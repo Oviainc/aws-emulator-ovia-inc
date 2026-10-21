@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePipeline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePipeline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePipeline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a pipeline record in this service's store and answers with it. The response is
+//! read back out of the stored record, so a later `GetPipeline` / `ListPipelines` cannot
+//! disagree with what this call returned.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +171,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePipeline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePipelineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePipeline"))
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+
+        // `PipelineName`'s length and pattern, and the `@range(1,)` on both unit counts,
+        // are modelled, so the boundary validator already refused anything outside them.
+        // The one rule the model cannot state is the relation between the two counts.
+        if input.max_units < input.min_units {
+            return Err(CreatePipelineErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "MaxUnits ({}) must be greater than or equal to MinUnits ({})",
+                    input.max_units, input.min_units
+                )),
+            })
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+        store.settle(now);
+
+        // Pipeline names are unique across the pipelines owned by an account within a
+        // Region (the `PipelineName` member's own doc), so a second create of a name that
+        // is already taken is a conflict, not a second pipeline.
+        if store.pipelines.contains_key(&input.pipeline_name) {
+            return Err(CreatePipelineErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!(
+                        "Pipeline with name {} already exists",
+                        input.pipeline_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The real service caps pipelines per account per Region and models
+        // LimitExceededException for exceeding it; the emulator's own ceiling is what
+        // keeps a create loop from growing this process without bound.
+        if store.pipelines.len() >= crate::state::MAX_PIPELINES {
+            return Err(CreatePipelineErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the maximum number of pipelines ({})",
+                        crate::state::MAX_PIPELINES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let pipeline_name = input.pipeline_name.clone();
+        let arn = crate::state::pipeline_arn(&region, &pipeline_name);
+        let record = crate::state::StoredPipeline {
+            ingest_endpoint_urls: crate::state::ingest_endpoint_urls(
+                &region,
+                &pipeline_name,
+                &arn,
+            ),
+            vpc_endpoints: crate::state::vpc_endpoints_for(&arn, input.vpc_options),
+            pipeline_name: pipeline_name.clone(),
+            pipeline_arn: arn,
+            min_units: input.min_units,
+            max_units: input.max_units,
+            pipeline_configuration_body: input.pipeline_configuration_body,
+            // A new pipeline is not running yet: the clock owes it ACTIVE.
+            status: crate::state::STATUS_CREATING.to_string(),
+            status_reason: Some("The pipeline is being created.".to_string()),
+            pending: Some(crate::state::PendingTransition {
+                to: crate::state::STATUS_ACTIVE.to_string(),
+                due_at: now + crate::state::TRANSITION_SPAN,
+            }),
+            created_at: now,
+            last_updated_at: now,
+            log_publishing_options: input.log_publishing_options,
+            buffer_options: input.buffer_options,
+            encryption_at_rest_options: input.encryption_at_rest_options,
+            pipeline_role_arn: input.pipeline_role_arn,
+            tags: input.tags.unwrap_or_default(),
+        };
+        store.pipelines.insert(pipeline_name.clone(), record);
+
+        // Answer from the stored record, so this response cannot drift from the state a
+        // later GetPipeline / ListPipelines reads.
+        let stored = store
+            .pipelines
+            .get(&pipeline_name)
+            .ok_or_else(store_unavailable)?;
+        Ok(CreatePipelineOutput {
+            pipeline: Some(stored.to_pipeline()),
+        })
     }
+}
+
+/// The store is unreachable — a server-side fault, which this operation models as
+/// `InternalException` (HTTP 500). Never answered by constructing a private engine.
+fn store_unavailable() -> CreatePipelineError {
+    CreatePipelineErrorModeled::InternalException(InternalException {
+        message: Some("the OpenSearch Ingestion pipeline store is unavailable".to_string()),
+    })
+    .into()
 }

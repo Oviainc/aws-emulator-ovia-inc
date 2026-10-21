@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePipeline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePipeline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePipeline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A MUTATION: it removes the pipeline record, so a later `GetPipeline` answers 404 and
+//! `ListPipelines` no longer includes it. A pipeline still settling into a status cannot
+//! be deleted — that is this operation's `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +141,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePipeline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePipelineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePipeline"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+        store.settle(now);
+
+        let pipeline_name = input.pipeline_name.clone();
+        let stored = store
+            .pipelines
+            .get(&pipeline_name)
+            .ok_or_else(|| not_found(&pipeline_name))?;
+
+        // A pipeline cannot be deleted while it is still being created, started, stopped
+        // or updated: AWS documents that you can't delete a pipeline that is mid-change,
+        // and this operation models ConflictException for it.
+        if stored.is_in_transition() {
+            return Err(DeletePipelineErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Pipeline {pipeline_name} cannot be deleted while its status is {}",
+                    stored.status
+                )),
+            })
+            .into());
+        }
+
+        store.pipelines.remove(&pipeline_name);
+        Ok(DeletePipelineOutput {})
     }
+}
+
+/// No pipeline of this name is stored — HTTP 404 `ResourceNotFoundException`. A second
+/// delete of the same name lands here, because the first one removed the record.
+fn not_found(pipeline_name: &str) -> DeletePipelineError {
+    DeletePipelineErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("Pipeline {pipeline_name} could not be found")),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server-side fault, modelled as `InternalException`
+/// (HTTP 500). Never answered by constructing a private engine.
+fn store_unavailable() -> DeletePipelineError {
+    DeletePipelineErrorModeled::InternalException(InternalException {
+        message: Some("the OpenSearch Ingestion pipeline store is unavailable".to_string()),
+    })
+    .into()
 }
