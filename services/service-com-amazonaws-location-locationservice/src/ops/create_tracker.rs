@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTracker
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTracker`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTracker::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: creates and persists a tracker resource in
+//! [`crate::state::ComAmazonawsLocationLocationserviceState::trackers`], keyed by
+//! `TrackerName`, and answers with the stored name, the generated ARN and the
+//! stored creation timestamp. A name that already exists is a `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +193,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTracker` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTrackerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTracker"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateTrackerErrorModeled::InternalServerException(InternalServerException {
+                message: "the Amazon Location state store is unavailable".to_string(),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+
+        // A tracker name is unique within an account, so creating one that already
+        // exists is a conflict rather than a silent overwrite.
+        if store.trackers.contains_key(&input.tracker_name) {
+            return Err(CreateTrackerErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Resource of type \"Tracker\" with name \"{}\" already exists.",
+                    input.tracker_name
+                ),
+            })
+            .into());
+        }
+
+        // Bound the store: refuse past the emulator's tracker ceiling with the
+        // modelled quota error rather than growing without limit.
+        if store.trackers.len() >= crate::state::MAX_TRACKERS {
+            return Err(CreateTrackerErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The maximum number of tracker resources ({}) has been reached.",
+                        crate::state::MAX_TRACKERS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let tracker = crate::state::Tracker {
+            name: input.tracker_name.clone(),
+            arn: crate::state::tracker_arn(&region, &input.tracker_name),
+            description: input.description.unwrap_or_default(),
+            position_filtering: input
+                .position_filtering
+                .unwrap_or_else(|| crate::state::DEFAULT_POSITION_FILTERING.to_string()),
+            kms_key_id: input.kms_key_id,
+            event_bridge_enabled: input.event_bridge_enabled.unwrap_or(false),
+            kms_key_enable_geospatial_queries: input
+                .kms_key_enable_geospatial_queries
+                .unwrap_or(false),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            create_time: now,
+            update_time: now,
+            consumer_arns: ::std::collections::BTreeSet::new(),
+            devices: ::std::collections::BTreeMap::new(),
+        };
+
+        let output = CreateTrackerOutput {
+            tracker_name: tracker.name.clone(),
+            tracker_arn: tracker.arn.clone(),
+            create_time: crate::state::to_date_time(tracker.create_time),
+        };
+        store.trackers.insert(tracker.name.clone(), tracker);
+        Ok(output)
     }
 }
