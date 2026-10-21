@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWorkgroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWorkgroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mutates the stored workgroup IN PLACE — only the members the request
+//! names change, every other one keeps the value the last write gave it — so a following
+//! `GetWorkgroup` observes the new values. An unknown name is a 404
+//! `ResourceNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWorkgroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The workgroup is reported in `MODIFYING` status — one of the four `WorkgroupStatus`
+//! values — and returns to `AVAILABLE` on its own a moment later; see
+//! [`crate::state::WorkgroupRecord::settle`].
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +191,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWorkgroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWorkgroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWorkgroup"))
+        let _ = ctx;
+        // `port`'s valid ranges are documented on the member, not modelled as a
+        // constraint, so the boundary validator cannot have refused a bad one.
+        if let Some(port) = input.port {
+            if !crate::state::port_in_documented_range(port) {
+                return Err(UpdateWorkgroupErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "port {port} is outside the valid port ranges 5431-5455 and 8191-8215"
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateWorkgroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the redshift-serverless store is unreachable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.settle_due_transitions();
+
+        let Some(record) = state.workgroups.get_mut(&input.workgroup_name) else {
+            return Err(UpdateWorkgroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no workgroup named {}", input.workgroup_name),
+                    resource_name: Some(input.workgroup_name.clone()),
+                },
+            )
+            .into());
+        };
+
+        // Every mutable member of `Workgroup` this operation models, applied only when
+        // the request names it.
+        if let Some(base_capacity) = input.base_capacity {
+            record.workgroup.base_capacity = Some(base_capacity);
+        }
+        if let Some(max_capacity) = input.max_capacity {
+            record.workgroup.max_capacity = Some(max_capacity);
+        }
+        if let Some(enhanced_vpc_routing) = input.enhanced_vpc_routing {
+            record.workgroup.enhanced_vpc_routing = Some(enhanced_vpc_routing);
+        }
+        if let Some(publicly_accessible) = input.publicly_accessible {
+            record.workgroup.publicly_accessible = Some(publicly_accessible);
+        }
+        if let Some(config_parameters) = input.config_parameters {
+            record.workgroup.config_parameters = Some(config_parameters);
+        }
+        if let Some(security_group_ids) = input.security_group_ids {
+            record.workgroup.security_group_ids = Some(security_group_ids);
+        }
+        if let Some(subnet_ids) = input.subnet_ids {
+            record.workgroup.subnet_ids = Some(subnet_ids);
+        }
+        if let Some(ip_address_type) = input.ip_address_type {
+            record.workgroup.ip_address_type = Some(ip_address_type);
+        }
+        if let Some(price_performance_target) = input.price_performance_target {
+            record.workgroup.price_performance_target = Some(price_performance_target);
+        }
+        if let Some(track_name) = input.track_name {
+            record.workgroup.track_name = Some(track_name);
+        }
+        if let Some(extra_compute) = input.extra_compute_for_automatic_optimization {
+            record.workgroup.extra_compute_for_automatic_optimization = Some(extra_compute);
+        }
+        if let Some(port) = input.port {
+            record.workgroup.port = Some(port);
+            // The endpoint listens on the workgroup's port, so it moves with it.
+            if let Some(endpoint) = record.workgroup.endpoint.as_mut() {
+                endpoint.port = Some(port);
+            }
+        }
+
+        record.begin_transition(
+            crate::state::WORKGROUP_MODIFYING,
+            crate::state::WORKGROUP_AVAILABLE,
+        );
+
+        Ok(UpdateWorkgroupOutput {
+            workgroup: record.workgroup.clone(),
+        })
     }
 }

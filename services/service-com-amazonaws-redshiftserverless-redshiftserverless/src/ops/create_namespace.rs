@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: inserts a namespace keyed by `namespaceName` into
+//! [`crate::state::ComAmazonawsRedshiftserverlessRedshiftserverlessState::namespaces`]
+//! and answers with the record it stored, so `GetNamespace` / `ListNamespaces` report
+//! exactly these bytes back. The admin password is stored and never returned —
+//! `Namespace` models no password member.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `manageAdminPassword` is recorded but mints no Secrets Manager secret, so
+//! `adminPasswordSecretArn` stays absent: the secret belongs to this emulator's Secrets
+//! Manager integration, not to this operation.
+//!
+//! The store this inserts into is bounded by the account's documented quota
+//! ([`crate::state::MAX_NAMESPACES`]); past it the create is refused rather than growing
+//! the store without limit.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +171,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNamespace"))
+        // Either the caller supplies the admin password or the service manages it; the
+        // two members describe the same secret, so naming both is contradictory.
+        if input.manage_admin_password.unwrap_or(false) && input.admin_user_password.is_some() {
+            return Err(CreateNamespaceErrorModeled::ValidationException(ValidationException {
+                message: "adminUserPassword cannot be set when manageAdminPassword is true"
+                    .to_string(),
+            })
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateNamespaceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the redshift-serverless store is unreachable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        // The store grows one record per create, so the account's quota bounds it. Read
+        // before the `entry` below takes the borrow; it bounds only a NEW record.
+        let stored_namespaces = state.namespaces.len();
+
+        let region = crate::state::request_region(ctx);
+        let namespace_id = crate::state::new_resource_id();
+        let namespace = Namespace {
+            namespace_arn: Some(crate::state::namespace_arn(&region, &namespace_id)),
+            namespace_id: Some(namespace_id),
+            namespace_name: Some(input.namespace_name.clone()),
+            admin_username: input.admin_username,
+            db_name: Some(
+                input
+                    .db_name
+                    .unwrap_or_else(|| crate::state::DEFAULT_DB_NAME.to_string()),
+            ),
+            kms_key_id: input.kms_key_id,
+            default_iam_role_arn: input.default_iam_role_arn,
+            iam_roles: Some(input.iam_roles.unwrap_or_default()),
+            log_exports: Some(input.log_exports.unwrap_or_default()),
+            // `NamespaceStatus` models no CREATING: a namespace carries no compute, so
+            // there is no transition for the clock to owe it.
+            status: Some(crate::state::NAMESPACE_AVAILABLE.to_string()),
+            creation_date: Some(crate::state::now_timestamp()),
+            ..Namespace::default()
+        };
+        let record = crate::state::NamespaceRecord {
+            namespace,
+            admin_user_password: input.admin_user_password,
+            manage_admin_password: input.manage_admin_password.unwrap_or(false),
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        // One lookup decides both the conflict and the insert: the name is the
+        // namespace's identity, so an occupied slot IS the conflict. The answer comes out
+        // of the STORED record, so what the caller reads is what a later GetNamespace
+        // reads.
+        match state.namespaces.entry(input.namespace_name) {
+            ::std::collections::btree_map::Entry::Occupied(occupied) => {
+                Err(CreateNamespaceErrorModeled::ConflictException(ConflictException {
+                    message: format!("a namespace named {} already exists", occupied.key()),
+                })
+                .into())
+            }
+            ::std::collections::btree_map::Entry::Vacant(slot) => {
+                if stored_namespaces >= crate::state::MAX_NAMESPACES {
+                    return Err(CreateNamespaceErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "this account has reached its quota of {} namespaces in this Region",
+                                crate::state::MAX_NAMESPACES
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                Ok(CreateNamespaceOutput {
+                    namespace: Some(slot.insert(record).namespace.clone()),
+                })
+            }
+        }
     }
 }
