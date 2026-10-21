@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDetectorVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDetectorVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reconstructs the detector version from state — its rules, models,
+//! endpoints, status, execution mode, timestamps and ARN all come out of the stored
+//! record. A reporting operation: it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDetectorVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rest of this header is the generated scaffold guide, kept for reference.
 //!
 //! ## Shape of an operation
 //!
@@ -170,20 +166,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDetectorVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDetectorVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDetectorVersion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDetectorVersionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the frauddetector emulator holds no state on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let not_found = || {
+            GetDetectorVersionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!(
+                    "detector version '{}' of detector '{}' does not exist",
+                    input.detector_version_id, input.detector_id
+                ),
+            })
+        };
+        let Some(detector) = store.detectors.get(&input.detector_id) else {
+            return Err(not_found().into());
+        };
+        // The modeled `wholeNumberVersionString` pattern is `^([1-9][0-9]*)$` with at
+        // most 5 digits, so a version id is a number; one that does not parse names no
+        // version this detector could hold.
+        let Some(stored) = input
+            .detector_version_id
+            .parse::<u32>()
+            .ok()
+            .and_then(|numeric_id| detector.versions.get(&numeric_id))
+        else {
+            return Err(not_found().into());
+        };
+
+        Ok(GetDetectorVersionOutput {
+            detector_id: Some(detector.detector_id.clone()),
+            detector_version_id: Some(stored.detector_version_id.clone()),
+            description: stored.description.clone(),
+            // The rule references the version was created with, each rebuilt from the
+            // stored pair plus the detector it belongs to.
+            rules: Some(
+                stored
+                    .rule_refs
+                    .iter()
+                    .map(|(rule_id, rule_version)| Rule {
+                        detector_id: detector.detector_id.clone(),
+                        rule_id: rule_id.clone(),
+                        rule_version: rule_version.clone(),
+                    })
+                    .collect(),
+            ),
+            model_versions: Some(stored.model_versions.clone()),
+            external_model_endpoints: Some(stored.external_model_endpoints.clone()),
+            status: Some(stored.status.clone()),
+            rule_execution_mode: Some(stored.rule_execution_mode.clone()),
+            created_time: Some(stored.created_time.clone()),
+            last_updated_time: Some(stored.last_updated_time.clone()),
+            arn: Some(stored.arn.clone()),
+        })
     }
 }

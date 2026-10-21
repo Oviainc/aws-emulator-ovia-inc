@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDetectors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDetectors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: lists the detectors state holds, honouring the `detectorId` filter and
+//! paging over the stored order with `maxResults` / `nextToken`. A reporting operation:
+//! it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDetectors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rest of this header is the generated scaffold guide, kept for reference.
 //!
 //! ## Shape of an operation
 //!
@@ -152,20 +148,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDetectors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDetectorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDetectors"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDetectorsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the frauddetector emulator holds no state on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let summarize = |record: &crate::state::DetectorRecord| Detector {
+            detector_id: Some(record.detector_id.clone()),
+            event_type_name: Some(record.event_type_name.clone()),
+            description: record.description.clone(),
+            created_time: Some(record.created_time.clone()),
+            last_updated_time: Some(record.last_updated_time.clone()),
+            arn: Some(record.arn.clone()),
+        };
+
+        // A `detectorId` names one detector, so the answer is that detector or a 404 —
+        // there is nothing to page over, so this path never issues a `nextToken` and
+        // refuses one, exactly as the unfiltered path refuses a token it did not issue.
+        if let Some(detector_id) = &input.detector_id {
+            if let Some(token) = &input.next_token {
+                return Err(GetDetectorsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "nextToken '{token}' is not a pagination token this operation issued: a request filtered by detectorId is never paged"
+                        ),
+                    },
+                )
+                .into());
+            }
+            let Some(record) = store.detectors.get(detector_id) else {
+                return Err(GetDetectorsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("detector with id '{detector_id}' does not exist"),
+                    },
+                )
+                .into());
+            };
+            return Ok(GetDetectorsOutput {
+                detectors: Some(vec![summarize(record)]),
+                next_token: None,
+            });
+        }
+
+        // "If you provide a null maxResults, this action retrieves a maximum of 10
+        // records per page. If you provide a maxResults, the value must be between 5 and
+        // 10." (the operation's own documentation, above) — so an absent one takes the
+        // default and a value outside the modelled range is refused, not quietly
+        // reshaped into one the caller did not ask for.
+        const DEFAULT_PAGE_SIZE: i32 = 10;
+        const MIN_PAGE_SIZE: i32 = 5;
+        const MAX_PAGE_SIZE: i32 = 10;
+        let page_size = match input.max_results {
+            None => DEFAULT_PAGE_SIZE,
+            Some(requested) if (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&requested) => requested,
+            Some(requested) => {
+                return Err(GetDetectorsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "maxResults {requested} is outside the supported range {MIN_PAGE_SIZE}..{MAX_PAGE_SIZE}"
+                        ),
+                    },
+                )
+                .into())
+            }
+        } as usize;
+
+        // The token is the id of the first detector of the next page, so paging resumes
+        // at that position in the stored order and repeats nothing. A token that names
+        // no stored detector names no position; answering page one for it would let a
+        // drain-the-pages loop run forever, so it is refused.
+        let lower = match input.next_token {
+            Some(token) if store.detectors.contains_key(&token) => {
+                ::std::ops::Bound::Included(token)
+            }
+            Some(token) => {
+                return Err(GetDetectorsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "nextToken '{token}' is not a pagination token this operation issued"
+                        ),
+                    },
+                )
+                .into())
+            }
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut detectors: Vec<Detector> = Vec::new();
+        let mut next_token = None;
+        for (detector_id, record) in store
+            .detectors
+            .range((lower, ::std::ops::Bound::Unbounded))
+        {
+            if detectors.len() == page_size {
+                next_token = Some(detector_id.clone());
+                break;
+            }
+            detectors.push(summarize(record));
+        }
+
+        Ok(GetDetectorsOutput {
+            detectors: Some(detectors),
+            next_token,
+        })
     }
 }

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDetector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDetector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: upserts the detector record in [`crate::state`]. A first call inserts
+//! it (stamping `arn`, `createdTime` and `lastUpdatedTime`); a later call for the same
+//! `detectorId` updates `eventTypeName`, `description` and `tags` in place and re-stamps
+//! `lastUpdatedTime`, keeping the rules and detector versions already hung off it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDetector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rest of this header is the generated scaffold guide, kept for reference.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +144,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDetector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDetectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDetector"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutDetectorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the frauddetector emulator holds no state on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::region_from_request(ctx.parts());
+        let now = crate::state::now_timestamp();
+        let mut store = state.lock();
+
+        // Upsert, not insert: the model documents this operation as "Creates or updates
+        // a detector", so a second call for the same id must not duplicate the record
+        // or drop the rules and detector versions already attached to it.
+        match store.detectors.get_mut(&input.detector_id) {
+            Some(existing) => {
+                existing.event_type_name = input.event_type_name;
+                existing.description = input.description;
+                existing.tags = input.tags.unwrap_or_default();
+                existing.last_updated_time = now;
+            }
+            None => {
+                // The store is bounded (see `crate::state::MAX_DETECTORS`): a new
+                // detector beyond the emulator's capacity is refused, never accepted
+                // and dropped.
+                if store.detectors.len() >= crate::state::MAX_DETECTORS {
+                    return Err(PutDetectorErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "this emulator holds at most {} detectors",
+                                crate::state::MAX_DETECTORS
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                store.detectors.insert(
+                    input.detector_id.clone(),
+                    crate::state::DetectorRecord {
+                        arn: crate::state::detector_arn(&region, &input.detector_id),
+                        detector_id: input.detector_id,
+                        event_type_name: input.event_type_name,
+                        description: input.description,
+                        created_time: now.clone(),
+                        last_updated_time: now,
+                        tags: input.tags.unwrap_or_default(),
+                        rules: ::std::collections::BTreeMap::new(),
+                        versions: ::std::collections::BTreeMap::new(),
+                        next_version_id: 1,
+                    },
+                );
+            }
+        }
+
+        Ok(PutDetectorOutput {})
     }
 }

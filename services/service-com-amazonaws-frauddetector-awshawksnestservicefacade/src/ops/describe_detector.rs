@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDetector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDetector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports one summary per detector version state holds for the detector,
+//! in version order, paged with `maxResults` / `nextToken`. A reporting operation: it
+//! writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDetector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rest of this header is the generated scaffold guide, kept for reference.
 //!
 //! ## Shape of an operation
 //!
@@ -154,20 +150,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDetector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDetectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDetector"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeDetectorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the frauddetector emulator holds no state on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let Some(detector) = store.detectors.get(&input.detector_id) else {
+            return Err(DescribeDetectorErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("detector with id '{}' does not exist", input.detector_id),
+                },
+            )
+            .into());
+        };
+
+        // `maxResults` is modeled with range 1000..2500: an absent one pages at the top
+        // of that range, and a value outside it is refused rather than quietly reshaped
+        // into a page size the caller did not ask for — the same rule `GetDetectors`
+        // states for its own range.
+        const DEFAULT_PAGE_SIZE: i32 = 2500;
+        const MIN_PAGE_SIZE: i32 = 1000;
+        const MAX_PAGE_SIZE: i32 = 2500;
+        let page_size = match input.max_results {
+            None => DEFAULT_PAGE_SIZE,
+            Some(requested) if (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&requested) => requested,
+            Some(requested) => {
+                return Err(DescribeDetectorErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "maxResults {requested} is outside the supported range {MIN_PAGE_SIZE}..{MAX_PAGE_SIZE}"
+                        ),
+                    },
+                )
+                .into())
+            }
+        } as usize;
+
+        // The token is the id of the first version of the next page; versions are keyed
+        // numerically, so the order is 1, 2, ..., 10 rather than lexicographic. A token
+        // that does not name a version this detector holds names no position, and
+        // inventing one (answering page one) would let a drain-the-pages loop run
+        // forever: refuse it, exactly as `GetDetectors` refuses a token it never issued.
+        let lower = match input.next_token.as_deref().map(str::parse::<u32>) {
+            Some(Ok(from)) if detector.versions.contains_key(&from) => {
+                ::std::ops::Bound::Included(from)
+            }
+            Some(_) => {
+                return Err(DescribeDetectorErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "nextToken '{}' is not a pagination token this operation issued",
+                            input.next_token.unwrap_or_default()
+                        ),
+                    },
+                )
+                .into())
+            }
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut summaries: Vec<DetectorVersionSummary> = Vec::new();
+        let mut next_token = None;
+        for (numeric_id, version) in detector
+            .versions
+            .range((lower, ::std::ops::Bound::Unbounded))
+        {
+            if summaries.len() == page_size {
+                next_token = Some(numeric_id.to_string());
+                break;
+            }
+            summaries.push(DetectorVersionSummary {
+                detector_version_id: Some(version.detector_version_id.clone()),
+                status: Some(version.status.clone()),
+                description: version.description.clone(),
+                last_updated_time: Some(version.last_updated_time.clone()),
+            });
+        }
+
+        Ok(DescribeDetectorOutput {
+            detector_id: Some(detector.detector_id.clone()),
+            detector_version_summaries: Some(summaries),
+            next_token,
+            arn: Some(detector.arn.clone()),
+        })
     }
 }

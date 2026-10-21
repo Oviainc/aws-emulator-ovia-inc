@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: attaches a rule version to the stored detector. The `ruleVersion` is
+//! allocated per `(detectorId, ruleId)` from the versions already in state (`"1"`, then
+//! `"2"`, …), and the returned `rule` is read back out of the record just stored.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rest of this header is the generated scaffold guide, kept for reference.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +147,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the frauddetector emulator holds no state on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `language` is a modeled enum (`Language`), so a value outside it is a client
+        // error, not something to store.
+        if !LANGUAGE_VALUES.contains(&input.language.as_str()) {
+            return Err(CreateRuleErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "language '{}' is not a supported rule language; expected one of {:?}",
+                    input.language, LANGUAGE_VALUES
+                ),
+            })
+            .into());
+        }
+
+        let region = crate::state::region_from_request(ctx.parts());
+        let now = crate::state::now_timestamp();
+        let mut store = state.lock();
+
+        // A rule belongs to a detector, so there is nothing to attach it to until that
+        // detector exists. `CreateRule` models no `ResourceNotFoundException`, so the
+        // refusal is the `ValidationException` it does model.
+        let Some(detector) = store.detectors.get_mut(&input.detector_id) else {
+            return Err(CreateRuleErrorModeled::ValidationException(ValidationException {
+                message: format!("detector with id '{}' does not exist", input.detector_id),
+            })
+            .into());
+        };
+        let detector_id = detector.detector_id.clone();
+
+        // Both stores this operation grows are bounded. A rule the detector does not
+        // have yet needs room for another rule (see `crate::state::MAX_RULES_PER_DETECTOR`),
+        // and `ruleVersion` is modelled as at most 5 digits, so version allocation stops
+        // at `crate::state::MAX_VERSION_ID` rather than emitting an id the model refuses.
+        if !detector.rules.contains_key(&input.rule_id)
+            && detector.rules.len() >= crate::state::MAX_RULES_PER_DETECTOR
+        {
+            return Err(CreateRuleErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "detector '{detector_id}' already holds the maximum of {} rules this emulator keeps",
+                    crate::state::MAX_RULES_PER_DETECTOR
+                ),
+            })
+            .into());
+        }
+
+        // Versions are allocated from what state already holds for this
+        // `(detectorId, ruleId)`: the first is "1" and each later one is len + 1.
+        let versions = detector.rules.entry(input.rule_id.clone()).or_default();
+        if versions.len() as u64 >= u64::from(crate::state::MAX_VERSION_ID) {
+            return Err(CreateRuleErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "rule '{}' of detector '{detector_id}' has exhausted its rule versions (the last is {})",
+                    input.rule_id,
+                    crate::state::MAX_VERSION_ID
+                ),
+            })
+            .into());
+        }
+        let rule_version = (versions.len() + 1).to_string();
+        versions.push(crate::state::RuleRecord {
+            arn: crate::state::rule_arn(&region, &detector_id, &input.rule_id, &rule_version),
+            rule_id: input.rule_id,
+            rule_version,
+            expression: input.expression,
+            language: input.language,
+            outcomes: input.outcomes,
+            description: input.description,
+            tags: input.tags.unwrap_or_default(),
+            created_time: now.clone(),
+            last_updated_time: now,
+        });
+
+        // Report the STORED version, so the caller sees the id state assigned rather
+        // than an echo of the request.
+        let Some(stored) = versions.last() else {
+            return Err(CreateRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the rule version could not be read back after storing it"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        Ok(CreateRuleOutput {
+            rule: Some(Rule {
+                detector_id,
+                rule_id: stored.rule_id.clone(),
+                rule_version: stored.rule_version.clone(),
+            }),
+        })
     }
 }

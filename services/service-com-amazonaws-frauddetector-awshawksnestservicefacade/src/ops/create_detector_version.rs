@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDetectorVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDetectorVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: allocates the next sequential `detectorVersionId` for the stored
+//! detector, resolves every referenced rule against the rules state holds for that
+//! detector, and persists the version with `status = DRAFT` and `ruleExecutionMode`
+//! defaulted to `FIRST_MATCHED`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDetectorVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rest of this header is the generated scaffold guide, kept for reference.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +164,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDetectorVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDetectorVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDetectorVersion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDetectorVersionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the frauddetector emulator holds no state on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `ruleExecutionMode` is a modeled enum; an absent one takes the documented
+        // default, and a value outside the enum is a client error.
+        let rule_execution_mode = match input.rule_execution_mode {
+            None => crate::state::RULE_EXECUTION_MODE_DEFAULT.to_string(),
+            Some(mode) if RULE_EXECUTION_MODE_VALUES.contains(&mode.as_str()) => mode,
+            Some(mode) => {
+                return Err(CreateDetectorVersionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "ruleExecutionMode '{mode}' is not valid; expected one of {:?}",
+                            RULE_EXECUTION_MODE_VALUES
+                        ),
+                    },
+                )
+                .into())
+            }
+        };
+
+        let region = crate::state::region_from_request(ctx.parts());
+        let now = crate::state::now_timestamp();
+        let mut store = state.lock();
+
+        let Some(detector) = store.detectors.get_mut(&input.detector_id) else {
+            return Err(CreateDetectorVersionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("detector with id '{}' does not exist", input.detector_id),
+                },
+            )
+            .into());
+        };
+
+        // Each referenced rule must resolve to a rule version this detector actually
+        // holds: a detector version is a snapshot of stored rules, not of request text.
+        let mut rule_refs: Vec<(String, String)> = Vec::with_capacity(input.rules.len());
+        for rule in &input.rules {
+            if rule.detector_id != detector.detector_id {
+                return Err(CreateDetectorVersionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "rule '{}' names detector '{}', which is not the detector being versioned ('{}')",
+                            rule.rule_id, rule.detector_id, detector.detector_id
+                        ),
+                    },
+                )
+                .into());
+            }
+            let known = detector
+                .rules
+                .get(&rule.rule_id)
+                .is_some_and(|versions| {
+                    versions
+                        .iter()
+                        .any(|stored| stored.rule_version == rule.rule_version)
+                });
+            if !known {
+                return Err(CreateDetectorVersionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "rule '{}' version '{}' does not exist for detector '{}'",
+                            rule.rule_id, rule.rule_version, detector.detector_id
+                        ),
+                    },
+                )
+                .into());
+            }
+            rule_refs.push((rule.rule_id.clone(), rule.rule_version.clone()));
+        }
+
+        // The id comes from the detector's own counter, so it is sequential per detector
+        // and never reused. The modelled `wholeNumberVersionString` is at most 5 digits,
+        // so the counter cannot be allowed to run past that: exhausting the space is
+        // refused rather than answered with an id the model would reject (or, worse, one
+        // that overwrites a stored version).
+        let numeric_id = detector.next_version_id;
+        if numeric_id > crate::state::MAX_VERSION_ID {
+            return Err(CreateDetectorVersionErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "detector '{}' has exhausted its detector version ids (the last is {})",
+                        detector.detector_id,
+                        crate::state::MAX_VERSION_ID
+                    ),
+                },
+            )
+            .into());
+        }
+        detector.next_version_id = numeric_id.saturating_add(1);
+        let detector_version_id = numeric_id.to_string();
+        detector.versions.insert(
+            numeric_id,
+            crate::state::DetectorVersionRecord {
+                arn: crate::state::detector_version_arn(
+                    &region,
+                    &detector.detector_id,
+                    &detector_version_id,
+                ),
+                detector_version_id,
+                description: input.description,
+                status: crate::state::DETECTOR_VERSION_STATUS_DRAFT.to_string(),
+                rule_refs,
+                model_versions: input.model_versions.unwrap_or_default(),
+                external_model_endpoints: input.external_model_endpoints.unwrap_or_default(),
+                rule_execution_mode,
+                created_time: now.clone(),
+                last_updated_time: now,
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+
+        // Report the stored version, read back out of state.
+        let Some(stored) = detector.versions.get(&numeric_id) else {
+            return Err(CreateDetectorVersionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the detector version could not be read back after storing it"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        Ok(CreateDetectorVersionOutput {
+            detector_id: Some(detector.detector_id.clone()),
+            detector_version_id: Some(stored.detector_version_id.clone()),
+            status: Some(stored.status.clone()),
+        })
     }
 }
