@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEarthObservationJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEarthObservationJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEarthObservationJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a stored Earth Observation job, so a following `GetEarthObservationJob`
+//! on the same ARN is a `ResourceNotFoundException` (404) and the job is gone from
+//! `ListEarthObservationJobs`. A job that has not reached a terminal status cannot
+//! be deleted (`ConflictException`, 409); an ARN this service holds no record of is
+//! a `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +144,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEarthObservationJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEarthObservationJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEarthObservationJob"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteEarthObservationJobError::from(
+                DeleteEarthObservationJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the sagemaker-geospatial store is unavailable".to_string(),
+                        resource_id: None,
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+        // One record's clock-owed transitions, not the whole store's: this call
+        // addresses one job.
+        store.materialize_job(&input.arn, now);
+
+        let Some(job) = store.earth_observation_jobs.get(&input.arn) else {
+            return Err(
+                DeleteEarthObservationJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "No Earth Observation job exists with the ARN {}",
+                            input.arn
+                        ),
+                        resource_id: Some(input.arn.clone()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        if !crate::state::is_terminal_status(&job.status) {
+            return Err(DeleteEarthObservationJobErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Earth Observation job {} cannot be deleted: its status is {}",
+                        job.arn, job.status
+                    ),
+                    resource_id: Some(job.arn.clone()),
+                },
+            )
+            .into());
+        }
+
+        store.earth_observation_jobs.remove(&input.arn);
+        // The idempotency tokens that resolved to this job resolve to nothing now,
+        // so a repeated `StartEarthObservationJob` mints a new job rather than
+        // reporting a deleted one.
+        store.idempotency.retain(|_, arn| arn != &input.arn);
+
+        Ok(DeleteEarthObservationJobOutput {})
     }
 }

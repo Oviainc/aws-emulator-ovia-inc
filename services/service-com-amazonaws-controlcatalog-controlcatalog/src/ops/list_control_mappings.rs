@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListControlMappings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListControlMappings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListControlMappings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the catalog's control mappings, a page at a time, out of this service's
+//! state (`crate::state`), optionally narrowed by control ARN, common control ARN and
+//! mapping type. Every mapping names a control, common control or control that the
+//! corresponding list or get operation also returns.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +75,110 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page `ListControlMappings` returns, and the page size a request that
+/// sends no `MaxResults` gets: the maximum of the modeled
+/// `MaxListControlMappingsResults` range (1..1000).
+const MAX_LIST_CONTROL_MAPPINGS_RESULTS: i32 = 1000;
+
+/// Project a stored mapping into the modeled `ControlMapping`.
+fn control_mapping(record: &crate::state::ControlMappingRecord) -> ControlMapping {
+    let mapping = match &record.mapping {
+        crate::state::MappingDetails::Framework { name, item } => {
+            Mapping::Framework(FrameworkMappingDetails {
+                name: name.clone(),
+                item: item.clone(),
+            })
+        }
+        crate::state::MappingDetails::CommonControl { common_control_arn } => {
+            Mapping::CommonControl(CommonControlMappingDetails {
+                common_control_arn: common_control_arn.clone(),
+            })
+        }
+        crate::state::MappingDetails::RelatedControl {
+            control_arn,
+            relation_type,
+        } => Mapping::RelatedControl(RelatedControlMappingDetails {
+            control_arn: control_arn.clone(),
+            relation_type: relation_type.clone(),
+        }),
+    };
+    ControlMapping {
+        control_arn: record.control_arn.clone(),
+        mapping_type: record.mapping_type.clone(),
+        mapping,
+    }
+}
+
+/// Does `record` satisfy every dimension the caller's filter sets?
+///
+/// A dimension the filter omits constrains nothing; a dimension it sets admits only a
+/// mapping whose own stored value is among the values listed. A control ARN is
+/// resolved through the catalog first, so the Control Tower form of a control's ARN
+/// filters for the same control its `controlcatalog` form does.
+fn matches_filter(
+    record: &crate::state::ControlMappingRecord,
+    filter: Option<&ControlMappingFilter>,
+    state: &crate::state::ComAmazonawsControlcatalogControlcatalogState,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    if let Some(control_arns) = filter.control_arns.as_ref() {
+        let matched = control_arns.iter().any(|requested| {
+            state
+                .resolve_control(requested)
+                .is_some_and(|control| control.arn == record.control_arn)
+        });
+        if !matched {
+            return false;
+        }
+    }
+    if let Some(common_control_arns) = filter.common_control_arns.as_ref() {
+        let matched = match &record.mapping {
+            crate::state::MappingDetails::CommonControl { common_control_arn } => {
+                common_control_arns.contains(common_control_arn)
+            }
+            _ => false,
+        };
+        if !matched {
+            return false;
+        }
+    }
+    if let Some(mapping_types) = filter.mapping_types.as_ref() {
+        if !mapping_types.contains(&record.mapping_type) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The filter's dimensions, as the `(dimension, values)` pairs
+/// `state::filter_fingerprint` hashes: the model declares `ControlArns`,
+/// `CommonControlArns` and `MappingTypes`, and a dimension the caller omitted
+/// contributes no values.
+fn filter_dimensions(filter: Option<&ControlMappingFilter>) -> Vec<(&'static str, Vec<String>)> {
+    vec![
+        (
+            "controlArns",
+            filter
+                .and_then(|filter| filter.control_arns.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "commonControlArns",
+            filter
+                .and_then(|filter| filter.common_control_arns.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "mappingTypes",
+            filter
+                .and_then(|filter| filter.mapping_types.clone())
+                .unwrap_or_default(),
+        ),
+    ]
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -152,18 +251,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListControlMappings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListControlMappingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListControlMappings"))
+        // `ctx` carries request metadata only; this operation reads none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListControlMappingsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Control Catalog store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        let filter = input.filter.as_ref();
+        let fingerprint = crate::state::filter_fingerprint(&filter_dimensions(filter));
+        let page = crate::state::page(
+            "control-mappings",
+            &fingerprint,
+            state
+                .control_mappings
+                .iter()
+                .filter(|(_, record)| matches_filter(record, filter, &state))
+                .map(|(key, record)| (key.clone(), control_mapping(record))),
+            input.next_token.as_deref(),
+            input.max_results,
+            MAX_LIST_CONTROL_MAPPINGS_RESULTS,
+        )
+        .map_err(|error| {
+            ListControlMappingsErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::page_refusal("ListControlMappings", error)),
+            })
+        })?;
+
+        Ok(ListControlMappingsOutput {
+            control_mappings: page.items,
+            next_token: page.next_token,
+        })
     }
 }
