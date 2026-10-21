@@ -2,10 +2,137 @@
 
 //! Engine state for the com-amazonaws-uxc-awsaccountuxsetting service.
 
+use std::collections::HashMap;
+
+/// One account's stored console customization record.
+///
+/// Each member is `Option` because the service distinguishes "never configured"
+/// from "configured to this value": `GetAccountCustomizations` documents that an
+/// unconfigured `visibleRegions`/`visibleServices` is returned as `null` (all
+/// Regions / all services are visible) and an unconfigured `accountColor` as
+/// `none`. An empty list is therefore NOT the same as an absent one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountUxCustomization {
+    /// The stored `AccountColor` wire value, or `None` while never configured.
+    pub account_color: Option<String>,
+    /// The stored visible-service identifiers, or `None` while never configured.
+    pub visible_services: Option<Vec<String>>,
+    /// The stored visible-Region codes, or `None` while never configured.
+    pub visible_regions: Option<Vec<String>>,
+}
+
+/// The wire value `AccountColor` uses for "no color set" — the documented default
+/// `GetAccountCustomizations` reports for an account that never set one.
+pub const ACCOUNT_COLOR_NONE: &str = "none";
+
+/// The service identifiers `ListServices` enumerates, in the order the catalog is
+/// seeded (sorted below, so paging is coherent).
+///
+/// `ListServices` returns "Amazon Web Services service identifiers that you can
+/// use as values for the visibleServices setting", so every entry here is an AWS
+/// service's endpoint prefix / signing name and satisfies the model's `Service`
+/// member constraints (`length 1..64`, `pattern ^[a-z0-9]+(-[a-z0-9]+)*$` — see
+/// `smithy_query(query="shape", shape="ServiceList")`). The real catalog varies by
+/// partition; this emulator serves one fixed, deterministic catalog.
+const SEED_SERVICE_CATALOG: &[&str] = &[
+    "access-analyzer",
+    "account",
+    "acm",
+    "amplify",
+    "apigateway",
+    "appconfig",
+    "athena",
+    "autoscaling",
+    "backup",
+    "batch",
+    "bedrock",
+    "cloudformation",
+    "cloudfront",
+    "cloudtrail",
+    "cloudwatch",
+    "codebuild",
+    "cognito-idp",
+    "config",
+    "dynamodb",
+    "ec2",
+    "ecr",
+    "ecs",
+    "eks",
+    "elasticache",
+    "events",
+    "firehose",
+    "glue",
+    "iam",
+    "kinesis",
+    "kms",
+    "lambda",
+    "logs",
+    "organizations",
+    "rds",
+    "route53",
+    "s3",
+    "sagemaker",
+    "secretsmanager",
+    "sns",
+    "sqs",
+    "ssm",
+    "states",
+    "sts",
+    "waf",
+    "xray",
+];
+
 /// Per-service state for com-amazonaws-uxc-awsaccountuxsetting. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsUxcAwsaccountuxsettingState {
-    // TODO: add service-specific state fields
+    /// The customization record of each account that has one, keyed by the
+    /// calling account's id. A missing key is the default (unconfigured) record.
+    pub customizations: HashMap<String, AccountUxCustomization>,
+    /// The ordered catalog `ListServices` pages over. Sorted and de-duplicated at
+    /// construction so a `nextToken` resolved against it names a stable position.
+    pub service_catalog: Vec<String>,
+}
+
+impl Default for ComAmazonawsUxcAwsaccountuxsettingState {
+    fn default() -> Self {
+        let mut service_catalog: Vec<String> =
+            SEED_SERVICE_CATALOG.iter().map(|s| (*s).to_string()).collect();
+        // Stable ordering is what makes pagination coherent: an offset-bearing
+        // token must name the same element on every page request.
+        service_catalog.sort();
+        service_catalog.dedup();
+        Self {
+            customizations: HashMap::new(),
+            service_catalog,
+        }
+    }
+}
+
+impl ComAmazonawsUxcAwsaccountuxsettingState {
+    /// The customization stored for `account_id`, or the default record when that
+    /// account has never been updated. A READ: it never inserts the key.
+    pub fn customization(&self, account_id: &str) -> AccountUxCustomization {
+        self.customizations
+            .get(account_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The customization record for `account_id`, created empty on first write.
+    pub fn customization_mut(&mut self, account_id: &str) -> &mut AccountUxCustomization {
+        self.customizations.entry(account_id.to_string()).or_default()
+    }
+}
+
+/// The account a request is made by, which keys [`ComAmazonawsUxcAwsaccountuxsettingState::customizations`].
+///
+/// Customizations are per account, and this emulator presents exactly one
+/// canonical account (`engine::emulator_account_id`) whatever credentials sign the
+/// request — so every caller resolves to that account rather than to its access
+/// key id. Resolved through this accessor, never a literal, so the key follows the
+/// emulator's account contract.
+pub fn calling_account_id() -> &'static str {
+    ::engine::emulator_account_id()
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

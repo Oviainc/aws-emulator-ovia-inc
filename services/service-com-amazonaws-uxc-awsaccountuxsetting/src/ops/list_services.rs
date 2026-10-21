@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServices
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServices`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServices::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: pages over the service catalog held in this service's state,
+//! writing nothing (`@readonly`) — a page token carries its own resume offset, so
+//! a read never has to record one.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +82,61 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The plaintext prefix of an issued page token, before base64 encoding.
+///
+/// A token is the emulator's own: it is MINTED here (never taken from the
+/// caller's imagination) and validated on the way back in, but it carries its
+/// resume offset inside itself instead of being recorded in state — `ListServices`
+/// is `@readonly`, so serving a page must not write anything.
+const PAGE_TOKEN_PREFIX: &str = "uxc/service-catalog/offset=";
+
+/// Width of the zero-padded offset in a page token's plaintext. Fixed so every
+/// issued token has the same length and clears the modelled `NextToken`
+/// `@length(32, 512)` (the plaintext is 39 bytes, so the base64 form is 52 chars).
+const PAGE_TOKEN_OFFSET_DIGITS: usize = 12;
+
+/// The most items one page may carry: the modelled `ServiceList` `@length` max
+/// (`smithy_query(query="shape", shape="ServiceList")`). It also bounds a page the
+/// caller did not size with `maxResults`.
+const SERVICE_LIST_MAX_ITEMS: usize = 500;
+
+/// The lowest and highest `maxResults` the model accepts
+/// (`smithy_query(query="shape", shape="MaxResults")`).
+const MAX_RESULTS_RANGE: std::ops::RangeInclusive<i32> = 1..=1000;
+
+/// Mint the opaque token that resumes a listing at `offset`.
+///
+/// base64 of the plaintext above: the standard alphabet plus `=` padding is
+/// exactly what the modelled `NextToken` pattern `^[-A-Za-z0-9+/_]+=*$` admits.
+fn encode_page_token(offset: usize) -> String {
+    let width = PAGE_TOKEN_OFFSET_DIGITS;
+    ::aws_smithy_types::base64::encode(format!("{PAGE_TOKEN_PREFIX}{offset:0width$}"))
+}
+
+/// The offset a token issued by [`encode_page_token`] resumes at, or `None` when
+/// the token is not one this service minted.
+fn decode_page_token(token: &str) -> Option<usize> {
+    let plaintext = String::from_utf8(::aws_smithy_types::base64::decode(token).ok()?).ok()?;
+    let digits = plaintext.strip_prefix(PAGE_TOKEN_PREFIX)?;
+    if digits.len() != PAGE_TOKEN_OFFSET_DIGITS || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The modelled `ValidationException` for one input member, carrying the member's
+/// path in `fieldList` the way the service's own boundary refusal does.
+fn invalid_member(path: &str, message: String) -> ListServicesError {
+    ListServicesErrorModeled::ValidationException(ValidationException {
+        message: format!("{path}: {message}"),
+        field_list: Some(vec![ValidationExceptionField {
+            path: path.to_string(),
+            message,
+        }]),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,18 +208,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServices` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServicesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServices"))
+        // Paging needs no request metadata: the resume position travels in the token.
+        let _ = ctx;
+
+        // The boundary validator already refuses a `maxResults` outside the
+        // modelled range and a `nextToken` outside its length/pattern; this guard
+        // keeps the page size an invariant of the handler itself and states the
+        // refusal as the modelled `ValidationException`.
+        if let Some(max_results) = input.max_results {
+            if !MAX_RESULTS_RANGE.contains(&max_results) {
+                return Err(invalid_member(
+                    "maxResults",
+                    format!(
+                        "Member must be between {} and {}, inclusive",
+                        MAX_RESULTS_RANGE.start(),
+                        MAX_RESULTS_RANGE.end()
+                    ),
+                ));
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListServicesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // One snapshot of the catalog, so the page and the decision to issue a
+        // token are taken against the same state. A pure read.
+        let catalog: Vec<String> = state.lock().service_catalog.clone();
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match decode_page_token(token) {
+                // A token that decodes but names a position past the catalog's end
+                // no longer resolves to a resume point, so it is refused like any
+                // other token this service did not issue for this listing.
+                Some(offset) if offset <= catalog.len() => offset,
+                _ => {
+                    return Err(invalid_member(
+                        "nextToken",
+                        "Member must be a nextToken returned by a previous ListServices response"
+                            .to_string(),
+                    ))
+                }
+            },
+        };
+
+        let page_size = input
+            .max_results
+            .map_or(SERVICE_LIST_MAX_ITEMS, |max| max as usize)
+            .min(SERVICE_LIST_MAX_ITEMS);
+        let end = offset.saturating_add(page_size).min(catalog.len());
+        let services = catalog[offset..end].to_vec();
+
+        Ok(ListServicesOutput {
+            // "This value is null when no more results are available": a token is
+            // issued only while the catalog holds items past this page.
+            next_token: (end < catalog.len()).then(|| encode_page_token(end)),
+            services: Some(services),
+        })
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAccountCustomizations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAccountCustomizations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAccountCustomizations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: merges the supplied settings into the calling account's
+//! persisted customization record and answers with the record read back out of
+//! state.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +164,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAccountCustomizations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAccountCustomizationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAccountCustomizations"))
+        // The write needs no request metadata beyond the calling account.
+        let _ = ctx;
+
+        // The boundary validator has already refused an `accountColor` outside the
+        // modelled value set, every `visibleServices`/`visibleRegions` element
+        // outside its pattern, and a list longer than its `@length`. This check is
+        // the handler's own guard on the one invariant it depends on (a stored
+        // colour is always a modelled wire value), stated as the modelled
+        // `ValidationException` with the offending member's path.
+        if let Some(color) = input.account_color.as_deref() {
+            if !ACCOUNT_COLOR_VALUES.contains(&color) {
+                return Err(UpdateAccountCustomizationsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "accountColor must be one of: {}",
+                            ACCOUNT_COLOR_VALUES.join(", ")
+                        ),
+                        field_list: Some(vec![ValidationExceptionField {
+                            path: "accountColor".to_string(),
+                            message: format!(
+                                "Member must satisfy enum value set: [{}]",
+                                ACCOUNT_COLOR_VALUES.join(", ")
+                            ),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateAccountCustomizationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let account_id = crate::state::calling_account_id();
+
+        {
+            // "Only the settings that you include in the request body are
+            // modified. Omitted settings remain unchanged." At the typed boundary
+            // an omitted member arrives as `None`, so `None` leaves the stored
+            // value alone; a colour is reset with the modelled `none` value and a
+            // list by sending it empty.
+            let mut guard = state.lock();
+            let record = guard.customization_mut(account_id);
+            if let Some(color) = input.account_color {
+                record.account_color = Some(color);
+            }
+            if let Some(services) = input.visible_services {
+                record.visible_services = Some(services);
+            }
+            if let Some(regions) = input.visible_regions {
+                record.visible_regions = Some(regions);
+            }
+        }
+
+        // Answer from PERSISTED state, read back after the write, rather than from
+        // the input: the response is "the current ... after the update", which also
+        // carries settings this request did not mention. Re-applying the same
+        // request therefore yields the same state and the same body (`@idempotent`).
+        let stored = state.lock().customization(account_id);
+
+        Ok(UpdateAccountCustomizationsOutput {
+            account_color: Some(
+                stored
+                    .account_color
+                    .unwrap_or_else(|| crate::state::ACCOUNT_COLOR_NONE.to_string()),
+            ),
+            visible_services: stored.visible_services,
+            visible_regions: stored.visible_regions,
+        })
     }
 }
