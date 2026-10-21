@@ -1699,6 +1699,42 @@
     {
       "shape_id": "com.amazonaws.wickr#WickrAdminApi",
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/wickr/service/2024-02-01/wickr-2024-02-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.wisdom#WisdomService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/wisdom/service/2020-10-19/wisdom-2020-10-19.json"
+    },
+    {
+      "shape_id": "com.amazonaws.workdocs#AWSGorillaBoyService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/workdocs/service/2016-05-01/workdocs-2016-05-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.workmail#WorkMailService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/workmail/service/2017-10-01/workmail-2017-10-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.workmailmessageflow#GiraffeMessageInTransitService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/workmailmessageflow/service/2019-05-01/workmailmessageflow-2019-05-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.workspaces#WorkspacesService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/workspaces/service/2015-04-08/workspaces-2015-04-08.json"
+    },
+    {
+      "shape_id": "com.amazonaws.workspacesinstances#EUCMIFrontendAPIService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/workspaces-instances/service/2022-07-26/workspaces-instances-2022-07-26.json"
+    },
+    {
+      "shape_id": "com.amazonaws.workspacesthinclient#ThinClient",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/workspaces-thin-client/service/2023-08-22/workspaces-thin-client-2023-08-22.json"
+    },
+    {
+      "shape_id": "com.amazonaws.workspacesweb#AWSErmineControlPlaneService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/workspaces-web/service/2020-07-08/workspaces-web-2020-07-08.json"
+    },
+    {
+      "shape_id": "com.amazonaws.xray#AWSXRay",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/xray/service/2016-04-12/xray-2016-04-12.json"
     }
   ]
 }

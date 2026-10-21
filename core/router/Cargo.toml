@@ -436,6 +436,15 @@ service-com-amazonaws-wafregional-awswaf-regional-20161128 = { workspace = true 
 service-com-amazonaws-wafv2-awswaf-20190729 = { workspace = true }
 service-com-amazonaws-wellarchitected-wellarchitectedapiservicelambda = { workspace = true }
 service-com-amazonaws-wickr-wickradminapi = { workspace = true }
+service-com-amazonaws-wisdom-wisdomservice = { workspace = true }
+service-com-amazonaws-workdocs-awsgorillaboyservice = { workspace = true }
+service-com-amazonaws-workmail-workmailservice = { workspace = true }
+service-com-amazonaws-workmailmessageflow-giraffemessageintransitservice = { workspace = true }
+service-com-amazonaws-workspaces-workspacesservice = { workspace = true }
+service-com-amazonaws-workspacesinstances-eucmifrontendapiservice = { workspace = true }
+service-com-amazonaws-workspacesthinclient-thinclient = { workspace = true }
+service-com-amazonaws-workspacesweb-awserminecontrolplaneservice = { workspace = true }
+service-com-amazonaws-xray-awsxray = { workspace = true }
 emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 smithy-server-runtime = { workspace = true }

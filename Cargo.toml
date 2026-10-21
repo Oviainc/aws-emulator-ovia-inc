@@ -425,6 +425,15 @@ members = [
     "services/service-com-amazonaws-wafv2-awswaf-20190729",
     "services/service-com-amazonaws-wellarchitected-wellarchitectedapiservicelambda",
     "services/service-com-amazonaws-wickr-wickradminapi",
+    "services/service-com-amazonaws-wisdom-wisdomservice",
+    "services/service-com-amazonaws-workdocs-awsgorillaboyservice",
+    "services/service-com-amazonaws-workmail-workmailservice",
+    "services/service-com-amazonaws-workmailmessageflow-giraffemessageintransitservice",
+    "services/service-com-amazonaws-workspaces-workspacesservice",
+    "services/service-com-amazonaws-workspacesinstances-eucmifrontendapiservice",
+    "services/service-com-amazonaws-workspacesthinclient-thinclient",
+    "services/service-com-amazonaws-workspacesweb-awserminecontrolplaneservice",
+    "services/service-com-amazonaws-xray-awsxray",
     "core/router",
     "core/embedded",
 ]
@@ -885,6 +894,15 @@ service-com-amazonaws-wafregional-awswaf-regional-20161128 = { path = "services/
 service-com-amazonaws-wafv2-awswaf-20190729 = { path = "services/service-com-amazonaws-wafv2-awswaf-20190729" }
 service-com-amazonaws-wellarchitected-wellarchitectedapiservicelambda = { path = "services/service-com-amazonaws-wellarchitected-wellarchitectedapiservicelambda" }
 service-com-amazonaws-wickr-wickradminapi = { path = "services/service-com-amazonaws-wickr-wickradminapi" }
+service-com-amazonaws-wisdom-wisdomservice = { path = "services/service-com-amazonaws-wisdom-wisdomservice" }
+service-com-amazonaws-workdocs-awsgorillaboyservice = { path = "services/service-com-amazonaws-workdocs-awsgorillaboyservice" }
+service-com-amazonaws-workmail-workmailservice = { path = "services/service-com-amazonaws-workmail-workmailservice" }
+service-com-amazonaws-workmailmessageflow-giraffemessageintransitservice = { path = "services/service-com-amazonaws-workmailmessageflow-giraffemessageintransitservice" }
+service-com-amazonaws-workspaces-workspacesservice = { path = "services/service-com-amazonaws-workspaces-workspacesservice" }
+service-com-amazonaws-workspacesinstances-eucmifrontendapiservice = { path = "services/service-com-amazonaws-workspacesinstances-eucmifrontendapiservice" }
+service-com-amazonaws-workspacesthinclient-thinclient = { path = "services/service-com-amazonaws-workspacesthinclient-thinclient" }
+service-com-amazonaws-workspacesweb-awserminecontrolplaneservice = { path = "services/service-com-amazonaws-workspacesweb-awserminecontrolplaneservice" }
+service-com-amazonaws-xray-awsxray = { path = "services/service-com-amazonaws-xray-awsxray" }
 
 # The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
 #

@@ -114,7 +114,8 @@ pub fn build_router(engine: Arc<InMemoryEngine>) -> MultiServiceRouter {
     let router = mount_chunk_35(router, &engine);
     let router = mount_chunk_36(router, &engine);
     let router = mount_chunk_37(router, &engine);
-    mount_chunk_38(router, &engine)
+    let router = mount_chunk_38(router, &engine);
+    mount_chunk_39(router, &engine)
 }
 
 /// Register services 00 of this workspace on `router`.
@@ -1007,6 +1008,27 @@ fn mount_chunk_38(
     router.register_service(service_com_amazonaws_wafv2_awswaf_20190729::EmulatedService::new(engine.clone()));
     router.register_service(service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::EmulatedService::new(engine.clone()));
     router.register_service(service_com_amazonaws_wickr_wickradminapi::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_wisdom_wisdomservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_workdocs_awsgorillaboyservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_workmail_workmailservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_workmailmessageflow_giraffemessageintransitservice::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 39 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_39(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_workspaces_workspacesservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_workspacesinstances_eucmifrontendapiservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_workspacesthinclient_thinclient::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_workspacesweb_awserminecontrolplaneservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_xray_awsxray::EmulatedService::new(engine.clone()));
     router
 }
 
