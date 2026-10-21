@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateServiceSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateServiceSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Persists this account's Linux subscriptions service settings — the discovery switch
+//! and the discovery settings — as the singleton `GetServiceSettings` then reports, and
+//! answers with the persisted values read back off it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateServiceSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The Region the request was signed for becomes the home Region in which License
+//! Manager displays the aggregated data. `AllowUpdate` is what admits a SECOND one: the
+//! model documents it as "if you allow updates, you can aggregate Linux subscription data
+//! in more than one home Region", so an update signed for a Region that is not already a
+//! home Region is refused unless `AllowUpdate` is set, and adds that Region to
+//! `HomeRegions` when it is.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +161,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateServiceSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateServiceSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateServiceSettings"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateServiceSettingsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the service state is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let mut state = state.lock();
+
+        let mut home_regions = state
+            .service_settings
+            .as_ref()
+            .map(|settings| settings.home_regions.clone())
+            .unwrap_or_default();
+        if !home_regions.contains(&region) {
+            // The first update makes the Region it was signed for the home Region;
+            // aggregating in a further one is exactly what `AllowUpdate` admits.
+            if !home_regions.is_empty() && !input.allow_update.unwrap_or(false) {
+                return Err(validation(format!(
+                    "Linux subscription data is already aggregated in home Region(s) {}; \
+                     set AllowUpdate to true to aggregate data in more than one home Region",
+                    home_regions.join(", ")
+                )));
+            }
+            if home_regions.len() >= crate::state::MAX_HOME_REGIONS {
+                return Err(validation(format!(
+                    "Linux subscription data cannot be aggregated in more than {} home Regions",
+                    crate::state::MAX_HOME_REGIONS
+                )));
+            }
+            home_regions.push(region);
+        }
+
+        state.service_settings = Some(crate::state::ServiceSettingsRecord {
+            linux_subscriptions_discovery: input.linux_subscriptions_discovery.clone(),
+            discovery_settings: input.linux_subscriptions_discovery_settings.clone(),
+            // The settings are stored by the time this call returns, so they are applied.
+            status: crate::state::SETTINGS_STATUS_SUCCESSFUL.to_string(),
+            // Nothing to detail about that status: a message is not invented for it.
+            status_message: std::collections::HashMap::new(),
+            home_regions,
+        });
+
+        // Answer from the persisted singleton, so this call and a later
+        // `GetServiceSettings` cannot disagree.
+        let reported = crate::state::reported_service_settings(state.service_settings.as_ref());
+        Ok(UpdateServiceSettingsOutput {
+            linux_subscriptions_discovery: reported.linux_subscriptions_discovery,
+            linux_subscriptions_discovery_settings: reported.discovery_settings,
+            status: reported.status,
+            status_message: reported.status_message,
+            home_regions: reported.home_regions,
+        })
     }
+}
+
+/// This operation's modelled `ValidationException` (HTTP 400).
+fn validation(message: impl Into<String>) -> UpdateServiceSettingsError {
+    UpdateServiceSettingsErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRegisteredSubscriptionProviders
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRegisteredSubscriptionProviders`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the registered Linux subscription providers held in this service's state, in
+//! registration order, narrowed to the `SubscriptionProviderSources` the caller named and
+//! paged through the `@paginated` `MaxResults`/`NextToken` contract.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRegisteredSubscriptionProviders::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +143,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRegisteredSubscriptionProviders` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRegisteredSubscriptionProvidersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRegisteredSubscriptionProviders"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListRegisteredSubscriptionProvidersErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service state is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // An absent or empty `SubscriptionProviderSources` selects every source; each
+        // listed value is one of the modelled `SubscriptionProviderSource` values, which
+        // the boundary already refused anything else for.
+        let sources = input.subscription_provider_sources.clone().unwrap_or_default();
+
+        // A pure read: the page is built from the stored records, and nothing is written.
+        let state = state.lock();
+        let selected: Vec<crate::state::SubscriptionProviderRecord> = state
+            .providers_in_order()
+            .into_iter()
+            .filter(|record| sources.is_empty() || sources.contains(&record.source))
+            .collect();
+
+        let (page, next_token) = crate::state::paginate(
+            &selected,
+            // The cursor is a position in THIS list: the operation plus the source
+            // selection, so a cursor minted for another selection is not accepted here.
+            &format!(
+                "registered-subscription-providers/{}",
+                crate::state::source_filter_signature(&sources)
+            ),
+            input.max_results,
+            input.next_token.as_deref(),
+        )
+        .map_err(into_error)?;
+
+        Ok(ListRegisteredSubscriptionProvidersOutput {
+            registered_subscription_providers: Some(
+                page.iter()
+                    .map(crate::state::registered_subscription_provider)
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// Map a state-layer refusal onto this operation's own modelled error enum. This
+/// operation models no `ResourceNotFoundException`, so a lookup failure cannot arise
+/// here: only the pagination cursor is refusable, as a `ValidationException`.
+fn into_error(error: crate::state::StateError) -> ListRegisteredSubscriptionProvidersError {
+    match error {
+        crate::state::StateError::NotFound(message) => {
+            ListRegisteredSubscriptionProvidersErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::StateError::Validation(message) => {
+            ListRegisteredSubscriptionProvidersErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }
