@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSigningJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSigningJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSigningJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: starts a signing job against a stored signing profile, snapshotting
+//! the profile's platform, version and signing material onto the job record.
 //!
 //! ## Shape of an operation
 //!
@@ -133,6 +127,16 @@ impl From<StartSigningJobErrorModeled> for StartSigningJobError {
     }
 }
 
+/// The modelled 404 for a profile that cannot start a signing job: either this
+/// account holds no profile of that name, or the one it holds is not `Active`.
+fn profile_cannot_sign(detail: String) -> StartSigningJobError {
+    StartSigningJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(detail),
+        code: None,
+    })
+    .into()
+}
+
 /// The `StartSigningJob` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -169,18 +173,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSigningJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSigningJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSigningJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartSigningJobErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the signer job store is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        // Signer signs an object in an S3 bucket and writes the signed image to
+        // another: "You specify the name of the source and destination buckets
+        // when calling the StartSigningJob operation." The model cannot express
+        // that `s3` is the only member either structure can carry, so a request
+        // naming neither is refused here.
+        if input.source.s3.is_none() {
+            return Err(StartSigningJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "source must name the S3 object to sign in its s3 member".to_string(),
+                    ),
+                    code: None,
+                },
+            )
+            .into());
+        }
+        if input
+            .destination
+            .s3
+            .as_ref()
+            .is_none_or(|s3| s3.bucket_name.is_none())
+        {
+            return Err(StartSigningJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "destination must name the S3 bucket to save the signed object in its \
+                         s3.bucketName member"
+                            .to_string(),
+                    ),
+                    code: None,
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let requested_by = crate::state::request_principal(ctx.parts());
+        let mut store = state.lock();
+
+        // `@idempotencyToken`: "All calls after the first that use this token
+        // return the same response as the first call." So a repeated token
+        // answers with the job it already started rather than starting a second.
+        if let Some(job_id) = store.job_tokens.get(&input.client_request_token).cloned() {
+            if let Some(job) = store.jobs.get(&job_id) {
+                return Ok(StartSigningJobOutput {
+                    job_id: Some(job.job_id.clone()),
+                    job_owner: Some(job.job_owner.clone()),
+                });
+            }
+        }
+
+        // `profileOwner` names the account that owns the profile. This emulator
+        // presents exactly one account, so any other owner's profile resolves to
+        // no profile at all.
+        if let Some(owner) = input.profile_owner.as_deref() {
+            if owner != ::engine::emulator_account_id() {
+                return Err(profile_cannot_sign(format!(
+                    "Signing profile {} owned by account {owner} not found",
+                    input.profile_name
+                )));
+            }
+        }
+
+        let Some(profile) = store.profiles.get(&input.profile_name).cloned() else {
+            return Err(profile_cannot_sign(format!(
+                "Signing profile {} not found",
+                input.profile_name
+            )));
+        };
+        if !profile.can_sign() {
+            return Err(profile_cannot_sign(format!(
+                "Signing profile {} is {} and cannot perform new signing jobs",
+                profile.profile_name, profile.status
+            )));
+        }
+
+        // What the job runs with is fixed now: a later `PutSigningProfile` on the
+        // same name mints another version, and this job keeps reporting the one
+        // it started under.
+        let job_id = store.mint_job_id();
+        let job = crate::state::SigningJobRecord {
+            job_id: job_id.clone(),
+            profile_name: profile.profile_name,
+            profile_version: profile.profile_version,
+            platform_id: profile.platform_id,
+            platform_display_name: profile.platform_display_name,
+            signing_material: profile.signing_material,
+            signing_parameters: profile.signing_parameters,
+            overrides: profile.overrides,
+            source: input.source,
+            destination: input.destination,
+            // The signed object exists once the signing finishes, so it is
+            // written by the completion the clock owes this job.
+            signed_object: None,
+            status: crate::state::JOB_STATUS_IN_PROGRESS.to_string(),
+            status_reason: None,
+            created_at: now,
+            completed_at: None,
+            completion_due: Some(now + crate::state::JOB_COMPLETION_SPAN),
+            requested_by,
+            job_owner: ::engine::emulator_account_id().to_string(),
+            // `jobInvoker` is the entity that initiated a job on ANOTHER
+            // account's profile; a job on this one account's own profile has
+            // none.
+            job_invoker: None,
+            client_request_token: input.client_request_token.clone(),
+        };
+
+        store.jobs.insert(job_id.clone(), job);
+        store
+            .job_tokens
+            .insert(input.client_request_token, job_id.clone());
+
+        // Reported out of the stored record, so this answer is what
+        // `DescribeSigningJob` resolves.
+        let stored = store
+            .jobs
+            .get(&job_id)
+            .expect("the job just inserted is in the store");
+        Ok(StartSigningJobOutput {
+            job_id: Some(stored.job_id.clone()),
+            job_owner: Some(stored.job_owner.clone()),
+        })
     }
 }

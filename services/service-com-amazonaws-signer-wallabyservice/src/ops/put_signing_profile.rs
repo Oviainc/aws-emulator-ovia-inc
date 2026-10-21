@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutSigningProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutSigningProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutSigningProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: creates, or re-versions, the signing profile `profileName` names
+//! in [`crate::state::ComAmazonawsSignerWallabyserviceState::profiles`]. Every
+//! member of the answer is read back out of the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +158,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutSigningProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutSigningProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutSigningProfile"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutSigningProfileErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the signer profile store is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // A profile keeps its identity across puts — same name, same ARN, same
+        // creation time — and gains a version per put, so the version this call
+        // returns is new even for a name that already exists.
+        let existing = store.profiles.get(&input.profile_name);
+        let created_at = existing.map_or(now, |profile| profile.created_at);
+        let mut versions = existing
+            .map(|profile| profile.versions.clone())
+            .unwrap_or_default();
+        let profile_version = store.mint_profile_version();
+        versions.push(profile_version.clone());
+
+        let arn = crate::state::profile_arn(&input.profile_name, &region);
+        let profile_version_arn = format!("{arn}/{profile_version}");
+        let record = crate::state::SigningProfileRecord {
+            profile_name: input.profile_name.clone(),
+            profile_version,
+            arn,
+            profile_version_arn,
+            platform_display_name: crate::state::platform_display_name(&input.platform_id),
+            platform_id: input.platform_id,
+            signing_material: input.signing_material,
+            signature_validity_period: input.signature_validity_period,
+            overrides: input.overrides,
+            signing_parameters: input
+                .signing_parameters
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            // A profile this call created or re-versioned can sign: nothing in
+            // the request holds it back, and only `CancelSigningProfile` /
+            // `RevokeSigningProfile` move it off `Active`.
+            status: crate::state::PROFILE_STATUS_ACTIVE.to_string(),
+            // `statusReason` reports why a profile is not active, so an active
+            // one carries none.
+            status_reason: None,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at,
+            versions,
+        };
+
+        // The answer is read back out of the store, so what this call reports is
+        // exactly what a later Get, List or StartSigningJob resolves.
+        let profile_name = record.profile_name.clone();
+        store.profiles.insert(profile_name.clone(), record);
+        let stored = store
+            .profiles
+            .get(&profile_name)
+            .expect("the profile just inserted is in the store");
+        Ok(PutSigningProfileOutput {
+            arn: Some(stored.arn.clone()),
+            profile_version: Some(stored.profile_version.clone()),
+            profile_version_arn: Some(stored.profile_version_arn.clone()),
+        })
     }
 }

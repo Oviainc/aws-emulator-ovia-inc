@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSigningProfiles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSigningProfiles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSigningProfiles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: pages over the stored signing profiles. Reporting only — it
+//! writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +153,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSigningProfiles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSigningProfilesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSigningProfiles"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListSigningProfilesErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the signer profile store is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        // The token is the profile name the next page starts at. This operation
+        // models no `ValidationException`, so a token that is not a profile name
+        // is refused through the service's own 400 channel.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_profile_name(token) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "nextToken {token:?} is not a token returned by ListSigningProfiles"
+                )));
+            }
+        }
+
+        // `maxResults` is modelled `@range(min: 1, max: 25)` and the boundary
+        // validator refused anything outside it before this handler ran, so the
+        // only case left is an absent value: serve the largest page the model
+        // allows. The `clamp` states that invariant rather than correcting a
+        // caller — a value reaching here outside the range is a validator bug,
+        // which the debug assertion surfaces instead of silently repairing.
+        let requested = input.max_results.unwrap_or(crate::state::PROFILE_PAGE_LIMIT);
+        debug_assert!(
+            (1..=crate::state::PROFILE_PAGE_LIMIT).contains(&requested),
+            "maxResults {requested} should have been refused at the boundary"
+        );
+        let page_size = usize::try_from(requested.clamp(1, crate::state::PROFILE_PAGE_LIMIT))
+            .expect("a page size clamped into 1..=25 fits in usize");
+
+        // Which statuses a profile may carry to be listed. `statuses` is the
+        // caller's own filter when it names any; otherwise the operation
+        // "[r]eturns only profiles with an ACTIVE status unless the
+        // includeCanceled request field is set to true".
+        let statuses: Vec<String> = match input.statuses {
+            Some(statuses) if !statuses.is_empty() => statuses,
+            _ => {
+                let mut allowed = vec![crate::state::PROFILE_STATUS_ACTIVE.to_string()];
+                if input.include_canceled {
+                    allowed.push(crate::state::PROFILE_STATUS_CANCELED.to_string());
+                }
+                allowed
+            }
+        };
+
+        let store = state.lock();
+        let mut profiles = Vec::with_capacity(page_size);
+        let mut next_token = None;
+        for (profile_name, profile) in &store.profiles {
+            // Resume at the first name at or after the token, so a page is still
+            // served when the profile the token named no longer passes the
+            // filters this call carries.
+            if input
+                .next_token
+                .as_deref()
+                .is_some_and(|token| profile_name.as_str() < token)
+            {
+                continue;
+            }
+            if !statuses.contains(&profile.status) {
+                continue;
+            }
+            if input
+                .platform_id
+                .as_deref()
+                .is_some_and(|platform_id| platform_id != profile.platform_id)
+            {
+                continue;
+            }
+            if profiles.len() == page_size {
+                next_token = Some(profile_name.clone());
+                break;
+            }
+            profiles.push(profile.to_summary());
+        }
+
+        Ok(ListSigningProfilesOutput {
+            profiles: Some(profiles),
+            next_token,
+        })
     }
 }

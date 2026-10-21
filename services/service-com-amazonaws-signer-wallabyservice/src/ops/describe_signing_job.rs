@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSigningJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSigningJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSigningJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the stored signing job `jobId` names, materialising the
+//! completion the clock owes it — the only write a reporting call makes here, and
+//! one that was due at the same instant whether or not anybody asked.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +172,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSigningJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSigningJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSigningJob"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeSigningJobErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the signer job store is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(job) = store.settled_job_mut(&input.job_id, now) else {
+            return Err(
+                DescribeSigningJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Signing job {} not found", input.job_id)),
+                        code: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(DescribeSigningJobOutput {
+            job_id: Some(job.job_id.clone()),
+            // The source and destination the job was STARTED with, not whatever a
+            // later request carried.
+            source: Some(job.source.clone()),
+            signed_object: job.signed_object.clone(),
+            signing_material: job.signing_material.clone(),
+            platform_id: Some(job.platform_id.clone()),
+            platform_display_name: job.platform_display_name.clone(),
+            profile_name: Some(job.profile_name.clone()),
+            profile_version: Some(job.profile_version.clone()),
+            overrides: job.overrides.clone(),
+            signing_parameters: job.signing_parameter_map(),
+            created_at: Some(crate::state::to_timestamp(job.created_at)),
+            completed_at: job.completed_at.map(crate::state::to_timestamp),
+            // A signature expiry is the signing certificate's, counted off in the
+            // profile's `signatureValidityPeriod`; this emulator issues no
+            // certificate, so it reports no expiry rather than inventing one.
+            signature_expires_at: None,
+            requested_by: job.requested_by.clone(),
+            status: Some(job.status.clone()),
+            status_reason: job.status_reason.clone(),
+            // A revocation record is written by `RevokeSignature`, which is still
+            // a stub with its own gap issue; no job carries one yet.
+            revocation_record: None,
+            job_owner: Some(job.job_owner.clone()),
+            job_invoker: job.job_invoker.clone(),
+        })
     }
 }
