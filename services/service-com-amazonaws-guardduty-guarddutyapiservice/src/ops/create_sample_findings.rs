@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSampleFindings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSampleFindings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: inserts one finding per requested finding type into the detector's
+//! finding store, so `ListFindings` and `GetFindings` read them back. An unknown
+//! detector id is refused with `BadRequestException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSampleFindings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Everything about a generated finding is derived from the finding TYPE, following
+//! GuardDuty's documented finding-type naming convention
+//! `ThreatPurpose:ResourceTypeAffected/ThreatFamilyName.DetectionMechanism!Artifact`:
+//! the affected resource type comes from the second segment and the severity band from
+//! the threat purpose in the first. Per-type severity values and titles are not in the
+//! model, so they are derived rather than invented per request.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +140,226 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSampleFindings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSampleFindingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSampleFindings"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateSampleFindingsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the GuardDuty state store is unavailable".to_string()),
+                    r#type: None,
+                },
+            )
+            .into());
+        };
+
+        // "If 'NULL' is specified for findingTypes, the API generates sample findings
+        // of all supported finding types"
+        // (`smithy_query(query="doc",shape="CreateSampleFindings")`). The model carries
+        // no list of finding types, so "all supported" is this emulator's catalogue.
+        let requested: Vec<String> = match input.finding_types.as_ref() {
+            Some(types) if !types.is_empty() => types.clone(),
+            _ => SUPPORTED_FINDING_TYPES
+                .iter()
+                .map(|t| (*t).to_string())
+                .collect(),
+        };
+
+        let region = crate::state::request_region(ctx);
+        let account_id = ::engine::emulator_account_id().to_string();
+        let mut state = state.lock();
+        if state.detector_in(&region, &input.detector_id).is_none() {
+            return Err(CreateSampleFindingsErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "The request is rejected because the specified detector ID does not exist: {}.",
+                        input.detector_id
+                    )),
+                    r#type: None,
+                },
+            )
+            .into());
+        }
+
+        for finding_type in requested {
+            let now = state.tick_millis();
+
+            // GuardDuty AGGREGATES repeated occurrences of the same finding type on
+            // the same resource into one finding rather than creating another: the
+            // existing finding keeps its id and ARN, and its occurrence count and
+            // `UpdatedAt` move. A sample finding has no distinct resource, so the
+            // finding type alone identifies it.
+            if let Some(existing) = state
+                .detector_in_mut(&region, &input.detector_id)
+                .and_then(|detector| {
+                    detector
+                        .findings
+                        .values_mut()
+                        .find(|finding| finding.r#type == finding_type)
+                })
+            {
+                existing.count = existing.count.saturating_add(1);
+                existing.updated_at_millis = now;
+                continue;
+            }
+
+            let finding_id = state.mint_id();
+            let arn = ::engine::emulator_arn(
+                "guardduty",
+                &region,
+                &format!(
+                    "detector/{}/finding/{finding_id}",
+                    input.detector_id.as_str()
+                ),
+            );
+            let record = crate::state::FindingRecord {
+                id: finding_id.clone(),
+                arn,
+                account_id: account_id.clone(),
+                region: region.clone(),
+                partition: crate::state::PARTITION.to_string(),
+                schema_version: crate::state::FINDING_SCHEMA_VERSION.to_string(),
+                severity: severity_for(&finding_type),
+                confidence: None,
+                title: Some(format!("[SAMPLE] {finding_type}")),
+                description: Some(describe(&finding_type)),
+                resource_type: resource_type_for(&finding_type),
+                detector_id: input.detector_id.clone(),
+                resource_role: RESOURCE_ROLE_TARGET.to_string(),
+                count: 1,
+                created_at_millis: now,
+                updated_at_millis: now,
+                archived: false,
+                sample: true,
+                r#type: finding_type,
+            };
+            if let Some(detector) = state.detector_in_mut(&region, &input.detector_id) {
+                detector.findings.insert(finding_id, record);
+                // GuardDuty retains a finding for 90 days and then drops it. This
+                // emulator has no 90-day-long process, so it bounds the store by the
+                // same SHAPE of rule — a window over the most recent findings — and
+                // drops the oldest once the window is full. Without a bound, a
+                // caller naming fresh finding types could grow the store without
+                // limit.
+                while detector.findings.len() > MAX_RETAINED_FINDINGS_PER_DETECTOR {
+                    let Some(oldest) = detector
+                        .findings
+                        .values()
+                        .min_by_key(|finding| (finding.created_at_millis, finding.id.clone()))
+                        .map(|finding| finding.id.clone())
+                    else {
+                        break;
+                    };
+                    detector.findings.remove(&oldest);
+                }
+            }
+        }
+
+        Ok(CreateSampleFindingsOutput {})
     }
+}
+
+/// How many findings one detector retains. See the retention note at the eviction
+/// site: GuardDuty's own bound is a 90-day window, and this is the same shape of
+/// bound expressed in a count, so the in-memory store cannot grow without limit.
+const MAX_RETAINED_FINDINGS_PER_DETECTOR: usize = 1024;
+
+/// GuardDuty finding types this emulator can generate a sample for, one per
+/// documented threat purpose so the generated set spans the taxonomy. Source: the
+/// GuardDuty finding-types reference (the Smithy model carries no list — `FindingType`
+/// is an unconstrained `string`, `smithy_query(shape="FindingType")`).
+const SUPPORTED_FINDING_TYPES: [&str; 21] = [
+    "Backdoor:EC2/C&CActivity.B",
+    "Backdoor:EC2/DenialOfService.Tcp",
+    "Behavior:EC2/NetworkPortUnusual",
+    "CredentialAccess:IAMUser/AnomalousBehavior",
+    "CryptoCurrency:EC2/BitcoinTool.B",
+    "DefenseEvasion:IAMUser/AnomalousBehavior",
+    "Discovery:S3/MaliciousIPCaller",
+    "Execution:EC2/MaliciousFile",
+    "Execution:Kubernetes/ExecInKubeSystemPod",
+    "Exfiltration:S3/ObjectRead.Unusual",
+    "Impact:EC2/AbusedDomainRequest.Reputation",
+    "InitialAccess:IAMUser/AnomalousBehavior",
+    "PenTest:IAMUser/KaliLinux",
+    "Persistence:IAMUser/AnomalousBehavior",
+    "Policy:IAMUser/RootCredentialUsage",
+    "PrivilegeEscalation:IAMUser/AnomalousBehavior",
+    "Recon:EC2/PortProbeUnprotectedPort",
+    "ResourceConsumption:IAMUser/ComputeResourceAbuse",
+    "Stealth:IAMUser/CloudTrailLoggingDisabled",
+    "Trojan:EC2/BlackholeTraffic",
+    "UnauthorizedAccess:EC2/SSHBruteForce",
+];
+
+/// The role the affected resource plays in a sample finding: GuardDuty reports
+/// `TARGET` when the resource was the subject of the suspicious activity.
+const RESOURCE_ROLE_TARGET: &str = "TARGET";
+
+/// GuardDuty's documented severity levels, as the midpoint of each band: Low
+/// 1.0–3.9, Medium 4.0–6.9, High 7.0–8.9, Critical 9.0–10.0 (GuardDuty
+/// "Severity levels for GuardDuty findings").
+const SEVERITY_LOW: f64 = 2.0;
+/// See [`SEVERITY_LOW`].
+const SEVERITY_MEDIUM: f64 = 5.0;
+/// See [`SEVERITY_LOW`].
+const SEVERITY_HIGH: f64 = 8.0;
+
+/// The severity a finding of this type carries.
+///
+/// A finding type's first segment is its THREAT PURPOSE, which is what says how
+/// dangerous the activity is: reconnaissance and policy observations sit in the Low
+/// band, anomalous-behaviour and discovery purposes in the Medium band, and the
+/// purposes that mean the resource is already compromised or losing data in the High
+/// band. An unrecognised purpose takes the Medium band, GuardDuty's own default for
+/// an unclassified observation.
+fn severity_for(finding_type: &str) -> f64 {
+    match threat_purpose(finding_type).to_ascii_lowercase().as_str() {
+        "pentest" | "policy" | "recon" | "unusual" => SEVERITY_LOW,
+        "behavior" | "defenseevasion" | "discovery" | "initialaccess" | "resourceconsumption"
+        | "stealth" | "unauthorizedaccess" => SEVERITY_MEDIUM,
+        "backdoor" | "credentialaccess" | "cryptocurrency" | "execution" | "exfiltration"
+        | "impact" | "persistence" | "privilegeescalation" | "trojan" => SEVERITY_HIGH,
+        _ => SEVERITY_MEDIUM,
+    }
+}
+
+/// The first segment of a finding type: everything before the `:`.
+fn threat_purpose(finding_type: &str) -> &str {
+    finding_type.split(':').next().unwrap_or(finding_type)
+}
+
+/// The second segment of a finding type: between the `:` and the `/`.
+fn resource_type_affected(finding_type: &str) -> &str {
+    finding_type
+        .split_once(':')
+        .map_or("", |(_, rest)| rest.split('/').next().unwrap_or(""))
+}
+
+/// The `Resource.ResourceType` a finding of this type is about.
+///
+/// The finding type's second segment names the AFFECTED RESOURCE TYPE in
+/// GuardDuty's own abbreviations; this maps each one onto the value the `Resource`
+/// shape reports. An abbreviation this emulator does not know is reported verbatim
+/// rather than guessed at.
+fn resource_type_for(finding_type: &str) -> String {
+    match resource_type_affected(finding_type) {
+        "EC2" | "Runtime" => "Instance",
+        "IAMUser" => "AccessKey",
+        "S3" => "S3Bucket",
+        "Kubernetes" | "EKS" => "EKSCluster",
+        "ECS" => "ECSCluster",
+        "RDS" => "RDSDBInstance",
+        "Lambda" => "Lambda",
+        "Container" => "Container",
+        other => other,
+    }
+    .to_string()
+}
+
+/// The `Description` a sample finding carries, stated from the two parts of the
+/// finding type that are documented to mean something.
+fn describe(finding_type: &str) -> String {
+    format!(
+        "[SAMPLE] GuardDuty sample finding of type {finding_type}: a {} observation affecting a {} resource.",
+        threat_purpose(finding_type),
+        resource_type_for(finding_type)
+    )
 }

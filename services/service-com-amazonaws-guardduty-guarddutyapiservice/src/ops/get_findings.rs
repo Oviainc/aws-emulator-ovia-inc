@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFindings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFindings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: builds each returned `Finding` from the stored record, so the `Id`,
+//! `Type` and `Severity` are the ones `CreateSampleFindings` persisted. An id the
+//! detector does not hold is simply absent from the result; an unknown detector id is
+//! refused with `BadRequestException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFindings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +139,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFindings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFindingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFindings"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetFindingsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the GuardDuty state store is unavailable".to_string()),
+                    r#type: None,
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        // A pure report: nothing below writes to the store.
+        let state = state.lock();
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            return Err(bad_request(format!(
+                "The request is rejected because the specified detector ID does not exist: {}.",
+                input.detector_id
+            )));
+        };
+
+        // An id the detector does not hold is absent from the result, not an error:
+        // `Findings` is `len 0..50` and carries only what was found.
+        let mut found: Vec<&crate::state::FindingRecord> = input
+            .finding_ids
+            .iter()
+            .filter_map(|id| detector.findings.get(id))
+            .collect();
+        crate::state::sort_findings(&mut found, input.sort_criteria.as_ref()).map_err(|path| {
+            bad_request(format!(
+                "sortCriteria.attributeName: '{path}' is not a finding attribute this service can sort on. Supported attributes are {}.",
+                crate::state::FINDING_ATTRIBUTES.join(", ")
+            ))
+        })?;
+
+        Ok(GetFindingsOutput {
+            findings: found.iter().map(|record| finding(record)).collect(),
+        })
     }
 }
+
+/// Refuse the request with this operation's modeled 400.
+fn bad_request(message: impl Into<String>) -> GetFindingsError {
+    GetFindingsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+        r#type: None,
+    })
+    .into()
+}
+
+/// The wire `Finding` for a stored record.
+///
+/// Every required member (`AccountId`, `Arn`, `CreatedAt`, `Id`, `Region`,
+/// `Resource`, `SchemaVersion`, `Severity`, `Type`, `UpdatedAt` —
+/// `smithy_query(shape="Finding")`) is read straight off the record. `Resource`
+/// carries the affected resource TYPE: the per-resource detail structures describe a
+/// real instance, volume or bucket, and this emulator has none to describe, so they
+/// stay absent rather than being filled with invented identifiers.
+fn finding(record: &crate::state::FindingRecord) -> Finding {
+    Finding {
+        account_id: record.account_id.clone(),
+        arn: record.arn.clone(),
+        confidence: record.confidence,
+        created_at: crate::state::iso8601(record.created_at_millis),
+        description: record.description.clone(),
+        id: record.id.clone(),
+        partition: Some(record.partition.clone()),
+        region: record.region.clone(),
+        resource: Resource {
+            resource_type: Some(record.resource_type.clone()),
+            ..Resource::default()
+        },
+        schema_version: record.schema_version.clone(),
+        service: Some(Service {
+            archived: Some(record.archived),
+            count: Some(record.count),
+            detector_id: Some(record.detector_id.clone()),
+            event_first_seen: Some(crate::state::iso8601(record.created_at_millis)),
+            event_last_seen: Some(crate::state::iso8601(record.updated_at_millis)),
+            resource_role: Some(record.resource_role.clone()),
+            service_name: Some(GUARDDUTY_SERVICE_NAME.to_string()),
+            // GuardDuty marks a generated sample this way, which is how a client
+            // tells a sample finding from a real detection.
+            additional_info: record.sample.then(|| ServiceAdditionalInfo {
+                r#type: Some(SAMPLE_ADDITIONAL_INFO_TYPE.to_string()),
+                value: Some("true".to_string()),
+            }),
+            ..Service::default()
+        }),
+        severity: record.severity,
+        title: record.title.clone(),
+        r#type: record.r#type.clone(),
+        updated_at: crate::state::iso8601(record.updated_at_millis),
+        associated_attack_sequence_arn: None,
+        custom_detection_rule_name: None,
+    }
+}
+
+/// The value `Service.ServiceName` carries: "The name of the Amazon Web Services
+/// service (GuardDuty) that generated a finding" (`smithy_query(shape="Service")`).
+const GUARDDUTY_SERVICE_NAME: &str = "guardduty";
+
+/// The `Service.AdditionalInfo.Type` a sample finding carries.
+const SAMPLE_ADDITIONAL_INFO_TYPE: &str = "SAMPLE";

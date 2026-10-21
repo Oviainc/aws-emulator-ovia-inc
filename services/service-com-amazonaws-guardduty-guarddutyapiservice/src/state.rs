@@ -1,12 +1,822 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-guardduty-guarddutyapiservice service.
+//!
+//! GuardDuty's control plane is rooted at the *detector*: one per account per
+//! Region. Everything the detector owns — its findings and its filters — hangs off
+//! the [`Detector`] record, so `DeleteDetector` cascades by dropping one map entry.
+//!
+//! This module holds only plain records plus the helpers more than one operation
+//! needs (id minting, the monotonic clock, finding attribute lookup, filtering and
+//! sorting). Each operation builds its own modelled output in its own
+//! `src/ops/<op>.rs`.
+
+use std::collections::{BTreeMap, HashMap};
 
 /// Per-service state for com-amazonaws-guardduty-guarddutyapiservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsGuarddutyGuarddutyapiserviceState {
-    // TODO: add service-specific state fields
+    /// Every persisted detector, keyed by its minted `DetectorId`.
+    pub detectors: HashMap<String, Detector>,
+    /// `ClientToken` -> `DetectorId`, so a replayed `CreateDetector` returns the
+    /// detector the first call minted instead of refusing or minting a second one.
+    /// Keyed by `(region, token)`: an idempotency token is scoped to the endpoint
+    /// it was replayed against.
+    pub client_tokens: HashMap<(String, String), String>,
+    /// Last instant handed out by [`Self::tick_millis`], so two mutations in the
+    /// same millisecond still get strictly increasing timestamps.
+    last_millis: i64,
+    /// Monotonic counter folded into every minted id.
+    seq: u64,
 }
+
+impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
+    /// The current instant in epoch milliseconds, strictly greater than every
+    /// instant this state handed out before.
+    ///
+    /// Call it only from a MUTATING operation: it is the "this resource changed
+    /// now" clock, and a reporting operation must not advance it. Monotonicity is
+    /// what makes `UpdatedAt > CreatedAt` observable for two changes that land in
+    /// the same wall-clock millisecond.
+    pub fn tick_millis(&mut self) -> i64 {
+        let wall = now_millis();
+        let next = if wall > self.last_millis {
+            wall
+        } else {
+            self.last_millis.saturating_add(1)
+        };
+        self.last_millis = next;
+        next
+    }
+
+    /// Mint a fresh 32-hex-character id, the shape GuardDuty uses for both
+    /// `DetectorId` and a finding `Id`.
+    ///
+    /// The low 16 bits carry this state's own sequence counter, so two ids minted
+    /// by the same state differ even if the hash above them repeats.
+    pub fn mint_id(&mut self) -> String {
+        self.seq = self.seq.wrapping_add(1);
+        let seq = self.seq;
+        let nanos = now_nanos();
+        let hi = scramble(seq, nanos);
+        let lo = scramble(nanos ^ GOLDEN_RATIO_64, hi ^ seq);
+        let lo = (lo & !0xFFFF) | (seq & 0xFFFF);
+        format!("{hi:016x}{lo:016x}")
+    }
+
+    /// The detector `region`'s endpoint serves for `id`, if any.
+    ///
+    /// A detector is a REGIONAL resource — "you must create a detector in each
+    /// Region where you enable the service"
+    /// (`smithy_query(query="doc",shape="CreateDetector")`) — so an id created
+    /// through another Region's endpoint is not visible here.
+    pub fn detector_in(&self, region: &str, id: &str) -> Option<&Detector> {
+        self.detectors
+            .get(id)
+            .filter(|detector| detector.region == region)
+    }
+
+    /// [`Self::detector_in`], for a mutating operation.
+    pub fn detector_in_mut(&mut self, region: &str, id: &str) -> Option<&mut Detector> {
+        self.detectors
+            .get_mut(id)
+            .filter(|detector| detector.region == region)
+    }
+
+    /// The ids of the detectors `region`'s endpoint serves, in a total order.
+    pub fn detector_ids_in(&self, region: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .detectors
+            .values()
+            .filter(|detector| detector.region == region)
+            .map(|detector| detector.id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+}
+
+/// The 64-bit golden-ratio odd constant used to decorrelate the two hash inputs.
+const GOLDEN_RATIO_64: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Hash two words into one, seeded by a freshly built [`std::collections::hash_map::RandomState`]
+/// so ids are not predictable across runs.
+fn scramble(a: u64, b: u64) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(a);
+    hasher.write_u64(b);
+    hasher.finish()
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos() & u128::from(u64::MAX)).unwrap_or(0))
+}
+
+/// Render an epoch-millisecond instant the way GuardDuty renders `CreatedAt` /
+/// `UpdatedAt`: an ISO-8601 instant in UTC with a fixed three-digit millisecond
+/// field.
+///
+/// The width is fixed deliberately. RFC 3339 allows trimming trailing zeros from
+/// the subsecond field, but then `…:21.62Z` and `…:21.621Z` no longer compare in
+/// time order as text, and `CreatedAt`/`UpdatedAt` are modelled as `String` — text
+/// is all a client has to order them by.
+pub fn iso8601(millis: i64) -> String {
+    let seconds = millis.div_euclid(1000);
+    let subsec_millis = millis.rem_euclid(1000);
+    let whole = ::aws_smithy_types::DateTime::from_secs(seconds)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default();
+    match whole.strip_suffix('Z') {
+        Some(prefix) => format!("{prefix}.{subsec_millis:03}Z"),
+        None => whole,
+    }
+}
+
+/// `DetectorStatus` / `FeatureStatus` / `DataSourceStatus` — every one of the three
+/// enums is `ENABLED | DISABLED` (`smithy_query(shape="DetectorStatus")`).
+pub const ENABLED: &str = "ENABLED";
+/// See [`ENABLED`].
+pub const DISABLED: &str = "DISABLED";
+
+/// Every member of the `DetectorFeature` enum, in model order
+/// (`smithy_query(shape="DetectorFeature")`).
+pub const DETECTOR_FEATURES: [&str; 9] = [
+    "S3_DATA_EVENTS",
+    "EKS_AUDIT_LOGS",
+    "EBS_MALWARE_PROTECTION",
+    "RDS_LOGIN_EVENTS",
+    "LAMBDA_NETWORK_LOGS",
+    "EKS_RUNTIME_MONITORING",
+    "RUNTIME_MONITORING",
+    "AI_PROTECTION",
+    "AI_ANALYST",
+];
+
+/// The one feature `CreateDetector` does NOT enable by default: "When you don't
+/// specify any features, with an exception to RUNTIME_MONITORING, all the optional
+/// features are enabled by default"
+/// (`smithy_query(query="doc",shape="CreateDetector")`).
+pub const FEATURE_RUNTIME_MONITORING: &str = "RUNTIME_MONITORING";
+/// Runtime Monitoring already covers Amazon EKS, so the two cannot both be
+/// requested: "Specifying both EKS Runtime Monitoring (EKS_RUNTIME_MONITORING) and
+/// Runtime Monitoring (RUNTIME_MONITORING) will cause an error"
+/// (`smithy_query(query="doc",shape="CreateDetector")`).
+pub const FEATURE_EKS_RUNTIME_MONITORING: &str = "EKS_RUNTIME_MONITORING";
+
+/// The feature that governs S3 data-event ingestion — the `DataSources.S3Logs`
+/// view of the same switch.
+pub const FEATURE_S3_DATA_EVENTS: &str = "S3_DATA_EVENTS";
+/// The feature behind `DataSources.Kubernetes.AuditLogs`.
+pub const FEATURE_EKS_AUDIT_LOGS: &str = "EKS_AUDIT_LOGS";
+/// The feature behind `DataSources.MalwareProtection.ScanEc2InstanceWithFindings`.
+pub const FEATURE_EBS_MALWARE_PROTECTION: &str = "EBS_MALWARE_PROTECTION";
+
+/// The current GuardDuty finding schema version, the value every finding carries
+/// in its required `SchemaVersion` member.
+pub const FINDING_SCHEMA_VERSION: &str = "2.0";
+
+/// The partition every emulated ARN lives in (`engine::emulator_arn` builds
+/// `arn:aws:...`).
+pub const PARTITION: &str = "aws";
+
+/// A configured detector feature and when its status last changed.
+#[derive(Debug, Clone)]
+pub struct FeatureRecord {
+    pub name: String,
+    pub status: String,
+    pub updated_at_millis: i64,
+    pub additional_configuration: Vec<AdditionalConfigRecord>,
+}
+
+/// A feature's nested additional configuration (e.g. a Runtime Monitoring agent
+/// management switch).
+#[derive(Debug, Clone)]
+pub struct AdditionalConfigRecord {
+    pub name: String,
+    pub status: String,
+    pub updated_at_millis: i64,
+}
+
+/// A GuardDuty detector: the account/Region-level resource the whole service hangs
+/// off.
+#[derive(Debug, Clone)]
+pub struct Detector {
+    pub id: String,
+    /// The Region whose endpoint created this detector, and the only one that
+    /// serves it.
+    pub region: String,
+    /// `DetectorStatus`: [`ENABLED`] or [`DISABLED`].
+    pub status: String,
+    pub service_role: String,
+    pub finding_publishing_frequency: Option<String>,
+    pub features: Vec<FeatureRecord>,
+    pub tags: BTreeMap<String, String>,
+    pub created_at_millis: i64,
+    pub updated_at_millis: i64,
+    /// This detector's findings, keyed by finding id.
+    pub findings: BTreeMap<String, FindingRecord>,
+    /// This detector's filters, keyed by filter name. `DeleteDetector` drops them
+    /// with the detector.
+    pub filters: BTreeMap<String, FilterRecord>,
+}
+
+impl Detector {
+    /// The status of one feature, or [`DISABLED`] when the detector does not carry
+    /// it.
+    pub fn feature_status(&self, name: &str) -> &str {
+        self.features
+            .iter()
+            .find(|f| f.name == name)
+            .map_or(DISABLED, |f| f.status.as_str())
+    }
+
+    /// A data source reports [`ENABLED`] only when the detector itself is enabled:
+    /// a disabled detector ingests nothing.
+    pub fn data_source_status(&self, feature: &str) -> String {
+        if self.status == ENABLED && self.feature_status(feature) == ENABLED {
+            ENABLED.to_string()
+        } else {
+            DISABLED.to_string()
+        }
+    }
+
+    /// The status the foundational data sources (CloudTrail management events, VPC
+    /// flow logs, DNS logs) report: they are always on for an enabled detector and
+    /// always off for a disabled one.
+    pub fn foundational_status(&self) -> String {
+        if self.status == ENABLED {
+            ENABLED.to_string()
+        } else {
+            DISABLED.to_string()
+        }
+    }
+
+    /// Set one feature's status, recording `now` as its `UpdatedAt`. Adds the
+    /// feature when the detector does not carry it yet.
+    pub fn set_feature(&mut self, name: &str, status: &str, now: i64) {
+        if let Some(existing) = self.features.iter_mut().find(|f| f.name == name) {
+            if existing.status != status {
+                existing.status = status.to_string();
+                existing.updated_at_millis = now;
+            }
+        } else {
+            self.features.push(FeatureRecord {
+                name: name.to_string(),
+                status: status.to_string(),
+                updated_at_millis: now,
+                additional_configuration: Vec::new(),
+            });
+        }
+    }
+}
+
+/// A finding filter. Only `DeleteDetector`'s cascade needs it in this slice;
+/// `CreateFilter` / `GetFilter` / `ListFilters` are still scaffolded.
+#[derive(Debug, Clone, Default)]
+pub struct FilterRecord {
+    pub name: String,
+    pub description: Option<String>,
+    pub action: Option<String>,
+    pub rank: Option<i32>,
+    pub tags: BTreeMap<String, String>,
+}
+
+/// One stored finding. Timestamps are kept as epoch milliseconds — the single
+/// source for both the ISO-8601 strings the wire carries and the numeric
+/// comparisons `FindingCriteria` makes.
+#[derive(Debug, Clone)]
+pub struct FindingRecord {
+    pub id: String,
+    pub arn: String,
+    pub account_id: String,
+    pub region: String,
+    pub partition: String,
+    pub schema_version: String,
+    pub r#type: String,
+    pub severity: f64,
+    pub confidence: Option<f64>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub resource_type: String,
+    pub detector_id: String,
+    pub resource_role: String,
+    /// `Service.Count`: "The total count of the occurrences of this finding type"
+    /// (`smithy_query(shape="Service")`).
+    pub count: i32,
+    pub created_at_millis: i64,
+    pub updated_at_millis: i64,
+    pub archived: bool,
+    /// True for a finding `CreateSampleFindings` generated.
+    pub sample: bool,
+}
+
+/// One finding attribute, resolved for comparison or sorting.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Attribute {
+    Text(String),
+    Number(f64),
+}
+
+impl Attribute {
+    /// The textual form `Equals` / `NotEquals` compare against: GuardDuty's
+    /// `findingCriteria` carries every value as a string, including numeric ones.
+    pub fn as_text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Number(n) => format_number(*n),
+        }
+    }
+
+    /// The numeric form the ordering conditions compare against, when the
+    /// attribute has one.
+    pub fn as_number(&self) -> Option<f64> {
+        match self {
+            Self::Text(_) => None,
+            Self::Number(n) => Some(*n),
+        }
+    }
+}
+
+/// Render a finding's numeric attribute without a trailing `.0`, so `severity`
+/// equality against the string `"8"` behaves the way it does on the real service.
+fn format_number(n: f64) -> String {
+    if n.fract() == 0.0 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n}")
+    }
+}
+
+/// The finding attribute paths this emulator can filter and sort on, as the
+/// `Finding` shape's `jsonName`s name them
+/// (`smithy_query(shape="Finding")`), plus the nested paths GuardDuty's own filter
+/// documentation uses.
+pub const FINDING_ATTRIBUTES: [&str; 16] = [
+    "accountId",
+    "arn",
+    "confidence",
+    "createdAt",
+    "description",
+    "id",
+    "partition",
+    "region",
+    "resource.resourceType",
+    "schemaVersion",
+    "service.archived",
+    "service.detectorId",
+    "severity",
+    "title",
+    "type",
+    "updatedAt",
+];
+
+/// Can this emulator evaluate `path` as a finding attribute? Decided from the
+/// catalogue rather than from a sample record, so an empty result set refuses an
+/// attribute path exactly as a populated one does.
+pub fn supports_attribute(path: &str) -> bool {
+    FINDING_ATTRIBUTES.contains(&path)
+}
+
+/// Resolve one finding attribute by its wire path, or `None` when this emulator
+/// does not model that path.
+///
+/// `updatedAt` is accepted as well as `createdAt`; both are compared as epoch
+/// milliseconds by the ordering conditions and as ISO-8601 text by the equality
+/// ones, which is how GuardDuty's own filters treat them.
+pub fn finding_attribute(finding: &FindingRecord, path: &str) -> Option<Attribute> {
+    let attr = match path {
+        "accountId" => Attribute::Text(finding.account_id.clone()),
+        "arn" => Attribute::Text(finding.arn.clone()),
+        "confidence" => Attribute::Number(finding.confidence.unwrap_or(0.0)),
+        "createdAt" => Attribute::Number(finding.created_at_millis as f64),
+        "updatedAt" => Attribute::Number(finding.updated_at_millis as f64),
+        "description" => Attribute::Text(finding.description.clone().unwrap_or_default()),
+        "id" => Attribute::Text(finding.id.clone()),
+        "partition" => Attribute::Text(finding.partition.clone()),
+        "region" => Attribute::Text(finding.region.clone()),
+        "resource.resourceType" => Attribute::Text(finding.resource_type.clone()),
+        "schemaVersion" => Attribute::Text(finding.schema_version.clone()),
+        "service.archived" => Attribute::Text(finding.archived.to_string()),
+        "service.detectorId" => Attribute::Text(finding.detector_id.clone()),
+        "severity" => Attribute::Number(finding.severity),
+        "title" => Attribute::Text(finding.title.clone().unwrap_or_default()),
+        "type" => Attribute::Text(finding.r#type.clone()),
+        _ => return None,
+    };
+    Some(attr)
+}
+
+/// A finding attribute rendered for EQUALITY comparison. `createdAt` /
+/// `updatedAt` compare as their ISO-8601 text, every other attribute as its own
+/// textual form.
+fn equality_text(finding: &FindingRecord, path: &str) -> Option<String> {
+    match path {
+        "createdAt" => Some(iso8601(finding.created_at_millis)),
+        "updatedAt" => Some(iso8601(finding.updated_at_millis)),
+        _ => finding_attribute(finding, path).map(|a| a.as_text()),
+    }
+}
+
+/// Does `finding` satisfy one `Condition` on `path`?
+///
+/// `Err(path)` means the emulator does not model that attribute path, which the
+/// caller turns into a refusal rather than silently returning every finding.
+/// Within one condition every populated operator must hold, which is how
+/// GuardDuty composes a criterion.
+pub fn condition_matches(
+    finding: &FindingRecord,
+    path: &str,
+    condition: &crate::ops::types::Condition,
+) -> Result<bool, String> {
+    if !supports_attribute(path) {
+        return Err(path.to_string());
+    }
+    let Some(attr) = finding_attribute(finding, path) else {
+        return Err(path.to_string());
+    };
+    let text = equality_text(finding, path).unwrap_or_else(|| attr.as_text());
+
+    // `Equals`/`NotEquals` and the deprecated `Eq`/`Neq` are the same comparison;
+    // a list holds alternatives, so `Equals` passes when ANY entry matches and
+    // `NotEquals` passes only when NONE does.
+    for list in [condition.equals.as_ref(), condition.eq.as_ref()].into_iter().flatten() {
+        if !list.is_empty() && !list.contains(&text) {
+            return Ok(false);
+        }
+    }
+    for list in [condition.not_equals.as_ref(), condition.neq.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if list.contains(&text) {
+            return Ok(false);
+        }
+    }
+
+    // The ordering conditions only apply to an attribute with a numeric form.
+    let bounds: [(Option<f64>, Ordering); 8] = [
+        (condition.greater_than.map(|v| v as f64), Ordering::Gt),
+        (condition.gt.map(f64::from), Ordering::Gt),
+        (condition.greater_than_or_equal.map(|v| v as f64), Ordering::Gte),
+        (condition.gte.map(f64::from), Ordering::Gte),
+        (condition.less_than.map(|v| v as f64), Ordering::Lt),
+        (condition.lt.map(f64::from), Ordering::Lt),
+        (condition.less_than_or_equal.map(|v| v as f64), Ordering::Lte),
+        (condition.lte.map(f64::from), Ordering::Lte),
+    ];
+    for (bound, ordering) in bounds {
+        let Some(bound) = bound else { continue };
+        let Some(value) = attr.as_number() else {
+            return Err(path.to_string());
+        };
+        let holds = match ordering {
+            Ordering::Gt => value > bound,
+            Ordering::Gte => value >= bound,
+            Ordering::Lt => value < bound,
+            Ordering::Lte => value <= bound,
+        };
+        if !holds {
+            return Ok(false);
+        }
+    }
+
+    // `Matches` / `NotMatches` compare the attribute against a pattern in which
+    // `*` stands for any run of characters; like the equality lists, a list holds
+    // alternatives.
+    if let Some(patterns) = condition.matches.as_ref() {
+        if !patterns.is_empty() && !patterns.iter().any(|p| wildcard_matches(p, &text)) {
+            return Ok(false);
+        }
+    }
+    if let Some(patterns) = condition.not_matches.as_ref() {
+        if patterns.iter().any(|p| wildcard_matches(p, &text)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Does `value` match `pattern`, where `*` in the pattern stands for any run of
+/// characters (including none)?
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let mut segments = pattern.split('*');
+    let Some(first) = segments.next() else {
+        return pattern == value;
+    };
+    if !value.starts_with(first) {
+        return false;
+    }
+    let mut rest = &value[first.len()..];
+    let segments: Vec<&str> = segments.collect();
+    let Some((last, middle)) = segments.split_last() else {
+        // No `*` at all: the pattern is a literal.
+        return rest.is_empty();
+    };
+    for segment in middle {
+        match rest.find(segment) {
+            Some(at) => rest = &rest[at + segment.len()..],
+            None => return false,
+        }
+    }
+    rest.len() >= last.len() && rest.ends_with(last)
+}
+
+/// Which way an ordering condition compares.
+enum Ordering {
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+}
+
+/// Does `finding` satisfy every criterion in `criteria`? An absent or empty
+/// criteria map matches every finding.
+pub fn finding_matches(
+    finding: &FindingRecord,
+    criteria: Option<&crate::ops::types::FindingCriteria>,
+) -> Result<bool, String> {
+    let Some(criterion) = criteria.and_then(|c| c.criterion.as_ref()) else {
+        return Ok(true);
+    };
+    for (path, condition) in criterion {
+        if !condition_matches(finding, path, condition)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Refuse a `FindingCriteria` this emulator cannot evaluate, naming the attribute
+/// path.
+///
+/// Checked BEFORE any finding is looked at, so whether a criterion is refused does
+/// not depend on how many findings happen to be stored: a detector with none must
+/// answer an unevaluable criterion exactly as a populated one does.
+pub fn validate_finding_criteria(
+    criteria: Option<&crate::ops::types::FindingCriteria>,
+) -> Result<(), String> {
+    let Some(criterion) = criteria.and_then(|c| c.criterion.as_ref()) else {
+        return Ok(());
+    };
+    for (path, condition) in criterion {
+        if !supports_attribute(path) {
+            return Err(path.clone());
+        }
+        let orders_numerically = condition.greater_than.is_some()
+            || condition.greater_than_or_equal.is_some()
+            || condition.less_than.is_some()
+            || condition.less_than_or_equal.is_some()
+            || condition.gt.is_some()
+            || condition.gte.is_some()
+            || condition.lt.is_some()
+            || condition.lte.is_some();
+        if orders_numerically && !attribute_is_numeric(path) {
+            return Err(path.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Which finding attributes an ordering condition can compare. `createdAt` /
+/// `updatedAt` order as epoch milliseconds, the way GuardDuty's own filters compare
+/// them.
+fn attribute_is_numeric(path: &str) -> bool {
+    matches!(path, "confidence" | "createdAt" | "severity" | "updatedAt")
+}
+
+/// Order `findings` for `ListFindings` / `GetFindings`.
+///
+/// With no `SortCriteria` the newest finding comes first, with the finding id
+/// breaking ties so the order is total and a page token stays meaningful.
+/// `Err(attribute)` means the emulator does not model that sort attribute.
+pub fn sort_findings(
+    findings: &mut [&FindingRecord],
+    sort: Option<&crate::ops::types::SortCriteria>,
+) -> Result<(), String> {
+    let attribute = sort
+        .and_then(|s| s.attribute_name.as_deref())
+        .filter(|a| !a.is_empty());
+    let descending = match sort.and_then(|s| s.order_by.as_deref()) {
+        Some("ASC") => false,
+        Some("DESC") => true,
+        // No explicit order: newest-first for the default attribute, ascending for
+        // an attribute the caller named.
+        _ => attribute.is_none(),
+    };
+    let attribute = attribute.unwrap_or("createdAt");
+    if !supports_attribute(attribute) {
+        return Err(attribute.to_string());
+    }
+
+    findings.sort_by(|a, b| {
+        let key = |f: &FindingRecord| match finding_attribute(f, attribute) {
+            Some(Attribute::Number(n)) => (n, String::new()),
+            Some(Attribute::Text(t)) => (0.0, t),
+            None => (0.0, String::new()),
+        };
+        let (an, at) = key(a);
+        let (bn, bt) = key(b);
+        let primary = an
+            .partial_cmp(&bn)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| at.cmp(&bt));
+        let primary = if descending { primary.reverse() } else { primary };
+        primary.then_with(|| a.id.cmp(&b.id))
+    });
+    Ok(())
+}
+
+/// Take one page out of an ordered key list.
+///
+/// `token` is the number of entries already returned, as a decimal string — the
+/// only thing a caller may do with it is hand it back. `Err(token)` means the token
+/// was not one this service issued: either it is not a decimal offset at all, or it
+/// points past the end of the list, which this service never hands out (it answers
+/// the last page with no `NextToken`).
+pub fn paginate(
+    keys: &[String],
+    max_results: Option<i32>,
+    token: Option<&str>,
+    page_limit: usize,
+) -> Result<(Vec<String>, Option<String>), String> {
+    let start = match token.filter(|t| !t.is_empty()) {
+        Some(t) => {
+            let start = t.parse::<usize>().map_err(|_| t.to_string())?;
+            // A token this service issued always names an entry that exists: it is
+            // emitted only while `consumed < keys.len()`.
+            if start >= keys.len() {
+                return Err(t.to_string());
+            }
+            start
+        }
+        None => 0,
+    };
+    let limit = max_results
+        .and_then(|m| usize::try_from(m).ok())
+        .filter(|m| *m > 0)
+        .unwrap_or(page_limit)
+        .min(page_limit);
+    let page: Vec<String> = keys.iter().skip(start).take(limit).cloned().collect();
+    let consumed = start.saturating_add(page.len());
+    let next = if consumed < keys.len() {
+        Some(consumed.to_string())
+    } else {
+        None
+    };
+    Ok((page, next))
+}
+
+/// The feature set `CreateDetector` gives a detector when the request names no
+/// features: every `DetectorFeature` enabled except Runtime Monitoring. "When you
+/// don't specify any features, with an exception to RUNTIME_MONITORING, all the
+/// optional features are enabled by default"
+/// (`smithy_query(query="doc",shape="CreateDetector")`).
+pub fn default_features(now: i64) -> Vec<FeatureRecord> {
+    DETECTOR_FEATURES
+        .iter()
+        .map(|name| FeatureRecord {
+            name: (*name).to_string(),
+            status: if *name == FEATURE_RUNTIME_MONITORING {
+                DISABLED.to_string()
+            } else {
+                ENABLED.to_string()
+            },
+            updated_at_millis: now,
+            additional_configuration: Vec::new(),
+        })
+        .collect()
+}
+
+/// Refuse a `Features` list this service cannot accept, with the message the
+/// refusal carries.
+///
+/// Two rules, both from `CreateDetector`'s own documentation: a feature name must
+/// be a `DetectorFeature` member, and EKS Runtime Monitoring and Runtime
+/// Monitoring cannot both be requested because Runtime Monitoring already includes
+/// Amazon EKS.
+pub fn validate_feature_configurations(
+    features: Option<&Vec<crate::ops::types::DetectorFeatureConfiguration>>,
+) -> Result<(), String> {
+    let Some(features) = features else {
+        return Ok(());
+    };
+    for feature in features {
+        let Some(name) = feature.name.as_deref() else {
+            continue;
+        };
+        if !DETECTOR_FEATURES.contains(&name) {
+            return Err(format!(
+                "Features: '{name}' is not a supported detector feature. Supported features are {}.",
+                DETECTOR_FEATURES.join(", ")
+            ));
+        }
+        if let Some(status) = feature.status.as_deref() {
+            if status != ENABLED && status != DISABLED {
+                return Err(format!(
+                    "Features: '{status}' is not a supported status for feature '{name}'. Supported values are {ENABLED}, {DISABLED}."
+                ));
+            }
+        }
+    }
+    let named = |wanted: &str| {
+        features
+            .iter()
+            .any(|f| f.name.as_deref() == Some(wanted) && f.status.as_deref() != Some(DISABLED))
+    };
+    if named(FEATURE_EKS_RUNTIME_MONITORING) && named(FEATURE_RUNTIME_MONITORING) {
+        return Err(format!(
+            "Features: {FEATURE_EKS_RUNTIME_MONITORING} and {FEATURE_RUNTIME_MONITORING} cannot both be enabled because {FEATURE_RUNTIME_MONITORING} already includes threat detection for Amazon EKS resources."
+        ));
+    }
+    Ok(())
+}
+
+/// Write a `Features` list onto `detector`. A feature the list does not name keeps
+/// the status it already had.
+pub fn apply_feature_configurations(
+    detector: &mut Detector,
+    features: Option<&Vec<crate::ops::types::DetectorFeatureConfiguration>>,
+    now: i64,
+) {
+    let Some(features) = features else { return };
+    for feature in features {
+        let Some(name) = feature.name.as_deref() else {
+            continue;
+        };
+        let status = feature.status.as_deref().unwrap_or(ENABLED);
+        detector.set_feature(name, status, now);
+        if let Some(additional) = feature.additional_configuration.as_ref() {
+            let configured: Vec<AdditionalConfigRecord> = additional
+                .iter()
+                .filter_map(|cfg| {
+                    cfg.name.as_deref().map(|name| AdditionalConfigRecord {
+                        name: name.to_string(),
+                        status: cfg.status.as_deref().unwrap_or(ENABLED).to_string(),
+                        updated_at_millis: now,
+                    })
+                })
+                .collect();
+            if let Some(record) = detector.features.iter_mut().find(|f| f.name == name) {
+                record.additional_configuration = configured;
+            }
+        }
+    }
+}
+
+/// Write the deprecated `DataSources` view onto `detector`.
+///
+/// `DataSources` is "deprecated, use Features instead"
+/// (`smithy_query(operation="CreateDetector")`), so each data source switch is
+/// stored as the feature that governs it — one source of truth, read back through
+/// either view.
+pub fn apply_data_sources(
+    detector: &mut Detector,
+    data_sources: Option<&crate::ops::types::DataSourceConfigurations>,
+    now: i64,
+) {
+    let Some(data_sources) = data_sources else {
+        return;
+    };
+    let status = |enable: bool| if enable { ENABLED } else { DISABLED };
+    if let Some(s3) = data_sources.s3_logs.as_ref() {
+        detector.set_feature(FEATURE_S3_DATA_EVENTS, status(s3.enable), now);
+    }
+    if let Some(kubernetes) = data_sources.kubernetes.as_ref() {
+        detector.set_feature(
+            FEATURE_EKS_AUDIT_LOGS,
+            status(kubernetes.audit_logs.enable),
+            now,
+        );
+    }
+    if let Some(enable) = data_sources
+        .malware_protection
+        .as_ref()
+        .and_then(|m| m.scan_ec2_instance_with_findings.as_ref())
+        .and_then(|s| s.ebs_volumes)
+    {
+        detector.set_feature(FEATURE_EBS_MALWARE_PROTECTION, status(enable), now);
+    }
+}
+
+/// The AWS Region a request was signed for, which is the Region the resources it
+/// creates live in. Falls back to the emulator's default Region for an unsigned
+/// request.
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
+}
+
+/// The Region an unsigned request is attributed to.
+pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

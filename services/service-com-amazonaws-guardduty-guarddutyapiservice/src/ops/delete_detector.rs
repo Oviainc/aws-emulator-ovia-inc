@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDetector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDetector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the detector and everything it owns — its findings and its
+//! filters — so a later `GetDetector` is refused and `ListDetectors` no longer carries
+//! the id. Deleting an id that does not exist is refused with `BadRequestException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDetector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -134,18 +130,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDetector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDetectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDetector"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteDetectorErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the GuardDuty state store is unavailable".to_string()),
+                    r#type: None,
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        let mut state = state.lock();
+        // Only this Region's endpoint can delete the detector it serves.
+        if state.detector_in(&region, &input.detector_id).is_none() {
+            return Err(DeleteDetectorErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "The request is rejected because the specified detector ID does not exist: {}.",
+                    input.detector_id
+                )),
+                r#type: None,
+            })
+            .into());
+        }
+        // Dropping the detector drops the findings and filters it owns, which is the
+        // cascade GuardDuty performs.
+        state.detectors.remove(&input.detector_id);
+        // An idempotency token that pointed at the deleted detector must stop
+        // resolving, or a replayed `CreateDetector` would answer with a detector id
+        // that no longer exists.
+        state
+            .client_tokens
+            .retain(|_, detector_id| *detector_id != input.detector_id);
+
+        Ok(DeleteDetectorOutput {})
     }
 }
