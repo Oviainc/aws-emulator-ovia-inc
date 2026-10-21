@@ -375,6 +375,31 @@ members = [
     "services/service-com-amazonaws-servicecatalogappregistry-aws242appregistry",
     "services/service-com-amazonaws-servicediscovery-route53autonaming-v20170314",
     "services/service-com-amazonaws-servicequotas-servicequotasv20190624",
+    "services/service-com-amazonaws-ses-simpleemailservice",
+    "services/service-com-amazonaws-sesv2-simpleemailservice-v2",
+    "services/service-com-amazonaws-sfn-awsstepfunctions",
+    "services/service-com-amazonaws-shield-awsshield-20160616",
+    "services/service-com-amazonaws-signer-wallabyservice",
+    "services/service-com-amazonaws-signerdata-signerdataplane",
+    "services/service-com-amazonaws-signin-signin",
+    "services/service-com-amazonaws-simpledbv2-simpledbv2",
+    "services/service-com-amazonaws-snowball-awsiesnowballjobmanagementservice",
+    "services/service-com-amazonaws-snowdevicemanagement-snowdevicemanagement",
+    "services/service-com-amazonaws-sns-amazonsimplenotificationservice",
+    "services/service-com-amazonaws-socialmessaging-socialmessaging",
+    "services/service-com-amazonaws-sqs-amazonsqs",
+    "services/service-com-amazonaws-ssm-amazonssm",
+    "services/service-com-amazonaws-ssmcontacts-ssmcontacts",
+    "services/service-com-amazonaws-ssmguiconnect-ssmguiconnect",
+    "services/service-com-amazonaws-ssmincidents-ssmincidents",
+    "services/service-com-amazonaws-ssmquicksetup-quicksetup",
+    "services/service-com-amazonaws-ssmsap-ssmsap",
+    "services/service-com-amazonaws-sso-swbportalservice",
+    "services/service-com-amazonaws-ssoadmin-swbexternalservice",
+    "services/service-com-amazonaws-ssooidc-awsssooidcservice",
+    "services/service-com-amazonaws-storagegateway-storagegateway-20130630",
+    "services/service-com-amazonaws-sts-awssecuritytokenservicev20110615",
+    "services/service-com-amazonaws-supplychain-galaxypublicapigateway",
     "core/router",
     "core/embedded",
 ]
@@ -785,6 +810,31 @@ service-com-amazonaws-servicecatalog-aws242servicecatalogservice = { path = "ser
 service-com-amazonaws-servicecatalogappregistry-aws242appregistry = { path = "services/service-com-amazonaws-servicecatalogappregistry-aws242appregistry" }
 service-com-amazonaws-servicediscovery-route53autonaming-v20170314 = { path = "services/service-com-amazonaws-servicediscovery-route53autonaming-v20170314" }
 service-com-amazonaws-servicequotas-servicequotasv20190624 = { path = "services/service-com-amazonaws-servicequotas-servicequotasv20190624" }
+service-com-amazonaws-ses-simpleemailservice = { path = "services/service-com-amazonaws-ses-simpleemailservice" }
+service-com-amazonaws-sesv2-simpleemailservice-v2 = { path = "services/service-com-amazonaws-sesv2-simpleemailservice-v2" }
+service-com-amazonaws-sfn-awsstepfunctions = { path = "services/service-com-amazonaws-sfn-awsstepfunctions" }
+service-com-amazonaws-shield-awsshield-20160616 = { path = "services/service-com-amazonaws-shield-awsshield-20160616" }
+service-com-amazonaws-signer-wallabyservice = { path = "services/service-com-amazonaws-signer-wallabyservice" }
+service-com-amazonaws-signerdata-signerdataplane = { path = "services/service-com-amazonaws-signerdata-signerdataplane" }
+service-com-amazonaws-signin-signin = { path = "services/service-com-amazonaws-signin-signin" }
+service-com-amazonaws-simpledbv2-simpledbv2 = { path = "services/service-com-amazonaws-simpledbv2-simpledbv2" }
+service-com-amazonaws-snowball-awsiesnowballjobmanagementservice = { path = "services/service-com-amazonaws-snowball-awsiesnowballjobmanagementservice" }
+service-com-amazonaws-snowdevicemanagement-snowdevicemanagement = { path = "services/service-com-amazonaws-snowdevicemanagement-snowdevicemanagement" }
+service-com-amazonaws-sns-amazonsimplenotificationservice = { path = "services/service-com-amazonaws-sns-amazonsimplenotificationservice" }
+service-com-amazonaws-socialmessaging-socialmessaging = { path = "services/service-com-amazonaws-socialmessaging-socialmessaging" }
+service-com-amazonaws-sqs-amazonsqs = { path = "services/service-com-amazonaws-sqs-amazonsqs" }
+service-com-amazonaws-ssm-amazonssm = { path = "services/service-com-amazonaws-ssm-amazonssm" }
+service-com-amazonaws-ssmcontacts-ssmcontacts = { path = "services/service-com-amazonaws-ssmcontacts-ssmcontacts" }
+service-com-amazonaws-ssmguiconnect-ssmguiconnect = { path = "services/service-com-amazonaws-ssmguiconnect-ssmguiconnect" }
+service-com-amazonaws-ssmincidents-ssmincidents = { path = "services/service-com-amazonaws-ssmincidents-ssmincidents" }
+service-com-amazonaws-ssmquicksetup-quicksetup = { path = "services/service-com-amazonaws-ssmquicksetup-quicksetup" }
+service-com-amazonaws-ssmsap-ssmsap = { path = "services/service-com-amazonaws-ssmsap-ssmsap" }
+service-com-amazonaws-sso-swbportalservice = { path = "services/service-com-amazonaws-sso-swbportalservice" }
+service-com-amazonaws-ssoadmin-swbexternalservice = { path = "services/service-com-amazonaws-ssoadmin-swbexternalservice" }
+service-com-amazonaws-ssooidc-awsssooidcservice = { path = "services/service-com-amazonaws-ssooidc-awsssooidcservice" }
+service-com-amazonaws-storagegateway-storagegateway-20130630 = { path = "services/service-com-amazonaws-storagegateway-storagegateway-20130630" }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { path = "services/service-com-amazonaws-sts-awssecuritytokenservicev20110615" }
+service-com-amazonaws-supplychain-galaxypublicapigateway = { path = "services/service-com-amazonaws-supplychain-galaxypublicapigateway" }
 
 # The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
 #

@@ -1499,6 +1499,106 @@
     {
       "shape_id": "com.amazonaws.servicequotas#ServiceQuotasV20190624",
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/service-quotas/service/2019-06-24/service-quotas-2019-06-24.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ses#SimpleEmailService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/ses/service/2010-12-01/ses-2010-12-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.sesv2#SimpleEmailService_v2",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sesv2/service/2019-09-27/sesv2-2019-09-27.json"
+    },
+    {
+      "shape_id": "com.amazonaws.sfn#AWSStepFunctions",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sfn/service/2016-11-23/sfn-2016-11-23.json"
+    },
+    {
+      "shape_id": "com.amazonaws.shield#AWSShield_20160616",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/shield/service/2016-06-02/shield-2016-06-02.json"
+    },
+    {
+      "shape_id": "com.amazonaws.signer#WallabyService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/signer/service/2017-08-25/signer-2017-08-25.json"
+    },
+    {
+      "shape_id": "com.amazonaws.signerdata#SignerDataPlane",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/signer-data/service/2017-08-25/signer-data-2017-08-25.json"
+    },
+    {
+      "shape_id": "com.amazonaws.signin#Signin",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/signin/service/2023-01-01/signin-2023-01-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.simpledbv2#SimpleDBv2",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/simpledbv2/service/2025-09-26/simpledbv2-2025-09-26.json"
+    },
+    {
+      "shape_id": "com.amazonaws.snowball#AWSIESnowballJobManagementService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/snowball/service/2016-06-30/snowball-2016-06-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.snowdevicemanagement#SnowDeviceManagement",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/snow-device-management/service/2021-08-04/snow-device-management-2021-08-04.json"
+    },
+    {
+      "shape_id": "com.amazonaws.sns#AmazonSimpleNotificationService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sns/service/2010-03-31/sns-2010-03-31.json"
+    },
+    {
+      "shape_id": "com.amazonaws.socialmessaging#SocialMessaging",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/socialmessaging/service/2024-01-01/socialmessaging-2024-01-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.sqs#AmazonSQS",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sqs/service/2012-11-05/sqs-2012-11-05.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ssm#AmazonSSM",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/ssm/service/2014-11-06/ssm-2014-11-06.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ssmcontacts#SSMContacts",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/ssm-contacts/service/2021-05-03/ssm-contacts-2021-05-03.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ssmguiconnect#SSMGuiConnect",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/ssm-guiconnect/service/2021-05-01/ssm-guiconnect-2021-05-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ssmincidents#SSMIncidents",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/ssm-incidents/service/2018-05-10/ssm-incidents-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ssmquicksetup#QuickSetup",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/ssm-quicksetup/service/2018-05-10/ssm-quicksetup-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ssmsap#SsmSap",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/ssm-sap/service/2018-05-10/ssm-sap-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.sso#SWBPortalService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sso/service/2019-06-10/sso-2019-06-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ssoadmin#SWBExternalService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sso-admin/service/2020-07-20/sso-admin-2020-07-20.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ssooidc#AWSSSOOIDCService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sso-oidc/service/2019-06-10/sso-oidc-2019-06-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.storagegateway#StorageGateway_20130630",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/storage-gateway/service/2013-06-30/storage-gateway-2013-06-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.sts#AWSSecurityTokenServiceV20110615",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sts/service/2011-06-15/sts-2011-06-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.supplychain#GalaxyPublicAPIGateway",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/supplychain/service/2024-01-01/supplychain-2024-01-01.json"
     }
   ]
 }
