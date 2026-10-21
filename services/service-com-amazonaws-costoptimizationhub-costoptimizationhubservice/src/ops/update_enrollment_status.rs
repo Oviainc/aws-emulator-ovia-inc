@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEnrollmentStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEnrollmentStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEnrollmentStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the caller's enrollment record: the status it sets, whether the
+//! organization's member accounts were asked for, the instant the account first
+//! enrolled, and the instant of this call. The status it answers with is the
+//! value read back out of the store after the write.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +147,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEnrollmentStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEnrollmentStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEnrollmentStatus"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateEnrollmentStatusErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Cost Optimization Hub store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let account_id = crate::state::caller_account_id().to_string();
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        // An absent `includeMemberAccounts` is a request that does not ask for the
+        // organization's member accounts to be enrolled, so it stores `false`.
+        let include_member_accounts = input.include_member_accounts.unwrap_or(false);
+
+        let stored_status = {
+            let mut store = state.lock();
+            let enrollment = store
+                .enrollments
+                .entry(account_id.clone())
+                .or_insert_with(|| crate::state::Enrollment {
+                    account_id: account_id.clone(),
+                    status: input.status.clone(),
+                    include_member_accounts,
+                    // Set once, when the account first enrolls.
+                    created_timestamp: now,
+                    last_updated_timestamp: now,
+                });
+            enrollment.status = input.status.clone();
+            enrollment.include_member_accounts = include_member_accounts;
+            // Refreshed on every call, including the first.
+            enrollment.last_updated_timestamp = now;
+            enrollment.status.clone()
+        };
+
+        Ok(UpdateEnrollmentStatusOutput {
+            status: Some(stored_status),
+        })
     }
 }

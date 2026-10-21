@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEnrollmentStatuses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEnrollmentStatuses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEnrollmentStatuses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the enrollment records `UpdateEnrollmentStatus` wrote: the caller's
+//! account alone, or every enrolled account in the organization when
+//! `includeOrganizationInfo` is set, narrowed by `accountId` and paged by
+//! `maxResults`/`nextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +150,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEnrollmentStatuses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEnrollmentStatusesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEnrollmentStatuses"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEnrollmentStatusesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Cost Optimization Hub store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let offset = match &input.next_token {
+            None => 0,
+            Some(token) => match crate::state::decode_page_token(PAGE_KIND, token) {
+                Some(offset) => offset,
+                None => return Err(invalid_next_token()),
+            },
+        };
+
+        let caller = crate::state::caller_account_id();
+        let (include_member_accounts, mut enrollments) = {
+            let store = state.lock();
+            let include_member_accounts = store
+                .enrollments
+                .get(caller)
+                .map(|enrollment| enrollment.include_member_accounts);
+            // Without `includeOrganizationInfo` the answer covers the calling
+            // account only; with it, every account enrolled in the organization.
+            let scoped: Vec<crate::state::Enrollment> = store
+                .enrollments
+                .values()
+                .filter(|enrollment| {
+                    input.include_organization_info || enrollment.account_id == caller
+                })
+                .filter(|enrollment| {
+                    input
+                        .account_id
+                        .as_deref()
+                        .is_none_or(|wanted| wanted == enrollment.account_id)
+                })
+                .cloned()
+                .collect();
+            (include_member_accounts, scoped)
+        };
+        // A stable order, so the token issued for one page resumes at the row the
+        // previous page stopped at.
+        enrollments.sort_by(|a, b| a.account_id.cmp(&b.account_id));
+
+        let page = crate::state::paginate(PAGE_KIND, &enrollments, offset, input.max_results);
+        let items: Vec<AccountEnrollmentStatus> = page
+            .items
+            .iter()
+            .map(|enrollment| AccountEnrollmentStatus {
+                account_id: Some(enrollment.account_id.clone()),
+                status: Some(enrollment.status.clone()),
+                created_timestamp: Some(enrollment.created_timestamp),
+                last_updated_timestamp: Some(enrollment.last_updated_timestamp),
+            })
+            .collect();
+
+        Ok(ListEnrollmentStatusesOutput {
+            items: Some(items),
+            include_member_accounts,
+            next_token: page.next_token,
+        })
     }
+}
+
+/// The list a `nextToken` from this operation belongs to.
+const PAGE_KIND: &str = "enrollment-statuses";
+
+/// Refuse a `nextToken` this service did not issue for this list.
+fn invalid_next_token() -> ListEnrollmentStatusesError {
+    ListEnrollmentStatusesErrorModeled::ValidationException(ValidationException {
+        message: "nextToken is not a pagination token issued by ListEnrollmentStatuses".to_string(),
+        reason: Some("FieldValidationFailed".to_string()),
+        fields: Some(vec![ValidationExceptionDetail {
+            field_name: "nextToken".to_string(),
+            message: "the value is not a pagination token issued by ListEnrollmentStatuses"
+                .to_string(),
+        }]),
+    })
+    .into()
 }

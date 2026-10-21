@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the recommendation catalog in the store: narrows it by every
+//! `filter` member the request sets, keeps one recommendation per resource
+//! unless `includeAllRecommendations` asks for them all, orders it by `orderBy`,
+//! and cuts the page `maxResults`/`nextToken` ask for. The money members are
+//! computed from each row's stored prices under the caller's stored
+//! `savingsEstimationMode` preference.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +148,196 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRecommendations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRecommendationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Cost Optimization Hub store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let offset = match &input.next_token {
+            None => 0,
+            Some(token) => match crate::state::decode_page_token(PAGE_KIND, token) {
+                Some(offset) => offset,
+                None => return Err(invalid_next_token()),
+            },
+        };
+
+        // An `orderBy` that names no `Recommendation` member cannot be honoured,
+        // so the request is refused rather than silently served in another order.
+        let order = match &input.order_by {
+            None => None,
+            Some(order_by) => match order_by.dimension.as_deref() {
+                None => None,
+                Some(dimension) => match crate::state::Dimension::parse(dimension) {
+                    Some(parsed) => Some((parsed, order_by.order.as_deref() == Some(ORDER_DESC))),
+                    None => return Err(unknown_dimension(dimension)),
+                },
+            },
+        };
+
+        let (mode, mut rows) = {
+            let store = state.lock();
+            let mode = store
+                .preferences
+                .get(crate::state::caller_account_id())
+                .and_then(|preferences| preferences.savings_estimation_mode.clone());
+            let rows: Vec<crate::state::StoredRecommendation> = store
+                .recommendation_order
+                .iter()
+                .filter_map(|id| store.recommendations.get(id))
+                .filter(|row| {
+                    input
+                        .filter
+                        .as_ref()
+                        .is_none_or(|filter| row.matches_filter(filter))
+                })
+                .cloned()
+                .collect();
+            (mode, rows)
+        };
+        let mode = mode.as_deref();
+
+        if !input.include_all_recommendations {
+            rows = dedupe_by_resource(rows, mode);
+        }
+
+        if let Some((dimension, descending)) = order {
+            sort_rows(&mut rows, dimension, descending, mode);
+        }
+
+        let page = crate::state::paginate(PAGE_KIND, &rows, offset, input.max_results);
+        let items: Vec<Recommendation> = page.items.iter().map(|row| render(row, mode)).collect();
+
+        Ok(ListRecommendationsOutput {
+            items: Some(items),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// The list a `nextToken` from this operation belongs to.
+const PAGE_KIND: &str = "recommendations";
+
+/// The `Order` value that reverses the sort; the other value (`Asc`) is the
+/// order a dimension's values take on their own, and is what an absent `order`
+/// leaves them in.
+const ORDER_DESC: &str = "Desc";
+
+/// Keep one recommendation per resource: the one that saves the most, because
+/// that is the recommendation for the resource. Ties keep the catalog's order,
+/// so the choice is stable across calls.
+fn dedupe_by_resource(
+    rows: Vec<crate::state::StoredRecommendation>,
+    mode: Option<&str>,
+) -> Vec<crate::state::StoredRecommendation> {
+    let mut best: Vec<crate::state::StoredRecommendation> = Vec::with_capacity(rows.len());
+    for row in rows {
+        match best
+            .iter()
+            .position(|kept| kept.resource_id == row.resource_id)
+        {
+            None => best.push(row),
+            Some(index) => {
+                if row.monthly_savings(mode) > best[index].monthly_savings(mode) {
+                    best[index] = row;
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Order the rows by one `orderBy` dimension.
+fn sort_rows(
+    rows: &mut [crate::state::StoredRecommendation],
+    dimension: crate::state::OrderDimension,
+    descending: bool,
+    mode: Option<&str>,
+) {
+    rows.sort_by(|a, b| {
+        let ordering = match dimension {
+            crate::state::OrderDimension::Plain(plain) => {
+                a.dimension_key(plain).compare(&b.dimension_key(plain))
+            }
+            crate::state::OrderDimension::Money(money) => {
+                money_value(a, money, mode).total_cmp(&money_value(b, money, mode))
+            }
+        };
+        if descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    });
+}
+
+/// The value of a money dimension under the stored `savingsEstimationMode`.
+fn money_value(
+    row: &crate::state::StoredRecommendation,
+    money: crate::state::MoneyDimension,
+    mode: Option<&str>,
+) -> f64 {
+    match money {
+        crate::state::MoneyDimension::EstimatedMonthlyCost => row.monthly_cost(mode),
+        crate::state::MoneyDimension::EstimatedMonthlySavings => row.monthly_savings(mode),
+        crate::state::MoneyDimension::EstimatedSavingsPercentage => row.savings_percentage(mode),
+    }
+}
+
+/// The list view of one stored recommendation.
+fn render(row: &crate::state::StoredRecommendation, mode: Option<&str>) -> Recommendation {
+    Recommendation {
+        recommendation_id: Some(row.recommendation_id.clone()),
+        account_id: Some(row.account_id.clone()),
+        region: Some(row.region.clone()),
+        resource_id: Some(row.resource_id.clone()),
+        resource_arn: Some(row.resource_arn.clone()),
+        current_resource_type: Some(row.current_resource_type.clone()),
+        recommended_resource_type: Some(row.recommended_resource_type.clone()),
+        estimated_monthly_savings: Some(row.monthly_savings(mode)),
+        estimated_savings_percentage: Some(row.savings_percentage(mode)),
+        estimated_monthly_cost: Some(row.monthly_cost(mode)),
+        currency_code: Some(row.currency_code.clone()),
+        implementation_effort: Some(row.implementation_effort.clone()),
+        restart_needed: Some(row.restart_needed),
+        action_type: Some(row.action_type.clone()),
+        rollback_possible: Some(row.rollback_possible),
+        current_resource_summary: Some(row.current_resource_summary.clone()),
+        recommended_resource_summary: Some(row.recommended_resource_summary.clone()),
+        last_refresh_timestamp: Some(row.last_refresh_timestamp),
+        recommendation_lookback_period_in_days: Some(row.recommendation_lookback_period_in_days),
+        source: Some(row.source.clone()),
+        tags: row.tag_list(),
+    }
+}
+
+/// Refuse a `nextToken` this service did not issue for this list.
+fn invalid_next_token() -> ListRecommendationsError {
+    ListRecommendationsErrorModeled::ValidationException(ValidationException {
+        message: "nextToken is not a pagination token issued by ListRecommendations".to_string(),
+        reason: Some("FieldValidationFailed".to_string()),
+        fields: Some(vec![ValidationExceptionDetail {
+            field_name: "nextToken".to_string(),
+            message: "the value is not a pagination token issued by ListRecommendations"
+                .to_string(),
+        }]),
+    })
+    .into()
+}
+
+/// Refuse an `orderBy.dimension` that names no `Recommendation` member.
+fn unknown_dimension(dimension: &str) -> ListRecommendationsError {
+    ListRecommendationsErrorModeled::ValidationException(ValidationException {
+        message: format!("orderBy.dimension {dimension} is not a recommendation dimension"),
+        reason: Some("FieldValidationFailed".to_string()),
+        fields: Some(vec![ValidationExceptionDetail {
+            field_name: "orderBy.dimension".to_string(),
+            message: format!("{dimension} is not a dimension recommendations can be sorted by"),
+        }]),
+    })
+    .into()
 }

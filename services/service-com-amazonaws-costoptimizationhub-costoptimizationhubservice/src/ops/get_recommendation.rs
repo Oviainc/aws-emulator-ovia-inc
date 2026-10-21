@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRecommendation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRecommendation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRecommendation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Looks `recommendationId` up in the same catalog `ListRecommendations` pages
+//! over and answers with the detail view of that row, or
+//! `ResourceNotFoundException` when the store holds no such id.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +188,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRecommendation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRecommendationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRecommendation"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetRecommendationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Cost Optimization Hub store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let (mode, row) = {
+            let store = state.lock();
+            let mode = store
+                .preferences
+                .get(crate::state::caller_account_id())
+                .and_then(|preferences| preferences.savings_estimation_mode.clone());
+            (mode, store.recommendations.get(&input.recommendation_id).cloned())
+        };
+
+        let Some(row) = row else {
+            return Err(GetRecommendationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no recommendation with the ID {} exists",
+                        input.recommendation_id
+                    ),
+                    resource_id: input.recommendation_id,
+                },
+            )
+            .into());
+        };
+        let mode = mode.as_deref();
+
+        Ok(GetRecommendationOutput {
+            recommendation_id: Some(row.recommendation_id.clone()),
+            resource_id: Some(row.resource_id.clone()),
+            resource_arn: Some(row.resource_arn.clone()),
+            account_id: Some(row.account_id.clone()),
+            currency_code: Some(row.currency_code.clone()),
+            recommendation_lookback_period_in_days: Some(row.recommendation_lookback_period_in_days),
+            cost_calculation_lookback_period_in_days: Some(
+                row.cost_calculation_lookback_period_in_days,
+            ),
+            estimated_savings_percentage: Some(row.savings_percentage(mode)),
+            estimated_savings_over_cost_calculation_lookback_period: Some(
+                row.savings_over_cost_calculation_lookback_period(mode),
+            ),
+            current_resource_type: Some(row.current_resource_type.clone()),
+            recommended_resource_type: Some(row.recommended_resource_type.clone()),
+            region: Some(row.region.clone()),
+            source: Some(row.source.clone()),
+            last_refresh_timestamp: Some(row.last_refresh_timestamp),
+            estimated_monthly_savings: Some(row.monthly_savings(mode)),
+            estimated_monthly_cost: Some(row.monthly_cost(mode)),
+            implementation_effort: Some(row.implementation_effort.clone()),
+            restart_needed: Some(row.restart_needed),
+            action_type: Some(row.action_type.clone()),
+            rollback_possible: Some(row.rollback_possible),
+            current_resource_details: Some(row.current_resource_details()),
+            recommended_resource_details: Some(row.recommended_resource_details()),
+            tags: row.tag_list(),
+        })
     }
 }

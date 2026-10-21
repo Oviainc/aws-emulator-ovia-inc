@@ -1,0 +1,937 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for the Cost Optimization Hub enrollment → preferences →
+//! recommendations loop, driven over the wire (`awsJson1_0`, `POST /` with
+//! `X-Amz-Target: CostOptimizationHubService.<Operation>`) through the same
+//! multi-service router the emulator boots.
+//!
+//! Every assertion here is about a RULE, exercised over a table of inputs rather
+//! than a single recorded call: what the store answers after a write, which rows
+//! a filter selects, where a page resumes, and that the detail view of a
+//! recommendation agrees with its list entry.
+
+use std::sync::Arc;
+
+use serde_json::{json, Value};
+use service_com_amazonaws_costoptimizationhub_costoptimizationhubservice::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// A router with only this service mounted, over one shared engine — the same
+/// assembly `core/router` performs, minus the other services.
+fn router() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    // In-process tests sign with a placeholder key; signature verification is a
+    // front-door setting, not part of what these tests are about.
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(engine));
+    router
+}
+
+/// Call one operation and return its HTTP status and JSON body.
+async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("https://cost-optimization-hub.us-east-1.amazonaws.com/")
+        .header("content-type", "application/x-amz-json-1.0")
+        .header("x-amz-target", format!("CostOptimizationHubService.{operation}"))
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 \
+             Credential=AKIDEMULATOR/20260101/us-east-1/cost-optimization-hub/aws4_request, \
+             SignedHeaders=host;x-amz-target, Signature=0000",
+        )
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(body).expect("the request body serializes"),
+        ))
+        .expect("the request builds");
+
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let payload = if response.body().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+    };
+    (status, payload)
+}
+
+/// Call one operation, requiring success.
+async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+    let (status, payload) = call(router, operation, body).await;
+    assert_eq!(
+        status, 200,
+        "case {operation} {body}: expected HTTP 200, got {status} with {payload}"
+    );
+    payload
+}
+
+/// The wire error code (`__type`) of an error body, without its namespace.
+fn error_code(payload: &Value) -> String {
+    payload["__type"]
+        .as_str()
+        .unwrap_or_default()
+        .rsplit(['#', ':'])
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The `recommendationId`s of a `ListRecommendations` answer, in order.
+fn ids(payload: &Value) -> Vec<String> {
+    payload["items"]
+        .as_array()
+        .expect("items is a list")
+        .iter()
+        .map(|item| {
+            item["recommendationId"]
+                .as_str()
+                .expect("every recommendation carries an id")
+                .to_string()
+        })
+        .collect()
+}
+
+/// The catalog ids, by their last four characters, so a case can name a row
+/// without repeating the whole id.
+fn id(suffix: &str) -> String {
+    format!("0ec38a3a-1a0a-4a4f-9d2a-1f1e9a7c{suffix}")
+}
+
+/// Every recommendation the store holds, in catalog order.
+async fn all_ids(router: &MultiServiceRouter) -> Vec<String> {
+    let payload = ok(
+        router,
+        "ListRecommendations",
+        &json!({"includeAllRecommendations": true}),
+    )
+    .await;
+    ids(&payload)
+}
+
+fn close(actual: f64, expected: f64) -> bool {
+    (actual - expected).abs() < 0.005
+}
+
+// ---------------------------------------------------------------------------
+// Enrollment
+// ---------------------------------------------------------------------------
+
+/// `UpdateEnrollmentStatus` persists what it was given and `ListEnrollmentStatuses`
+/// reports it: the status, the `includeMemberAccounts` preference, one
+/// `createdTimestamp` set at the first enrollment, and a `lastUpdatedTimestamp`
+/// refreshed by every call.
+#[tokio::test]
+async fn enrollment_status_is_stored_and_listed_back() {
+    let router = router();
+    let account = engine::emulator_account_id();
+
+    // Before any call the account has no enrollment record at all.
+    let empty = ok(
+        &router,
+        "ListEnrollmentStatuses",
+        &json!({"includeOrganizationInfo": false}),
+    )
+    .await;
+    assert_eq!(
+        empty["items"].as_array().map(Vec::len),
+        Some(0),
+        "case before-enrollment: expected no enrollment rows, got {empty}"
+    );
+    assert!(
+        empty["includeMemberAccounts"].is_null(),
+        "case before-enrollment: expected no stored includeMemberAccounts, got {empty}"
+    );
+
+    // Each row is one UpdateEnrollmentStatus call and what the store must then
+    // report. The rows differ in status and in whether member accounts are
+    // asked for, including the request that omits the member-account member.
+    let cases: [(Value, &str, bool); 4] = [
+        (json!({"status": "Active", "includeMemberAccounts": true}), "Active", true),
+        (json!({"status": "Inactive", "includeMemberAccounts": false}), "Inactive", false),
+        (json!({"status": "Active"}), "Active", false),
+        (json!({"status": "Inactive", "includeMemberAccounts": true}), "Inactive", true),
+    ];
+
+    let mut created: Option<f64> = None;
+    let mut previous_update = f64::MIN;
+    for (request, expected_status, expected_members) in &cases {
+        let updated = ok(&router, "UpdateEnrollmentStatus", request).await;
+        assert_eq!(
+            updated["status"].as_str(),
+            Some(*expected_status),
+            "case {request}: expected status {expected_status}, got {updated}"
+        );
+
+        let listed = ok(
+            &router,
+            "ListEnrollmentStatuses",
+            &json!({"includeOrganizationInfo": false}),
+        )
+        .await;
+        let items = listed["items"].as_array().expect("items is a list");
+        assert_eq!(
+            items.len(),
+            1,
+            "case {request}: expected exactly the caller's account, got {listed}"
+        );
+        assert_eq!(
+            items[0]["accountId"].as_str(),
+            Some(account),
+            "case {request}: expected account {account}, got {listed}"
+        );
+        assert_eq!(
+            items[0]["status"].as_str(),
+            Some(*expected_status),
+            "case {request}: expected stored status {expected_status}, got {listed}"
+        );
+        assert_eq!(
+            listed["includeMemberAccounts"].as_bool(),
+            Some(*expected_members),
+            "case {request}: expected includeMemberAccounts {expected_members}, got {listed}"
+        );
+
+        let created_at = items[0]["createdTimestamp"]
+            .as_f64()
+            .expect("createdTimestamp is a timestamp");
+        let updated_at = items[0]["lastUpdatedTimestamp"]
+            .as_f64()
+            .expect("lastUpdatedTimestamp is a timestamp");
+        match created {
+            None => created = Some(created_at),
+            Some(first) => assert!(
+                close(created_at, first),
+                "case {request}: createdTimestamp must stay at {first}, got {created_at}"
+            ),
+        }
+        assert!(
+            updated_at >= previous_update,
+            "case {request}: lastUpdatedTimestamp went backwards to {updated_at} from {previous_update}"
+        );
+        assert!(
+            updated_at + 0.005 >= created_at,
+            "case {request}: lastUpdatedTimestamp {updated_at} precedes createdTimestamp {created_at}"
+        );
+        previous_update = updated_at;
+    }
+}
+
+/// `ListEnrollmentStatuses` honours `accountId`, `maxResults` and
+/// `includeOrganizationInfo` against the store, and refuses a `nextToken` it did
+/// not issue.
+#[tokio::test]
+async fn list_enrollment_statuses_filters_and_pages() {
+    let router = router();
+    let account = engine::emulator_account_id();
+    ok(
+        &router,
+        "UpdateEnrollmentStatus",
+        &json!({"status": "Active", "includeMemberAccounts": false}),
+    )
+    .await;
+
+    // (request, expected number of rows)
+    let cases: [(Value, usize); 6] = [
+        (json!({"includeOrganizationInfo": false}), 1),
+        (json!({"includeOrganizationInfo": true}), 1),
+        (json!({"includeOrganizationInfo": false, "accountId": account}), 1),
+        // A 12-digit account that never enrolled has no row to report.
+        (json!({"includeOrganizationInfo": false, "accountId": "123456789012"}), 0),
+        (json!({"includeOrganizationInfo": false, "maxResults": 1}), 1),
+        // `maxResults` 0 is inside the modelled 0..100 range: an empty page.
+        (json!({"includeOrganizationInfo": false, "maxResults": 0}), 0),
+    ];
+    for (request, expected) in &cases {
+        let listed = ok(&router, "ListEnrollmentStatuses", request).await;
+        assert_eq!(
+            listed["items"].as_array().map(Vec::len),
+            Some(*expected),
+            "case {request}: expected {expected} rows, got {listed}"
+        );
+        assert!(
+            listed["nextToken"].is_null(),
+            "case {request}: the only page must carry no nextToken, got {listed}"
+        );
+    }
+
+    for token in ["not-a-token", "", "6e6f7065"] {
+        let (status, payload) = call(
+            &router,
+            "ListEnrollmentStatuses",
+            &json!({"includeOrganizationInfo": false, "nextToken": token}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case nextToken {token:?}: expected HTTP 400, got {status} with {payload}"
+        );
+        assert_eq!(
+            error_code(&payload),
+            "ValidationException",
+            "case nextToken {token:?}: expected ValidationException, got {payload}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Preferences
+// ---------------------------------------------------------------------------
+
+/// `UpdatePreferences` sets the members it supplies and leaves every omitted
+/// member at its stored value, at each level of the record; `GetPreferences`
+/// reports exactly what was stored.
+#[tokio::test]
+async fn preferences_merge_and_persist() {
+    let router = router();
+
+    // Nothing is stored before the first UpdatePreferences, so nothing is
+    // reported: the service invents no preference the caller never set.
+    let initial = ok(&router, "GetPreferences", &json!({})).await;
+    for member in [
+        "savingsEstimationMode",
+        "memberAccountDiscountVisibility",
+        "preferredCommitment",
+    ] {
+        assert!(
+            initial[member].is_null(),
+            "case before-update: expected {member} absent, got {initial}"
+        );
+    }
+
+    // (request, the whole record the store must then hold). Rows differ in which
+    // members they set — including one that sets only a nested member.
+    let cases: [(Value, Value); 6] = [
+        (
+            json!({"savingsEstimationMode": "BeforeDiscounts"}),
+            json!({"savingsEstimationMode": "BeforeDiscounts"}),
+        ),
+        (
+            json!({"memberAccountDiscountVisibility": "None"}),
+            json!({"savingsEstimationMode": "BeforeDiscounts", "memberAccountDiscountVisibility": "None"}),
+        ),
+        (
+            json!({"preferredCommitment": {"term": "ThreeYears"}}),
+            json!({
+                "savingsEstimationMode": "BeforeDiscounts",
+                "memberAccountDiscountVisibility": "None",
+                "preferredCommitment": {"term": "ThreeYears"},
+            }),
+        ),
+        (
+            json!({"preferredCommitment": {"paymentOption": "AllUpfront"}}),
+            json!({
+                "savingsEstimationMode": "BeforeDiscounts",
+                "memberAccountDiscountVisibility": "None",
+                "preferredCommitment": {"term": "ThreeYears", "paymentOption": "AllUpfront"},
+            }),
+        ),
+        (
+            json!({"savingsEstimationMode": "AfterDiscounts"}),
+            json!({
+                "savingsEstimationMode": "AfterDiscounts",
+                "memberAccountDiscountVisibility": "None",
+                "preferredCommitment": {"term": "ThreeYears", "paymentOption": "AllUpfront"},
+            }),
+        ),
+        (
+            json!({
+                "memberAccountDiscountVisibility": "All",
+                "preferredCommitment": {"term": "OneYear", "paymentOption": "NoUpfront"},
+            }),
+            json!({
+                "savingsEstimationMode": "AfterDiscounts",
+                "memberAccountDiscountVisibility": "All",
+                "preferredCommitment": {"term": "OneYear", "paymentOption": "NoUpfront"},
+            }),
+        ),
+    ];
+
+    for (request, expected) in &cases {
+        let updated = ok(&router, "UpdatePreferences", request).await;
+        assert_eq!(
+            &updated, expected,
+            "case {request}: expected the merged record {expected}, got {updated}"
+        );
+
+        // The round trip: a separate read must see the same record, twice.
+        for attempt in 0..2 {
+            let fetched = ok(&router, "GetPreferences", &json!({})).await;
+            assert_eq!(
+                &fetched, expected,
+                "case {request} read {attempt}: expected {expected}, got {fetched}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recommendations
+// ---------------------------------------------------------------------------
+
+/// Every `filter` member narrows the list to the rows whose stored value the
+/// filter admits; several members narrow together.
+#[tokio::test]
+async fn recommendation_filters_select_the_matching_rows() {
+    let router = router();
+    let account = engine::emulator_account_id();
+    let volume_arn = engine::emulator_arn("ec2", "us-east-1", "volume/vol-00112233445566003");
+
+    // (filter, the ids it must select — in catalog order)
+    let cases: Vec<(Value, Vec<&str>)> = vec![
+        (json!({}), vec!["0001", "0002", "0003", "0004", "0005", "0006", "0007"]),
+        (json!({"regions": ["us-west-2"]}), vec!["0004", "0006", "0007"]),
+        (
+            json!({"regions": ["us-east-1", "us-west-2"]}),
+            vec!["0001", "0002", "0003", "0004", "0005", "0006", "0007"],
+        ),
+        (json!({"resourceTypes": ["Ec2Instance"]}), vec!["0001", "0002"]),
+        (
+            json!({"resourceTypes": ["EbsVolume", "NatGateway"]}),
+            vec!["0003", "0006"],
+        ),
+        (json!({"actionTypes": ["Rightsize"]}), vec!["0001", "0004"]),
+        (
+            json!({"actionTypes": ["Upgrade", "Delete"]}),
+            vec!["0003", "0006", "0007"],
+        ),
+        (json!({"implementationEfforts": ["VeryLow"]}), vec!["0001", "0005"]),
+        (
+            json!({"implementationEfforts": ["High", "VeryHigh"]}),
+            vec!["0006", "0007"],
+        ),
+        (json!({"restartNeeded": true}), vec!["0001", "0002", "0006"]),
+        (
+            json!({"restartNeeded": false}),
+            vec!["0003", "0004", "0005", "0007"],
+        ),
+        (json!({"rollbackPossible": false}), vec!["0005", "0006"]),
+        (json!({"recommendationIds": [id("0003")]}), vec!["0003"]),
+        (
+            json!({"recommendationIds": [id("0005"), id("0001")]}),
+            vec!["0001", "0005"],
+        ),
+        (
+            json!({"accountIds": [account]}),
+            vec!["0001", "0002", "0003", "0004", "0005", "0006", "0007"],
+        ),
+        (json!({"accountIds": ["123456789012"]}), vec![]),
+        (
+            json!({"resourceIds": ["i-0a1b2c3d4e5f60001"]}),
+            vec!["0001", "0002"],
+        ),
+        (json!({"resourceArns": [volume_arn]}), vec!["0003"]),
+        (
+            json!({"tags": [{"key": "environment", "value": "production"}]}),
+            vec!["0001", "0002", "0003"],
+        ),
+        (json!({"tags": [{"key": "team"}]}), vec!["0001", "0002", "0007"]),
+        (
+            json!({"tags": [{"key": "environment", "value": "sandbox"}]}),
+            vec!["0006"],
+        ),
+        // Several members narrow together.
+        (
+            json!({"regions": ["us-east-1"], "actionTypes": ["Rightsize"]}),
+            vec!["0001"],
+        ),
+        (
+            json!({"restartNeeded": true, "rollbackPossible": false}),
+            vec!["0006"],
+        ),
+        (
+            json!({"regions": ["us-west-2"], "resourceTypes": ["Ec2Instance"]}),
+            vec![],
+        ),
+    ];
+
+    for (filter, expected) in &cases {
+        let payload = ok(
+            &router,
+            "ListRecommendations",
+            &json!({"includeAllRecommendations": true, "filter": filter}),
+        )
+        .await;
+        let expected: Vec<String> = expected.iter().map(|suffix| id(suffix)).collect();
+        assert_eq!(
+            ids(&payload),
+            expected,
+            "case filter {filter}: expected {expected:?}, got {payload}"
+        );
+    }
+}
+
+/// `includeAllRecommendations` decides whether every recommendation for a
+/// resource is listed or only the one that saves the most.
+#[tokio::test]
+async fn include_all_recommendations_dedupes_by_resource() {
+    let router = router();
+
+    let all = ok(
+        &router,
+        "ListRecommendations",
+        &json!({"includeAllRecommendations": true}),
+    )
+    .await;
+    assert_eq!(
+        ids(&all),
+        (1..=7).map(|n| id(&format!("000{n}"))).collect::<Vec<_>>(),
+        "case includeAllRecommendations=true: expected the whole catalog, got {all}"
+    );
+
+    // (request, expected ids) — the default and the explicit `false` both de-dupe.
+    for request in [
+        json!({"includeAllRecommendations": false}),
+        json!({}),
+        json!({"includeAllRecommendations": false, "filter": {"resourceIds": ["i-0a1b2c3d4e5f60001"]}}),
+    ] {
+        let payload = ok(&router, "ListRecommendations", &request).await;
+        let listed = ids(&payload);
+        assert!(
+            listed.contains(&id("0001")),
+            "case {request}: expected the highest-saving recommendation for the shared resource, got {payload}"
+        );
+        assert!(
+            !listed.contains(&id("0002")),
+            "case {request}: expected one recommendation per resource, got {payload}"
+        );
+    }
+
+    let deduped = ok(
+        &router,
+        "ListRecommendations",
+        &json!({"includeAllRecommendations": false}),
+    )
+    .await;
+    assert_eq!(
+        ids(&deduped).len(),
+        6,
+        "case includeAllRecommendations=false: expected one row per resource, got {deduped}"
+    );
+}
+
+/// Pagination resumes where the previous page ended, for every page size, and
+/// the last page carries no token.
+#[tokio::test]
+async fn recommendation_pagination_resumes_where_the_previous_page_ended() {
+    let router = router();
+    let expected = all_ids(&router).await;
+
+    for page_size in [1_i64, 2, 3, 6, 7, 20] {
+        let mut collected: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let mut request = json!({
+                "includeAllRecommendations": true,
+                "maxResults": page_size,
+            });
+            if let Some(token) = &token {
+                request["nextToken"] = json!(token);
+            }
+            let payload = ok(&router, "ListRecommendations", &request).await;
+            let page = ids(&payload);
+            assert!(
+                page.len() as i64 <= page_size,
+                "case maxResults {page_size}: a page returned {} rows, got {payload}",
+                page.len()
+            );
+            collected.extend(page);
+            pages += 1;
+            assert!(
+                pages <= expected.len() + 1,
+                "case maxResults {page_size}: pagination did not terminate after {pages} pages"
+            );
+            match payload["nextToken"].as_str() {
+                None => break,
+                Some(next) => token = Some(next.to_string()),
+            }
+        }
+        assert_eq!(
+            collected, expected,
+            "case maxResults {page_size}: paging must yield the catalog exactly once"
+        );
+    }
+
+    // A zero-size page cannot advance, so it ends the walk rather than handing
+    // out a token that would repeat forever.
+    let empty = ok(
+        &router,
+        "ListRecommendations",
+        &json!({"includeAllRecommendations": true, "maxResults": 0}),
+    )
+    .await;
+    assert_eq!(
+        ids(&empty),
+        Vec::<String>::new(),
+        "case maxResults 0: expected an empty page, got {empty}"
+    );
+    assert!(
+        empty["nextToken"].is_null(),
+        "case maxResults 0: expected no nextToken, got {empty}"
+    );
+
+    // A token this operation did not issue is refused, including one issued for
+    // the other paginated list.
+    for token in ["nope", "636f6876313a656e726f6c6c6d656e742d73746174757365733a31"] {
+        let (status, payload) = call(
+            &router,
+            "ListRecommendations",
+            &json!({"includeAllRecommendations": true, "nextToken": token}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case nextToken {token:?}: expected HTTP 400, got {status} with {payload}"
+        );
+        assert_eq!(
+            error_code(&payload),
+            "ValidationException",
+            "case nextToken {token:?}: expected ValidationException, got {payload}"
+        );
+    }
+}
+
+/// `orderBy` sorts the list along the named dimension, ascending by default and
+/// descending on request; a dimension that names no `Recommendation` member is
+/// refused.
+#[tokio::test]
+async fn order_by_sorts_along_the_named_dimension() {
+    let router = router();
+
+    // Every dimension is a `Recommendation` member name, so the answer can be
+    // checked by reading that member back off each item.
+    let dimensions = [
+        "recommendationId",
+        "accountId",
+        "region",
+        "resourceId",
+        "resourceArn",
+        "currentResourceType",
+        "recommendedResourceType",
+        "actionType",
+        "implementationEffort",
+        "source",
+        "currencyCode",
+        "restartNeeded",
+        "rollbackPossible",
+        "recommendationLookbackPeriodInDays",
+        "lastRefreshTimestamp",
+        "estimatedMonthlyCost",
+        "estimatedMonthlySavings",
+        "estimatedSavingsPercentage",
+    ];
+
+    for dimension in dimensions {
+        for order in ["Asc", "Desc"] {
+            let payload = ok(
+                &router,
+                "ListRecommendations",
+                &json!({
+                    "includeAllRecommendations": true,
+                    "orderBy": {"dimension": dimension, "order": order},
+                }),
+            )
+            .await;
+            let items = payload["items"].as_array().expect("items is a list");
+            assert_eq!(
+                items.len(),
+                7,
+                "case {dimension}/{order}: ordering must not drop rows, got {payload}"
+            );
+            for window in items.windows(2) {
+                let (left, right) = (&window[0][dimension], &window[1][dimension]);
+                let ordered = match order {
+                    "Asc" => !value_greater(left, right),
+                    _ => !value_greater(right, left),
+                };
+                assert!(
+                    ordered,
+                    "case {dimension}/{order}: {left} and {right} are out of order in {payload}"
+                );
+            }
+        }
+    }
+
+    // An absent `order` leaves the dimension's values in their own order.
+    let ascending = ok(
+        &router,
+        "ListRecommendations",
+        &json!({
+            "includeAllRecommendations": true,
+            "orderBy": {"dimension": "estimatedMonthlySavings"},
+        }),
+    )
+    .await;
+    let savings: Vec<f64> = ascending["items"]
+        .as_array()
+        .expect("items is a list")
+        .iter()
+        .map(|item| item["estimatedMonthlySavings"].as_f64().unwrap_or_default())
+        .collect();
+    assert!(
+        savings.windows(2).all(|w| w[0] <= w[1]),
+        "case absent order: expected ascending savings, got {savings:?}"
+    );
+
+    for dimension in ["notADimension", "estimatedMonthlyBananas", ""] {
+        let (status, payload) = call(
+            &router,
+            "ListRecommendations",
+            &json!({
+                "includeAllRecommendations": true,
+                "orderBy": {"dimension": dimension, "order": "Asc"},
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case dimension {dimension:?}: expected HTTP 400, got {status} with {payload}"
+        );
+        assert_eq!(
+            error_code(&payload),
+            "ValidationException",
+            "case dimension {dimension:?}: expected ValidationException, got {payload}"
+        );
+    }
+}
+
+/// Order two JSON values of one dimension: `true` when `left` sorts after
+/// `right`.
+fn value_greater(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) => {
+            a.as_f64().unwrap_or_default() > b.as_f64().unwrap_or_default()
+        }
+        (Value::String(a), Value::String(b)) => a > b,
+        (Value::Bool(a), Value::Bool(b)) => *a & !*b,
+        _ => false,
+    }
+}
+
+/// `GetRecommendation` reads the same row `ListRecommendations` listed, so every
+/// member the two views share carries the same value, and the detail view's
+/// derived members agree with it.
+#[tokio::test]
+async fn get_recommendation_agrees_with_the_list_entry() {
+    let router = router();
+    let listed = ok(
+        &router,
+        "ListRecommendations",
+        &json!({"includeAllRecommendations": true}),
+    )
+    .await;
+
+    let shared = [
+        "recommendationId",
+        "accountId",
+        "region",
+        "resourceId",
+        "resourceArn",
+        "currentResourceType",
+        "recommendedResourceType",
+        "actionType",
+        "implementationEffort",
+        "restartNeeded",
+        "rollbackPossible",
+        "currencyCode",
+        "source",
+        "estimatedMonthlyCost",
+        "estimatedMonthlySavings",
+        "estimatedSavingsPercentage",
+        "recommendationLookbackPeriodInDays",
+        "lastRefreshTimestamp",
+        "tags",
+    ];
+
+    for item in listed["items"].as_array().expect("items is a list") {
+        let recommendation_id = item["recommendationId"].as_str().expect("an id");
+        let detail = ok(
+            &router,
+            "GetRecommendation",
+            &json!({"recommendationId": recommendation_id}),
+        )
+        .await;
+
+        for member in shared {
+            assert_eq!(
+                detail[member], item[member],
+                "case {recommendation_id}: {member} differs between the list and detail views \
+                 ({} vs {})",
+                item[member], detail[member]
+            );
+        }
+
+        // The detail view's own members are derived from the same row: the
+        // saving over the lookback period is the monthly saving prorated across
+        // that period, and the resource details are present for both resources.
+        let savings = detail["estimatedMonthlySavings"].as_f64().expect("a saving");
+        let lookback = detail["costCalculationLookbackPeriodInDays"]
+            .as_f64()
+            .expect("a lookback period");
+        let over_lookback = detail["estimatedSavingsOverCostCalculationLookbackPeriod"]
+            .as_f64()
+            .expect("a saving over the lookback period");
+        assert!(
+            close(over_lookback, savings * lookback / 30.0),
+            "case {recommendation_id}: expected {} over {lookback} days, got {over_lookback}",
+            savings * lookback / 30.0
+        );
+        for member in ["currentResourceDetails", "recommendedResourceDetails"] {
+            assert!(
+                detail[member].is_object(),
+                "case {recommendation_id}: expected {member} in the detail view, got {detail}"
+            );
+        }
+    }
+}
+
+/// An id the store does not hold is a 404 `ResourceNotFoundException` naming it,
+/// never an empty success.
+#[tokio::test]
+async fn get_recommendation_rejects_an_unknown_id() {
+    let router = router();
+    for unknown in [
+        "does-not-exist",
+        "0ec38a3a-1a0a-4a4f-9d2a-1f1e9a7c9999",
+        " ",
+        "0001",
+    ] {
+        let (status, payload) = call(
+            &router,
+            "GetRecommendation",
+            &json!({"recommendationId": unknown}),
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "case {unknown:?}: expected HTTP 404, got {status} with {payload}"
+        );
+        assert_eq!(
+            error_code(&payload),
+            "ResourceNotFoundException",
+            "case {unknown:?}: expected ResourceNotFoundException, got {payload}"
+        );
+        assert_eq!(
+            payload["resourceId"].as_str(),
+            Some(unknown),
+            "case {unknown:?}: expected the id in resourceId, got {payload}"
+        );
+    }
+}
+
+/// The stored `savingsEstimationMode` decides whether the money members are
+/// reported before or after discounts — the same stored prices, read two ways.
+#[tokio::test]
+async fn savings_estimation_mode_changes_the_reported_money() {
+    let router = router();
+    let rightsize = id("0001");
+
+    // (stored savingsEstimationMode, expected monthly cost, expected saving).
+    // Row 0001 costs 280.32 before a 28.03 savings-plan discount and its
+    // recommended resource 140.16 before a 14.02 discount.
+    let cases: [(Option<&str>, f64, f64); 4] = [
+        (None, 280.32, 140.16),
+        (Some("BeforeDiscounts"), 280.32, 140.16),
+        (Some("AfterDiscounts"), 252.29, 126.15),
+        (Some("BeforeDiscounts"), 280.32, 140.16),
+    ];
+
+    for (mode, expected_cost, expected_savings) in &cases {
+        if let Some(mode) = mode {
+            ok(
+                &router,
+                "UpdatePreferences",
+                &json!({"savingsEstimationMode": mode}),
+            )
+            .await;
+        }
+
+        let listed = ok(
+            &router,
+            "ListRecommendations",
+            &json!({
+                "includeAllRecommendations": true,
+                "filter": {"recommendationIds": [rightsize]},
+            }),
+        )
+        .await;
+        let item = &listed["items"][0];
+        let detail = ok(
+            &router,
+            "GetRecommendation",
+            &json!({"recommendationId": rightsize}),
+        )
+        .await;
+
+        for (view, payload) in [("list", item), ("detail", &detail)] {
+            let cost = payload["estimatedMonthlyCost"].as_f64().expect("a cost");
+            let savings = payload["estimatedMonthlySavings"].as_f64().expect("a saving");
+            let percentage = payload["estimatedSavingsPercentage"]
+                .as_f64()
+                .expect("a percentage");
+            assert!(
+                close(cost, *expected_cost),
+                "case {mode:?} {view}: expected cost {expected_cost}, got {cost}"
+            );
+            assert!(
+                close(savings, *expected_savings),
+                "case {mode:?} {view}: expected saving {expected_savings}, got {savings}"
+            );
+            assert!(
+                close(percentage, savings / cost * 100.0),
+                "case {mode:?} {view}: expected {} percent, got {percentage}",
+                savings / cost * 100.0
+            );
+        }
+    }
+}
+
+/// Reading the catalog does not change it: two identical reads, either side of
+/// a `GetRecommendation`, answer the same thing.
+#[tokio::test]
+async fn reads_do_not_change_what_a_later_caller_sees() {
+    let router = router();
+    let request = json!({"includeAllRecommendations": true});
+
+    let first = ok(&router, "ListRecommendations", &request).await;
+    ok(
+        &router,
+        "GetRecommendation",
+        &json!({"recommendationId": id("0004")}),
+    )
+    .await;
+    ok(&router, "GetPreferences", &json!({})).await;
+    let second = ok(&router, "ListRecommendations", &request).await;
+
+    assert_eq!(
+        first, second,
+        "case repeated read: the catalog changed between two reads"
+    );
+}
+
+/// The two operations this slice leaves unimplemented still answer 501, so a
+/// caller can tell "not written yet" from an empty success.
+#[tokio::test]
+async fn the_remaining_operations_are_still_scaffolded() {
+    let router = router();
+    let cases: [(&str, Value); 2] = [
+        (
+            "ListRecommendationSummaries",
+            json!({"groupBy": "ActionType"}),
+        ),
+        (
+            "ListEfficiencyMetrics",
+            json!({
+                "granularity": "Monthly",
+                "timePeriod": {"start": "2026-01-01", "end": "2026-02-01"},
+            }),
+        ),
+    ];
+    for (operation, body) in &cases {
+        let (status, payload) = call(&router, operation, body).await;
+        assert_eq!(
+            status, 501,
+            "case {operation}: expected HTTP 501, got {status} with {payload}"
+        );
+    }
+}
