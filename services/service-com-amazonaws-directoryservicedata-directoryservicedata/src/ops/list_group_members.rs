@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGroupMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGroupMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGroupMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the members of one group, computed from the memberships [`crate::state`]
+//! holds on that group's record: one page of `Member` in member-name order, no more
+//! than `MaxResults` of them, and a `NextToken` only when the group holds more. Each
+//! member's SID is read from the member's own record. An unknown group is
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +175,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGroupMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGroupMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGroupMembers"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListGroupMembersErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the directory object store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let page_size = crate::state::page_size(input.max_results);
+        let group_key = crate::state::fold(&input.sam_account_name);
+
+        // A read NEVER materialises a directory: a `DirectoryId` nothing has written
+        // to holds no group to report on.
+        let store = state.lock();
+        let not_found = || {
+            ListGroupMembersErrorModeled::ResourceNotFoundException(crate::state::group_not_found(
+                &input.directory_id,
+                &input.sam_account_name,
+            ))
+        };
+        let Some(directory) = store.directories.get(&input.directory_id) else {
+            return Err(not_found().into());
+        };
+
+        // `Realm` names the domain the GROUP is in; this directory holds groups only
+        // in its own realm.
+        if !crate::state::realm_matches(input.realm.as_deref(), &directory.realm) {
+            return Err(not_found().into());
+        }
+        let Some(group) = directory.groups.get(&group_key) else {
+            return Err(not_found().into());
+        };
+
+        let realm = crate::state::resolved_realm(input.realm.as_deref(), &directory.realm);
+        // `MemberRealm` names the domain the MEMBERS are in; this directory holds
+        // members only in its own realm, so another realm reports none of them.
+        let member_realm =
+            crate::state::resolved_realm(input.member_realm.as_deref(), &directory.realm);
+        let members_visible =
+            crate::state::realm_matches(input.member_realm.as_deref(), &directory.realm);
+
+        // The cursor is stamped with what decides which records are walked, so a token
+        // issued for another listing, or built by a client, is refused rather than
+        // read as a position in this one.
+        let scope = crate::state::list_scope(&[
+            &input.directory_id,
+            &group_key,
+            &realm.to_ascii_lowercase(),
+            &member_realm.to_ascii_lowercase(),
+        ]);
+        let after = match input.next_token.as_deref() {
+            Some(token) => {
+                match crate::state::decode_cursor(token, crate::state::GROUP_MEMBERS_PAGE, &scope) {
+                    Some(after) => Some(after),
+                    None => {
+                        return Err(ListGroupMembersErrorModeled::ValidationException(
+                            crate::state::invalid_next_token(),
+                        )
+                        .into());
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let mut members = Vec::new();
+        let mut next_token = None;
+        let mut last_key = String::new();
+        if members_visible {
+            for (key, membership) in &group.members {
+                // Resume strictly after the key the previous page ended on, so a
+                // member removed meanwhile cannot hide the members that follow it.
+                if after.as_deref().is_some_and(|after| key.as_str() <= after) {
+                    continue;
+                }
+                if members.len() == page_size {
+                    next_token = Some(crate::state::encode_cursor(
+                        crate::state::GROUP_MEMBERS_PAGE,
+                        &scope,
+                        &last_key,
+                    ));
+                    break;
+                }
+                // A membership whose object is gone has nothing to report: the
+                // deletes that remove an object remove its memberships with it, so
+                // this is unreachable rather than a hole in the page.
+                if let Some(member) = directory.member_view(membership) {
+                    members.push(member);
+                }
+                last_key = key.clone();
+            }
+        }
+
+        Ok(ListGroupMembersOutput {
+            directory_id: Some(input.directory_id.clone()),
+            realm: Some(realm),
+            member_realm: Some(member_realm),
+            members: Some(members),
+            next_token,
+        })
     }
 }
