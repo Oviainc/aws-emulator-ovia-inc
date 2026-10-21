@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetControl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetControl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetControl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers with the stored control the requested ARN names, read out of this
+//! service's state (`crate::state`) — the same record `ListControls` summarises — or
+//! `ResourceNotFoundException` when the catalog holds no such control.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +122,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `ControlScope` value whose controls are effective in every Region. The scaffold
+/// generated the enum's wire values as `CONTROL_SCOPE_VALUES` in `super::types`; this
+/// names the one this handler branches on.
+const CONTROL_SCOPE_GLOBAL: &str = "GLOBAL";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -200,18 +199,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetControl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetControlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetControl"))
+        // `ctx` carries request metadata only; this operation reads none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetControlErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Control Catalog store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // The ARN's form is already checked against the modeled `ControlArn` pattern
+        // before this handler runs, so a malformed ARN never reaches here: what is left
+        // to decide is whether the catalog holds the control it names.
+        let Some(control) = state.resolve_control(&input.control_arn) else {
+            return Err(GetControlErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "the Control Catalog holds no control with the ARN {}",
+                        input.control_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetControlOutput {
+            // Always the `controlcatalog` ARN, whichever accepted form was asked with.
+            arn: control.arn.clone(),
+            aliases: Some(control.aliases.clone()),
+            name: control.name.clone(),
+            description: control.description.clone(),
+            behavior: control.behavior.clone(),
+            severity: control.severity.clone(),
+            region_configuration: RegionConfiguration {
+                scope: control.region_configuration.scope.clone(),
+                // A control whose scope is GLOBAL does not show DeployableRegions,
+                // because the field does not apply to it.
+                deployable_regions: if control.region_configuration.scope == CONTROL_SCOPE_GLOBAL {
+                    None
+                } else {
+                    Some(control.region_configuration.deployable_regions.clone())
+                },
+            },
+            implementation: control
+                .implementation
+                .as_ref()
+                .map(|implementation| ImplementationDetails {
+                    r#type: implementation.implementation_type.clone(),
+                    identifier: implementation.identifier.clone(),
+                }),
+            parameter_requirement_summary: control.parameter_requirement_summary.clone(),
+            parameters: Some(
+                control
+                    .parameters
+                    .iter()
+                    .map(|parameter| ControlParameter {
+                        name: parameter.name.clone(),
+                        requirement: parameter.requirement.clone(),
+                    })
+                    .collect(),
+            ),
+            create_time: Some(::aws_smithy_types::DateTime::from_secs(control.create_time)),
+            governed_resources: Some(control.governed_resources.clone()),
+            governed_providers: Some(control.governed_providers.clone()),
+        })
     }
 }
