@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutObject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutObject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutObject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This emulator does not model the CONTAINER dimension (see `crate::state`), so the
+//! modelled `ContainerNotFoundException` is unreachable and a request is served as if
+//! its container exists.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +165,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutObject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutObjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutObject"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutObjectErrorModeled::InternalServerError(InternalServerError {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+        })?;
+
+        // The model types `StorageClass` and `UploadAvailability` as enum SHAPES, whose
+        // membership the boundary validator does not check (it enforces `@length` and
+        // `@pattern` only), so a value outside the set is refused here. The model
+        // declares no client-input error for `PutObject`, so this is the framework's
+        // 400 `ValidationException` rather than a modelled shape.
+        let storage_class = match input.storage_class.as_deref() {
+            None => crate::state::DEFAULT_STORAGE_CLASS.to_string(),
+            Some(value) if STORAGE_CLASS_VALUES.contains(&value) => value.to_string(),
+            Some(other) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "StorageClass must be one of [{}], got `{other}`",
+                    STORAGE_CLASS_VALUES.join(", ")
+                )))
+            }
+        };
+        if let Some(other) = input
+            .upload_availability
+            .as_deref()
+            .filter(|value| !UPLOAD_AVAILABILITY_VALUES.contains(value))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "UploadAvailability must be one of [{}], got `{other}`",
+                UPLOAD_AVAILABILITY_VALUES.join(", ")
+            )));
+        }
+
+        // The documented object-size ceiling for this upload availability, refused
+        // BEFORE the body is digested or retained.
+        let max_bytes = crate::state::max_object_bytes(input.upload_availability.as_deref());
+        if input.body.len() > max_bytes {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Body may be at most {max_bytes} bytes for {} upload availability, got {}",
+                input
+                    .upload_availability
+                    .as_deref()
+                    .unwrap_or("STANDARD")
+                    .to_ascii_lowercase(),
+                input.body.len()
+            )));
+        }
+
+        // Storing under the normalized path is what makes a later Describe/Get/List of
+        // the same path (with or without its leading `/`) find this object; a Put over
+        // an existing path replaces it, which is how an object store overwrites.
+        let key = crate::state::normalize_object_path(&input.path);
+        let stored = crate::state::StoredObject::new(
+            input.body,
+            input.content_type,
+            input.cache_control,
+            storage_class,
+            input.upload_availability,
+        );
+        let output = PutObjectOutput {
+            content_sha256: Some(stored.content_sha256.clone()),
+            e_tag: Some(stored.etag.clone()),
+            storage_class: Some(stored.storage_class.clone()),
+        };
+        let mut objects = state.lock();
+        // The store's own ceilings on how many objects and how many bytes this emulator
+        // retains; see the bounds section of `crate::state`.
+        objects
+            .check_capacity(&key, stored.body.len())
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        objects.store_object(key, stored);
+        Ok(output)
     }
 }

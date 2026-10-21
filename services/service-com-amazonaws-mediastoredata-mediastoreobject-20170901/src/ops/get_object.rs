@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetObject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetObject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetObject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This emulator does not model the CONTAINER dimension (see `crate::state`), so the
+//! modelled `ContainerNotFoundException` is unreachable and a request is served as if
+//! its container exists. `Range` is likewise always honoured: the "ignored for a
+//! partially uploaded object with streaming upload availability" case needs an
+//! in-progress upload, which the stored object model does not carry.
 //!
 //! ## Shape of an operation
 //!
@@ -168,6 +165,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "GetObject";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::GET_OBJECT_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::GET_OBJECT_OUTPUT_SCHEMA;
+    // The DEFAULT success status. The modelled `StatusCode` member is
+    // `@httpResponseCode`, which the serializer applies over this constant, so a range
+    // answer really is HTTP 206 on the wire and not merely 206 in a field — see the
+    // `206`/`Content-Range` assertions in `tests/all/object_lifecycle.rs`.
     const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
@@ -175,18 +176,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetObject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetObjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetObject"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetObjectErrorModeled::InternalServerError(InternalServerError {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+        })?;
+
+        // Reporting only: the body and every header come from the object `PutObject`
+        // stored, so a Get never changes what a later caller sees.
+        let key = crate::state::normalize_object_path(&input.path);
+        let objects = state.lock();
+        let object = objects.objects.get(&key).ok_or_else(|| {
+            GetObjectErrorModeled::ObjectNotFoundException(ObjectNotFoundException {
+                message: Some(
+                    "Could not perform an operation on an object that does not exist.".to_string(),
+                ),
+            })
+        })?;
+
+        let total = object.body.len() as u64;
+        // A `Range` narrows the answer to one byte span; a range no byte of the object
+        // satisfies is the modelled 416 rather than a short read.
+        let span = match input.range.as_deref() {
+            None => None,
+            Some(range) => Some(ByteSpan::resolve(range, total).ok_or_else(|| {
+                GetObjectErrorModeled::RequestedRangeNotSatisfiableException(
+                    RequestedRangeNotSatisfiableException {
+                        message: Some(format!(
+                            "The requested range `{range}` is not valid for an object of {total} bytes."
+                        )),
+                    },
+                )
+            })?),
+        };
+
+        // HTTP 206 with the span's own `Content-Length` and the `Content-Range` the
+        // model declares; HTTP 200 and the whole object otherwise.
+        let (body, content_range, status_code) = match span {
+            None => (object.body.clone(), None, FULL_CONTENT_STATUS),
+            Some(span) => (
+                object.body[span.first as usize..=span.last as usize].to_vec(),
+                Some(span.content_range(total)),
+                PARTIAL_CONTENT_STATUS,
+            ),
+        };
+
+        Ok(GetObjectOutput {
+            content_length: Some(body.len() as i64),
+            body,
+            cache_control: object.cache_control.clone(),
+            content_range,
+            content_type: object.content_type.clone(),
+            e_tag: Some(object.etag.clone()),
+            last_modified: Some(::aws_smithy_types::DateTime::from(object.last_modified)),
+            status_code,
+        })
+    }
+}
+
+/// The modelled `StatusCode` of a whole-object answer.
+const FULL_CONTENT_STATUS: i32 = 200;
+
+/// The modelled `StatusCode` of a byte-range answer (HTTP `206 Partial Content`).
+const PARTIAL_CONTENT_STATUS: i32 = 206;
+
+/// An inclusive, satisfiable byte span of a stored object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ByteSpan {
+    /// First byte of the span, `0`-based.
+    first: u64,
+    /// Last byte of the span, inclusive — never past the end of the object.
+    last: u64,
+}
+
+impl ByteSpan {
+    /// The span a `Range` header selects from an object of `total` bytes, or `None`
+    /// when no byte of the object satisfies it.
+    ///
+    /// The modelled `RangePattern` (`^bytes=(?:\d+\-\d*|\d*\-\d+)$`) admits the three
+    /// RFC 9110 byte-range forms, read here with RFC 9110 §14.1.2 semantics: `first-last`
+    /// (clamped to the last byte), `first-` (to the end of the object), and `-suffix`
+    /// (the final `suffix` bytes). A first byte at or past the end, an inverted span, a
+    /// zero-length suffix, and an empty object satisfy nothing.
+    fn resolve(range: &str, total: u64) -> Option<Self> {
+        let (start, end) = range.strip_prefix("bytes=")?.split_once('-')?;
+        if total == 0 {
+            return None;
+        }
+        let span = match (start.is_empty(), end.is_empty()) {
+            // `-suffix`: the last `suffix` bytes, clamped to the whole object.
+            (true, false) => {
+                let suffix = end.parse::<u64>().ok()?;
+                if suffix == 0 {
+                    return None;
+                }
+                Self {
+                    first: total.saturating_sub(suffix),
+                    last: total - 1,
+                }
+            }
+            // `first-`: from `first` to the end of the object.
+            (false, true) => Self {
+                first: start.parse::<u64>().ok()?,
+                last: total - 1,
+            },
+            // `first-last`: `last` past the end means to the end of the object.
+            (false, false) => Self {
+                first: start.parse::<u64>().ok()?,
+                last: end.parse::<u64>().ok()?.min(total - 1),
+            },
+            // `bytes=-` names no bytes; the modelled pattern already refuses it.
+            (true, true) => return None,
+        };
+        (span.first <= span.last && span.first < total).then_some(span)
+    }
+
+    /// The `Content-Range` header value for this span of an object of `total` bytes,
+    /// in the form the modelled `ContentRangePattern` (`^bytes=\d+\-\d+/\d+$`) declares.
+    fn content_range(&self, total: u64) -> String {
+        format!("bytes={}-{}/{}", self.first, self.last, total)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ByteSpan;
+
+    /// Every row the modelled `RangePattern` admits, over one object length.
+    #[test]
+    fn byte_span_follows_the_rfc_9110_range_forms() {
+        /// One row: the `Range` header, the object's byte length, and the span it
+        /// selects (`None` when no byte of the object satisfies it).
+        type Case = (&'static str, u64, Option<(u64, u64)>);
+        let cases: &[Case] = &[
+            ("bytes=0-4", 16, Some((0, 4))),
+            ("bytes=0-0", 16, Some((0, 0))),
+            ("bytes=15-15", 16, Some((15, 15))),
+            ("bytes=10-99", 16, Some((10, 15))),
+            ("bytes=0-", 16, Some((0, 15))),
+            ("bytes=15-", 16, Some((15, 15))),
+            ("bytes=-5", 16, Some((11, 15))),
+            ("bytes=-99", 16, Some((0, 15))),
+            ("bytes=16-", 16, None),
+            ("bytes=100-200", 16, None),
+            ("bytes=-0", 16, None),
+            ("bytes=0-4", 0, None),
+        ];
+        for (range, total, expected) in cases {
+            let actual = ByteSpan::resolve(range, *total).map(|s| (s.first, s.last));
+            assert_eq!(
+                actual, *expected,
+                "case {range:?} over {total} bytes: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_range_renders_the_modelled_form() {
+        let span = ByteSpan::resolve("bytes=0-4", 16).expect("bytes=0-4 of 16 is satisfiable");
+        let actual = span.content_range(16);
+        assert_eq!(
+            actual, "bytes=0-4/16",
+            "Content-Range must match ^bytes=\\d+\\-\\d+/\\d+$, got {actual:?}"
+        );
     }
 }

@@ -21,13 +21,13 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# SHA-256: PutObject's ContentSHA256 and the content-derived ETag.
+sha2 = { workspace = true }
+# Hex: the modelled SHA256Hash/ETag rendering and the opaque ListItems NextToken.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

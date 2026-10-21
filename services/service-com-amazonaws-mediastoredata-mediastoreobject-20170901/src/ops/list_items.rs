@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListItems
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListItems`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListItems::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This emulator does not model the CONTAINER dimension (see `crate::state`), so the
+//! modelled `ContainerNotFoundException` is unreachable and a request is served as if
+//! its container exists.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +81,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::collections::BTreeMap;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,18 +152,203 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListItems` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListItemsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListItems"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListItemsErrorModeled::InternalServerError(InternalServerError {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+        })?;
+
+        let prefix = crate::state::folder_prefix(input.path.as_deref());
+
+        // A continuation token names the entry the previous page ended on, for this same
+        // folder. It is opaque but self-contained, so listing stays a pure read: nothing
+        // about a `ListItems` call changes what a later caller sees.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_token(token, &prefix).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(
+                    "NextToken is not a token this service issued for the requested Path",
+                )
+            })?),
+        };
+
+        // One entry per immediate child of the folder, built from the stored objects:
+        // an OBJECT for a key that ends in the folder, a FOLDER for the first segment of
+        // a key that continues past it. Only the prefix's own range of the store is
+        // walked, so the work is bounded by the folder rather than by the whole store.
+        // Keyed in a `BTreeMap` so the enumeration order is the children's
+        // lexicographic order, which is what makes a cursor continuable.
+        let objects = state.lock();
+        let mut entries: BTreeMap<EntryKey, Item> = BTreeMap::new();
+        let in_folder = objects
+            .objects
+            .range(prefix.clone()..)
+            .take_while(|(key, _)| key.starts_with(&prefix));
+        for (key, object) in in_folder {
+            let Some(remainder) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            if remainder.is_empty() {
+                continue;
+            }
+            match remainder.split_once('/') {
+                Some((folder, _)) => {
+                    entries
+                        .entry((folder.to_string(), FOLDER_RANK))
+                        .or_insert_with(|| Item {
+                            name: Some(folder.to_string()),
+                            r#type: Some(ITEM_TYPE_FOLDER.to_string()),
+                            e_tag: None,
+                            last_modified: None,
+                            content_type: None,
+                            content_length: None,
+                        });
+                }
+                None => {
+                    entries.insert(
+                        (remainder.to_string(), OBJECT_RANK),
+                        Item {
+                            name: Some(remainder.to_string()),
+                            r#type: Some(ITEM_TYPE_OBJECT.to_string()),
+                            e_tag: Some(object.etag.clone()),
+                            last_modified: Some(::aws_smithy_types::DateTime::from(
+                                object.last_modified,
+                            )),
+                            content_type: object.content_type.clone(),
+                            content_length: Some(object.content_length),
+                        },
+                    );
+                }
+            }
+        }
+
+        // `MaxResults` is a hard page bound; the model bounds it to 1..1000 and the
+        // boundary validator already refuses a value outside that range with a 400, so
+        // the clamp below is only a backstop. An absent one "defaults to pagination with
+        // a maximum of 1,000 results per page", per the operation's documentation.
+        let page_size = input
+            .max_results
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .clamp(1, DEFAULT_MAX_RESULTS) as usize;
+
+        let mut remaining = entries
+            .into_iter()
+            .skip_while(|(entry, _)| resume_after.as_ref().is_some_and(|cursor| entry <= cursor));
+        let page: Vec<(EntryKey, Item)> = remaining.by_ref().take(page_size).collect();
+        // A token is issued only when an entry is actually left over, so the final page
+        // carries none.
+        let next_token = match (remaining.next(), page.last()) {
+            (Some(_), Some((last, _))) => Some(encode_token(&prefix, last)),
+            _ => None,
+        };
+
+        Ok(ListItemsOutput {
+            items: Some(page.into_iter().map(|(_, item)| item).collect()),
+            next_token,
+        })
+    }
+}
+
+/// The page bound applied when the request names no `MaxResults`, which is also the
+/// model's `ListLimit` maximum.
+const DEFAULT_MAX_RESULTS: i32 = 1000;
+
+/// The `ItemType` of a sub-folder of the listed folder (see `ITEM_TYPE_VALUES`).
+const ITEM_TYPE_FOLDER: &str = "FOLDER";
+
+/// The `ItemType` of an object stored directly in the listed folder (see
+/// `ITEM_TYPE_VALUES`).
+const ITEM_TYPE_OBJECT: &str = "OBJECT";
+
+/// Order rank of a FOLDER entry, so a folder and an object of the same name keep a
+/// stable relative order.
+const FOLDER_RANK: u8 = 0;
+
+/// Order rank of an OBJECT entry; see [`FOLDER_RANK`].
+const OBJECT_RANK: u8 = 1;
+
+/// One listed child of a folder, ordered by name and then by kind: the unit a page
+/// boundary falls on.
+type EntryKey = (String, u8);
+
+/// The opaque `NextToken` that resumes a listing of `prefix` after `entry`.
+///
+/// The cursor travels inside the token (hex of `<prefix>\n<rank>/<name>`), so the
+/// service keeps no pagination state and a token stays valid across calls. `\n` and
+/// `/` cannot appear in a child name — the modelled path pattern admits neither — so
+/// the encoding is unambiguous. The 15-minute token lifetime AWS documents is
+/// deliberately not emulated: a token here never expires, which is strictly more
+/// permissive, and the operation models no expiry error to answer with.
+fn encode_token(prefix: &str, entry: &EntryKey) -> String {
+    let (name, rank) = entry;
+    hex::encode(format!("{prefix}\n{rank}/{name}"))
+}
+
+/// The cursor a `NextToken` carries, or `None` when it is not a token this service
+/// issued for `prefix`.
+fn decode_token(token: &str, prefix: &str) -> Option<EntryKey> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    let (token_prefix, cursor) = decoded.split_once('\n')?;
+    if token_prefix != prefix {
+        return None;
+    }
+    let (rank, name) = cursor.split_once('/')?;
+    Some((name.to_string(), rank.parse::<u8>().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        decode_token, encode_token, EntryKey, FOLDER_RANK, ITEM_TYPE_FOLDER, ITEM_TYPE_OBJECT,
+        OBJECT_RANK,
+    };
+    use crate::ops::types::ITEM_TYPE_VALUES;
+
+    /// The two kinds this operation reports are the model's own `ItemType` values.
+    #[test]
+    fn item_types_are_modelled_values() {
+        for kind in [ITEM_TYPE_FOLDER, ITEM_TYPE_OBJECT] {
+            assert!(
+                ITEM_TYPE_VALUES.contains(&kind),
+                "case {kind:?}: expected one of {ITEM_TYPE_VALUES:?}, got {kind:?}"
+            );
+        }
+    }
+
+    /// A token round-trips its cursor for the folder it was issued for, and is refused
+    /// for any other folder or when it is not a token at all.
+    #[test]
+    fn token_round_trips_per_folder() {
+        let cases: &[(&str, EntryKey)] = &[
+            ("", ("a.txt".to_string(), OBJECT_RANK)),
+            ("folder/", ("b.txt".to_string(), OBJECT_RANK)),
+            ("folder/", ("nested".to_string(), FOLDER_RANK)),
+            (
+                "a/b/c/d/e/f/g/h/i/j/",
+                ("deep~file.1".to_string(), OBJECT_RANK),
+            ),
+        ];
+        for (prefix, entry) in cases {
+            let token = encode_token(prefix, entry);
+            let actual = decode_token(&token, prefix);
+            assert_eq!(
+                actual.as_ref(),
+                Some(entry),
+                "case ({prefix:?}, {entry:?}): expected the cursor back, got {actual:?}"
+            );
+            let other = decode_token(&token, "other/");
+            assert!(
+                other.is_none(),
+                "case ({prefix:?}, {entry:?}): a token of another folder must be refused, got {other:?}"
+            );
+        }
+        for bad in ["", "zz", "6e6f742d612d746f6b656e"] {
+            let actual = decode_token(bad, "folder/");
+            assert!(
+                actual.is_none(),
+                "case {bad:?}: a malformed token must be refused, got {actual:?}"
+            );
+        }
     }
 }
