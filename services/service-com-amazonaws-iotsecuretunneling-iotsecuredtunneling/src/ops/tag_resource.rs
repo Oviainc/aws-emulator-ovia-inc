@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges the supplied tags into the tag store of the tunnel `resourceArn` names,
+//! overwriting a tag that already carries that key.
 //!
 //! ## Shape of an operation
 //!
@@ -132,18 +126,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("TagResource"))?;
+
+        let mut store = state.lock();
+        // An ARN that names no stored tunnel has nothing to tag.
+        if store.tunnel_id_for_arn(&input.resource_arn).is_none() {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Resource {} not found", input.resource_arn)),
+                },
+            )
+            .into());
+        }
+
+        // A tunnel carries at most `MAX_TAGS_PER_TUNNEL` tags. The modelled list
+        // length bounds one request, not the set a resource accumulates over
+        // repeated calls, so the merged key count is checked here — and the store
+        // is left untouched when the request would take it past the limit. The
+        // service models no "too many tags" error, so this is a 400.
+        let merged = store.merged_tag_count(&input.resource_arn, &input.tags);
+        if merged > crate::state::MAX_TAGS_PER_TUNNEL {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "tags would take this resource to {merged} tags; a tunnel carries at most {}",
+                crate::state::MAX_TAGS_PER_TUNNEL
+            )));
+        }
+
+        let stored = store.tags.entry(input.resource_arn.clone()).or_default();
+        for tag in &input.tags {
+            stored.insert(tag.key.clone(), tag.value.clone());
+        }
+        drop(store);
+
+        Ok(TagResourceOutput {})
     }
 }
