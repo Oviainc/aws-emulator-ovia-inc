@@ -193,7 +193,25 @@ pub struct SipRule {
     pub updated_timestamp: Option<::aws_smithy_types::DateTime>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.chimesdkvoice#VoiceConnector")]
+// `VoiceConnector` is the ONE shape in this module whose schema is written out by hand
+// rather than produced by `#[smithy_macros::smithy(shape = ...)]`, and the reason is a
+// single trait the macro does not read: `@timestampFormat`.
+//
+// The model targets `CreatedTimestamp`/`UpdatedTimestamp` at `Iso8601Timestamp`, which
+// carries `@timestampFormat("date-time")` (`smithy_query(query="shape",
+// shape="VoiceConnector")` reports `"timestampFormat": "date-time"` on both members).
+// The vendored codegen never emits `with_timestamp_format`, so a macro-built member
+// schema reports no format and the restJson1 JSON codec falls back to its protocol
+// default, epoch seconds — a NUMBER where the model (and every AWS SDK's generated
+// deserializer for a `date-time` member) requires an ISO-8601 string. The hand-written
+// member schemas below differ from the macro's output in exactly that one chain call.
+//
+// Everything else mirrors the macro's output for a structure: one `M_<MEMBER>` member
+// schema per member (index = position in the member list), a `SCHEMA` naming them in
+// order, the `<SHAPE>_SCHEMA` alias, and the serialize/deserialize pair. Constraint
+// traits are deliberately absent: the validating walk runs on operation INPUTS only, and
+// `VoiceConnector` is an output shape, so the macro's captured constraints would be inert
+// here too (see the note in the vendored macro's `emit_struct_impls`).
 #[derive(Debug, Clone, Default)]
 pub struct VoiceConnector {
     pub voice_connector_id: Option<String>,
@@ -206,6 +224,226 @@ pub struct VoiceConnector {
     pub voice_connector_arn: Option<String>,
     pub integration_type: Option<String>,
     pub network_type: Option<String>,
+}
+
+#[allow(non_upper_case_globals)]
+impl VoiceConnector {
+    const SHAPE_ID: &'static str = "com.amazonaws.chimesdkvoice#VoiceConnector";
+    const NAMESPACE: &'static str = "com.amazonaws.chimesdkvoice";
+
+    pub const M_VOICE_CONNECTOR_ID: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.chimesdkvoice#VoiceConnector$VoiceConnectorId",
+                Self::NAMESPACE,
+                "VoiceConnectorId",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "VoiceConnectorId",
+            0,
+        );
+    pub const M_AWS_REGION: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.chimesdkvoice#VoiceConnector$AwsRegion",
+                Self::NAMESPACE,
+                "AwsRegion",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "AwsRegion",
+            1,
+        );
+    pub const M_NAME: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.chimesdkvoice#VoiceConnector$Name",
+            Self::NAMESPACE,
+            "Name",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Name",
+        2,
+    );
+    pub const M_OUTBOUND_HOST_NAME: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.chimesdkvoice#VoiceConnector$OutboundHostName",
+                Self::NAMESPACE,
+                "OutboundHostName",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "OutboundHostName",
+            3,
+        );
+    pub const M_REQUIRE_ENCRYPTION: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.chimesdkvoice#VoiceConnector$RequireEncryption",
+                Self::NAMESPACE,
+                "RequireEncryption",
+            ),
+            ::aws_smithy_schema::ShapeType::Boolean,
+            "RequireEncryption",
+            4,
+        );
+    /// `@timestampFormat("date-time")` from `Iso8601Timestamp` — the chain the macro
+    /// cannot emit.
+    pub const M_CREATED_TIMESTAMP: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.chimesdkvoice#VoiceConnector$CreatedTimestamp",
+                Self::NAMESPACE,
+                "CreatedTimestamp",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "CreatedTimestamp",
+            5,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    /// `@timestampFormat("date-time")`, as for `CreatedTimestamp`.
+    pub const M_UPDATED_TIMESTAMP: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.chimesdkvoice#VoiceConnector$UpdatedTimestamp",
+                Self::NAMESPACE,
+                "UpdatedTimestamp",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "UpdatedTimestamp",
+            6,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    pub const M_VOICE_CONNECTOR_ARN: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.chimesdkvoice#VoiceConnector$VoiceConnectorArn",
+                Self::NAMESPACE,
+                "VoiceConnectorArn",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "VoiceConnectorArn",
+            7,
+        );
+    pub const M_INTEGRATION_TYPE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.chimesdkvoice#VoiceConnector$IntegrationType",
+                Self::NAMESPACE,
+                "IntegrationType",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "IntegrationType",
+            8,
+        );
+    pub const M_NETWORK_TYPE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.chimesdkvoice#VoiceConnector$NetworkType",
+                Self::NAMESPACE,
+                "NetworkType",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "NetworkType",
+            9,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            Self::SHAPE_ID,
+            Self::NAMESPACE,
+            "VoiceConnector",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_VOICE_CONNECTOR_ID,
+            &Self::M_AWS_REGION,
+            &Self::M_NAME,
+            &Self::M_OUTBOUND_HOST_NAME,
+            &Self::M_REQUIRE_ENCRYPTION,
+            &Self::M_CREATED_TIMESTAMP,
+            &Self::M_UPDATED_TIMESTAMP,
+            &Self::M_VOICE_CONNECTOR_ARN,
+            &Self::M_INTEGRATION_TYPE,
+            &Self::M_NETWORK_TYPE,
+        ],
+    );
+}
+
+pub static VOICE_CONNECTOR_SCHEMA: &::aws_smithy_schema::Schema = &VoiceConnector::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for VoiceConnector {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.voice_connector_id.as_ref() {
+            s.write_string(&Self::M_VOICE_CONNECTOR_ID, v.as_str())?;
+        }
+        if let Some(v) = self.aws_region.as_ref() {
+            s.write_string(&Self::M_AWS_REGION, v.as_str())?;
+        }
+        if let Some(v) = self.name.as_ref() {
+            s.write_string(&Self::M_NAME, v.as_str())?;
+        }
+        if let Some(v) = self.outbound_host_name.as_ref() {
+            s.write_string(&Self::M_OUTBOUND_HOST_NAME, v.as_str())?;
+        }
+        if let Some(v) = self.require_encryption.as_ref() {
+            s.write_boolean(&Self::M_REQUIRE_ENCRYPTION, *v)?;
+        }
+        if let Some(v) = self.created_timestamp.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_TIMESTAMP, v)?;
+        }
+        if let Some(v) = self.updated_timestamp.as_ref() {
+            s.write_timestamp(&Self::M_UPDATED_TIMESTAMP, v)?;
+        }
+        if let Some(v) = self.voice_connector_arn.as_ref() {
+            s.write_string(&Self::M_VOICE_CONNECTOR_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.integration_type.as_ref() {
+            s.write_string(&Self::M_INTEGRATION_TYPE, v.as_str())?;
+        }
+        if let Some(v) = self.network_type.as_ref() {
+            s.write_string(&Self::M_NETWORK_TYPE, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for VoiceConnector {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => {
+                    out.voice_connector_id = Some(d.read_string(&Self::M_VOICE_CONNECTOR_ID)?)
+                }
+                Some(1) => out.aws_region = Some(d.read_string(&Self::M_AWS_REGION)?),
+                Some(2) => out.name = Some(d.read_string(&Self::M_NAME)?),
+                Some(3) => {
+                    out.outbound_host_name = Some(d.read_string(&Self::M_OUTBOUND_HOST_NAME)?)
+                }
+                Some(4) => {
+                    out.require_encryption = Some(d.read_boolean(&Self::M_REQUIRE_ENCRYPTION)?)
+                }
+                Some(5) => {
+                    out.created_timestamp = Some(d.read_timestamp(&Self::M_CREATED_TIMESTAMP)?)
+                }
+                Some(6) => {
+                    out.updated_timestamp = Some(d.read_timestamp(&Self::M_UPDATED_TIMESTAMP)?)
+                }
+                Some(7) => {
+                    out.voice_connector_arn = Some(d.read_string(&Self::M_VOICE_CONNECTOR_ARN)?)
+                }
+                Some(8) => out.integration_type = Some(d.read_string(&Self::M_INTEGRATION_TYPE)?),
+                Some(9) => out.network_type = Some(d.read_string(&Self::M_NETWORK_TYPE)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.chimesdkvoice#VoiceConnectorItem")]
