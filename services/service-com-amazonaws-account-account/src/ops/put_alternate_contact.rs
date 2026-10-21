@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAlternateContact
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAlternateContact`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAlternateContact::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Upserts one alternate contact of the named type on the resolved account: at
+//! most one contact per `AlternateContactType`, so a second call with the same
+//! type overwrites the stored record rather than adding a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +181,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAlternateContact` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAlternateContactErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAlternateContact"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutAlternateContactErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                    error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // Every modelled constraint on this input (the four required contact
+        // members with their lengths and patterns, `AccountId`'s `^\d{12}$`) was
+        // already refused at the boundary; what the model cannot express is that
+        // `AlternateContactType` must name a type this service stores.
+        let Some(contact_type) =
+            crate::state::AlternateContactType::from_wire(&input.alternate_contact_type)
+        else {
+            return Err(PutAlternateContactErrorModeled::ValidationException(
+                crate::state::invalid_alternate_contact_type(&input.alternate_contact_type),
+            )
+            .into());
+        };
+
+        let account_id = crate::state::resolve_account_id(input.account_id.as_deref());
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::AlternateContactRecord {
+            name: input.name,
+            title: input.title,
+            email_address: input.email_address,
+            phone_number: input.phone_number,
+            contact_type,
+        };
+        let mut store = state.lock();
+        let Some(account) = store.account_mut(&account_id, now) else {
+            return Err(PutAlternateContactErrorModeled::AccessDeniedException(
+                crate::state::account_store_full(&account_id),
+            )
+            .into());
+        };
+        // Keyed by the contact type, so this is an upsert: the operation is
+        // `@idempotent` and an account holds at most one contact of each type.
+        account.alternate_contacts.insert(contact_type, record);
+
+        Ok(PutAlternateContactOutput)
     }
 }
