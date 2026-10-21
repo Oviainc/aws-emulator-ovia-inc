@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTables
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTables`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: pages over the tables held in [`crate::state`], in name order — the
+//! named database's tables, or every database's tables when `DatabaseName` is omitted.
+//! `ResourceNotFoundException` (404) when the named database does not exist, and
+//! `ValidationException` (400) for a `NextToken` this service did not issue.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTables::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,20 +152,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTables` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTablesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTables"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTablesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Timestream Write store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The model bounds `MaxResults` to 1..20, so the largest page a caller can ask
+        // for is also the page size used when the caller asks for none.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::MAX_PAGE_SIZE)
+                .clamp(1, crate::state::MAX_PAGE_SIZE),
+        )
+        .unwrap_or(1);
+
+        let start = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_table_cursor(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListTablesErrorModeled::ValidationException(ValidationException {
+                        message: "The pagination token is not valid".to_string(),
+                    })
+                    .into())
+                }
+            },
+        };
+
+        let store = state.lock();
+        let candidates: Vec<&crate::state::TableEntry> = match input.database_name.as_deref() {
+            Some(database_name) => {
+                let Some(database) = store.databases.get(database_name) else {
+                    return Err(ListTablesErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "The database '{database_name}' does not exist"
+                            )),
+                        },
+                    )
+                    .into());
+                };
+                database.tables.values().collect()
+            }
+            None => store.all_tables().collect(),
+        };
+
+        // Both sources iterate the nested name-ordered `BTreeMap`s, i.e. in
+        // `(database name, table name)` order, so the resume test compares that same
+        // PAIR. Comparing the joined `<db>/<table>` cursor as a string would not:
+        // `/` sorts above the `-` and `.` a name may contain, so a page could repeat
+        // an entry and re-issue its own token forever.
+        let mut tables = Vec::with_capacity(page_size.min(candidates.len()));
+        let mut next_token = None;
+        for table in candidates {
+            let here = (&table.database_name, &table.table_name);
+            if start
+                .as_ref()
+                .is_some_and(|(database, name)| here < (database, name))
+            {
+                continue;
+            }
+            if tables.len() == page_size {
+                next_token = Some(crate::state::encode_next_token(&crate::state::table_cursor(
+                    &table.database_name,
+                    &table.table_name,
+                )));
+                break;
+            }
+            tables.push(table.to_wire());
+        }
+
+        Ok(ListTablesOutput {
+            tables: Some(tables),
+            next_token,
+        })
     }
 }

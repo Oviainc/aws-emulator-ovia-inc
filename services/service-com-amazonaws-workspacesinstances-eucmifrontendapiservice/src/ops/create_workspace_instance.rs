@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkspaceInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkspaceInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkspaceInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +152,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkspaceInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkspaceInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkspaceInstance"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateWorkspaceInstanceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the WorkSpaces Instances store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // `@idempotent` + `@idempotencyToken`: a repeat call carrying a token this
+        // service has already created for replays the SAME id and creates nothing.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = state.client_tokens.get(token) {
+                return Ok(CreateWorkspaceInstanceOutput {
+                    workspace_instance_id: Some(existing.clone()),
+                });
+            }
+        }
+
+        // A real account has a Service Quotas limit on WorkSpace Instances, and this
+        // operation models `ServiceQuotaExceededException` for reaching it. Capacity
+        // is released by DeleteWorkspaceInstance.
+        if !state.has_instance_capacity() {
+            return Err(
+                CreateWorkspaceInstanceErrorModeled::ServiceQuotaExceededException(
+                    crate::state::instance_quota_exceeded(state.instances.len()),
+                )
+                .into(),
+            );
+        }
+
+        let (instance_id, ec2_instance_id) = state.mint_ids();
+        // Tags arrive as a list of `Tag{Key, Value}`, both optional in the model; a
+        // repeated key keeps the last value, which is what merging onto a map gives.
+        let mut tags = std::collections::BTreeMap::new();
+        for tag in input.tags.unwrap_or_default() {
+            if let Some(key) = tag.key {
+                tags.insert(key, tag.value.unwrap_or_default());
+            }
+        }
+
+        let record = crate::state::WorkspaceInstanceRecord {
+            id: instance_id.clone(),
+            // The instance is launched, not ready: it starts in the non-terminal
+            // `ALLOCATING` state and the move to `ALLOCATED` falls due one
+            // `ALLOCATION_SPAN` from now.
+            provision_state: crate::state::PROVISION_STATE_ALLOCATING.to_string(),
+            managed_instance: input.managed_instance,
+            ec2_instance_id,
+            // The model documents hourly billing as the default when the call supplies
+            // no `BillingConfiguration`, and Get reports the ACTIVE configuration, so
+            // the default is materialised here rather than left absent.
+            billing_configuration: input.billing_configuration.unwrap_or(BillingConfiguration {
+                billing_mode: crate::state::DEFAULT_BILLING_MODE.to_string(),
+            }),
+            tags,
+            client_token: input.client_token.clone(),
+            created_at: std::time::SystemTime::now(),
+            allocation_due: std::time::Instant::now() + crate::state::ALLOCATION_SPAN,
+        };
+
+        if let Some(token) = input.client_token {
+            state.client_tokens.insert(token, instance_id.clone());
+        }
+        state.instances.insert(instance_id.clone(), record);
+
+        Ok(CreateWorkspaceInstanceOutput {
+            workspace_instance_id: Some(instance_id),
+        })
     }
 }
