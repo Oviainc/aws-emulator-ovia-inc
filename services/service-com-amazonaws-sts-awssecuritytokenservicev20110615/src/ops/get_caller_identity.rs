@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCallerIdentity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCallerIdentity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCallerIdentity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the identity the request's credential speaks for: the access key id in the
+//! request's SigV4 `Credential=` scope is looked up in this service's session
+//! registry, so a request signed with a credential `AssumeRole` /
+//! `GetSessionToken` / `GetFederationToken` minted reports THAT session's identity,
+//! and one signed with a long-term key reports the ambient identity. Nothing here is
+//! canned: the answer is whatever `crate::state` holds for the presented key.
 //!
 //! ## Shape of an operation
 //!
@@ -83,9 +81,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-sts-awssecuritytokenser
 // here — hence the `GetCallerIdentityError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.sts#GetCallerIdentity")]
+// `GetCallerIdentity` lists no error of its own, so `ExpiredTokenException` — a shape
+// this SERVICE models, with its own 400 status and awsQuery code — is widened in: a
+// request that presents an expired session credential must be refused, and refusing
+// it with the service's own expired-token error is what a client already matches on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.sts#GetCallerIdentity",
+    extra_errors = ["ExpiredTokenException"]
+)]
 #[derive(Debug)]
 pub enum GetCallerIdentityErrorModeled {
+    ExpiredTokenException(ExpiredTokenException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -139,18 +145,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCallerIdentity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCallerIdentityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCallerIdentity"))
+        // `GetCallerIdentity` models no input members: the answer comes entirely from
+        // the credential the request was signed with.
+        let GetCallerIdentityInput {} = input;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This service has no store on the engine it was mounted on, so it cannot
+            // serve anything. The router builds the one engine that does, so this is
+            // unreachable there.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetCallerIdentity",
+            ));
+        };
+
+        let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+        let identity = crate::state::resolve_caller(
+            &mut state.lock(),
+            &access_key_id,
+            ::std::time::SystemTime::now(),
+            ctx.credential_store(),
+        )
+        .map_err(|expired| {
+            GetCallerIdentityErrorModeled::ExpiredTokenException(ExpiredTokenException {
+                message: Some(expired.message()),
+            })
+        })?;
+
+        Ok(GetCallerIdentityOutput {
+            user_id: Some(identity.user_id),
+            account: Some(identity.account),
+            arn: Some(identity.arn),
+        })
     }
 }
