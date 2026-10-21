@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# SHA-256 over the page-cursor payload, so an opaque `NextToken` authenticates as one
+# this emulator issued without storing anything server-side.
+sha2 = { workspace = true }
+# Hex encoding for that cursor, keeping the token within `NextToken`'s `^\S+$` pattern.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
