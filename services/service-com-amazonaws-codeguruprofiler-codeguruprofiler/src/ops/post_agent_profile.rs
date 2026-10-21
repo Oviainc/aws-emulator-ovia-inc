@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PostAgentProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PostAgentProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PostAgentProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores an agent profile against its profiling group — the bytes verbatim, the
+//! `Content-Type` it was posted under, and the receipt time — and records
+//! `profilingStatus.latestAgentProfileReportedAt`. Idempotent on `profileToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +144,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PostAgentProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PostAgentProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PostAgentProfile"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PostAgentProfileErrorModeled::InternalServerException(InternalServerException {
+                message: "the profiling-group store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+        // `post_profile` is the single writer: it honours `profileToken` as an
+        // idempotency token (a replay stores nothing and still succeeds), records
+        // `profilingStatus.latestAgentProfileReportedAt`, and applies every retention
+        // bound — the per-group profile count and byte caps and the store-wide profile
+        // byte budget.
+        match guard.post_profile(
+            &input.profiling_group_name,
+            input.profile_token.as_deref(),
+            crate::state::AgentProfile {
+                bytes: input.agent_profile.clone(),
+                content_type: input.content_type.clone(),
+                received_at: crate::state::now(),
+            },
+        ) {
+            crate::state::PostedProfile::Stored | crate::state::PostedProfile::Replayed => {
+                Ok(PostAgentProfileOutput {})
+            }
+            crate::state::PostedProfile::UnknownGroup => Err(
+                PostAgentProfileErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "no profiling group named {}",
+                            input.profiling_group_name
+                        ),
+                    },
+                )
+                .into(),
+            ),
+        }
     }
 }
