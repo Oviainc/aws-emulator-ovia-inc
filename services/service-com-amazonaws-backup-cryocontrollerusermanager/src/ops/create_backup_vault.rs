@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBackupVault
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBackupVault`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBackupVault::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts a vault record into [`crate::state`] and answers from it. A create
+//! naming a vault that already exists is a RETRY only when it repeats the
+//! stored `CreatorRequestId` and the rest of the stored creation parameters; any
+//! other repeat is refused with `AlreadyExistsException`.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +165,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBackupVault` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBackupVaultErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBackupVault"))
+        // `BackupVaultName`'s `@pattern` is refused by the framework BEFORE this
+        // handler runs, and `crate::service` words that refusal as this service's
+        // own `InvalidParameterValueException`, so reaching here means the name is
+        // one the model admits.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBackupVaultErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the backup vault store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // The model types `EncryptionKeyArn` as `ARN` with no pattern, so the
+        // framework cannot refuse a malformed one; AWS does, rather than
+        // storing a key reference that names nothing.
+        if input
+            .encryption_key_arn
+            .as_deref()
+            .is_some_and(|arn| !crate::state::is_arn(arn))
+        {
+            return Err(
+                CreateBackupVaultErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(
+                            "EncryptionKeyArn must be an ARN of the form \
+                             arn:<partition>:<service>:<region>:<account>:<resource>"
+                                .to_string(),
+                        ),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+        let tags: ::std::collections::BTreeMap<String, String> = input
+            .backup_vault_tags
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
+        let mut store = state.lock();
+        if let Some(existing) = store.vaults.get(&input.backup_vault_name) {
+            // A repeat create is a retry of the ORIGINAL request only when it
+            // carries the same idempotency token and the same creation
+            // parameters; a request with no token is not a retry of anything.
+            let is_retry = input.creator_request_id.is_some()
+                && existing.creator_request_id == input.creator_request_id
+                && existing.encryption_key_arn == input.encryption_key_arn
+                && existing.tags == tags;
+            if !is_retry {
+                return Err(CreateBackupVaultErrorModeled::AlreadyExistsException(
+                    AlreadyExistsException {
+                        message: Some(format!(
+                            "Backup vault {} already exists",
+                            input.backup_vault_name
+                        )),
+                        creator_request_id: existing.creator_request_id.clone(),
+                        arn: Some(existing.arn.clone()),
+                        ..Default::default()
+                    },
+                )
+                .into());
+            }
+            return Ok(CreateBackupVaultOutput {
+                backup_vault_name: Some(existing.name.clone()),
+                backup_vault_arn: Some(existing.arn.clone()),
+                creation_date: Some(::aws_smithy_types::DateTime::from(existing.creation_date)),
+            });
+        }
+
+        // The store is in memory and every request can add to it, so the number
+        // of vaults it keeps is bounded. AWS answers the same modelled error
+        // once an account reaches its own vault quota.
+        if store.vaults.len() >= crate::state::MAX_VAULTS {
+            return Err(CreateBackupVaultErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator keeps at most {} backup vaults",
+                        crate::state::MAX_VAULTS
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let vault = crate::state::BackupVault {
+            name: input.backup_vault_name.clone(),
+            arn: crate::state::backup_vault_arn(&region, &input.backup_vault_name),
+            encryption_key_arn: input.encryption_key_arn,
+            creator_request_id: input.creator_request_id,
+            creation_date: now,
+            vault_type: crate::state::VAULT_TYPE_BACKUP_VAULT.to_string(),
+            vault_state: crate::state::VAULT_STATE_AVAILABLE.to_string(),
+            tags,
+            locked: false,
+            min_retention_days: None,
+            max_retention_days: None,
+        };
+        let output = CreateBackupVaultOutput {
+            backup_vault_name: Some(vault.name.clone()),
+            backup_vault_arn: Some(vault.arn.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(vault.creation_date)),
+        };
+        store
+            .recovery_points_by_vault
+            .entry(vault.name.clone())
+            .or_default();
+        store.vaults.insert(vault.name.clone(), vault);
+        Ok(output)
     }
 }

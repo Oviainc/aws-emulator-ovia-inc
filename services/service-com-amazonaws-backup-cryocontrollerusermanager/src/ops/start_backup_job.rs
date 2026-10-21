@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartBackupJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartBackupJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartBackupJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a backup job and stores BOTH the job and the recovery point it
+//! produces inside the named vault, so `DescribeBackupJob`,
+//! `ListRecoveryPointsByBackupVault` and `DescribeBackupVault` all read the one
+//! stored pair. A replayed `IdempotencyToken` returns the job it already
+//! created rather than minting a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -212,18 +209,250 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartBackupJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartBackupJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartBackupJob"))
+        // `BackupVaultName`, `ResourceArn` and `IamRoleArn` are `@required`, so an
+        // absent one is refused before this handler runs; `crate::service` words
+        // that refusal as `MissingParameterValueException`.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartBackupJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the backup vault store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // A logically air-gapped destination vault is reached only through
+        // `CreateLogicallyAirGappedBackupVault`, which is still unimplemented, so
+        // this emulator cannot honour the copy that member asks for.
+        if input.logically_air_gapped_backup_vault_arn.is_some() {
+            return Err(StartBackupJobErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "LogicallyAirGappedBackupVaultArn is not supported by this emulator"
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // The model types these members as `ARN` with no pattern, so the
+        // framework cannot refuse a malformed one; AWS does. Refusing here keeps
+        // a value the service could never have resolved out of stored state.
+        for (member, value) in [
+            ("ResourceArn", input.resource_arn.as_str()),
+            ("IamRoleArn", input.iam_role_arn.as_str()),
+        ] {
+            if !crate::state::is_arn(value) {
+                return Err(StartBackupJobErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "{member} must be an ARN of the form \
+                             arn:<partition>:<service>:<region>:<account>:<resource>"
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Both backup windows carry a documented range; a value outside it is a
+        // parameter value AWS refuses. `CompleteWindowMinutes` is validated and
+        // then not stored: no modelled output member reports it, and the
+        // emulated job always completes inside any window the range admits.
+        for (member, minutes, minimum) in [
+            (
+                "StartWindowMinutes",
+                input.start_window_minutes,
+                crate::state::MIN_START_WINDOW_MINUTES,
+            ),
+            ("CompleteWindowMinutes", input.complete_window_minutes, 0),
+        ] {
+            let range = minimum..=crate::state::MAX_WINDOW_MINUTES;
+            if minutes.is_some_and(|minutes| !range.contains(&minutes)) {
+                return Err(StartBackupJobErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "{member} must be between {minimum} and {} minutes",
+                            crate::state::MAX_WINDOW_MINUTES
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+        // The one store whose KEYS a caller chooses: forget expired records and
+        // the oldest beyond the ceiling before recording another.
+        store.prune_idempotency_tokens(now);
+
+        let Some(vault) = store.vaults.get(&input.backup_vault_name).cloned() else {
+            return Err(StartBackupJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Backup vault {} not found",
+                        input.backup_vault_name
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+
+        // A replayed idempotency token answers with the job it already created:
+        // no second job, no second recovery point. The token identifies ONE
+        // call, so the replay has to name the same vault, resource and role;
+        // reused on a different call it is not a retry of the stored one, and
+        // the vault is resolved first so a replay naming a vault that no longer
+        // exists is still refused.
+        if let Some(token) = input.idempotency_token.as_deref() {
+            let replay = store
+                .idempotency_tokens
+                .get(token)
+                .and_then(|record| store.backup_jobs.get(&record.job_id))
+                .filter(|job| {
+                    job.backup_vault_name == input.backup_vault_name
+                        && job.resource_arn == input.resource_arn
+                        && job.iam_role_arn == input.iam_role_arn
+                });
+            if let Some(job) = replay {
+                return Ok(StartBackupJobOutput {
+                    backup_job_id: Some(job.job_id.clone()),
+                    recovery_point_arn: Some(job.recovery_point_arn.clone()),
+                    creation_date: Some(::aws_smithy_types::DateTime::from(job.creation_date)),
+                    is_parent: job.is_parent,
+                });
+            }
+        }
+
+        // The stores are in memory and every request adds to them, so the
+        // number of jobs and recovery points they keep is bounded. AWS caps
+        // concurrent backup jobs per account and answers the same modelled
+        // error.
+        if store.backup_jobs.len() >= crate::state::MAX_BACKUP_JOBS
+            || store.recovery_points.len() >= crate::state::MAX_RECOVERY_POINTS
+        {
+            return Err(StartBackupJobErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator keeps at most {} backup jobs and {} recovery points",
+                        crate::state::MAX_BACKUP_JOBS,
+                        crate::state::MAX_RECOVERY_POINTS
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let job_id = store.next_id(now);
+        let point_id = store.next_id(now);
+        let point_arn = crate::state::recovery_point_arn(&region, &point_id);
+        let resource_type = crate::state::resource_type_of(&input.resource_arn);
+        // Checked arithmetic here too, for consistency with `start_by` below: a
+        // clock that cannot express the due instant settles the job at once
+        // rather than panicking.
+        let settles_at = now
+            .checked_add(crate::state::JOB_SETTLE_AFTER)
+            .unwrap_or(now);
+        let backup_options: ::std::collections::BTreeMap<String, String> = input
+            .backup_options
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let tags: ::std::collections::BTreeMap<String, String> = input
+            .recovery_point_tags
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        // `StartWindowMinutes` is the caller's own deadline for the job to begin,
+        // so it keeps the value the caller gave. Checked arithmetic throughout:
+        // the member's range is enforced above, and an instant this clock cannot
+        // express is simply not due.
+        let start_by = input
+            .start_window_minutes
+            .and_then(|minutes| u64::try_from(minutes).ok())
+            .and_then(|minutes| minutes.checked_mul(60))
+            .and_then(|seconds| now.checked_add(::std::time::Duration::from_secs(seconds)));
+        let is_encrypted = vault.encryption_key_arn.is_some();
+
+        let point = crate::state::RecoveryPoint {
+            arn: point_arn.clone(),
+            backup_vault_name: vault.name.clone(),
+            backup_vault_arn: vault.arn.clone(),
+            resource_arn: input.resource_arn.clone(),
+            resource_type: resource_type.clone(),
+            iam_role_arn: input.iam_role_arn.clone(),
+            status: crate::state::RECOVERY_POINT_STATUS_CREATING.to_string(),
+            creation_date: now,
+            settles_at,
+            completion_date: None,
+            backup_size_in_bytes: 0,
+            lifecycle: input.lifecycle.clone(),
+            encryption_key_arn: vault.encryption_key_arn.clone(),
+            is_encrypted,
+            is_parent: false,
+            tags,
+            // `Index: ENABLED` asks for a searchable index; it is built by the
+            // same job, so it starts PENDING and settles with it.
+            index_status: match input.index.as_deref() {
+                Some("ENABLED") => Some(crate::state::INDEX_STATUS_PENDING.to_string()),
+                _ => None,
+            },
+            created_by_job_id: job_id.clone(),
+        };
+        let job = crate::state::BackupJob {
+            job_id: job_id.clone(),
+            backup_vault_name: vault.name.clone(),
+            backup_vault_arn: vault.arn.clone(),
+            recovery_point_arn: point_arn.clone(),
+            resource_arn: input.resource_arn,
+            resource_type,
+            iam_role_arn: input.iam_role_arn,
+            state: crate::state::BACKUP_JOB_STATE_CREATED.to_string(),
+            status_message: None,
+            percent_done: crate::state::PERCENT_DONE_NONE.to_string(),
+            backup_size_in_bytes: 0,
+            bytes_transferred: 0,
+            creation_date: now,
+            settles_at,
+            completion_date: None,
+            start_by,
+            lifecycle: input.lifecycle,
+            backup_options,
+            encryption_key_arn: vault.encryption_key_arn.clone(),
+            is_encrypted,
+            is_parent: false,
+            idempotency_token: input.idempotency_token.clone(),
+        };
+
+        let output = StartBackupJobOutput {
+            backup_job_id: Some(job.job_id.clone()),
+            recovery_point_arn: Some(point.arn.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(job.creation_date)),
+            is_parent: job.is_parent,
+        };
+
+        store
+            .recovery_points_by_vault
+            .entry(vault.name.clone())
+            .or_default()
+            .push(point.arn.clone());
+        store.recovery_points.insert(point.arn.clone(), point);
+        if let Some(token) = input.idempotency_token {
+            store.idempotency_tokens.insert(
+                token,
+                crate::state::IdempotencyRecord {
+                    job_id: job_id.clone(),
+                    recorded_at: now,
+                },
+            );
+        }
+        store.backup_jobs.insert(job_id, job);
+        Ok(output)
     }
 }

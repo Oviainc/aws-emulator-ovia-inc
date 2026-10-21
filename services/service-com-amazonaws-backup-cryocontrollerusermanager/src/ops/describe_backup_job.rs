@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeBackupJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeBackupJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeBackupJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored job. The `CREATED` -> `COMPLETED` transition the clock
+//! owes the job is materialised from the due instant stored on it, so the state
+//! reported is the state the job is actually in — never a guess.
 //!
 //! ## Shape of an operation
 //!
@@ -243,18 +238,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeBackupJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeBackupJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeBackupJob"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeBackupJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the backup vault store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let mut store = state.lock();
+        // Materialise only what the clock already owed, and only for the job
+        // asked about: a job whose settle instant has passed completed then,
+        // whether or not anybody looked.
+        store.settle_job(&input.backup_job_id, ::std::time::SystemTime::now());
+
+        let Some(job) = store.backup_jobs.get(&input.backup_job_id) else {
+            return Err(DescribeBackupJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Backup job {} not found", input.backup_job_id)),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+        let vault_type = store
+            .vaults
+            .get(&job.backup_vault_name)
+            .map(|vault| vault.vault_type.clone());
+
+        Ok(DescribeBackupJobOutput {
+            account_id: Some(::engine::emulator_account_id().to_string()),
+            backup_job_id: Some(job.job_id.clone()),
+            backup_vault_name: Some(job.backup_vault_name.clone()),
+            backup_vault_arn: Some(job.backup_vault_arn.clone()),
+            vault_type,
+            recovery_point_arn: Some(job.recovery_point_arn.clone()),
+            recovery_point_lifecycle: job.lifecycle.clone(),
+            encryption_key_arn: job.encryption_key_arn.clone(),
+            is_encrypted: job.is_encrypted,
+            resource_arn: Some(job.resource_arn.clone()),
+            resource_type: job.resource_type.clone(),
+            creation_date: Some(::aws_smithy_types::DateTime::from(job.creation_date)),
+            completion_date: job.completion_date.map(::aws_smithy_types::DateTime::from),
+            expected_completion_date: Some(::aws_smithy_types::DateTime::from(job.settles_at)),
+            start_by: job.start_by.map(::aws_smithy_types::DateTime::from),
+            state: Some(job.state.clone()),
+            status_message: job.status_message.clone(),
+            percent_done: Some(job.percent_done.clone()),
+            backup_size_in_bytes: Some(job.backup_size_in_bytes),
+            bytes_transferred: Some(job.bytes_transferred),
+            iam_role_arn: Some(job.iam_role_arn.clone()),
+            backup_options: Some(job.backup_options.clone().into_iter().collect()),
+            is_parent: job.is_parent,
+            // A job started directly by `StartBackupJob` has no backup plan
+            // behind it and no parent or child jobs, and vault lock, backup
+            // type, message categories and the separate initiation instant are
+            // reached only by operations still at 501 or by machinery this
+            // slice does not have.
+            initiation_date: None,
+            created_by: None,
+            vault_lock_state: None,
+            backup_type: None,
+            parent_job_id: None,
+            number_of_child_jobs: None,
+            child_jobs_in_state: None,
+            resource_name: None,
+            message_category: None,
+        })
     }
 }

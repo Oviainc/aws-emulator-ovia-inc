@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRecoveryPointsByBackupVault
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRecoveryPointsByBackupVault`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRecoveryPointsByBackupVault::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the recovery points `StartBackupJob` stored in the named vault, in the
+//! order they were stored, after applying the `By*` filters the model declares.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +172,197 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRecoveryPointsByBackupVault` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRecoveryPointsByBackupVaultErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRecoveryPointsByBackupVault"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListRecoveryPointsByBackupVaultErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the backup vault store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+
+        // The model types `ByResourceArn` as `ARN` with no pattern, so the
+        // framework cannot refuse a malformed one; AWS does, rather than
+        // answering an empty page for a filter it could never match.
+        if input
+            .by_resource_arn
+            .as_deref()
+            .is_some_and(|arn| !crate::state::is_arn(arn))
+        {
+            return Err(
+                ListRecoveryPointsByBackupVaultErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(
+                            "ByResourceArn must be an ARN of the form \
+                             arn:<partition>:<service>:<region>:<account>:<resource>"
+                                .to_string(),
+                        ),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // One account's vaults are the only ones this emulator holds.
+        let wrong_account = input
+            .backup_vault_account_id
+            .as_deref()
+            .is_some_and(|account| account != ::engine::emulator_account_id());
+        let Some(vault) = store
+            .vaults
+            .get(&input.backup_vault_name)
+            .filter(|_| !wrong_account)
+            .cloned()
+        else {
+            return Err(
+                ListRecoveryPointsByBackupVaultErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Backup vault {} not found",
+                            input.backup_vault_name
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Validated and resolved first, so a refused request writes nothing.
+        // This is the one write a read performs: a recovery point whose settle
+        // instant has passed completed then, whether or not anybody looked.
+        store.settle_recovery_points_in(&input.backup_vault_name, ::std::time::SystemTime::now());
+
+        // The two instant filters are closed over as `SystemTime`, the form the
+        // stored creation date is held in.
+        let created_before = input
+            .by_created_before
+            .and_then(|at| ::std::time::SystemTime::try_from(at).ok());
+        let created_after = input
+            .by_created_after
+            .and_then(|at| ::std::time::SystemTime::try_from(at).ok());
+        let matching: Vec<&crate::state::RecoveryPoint> = store
+            .recovery_points_by_vault
+            .get(&input.backup_vault_name)
+            .map(::std::vec::Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|arn| store.recovery_points.get(arn))
+            .filter(|point| {
+                input
+                    .by_resource_arn
+                    .as_deref()
+                    .is_none_or(|arn| point.resource_arn == arn)
+                    && input
+                        .by_resource_type
+                        .as_deref()
+                        .is_none_or(|ty| point.resource_type.as_deref() == Some(ty))
+                    && created_before.is_none_or(|before| point.creation_date <= before)
+                    && created_after.is_none_or(|after| point.creation_date >= after)
+                    // Nothing in this slice composes recovery points, so no
+                    // stored point has a parent to match.
+                    && input.by_parent_recovery_point_arn.is_none()
+                    // A recovery point this slice stores was started directly by
+                    // `StartBackupJob`, so none was created by a backup plan.
+                    && input.by_backup_plan_id.is_none()
+            })
+            .collect();
+
+        // The cursor names the first item of the page being asked for.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let key = crate::state::decode_page_token(token);
+                let position = key.and_then(|key| {
+                    matching.iter().position(|point| point.arn == key)
+                });
+                let Some(position) = position else {
+                    return Err(
+                        ListRecoveryPointsByBackupVaultErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(
+                                    "NextToken does not name a page of this result set"
+                                        .to_string(),
+                                ),
+                                ..Default::default()
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                position
+            }
+        };
+        // No `MaxResults` means one page: the model's own maximum. The model's
+        // `@range(1..1000)` is refused by the framework before this handler
+        // runs; the clamp keeps the page size inside that range even so, because
+        // a zero page size would vend a cursor that never advances.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+        let end = start.saturating_add(page_size).min(matching.len());
+        let next_token = matching
+            .get(end)
+            .map(|point| crate::state::encode_page_token(&point.arn));
+
+        let recovery_points: Vec<RecoveryPointByBackupVault> = matching[start..end]
+            .iter()
+            .map(|point| {
+                let calculated = point.calculated_lifecycle().map(|(cold, delete)| {
+                    CalculatedLifecycle {
+                        move_to_cold_storage_at: cold.map(::aws_smithy_types::DateTime::from),
+                        delete_at: delete.map(::aws_smithy_types::DateTime::from),
+                    }
+                });
+                RecoveryPointByBackupVault {
+                    recovery_point_arn: Some(point.arn.clone()),
+                    backup_vault_name: Some(point.backup_vault_name.clone()),
+                    backup_vault_arn: Some(point.backup_vault_arn.clone()),
+                    resource_arn: Some(point.resource_arn.clone()),
+                    resource_type: point.resource_type.clone(),
+                    iam_role_arn: Some(point.iam_role_arn.clone()),
+                    status: Some(point.status.clone()),
+                    creation_date: Some(::aws_smithy_types::DateTime::from(point.creation_date)),
+                    completion_date: point
+                        .completion_date
+                        .map(::aws_smithy_types::DateTime::from),
+                    backup_size_in_bytes: Some(point.backup_size_in_bytes),
+                    lifecycle: point.lifecycle.clone(),
+                    calculated_lifecycle: calculated,
+                    encryption_key_arn: point.encryption_key_arn.clone(),
+                    encryption_key_type: Some(point.encryption_key_type().to_string()),
+                    is_encrypted: point.is_encrypted,
+                    is_parent: point.is_parent,
+                    vault_type: Some(vault.vault_type.clone()),
+                    index_status: point.index_status.clone(),
+                    // Backup plans, composite recovery points, restores,
+                    // malware scans and restore-access vaults are all reached
+                    // only by operations still at 501, and a recovery point
+                    // started directly has no initiation instant separate from
+                    // its creation.
+                    initiation_date: None,
+                    created_by: None,
+                    status_message: None,
+                    source_backup_vault_arn: None,
+                    last_restore_time: None,
+                    parent_recovery_point_arn: None,
+                    composite_member_identifier: None,
+                    resource_name: None,
+                    index_status_message: None,
+                    aggregated_scan_result: None,
+                }
+            })
+            .collect();
+
+        Ok(ListRecoveryPointsByBackupVaultOutput {
+            recovery_points: Some(recovery_points),
+            next_token,
+        })
     }
 }

@@ -96,17 +96,38 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // AWS Backup does not answer a refused request with the framework's
+        // generic `ValidationException`: every operation in this service models
+        // `MissingParameterValueException` for a required member the request
+        // left out, and `InvalidParameterValueException` for a value that is
+        // present but outside what the model admits (the `BackupVaultName`
+        // pattern, a `MaxResults` outside 1..1000, an enum value the model does
+        // not list). Both the code and the message are replaced, so a client
+        // branching on the code sees the code this service's own errors carry.
+        match refusal {
+            Refusal::Invalid(violations) if !violations.is_empty() => {
+                let absent = violations.iter().all(|violation| {
+                    violation.kind == aws_smithy_schema_server::ViolationKind::MissingRequiredMember
+                });
+                let code = if absent {
+                    "MissingParameterValueException"
+                } else {
+                    "InvalidParameterValueException"
+                };
+                let message = violations
+                    .iter()
+                    .map(aws_smithy_schema_server::Violation::message)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                Some(Refused {
+                    code: code.to_string(),
+                    message,
+                })
+            }
+            // Anything else (an authentication refusal, or a refusal with no
+            // violation to name) keeps the framework's wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

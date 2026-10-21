@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBackupVault
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBackupVault`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBackupVault::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the vault from [`crate::state`]. AWS requires the vault be empty
+//! first, so a vault that still holds recovery points is refused with
+//! `InvalidRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +165,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBackupVault` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBackupVaultErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBackupVault"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteBackupVaultErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the backup vault store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let mut store = state.lock();
+        // This operation's `BackupVaultName` targets a plain `string`, so the
+        // framework does not apply the vault-name pattern for it; a name the
+        // service could never have stored is a bad parameter value, not an
+        // absent resource.
+        if !crate::state::is_modelled_vault_name(&input.backup_vault_name) {
+            return Err(
+                DeleteBackupVaultErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "BackupVaultName {:?} must satisfy regular expression pattern: \
+                             ^[a-zA-Z0-9\\-\\_]{{2,50}}$",
+                            input.backup_vault_name
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+        if !store.vaults.contains_key(&input.backup_vault_name) {
+            return Err(DeleteBackupVaultErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Backup vault {} not found",
+                        input.backup_vault_name
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+        let held = store.recovery_point_count(&input.backup_vault_name);
+        if held > 0 {
+            return Err(DeleteBackupVaultErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "Backup vault {} still holds {held} recovery point(s); \
+                         a backup vault must be empty before it can be deleted",
+                        input.backup_vault_name
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        store.vaults.remove(&input.backup_vault_name);
+        store
+            .recovery_points_by_vault
+            .remove(&input.backup_vault_name);
+        Ok(DeleteBackupVaultOutput)
     }
 }

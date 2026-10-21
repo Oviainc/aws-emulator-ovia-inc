@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeBackupVault
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeBackupVault`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeBackupVault::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored vault. `NumberOfRecoveryPoints` is derived from the
+//! per-vault recovery-point index, never stored twice.
 //!
 //! ## Shape of an operation
 //!
@@ -207,18 +201,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeBackupVault` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeBackupVaultErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeBackupVault"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeBackupVaultErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the backup vault store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+
+        let store = state.lock();
+        // This operation's `BackupVaultName` targets a plain `string`, so the
+        // framework does not apply the vault-name pattern for it; a name the
+        // service could never have stored is a bad parameter value, not an
+        // absent resource.
+        if !crate::state::is_modelled_vault_name(&input.backup_vault_name) {
+            return Err(
+                DescribeBackupVaultErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "BackupVaultName {:?} must satisfy regular expression pattern: \
+                             ^[a-zA-Z0-9\\-\\_]{{2,50}}$",
+                            input.backup_vault_name
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+        // A vault is scoped to one account, and this emulator holds exactly one
+        // (`engine::emulator_account_id`), so a request naming another account's
+        // vault finds nothing.
+        let wrong_account = input
+            .backup_vault_account_id
+            .as_deref()
+            .is_some_and(|account| account != ::engine::emulator_account_id());
+        let vault = store.vaults.get(&input.backup_vault_name).filter(|_| !wrong_account);
+        let Some(vault) = vault else {
+            return Err(DescribeBackupVaultErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Backup vault {} not found",
+                        input.backup_vault_name
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeBackupVaultOutput {
+            backup_vault_name: Some(vault.name.clone()),
+            backup_vault_arn: Some(vault.arn.clone()),
+            vault_type: Some(vault.vault_type.clone()),
+            vault_state: Some(vault.vault_state.clone()),
+            encryption_key_arn: vault.encryption_key_arn.clone(),
+            creation_date: Some(::aws_smithy_types::DateTime::from(vault.creation_date)),
+            creator_request_id: vault.creator_request_id.clone(),
+            number_of_recovery_points: store.recovery_point_count(&input.backup_vault_name),
+            locked: Some(vault.locked),
+            min_retention_days: vault.min_retention_days,
+            max_retention_days: vault.max_retention_days,
+            encryption_key_type: Some(vault.encryption_key_type().to_string()),
+            // Vault lock, the MPA approval team and restore-access vaults are
+            // reached only by operations still at 501, so nothing stored can
+            // populate these yet.
+            lock_date: None,
+            source_backup_vault_arn: None,
+            mpa_approval_team_arn: None,
+            mpa_session_arn: None,
+            latest_mpa_approval_team_update: None,
+        })
     }
 }

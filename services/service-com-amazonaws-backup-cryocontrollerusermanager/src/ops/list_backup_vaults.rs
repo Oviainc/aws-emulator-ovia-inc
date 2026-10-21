@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBackupVaults
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBackupVaults`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBackupVaults::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the stored vaults by name, so a vault `CreateBackupVault` inserted is
+//! listed exactly once and one `DeleteBackupVault` removed is not listed at all.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +152,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBackupVaults` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBackupVaultsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBackupVaults"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListBackupVaultsErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the backup vault store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let store = state.lock();
+        // `store.vaults` is a `BTreeMap` keyed by `BackupVaultName`, so this
+        // walk is already in name order — which is what makes the name-valued
+        // cursor below resolve to the same position on every request.
+        let matching: Vec<&crate::state::BackupVault> = store
+            .vaults
+            .values()
+            .filter(|vault| {
+                input
+                    .by_vault_type
+                    .as_deref()
+                    .is_none_or(|vault_type| vault.vault_type == vault_type)
+                    // `ByShared` asks for vaults shared with this account from
+                    // another one. This emulator holds exactly one account's
+                    // vaults, so none of them is shared in.
+                    && !input.by_shared
+            })
+            .collect();
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let key = crate::state::decode_page_token(token);
+                let position =
+                    key.and_then(|key| matching.iter().position(|vault| vault.name == key));
+                let Some(position) = position else {
+                    return Err(
+                        ListBackupVaultsErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(
+                                    "NextToken does not name a page of this result set"
+                                        .to_string(),
+                                ),
+                                ..Default::default()
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                position
+            }
+        };
+        // No `MaxResults` means one page: the model's own maximum. The model's
+        // `@range(1..1000)` is refused by the framework before this handler
+        // runs; the clamp keeps the page size inside that range even so, because
+        // a zero page size would vend a cursor that never advances.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+        let end = start.saturating_add(page_size).min(matching.len());
+        let next_token = matching
+            .get(end)
+            .map(|vault| crate::state::encode_page_token(&vault.name));
+
+        let backup_vault_list: Vec<BackupVaultListMember> = matching[start..end]
+            .iter()
+            .map(|vault| BackupVaultListMember {
+                backup_vault_name: Some(vault.name.clone()),
+                backup_vault_arn: Some(vault.arn.clone()),
+                vault_type: Some(vault.vault_type.clone()),
+                vault_state: Some(vault.vault_state.clone()),
+                creation_date: Some(::aws_smithy_types::DateTime::from(vault.creation_date)),
+                encryption_key_arn: vault.encryption_key_arn.clone(),
+                encryption_key_type: Some(vault.encryption_key_type().to_string()),
+                creator_request_id: vault.creator_request_id.clone(),
+                number_of_recovery_points: store.recovery_point_count(&vault.name),
+                locked: Some(vault.locked),
+                min_retention_days: vault.min_retention_days,
+                max_retention_days: vault.max_retention_days,
+                // Vault Lock is reached only by operations still at 501, so no
+                // stored vault carries a lock date.
+                lock_date: None,
+            })
+            .collect();
+
+        Ok(ListBackupVaultsOutput {
+            backup_vault_list: Some(backup_vault_list),
+            next_token,
+        })
     }
 }
