@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTrails
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTrails`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTrails::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the trails in the account from the shared trail registry (`crate::state`).
 //!
 //! ## Shape of an operation
 //!
@@ -146,20 +138,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTrails` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTrailsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTrails"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTrailsErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+                message: Some(
+                    "ListTrails needs the CloudTrail trail registry, which this engine \
+                     does not carry"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let store = state.lock();
+
+        // "Lists trails that are in the current account" — every Region's, unlike
+        // `DescribeTrails`, which reports the caller's Region. The page token is the
+        // registry key the next page resumes at, rendered `<name>:<home region>`
+        // (a trail name can hold no colon), which the name-ordered registry seeks to
+        // directly.
+        let mut page: Vec<TrailInfo> = Vec::new();
+        let mut next_token = None;
+        let resume_at = input.next_token.as_deref().map(|token| {
+            let (name, region) = token.split_once(':').unwrap_or((token, ""));
+            (name.to_string(), region.to_string())
+        });
+        let remaining: Box<dyn Iterator<Item = &crate::state::TrailRecord>> = match resume_at {
+            Some(key) => Box::new(store.trails.range(key..).map(|(_, record)| record)),
+            None => Box::new(store.trails.values()),
+        };
+        for record in remaining {
+            if page.len() == crate::state::LIST_TRAILS_PAGE_SIZE {
+                // One trail past a full page: report where to resume rather than
+                // carrying it.
+                next_token = Some(format!("{}:{}", record.name, record.home_region));
+                break;
+            }
+            page.push(record.to_trail_info());
+        }
+
+        Ok(ListTrailsOutput {
+            trails: Some(page),
+            next_token,
+        })
     }
 }
