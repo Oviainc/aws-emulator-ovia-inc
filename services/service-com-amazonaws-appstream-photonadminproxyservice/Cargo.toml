@@ -8,6 +8,8 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# Hex codec for the opaque pagination cursor a Describe's `NextToken` carries.
+hex = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -27,7 +29,6 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

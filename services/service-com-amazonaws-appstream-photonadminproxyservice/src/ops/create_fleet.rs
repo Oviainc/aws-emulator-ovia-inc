@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFleet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFleet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFleet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: persists a [`crate::state::FleetRecord`] in this service's store and
+//! returns the modelled `Fleet` rendered FROM that record. A freshly created fleet is
+//! `STOPPED` with no running capacity, and `ComputeCapacityStatus.Desired` comes from
+//! the requested `ComputeCapacity`. A duplicate `Name` answers
+//! `ResourceAlreadyExistsException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -257,18 +253,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFleet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFleetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFleet"))
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("CreateFleet"))?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = state.lock();
+
+        if state.fleets.contains_key(&input.name) {
+            return Err(CreateFleetErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!("Fleet already exists: {}", input.name)),
+                },
+            )
+            .into());
+        }
+
+        // CC-02 growth bound: the store must not grow per request without a ceiling.
+        if state.fleets.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(CreateFleetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::limit_exceeded_message("fleets")),
+                },
+            )
+            .into());
+        }
+
+        let compute_capacity = input.compute_capacity.unwrap_or_default();
+        let record = crate::state::FleetRecord {
+            arn: crate::state::fleet_arn(&region, &input.name),
+            name: input.name.clone(),
+            instance_type: input.instance_type,
+            // `FleetType` is optional on the wire; the service's default is ON_DEMAND.
+            fleet_type: input
+                .fleet_type
+                .unwrap_or_else(|| crate::state::DEFAULT_FLEET_TYPE.to_string()),
+            image_name: input.image_name,
+            image_arn: input.image_arn,
+            // A fleet is created stopped: it starts streaming only once StartFleet runs,
+            // so nothing is running, in use or available yet.
+            state: crate::state::FLEET_STATE_CREATED.to_string(),
+            desired_instances: compute_capacity.desired_instances.unwrap_or(0),
+            desired_user_sessions: compute_capacity.desired_sessions,
+            running: 0,
+            in_use: 0,
+            available: 0,
+            vpc_config: input.vpc_config,
+            description: input.description,
+            display_name: input.display_name,
+            max_user_duration_in_seconds: input.max_user_duration_in_seconds,
+            disconnect_timeout_in_seconds: input.disconnect_timeout_in_seconds,
+            idle_disconnect_timeout_in_seconds: input.idle_disconnect_timeout_in_seconds,
+            max_concurrent_sessions: input.max_concurrent_sessions,
+            max_sessions_per_instance: input.max_sessions_per_instance,
+            stream_view: input.stream_view,
+            platform: input.platform,
+            enable_default_internet_access: input.enable_default_internet_access,
+            domain_join_info: input.domain_join_info,
+            iam_role_arn: input.iam_role_arn,
+            usb_device_filter_strings: input.usb_device_filter_strings.unwrap_or_default(),
+            session_script_s3_location: input.session_script_s3_location,
+            root_volume_config: input.root_volume_config,
+            disable_imdsv1: input.disable_imdsv1,
+            created_time: crate::state::now(),
+            // A freshly created fleet carries no errors.
+            fleet_errors: Vec::new(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        let fleet = record.to_fleet();
+        state.fleets.insert(record.name.clone(), record);
+        Ok(CreateFleetOutput {
+            fleet: Some(fleet),
+        })
     }
 }

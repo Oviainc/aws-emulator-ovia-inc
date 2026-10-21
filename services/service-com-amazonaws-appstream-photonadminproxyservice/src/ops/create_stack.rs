@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStack
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStack`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStack::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: persists a [`crate::state::StackRecord`] in this service's store and
+//! returns the modelled `Stack` rendered FROM that record, so a later `DescribeStacks`
+//! answers with the same ARN, `CreatedTime` and configuration. A second create of the
+//! same `Name` answers `ResourceAlreadyExistsException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +189,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStack` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStack"))
+        // The shared store, reached through the constructor-injected engine. The `None`
+        // arm is only reachable when this service is mounted on an engine that is not
+        // the emulator's `InMemoryEngine`: there is no store to read or write, so the
+        // honest answer is "not written for that engine", never a fabricated success.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("CreateStack"))?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = state.lock();
+
+        if state.stacks.contains_key(&input.name) {
+            return Err(CreateStackErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!("Stack already exists: {}", input.name)),
+                },
+            )
+            .into());
+        }
+
+        // CC-02 growth bound: the store must not grow per request without a ceiling.
+        if state.stacks.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(CreateStackErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::limit_exceeded_message("stacks")),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::StackRecord {
+            arn: crate::state::stack_arn(&region, &input.name),
+            name: input.name.clone(),
+            description: input.description,
+            display_name: input.display_name,
+            created_time: crate::state::now(),
+            storage_connectors: input.storage_connectors.unwrap_or_default(),
+            redirect_url: input.redirect_url,
+            feedback_url: input.feedback_url,
+            user_settings: input.user_settings.unwrap_or_default(),
+            // The request carries `ApplicationSettings`; the resource reports the
+            // `ApplicationSettingsResponse` form of that same configuration.
+            application_settings: input.application_settings.map(|settings| {
+                ApplicationSettingsResponse {
+                    enabled: Some(settings.enabled),
+                    settings_group: settings.settings_group,
+                    s3_bucket_name: None,
+                }
+            }),
+            access_endpoints: input.access_endpoints.unwrap_or_default(),
+            embed_host_domains: input.embed_host_domains.unwrap_or_default(),
+            streaming_experience_settings: input.streaming_experience_settings,
+            content_redirection: input.content_redirection,
+            agent_access_config: input.agent_access_config,
+            storage_connector_authentication: input.storage_connector_authentication,
+            // A freshly created stack carries no errors.
+            stack_errors: Vec::new(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        let stack = record.to_stack();
+        state.stacks.insert(record.name.clone(), record);
+        Ok(CreateStackOutput {
+            stack: Some(stack),
+        })
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateFleet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateFleet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateFleet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: records the `(FleetName, StackName)` edge in this service's store, so a
+//! later `DeleteFleet`/`DeleteStack` can refuse while the edge exists. Either name
+//! missing from the store answers `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -143,20 +137,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateFleet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateFleetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateFleet"))
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("AssociateFleet"))?;
+        let mut state = state.lock();
+
+        if !state.fleets.contains_key(&input.fleet_name) {
+            return Err(AssociateFleetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Fleet not found: {}", input.fleet_name)),
+                },
+            )
+            .into());
+        }
+        if !state.stacks.contains_key(&input.stack_name) {
+            return Err(AssociateFleetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Stack not found: {}", input.stack_name)),
+                },
+            )
+            .into());
+        }
+
+        // A set, so associating the same pair twice is idempotent rather than a second
+        // edge that would need two DisassociateFleet calls to clear.
+        let edge = (input.fleet_name, input.stack_name);
+        // CC-02 growth bound: a NEW edge must not grow the store past its ceiling. A
+        // repeat of an edge already held inserts nothing, so it is never refused.
+        if !state.fleet_stack_associations.contains(&edge)
+            && state.fleet_stack_associations.len() >= crate::state::MAX_RECORDS_PER_STORE
+        {
+            return Err(AssociateFleetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::limit_exceeded_message(
+                        "fleet/stack associations",
+                    )),
+                },
+            )
+            .into());
+        }
+        state.fleet_stack_associations.insert(edge);
+        Ok(AssociateFleetOutput {})
     }
 }
