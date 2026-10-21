@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVirtualCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVirtualCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVirtualCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a virtual cluster and persists it in [`crate::state`]: a fresh
+//! `ResourceIdString` id, the `VirtualClusterArn` built from it, `state = RUNNING` and
+//! `createdAt = now`, plus every member the request carried. A replayed `clientToken`
+//! (`@idempotencyToken`) returns the cluster the first call minted, not a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +159,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVirtualCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVirtualClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVirtualCluster"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateVirtualClusterError::Modeled(
+                CreateVirtualClusterErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the virtual cluster store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let region = crate::state::request_region(ctx);
+        let mut state = store.lock();
+        state.settle();
+
+        // `clientToken` is `@idempotencyToken`: the same token replayed names the
+        // cluster the first call minted, so a retried create never doubles the resource.
+        let replayed = state
+            .replayed_idempotency(crate::state::CREATE_VIRTUAL_CLUSTER_SCOPE, &input.client_token)
+            .cloned();
+        if let Some(existing) = replayed.and_then(|id| state.virtual_clusters.get(&id)) {
+            return Ok(CreateVirtualClusterOutput {
+                id: Some(existing.id.clone()),
+                name: Some(existing.name.clone()),
+                arn: Some(existing.arn.clone()),
+            });
+        }
+
+        // The store is capped, and a retired cluster is reclaimed to make room. Once
+        // every slot holds a live cluster there is nothing to reclaim, and the create is
+        // refused instead of growing the store without bound.
+        if !state.reserve_virtual_cluster() {
+            return Err(CreateVirtualClusterErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "This emulator retains at most {} virtual clusters; delete one and retry",
+                        crate::state::MAX_VIRTUAL_CLUSTERS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.mint_id();
+        let arn = crate::state::virtual_cluster_arn(&region, &id);
+        // EMR on EKS creates a virtual cluster ready: it is a mapping onto an existing
+        // Kubernetes namespace and consumes no resource of its own, so it is RUNNING at
+        // once and owes no later transition.
+        let record = crate::state::VirtualClusterRecord {
+            id: id.clone(),
+            name: input.name.clone(),
+            arn: arn.clone(),
+            state: crate::state::CLUSTER_RUNNING.to_string(),
+            container_provider: input.container_provider,
+            created_at_millis: crate::state::now_millis(),
+            tags: input.tags.unwrap_or_default(),
+            // Not resolved against a security-configuration store: this service holds
+            // none yet (`CreateSecurityConfiguration` is still a stub), so the id is
+            // persisted as submitted and `DescribeVirtualCluster` reads it back.
+            security_configuration_id: input.security_configuration_id,
+            session_enabled: input.session_enabled,
+            scheduler_configuration: input.scheduler_configuration,
+            client_token: input.client_token.clone(),
+            pending: None,
+        };
+        state.insert_virtual_cluster(record);
+
+        Ok(CreateVirtualClusterOutput {
+            id: Some(id),
+            name: Some(input.name),
+            arn: Some(arn),
+        })
     }
 }
