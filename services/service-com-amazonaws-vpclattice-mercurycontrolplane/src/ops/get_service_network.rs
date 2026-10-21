@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetServiceNetwork
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetServiceNetwork`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetServiceNetwork::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reads one persisted service network, by id or by ARN, and counts its
+//! associations at read time.
 //!
 //! ## Shape of an operation
 //!
@@ -129,6 +123,16 @@ impl From<GetServiceNetworkErrorModeled> for GetServiceNetworkError {
     }
 }
 
+/// HTTP 404 for an identifier that names no persisted service network.
+fn not_found(identifier: &str) -> GetServiceNetworkError {
+    GetServiceNetworkErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("service network {identifier} not found"),
+        resource_id: identifier.to_string(),
+        resource_type: crate::state::KIND_SERVICE_NETWORK.to_string(),
+    })
+    .into()
+}
+
 /// The `GetServiceNetwork` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -165,18 +169,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetServiceNetwork` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetServiceNetworkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetServiceNetwork"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetServiceNetworkErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        // `serviceNetworkIdentifier` is modelled as either the bare id or the ARN.
+        let Some(id) = crate::state::id_from_identifier(
+            &input.service_network_identifier,
+            crate::state::PREFIX_SERVICE_NETWORK,
+        ) else {
+            return Err(not_found(&input.service_network_identifier));
+        };
+        let store = state.lock();
+        let Some(network) = store.service_networks.get(&id) else {
+            return Err(not_found(&input.service_network_identifier));
+        };
+        Ok(GetServiceNetworkOutput {
+            id: Some(network.id.clone()),
+            name: Some(network.name.clone()),
+            created_at: Some(crate::state::timestamp(network.created_at)),
+            last_updated_at: Some(crate::state::timestamp(network.last_updated_at)),
+            arn: Some(network.arn.clone()),
+            auth_type: Some(network.auth_type.clone()),
+            sharing_config: network.sharing_enabled.map(|enabled| SharingConfig {
+                enabled: Some(enabled),
+            }),
+            // Counted from the persisted associations, never from a stored counter. VPC
+            // associations have no handler yet (CreateServiceNetworkVpcAssociation is
+            // still a 501), so none can be persisted and the count is 0.
+            number_of_associated_vp_cs: Some(0),
+            number_of_associated_services: Some(store.associated_service_count(&id)),
+        })
     }
 }

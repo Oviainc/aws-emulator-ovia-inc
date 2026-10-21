@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateService
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateService`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateService::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints a service with its DNS entry, persists it in
+//! [`crate::state::ComAmazonawsVpclatticeMercurycontrolplaneState::services`] and
+//! answers from what was stored.
 //!
 //! ## Shape of an operation
 //!
@@ -159,6 +154,29 @@ impl From<CreateServiceErrorModeled> for CreateServiceError {
     }
 }
 
+/// The response for a stored service — every member read back out of state, with the
+/// status the clock owes it at `now`.
+fn output_of(
+    service: &crate::state::LatticeService,
+    now: std::time::SystemTime,
+) -> CreateServiceOutput {
+    let (domain_name, hosted_zone_id) = service.dns_entry();
+    CreateServiceOutput {
+        id: Some(service.id.clone()),
+        arn: Some(service.arn.clone()),
+        name: Some(service.name.clone()),
+        custom_domain_name: service.custom_domain_name.clone(),
+        certificate_arn: service.certificate_arn.clone(),
+        status: Some(service.status(now).to_string()),
+        auth_type: Some(service.auth_type.clone()),
+        idle_timeout_seconds: Some(service.idle_timeout_seconds),
+        dns_entry: Some(DnsEntry {
+            domain_name: Some(domain_name),
+            hosted_zone_id: Some(hosted_zone_id),
+        }),
+    }
+}
+
 /// The `CreateService` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -195,18 +213,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateService` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServiceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateService"))
+        // Modeled constraints the framework CAN check (the `@length` bounds,
+        // `idleTimeoutSeconds`' 60..600 range, the `certificateArn` pattern) are refused
+        // before this handler runs; `name`'s pattern is not one of them — see below.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateServiceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let region = crate::state::region_of(ctx.parts());
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The modelled `name` pattern is written with negative lookahead (including the
+        // reserved `svc-` prefix), which the boundary's regex engine cannot compile —
+        // so it is enforced here.
+        if let Err(reason) = crate::state::check_resource_name(
+            &input.name,
+            Some(crate::state::PREFIX_SERVICE),
+        ) {
+            return Err(CreateServiceErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!("name {reason}"),
+                    reason: "fieldValidationFailed".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "name".to_string(),
+                        message: reason,
+                    }]),
+                },
+            )
+            .into());
+        }
+        if let Err(reason) = crate::state::check_tag_count(input.tags.as_ref()) {
+            return Err(CreateServiceErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!("tags {reason}"),
+                    reason: "fieldValidationFailed".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "tags".to_string(),
+                        message: reason,
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // `clientToken` is an @idempotencyToken: a retry carrying the token of a
+        // completed create answers with that same service.
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::token_key(Self::NAME, token));
+        if let Some(existing) = token
+            .as_ref()
+            .and_then(|key| store.idempotency_tokens.get(key))
+            .and_then(|id| store.services.get(id))
+        {
+            if existing.name != input.name {
+                return Err(CreateServiceErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "clientToken was already used to create service {} with a different name",
+                            existing.id
+                        ),
+                        resource_id: existing.id.clone(),
+                        resource_type: crate::state::KIND_SERVICE.to_string(),
+                    },
+                )
+                .into());
+            }
+            return Ok(output_of(existing, now));
+        }
+
+        let name_key = crate::state::name_key(crate::state::KIND_SERVICE, &input.name);
+        if let Some(taken_by) = store.name_index.get(&name_key) {
+            return Err(CreateServiceErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "a service named {} already exists in this account",
+                        input.name
+                    ),
+                    resource_id: taken_by.clone(),
+                    resource_type: crate::state::KIND_SERVICE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The emulator's own ceiling on stored services, answered with the modelled 402
+        // so a caller looping on create cannot grow this process without bound.
+        if store.services.len() >= crate::state::MAX_SERVICES {
+            return Err(CreateServiceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} services",
+                        crate::state::MAX_SERVICES
+                    ),
+                    resource_id: None,
+                    resource_type: crate::state::KIND_SERVICE.to_string(),
+                    service_code: crate::state::ARN_SERVICE.to_string(),
+                    quota_code: "services-per-account".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let id = crate::state::mint_id(crate::state::PREFIX_SERVICE);
+        let sequence = store.next_sequence();
+        let record = crate::state::LatticeService {
+            arn: crate::state::arn_for(&region, crate::state::KIND_SERVICE, &id),
+            dns_domain_name: crate::state::service_domain_name(&input.name, &id, &region),
+            dns_hosted_zone_id: crate::state::mint_hosted_zone_id(),
+            id: id.clone(),
+            name: input.name.clone(),
+            custom_domain_name: input.custom_domain_name.clone(),
+            certificate_arn: input.certificate_arn.clone(),
+            // The model documents NONE as the default auth type.
+            auth_type: input.auth_type.clone().unwrap_or_else(|| "NONE".to_string()),
+            // The member's documentation gives an absent value a default of 60 seconds.
+            idle_timeout_seconds: input
+                .idle_timeout_seconds
+                .unwrap_or(crate::state::DEFAULT_IDLE_TIMEOUT_SECONDS),
+            tags: input.tags.clone().unwrap_or_default(),
+            created_at: now,
+            last_updated_at: now,
+            // Creation is asynchronous: the service reports CREATE_IN_PROGRESS until
+            // this stored due instant passes, then ACTIVE.
+            active_at: now + crate::state::CREATE_TRANSITION,
+            sequence,
+        };
+
+        store.name_index.insert(name_key, id.clone());
+        if let Some(key) = token {
+            store.idempotency_tokens.record(key, id.clone());
+        }
+        store.services.insert(id.clone(), record);
+        let stored = store
+            .services
+            .get(&id)
+            .expect("the service was just inserted under this id");
+        Ok(output_of(stored, now))
     }
 }
