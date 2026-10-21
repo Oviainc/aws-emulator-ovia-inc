@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTaskExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTaskExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTaskExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the execution `StartTaskExecution` stored under this `TaskExecutionArn`.
+//! The phase, the timestamps and `Result`'s per-phase durations all come from the
+//! schedule stored when the execution started, so they advance with the clock and are
+//! the same for every observer. An unknown ARN is `InvalidRequestException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -280,18 +276,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTaskExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTaskExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTaskExecution"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeTaskExecutionErrorModeled::InternalException(
+                InternalException {
+                    message: Some(
+                        "the DataSync emulator could not reach its state store".to_string(),
+                    ),
+                    error_code: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+        let Some(execution) = store.task_executions.get(&input.task_execution_arn) else {
+            return Err(DescribeTaskExecutionErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "Task execution {} is not found.",
+                        input.task_execution_arn
+                    )),
+                    error_code: None,
+                    datasync_error_code: None,
+                },
+            )
+            .into());
+        };
+
+        let counters = execution.counters;
+        Ok(DescribeTaskExecutionOutput {
+            task_execution_arn: Some(execution.arn.clone()),
+            status: Some(execution.status.as_str().to_string()),
+            options: Some(execution.options.clone()),
+            excludes: (!execution.excludes.is_empty()).then(|| execution.excludes.clone()),
+            includes: (!execution.includes.is_empty()).then(|| execution.includes.clone()),
+            manifest_config: execution.manifest_config.clone(),
+            start_time: Some(crate::state::as_timestamp(execution.start_time)),
+            estimated_files_to_transfer: counters.estimated_files_to_transfer,
+            estimated_bytes_to_transfer: counters.estimated_bytes_to_transfer,
+            files_transferred: counters.files_transferred,
+            bytes_written: counters.bytes_written,
+            bytes_transferred: counters.bytes_transferred,
+            bytes_compressed: counters.bytes_compressed,
+            result: Some(phase_result(execution)),
+            task_report_config: execution.task_report_config.clone(),
+            files_deleted: counters.files_deleted,
+            files_skipped: counters.files_skipped,
+            files_verified: counters.files_verified,
+            // `ReportResult` describes a task report DataSync wrote to S3; nothing
+            // writes one, so there is no result to report.
+            report_result: None,
+            estimated_files_to_delete: counters.estimated_files_to_delete,
+            task_mode: Some(execution.task_mode.clone()),
+            files_prepared: counters.files_prepared,
+            files_listed: None,
+            files_failed: None,
+            // The `Folders*` members are reported for Enhanced mode tasks only, and
+            // like the file counters they would all be zero: no listing ran.
+            estimated_folders_to_delete: None,
+            estimated_folders_to_transfer: None,
+            folders_skipped: None,
+            folders_prepared: None,
+            folders_transferred: None,
+            folders_verified: None,
+            folders_deleted: None,
+            folders_listed: None,
+            folders_failed: None,
+            launch_time: execution.launch_time.map(crate::state::as_timestamp),
+            end_time: execution.end_time.map(crate::state::as_timestamp),
+        })
+    }
+}
+
+/// `Result`: each phase's status and, once the phase is behind the execution, how long
+/// it took.
+///
+/// Both come from the instants stored when the execution started, so a phase the
+/// execution has not reached reports the modelled `PhaseStatus` `PENDING` with no
+/// duration, and one it has finished reports `SUCCESS` with the elapsed milliseconds
+/// between its own two boundaries. `TotalDuration` is only known once the execution
+/// has ended.
+fn phase_result(execution: &crate::state::TaskExecution) -> TaskExecutionResultDetail {
+    let schedule = execution.schedule;
+    let status = execution.status;
+    let reached = |phase: crate::state::TaskExecutionStatus| {
+        status.phase_index() > phase.phase_index()
+    };
+
+    let prepare_done = reached(crate::state::TaskExecutionStatus::Preparing);
+    let transfer_done = reached(crate::state::TaskExecutionStatus::Transferring);
+    let verify_done = reached(crate::state::TaskExecutionStatus::Verifying);
+
+    TaskExecutionResultDetail {
+        prepare_duration: prepare_done.then(|| {
+            crate::state::millis_between(schedule.launched_at, schedule.transfer_at)
+        }),
+        prepare_status: Some(phase_status(prepare_done).to_string()),
+        total_duration: execution
+            .end_time
+            .map(|end| crate::state::millis_between(execution.start_time, end)),
+        transfer_duration: transfer_done
+            .then(|| crate::state::millis_between(schedule.transfer_at, schedule.verify_at)),
+        transfer_status: Some(phase_status(transfer_done).to_string()),
+        verify_duration: verify_done
+            .then(|| crate::state::millis_between(schedule.verify_at, schedule.finished_at)),
+        verify_status: Some(phase_status(verify_done).to_string()),
+        // `ErrorCode`/`ErrorDetail` describe an execution that failed; this one did not.
+        error_code: None,
+        error_detail: None,
+    }
+}
+
+/// A phase's `PhaseStatus`: `SUCCESS` once it is behind the execution, else `PENDING`.
+fn phase_status(done: bool) -> &'static str {
+    if done {
+        "SUCCESS"
+    } else {
+        "PENDING"
     }
 }

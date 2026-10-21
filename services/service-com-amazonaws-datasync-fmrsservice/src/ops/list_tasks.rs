@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the tasks this service holds, in creation order, applying the request's
+//! `Filters` and truncating at `MaxResults`. The `NextToken` it returns is an opaque
+//! cursor carrying the creation sequence the next page resumes after, so a page
+//! boundary is exact even when a task is deleted between pages; the final page carries
+//! no token. A token this service did not issue is `InvalidRequestException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +143,224 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTasks"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTasksErrorModeled::InternalException(InternalException {
+                message: Some(
+                    "the DataSync emulator could not reach its state store".to_string(),
+                ),
+                error_code: None,
+            })
+            .into());
+        };
+
+        let after_seq = match input.next_token.as_deref().map(decode_cursor) {
+            None => 0,
+            Some(Some(seq)) => seq,
+            Some(None) => {
+                return Err(ListTasksErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some("NextToken is not a token this service issued.".to_string()),
+                        error_code: None,
+                        datasync_error_code: None,
+                    },
+                )
+                .into())
+            }
+        };
+
+        // `MaxResults` is modelled `0..100`; a request that declares no page size, or
+        // declares one that carries nothing, gets the largest page the member admits.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .filter(|max| *max > 0)
+            .unwrap_or(crate::state::LIST_TASKS_DEFAULT_PAGE_SIZE);
+
+        let filters = input.filters.unwrap_or_default();
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        // Every task the request asks for, in creation order, from the cursor on.
+        let mut matching: Vec<(u64, TaskListEntry)> = Vec::new();
+        for task in store.tasks_in_creation_order() {
+            if task.seq <= after_seq {
+                continue;
+            }
+            if !matches_all_filters(task, &filters)? {
+                continue;
+            }
+            matching.push((
+                task.seq,
+                TaskListEntry {
+                    task_arn: Some(task.arn.clone()),
+                    status: Some(task.status.as_str().to_string()),
+                    name: task.name.clone(),
+                    task_mode: Some(task.task_mode.clone()),
+                },
+            ));
+        }
+        drop(store);
+
+        let truncated = matching.len() > page_size;
+        matching.truncate(page_size);
+        let page_ended_after = matching.last().map(|(seq, _)| *seq);
+        let tasks: Vec<TaskListEntry> = matching.into_iter().map(|(_, entry)| entry).collect();
+
+        Ok(ListTasksOutput {
+            tasks: Some(tasks),
+            // Only a truncated page has a next one; the final page carries no token.
+            next_token: if truncated {
+                page_ended_after.map(encode_cursor)
+            } else {
+                None
+            },
+        })
     }
+}
+
+/// The opaque `NextToken` for a page that ended after creation sequence `seq`.
+///
+/// Hex-encoded, so the token matches the member's modelled
+/// `^[a-zA-Z0-9=_-]+$` pattern and carries no meaning a client could construct.
+fn encode_cursor(seq: u64) -> String {
+    hex::encode(format!("{CURSOR_VERSION}:{seq}"))
+}
+
+/// The creation sequence a `NextToken` resumes after, or `None` when the token is not
+/// one [`encode_cursor`] produced.
+fn decode_cursor(token: &str) -> Option<u64> {
+    let decoded = hex::decode(token).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    decoded.strip_prefix(CURSOR_VERSION)?.strip_prefix(':')?.parse().ok()
+}
+
+/// Stamped into every cursor so a token from an older encoding is rejected rather
+/// than misread.
+const CURSOR_VERSION: &str = "v1";
+
+/// Whether `task` satisfies every filter in `filters` (a request with none matches all
+/// tasks, which is what makes `Filters` optional).
+fn matches_all_filters(
+    task: &crate::state::Task,
+    filters: &[TaskFilter],
+) -> Result<bool, ListTasksError> {
+    for filter in filters {
+        if !matches_filter(task, filter)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether `task` satisfies one filter.
+///
+/// The modelled `TaskFilterName` admits `LocationId` and `CreationTime`. `LocationId`
+/// is compared against the task's source AND destination location ARNs — the shape's
+/// own documentation describes it as retrieving "all tasks on a source location", and
+/// a task is on both of its locations — so a task matches when either side does.
+/// `CreationTime` is compared as an instant, not as text.
+fn matches_filter(
+    task: &crate::state::Task,
+    filter: &TaskFilter,
+) -> Result<bool, ListTasksError> {
+    match filter.name.as_str() {
+        "LocationId" => {
+            // A negated operator is the negation of its positive form, so it must hold
+            // for BOTH of the task's locations: a task "not on" a location is one
+            // neither side of which is that location.
+            let (positive, negated) = match filter.operator.as_str() {
+                "NotEquals" => ("Equals", true),
+                "NotContains" => ("Contains", true),
+                other => (other, false),
+            };
+            let source = text_matches(positive, &task.source_location_arn, &filter.values);
+            let destination =
+                text_matches(positive, &task.destination_location_arn, &filter.values);
+            match (source, destination) {
+                (Some(source), Some(destination)) => Ok((source || destination) != negated),
+                _ => Err(unsupported_operator(&filter.operator, &filter.name)),
+            }
+        }
+        "CreationTime" => {
+            let created = crate::state::as_timestamp(task.creation_time).as_secs_f64();
+            let mut bounds = Vec::with_capacity(filter.values.len());
+            for value in &filter.values {
+                let Some(parsed) = parse_instant(value) else {
+                    return Err(ListTasksErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(format!(
+                                "Filter CreationTime value {value} is not a timestamp."
+                            )),
+                            error_code: None,
+                            datasync_error_code: None,
+                        },
+                    )
+                    .into());
+                };
+                bounds.push(parsed);
+            }
+            number_matches(&filter.operator, created, &bounds)
+                .ok_or_else(|| unsupported_operator(&filter.operator, &filter.name))
+        }
+        other => Err(ListTasksErrorModeled::InvalidRequestException(
+            InvalidRequestException {
+                message: Some(format!("Filter name {other} is not supported by ListTasks.")),
+                error_code: None,
+                datasync_error_code: None,
+            },
+        )
+        .into()),
+    }
+}
+
+/// A refusal for an operator the filtered attribute cannot be compared with.
+fn unsupported_operator(operator: &str, name: &str) -> ListTasksError {
+    ListTasksErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(format!(
+            "Operator {operator} cannot be used with filter name {name}."
+        )),
+        error_code: None,
+        datasync_error_code: None,
+    })
+    .into()
+}
+
+/// `attribute` against `values` under a textual operator, or `None` when the modelled
+/// `Operator` is one that only orders numbers.
+///
+/// The operators are the positive members of the model's `Operator` enum: `Equals`,
+/// `In`, `Contains` and `BeginsWith`. A multi-valued filter matches when any value
+/// matches. Callers apply `NotEquals`/`NotContains` by negating the positive form.
+fn text_matches(operator: &str, attribute: &str, values: &[String]) -> Option<bool> {
+    match operator {
+        "Equals" | "In" => Some(values.iter().any(|value| value == attribute)),
+        "Contains" => Some(values.iter().any(|value| attribute.contains(value.as_str()))),
+        "BeginsWith" => Some(values.iter().any(|value| attribute.starts_with(value.as_str()))),
+        _ => None,
+    }
+}
+
+/// `attribute` against `values` under an operator that orders numbers, or `None` when
+/// the modelled `Operator` is one that only compares text.
+fn number_matches(operator: &str, attribute: f64, values: &[f64]) -> Option<bool> {
+    match operator {
+        "Equals" | "In" => Some(values.contains(&attribute)),
+        "NotEquals" => Some(values.iter().all(|value| *value != attribute)),
+        "GreaterThan" => Some(values.iter().any(|value| attribute > *value)),
+        "GreaterThanOrEqual" => Some(values.iter().any(|value| attribute >= *value)),
+        "LessThan" => Some(values.iter().any(|value| attribute < *value)),
+        "LessThanOrEqual" => Some(values.iter().any(|value| attribute <= *value)),
+        _ => None,
+    }
+}
+
+/// A filter value read as an instant: epoch seconds, or an RFC 3339 date-time.
+fn parse_instant(value: &str) -> Option<f64> {
+    if let Ok(seconds) = value.parse::<f64>() {
+        return Some(seconds);
+    }
+    ::aws_smithy_types::DateTime::from_str(value, ::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
+        .map(|parsed| parsed.as_secs_f64())
 }
