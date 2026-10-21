@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Upserts the request's tags into the stored tag map of every ARN in
+//! `ResourceARNList`: a key already on the resource is overwritten, every other
+//! key it carries is left alone. An ARN that cannot be parsed is reported in
+//! `FailedResourcesMap` — HTTP 200 overall, because the well-formed ARNs in the
+//! same request were tagged. So is a write that would push one resource past the
+//! service's documented 50-tag limit, or a NEW ARN once the store is already
+//! holding this emulator's maximum (see `crate::state::MAX_TAGGED_RESOURCES`).
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +181,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResources"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourcesErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the tagging store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // The modelled bounds (1..20 ARNs, 1..50 tags, each key 1..128 and each
+        // value 0..256 characters) are refused at the boundary before this runs.
+        // They cap ONE request; the two store bounds below cap what repeated
+        // requests can accumulate, and each is reported as that ARN's own
+        // failure so the caller sees which resources were not tagged.
+        let mut failed: std::collections::HashMap<String, FailureInfo> =
+            std::collections::HashMap::new();
+        for arn in &input.resource_arn_list {
+            let Some(parsed) = crate::state::parse_arn(arn) else {
+                failed.insert(arn.clone(), crate::state::malformed_arn_failure(arn));
+                continue;
+            };
+            let would_hold = state.tag_count_after_merging(arn, input.tags.keys());
+            if would_hold > crate::state::MAX_TAGS_PER_RESOURCE {
+                failed.insert(
+                    arn.clone(),
+                    crate::state::too_many_tags_failure(arn, would_hold),
+                );
+                continue;
+            }
+            let Some(entry) = state.entry_mut(&parsed) else {
+                failed.insert(arn.clone(), crate::state::store_at_capacity_failure(arn));
+                continue;
+            };
+            for (key, value) in &input.tags {
+                entry.tags.insert(key.clone(), value.clone());
+            }
+        }
+
+        // An empty map, not an absent one: "If there are no errors, the
+        // FailedResourcesMap is empty."
+        Ok(TagResourcesOutput {
+            failed_resources_map: Some(failed),
+        })
     }
 }
