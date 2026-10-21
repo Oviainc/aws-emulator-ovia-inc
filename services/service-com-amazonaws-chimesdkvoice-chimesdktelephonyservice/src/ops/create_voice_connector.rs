@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVoiceConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVoiceConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVoiceConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `VoiceConnectorId`, derives the outbound host name and the ARN from it,
+//! stamps both timestamps, and PERSISTS the record in this service's state before
+//! returning it, so `GetVoiceConnector`/`ListVoiceConnectors` report the same resource
+//! afterwards.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +170,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVoiceConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVoiceConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVoiceConnector"))
+        // `ctx` carries request metadata only. The emulator verifies the request
+        // signature centrally before dispatch, and this operation models no principal
+        // to authorize against, so nothing here reads it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateVoiceConnectorErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    code: Some("ServiceFailure".to_string()),
+                    message: Some("the Voice Connector store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `Name`'s length and pattern, and `AwsRegion`'s enum value set, are modelled
+        // constraints, so the boundary validator has already refused anything outside
+        // them (worded as `BadRequestException` by `crate::service`'s refusal hook).
+        let aws_region = input
+            .aws_region
+            .unwrap_or_else(|| crate::state::DEFAULT_AWS_REGION.to_string());
+        let created = crate::state::current_timestamp();
+
+        let mut store = state.lock();
+        // The store is bounded: past its ceiling a create is refused with the error the
+        // model declares for a quota, not served by growing the store further.
+        if store.voice_connectors.len() >= crate::state::MAX_VOICE_CONNECTORS {
+            return Err(
+                CreateVoiceConnectorErrorModeled::ResourceLimitExceededException(
+                    ResourceLimitExceededException {
+                        code: Some("ResourceLimitExceeded".to_string()),
+                        message: Some(format!(
+                            "this account already holds the maximum of {} Voice Connectors",
+                            crate::state::MAX_VOICE_CONNECTORS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Mint and insert under ONE lock: an id handed back without its record would
+        // name a connector no later call can read.
+        let voice_connector_id = store.mint_voice_connector_id();
+        let mut record = crate::state::VoiceConnectorRecord::new(
+            voice_connector_id.clone(),
+            input.name,
+            aws_region,
+            input.require_encryption,
+            created,
+        );
+        record.integration_type = input.integration_type;
+        record.network_type = input.network_type;
+        record.tags = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        let voice_connector = record.to_shape();
+        store.voice_connectors.insert(voice_connector_id, record);
+        drop(store);
+
+        Ok(CreateVoiceConnectorOutput {
+            voice_connector: Some(voice_connector),
+        })
     }
 }
