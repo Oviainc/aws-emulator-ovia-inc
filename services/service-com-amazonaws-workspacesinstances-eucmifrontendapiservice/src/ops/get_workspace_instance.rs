@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWorkspaceInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWorkspaceInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWorkspaceInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +150,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWorkspaceInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWorkspaceInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWorkspaceInstance"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetWorkspaceInstanceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the WorkSpaces Instances store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // `@readonly`: the only write this reporting call makes is materialising the
+        // `ALLOCATING -> ALLOCATED` move the clock already owed — a change that was due
+        // at the same instant whether or not anybody read the instance.
+        let Some(record) = state.settled(&input.workspace_instance_id, std::time::Instant::now())
+        else {
+            return Err(GetWorkspaceInstanceErrorModeled::ResourceNotFoundException(
+                crate::state::instance_not_found(&input.workspace_instance_id),
+            )
+            .into());
+        };
+
+        Ok(GetWorkspaceInstanceOutput {
+            // This slice models no lifecycle failure, so neither error list ever
+            // carries an entry; both stay absent rather than empty.
+            workspace_instance_errors: None,
+            ec2_instance_errors: None,
+            provision_state: Some(record.provision_state.clone()),
+            workspace_instance_id: Some(record.id.clone()),
+            ec2_managed_instance: Some(EC2ManagedInstance {
+                instance_id: Some(record.ec2_instance_id.clone()),
+            }),
+            billing_configuration: Some(record.billing_configuration.clone()),
+        })
     }
 }

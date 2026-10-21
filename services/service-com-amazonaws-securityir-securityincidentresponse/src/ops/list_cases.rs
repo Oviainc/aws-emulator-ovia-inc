@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the cases actually stored, newest-id-last, projecting each into a
+//! `ListCasesItem`. A pure read; `total` is the full stored count and the page honours
+//! the `@paginated` contract (`maxResults` items, then a `nextToken` that resumes where
+//! the page ended).
 //!
 //! ## Shape of an operation
 //!
@@ -82,9 +78,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-securityir-securityinci
 // here — hence the `ListCasesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.securityir#ListCases")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.securityir#ListCases",
+    extra_errors = ["ValidationException", "InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListCasesErrorModeled {
+    /// The supplied `nextToken` is not one this service ever handed out (HTTP 400).
+    ValidationException(ValidationException),
+    /// The service's common server error (HTTP 500). Answered only when this service's
+    /// store is unreachable.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -138,18 +142,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCases"))
+        let _ = ctx;
+        // Refuse a token this service never issued before taking the shared state lock:
+        // a bad request must not make every other caller wait.
+        if let Some(token) = input.next_token.as_deref() {
+            if !is_page_token(token) {
+                return Err(invalid_next_token().into());
+            }
+        }
+        let max_results = crate::state::page_size(input.max_results);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListCasesErrorModeled::InternalServerException(InternalServerException {
+                message: "the Security IR case store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let state = state.lock();
+        let (page, next_token) =
+            crate::state::page_keys(&state.cases, input.next_token.as_deref(), max_results);
+
+        let items = page
+            .iter()
+            .filter_map(|case_id| state.cases.get(case_id))
+            .map(|case| ListCasesItem {
+                case_id: case.case_id.clone(),
+                last_updated_date: Some(case.last_updated_date),
+                title: Some(case.title.clone()),
+                case_arn: Some(case.case_arn.clone()),
+                engagement_type: Some(case.engagement_type.clone()),
+                case_status: Some(case.case_status.clone()),
+                created_date: Some(case.created_date),
+                closed_date: case.closed_date,
+                resolver_type: Some(case.resolver_type.clone()),
+                pending_action: case.pending_action.clone(),
+            })
+            .collect();
+
+        Ok(ListCasesOutput {
+            next_token,
+            items: Some(items),
+            // `total` is the full stored count, not the size of this page.
+            total: Some(state.cases.len() as i64),
+        })
     }
+}
+
+/// Whether `token` has the SHAPE of a page token this operation hands out. Every
+/// `nextToken` `ListCases` emits is the `caseId` the next page starts at, so it
+/// satisfies `CaseId`'s `^\d{10,32}`; a token that fails this check cannot have come
+/// from here. A token that passes it but names no stored case is not an error — it is a
+/// cursor into a keyspace that has moved on, and pages from where it points, which is
+/// what an opaque cursor over a mutable collection does.
+fn is_page_token(token: &str) -> bool {
+    token.len() >= 10 && token.len() <= 32 && token.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The modelled refusal for a `nextToken` this service never handed out.
+fn invalid_next_token() -> ListCasesErrorModeled {
+    ListCasesErrorModeled::ValidationException(ValidationException {
+        message: "nextToken is not a token returned by a previous ListCases call".to_string(),
+        // One of `ValidationExceptionReason`: the failure is in a request field.
+        reason: "FIELD_VALIDATION_FAILED".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "nextToken".to_string(),
+            message: "must be copied verbatim from a previous ListCases response".to_string(),
+        }]),
+    })
 }

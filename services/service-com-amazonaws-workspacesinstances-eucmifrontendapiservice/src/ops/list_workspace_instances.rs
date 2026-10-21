@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkspaceInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkspaceInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkspaceInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +141,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkspaceInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkspaceInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkspaceInstances"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListWorkspaceInstancesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the WorkSpaces Instances store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // The opaque `NextToken` this operation mints is the hex encoding of the
+        // `WorkspaceInstanceId` the next page resumes at, so a caller cannot read a
+        // resource id straight out of it. A token this service did not mint is refused
+        // rather than guessed at: it must decode to a value shaped like an instance id.
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                let decoded = hex::decode(token)
+                    .ok()
+                    .and_then(|raw| String::from_utf8(raw).ok())
+                    .filter(|id| crate::state::is_workspace_instance_id(id));
+                match decoded {
+                    Some(id) => Some(id),
+                    None => {
+                        const WHY: &str = "NextToken is not a token this service issued";
+                        return Err(ListWorkspaceInstancesErrorModeled::ValidationException(
+                            ValidationException {
+                                message: WHY.to_string(),
+                                reason: "FIELD_VALIDATION_FAILED".to_string(),
+                                field_list: Some(vec![ValidationExceptionField {
+                                    name: "NextToken".to_string(),
+                                    reason: "FIELD_VALIDATION_FAILED".to_string(),
+                                    message: WHY.to_string(),
+                                }]),
+                            },
+                        )
+                        .into());
+                    }
+                }
+            }
+        };
+
+        // `MaxResults` is modelled `range 1..25`, already enforced at the boundary; a
+        // caller that sends none gets that modelled maximum as the page size.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::DEFAULT_MAX_RESULTS, |n| n as usize);
+
+        let mut state = state.lock();
+        // The `ALLOCATING -> ALLOCATED` moves the clock already owes, materialised
+        // before the page is read so the listing reports the same state a `Get` would.
+        state.settle_all(std::time::Instant::now());
+
+        // Iteration is in id order (the store is a `BTreeMap`), which is creation
+        // order, so a token resumes at a well-defined place even across a create or
+        // delete between pages.
+        let matching = state
+            .instances
+            .values()
+            .filter(|record| {
+                resume_from
+                    .as_deref()
+                    .is_none_or(|resume| record.id.as_str() >= resume)
+            })
+            .filter(|record| {
+                // An absent `ProvisionStates` is no filter, and so is an empty list:
+                // the member asks which states to keep, and naming none asks for no
+                // restriction rather than for nothing. The model settles neither, and
+                // "filter by nothing" returning nothing would make an empty list the
+                // only way to ask for an empty page.
+                input
+                    .provision_states
+                    .as_ref()
+                    .is_none_or(|wanted| wanted.is_empty() || wanted.contains(&record.provision_state))
+            });
+
+        let mut workspace_instances = Vec::new();
+        let mut next_token = None;
+        for record in matching {
+            if workspace_instances.len() == page_size {
+                // One past the page: its id is what the next page resumes at.
+                next_token = Some(hex::encode(&record.id));
+                break;
+            }
+            workspace_instances.push(WorkspaceInstance {
+                provision_state: Some(record.provision_state.clone()),
+                workspace_instance_id: Some(record.id.clone()),
+                ec2_managed_instance: Some(EC2ManagedInstance {
+                    instance_id: Some(record.ec2_instance_id.clone()),
+                }),
+            });
+        }
+
+        Ok(ListWorkspaceInstancesOutput {
+            workspace_instances,
+            next_token,
+        })
     }
 }
