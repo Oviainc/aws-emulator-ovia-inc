@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLFTag
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLFTag`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLFTag::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the value set of one stored LF-tag in
+//! [`crate::state::ComAmazonawsLakeformationAwslakeformationState`]'s `lf_tags`:
+//! additions are merged in (existing values kept, duplicates dropped) and deletions are
+//! removed. An unknown tag key is `EntityNotFoundException`; a request naming NEITHER
+//! list, or one that would leave the tag with no values at all, or one that would push it
+//! past the values `TagValueList` admits, is `InvalidInputException`. Adding a value the
+//! tag already holds, or deleting one it never held, is a legal no-op on that value: the
+//! values are a set.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +154,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLFTag` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLFTagErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLFTag"))
+        // The caller the audit record below attributes this state change to.
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateLFTagErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("LakeFormation state is unavailable".to_string()),
+            })
+        })?;
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_deref());
+        let to_add = input.tag_values_to_add.as_deref().unwrap_or(&[]);
+        let to_delete = input.tag_values_to_delete.as_deref().unwrap_or(&[]);
+
+        // An update that neither adds nor removes a value asks for no change at all.
+        if to_add.is_empty() && to_delete.is_empty() {
+            return Err(UpdateLFTagErrorModeled::InvalidInputException(InvalidInputException {
+                message: Some(
+                    "At least one of TagValuesToAdd or TagValuesToDelete must be provided"
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
+        let mut store = state.lock();
+        let Some(tag) = store
+            .lf_tags
+            .get_mut(&catalog_id)
+            .and_then(|catalog| catalog.get_mut(&input.tag_key))
+        else {
+            return Err(UpdateLFTagErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(format!(
+                        "Tag key {} not found in catalog {catalog_id}",
+                        input.tag_key
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The stored values are a set: merge the additions in (existing values kept, in
+        // order, duplicates dropped) and then drop every deleted value.
+        let mut merged = tag.tag_values.clone();
+        merged.extend(to_add.iter().cloned());
+        let mut merged = crate::state::dedup_values(merged.iter());
+        merged.retain(|value| !to_delete.iter().any(|deleted| deleted == value));
+
+        // `TagValueList` is `len 1..50`, so a tag can neither lose every value nor hold
+        // more than 50 (`smithy_query(query="shape",shape="TagValueList")`).
+        if merged.is_empty() {
+            return Err(UpdateLFTagErrorModeled::InvalidInputException(InvalidInputException {
+                message: Some(format!(
+                    "Cannot delete every value of tag key {}: an LF-tag must keep at least one value",
+                    input.tag_key
+                )),
+            })
+            .into());
+        }
+        if merged.len() > crate::state::MAX_TAG_VALUES {
+            return Err(UpdateLFTagErrorModeled::InvalidInputException(InvalidInputException {
+                message: Some(format!(
+                    "Tag key {} would hold {} values; TagValues accepts at most {}",
+                    input.tag_key,
+                    merged.len(),
+                    crate::state::MAX_TAG_VALUES
+                )),
+            })
+            .into());
+        }
+
+        tag.tag_values = merged;
+        let values_now = tag.tag_values.len();
+
+        // The audit record for a state change: who, what, where, outcome. No secret and
+        // no credential material — the access key id identifies the caller the way the
+        // real service's trail does.
+        tracing::info!(
+            operation = "UpdateLFTag",
+            akid = %akid,
+            catalog_id = %catalog_id,
+            tag_key = %input.tag_key,
+            values = values_now,
+            outcome = "updated",
+            "LF-tag values updated"
+        );
+
+        // `UpdateLFTagResponse` models no members: the merged value set is observable
+        // through `GetLFTag` / `ListLFTags`.
+        Ok(UpdateLFTagOutput {})
     }
 }

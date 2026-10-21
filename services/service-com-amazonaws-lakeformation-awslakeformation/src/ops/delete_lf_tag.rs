@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteLFTag
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteLFTag`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteLFTag::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one LF-tag from
+//! [`crate::state::ComAmazonawsLakeformationAwslakeformationState`]'s `lf_tags`.
+//! Deleting a tag key the catalog does not hold is the modelled
+//! `EntityNotFoundException`, so a delete never silently succeeds twice.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +141,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteLFTag` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteLFTagErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteLFTag"))
+        // The caller the audit record below attributes this state change to.
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteLFTagErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("LakeFormation state is unavailable".to_string()),
+            })
+        })?;
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_deref());
+        let mut store = state.lock();
+        let removed = store
+            .lf_tags
+            .get_mut(&catalog_id)
+            .and_then(|catalog| catalog.remove(&input.tag_key));
+        if removed.is_none() {
+            return Err(DeleteLFTagErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(format!(
+                        "Tag key {} not found in catalog {catalog_id}",
+                        input.tag_key
+                    )),
+                },
+            )
+            .into());
+        }
+        // Drop a catalog that no longer holds any tag, so `ListLFTags`' cross-catalog
+        // enumeration never walks an empty one.
+        if store
+            .lf_tags
+            .get(&catalog_id)
+            .is_some_and(|catalog| catalog.is_empty())
+        {
+            store.lf_tags.remove(&catalog_id);
+        }
+
+        // The audit record for a state change: who, what, where, outcome. No secret and
+        // no credential material — the access key id identifies the caller the way the
+        // real service's trail does.
+        tracing::info!(
+            operation = "DeleteLFTag",
+            akid = %akid,
+            catalog_id = %catalog_id,
+            tag_key = %input.tag_key,
+            outcome = "deleted",
+            "LF-tag deleted"
+        );
+
+        // `DeleteLFTagResponse` models no members: the removal is observable through
+        // `GetLFTag` (now `EntityNotFoundException`) and `ListLFTags`.
+        Ok(DeleteLFTagOutput {})
     }
 }

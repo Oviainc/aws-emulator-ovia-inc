@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLFTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLFTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Enumerates the LF-tags held in
+//! [`crate::state::ComAmazonawsLakeformationAwslakeformationState`]'s `lf_tags`, in the
+//! catalogs `ResourceShareType` selects, bounded by `MaxResults` and resumed by an
+//! opaque `NextToken` that names the (catalog, tag key) the previous page stopped on.
+//! Reporting only — it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLFTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Two bounds a client should know: `MaxResults` above the 50 entries `LFTagsList`
+//! admits is clamped to 50 (the rest follows on the next page), and a page with no tags
+//! at all OMITS `LFTags` rather than sending an empty list the modelled `len 1..50`
+//! cannot carry — treat an absent member as "no tags".
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +158,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLFTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLFTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLFTags"))
+        // `ctx` carries request metadata only; this operation reads none of it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListLFTagsErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("LakeFormation state is unavailable".to_string()),
+            })
+        })?;
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_deref());
+        // The caller's own account catalog. A tag held by any OTHER catalog is a shared
+        // ("foreign") one, which is the distinction `ResourceShareType` selects on.
+        let account_catalog = ::engine::emulator_account_id();
+
+        // `ResourceShareType` is modelled as the enum `ALL | FOREIGN`
+        // (`smithy_query(query="shape",shape="ResourceShareType")`): ALL "returns both
+        // in-account LF-tags and shared LF-tags", FOREIGN "returns all share LF-tags",
+        // and absent "lists LF-tags in the given catalog ID". A value outside the enum
+        // is refused by the boundary validator before this handler runs.
+        let share_type = input.resource_share_type.as_deref();
+
+        // An opaque continuation token is either one this service minted — naming the
+        // (catalog, tag key) the previous page stopped on — or not a token at all.
+        let start_after = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListLFTagsErrorModeled::InvalidInputException(InvalidInputException {
+                    message: Some("NextToken is not a continuation token for ListLFTags".to_string()),
+                })
+            })?),
+            None => None,
+        };
+
+        // `MaxResults` is modelled `range 1..1000`, but the output member `LFTags`
+        // targets `LFTagsList`, which is `len 1..50` — so 50 bounds a page, and is also
+        // the page size when the caller names none.
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::MAX_LF_TAGS_PAGE)
+            .clamp(1, crate::state::MAX_LF_TAGS_PAGE) as usize;
+
+        let store = state.lock();
+        let mut selected: Vec<(&String, &crate::state::LfTag)> = store
+            .lf_tags
+            .iter()
+            .filter(|(catalog, _)| match share_type {
+                // "returns all share LF-tags that the requester can view": a catalog
+                // other than the caller's own account is a shared one.
+                Some("FOREIGN") => catalog.as_str() != account_catalog,
+                // "returns both in-account LF-tags and shared LF-tags": the caller's own
+                // account catalog plus every shared one — which is every catalog, so
+                // `CatalogId` does not narrow this selection.
+                Some("ALL") => true,
+                // Absent: "lists LF-tags in the given catalog ID".
+                _ => catalog.as_str() == catalog_id,
+            })
+            .flat_map(|(catalog, tags)| tags.values().map(move |tag| (catalog, tag)))
+            .filter(|(catalog, tag)| match &start_after {
+                Some((start_catalog, start_key)) => {
+                    (catalog.as_str(), tag.tag_key.as_str())
+                        > (start_catalog.as_str(), start_key.as_str())
+                }
+                None => true,
+            })
+            // One past the page: its presence is what says another page follows.
+            .take(page_size + 1)
+            .collect();
+
+        let has_more = selected.len() > page_size;
+        selected.truncate(page_size);
+
+        let next_token = if has_more {
+            selected
+                .last()
+                .map(|(catalog, tag)| crate::state::encode_page_token(catalog, &tag.tag_key))
+        } else {
+            None
+        };
+
+        let lf_tags: Vec<LFTagPair> = selected
+            .iter()
+            .map(|(_, tag)| LFTagPair {
+                catalog_id: Some(tag.catalog_id.clone()),
+                tag_key: tag.tag_key.clone(),
+                tag_values: tag.tag_values.clone(),
+            })
+            .collect();
+
+        Ok(ListLFTagsOutput {
+            // `LFTagsList` is `len 1..50`, so an empty page omits the member rather
+            // than rendering a list the model cannot carry.
+            lf_tags: (!lf_tags.is_empty()).then_some(lf_tags),
+            next_token,
+        })
     }
 }

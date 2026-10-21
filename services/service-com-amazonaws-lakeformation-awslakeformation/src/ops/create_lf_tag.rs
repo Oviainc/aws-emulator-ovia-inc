@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLFTag
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLFTag`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLFTag::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts one LF-tag into
+//! [`crate::state::ComAmazonawsLakeformationAwslakeformationState`]'s `lf_tags`, keyed
+//! by (catalog id, tag key). A tag key is unique within a catalog, so creating one that
+//! already exists is refused with the modelled `InvalidInputException` rather than
+//! overwriting the stored values.
+//!
+//! This is the ONLY site that grows the store, so it is where its ceilings are enforced:
+//! [`crate::state::MAX_LF_TAGS_PER_CATALOG`] tags in one catalog,
+//! [`crate::state::MAX_LF_TAG_CATALOGS`] catalogs, and
+//! [`crate::state::MAX_LF_TAGS_TOTAL`] tags overall — each refused with the modelled
+//! `ResourceNumberLimitExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +152,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLFTag` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLFTagErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLFTag"))
+        // The caller the audit record below attributes this state change to.
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateLFTagErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("LakeFormation state is unavailable".to_string()),
+            })
+        })?;
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_deref());
+        // `TagValues` is modelled required with `len 1..50`, so the boundary validator
+        // already refused an absent or empty list; what the model does not express is
+        // that the values are a SET.
+        let tag_values = crate::state::dedup_values(&input.tag_values);
+
+        let mut store = state.lock();
+        if store
+            .lf_tags
+            .get(&catalog_id)
+            .is_some_and(|catalog| catalog.contains_key(&input.tag_key))
+        {
+            return Err(CreateLFTagErrorModeled::InvalidInputException(InvalidInputException {
+                message: Some(format!(
+                    "Tag key {} already exists in catalog {catalog_id}",
+                    input.tag_key
+                )),
+            })
+            .into());
+        }
+
+        // A catalog holds a bounded number of LF-tags, and the store holds a bounded
+        // number of catalogs and of tags overall: the model declares
+        // `ResourceNumberLimitExceededException` for exactly this, so the store is never
+        // grown past a ceiling (see `crate::state`'s constants). The last two ceilings
+        // matter because `CatalogId` is request-supplied: without them a caller that
+        // varies it would grow the store without end.
+        let held = store
+            .lf_tags
+            .get(&catalog_id)
+            .map_or(0, |catalog| catalog.len());
+        let opens_a_catalog = !store.lf_tags.contains_key(&catalog_id);
+        let catalogs = store.lf_tags.len();
+        let total = store.total_lf_tags();
+        let refusal = if held >= crate::state::MAX_LF_TAGS_PER_CATALOG {
+            Some(format!(
+                "Catalog {catalog_id} already holds {held} LF-tags, the maximum is {}",
+                crate::state::MAX_LF_TAGS_PER_CATALOG
+            ))
+        } else if opens_a_catalog && catalogs >= crate::state::MAX_LF_TAG_CATALOGS {
+            Some(format!(
+                "LF-tags are already held for {catalogs} Data Catalogs, the maximum is {}",
+                crate::state::MAX_LF_TAG_CATALOGS
+            ))
+        } else if total >= crate::state::MAX_LF_TAGS_TOTAL {
+            Some(format!(
+                "{total} LF-tags are already held, the maximum is {}",
+                crate::state::MAX_LF_TAGS_TOTAL
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = refusal {
+            return Err(CreateLFTagErrorModeled::ResourceNumberLimitExceededException(
+                ResourceNumberLimitExceededException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        store.lf_tags.entry(catalog_id.clone()).or_default().insert(
+            input.tag_key.clone(),
+            crate::state::LfTag {
+                catalog_id: catalog_id.clone(),
+                tag_key: input.tag_key.clone(),
+                tag_values,
+            },
+        );
+
+        // The audit record for a state change: who, what, where, outcome. No secret and
+        // no credential material — the access key id identifies the caller the way the
+        // real service's trail does.
+        tracing::info!(
+            operation = "CreateLFTag",
+            akid = %akid,
+            catalog_id = %catalog_id,
+            tag_key = %input.tag_key,
+            outcome = "created",
+            "LF-tag created"
+        );
+
+        // `CreateLFTagResponse` models no members: the proof of the insert is what
+        // `GetLFTag` / `ListLFTags` read back out of state.
+        Ok(CreateLFTagOutput {})
     }
 }
