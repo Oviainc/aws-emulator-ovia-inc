@@ -1,0 +1,54 @@
+Issue-Severity: CRITICAL
+Issue-Gap-Class: missing
+Issue-Commit: 0761ec9a912f1ad457725ac2bfa14369ca92ad04
+
+# Bootstrap the PartnerCentralAccount emulator
+
+_Filed: 2026-10-21T23:13:10Z_
+_Operation: service-com-amazonaws-partnercentralaccount-partnercentralaccount | Class: missing_
+
+> _Note: this issue was identified against the code base at commit `0761ec9a912f1ad457725ac2bfa14369ca92ad04`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Description
+
+Every one of the 34 operations in `services/service-com-amazonaws-partnercentralaccount-partnercentralaccount/src/ops/` is an unmodified scaffold: it carries the `//! SCAFFOLDED, NOT IMPLEMENTED:` header and answers HTTP 501 `NotImplemented`, holding no state. There is no working emulator for this service.
+
+This issue defines the FIRST, SMALL slice: the connection-invitation -> connection lifecycle, which is the service's primary resource pair (ids `pacinv-[A-Za-z0-9]{13}` for invitations and `pac-[A-Za-z0-9]{13}` for connections). Protocol is `awsJson1_0`, routed by `POST /` with `X-Amz-Target: PartnerCentralAccount.<OperationName>` (README/OPERATIONS.md 'Wire protocol').
+
+Implement these 6 operations, in this order, each computing its response from persisted state — no canned bodies, no echoing the input back, no minting an id that is never stored:
+
+1. **CreateConnectionInvitation** — input `Catalog` (required), `ClientToken` (required, @idempotencyToken), `ConnectionType` (OPPORTUNITY_COLLABORATION|SUBSIDIARY, required), `Email` (required), `Message` (required), `Name` (required), `ReceiverIdentifier` (required). Must mint and STORE a new invitation: `Id` matching `^pacinv-[A-Za-z0-9]{13}$`, `Arn` of the form `arn:aws:partnercentral:<region>::catalog/<Catalog>/connection-invitation/<Id>`, `Status = PENDING`, `ParticipantType = SENDER`, `OtherParticipantIdentifier` from `ReceiverIdentifier`, `InvitationMessage` from `Message`, `InviterEmail` from `Email`, `InviterName` from `Name`, `CreatedAt`/`UpdatedAt` = now, `ExpiresAt` = now + a fixed TTL, `ConnectionId` absent until acceptance. Re-sending the SAME `ClientToken` must return the SAME stored invitation (and not create a second one).
+2. **GetConnectionInvitation** — input `Catalog`, `Identifier`. Must look up the stored invitation and return exactly the fields that were persisted at create (same `Id`/`Arn`/`Status`/timestamps/message/inviter fields). Unknown `Identifier`, or one from a different `Catalog`, must raise `ResourceNotFoundException` (HTTP 404), not 501 and not an empty success.
+3. **ListConnectionInvitations** — input `Catalog`, `MaxResults` (1..100, default 20), `NextToken`, plus the filters `ConnectionType`, `ParticipantType`, `Status`, `OtherParticipantIdentifiers`. Must return `ConnectionInvitationSummaries` built from stored invitations in the requested catalog (`Catalog`, `Id`, `Arn`, `ConnectionId`, `ConnectionType`, `CreatedAt`, `UpdatedAt`, `ExpiresAt`, `OtherParticipantIdentifier`, `ParticipantType`, `Status`), honour each filter, cap the page at `MaxResults`, and return an opaque `NextToken` that resumes where the page stopped (absent on the last page).
+4. **AcceptConnectionInvitation** — input `Catalog`, `Identifier`, `ClientToken`. Must transition the stored invitation `PENDING -> ACCEPTED`, bump `UpdatedAt`, create and STORE a `Connection` (`Id` matching `^pac-[A-Za-z0-9]{13}$`, `Arn` `.../connection/<Id>`, `OtherParticipantAccountId` a 12-digit account id, `UpdatedAt`, `ConnectionTypes` map keyed by the invitation's `ConnectionType` with a `ConnectionTypeDetail{CreatedAt, InviterEmail, InviterName, Status, OtherParticipant}`), link `ConnectionId` back onto the invitation, and return the stored `Connection`. Accepting an invitation that is not `PENDING` (already ACCEPTED/REJECTED/CANCELED/EXPIRED) must raise `ConflictException` (HTTP 409); an unknown `Identifier` must raise `ResourceNotFoundException`. Same `ClientToken` replayed must be idempotent and must not mint a second connection.
+5. **GetConnection** — input `Catalog`, `Identifier` (`pac-...`). Must return the connection stored by step 4, including the populated `ConnectionTypes` map; unknown id -> `ResourceNotFoundException` (404).
+6. **CancelConnection** — input `Catalog`, `Identifier`, `ConnectionType` (required), `Reason` (required), `ClientToken`. Must mutate the stored connection: set that connection type's detail `Status` to its cancelled value, record `CanceledAt` = now and `CanceledBy` = caller account, bump the connection `UpdatedAt`, and return the updated connection. A subsequent **GetConnection** must observe the cancelled state (and **ListConnections**, if reached, must reflect it). Cancelling an already-cancelled type, or a `ConnectionType` not present on the connection, must raise `ConflictException` / `ValidationException` respectively rather than silently succeeding.
+
+Done means: a client script runs CreateConnectionInvitation -> GetConnectionInvitation -> ListConnectionInvitations -> AcceptConnectionInvitation -> GetConnection -> CancelConnection against one running emulator process and every response is derived from the state written by the earlier calls (ids, ARNs, statuses, timestamps and inviter fields all agree), plus the documented 404/409 negative paths behave as above. The other 28 operations (partner profile, verification, qualifications tasks, tagging, connection preferences, alliance lead contact, profile visibility) stay at 501 and are tracked as separate gap issues.
+
+## State Model
+
+Per-service state in `src/state.rs` (`ComAmazonawsPartnercentralaccountPartnercentralaccountState`), reached through `crate::state::service_state(&*self.engine)` and mutated under `state.lock()`:
+
+- `invitations: HashMap<(String /*catalog*/, String /*invitation id `pacinv-...`*/), ConnectionInvitationRecord>` where `ConnectionInvitationRecord { catalog, id, arn, connection_id: Option<String>, connection_type: ConnectionType, created_at, updated_at, expires_at: Option<Timestamp>, other_participant_identifier, participant_type: ParticipantType, status: InvitationStatus, invitation_message, inviter_email, inviter_name }`.
+- `connections: HashMap<(String /*catalog*/, String /*connection id `pac-...`*/), ConnectionRecord>` where `ConnectionRecord { catalog, id, arn, other_participant_account_id, updated_at, connection_types: HashMap<ConnectionType, ConnectionTypeDetailRecord> }` and `ConnectionTypeDetailRecord { created_at, inviter_email, inviter_name, status, canceled_at: Option<Timestamp>, canceled_by: Option<String>, other_participant }`.
+- `idempotency: HashMap<(String /*operation*/, String /*client token*/), String /*resource id created*/>` so CreateConnectionInvitation and AcceptConnectionInvitation replay instead of duplicating.
+- `invitation_seq`/`connection_seq` counters (or a random 13-char generator) used ONLY to mint ids that are immediately inserted into the maps above.
+- `list_tokens`: pagination cursors encoded as an opaque token (e.g. catalog + last-seen sorted key) for ListConnectionInvitations.
+
+No handler may construct a fresh engine (`engine::InMemoryEngine::new()`) — that silently gives the request a private store, per the README warning.
+
+## Evidence
+
+OPERATIONS.md for this crate (crate root) lists all 34 operations with their members: `CreateConnectionInvitation` (inputs Catalog/ClientToken/ConnectionType/Email/Message/Name/ReceiverIdentifier; outputs Id `^pacinv-[A-Za-z0-9]{13}$`, Arn, ConnectionId, Status InvitationStatus ACCEPTED|CANCELED|EXPIRED|PENDING|REJECTED, ParticipantType, CreatedAt/UpdatedAt/ExpiresAt, InvitationMessage, InviterEmail, InviterName), `GetConnectionInvitation` (@readonly, Catalog+Identifier, errors include ResourceNotFoundException 404), `ListConnectionInvitations` (@paginated inputToken=NextToken outputToken=NextToken items=ConnectionInvitationSummaries, MaxResults 1..100 default 20, filters ConnectionType/ParticipantType/Status/OtherParticipantIdentifiers), `AcceptConnectionInvitation` (Catalog+Identifier+ClientToken -> Connection, errors ConflictException 409 and ResourceNotFoundException 404), `GetConnection` (@readonly, Catalog+Identifier `^pac-[A-Za-z0-9]{13}$` -> Catalog/Id/Arn/OtherParticipantAccountId/UpdatedAt/ConnectionTypes), `CancelConnection` (Catalog+Identifier+ConnectionType+Reason+ClientToken -> the updated connection). Smithy shapes `Connection`, `ConnectionTypeDetail` (CreatedAt, InviterEmail, InviterName, Status, CanceledAt, CanceledBy, OtherParticipant), `ConnectionInvitationSummary` and `ConnectionSummary` confirm the field names and required-ness used above. All 34 files under `src/ops/` match `^//! SCAFFOLDED, NOT IMPLEMENTED:` (e.g. create_connection_invitation.rs:4, accept_connection_invitation.rs:4, get_connection.rs:4, cancel_connection.rs:4), so nothing is implemented and no test asserts any of this behaviour.
+
+## Steps to Reproduce
+
+1. Start the emulator and point an AWS SDK/`aws partnercentral-account` client at it (awsJson1_0, target prefix `PartnerCentralAccount.`).
+2. Call CreateConnectionInvitation with Catalog="AWS", ClientToken="tok-1", ConnectionType="OPPORTUNITY_COLLABORATION", Email="inviter@example.com", Message="hello", Name="Inviter", ReceiverIdentifier="partner-123" — today returns HTTP 501 NotImplemented; expected a stored invitation with Id `pacinv-...`, Status=PENDING, ParticipantType=SENDER.
+3. Call GetConnectionInvitation with that Catalog/Identifier and verify every field equals what create returned; call it with Identifier="pacinv-0000000000000" and expect ResourceNotFoundException (404).
+4. Call ListConnectionInvitations with Catalog="AWS", Status="PENDING", MaxResults=1 and verify the invitation appears in ConnectionInvitationSummaries, the page is capped at 1, and NextToken pages through further invitations.
+5. Call CreateConnectionInvitation again with the SAME ClientToken="tok-1" and verify the same Id is returned and ListConnectionInvitations still shows one invitation.
+6. Call AcceptConnectionInvitation with Catalog/Identifier and ClientToken="tok-2"; verify a Connection with Id `pac-...` is returned, GetConnectionInvitation now reports Status=ACCEPTED with ConnectionId set, and calling AcceptConnectionInvitation again on the same invitation yields ConflictException (409).
+7. Call GetConnection with the new connection id and verify ConnectionTypes contains OPPORTUNITY_COLLABORATION with InviterEmail/InviterName from the invitation.
+8. Call CancelConnection with that id, ConnectionType="OPPORTUNITY_COLLABORATION", Reason="done", ClientToken="tok-3"; then GetConnection again and verify the connection type's Status is cancelled with CanceledAt/CanceledBy populated and UpdatedAt advanced.

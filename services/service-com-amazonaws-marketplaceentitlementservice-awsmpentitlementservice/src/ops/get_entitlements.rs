@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEntitlements
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEntitlements`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEntitlements::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads the `Entitlement` records held in [`crate::state`] — seeded through
+//! [`crate::state::seed_entitlements`], since AWS Marketplace grants entitlements out of
+//! band and this API models no operation that creates one.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +87,174 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{StoredEntitlement, StoredEntitlementValue};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+
+/// The page size `GetEntitlements` uses when the caller sends no `MaxResults`, and the
+/// largest page it will answer with.
+///
+/// Taken from the model: `MaxResults` targets `PageSizeInteger`, whose `@range` is
+/// `1..25`, so 25 is the largest page the API can be asked for and therefore the widest
+/// page it may answer with unasked.
+const DEFAULT_PAGE_SIZE: usize = 25;
+
+/// The smallest page size the model allows (`PageSizeInteger` `@range` min).
+const MIN_PAGE_SIZE: usize = 1;
+
+/// Domain separator mixed into every page-cursor digest, so a token only ever
+/// authenticates as a cursor of THIS operation.
+const PAGE_CURSOR_DOMAIN: &str =
+    "com.amazonaws.marketplaceentitlementservice#GetEntitlements/page-cursor/v1";
+
+/// Which stored member a `GetEntitlementFilterName` selects on.
+///
+/// The four names come from the modeled `GetEntitlementFilterName` enum, which this
+/// crate already renders as [`GET_ENTITLEMENT_FILTER_NAME_VALUES`] in
+/// `ops/types/shared_types.rs`; `filter_member` and that list are kept in agreement by
+/// [`filter_key_is_modeled`].
+fn filter_member<'e>(key: &str, entitlement: &'e StoredEntitlement) -> Option<&'e str> {
+    match key {
+        "CUSTOMER_IDENTIFIER" => entitlement.customer_identifier.as_deref(),
+        "DIMENSION" => entitlement.dimension.as_deref(),
+        "CUSTOMER_AWS_ACCOUNT_ID" => entitlement.customer_aws_account_id.as_deref(),
+        "LICENSE_ARN" => entitlement.license_arn.as_deref(),
+        _ => None,
+    }
+}
+
+/// Whether `key` is one of the values the modeled filter-name enum declares.
+fn filter_key_is_modeled(key: &str) -> bool {
+    GET_ENTITLEMENT_FILTER_NAME_VALUES.contains(&key)
+}
+
+/// An `InvalidParameterException` (HTTP 400) carrying `message`.
+fn invalid_parameter(message: impl Into<String>) -> GetEntitlementsError {
+    GetEntitlementsErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server-side fault, not a bad request.
+fn internal_service_error(message: impl Into<String>) -> GetEntitlementsError {
+    GetEntitlementsErrorModeled::InternalServiceErrorException(InternalServiceErrorException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// Absorb one field into `hasher`, length-prefixed.
+///
+/// The length prefix is what makes the fingerprint unambiguous: without it, two
+/// different filters whose values happen to concatenate to the same bytes would
+/// fingerprint identically, and a cursor from one would be accepted for the other.
+fn absorb(hasher: &mut Sha256, field: &[u8]) {
+    hasher.update((field.len() as u64).to_be_bytes());
+    hasher.update(field);
+}
+
+/// A fingerprint of the QUERY a page cursor belongs to: the product code plus the
+/// filter, canonicalised so key and value ordering do not matter (the filter is a map
+/// and its value lists are unioned, so neither order changes the result set).
+fn query_fingerprint(product_code: &str, filter: Option<&HashMap<String, Vec<String>>>) -> String {
+    let mut canonical: Vec<(&str, Vec<&str>)> = filter
+        .map(|filter| {
+            filter
+                .iter()
+                .map(|(key, values)| {
+                    let mut values: Vec<&str> = values.iter().map(String::as_str).collect();
+                    values.sort_unstable();
+                    (key.as_str(), values)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    canonical.sort_unstable_by(|left, right| left.0.cmp(right.0));
+
+    let mut hasher = Sha256::new();
+    absorb(&mut hasher, product_code.as_bytes());
+    absorb(&mut hasher, canonical.len().to_string().as_bytes());
+    for (key, values) in canonical {
+        absorb(&mut hasher, key.as_bytes());
+        absorb(&mut hasher, values.len().to_string().as_bytes());
+        for value in values {
+            absorb(&mut hasher, value.as_bytes());
+        }
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// The digest half of a page token: a deterministic integrity tag binding the offset to
+/// the query the token was issued for.
+///
+/// NOT a secret and NOT an authenticator: every input is derivable from the caller's own
+/// request, so a caller who knows this construction can mint a tag for any offset of a
+/// query it is already reading. That is deliberate — the tag's job is to detect a token
+/// that is malformed, truncated, or carried over from a DIFFERENT query, which is what
+/// makes a cursor usable only where it means something; it is not an access control, and
+/// nothing in the emulator treats it as one.
+fn page_cursor_digest(query_fingerprint: &str, offset: usize) -> String {
+    let mut hasher = Sha256::new();
+    absorb(&mut hasher, PAGE_CURSOR_DOMAIN.as_bytes());
+    absorb(&mut hasher, query_fingerprint.as_bytes());
+    absorb(&mut hasher, offset.to_string().as_bytes());
+    hex::encode(&hasher.finalize()[..16])
+}
+
+/// Encode an opaque cursor at `offset` of the query identified by `query_fingerprint`.
+///
+/// Stateless on purpose: `GetEntitlements` is a read, so handing out a page token must
+/// not write anything a later caller could observe. The token is hex, hence matches the
+/// modeled `^\S+$` pattern for `NextToken`. "Opaque" here means a caller is given no
+/// structure to rely on, not that the token is unforgeable — see [`page_cursor_digest`].
+fn encode_page_cursor(query_fingerprint: &str, offset: usize) -> String {
+    format!(
+        "{}.{}",
+        hex::encode(offset.to_string()),
+        page_cursor_digest(query_fingerprint, offset)
+    )
+}
+
+/// Recover the offset carried by a cursor of THIS query, or `None` when the token is not
+/// one — free text, a malformed or truncated token, a tampered digest, or a token issued
+/// for a different product code or filter.
+///
+/// A caller that reimplements [`page_cursor_digest`] can mint a cursor for an arbitrary
+/// offset of a query it is already allowed to read; that is harmless (an offset past the
+/// end simply yields an empty page) and is not what this check is for.
+fn decode_page_cursor(query_fingerprint: &str, token: &str) -> Option<usize> {
+    let (offset_hex, digest) = token.split_once('.')?;
+    let offset_bytes = hex::decode(offset_hex).ok()?;
+    let offset: usize = std::str::from_utf8(&offset_bytes).ok()?.parse().ok()?;
+    (page_cursor_digest(query_fingerprint, offset) == digest).then_some(offset)
+}
+
+impl From<&StoredEntitlementValue> for EntitlementValue {
+    fn from(stored: &StoredEntitlementValue) -> Self {
+        Self {
+            integer_value: stored.integer_value,
+            double_value: stored.double_value,
+            boolean_value: stored.boolean_value,
+            string_value: stored.string_value.clone(),
+        }
+    }
+}
+
+impl From<&StoredEntitlement> for Entitlement {
+    fn from(stored: &StoredEntitlement) -> Self {
+        Self {
+            product_code: Some(stored.product_code.clone()),
+            dimension: stored.dimension.clone(),
+            customer_identifier: stored.customer_identifier.clone(),
+            customer_aws_account_id: stored.customer_aws_account_id.clone(),
+            value: stored.value.as_ref().map(EntitlementValue::from),
+            expiration_date: stored.expiration_date,
+            license_arn: stored.license_arn.clone(),
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -162,18 +325,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEntitlements` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEntitlementsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEntitlements"))
+        let filter = input.filter.as_ref();
+        // Only the filter KEYS are traced below; a value can carry a customer identifier.
+        let mut filter_keys: Vec<&str> = filter
+            .map(|filter| filter.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        filter_keys.sort_unstable();
+
+        // Every filter key must be a value the modeled enum declares; an unknown one
+        // names no entitlement member, so it cannot be answered.
+        if let Some(filter) = filter {
+            if let Some(unknown) = filter.keys().find(|key| !filter_key_is_modeled(key.as_str())) {
+                tracing::debug!(
+                    operation = Self::NAME,
+                    method = %ctx.parts().method,
+                    filter_keys = ?filter_keys,
+                    "GetEntitlements refused an unmodeled Filter key"
+                );
+                return Err(invalid_parameter(format!(
+                    "Filter key {unknown} is not a supported GetEntitlementFilterName; \
+                     supported keys are {}",
+                    GET_ENTITLEMENT_FILTER_NAME_VALUES.join(", ")
+                )));
+            }
+
+            // CustomerIdentifier and CustomerAWSAccountId identify the same buyer two
+            // ways, so the model's docs state they are mutually exclusive: one or the
+            // other, never both in one request.
+            if filter.contains_key("CUSTOMER_IDENTIFIER")
+                && filter.contains_key("CUSTOMER_AWS_ACCOUNT_ID")
+            {
+                tracing::debug!(
+                    operation = Self::NAME,
+                    method = %ctx.parts().method,
+                    filter_keys = ?filter_keys,
+                    "GetEntitlements refused mutually exclusive customer Filter keys"
+                );
+                return Err(invalid_parameter(
+                    "Filter keys CUSTOMER_IDENTIFIER and CUSTOMER_AWS_ACCOUNT_ID are mutually \
+                     exclusive; use one or the other, but not both in the same request",
+                ));
+            }
+        }
+
+        let fingerprint = query_fingerprint(&input.product_code, filter);
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => decode_page_cursor(&fingerprint, token).ok_or_else(|| {
+                tracing::debug!(
+                    operation = Self::NAME,
+                    method = %ctx.parts().method,
+                    filter_keys = ?filter_keys,
+                    "GetEntitlements refused a NextToken that is not a cursor of this query"
+                );
+                invalid_parameter(
+                    "NextToken is not a pagination token this service issued for this \
+                     ProductCode and Filter",
+                )
+            })?,
+        };
+
+        // `MaxResults` targets `PageSizeInteger`, `@range(min: 1, max: 25)`. The boundary
+        // validator refuses an out-of-range value before this handler runs; refusing it
+        // here too means a gap there surfaces as the modelled 400 rather than as a
+        // silently narrowed or widened page.
+        let page_size = match input.max_results {
+            None => DEFAULT_PAGE_SIZE,
+            Some(max_results) => usize::try_from(max_results)
+                .ok()
+                .filter(|size| (MIN_PAGE_SIZE..=DEFAULT_PAGE_SIZE).contains(size))
+                .ok_or_else(|| {
+                    invalid_parameter(format!(
+                        "MaxResults must be between {MIN_PAGE_SIZE} and {DEFAULT_PAGE_SIZE}, \
+                         got {max_results}"
+                    ))
+                })?,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            internal_service_error("the entitlement store is unavailable on this engine")
+        })?;
+
+        // Read-only: select the matching records, in the store's insertion order, and
+        // cut the requested page out of them. Nothing in the store is touched.
+        let (entitlements, next_token) = {
+            let store = state.lock();
+            let matched: Vec<&StoredEntitlement> = store
+                .entitlements
+                .iter()
+                .filter(|entitlement| entitlement.product_code == input.product_code)
+                .filter(|entitlement| {
+                    // Values within one key are UNIONed; distinct keys are INTERSECTed.
+                    filter.is_none_or(|filter| {
+                        filter.iter().all(|(key, values)| {
+                            filter_member(key, entitlement)
+                                .is_some_and(|member| values.iter().any(|value| value == member))
+                        })
+                    })
+                })
+                .collect();
+
+            let page: Vec<Entitlement> = matched
+                .iter()
+                .skip(offset)
+                .take(page_size)
+                .map(|entitlement| Entitlement::from(*entitlement))
+                .collect();
+            let consumed = offset.saturating_add(page.len());
+            let next_token =
+                (consumed < matched.len()).then(|| encode_page_cursor(&fingerprint, consumed));
+            (page, next_token)
+        };
+
+        tracing::debug!(
+            operation = Self::NAME,
+            method = %ctx.parts().method,
+            product_code = %input.product_code,
+            filter_keys = ?filter_keys,
+            page_size,
+            offset,
+            returned = entitlements.len(),
+            has_next_token = next_token.is_some(),
+            "GetEntitlements answered a page from the entitlement store"
+        );
+
+        Ok(GetEntitlementsOutput {
+            entitlements: Some(entitlements),
+            next_token,
+        })
     }
 }
