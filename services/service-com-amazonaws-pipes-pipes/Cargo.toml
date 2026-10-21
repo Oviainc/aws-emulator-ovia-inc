@@ -21,6 +21,8 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Hex codec for the opaque `NextToken` ListPipes issues and reads back.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -28,6 +30,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `time` on top of the workspace features: the lifecycle test waits out the state-settle
+# span with `tokio::time::sleep` rather than parking the test runtime's worker thread.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

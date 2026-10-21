@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPipes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPipes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPipes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: enumerates the persisted pipes in name order, honouring every modelled
+//! filter plus `Limit` and an opaque `NextToken`. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +156,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPipes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPipesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPipes"))
+        // A report of the stored pipes: nothing here depends on request metadata.
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPipesErrorModeled::InternalException(InternalException {
+                message: "the pipes store is not reachable from this engine".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        // The enum-valued filters. The boundary validator already refuses a value outside
+        // the member's enum; these re-state the same rule naming the member.
+        for (member, value, allowed) in [
+            (
+                "DesiredState",
+                input.desired_state.as_deref(),
+                REQUESTED_PIPE_STATE_VALUES,
+            ),
+            (
+                "CurrentState",
+                input.current_state.as_deref(),
+                PIPE_STATE_VALUES,
+            ),
+        ] {
+            if let Some(value) = value {
+                if !allowed.contains(&value) {
+                    return Err(ListPipesErrorModeled::ValidationException(ValidationException {
+                        message: Some(format!(
+                            "{member} must be one of {}; got '{value}'",
+                            allowed.join(", "),
+                        )),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: member.to_string(),
+                            message: format!("must be one of {}", allowed.join(", ")),
+                        }]),
+                    })
+                    .into());
+                }
+            }
+        }
+
+        // `Limit` targets `LimitMax100`, `@range(min: 1, max: 100)`; an absent `Limit`
+        // returns a full page, which is that maximum.
+        const MAX_LIMIT: i32 = 100;
+        let limit = match input.limit {
+            None => MAX_LIMIT,
+            Some(limit) if (1..=MAX_LIMIT).contains(&limit) => limit,
+            Some(limit) => {
+                return Err(ListPipesErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "Limit must be between 1 and {MAX_LIMIT}; got {limit}"
+                    )),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "Limit".to_string(),
+                        message: format!("must be between 1 and {MAX_LIMIT}"),
+                    }]),
+                })
+                .into());
+            }
+        };
+        let limit = usize::try_from(limit).unwrap_or(1);
+
+        // A `NextToken` is opaque to its caller, who passes back one THIS service issued;
+        // anything else is refused rather than silently read as a name.
+        let start_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_next_token(token) {
+                Some(after) => Some(after),
+                None => {
+                    return Err(ListPipesErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "NextToken is not a token issued by a previous ListPipes call"
+                                    .to_string(),
+                            ),
+                            field_list: Some(vec![ValidationExceptionField {
+                                name: "NextToken".to_string(),
+                                message: "must be a NextToken returned by a previous ListPipes \
+                                          call, passed back unchanged"
+                                    .to_string(),
+                            }]),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let mut state = store.lock();
+        // The ONE write a reporting operation may make: materialise the state moves the
+        // clock has ALREADY made due, so `CurrentState` here is the same value a
+        // DescribePipe at this instant reports (and the `CurrentState` filter sees it).
+        state.settle_due_transitions();
+
+        // `pipes` is a `BTreeMap`, so this enumerates in name order: one deterministic
+        // sequence for every page of one query.
+        let mut matching = state
+            .pipes
+            .values()
+            .filter(|pipe| {
+                start_after
+                    .as_deref()
+                    .is_none_or(|after| pipe.name.as_str() > after)
+            })
+            .filter(|pipe| {
+                input
+                    .name_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| pipe.name.starts_with(prefix))
+            })
+            .filter(|pipe| {
+                input
+                    .desired_state
+                    .as_deref()
+                    .is_none_or(|state| pipe.desired_state == state)
+            })
+            .filter(|pipe| {
+                input
+                    .current_state
+                    .as_deref()
+                    .is_none_or(|state| pipe.current_state == state)
+            })
+            .filter(|pipe| {
+                input
+                    .source_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| pipe.source.starts_with(prefix))
+            })
+            .filter(|pipe| {
+                input
+                    .target_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| pipe.target.starts_with(prefix))
+            });
+
+        // Only this page is materialised; one more step of the iterator says whether a
+        // later page exists.
+        let page: Vec<Pipe> = matching
+            .by_ref()
+            .take(limit)
+            .map(crate::state::PipeRecord::summary)
+            .collect();
+        let more_remain = matching.next().is_some();
+        // A token only when a later page exists, and it names the last pipe returned, so
+        // the next call resumes immediately after it.
+        let next_token = match page.last() {
+            Some(last) if more_remain => last
+                .name
+                .as_deref()
+                .map(crate::state::encode_next_token),
+            _ => None,
+        };
+
+        Ok(ListPipesOutput {
+            pipes: Some(page),
+            next_token,
+        })
     }
 }

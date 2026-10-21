@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePipe
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePipe`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePipe::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: persists the whole pipe record in [`crate::state`], mints its ARN, and
+//! answers from the record it just stored. A name that already exists is refused with
+//! `ConflictException` (409). This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +185,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePipe` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePipeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePipe"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreatePipeErrorModeled::InternalException(InternalException {
+                message: "the pipes store is not reachable from this engine".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        // `DesiredState` targets `RequestedPipeState`; the boundary validator refuses a
+        // value outside that enum, and this re-states the same rule for any path that
+        // reaches the handler with one, naming the member and its legal values.
+        let desired_state = match input.desired_state.as_deref() {
+            None => crate::state::requested_state::RUNNING.to_string(),
+            Some(value) if REQUESTED_PIPE_STATE_VALUES.contains(&value) => value.to_string(),
+            Some(value) => {
+                return Err(CreatePipeErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "DesiredState must be one of {}; got '{value}'",
+                        REQUESTED_PIPE_STATE_VALUES.join(", "),
+                    )),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "DesiredState".to_string(),
+                        message: format!(
+                            "must be one of {}",
+                            REQUESTED_PIPE_STATE_VALUES.join(", ")
+                        ),
+                    }]),
+                })
+                .into());
+            }
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = store.lock();
+        state.settle_due_transitions();
+
+        if let Some(existing) = state.pipes.get(&input.name) {
+            return Err(CreatePipeErrorModeled::ConflictException(ConflictException {
+                message: format!("Pipe named {} already exists.", existing.name),
+                resource_id: existing.name.clone(),
+                resource_type: crate::state::PIPE_RESOURCE_TYPE.to_string(),
+            })
+            .into());
+        }
+
+        // The store holds at most `MAX_PIPES` records, so no caller can grow it without
+        // limit; past the cap this is the quota failure the model declares.
+        if state.pipes.len() >= crate::state::MAX_PIPES {
+            return Err(CreatePipeErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The number of pipes in this account and Region has reached the \
+                         limit of {}.",
+                        crate::state::MAX_PIPES
+                    ),
+                    resource_id: input.name.clone(),
+                    resource_type: crate::state::PIPE_RESOURCE_TYPE.to_string(),
+                    service_code: "pipes".to_string(),
+                    // A descriptive name: AWS's own quota code is an `L-…` identifier
+                    // this emulator has no source for, and the member is required.
+                    quota_code: "PipeCount".to_string(),
+                },
+            )
+            .into());
+        }
+
+        // A pipe AWS has just accepted is reported `CREATING` and reaches the state the
+        // caller asked for a moment later; the record stores that due instant rather than
+        // sleeping for it.
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::PipeRecord {
+            arn: crate::state::pipe_arn(&region, &input.name),
+            name: input.name.clone(),
+            description: input.description.clone(),
+            current_state: crate::state::pipe_state::CREATING.to_string(),
+            // The move the clock owes: `CREATING` -> the state the caller asked for.
+            pending: Some(crate::state::pending_transition(&desired_state)),
+            desired_state,
+            state_reason: None,
+            source: input.source.clone(),
+            source_parameters: input.source_parameters.clone(),
+            enrichment: input.enrichment.clone(),
+            enrichment_parameters: input.enrichment_parameters.clone(),
+            target: input.target.clone(),
+            target_parameters: input.target_parameters.clone(),
+            role_arn: input.role_arn.clone(),
+            tags: input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            creation_time: now,
+            last_modified_time: now,
+            log_configuration: input.log_configuration.as_ref().map(log_configuration_of),
+            kms_key_identifier: input.kms_key_identifier.clone(),
+        };
+
+        let output = CreatePipeOutput {
+            arn: Some(record.arn.clone()),
+            name: Some(record.name.clone()),
+            desired_state: Some(record.desired_state.clone()),
+            current_state: Some(record.current_state.clone()),
+            creation_time: Some(crate::state::timestamp(record.creation_time)),
+            last_modified_time: Some(crate::state::timestamp(record.last_modified_time)),
+        };
+        state.pipes.insert(record.name.clone(), record);
+        Ok(output)
+    }
+}
+
+/// The logging configuration AWS reports (`PipeLogConfiguration`) for the one the caller
+/// supplied (`PipeLogConfigurationParameters`): the same destinations, as the read shape.
+fn log_configuration_of(params: &PipeLogConfigurationParameters) -> PipeLogConfiguration {
+    PipeLogConfiguration {
+        s3_log_destination: params
+            .s3_log_destination
+            .as_ref()
+            .map(|dest| S3LogDestination {
+                bucket_name: Some(dest.bucket_name.clone()),
+                prefix: dest.prefix.clone(),
+                bucket_owner: Some(dest.bucket_owner.clone()),
+                output_format: dest.output_format.clone(),
+            }),
+        firehose_log_destination: params
+            .firehose_log_destination
+            .as_ref()
+            .map(|dest| FirehoseLogDestination {
+                delivery_stream_arn: Some(dest.delivery_stream_arn.clone()),
+            }),
+        cloudwatch_logs_log_destination: params
+            .cloudwatch_logs_log_destination
+            .as_ref()
+            .map(|dest| CloudwatchLogsLogDestination {
+                log_group_arn: Some(dest.log_group_arn.clone()),
+            }),
+        level: Some(params.level.clone()),
+        include_execution_data: params.include_execution_data.clone(),
     }
 }
