@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# SHA-256 over a catalog entry's slug: derives the deterministic opaque id in each
+# catalog ARN, and the filter fingerprint carried inside a pagination token.
+sha2 = { workspace = true }
+# Hex codec for those ids and for the opaque pagination token encoding.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
