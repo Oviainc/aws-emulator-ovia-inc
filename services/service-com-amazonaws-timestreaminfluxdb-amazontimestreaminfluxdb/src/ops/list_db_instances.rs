@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDbInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDbInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDbInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +146,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDbInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDbInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDbInstances"))
+        use crate::state as st;
+        use ::std::ops::Bound;
+
+        let _ = ctx;
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(ListDbInstancesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        // `maxResults` is modeled `range 1..100`, so the framework has already refused
+        // anything outside it; an omitted value pages at that modeled maximum.
+        let page_size = usize::try_from(input.max_results.unwrap_or(st::MAX_RESULTS_DEFAULT))
+            .unwrap_or(st::MAX_RESULTS_DEFAULT as usize)
+            .max(1);
+
+        let mut state = state.lock();
+        // Reporting only: settling applies the status change the clock already made due.
+        for record in state.db_instances.values_mut() {
+            record.settle(now);
+        }
+
+        // The token is the id the previous page ended on, so a page resumes strictly
+        // after it: every live instance is yielded exactly once even if the instance the
+        // token names was deleted between pages.
+        let lower = match input.next_token.as_deref() {
+            Some(token) => Bound::Excluded(token.to_string()),
+            None => Bound::Unbounded,
+        };
+        let mut remaining = state.db_instances.range((lower, Bound::Unbounded));
+        let items: Vec<DbInstanceSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(_, record)| record.to_summary())
+            .collect();
+        // A token comes back only when a further page exists, and it names the last id
+        // on THIS page so the next request resumes after it.
+        let next_token = remaining
+            .next()
+            .and_then(|_| items.last().map(|item| item.id.clone()));
+
+        Ok(ListDbInstancesOutput { items, next_token })
     }
 }
