@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateJobExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateJobExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateJobExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the device's `status` (plus `statusDetails` and the step timeout) to
+//! the persisted execution, increments `versionNumber` and stamps
+//! `lastUpdatedAt`. An `expectedVersion` that does not match the stored version
+//! is refused with 409 `InvalidStateTransitionException` and changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -107,6 +103,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    CANCEL_STEP_TIMER_MINUTES, MAX_STEP_TIMEOUT_MINUTES, MIN_STEP_TIMEOUT_MINUTES,
+    STATUS_IN_PROGRESS,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -180,18 +181,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateJobExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateJobExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateJobExecution"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let unavailable = || -> UpdateJobExecutionError {
+            UpdateJobExecutionErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the job execution store is unavailable".to_string()),
+                },
+            )
+            .into()
+        };
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable());
+        };
+
+        // `status` is a modeled enum, so the boundary validator has already
+        // refused anything outside it; checking it here as well keeps the
+        // store's invariant local — only a value of the generated catalog is
+        // ever written, so every stored status is classified pending or terminal.
+        if !JOB_EXECUTION_STATUS_VALUES.contains(&input.status.as_str()) {
+            return Err(UpdateJobExecutionErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "status must be one of {}, got {}",
+                        JOB_EXECUTION_STATUS_VALUES.join(", "),
+                        input.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The model declares no bound on `stepTimeoutInMinutes`, but the member
+        // documents 1..10080 plus -1 ("will cancel the current step timer").
+        if let Some(minutes) = input.step_timeout_in_minutes {
+            let acceptable = minutes == CANCEL_STEP_TIMER_MINUTES
+                || (MIN_STEP_TIMEOUT_MINUTES..=MAX_STEP_TIMEOUT_MINUTES).contains(&minutes);
+            if !acceptable {
+                return Err(UpdateJobExecutionErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "stepTimeoutInMinutes must be between {MIN_STEP_TIMEOUT_MINUTES} and {MAX_STEP_TIMEOUT_MINUTES}, or {CANCEL_STEP_TIMER_MINUTES} to cancel the step timer, got {minutes}"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut state = state.lock();
+        let Some(index) =
+            state.execution_index(&input.thing_name, &input.job_id, input.execution_number)
+        else {
+            return Err(UpdateJobExecutionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no job execution {} for thing {}",
+                        input.job_id, input.thing_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let now = crate::state::now_epoch_seconds();
+        let Some(record) = state.record_mut(&input.thing_name, index) else {
+            return Err(unavailable());
+        };
+
+        // A stale `expectedVersion` is refused BEFORE anything is written, so the
+        // rejected update leaves the execution exactly as it was.
+        if let Some(expected) = input.expected_version {
+            if expected != record.version_number {
+                return Err(
+                    UpdateJobExecutionErrorModeled::InvalidStateTransitionException(
+                        InvalidStateTransitionException {
+                            message: Some(format!(
+                                "expectedVersion {expected} does not match the job execution's current version {}",
+                                record.version_number
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // An execution that has reached a terminal status is finished: no further
+        // update can move it — the case `InvalidStateTransitionException` itself
+        // documents ("an attempt to change a request in state SUCCESS to state
+        // IN_PROGRESS").
+        if record.is_terminal() {
+            return Err(
+                UpdateJobExecutionErrorModeled::InvalidStateTransitionException(
+                    InvalidStateTransitionException {
+                        message: Some(format!(
+                            "job execution {} is in terminal status {} and cannot be changed to {}",
+                            record.job_id, record.status, input.status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The details are checked and applied FIRST, so a map the record cannot
+        // hold leaves the execution untouched, exactly like a stale
+        // `expectedVersion`.
+        if let Err(reason) = record.try_merge_status_details(input.status_details.as_ref()) {
+            return Err(UpdateJobExecutionErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+        record.status = input.status.clone();
+        record.arm_step_timer(input.step_timeout_in_minutes, now);
+        if record.status == STATUS_IN_PROGRESS && record.started_at.is_none() {
+            record.started_at = Some(now);
+        }
+        record.last_updated_at = now;
+        // "Job execution versions are incremented each time they are updated by a
+        // device" — `JobExecution$versionNumber`.
+        record.version_number += 1;
+
+        Ok(UpdateJobExecutionOutput {
+            // Both members are opt-in: "The default is false" for each.
+            execution_state: input
+                .include_job_execution_state
+                .unwrap_or(false)
+                .then(|| record.to_execution_state()),
+            job_document: input
+                .include_job_document
+                .unwrap_or(false)
+                .then(|| record.job_document.clone()),
+        })
     }
 }

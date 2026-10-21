@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartNextPendingJobExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartNextPendingJobExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartNextPendingJobExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes the thing's next pending (`IN_PROGRESS` or `QUEUED`) execution, moves it
+//! to `IN_PROGRESS`, applies the request's `statusDetails` and step timeout,
+//! increments `versionNumber` and returns the stored execution with its job
+//! document. A thing with no pending execution gets a 200 with no `execution`.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +80,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    MAX_STEP_TIMEOUT_MINUTES, MIN_STEP_TIMEOUT_MINUTES, STATUS_IN_PROGRESS,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -156,18 +156,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartNextPendingJobExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartNextPendingJobExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartNextPendingJobExecution"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                StartNextPendingJobExecutionErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the job execution store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The model declares no bound on `stepTimeoutInMinutes`, but the member
+        // documents one (1..10080), so the refusal is this operation's own.
+        if let Some(minutes) = input.step_timeout_in_minutes {
+            if !(MIN_STEP_TIMEOUT_MINUTES..=MAX_STEP_TIMEOUT_MINUTES).contains(&minutes) {
+                return Err(
+                    StartNextPendingJobExecutionErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(format!(
+                                "stepTimeoutInMinutes must be between {MIN_STEP_TIMEOUT_MINUTES} and {MAX_STEP_TIMEOUT_MINUTES}, got {minutes}"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let mut state = state.lock();
+        // Pending is "IN_PROGRESS or QUEUED", as this operation documents; an
+        // already-started execution is resumed before a queued one is started.
+        let Some(index) = state.next_pending_index(&input.thing_name) else {
+            // No pending execution for this thing: nothing was started, so there
+            // is no execution to report.
+            return Ok(StartNextPendingJobExecutionOutput { execution: None });
+        };
+
+        let now = crate::state::now_epoch_seconds();
+        let execution = {
+            let Some(record) = state.record_mut(&input.thing_name, index) else {
+                return Err(
+                    StartNextPendingJobExecutionErrorModeled::ServiceUnavailableException(
+                        ServiceUnavailableException {
+                            message: Some("the job execution store is unavailable".to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            // The details are checked and applied BEFORE anything else moves, so
+            // a map the record cannot hold leaves the execution untouched.
+            if let Err(reason) = record.try_merge_status_details(input.status_details.as_ref()) {
+                return Err(
+                    StartNextPendingJobExecutionErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(reason),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            record.status = STATUS_IN_PROGRESS.to_string();
+            // `startedAt` is when the execution started, so resuming one that is
+            // already in progress keeps its original start time.
+            record.started_at = Some(record.started_at.unwrap_or(now));
+            record.arm_step_timer(input.step_timeout_in_minutes, now);
+            record.last_updated_at = now;
+            // This IS a device update, so the version moves.
+            record.version_number += 1;
+            // The device needs the job document to run the job, so it is always
+            // part of this response.
+            record.to_job_execution(true, now)
+        };
+
+        Ok(StartNextPendingJobExecutionOutput {
+            execution: Some(execution),
+        })
     }
 }

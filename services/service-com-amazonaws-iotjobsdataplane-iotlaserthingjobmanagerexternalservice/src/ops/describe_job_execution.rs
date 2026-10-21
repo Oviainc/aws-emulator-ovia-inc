@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeJobExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeJobExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeJobExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the persisted execution `jobId` names on the thing — with `$next`
+//! resolving to the thing's next pending execution and `executionNumber`
+//! selecting one — and writes nothing. `includeJobDocument` defaults to TRUE
+//! here, as the member documents ("Unless set to false, the response contains the
+//! job document. The default is true").
+//!
+//! `DescribeJobExecution`'s `TerminalStateException` (410) and
+//! `InvalidRequestException` (400) are deliberately NOT produced here: this
+//! operation reports the stored execution, including one in a terminal status
+//! (the bootstrap issue requires exactly that), and the request combinations the
+//! real service refuses are filed as their own issue along with the rest of the
+//! long tail (clock-driven `TIMED_OUT`, certificate validation, throttling).
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +157,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeJobExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeJobExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeJobExecution"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeJobExecutionErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the job execution store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // ONE lookup, so a job the store does not hold has exactly one answer:
+        // 404. `$next` resolves to the thing's next pending execution.
+        let Some(record) =
+            state.resolve_record(&input.thing_name, &input.job_id, input.execution_number)
+        else {
+            return Err(DescribeJobExecutionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no job execution {} for thing {}",
+                        input.job_id, input.thing_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "Unless set to false, the response contains the job document. The
+        // default is true."
+        let include_job_document = input.include_job_document.unwrap_or(true);
+        Ok(DescribeJobExecutionOutput {
+            execution: Some(
+                record.to_job_execution(include_job_document, crate::state::now_epoch_seconds()),
+            ),
+        })
     }
 }
