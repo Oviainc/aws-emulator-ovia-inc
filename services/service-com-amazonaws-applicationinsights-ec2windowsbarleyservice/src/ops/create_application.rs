@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: persists a new application keyed by `ResourceGroupName` in
+//! [`crate::state`] and reports it back through [`crate::state::Application::info`], so
+//! `DescribeApplication` and `ListApplications` answer from the same stored record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A create that names no `ResourceGroupName` is refused, including the
+//! `GroupingType=ACCOUNT_BASED` case where the real service onboards the whole
+//! account under a group name it mints itself: minting that name is part of the
+//! account-based slice, which is not implemented here, so this handler refuses
+//! rather than inventing one.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +174,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplication"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateApplicationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `ResourceGroupName` is the key an application is stored and looked up
+        // under, so a create that names none has nothing to key. The model marks
+        // the member optional, so the boundary validator lets it through and the
+        // refusal belongs here.
+        let Some(resource_group_name) = input.resource_group_name else {
+            return Err(CreateApplicationErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "ResourceGroupName must not be null: it names the resource group the application is created over"
+                        .to_string(),
+                ),
+            })
+            .into());
+        };
+
+        let discovery_type = crate::state::discovery_type_for(input.grouping_type.as_deref());
+        let now = ::std::time::SystemTime::now();
+
+        // `AutoCreate` asks for the recommended configuration to be applied to
+        // every resource in the group; component configuration
+        // (`UpdateComponentConfiguration`) is a later slice and still answers
+        // 501, so nothing here claims to have applied it. `Tags` ARE stored on
+        // the record below, so the write is not discarded, even though the
+        // tagging operations that report them are also a later slice.
+        let application_info = {
+            let mut store = state.lock();
+            if store.applications.contains_key(&resource_group_name) {
+                return Err(CreateApplicationErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(format!(
+                            "an application already exists for resource group {resource_group_name}"
+                        )),
+                    },
+                )
+                .into());
+            }
+            // What stops a caller growing the store without end: the emulator's
+            // own bound, not a claim about any account's quota.
+            if store.applications.len() >= crate::state::APPLICATION_QUOTA {
+                return Err(CreateApplicationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "this emulator stores at most {} applications; delete one before creating another",
+                            crate::state::APPLICATION_QUOTA
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            let application = crate::state::Application {
+                resource_group_name: resource_group_name.clone(),
+                account_id: ::engine::emulator_account_id().to_string(),
+                ops_center_enabled: input.ops_center_enabled,
+                cwe_monitor_enabled: input.cwe_monitor_enabled,
+                auto_config_enabled: input.auto_config_enabled,
+                ops_item_sns_topic_arn: input.ops_item_sns_topic_arn,
+                sns_notification_arn: input.sns_notification_arn,
+                attach_missing_permission: input.attach_missing_permission,
+                discovery_type: Some(discovery_type.to_string()),
+                remarks: None,
+                tags: input.tags.unwrap_or_default(),
+                components: ::std::collections::BTreeMap::new(),
+                // Onboarding is owed by the clock from here, so the application
+                // this call reports is still `CREATING`.
+                onboarded_at: now + crate::state::ONBOARDING_SPAN,
+            };
+            // Report the record that was STORED, not the request: the info is
+            // read off the application before it is inserted, by the same
+            // mapping every reader uses.
+            let application_info = application.info(now);
+            store.applications.insert(resource_group_name, application);
+            application_info
+        };
+
+        Ok(CreateApplicationOutput {
+            application_info: Some(application_info),
+        })
     }
 }
