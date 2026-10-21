@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOutpost
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOutpost`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOutpost::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves the `SiteId` the caller named against this service's store,
+//! mints an `OutpostId` / `OutpostArn`, persists the Outpost against that site and
+//! answers the stored record. `GetOutpost`, `ListOutposts` and `DeleteOutpost` read
+//! that same store, and `DeleteSite` refuses a site this still references.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +154,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOutpost` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOutpostErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOutpost"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateOutpostErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+
+        // `SiteId` accepts the bare id or the full site ARN; both name the same
+        // stored site.
+        let site_id = crate::state::resolve_site_id(&input.site_id).ok_or_else(|| {
+            CreateOutpostErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "SiteId must be a site id or site ARN, got {}",
+                    input.site_id
+                )),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // An Outpost belongs to a site, so a site that does not exist cannot take
+        // one: the service answers the not-found error it models for this call.
+        let site_arn = store
+            .sites
+            .get(&site_id)
+            .and_then(|record| record.site.site_arn.clone())
+            .ok_or_else(|| {
+                CreateOutpostErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!("the site {site_id} does not exist")),
+                })
+            })?;
+        // See `CreateSite`: the store's growth is capped and refused with the quota
+        // error this operation models.
+        if store.outposts.len() >= crate::state::MAX_RESOURCES {
+            return Err(CreateOutpostErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the number of Outposts would exceed the limit of {}",
+                        crate::state::MAX_RESOURCES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let (outpost_id, sequence) = store.mint_id("op");
+        let outpost = Outpost {
+            outpost_id: Some(outpost_id.clone()),
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            outpost_arn: Some(crate::state::outpost_arn(&region, &outpost_id)),
+            site_id: Some(site_id),
+            name: Some(input.name),
+            description: input.description,
+            life_cycle_status: Some(crate::state::LIFE_CYCLE_STATUS_ACTIVE.to_string()),
+            availability_zone: crate::state::non_empty(input.availability_zone),
+            availability_zone_id: crate::state::non_empty(input.availability_zone_id),
+            tags: crate::state::tags_member(&input.tags.unwrap_or_default()),
+            site_arn: Some(site_arn),
+            // `SupportedHardwareType` is optional and the model documents no
+            // default for it, so an Outpost the caller named none for reports
+            // none rather than a guessed form factor.
+            supported_hardware_type: crate::state::non_empty(input.supported_hardware_type),
+            // `Generation` and `RackScalingType` describe the hardware an order
+            // installs; `CreateOutpost` takes neither, and nothing in this slice
+            // places hardware, so the emulator reports no value rather than
+            // inventing one.
+            generation: None,
+            rack_scaling_type: None,
+        };
+        store.outposts.insert(
+            outpost_id,
+            crate::state::OutpostRecord {
+                sequence,
+                outpost: outpost.clone(),
+            },
+        );
+
+        Ok(CreateOutpostOutput {
+            outpost: Some(outpost),
+        })
     }
 }
