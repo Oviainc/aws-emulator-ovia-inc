@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRequestAuthorizationDetails
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRequestAuthorizationDetails`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRequestAuthorizationDetails::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: every response is computed from the record
+//! [`crate::state::ComAmazonawsIamtoolboxAuthrequestserviceState`] holds for the
+//! requested authorization id. A hit inside the retention window is a 200 carrying that
+//! record's own request context, policies and one page of its evaluations; an id with no
+//! live record is a 404 `ResourceNotFoundException`; a `nextToken` this operation did not
+//! issue for that id is a 400 `ValidationException`. The read never writes: two calls
+//! with the same input answer the same body.
 //!
 //! ## Shape of an operation
 //!
@@ -162,20 +161,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRequestAuthorizationDetails` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRequestAuthorizationDetailsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRequestAuthorizationDetails"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            server_error(
+                "The authorization details store is not reachable from this emulator's engine.",
+            )
+        })?;
+
+        // The pagination token is part of the REQUEST, so it is checked before the
+        // record is looked up: a token this operation never issued for this
+        // authorization id is a malformed request, not a missing resource.
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => decode_page_token(token, &input.authorization_id)?,
+        };
+
+        // Read-only: the guard is taken, the page is copied out of the stored record,
+        // and nothing in the store is written — so repeating the call answers the same
+        // body, and a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let record = store
+            .live_record(&input.authorization_id, std::time::SystemTime::now())
+            .ok_or_else(|| {
+                not_found(format!(
+                    "No authorization details exist for authorization ID {} in this region, \
+                     or they have expired.",
+                    input.authorization_id
+                ))
+            })?;
+
+        let total = record.evaluations.len();
+        // A token is issued only for an offset that STARTS a further page, so an offset
+        // at or past the end of this record's evaluations is not one this operation
+        // issued, however well-formed the rest of the token is.
+        if input.next_token.is_some() && offset >= total {
+            return Err(invalid_next_token(format!(
+                "The nextToken value does not resolve to a page of the evaluations recorded \
+                 for authorization ID {}.",
+                input.authorization_id
+            )));
+        }
+        let end = offset.saturating_add(EVALUATIONS_PAGE_SIZE).min(total);
+
+        Ok(GetRequestAuthorizationDetailsOutput {
+            // Request-level members: they describe the denied request as a whole, so
+            // every page of its evaluations repeats them.
+            request_context: record.request_context.clone(),
+            policies: record.policies.clone(),
+            evaluations: record.evaluations[offset..end].to_vec(),
+            // Only while a further page exists; absent on the last one.
+            next_token: (end < total)
+                .then(|| encode_page_token(&input.authorization_id, end)),
+        })
     }
+}
+
+/// How many `evaluations` one page carries.
+///
+/// The model binds no page-size member to this operation (no `maxResults`/`pageSize`
+/// input, see `smithy_query(query="operation",operation="GetRequestAuthorizationDetails")`),
+/// so the page size is the service's own: a chosen value, not a documented one. It only
+/// has to be a fixed, positive page size — a caller follows `nextToken` until it is
+/// absent rather than counting items.
+const EVALUATIONS_PAGE_SIZE: usize = 10;
+
+/// The version field every pagination token this operation issues starts with, so a
+/// later encoding can be told apart from this one instead of being mis-decoded.
+const PAGE_TOKEN_VERSION: &str = "v1";
+
+/// The opaque `nextToken` for resuming `authorization_id`'s evaluations at `offset`.
+///
+/// The token is opaque to the caller but not arbitrary: it is the hex encoding (the `hex`
+/// crate, rather than a hand-rolled codec) of `version:authorization-id:offset`, so
+/// decoding it recovers the record it belongs to and the offset into that record's
+/// evaluation list. Carrying the id is what lets a token issued for one authorization id
+/// be refused when it is replayed against another.
+fn encode_page_token(authorization_id: &str, offset: usize) -> String {
+    hex::encode(format!("{PAGE_TOKEN_VERSION}:{authorization_id}:{offset}"))
+}
+
+/// The offset a `nextToken` resolves to for `authorization_id`, or a 400
+/// `ValidationException` when the value is not a token this operation issued for that id.
+///
+/// Every token this operation issues names a positive offset that is a multiple of
+/// [`EVALUATIONS_PAGE_SIZE`], so any other offset is refused here rather than served as
+/// a window no page boundary ever fell on.
+///
+/// The modeled `authorizationId` pattern admits only lowercase alphanumerics, so the
+/// field separator cannot occur inside an id and the split is unambiguous.
+fn decode_page_token(
+    token: &str,
+    authorization_id: &str,
+) -> Result<usize, GetRequestAuthorizationDetailsError> {
+    let malformed = || {
+        invalid_next_token(
+            "The nextToken value is not a pagination token issued by \
+             GetRequestAuthorizationDetails.",
+        )
+    };
+
+    let decoded = hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(malformed)?;
+
+    let mut fields = decoded.split(':');
+    let (Some(PAGE_TOKEN_VERSION), Some(token_id), Some(offset), None) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return Err(malformed());
+    };
+
+    if token_id != authorization_id {
+        return Err(invalid_next_token(format!(
+            "The nextToken value was issued for a different authorization ID than {authorization_id}."
+        )));
+    }
+
+    let offset: usize = offset.parse().map_err(|_| malformed())?;
+    if offset == 0 || !offset.is_multiple_of(EVALUATIONS_PAGE_SIZE) {
+        return Err(malformed());
+    }
+    Ok(offset)
+}
+
+/// A 400 `ValidationException`: the request named a `nextToken` the service cannot
+/// resolve.
+fn invalid_next_token(message: impl Into<String>) -> GetRequestAuthorizationDetailsError {
+    GetRequestAuthorizationDetailsErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException`: no live record for the requested authorization id.
+fn not_found(message: impl Into<String>) -> GetRequestAuthorizationDetailsError {
+    GetRequestAuthorizationDetailsErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: message.into(),
+        },
+    )
+    .into()
+}
+
+/// A 500 `InternalServerException`: the service's own store could not be reached, which
+/// is a fault of the emulator rather than of the request.
+fn server_error(message: impl Into<String>) -> GetRequestAuthorizationDetailsError {
+    GetRequestAuthorizationDetailsErrorModeled::InternalServerException(InternalServerException {
+        message: message.into(),
+    })
+    .into()
 }

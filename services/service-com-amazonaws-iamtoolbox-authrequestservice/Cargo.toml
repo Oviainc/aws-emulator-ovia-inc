@@ -19,6 +19,8 @@ aws-smithy-types = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
+# Codec for the opaque `nextToken` this service's paginated read issues.
+hex = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 
