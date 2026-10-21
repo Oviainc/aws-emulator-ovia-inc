@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDocumentTextDetection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDocumentTextDetection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Derives its answer from stored state; see the modelled contract below.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDocumentTextDetection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Reports an asynchronous text-detection job. The job is looked up by `JobId`, so an
+//! unknown id (or one belonging to a `StartDocumentAnalysis` job) is an
+//! `InvalidJobIdException`, never a hollow 200. `JobStatus` is derived from the
+//! instant the start call made the terminal transition due — `IN_PROGRESS` before it,
+//! then `SUCCEEDED` or the modelled `FAILED` with the stored `StatusMessage` — and
+//! `MaxResults` / `NextToken` page the job's STORED block list.
+//!
+//! NOTE on coverage: a job only reaches `SUCCEEDED` when its document was readable, and
+//! an asynchronous document is always an S3 object this emulator's Amazon S3 cannot
+//! serve bytes for yet, so today every job settles `FAILED` and the block-serving
+//! branch below is not reached over the wire. It becomes reachable unchanged as soon as
+//! S3 can serve objects; until then the paging rule it relies on is asserted directly
+//! over `state::page_of_blocks` / `encode_page_token` / `decode_page_token` in
+//! `tests/all/document_extraction.rs`.
 //!
 //! ## Shape of an operation
 //!
@@ -198,20 +207,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDocumentTextDetection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDocumentTextDetectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDocumentTextDetection"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDocumentTextDetectionErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("Textract state is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        // A job started by StartDocumentAnalysis is not readable here: this operation
+        // only knows text-detection jobs, so its id is not a valid JobId for it.
+        let job = store
+            .jobs
+            .get(&input.job_id)
+            .filter(|job| job.kind == crate::state::JobKind::TextDetection);
+        let Some(job) = job else {
+            return Err(GetDocumentTextDetectionErrorModeled::InvalidJobIdException(
+                InvalidJobIdException {
+                    message: Some(format!(
+                        "{} is not a text detection job started by this service",
+                        input.job_id
+                    )),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        let status = job.status(std::time::SystemTime::now());
+
+        // `NextToken` is checked before anything is reported: a cursor that was not
+        // issued for this job is a bad request whatever the job's status is.
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::decode_page_token(&job.job_id, token) {
+                Some(offset) => offset,
+                None => {
+                    return Err(
+                        GetDocumentTextDetectionErrorModeled::InvalidParameterException(
+                            InvalidParameterException {
+                                message: Some(
+                                    "NextToken was not issued for this job".to_string(),
+                                ),
+                                code: None,
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+        };
+
+        if status != "SUCCEEDED" {
+            // There is no result to report: the job is still running, or it ended in
+            // the modelled FAILED state and `StatusMessage` says why.
+            return Ok(GetDocumentTextDetectionOutput {
+                document_metadata: Some(DocumentMetadata {
+                    pages: Some(job.pages),
+                }),
+                job_status: Some(status.to_string()),
+                next_token: None,
+                blocks: None,
+                warnings: None,
+                status_message: job.status_message.clone(),
+                detect_document_text_model_version: Some(job.model_version.clone()),
+            });
+        }
+
+        let Some((blocks, next_token)) =
+            crate::state::page_of_blocks(&job.job_id, &job.blocks, input.max_results, offset)
+        else {
+            return Err(
+                GetDocumentTextDetectionErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "MaxResults must be at least 1, got {:?}",
+                            input.max_results
+                        )),
+                        code: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetDocumentTextDetectionOutput {
+            document_metadata: Some(DocumentMetadata {
+                pages: Some(job.pages),
+            }),
+            job_status: Some(status.to_string()),
+            next_token,
+            blocks: Some(blocks),
+            warnings: (!job.warnings.is_empty()).then(|| job.warnings.clone()),
+            status_message: job.status_message.clone(),
+            detect_document_text_model_version: Some(job.model_version.clone()),
+        })
     }
 }

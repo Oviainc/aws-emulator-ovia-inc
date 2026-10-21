@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDocumentAnalysis
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDocumentAnalysis`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Derives its answer from stored state; see the modelled contract below.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDocumentAnalysis::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Starts an asynchronous analysis job. Same as `StartDocumentTextDetection`, plus the
+//! required `FeatureTypes`, which are persisted on the job and decide the block set
+//! `GetDocumentAnalysis` reports. A document that cannot be read ends the job in the
+//! modelled `FAILED` state with a `StatusMessage` saying why.
 //!
 //! ## Shape of an operation
 //!
@@ -216,20 +215,180 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDocumentAnalysis` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDocumentAnalysisErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDocumentAnalysis"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartDocumentAnalysisErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("Textract state is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        let invalid = |message: String| -> Self::Error {
+            StartDocumentAnalysisErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                    code: None,
+                },
+            )
+            .into()
+        };
+
+        if input.adapters_config.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StartDocumentAnalysis with AdaptersConfig",
+            ));
+        }
+        if input.queries_config.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StartDocumentAnalysis with QueriesConfig",
+            ));
+        }
+
+        let features = match crate::state::parse_features(&input.feature_types) {
+            Ok(features) => features,
+            Err(crate::state::FeatureError::Empty) => {
+                return Err(invalid(
+                    "FeatureTypes must contain at least one FeatureType".to_string(),
+                ))
+            }
+            Err(crate::state::FeatureError::Unknown(value)) => {
+                return Err(invalid(format!(
+                    "FeatureTypes contains {value}, which is not a FeatureType"
+                )))
+            }
+            Err(crate::state::FeatureError::NotDerived(value)) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "StartDocumentAnalysis with FeatureTypes {value}"
+                )))
+            }
+        };
+
+        let feature_types = input.feature_types;
+        let reference = match crate::state::reference_for_location(&input.document_location) {
+            Ok(reference) => reference,
+            Err(message) => return Err(invalid(message)),
+        };
+
+        let kind = crate::state::JobKind::DocumentAnalysis;
+        let key = reference.identity_key();
+        let slot = input
+            .client_request_token
+            .as_deref()
+            .map(|token| format!("{}:{token}", kind.as_str()));
+
+        // Idempotency: the same token must answer with the job the first call created,
+        // and is a mismatch when the document or the requested features differ.
+        if let Some(slot) = &slot {
+            let existing = state.lock().job_for_token(slot, &reference, &feature_types);
+            if let Some((job_id, same_request)) = existing {
+                if same_request {
+                    return Ok(StartDocumentAnalysisOutput {
+                        job_id: Some(job_id),
+                    });
+                }
+                return Err(
+                    StartDocumentAnalysisErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(format!(
+                                "the ClientRequestToken was already used to start job {job_id} \
+                                 with different parameters"
+                            )),
+                            code: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Reading the document and deriving its blocks happens OUTSIDE the state lock,
+        // so one caller's work is never serialised in front of another caller's request.
+        let stored = state.lock().stored_content(&key);
+        let read = match stored {
+            Some(content) => Ok(content),
+            None => crate::state::read_content(&reference, None),
+        };
+        // A document this emulator cannot read is a job that ENDS in the modelled
+        // FAILED state carrying the reason, not a hollow success.
+        let (outcome, status_message, content, blocks) = match read {
+            Ok(content) => {
+                let blocks = crate::state::blocks(&key, &content, features);
+                (
+                    crate::state::JobOutcome::Succeeded,
+                    None,
+                    content,
+                    blocks,
+                )
+            }
+            Err(reason) => (
+                crate::state::JobOutcome::Failed,
+                Some(reason.message().to_string()),
+                crate::state::DocumentContent::default(),
+                Vec::new(),
+            ),
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Re-check the token under the lock that mints: a concurrent start with the same
+        // token may have created the job while this one was reading the document, and
+        // the contract is that one token names one job.
+        if let Some(slot) = &slot {
+            let existing = store.job_for_token(slot, &reference, &feature_types);
+            if let Some((job_id, same_request)) = existing {
+                if same_request {
+                    return Ok(StartDocumentAnalysisOutput {
+                        job_id: Some(job_id),
+                    });
+                }
+                return Err(
+                    StartDocumentAnalysisErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(format!(
+                                "the ClientRequestToken was already used to start job {job_id} \
+                                 with different parameters"
+                            )),
+                            code: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        if outcome == crate::state::JobOutcome::Succeeded {
+            store.register_document(reference.clone(), content.clone());
+        }
+        let job_id = store.mint_job_id(&key);
+        let job = crate::state::Job {
+            job_id: job_id.clone(),
+            kind,
+            document: reference,
+            feature_types,
+            client_request_token: input.client_request_token,
+            job_tag: input.job_tag,
+            notification_channel: input.notification_channel,
+            output_config: input.output_config,
+            kms_key_id: input.kms_key_id,
+            outcome,
+            status_message,
+            warnings: Vec::new(),
+            created_at: now,
+            settles_at: now + crate::state::JOB_COMPLETION_DELAY,
+            pages: content.page_count(),
+            blocks,
+            model_version: crate::state::ANALYZE_DOCUMENT_MODEL_VERSION.to_string(),
+        };
+        if let Some(slot) = slot {
+            store.idempotency.insert(slot, job_id.clone());
+        }
+        store.insert_job(job);
+
+        Ok(StartDocumentAnalysisOutput {
+            job_id: Some(job_id),
+        })
     }
 }

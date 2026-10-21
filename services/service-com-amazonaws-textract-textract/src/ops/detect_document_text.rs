@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetectDocumentText
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetectDocumentText`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Derives its answer from stored state; see the modelled contract below.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetectDocumentText::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Synchronous text detection, implemented.
+//!
+//! The document is registered in this service's state and its `PAGE`/`LINE`/`WORD`
+//! blocks are derived from the stored content, so the same document always answers
+//! with the same blocks and the asynchronous path
+//! (`StartDocumentTextDetection` / `GetDocumentTextDetection`) agrees with it.
 //!
 //! ## Shape of an operation
 //!
@@ -178,20 +179,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetectDocumentText` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetectDocumentTextErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetectDocumentText"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DetectDocumentTextErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("Textract state is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        // Exactly one of `Document.Bytes` / `Document.S3Object` must be set; the model
+        // cannot express that, so it is refused here with the error this operation
+        // documents for it.
+        let reference = match crate::state::reference_for_document(&input.document) {
+            Ok(reference) => reference,
+            Err(message) => {
+                return Err(DetectDocumentTextErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                        code: None,
+                    },
+                )
+                .into())
+            }
+        };
+
+        let key = reference.identity_key();
+        // Read the document's text, or refuse with the modelled error for why it cannot
+        // be read. The read happens OUTSIDE the state lock.
+        let stored = state.lock().stored_content(&key);
+        let content = match stored {
+            Some(content) => content,
+            None => match crate::state::read_content(&reference, input.document.bytes.as_deref()) {
+                Ok(content) => state.lock().register_document(reference, content),
+                Err(reason) => return Err(unreadable_error(&reason)),
+            },
+        };
+
+        // `FeatureSet::default()` yields PAGE/LINE/WORD only — no `EntityTypes`,
+        // `RowIndex`, `ColumnIndex`, `RowSpan` or `ColumnSpan`, which the `Block` docs
+        // say DetectDocumentText does not return.
+        let blocks = crate::state::blocks(&key, &content, crate::state::FeatureSet::default());
+
+        Ok(DetectDocumentTextOutput {
+            document_metadata: Some(content.metadata()),
+            blocks: Some(blocks),
+            detect_document_text_model_version: Some(
+                crate::state::DETECT_DOCUMENT_TEXT_MODEL_VERSION.to_string(),
+            ),
+        })
     }
+}
+
+/// The modelled answer for a document whose text cannot be read.
+fn unreadable_error(reason: &crate::state::Unreadable) -> DetectDocumentTextError {
+    let message = Some(reason.message().to_string());
+    match reason {
+        crate::state::Unreadable::UnsupportedFormat(_) => {
+            DetectDocumentTextErrorModeled::UnsupportedDocumentException(
+                UnsupportedDocumentException {
+                    message,
+                    code: None,
+                },
+            )
+        }
+        crate::state::Unreadable::S3Unreadable(_) => {
+            DetectDocumentTextErrorModeled::InvalidS3ObjectException(InvalidS3ObjectException {
+                message,
+                code: None,
+            })
+        }
+        crate::state::Unreadable::TooLarge(_) => {
+            DetectDocumentTextErrorModeled::DocumentTooLargeException(DocumentTooLargeException {
+                message,
+                code: None,
+            })
+        }
+    }
+    .into()
 }

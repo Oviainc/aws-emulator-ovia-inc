@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AnalyzeDocument
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AnalyzeDocument`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Derives its answer from stored state; see the modelled contract below.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AnalyzeDocument::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Synchronous document analysis. The document is registered in this service's state
+//! and the derived block set depends on the requested `FeatureTypes`: `FORMS` adds
+//! `KEY_VALUE_SET` blocks (`EntityTypes` KEY/VALUE, with `CHILD` and `VALUE`
+//! relationships) and `TABLES` adds `TABLE` + `CELL` blocks carrying `RowIndex` /
+//! `ColumnIndex`. Requesting neither yields PAGE/LINE/WORD only, which is exactly what
+//! `DetectDocumentText` answers for the same document.
 //!
 //! ## Shape of an operation
 //!
@@ -213,20 +214,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AnalyzeDocument` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AnalyzeDocumentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AnalyzeDocument"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AnalyzeDocumentErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("Textract state is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        let invalid = |message: String| -> Self::Error {
+            AnalyzeDocumentErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+                code: None,
+            })
+            .into()
+        };
+
+        // A human loop and an adapter are resources this slice does not model, so a
+        // request that asks for one is answered 501 rather than with a 200 that
+        // silently drops it.
+        if input.human_loop_config.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "AnalyzeDocument with HumanLoopConfig",
+            ));
+        }
+        if input.adapters_config.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "AnalyzeDocument with AdaptersConfig",
+            ));
+        }
+        if input.queries_config.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "AnalyzeDocument with QueriesConfig",
+            ));
+        }
+
+        let features = match crate::state::parse_features(&input.feature_types) {
+            Ok(features) => features,
+            Err(crate::state::FeatureError::Empty) => {
+                return Err(invalid(
+                    "FeatureTypes must contain at least one FeatureType".to_string(),
+                ))
+            }
+            Err(crate::state::FeatureError::Unknown(value)) => {
+                return Err(invalid(format!(
+                    "FeatureTypes contains {value}, which is not a FeatureType"
+                )))
+            }
+            Err(crate::state::FeatureError::NotDerived(value)) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "AnalyzeDocument with FeatureTypes {value}"
+                )))
+            }
+        };
+
+        let reference = match crate::state::reference_for_document(&input.document) {
+            Ok(reference) => reference,
+            Err(message) => return Err(invalid(message)),
+        };
+
+        let key = reference.identity_key();
+        let stored = state.lock().stored_content(&key);
+        let content = match stored {
+            Some(content) => content,
+            None => match crate::state::read_content(&reference, input.document.bytes.as_deref()) {
+                Ok(content) => state.lock().register_document(reference, content),
+                Err(reason) => return Err(unreadable_error(&reason)),
+            },
+        };
+        let blocks = crate::state::blocks(&key, &content, features);
+
+        Ok(AnalyzeDocumentOutput {
+            document_metadata: Some(content.metadata()),
+            blocks: Some(blocks),
+            human_loop_activation_output: None,
+            analyze_document_model_version: Some(
+                crate::state::ANALYZE_DOCUMENT_MODEL_VERSION.to_string(),
+            ),
+        })
     }
+}
+
+/// The modelled answer for a document whose text cannot be read.
+fn unreadable_error(reason: &crate::state::Unreadable) -> AnalyzeDocumentError {
+    let message = Some(reason.message().to_string());
+    match reason {
+        crate::state::Unreadable::UnsupportedFormat(_) => {
+            AnalyzeDocumentErrorModeled::UnsupportedDocumentException(
+                UnsupportedDocumentException {
+                    message,
+                    code: None,
+                },
+            )
+        }
+        crate::state::Unreadable::S3Unreadable(_) => {
+            AnalyzeDocumentErrorModeled::InvalidS3ObjectException(InvalidS3ObjectException {
+                message,
+                code: None,
+            })
+        }
+        crate::state::Unreadable::TooLarge(_) => {
+            AnalyzeDocumentErrorModeled::DocumentTooLargeException(DocumentTooLargeException {
+                message,
+                code: None,
+            })
+        }
+    }
+    .into()
 }

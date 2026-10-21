@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDocumentTextDetection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDocumentTextDetection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Derives its answer from stored state; see the modelled contract below.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDocumentTextDetection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Starts an asynchronous text-detection job: the job record (its document, its
+//! derived blocks and the instant its terminal transition falls due) is persisted
+//! under the minted `JobId`, which `GetDocumentTextDetection` reads back. Repeating a
+//! `ClientRequestToken` returns the SAME `JobId`; reusing it for a different document
+//! is an `IdempotentParameterMismatchException`.
+//!
+//! A `DocumentLocation` names an S3 object, and this emulator's Amazon S3 cannot serve
+//! object bytes yet, so the document usually cannot be read. That is NOT answered with
+//! a hollow success: the job is created and then ends in the modelled `FAILED` state
+//! with a `StatusMessage` saying why the document could not be read.
 //!
 //! ## Shape of an operation
 //!
@@ -208,20 +213,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDocumentTextDetection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDocumentTextDetectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDocumentTextDetection"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartDocumentTextDetectionErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("Textract state is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        let reference = match crate::state::reference_for_location(&input.document_location) {
+            Ok(reference) => reference,
+            Err(message) => {
+                return Err(
+                    StartDocumentTextDetectionErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(message),
+                            code: None,
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        let kind = crate::state::JobKind::TextDetection;
+        let key = reference.identity_key();
+        let slot = input
+            .client_request_token
+            .as_deref()
+            .map(|token| format!("{}:{token}", kind.as_str()));
+
+        // Idempotency: the same token for the same document answers with the job the
+        // first call created; for a different document it is a mismatch.
+        if let Some(slot) = &slot {
+            let existing = state.lock().job_for_token(slot, &reference, &[]);
+            if let Some((job_id, same_document)) = existing {
+                if same_document {
+                    return Ok(StartDocumentTextDetectionOutput {
+                        job_id: Some(job_id),
+                    });
+                }
+                return Err(
+                    StartDocumentTextDetectionErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(format!(
+                                "the ClientRequestToken was already used to start job {job_id} \
+                                 for a different document"
+                            )),
+                            code: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Reading the document and deriving its blocks happens OUTSIDE the state lock,
+        // so one caller's work is never serialised in front of another caller's request.
+        let stored = state.lock().stored_content(&key);
+        let read = match stored {
+            Some(content) => Ok(content),
+            None => crate::state::read_content(&reference, None),
+        };
+        // A document this emulator cannot read is a job that ENDS in the modelled
+        // FAILED state carrying the reason, not a hollow success.
+        let (outcome, status_message, content, blocks) = match read {
+            Ok(content) => {
+                let blocks =
+                    crate::state::blocks(&key, &content, crate::state::FeatureSet::default());
+                (
+                    crate::state::JobOutcome::Succeeded,
+                    None,
+                    content,
+                    blocks,
+                )
+            }
+            Err(reason) => (
+                crate::state::JobOutcome::Failed,
+                Some(reason.message().to_string()),
+                crate::state::DocumentContent::default(),
+                Vec::new(),
+            ),
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Re-check the token under the lock that mints: a concurrent start with the same
+        // token may have created the job while this one was reading the document, and
+        // the contract is that one token names one job.
+        if let Some(slot) = &slot {
+            let existing = store.job_for_token(slot, &reference, &[]);
+            if let Some((job_id, same_document)) = existing {
+                if same_document {
+                    return Ok(StartDocumentTextDetectionOutput {
+                        job_id: Some(job_id),
+                    });
+                }
+                return Err(
+                    StartDocumentTextDetectionErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(format!(
+                                "the ClientRequestToken was already used to start job {job_id} \
+                                 for a different document"
+                            )),
+                            code: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        if outcome == crate::state::JobOutcome::Succeeded {
+            store.register_document(reference.clone(), content.clone());
+        }
+        let job_id = store.mint_job_id(&key);
+        let job = crate::state::Job {
+            job_id: job_id.clone(),
+            kind,
+            document: reference,
+            feature_types: Vec::new(),
+            client_request_token: input.client_request_token,
+            job_tag: input.job_tag,
+            notification_channel: input.notification_channel,
+            output_config: input.output_config,
+            kms_key_id: input.kms_key_id,
+            outcome,
+            status_message,
+            warnings: Vec::new(),
+            created_at: now,
+            settles_at: now + crate::state::JOB_COMPLETION_DELAY,
+            pages: content.page_count(),
+            blocks,
+            model_version: crate::state::DETECT_DOCUMENT_TEXT_MODEL_VERSION.to_string(),
+        };
+        if let Some(slot) = slot {
+            store.idempotency.insert(slot, job_id.clone());
+        }
+        store.insert_job(job);
+
+        Ok(StartDocumentTextDetectionOutput {
+            job_id: Some(job_id),
+        })
     }
 }
