@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CountTokens
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CountTokens`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CountTokens::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Counts the tokens of an `InvokeModel` or `Converse` request body with the
+//! single tokenizer in [`crate::state`], so the count this operation reports and
+//! the one `Converse` reports in `usage.inputTokens` agree for identical input.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +172,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CountTokens` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CountTokensErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CountTokens"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CountTokensErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Bedrock Runtime emulator has no state store".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // @readonly: this operation only reports, so it takes the lock to resolve
+        // the model and writes nothing.
+        if state.lock().resolve_model(&input.model_id).is_none() {
+            return Err(CountTokensErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "The provided model identifier is invalid: {}",
+                        input.model_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let input_tokens = match &input.input {
+            CountTokensInput2::invokeModel(request) => {
+                crate::state::body_input_tokens(&request.body)
+            }
+            CountTokensInput2::Converse(request) => crate::state::converse_input_tokens(
+                request.system.as_ref(),
+                request.messages.as_ref(),
+                request.tool_config.as_ref(),
+            ),
+        };
+
+        let input_tokens = crate::state::token_count_i32(input_tokens);
+
+        Ok(CountTokensOutput { input_tokens })
     }
 }
