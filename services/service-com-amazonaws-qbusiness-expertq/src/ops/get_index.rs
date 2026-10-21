@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored index record. A reporting operation: it writes only the
+//! `CREATING` -> `ACTIVE` transition the clock already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +176,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIndex"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetIndexErrorModeled::InternalServerException(InternalServerException {
+                message: "the Amazon Q Business store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        // The only write a report may make: the status transition the clock already owes.
+        store.settle(now);
+
+        let application = store.applications.get(&input.application_id).ok_or_else(|| {
+            GetIndexErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("Application with ID {} not found", input.application_id),
+                resource_id: input.application_id.clone(),
+                resource_type: "APPLICATION".to_string(),
+            })
+        })?;
+        let index = application.indices.get(&input.index_id).ok_or_else(|| {
+            GetIndexErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("Index with ID {} not found", input.index_id),
+                resource_id: input.index_id.clone(),
+                resource_type: "INDEX".to_string(),
+            })
+        })?;
+
+        Ok(GetIndexOutput {
+            application_id: Some(index.application_id.clone()),
+            index_id: Some(index.index_id.clone()),
+            display_name: Some(index.display_name.clone()),
+            index_arn: Some(index.index_arn.clone()),
+            status: Some(index.status.clone()),
+            r#type: index.index_type.clone(),
+            description: index.description.clone(),
+            created_at: Some(::aws_smithy_types::DateTime::from(index.created_at)),
+            updated_at: Some(::aws_smithy_types::DateTime::from(index.updated_at)),
+            capacity_configuration: index.capacity_configuration.clone(),
+            // `@length(1, 500)`, so an index with no configured document attributes
+            // reports none rather than an empty list.
+            document_attribute_configurations: (!index
+                .document_attribute_configurations
+                .is_empty())
+            .then(|| index.document_attribute_configurations.clone()),
+            error: None,
+            // Document statistics are a data-plane fact; BatchPutDocument and the rest of
+            // the document operations are not implemented yet, so none is reported.
+            index_statistics: None,
+        })
     }
 }
