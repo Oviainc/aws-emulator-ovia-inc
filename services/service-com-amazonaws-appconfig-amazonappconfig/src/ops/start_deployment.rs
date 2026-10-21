@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: starts a deployment of a configuration version into an environment
+//! and persists it, paced by the deployment strategy it names.
 //!
 //! ## Shape of an operation
 //!
@@ -182,6 +175,16 @@ impl From<StartDeploymentErrorModeled> for StartDeploymentError {
     }
 }
 
+/// A `ResourceNotFoundException` (HTTP 404) naming the resource the deployment could
+/// not resolve.
+fn not_found(message: String, resource_name: String) -> StartDeploymentError {
+    StartDeploymentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        resource_name: Some(resource_name),
+    })
+    .into()
+}
+
 /// The `StartDeployment` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -216,20 +219,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDeployment"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartDeploymentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let started_at = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Resolve every resource the deployment names before anything is written.
+        let Some(application) = store.applications.get(&input.application_id) else {
+            return Err(not_found(
+                format!("No application with id {} exists.", input.application_id),
+                input.application_id,
+            ));
+        };
+        if !application.environments.contains_key(&input.environment_id) {
+            return Err(not_found(
+                format!(
+                    "No environment with id {} exists in application {}.",
+                    input.environment_id, input.application_id
+                ),
+                input.environment_id,
+            ));
+        }
+        let Some(profile) = application.profiles.get(&input.configuration_profile_id) else {
+            return Err(not_found(
+                format!(
+                    "No configuration profile with id {} exists in application {}.",
+                    input.configuration_profile_id, input.application_id
+                ),
+                input.configuration_profile_id,
+            ));
+        };
+        // The deployment records WHAT it deployed, so the configuration's name and
+        // location are copied off the profile as it stands now.
+        let configuration_name = profile.name.clone();
+        let configuration_location_uri = profile.location_uri.clone();
+        // `ConfigurationVersion` names a hosted version either by its version number or
+        // by its version label, so the deployment records the label of the version it
+        // deployed when that version carries one.
+        let version_label = profile
+            .hosted_versions
+            .values()
+            .find(|version| {
+                version.version_number.to_string() == input.configuration_version
+                    || version.version_label.as_deref()
+                        == Some(input.configuration_version.as_str())
+            })
+            .and_then(|version| version.version_label.clone());
+
+        let Some(strategy) = store.resolve_strategy(&input.deployment_strategy_id) else {
+            return Err(not_found(
+                format!(
+                    "No deployment strategy with id {} exists.",
+                    input.deployment_strategy_id
+                ),
+                input.deployment_strategy_id,
+            ));
+        };
+
+        let Some(environment) = store
+            .applications
+            .get_mut(&input.application_id)
+            .and_then(|application| application.environments.get_mut(&input.environment_id))
+        else {
+            return Err(StartDeploymentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The environment could not be re-read while starting the deployment"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Bring the environment up to date first: a deployment whose rollout and bake
+        // time have both elapsed is no longer in flight, and must not block this one.
+        environment.materialize(started_at);
+        if let Some(in_flight) = environment.deployment_in_flight() {
+            return Err(StartDeploymentErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Deployment number {} is still {} in environment {}; only one deployment \
+                     at a time can be in progress for an environment.",
+                    in_flight.deployment_number, in_flight.state, environment.id
+                )),
+            })
+            .into());
+        }
+
+        // `LatestDeploymentNumber` is the caller's assertion about the state it is
+        // deploying from: "use this value to ensure that the deployment starts from the
+        // expected state and to prevent conflicting updates".
+        if let Some(expected) = input.latest_deployment_number {
+            let latest = environment.latest_deployment_number();
+            if expected != latest {
+                return Err(StartDeploymentErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "LatestDeploymentNumber {expected} does not match the latest deployment \
+                         number {latest} of this environment."
+                    )),
+                })
+                .into());
+            }
+        }
+
+        let deployment_number = environment.next_deployment_number;
+        environment.next_deployment_number += 1;
+        let deployment = crate::state::Deployment::start(
+            crate::state::NewDeployment {
+                deployment_number,
+                application_id: environment.application_id.clone(),
+                environment_id: environment.id.clone(),
+                configuration_profile_id: input.configuration_profile_id,
+                configuration_name,
+                configuration_location_uri,
+                configuration_version: input.configuration_version,
+                description: input.description,
+                kms_key_identifier: input.kms_key_identifier,
+                version_label,
+                tags: input.tags.unwrap_or_default(),
+            },
+            &strategy,
+            started_at,
+        );
+        let stored = environment.record_deployment(deployment);
+
+        // Answered from the stored deployment. `KmsKeyArn` and `AppliedExtensions` are
+        // deliberately left unset, not overlooked: the first is the ARN of the key
+        // `KmsKeyIdentifier` resolves to and this emulator resolves no KMS key, and the
+        // second lists the extensions the deployment invoked, which this emulator does
+        // not run (extension associations are still a 501 of their own). Any value here
+        // would be fabricated.
+        let output = StartDeploymentOutput {
+            application_id: Some(stored.application_id.clone()),
+            environment_id: Some(stored.environment_id.clone()),
+            deployment_strategy_id: Some(stored.deployment_strategy_id.clone()),
+            configuration_profile_id: Some(stored.configuration_profile_id.clone()),
+            deployment_number: stored.deployment_number,
+            configuration_name: Some(stored.configuration_name.clone()),
+            configuration_location_uri: Some(stored.configuration_location_uri.clone()),
+            configuration_version: Some(stored.configuration_version.clone()),
+            description: stored.description.clone(),
+            deployment_duration_in_minutes: stored.deployment_duration_in_minutes,
+            growth_type: Some(stored.growth_type.clone()),
+            growth_factor: Some(stored.growth_factor),
+            final_bake_time_in_minutes: stored.final_bake_time_in_minutes,
+            state: Some(stored.state.clone()),
+            event_log: Some(stored.event_log_newest_first()),
+            percentage_complete: Some(stored.percentage_complete),
+            started_at: Some(crate::state::to_date_time(stored.started_at)),
+            completed_at: stored.completed_at.map(crate::state::to_date_time),
+            applied_extensions: None,
+            kms_key_arn: None,
+            kms_key_identifier: stored.kms_key_identifier.clone(),
+            version_label: stored.version_label.clone(),
+        };
+
+        // The environment is DEPLOYING for as long as this deployment is in flight.
+        environment.materialize(started_at);
+
+        Ok(output)
     }
 }

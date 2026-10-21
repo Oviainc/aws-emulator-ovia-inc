@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfigurationProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfigurationProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfigurationProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: creates a configuration profile under an application and persists it.
 //!
 //! ## Shape of an operation
 //!
@@ -218,20 +210,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfigurationProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConfigurationProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfigurationProfile"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateConfigurationProfileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The model's `Type` documentation names the values this member accepts: "When
+        // calling this API, enter one of the following values for Type:
+        // AWS.AppConfig.FeatureFlags, AWS.Freeform". The schema walk only enforces the
+        // member's pattern, so the value itself is checked here.
+        if let Some(profile_type) = input.r#type.as_deref() {
+            if !crate::state::CONFIGURATION_PROFILE_TYPES.contains(&profile_type) {
+                return Err(CreateConfigurationProfileErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!(
+                            "Type {profile_type} is not a configuration profile type; enter one \
+                             of {}.",
+                            crate::state::CONFIGURATION_PROFILE_TYPES.join(", ")
+                        )),
+                        reason: None,
+                        details: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A profile only exists under an application, so the parent is resolved before
+        // an id is minted for the child.
+        let Some(application) = store.applications.get(&input.application_id) else {
+            return Err(CreateConfigurationProfileErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No application with id {} exists.",
+                        input.application_id
+                    )),
+                    resource_name: Some(input.application_id),
+                },
+            )
+            .into());
+        };
+        // Bounded so a loop of create calls cannot grow this emulator's heap without
+        // limit; see `state::MAX_CONFIGURATION_PROFILES_PER_APPLICATION`.
+        if application.profiles.len() >= crate::state::MAX_CONFIGURATION_PROFILES_PER_APPLICATION {
+            return Err(
+                CreateConfigurationProfileErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "Cannot create another configuration profile: application {} already \
+                             holds the maximum of {} configuration profiles.",
+                            input.application_id,
+                            crate::state::MAX_CONFIGURATION_PROFILES_PER_APPLICATION
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.mint_id();
+        let Some(application) = store.applications.get_mut(&input.application_id) else {
+            return Err(CreateConfigurationProfileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The application could not be re-read while creating the configuration \
+                         profile"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let profile = crate::state::ConfigurationProfile {
+            id: id.clone(),
+            application_id: application.id.clone(),
+            name: input.name,
+            description: input.description,
+            location_uri: input.location_uri,
+            retrieval_role_arn: input.retrieval_role_arn,
+            validators: input.validators.unwrap_or_default(),
+            profile_type: input.r#type,
+            kms_key_identifier: input.kms_key_identifier,
+            tags: input.tags.unwrap_or_default(),
+            hosted_versions: std::collections::BTreeMap::new(),
+            // AppConfig numbers a profile's hosted configuration versions from 1.
+            next_version_number: 1,
+        };
+        // `mint_id` rejects every id any resource already holds, so the slot is vacant.
+        // An occupied one is refused rather than answered from: reporting 201 with
+        // another profile's record would describe a resource this call never made.
+        let stored = match application.profiles.entry(id) {
+            std::collections::hash_map::Entry::Vacant(slot) => slot.insert(profile),
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(CreateConfigurationProfileErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The minted configuration profile id was already in use".to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // Answered from the stored record. `KmsKeyArn` is deliberately left unset, not
+        // overlooked: it is the ARN of the key `KmsKeyIdentifier` resolves to, and this
+        // emulator resolves no KMS key, so there is no ARN to report that would not be
+        // fabricated. `KmsKeyIdentifier` itself is persisted and answered.
+        Ok(CreateConfigurationProfileOutput {
+            application_id: Some(stored.application_id.clone()),
+            id: Some(stored.id.clone()),
+            name: Some(stored.name.clone()),
+            description: stored.description.clone(),
+            location_uri: Some(stored.location_uri.clone()),
+            retrieval_role_arn: stored.retrieval_role_arn.clone(),
+            validators: (!stored.validators.is_empty()).then(|| stored.validators.clone()),
+            r#type: stored.profile_type.clone(),
+            kms_key_arn: None,
+            kms_key_identifier: stored.kms_key_identifier.clone(),
+        })
     }
 }
