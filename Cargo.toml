@@ -200,6 +200,31 @@ members = [
     "services/service-com-amazonaws-iotjobsdataplane-iotlaserthingjobmanagerexternalservice",
     "services/service-com-amazonaws-iotmanagedintegrations-iotmanagedintegrations",
     "services/service-com-amazonaws-iotsecuretunneling-iotsecuredtunneling",
+    "services/service-com-amazonaws-iotsitewise-awsiotsitewise",
+    "services/service-com-amazonaws-iotthingsgraph-iotthingsgraphfrontendservice",
+    "services/service-com-amazonaws-iottwinmaker-awsiottwinmaker",
+    "services/service-com-amazonaws-iotwireless-iotwireless",
+    "services/service-com-amazonaws-ivs-amazoninteractivevideoservice",
+    "services/service-com-amazonaws-ivschat-amazoninteractivevideoservicechat",
+    "services/service-com-amazonaws-ivsrealtime-amazoninteractivevideoservicerealtime",
+    "services/service-com-amazonaws-kafka-kafka",
+    "services/service-com-amazonaws-kafkaconnect-kafkaconnect",
+    "services/service-com-amazonaws-kendra-awskendrafrontendservice",
+    "services/service-com-amazonaws-kendraranking-awskendrarerankingfrontendservice",
+    "services/service-com-amazonaws-keyspaces-keyspacesservice",
+    "services/service-com-amazonaws-keyspacesstreams-keyspacesstreams",
+    "services/service-com-amazonaws-kinesis-kinesis-20131202",
+    "services/service-com-amazonaws-kinesisanalytics-kinesisanalytics-20150814",
+    "services/service-com-amazonaws-kinesisanalyticsv2-kinesisanalytics-20180523",
+    "services/service-com-amazonaws-kinesisvideo-kinesisvideo-20170930",
+    "services/service-com-amazonaws-kinesisvideoarchivedmedia-awsacuityreader",
+    "services/service-com-amazonaws-kinesisvideomedia-awsacuityinletservice",
+    "services/service-com-amazonaws-kinesisvideosignaling-awsacuitysignalingservice",
+    "services/service-com-amazonaws-kinesisvideowebrtcstorage-awsacuityroutingservicelambda",
+    "services/service-com-amazonaws-kms-trentservice",
+    "services/service-com-amazonaws-lakeformation-awslakeformation",
+    "services/service-com-amazonaws-lambdacore-lambdacoreapiservice",
+    "services/service-com-amazonaws-lambdamicrovms-lambdamicrovms",
     "core/router",
     "core/embedded",
 ]
@@ -435,6 +460,31 @@ service-com-amazonaws-iotfleetwise-iotautobahncontrolplane = { path = "services/
 service-com-amazonaws-iotjobsdataplane-iotlaserthingjobmanagerexternalservice = { path = "services/service-com-amazonaws-iotjobsdataplane-iotlaserthingjobmanagerexternalservice" }
 service-com-amazonaws-iotmanagedintegrations-iotmanagedintegrations = { path = "services/service-com-amazonaws-iotmanagedintegrations-iotmanagedintegrations" }
 service-com-amazonaws-iotsecuretunneling-iotsecuredtunneling = { path = "services/service-com-amazonaws-iotsecuretunneling-iotsecuredtunneling" }
+service-com-amazonaws-iotsitewise-awsiotsitewise = { path = "services/service-com-amazonaws-iotsitewise-awsiotsitewise" }
+service-com-amazonaws-iotthingsgraph-iotthingsgraphfrontendservice = { path = "services/service-com-amazonaws-iotthingsgraph-iotthingsgraphfrontendservice" }
+service-com-amazonaws-iottwinmaker-awsiottwinmaker = { path = "services/service-com-amazonaws-iottwinmaker-awsiottwinmaker" }
+service-com-amazonaws-iotwireless-iotwireless = { path = "services/service-com-amazonaws-iotwireless-iotwireless" }
+service-com-amazonaws-ivs-amazoninteractivevideoservice = { path = "services/service-com-amazonaws-ivs-amazoninteractivevideoservice" }
+service-com-amazonaws-ivschat-amazoninteractivevideoservicechat = { path = "services/service-com-amazonaws-ivschat-amazoninteractivevideoservicechat" }
+service-com-amazonaws-ivsrealtime-amazoninteractivevideoservicerealtime = { path = "services/service-com-amazonaws-ivsrealtime-amazoninteractivevideoservicerealtime" }
+service-com-amazonaws-kafka-kafka = { path = "services/service-com-amazonaws-kafka-kafka" }
+service-com-amazonaws-kafkaconnect-kafkaconnect = { path = "services/service-com-amazonaws-kafkaconnect-kafkaconnect" }
+service-com-amazonaws-kendra-awskendrafrontendservice = { path = "services/service-com-amazonaws-kendra-awskendrafrontendservice" }
+service-com-amazonaws-kendraranking-awskendrarerankingfrontendservice = { path = "services/service-com-amazonaws-kendraranking-awskendrarerankingfrontendservice" }
+service-com-amazonaws-keyspaces-keyspacesservice = { path = "services/service-com-amazonaws-keyspaces-keyspacesservice" }
+service-com-amazonaws-keyspacesstreams-keyspacesstreams = { path = "services/service-com-amazonaws-keyspacesstreams-keyspacesstreams" }
+service-com-amazonaws-kinesis-kinesis-20131202 = { path = "services/service-com-amazonaws-kinesis-kinesis-20131202" }
+service-com-amazonaws-kinesisanalytics-kinesisanalytics-20150814 = { path = "services/service-com-amazonaws-kinesisanalytics-kinesisanalytics-20150814" }
+service-com-amazonaws-kinesisanalyticsv2-kinesisanalytics-20180523 = { path = "services/service-com-amazonaws-kinesisanalyticsv2-kinesisanalytics-20180523" }
+service-com-amazonaws-kinesisvideo-kinesisvideo-20170930 = { path = "services/service-com-amazonaws-kinesisvideo-kinesisvideo-20170930" }
+service-com-amazonaws-kinesisvideoarchivedmedia-awsacuityreader = { path = "services/service-com-amazonaws-kinesisvideoarchivedmedia-awsacuityreader" }
+service-com-amazonaws-kinesisvideomedia-awsacuityinletservice = { path = "services/service-com-amazonaws-kinesisvideomedia-awsacuityinletservice" }
+service-com-amazonaws-kinesisvideosignaling-awsacuitysignalingservice = { path = "services/service-com-amazonaws-kinesisvideosignaling-awsacuitysignalingservice" }
+service-com-amazonaws-kinesisvideowebrtcstorage-awsacuityroutingservicelambda = { path = "services/service-com-amazonaws-kinesisvideowebrtcstorage-awsacuityroutingservicelambda" }
+service-com-amazonaws-kms-trentservice = { path = "services/service-com-amazonaws-kms-trentservice" }
+service-com-amazonaws-lakeformation-awslakeformation = { path = "services/service-com-amazonaws-lakeformation-awslakeformation" }
+service-com-amazonaws-lambdacore-lambdacoreapiservice = { path = "services/service-com-amazonaws-lambdacore-lambdacoreapiservice" }
+service-com-amazonaws-lambdamicrovms-lambdamicrovms = { path = "services/service-com-amazonaws-lambdamicrovms-lambdamicrovms" }
 
 # The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
 #

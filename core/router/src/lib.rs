@@ -94,7 +94,9 @@ pub fn build_router(engine: Arc<InMemoryEngine>) -> MultiServiceRouter {
     let router = mount_chunk_15(router, &engine);
     let router = mount_chunk_16(router, &engine);
     let router = mount_chunk_17(router, &engine);
-    mount_chunk_18(router, &engine)
+    let router = mount_chunk_18(router, &engine);
+    let router = mount_chunk_19(router, &engine);
+    mount_chunk_20(router, &engine)
 }
 
 /// Register services 00 of this workspace on `router`.
@@ -522,6 +524,55 @@ fn mount_chunk_18(
 ) -> MultiServiceRouter {
     router.register_service(service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::EmulatedService::new(engine.clone()));
     router.register_service(service_com_amazonaws_iotsecuretunneling_iotsecuredtunneling::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_iotsitewise_awsiotsitewise::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_iotthingsgraph_iotthingsgraphfrontendservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_iottwinmaker_awsiottwinmaker::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_iotwireless_iotwireless::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_ivs_amazoninteractivevideoservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_ivschat_amazoninteractivevideoservicechat::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_ivsrealtime_amazoninteractivevideoservicerealtime::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_kafka_kafka::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_kafkaconnect_kafkaconnect::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 19 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_19(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_kendra_awskendrafrontendservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_kendraranking_awskendrarerankingfrontendservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_keyspaces_keyspacesservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_keyspacesstreams_keyspacesstreams::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_kinesisanalytics_kinesisanalytics_20150814::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_kinesisvideo_kinesisvideo_20170930::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_kinesisvideoarchivedmedia_awsacuityreader::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_kinesisvideomedia_awsacuityinletservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_kinesisvideosignaling_awsacuitysignalingservice::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 20 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_20(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_kinesisvideowebrtcstorage_awsacuityroutingservicelambda::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_kms_trentservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_lakeformation_awslakeformation::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_lambdacore_lambdacoreapiservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_lambdamicrovms_lambdamicrovms::EmulatedService::new(engine.clone()));
     router
 }
 

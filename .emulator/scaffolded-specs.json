@@ -799,6 +799,106 @@
     {
       "shape_id": "com.amazonaws.iotsecuretunneling#IoTSecuredTunneling",
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/iotsecuretunneling/service/2018-10-05/iotsecuretunneling-2018-10-05.json"
+    },
+    {
+      "shape_id": "com.amazonaws.iotsitewise#AWSIoTSiteWise",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/iotsitewise/service/2019-12-02/iotsitewise-2019-12-02.json"
+    },
+    {
+      "shape_id": "com.amazonaws.iotthingsgraph#IotThingsGraphFrontEndService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/iotthingsgraph/service/2018-09-06/iotthingsgraph-2018-09-06.json"
+    },
+    {
+      "shape_id": "com.amazonaws.iottwinmaker#AWSIoTTwinMaker",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/iottwinmaker/service/2021-11-29/iottwinmaker-2021-11-29.json"
+    },
+    {
+      "shape_id": "com.amazonaws.iotwireless#iotwireless",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/iot-wireless/service/2020-11-22/iot-wireless-2020-11-22.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ivs#AmazonInteractiveVideoService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/ivs/service/2020-07-14/ivs-2020-07-14.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ivschat#AmazonInteractiveVideoServiceChat",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/ivschat/service/2020-07-14/ivschat-2020-07-14.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ivsrealtime#AmazonInteractiveVideoServiceRealTime",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/ivs-realtime/service/2020-07-14/ivs-realtime-2020-07-14.json"
+    },
+    {
+      "shape_id": "com.amazonaws.kafka#Kafka",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/kafka/service/2018-11-14/kafka-2018-11-14.json"
+    },
+    {
+      "shape_id": "com.amazonaws.kafkaconnect#KafkaConnect",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/kafkaconnect/service/2021-09-14/kafkaconnect-2021-09-14.json"
+    },
+    {
+      "shape_id": "com.amazonaws.kendra#AWSKendraFrontendService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/kendra/service/2019-02-03/kendra-2019-02-03.json"
+    },
+    {
+      "shape_id": "com.amazonaws.kendraranking#AWSKendraRerankingFrontendService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/kendra-ranking/service/2022-10-19/kendra-ranking-2022-10-19.json"
+    },
+    {
+      "shape_id": "com.amazonaws.keyspaces#KeyspacesService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/keyspaces/service/2022-02-10/keyspaces-2022-02-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.keyspacesstreams#KeyspacesStreams",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/keyspacesstreams/service/2024-09-09/keyspacesstreams-2024-09-09.json"
+    },
+    {
+      "shape_id": "com.amazonaws.kinesis#Kinesis_20131202",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/kinesis/service/2013-12-02/kinesis-2013-12-02.json"
+    },
+    {
+      "shape_id": "com.amazonaws.kinesisanalytics#KinesisAnalytics_20150814",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/kinesis-analytics/service/2015-08-14/kinesis-analytics-2015-08-14.json"
+    },
+    {
+      "shape_id": "com.amazonaws.kinesisanalyticsv2#KinesisAnalytics_20180523",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/kinesis-analytics-v2/service/2018-05-23/kinesis-analytics-v2-2018-05-23.json"
+    },
+    {
+      "shape_id": "com.amazonaws.kinesisvideo#KinesisVideo_20170930",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/kinesis-video/service/2017-09-30/kinesis-video-2017-09-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.kinesisvideoarchivedmedia#AWSAcuityReader",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/kinesis-video-archived-media/service/2017-09-30/kinesis-video-archived-media-2017-09-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.kinesisvideomedia#AWSAcuityInletService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/kinesis-video-media/service/2017-09-30/kinesis-video-media-2017-09-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.kinesisvideosignaling#AWSAcuitySignalingService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/kinesis-video-signaling/service/2019-12-04/kinesis-video-signaling-2019-12-04.json"
+    },
+    {
+      "shape_id": "com.amazonaws.kinesisvideowebrtcstorage#AWSAcuityRoutingServiceLambda",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/kinesis-video-webrtc-storage/service/2018-05-10/kinesis-video-webrtc-storage-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.kms#TrentService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/kms/service/2014-11-01/kms-2014-11-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.lakeformation#AWSLakeFormation",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/lakeformation/service/2017-03-31/lakeformation-2017-03-31.json"
+    },
+    {
+      "shape_id": "com.amazonaws.lambdacore#LambdaCoreApiService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/lambda-core/service/2026-04-30/lambda-core-2026-04-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.lambdamicrovms#LambdaMicrovms",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/lambda-microvms/service/2025-09-09/lambda-microvms-2025-09-09.json"
     }
   ]
 }
