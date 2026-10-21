@@ -250,6 +250,31 @@ members = [
     "services/service-com-amazonaws-marketplacedeployment-awsmpdeploymentparametersservice",
     "services/service-com-amazonaws-marketplacediscovery-awsmarketplacediscovery",
     "services/service-com-amazonaws-marketplaceentitlementservice-awsmpentitlementservice",
+    "services/service-com-amazonaws-marketplacemetering-awsmpmeteringservice",
+    "services/service-com-amazonaws-marketplacereporting-awsmarketplacereporting",
+    "services/service-com-amazonaws-mediaconnect-mediaconnect",
+    "services/service-com-amazonaws-mediaconvert-mediaconvert",
+    "services/service-com-amazonaws-medialive-medialive",
+    "services/service-com-amazonaws-mediapackage-mediapackage",
+    "services/service-com-amazonaws-mediapackagev2-mediapackagev2",
+    "services/service-com-amazonaws-mediapackagevod-mediapackagevod",
+    "services/service-com-amazonaws-mediastore-mediastore-20170901",
+    "services/service-com-amazonaws-mediastoredata-mediastoreobject-20170901",
+    "services/service-com-amazonaws-mediatailor-mediatailor",
+    "services/service-com-amazonaws-medicalimaging-ahigatewayservice",
+    "services/service-com-amazonaws-memorydb-amazonmemorydb",
+    "services/service-com-amazonaws-mgn-applicationmigrationservice",
+    "services/service-com-amazonaws-migrationhub-awsmigrationhub",
+    "services/service-com-amazonaws-migrationhubconfig-awsmigrationhubmultiaccountservice",
+    "services/service-com-amazonaws-migrationhuborchestrator-awsmigrationhuborchestrator",
+    "services/service-com-amazonaws-migrationhubrefactorspaces-refactorspaces",
+    "services/service-com-amazonaws-migrationhubstrategy-awsmigrationhubstrategyrecommendation",
+    "services/service-com-amazonaws-mpa-awsfluffycoreservice",
+    "services/service-com-amazonaws-mq-mq",
+    "services/service-com-amazonaws-mturk-mturkrequesterservicev20170117",
+    "services/service-com-amazonaws-mwaa-amazonmwaa",
+    "services/service-com-amazonaws-mwaaserverless-amazonmwaaserverless",
+    "services/service-com-amazonaws-neptunedata-amazonneptunedataplane",
     "core/router",
     "core/embedded",
 ]
@@ -535,6 +560,31 @@ service-com-amazonaws-marketplacecommerceanalytics-marketplacecommerceanalytics2
 service-com-amazonaws-marketplacedeployment-awsmpdeploymentparametersservice = { path = "services/service-com-amazonaws-marketplacedeployment-awsmpdeploymentparametersservice" }
 service-com-amazonaws-marketplacediscovery-awsmarketplacediscovery = { path = "services/service-com-amazonaws-marketplacediscovery-awsmarketplacediscovery" }
 service-com-amazonaws-marketplaceentitlementservice-awsmpentitlementservice = { path = "services/service-com-amazonaws-marketplaceentitlementservice-awsmpentitlementservice" }
+service-com-amazonaws-marketplacemetering-awsmpmeteringservice = { path = "services/service-com-amazonaws-marketplacemetering-awsmpmeteringservice" }
+service-com-amazonaws-marketplacereporting-awsmarketplacereporting = { path = "services/service-com-amazonaws-marketplacereporting-awsmarketplacereporting" }
+service-com-amazonaws-mediaconnect-mediaconnect = { path = "services/service-com-amazonaws-mediaconnect-mediaconnect" }
+service-com-amazonaws-mediaconvert-mediaconvert = { path = "services/service-com-amazonaws-mediaconvert-mediaconvert" }
+service-com-amazonaws-medialive-medialive = { path = "services/service-com-amazonaws-medialive-medialive" }
+service-com-amazonaws-mediapackage-mediapackage = { path = "services/service-com-amazonaws-mediapackage-mediapackage" }
+service-com-amazonaws-mediapackagev2-mediapackagev2 = { path = "services/service-com-amazonaws-mediapackagev2-mediapackagev2" }
+service-com-amazonaws-mediapackagevod-mediapackagevod = { path = "services/service-com-amazonaws-mediapackagevod-mediapackagevod" }
+service-com-amazonaws-mediastore-mediastore-20170901 = { path = "services/service-com-amazonaws-mediastore-mediastore-20170901" }
+service-com-amazonaws-mediastoredata-mediastoreobject-20170901 = { path = "services/service-com-amazonaws-mediastoredata-mediastoreobject-20170901" }
+service-com-amazonaws-mediatailor-mediatailor = { path = "services/service-com-amazonaws-mediatailor-mediatailor" }
+service-com-amazonaws-medicalimaging-ahigatewayservice = { path = "services/service-com-amazonaws-medicalimaging-ahigatewayservice" }
+service-com-amazonaws-memorydb-amazonmemorydb = { path = "services/service-com-amazonaws-memorydb-amazonmemorydb" }
+service-com-amazonaws-mgn-applicationmigrationservice = { path = "services/service-com-amazonaws-mgn-applicationmigrationservice" }
+service-com-amazonaws-migrationhub-awsmigrationhub = { path = "services/service-com-amazonaws-migrationhub-awsmigrationhub" }
+service-com-amazonaws-migrationhubconfig-awsmigrationhubmultiaccountservice = { path = "services/service-com-amazonaws-migrationhubconfig-awsmigrationhubmultiaccountservice" }
+service-com-amazonaws-migrationhuborchestrator-awsmigrationhuborchestrator = { path = "services/service-com-amazonaws-migrationhuborchestrator-awsmigrationhuborchestrator" }
+service-com-amazonaws-migrationhubrefactorspaces-refactorspaces = { path = "services/service-com-amazonaws-migrationhubrefactorspaces-refactorspaces" }
+service-com-amazonaws-migrationhubstrategy-awsmigrationhubstrategyrecommendation = { path = "services/service-com-amazonaws-migrationhubstrategy-awsmigrationhubstrategyrecommendation" }
+service-com-amazonaws-mpa-awsfluffycoreservice = { path = "services/service-com-amazonaws-mpa-awsfluffycoreservice" }
+service-com-amazonaws-mq-mq = { path = "services/service-com-amazonaws-mq-mq" }
+service-com-amazonaws-mturk-mturkrequesterservicev20170117 = { path = "services/service-com-amazonaws-mturk-mturkrequesterservicev20170117" }
+service-com-amazonaws-mwaa-amazonmwaa = { path = "services/service-com-amazonaws-mwaa-amazonmwaa" }
+service-com-amazonaws-mwaaserverless-amazonmwaaserverless = { path = "services/service-com-amazonaws-mwaaserverless-amazonmwaaserverless" }
+service-com-amazonaws-neptunedata-amazonneptunedataplane = { path = "services/service-com-amazonaws-neptunedata-amazonneptunedataplane" }
 
 # The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
 #
