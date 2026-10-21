@@ -21,13 +21,16 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Content-derived identifiers: the pipeline-id segment of an ingestion endpoint host and
+# the id of the VPC interface endpoint a VPC-attached pipeline gets are digests of the
+# pipeline's own ARN, so they are stable across reads and unique per pipeline.
+sha2 = { workspace = true }
+# Opaque pagination cursors: hex-encode the internal list cursor so `NextToken` is a
+# single-token string a client only ever echoes back.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
