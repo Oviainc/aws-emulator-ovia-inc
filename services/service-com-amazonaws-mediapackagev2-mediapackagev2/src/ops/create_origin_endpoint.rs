@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOriginEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOriginEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Creates an origin endpoint under an existing channel and persists it in
+//! [`crate::state`], turning each submitted `Create*ManifestConfiguration` into the
+//! `Get*ManifestConfiguration` the service reports, with the egress URL it computes for
+//! that manifest. An unknown group or channel is a `ResourceNotFoundException`; an
+//! endpoint name already used on that channel is a `ConflictException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOriginEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `handle` below is the implementation; `crate::state` holds the store it reads and
+//! writes.
 //!
 //! ## Shape of an operation
 //!
@@ -245,18 +244,191 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOriginEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOriginEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOriginEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateOriginEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+            return Err(CreateOriginEndpointErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Channel group {} not found",
+                        input.channel_group_name
+                    )),
+                    resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
+                },
+            )
+            .into());
+        };
+        let egress_domain = group.egress_domain.clone();
+        let group_name = group.name.clone();
+        let Some(channel) = group.channels.get_mut(&input.channel_name) else {
+            return Err(CreateOriginEndpointErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Channel {} not found in channel group {}",
+                        input.channel_name, group_name
+                    )),
+                    resource_type_not_found: Some("CHANNEL".to_string()),
+                },
+            )
+            .into());
+        };
+        if channel
+            .origin_endpoints
+            .contains_key(&input.origin_endpoint_name)
+        {
+            return Err(CreateOriginEndpointErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Origin endpoint {} already exists on channel {}",
+                    input.origin_endpoint_name, channel.name
+                )),
+                conflict_exception_type: Some("RESOURCE_ALREADY_EXISTS".to_string()),
+            })
+            .into());
+        }
+
+        // A channel's endpoint map only shrinks on an explicit delete, so its size is
+        // bounded here rather than by how many requests arrive.
+        if channel.origin_endpoints.len() >= crate::state::MAX_ORIGIN_ENDPOINTS_PER_CHANNEL {
+            return Err(
+                CreateOriginEndpointErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "Channel {} already has the maximum of {} origin endpoints",
+                            channel.name,
+                            crate::state::MAX_ORIGIN_ENDPOINTS_PER_CHANNEL
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Every submitted manifest is persisted with its computed URL, so the record's
+        // size is bounded too, not just the number of records.
+        let manifest_count = input.hls_manifests.as_ref().map_or(0, Vec::len)
+            + input.low_latency_hls_manifests.as_ref().map_or(0, Vec::len)
+            + input.dash_manifests.as_ref().map_or(0, Vec::len)
+            + input.mss_manifests.as_ref().map_or(0, Vec::len);
+        if manifest_count > crate::state::MAX_MANIFESTS_PER_ORIGIN_ENDPOINT {
+            return Err(
+                CreateOriginEndpointErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "An origin endpoint accepts at most {} manifests; the request has {manifest_count}",
+                            crate::state::MAX_MANIFESTS_PER_ORIGIN_ENDPOINT
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let name = input.origin_endpoint_name.clone();
+        let at = crate::state::ManifestLocation {
+            egress_domain: &egress_domain,
+            group: &group_name,
+            channel: &channel.name,
+            endpoint: &name,
+        };
+        // Each submitted manifest is stored in its reported (`Get*`) form, URL included,
+        // so the URL a client reads later is the one computed here.
+        let hls_manifests: Vec<_> = input
+            .hls_manifests
+            .unwrap_or_default()
+            .into_iter()
+            .map(|manifest| crate::state::stored_hls_manifest(manifest, at))
+            .collect();
+        let low_latency_hls_manifests: Vec<_> = input
+            .low_latency_hls_manifests
+            .unwrap_or_default()
+            .into_iter()
+            .map(|manifest| crate::state::stored_low_latency_hls_manifest(manifest, at))
+            .collect();
+        let dash_manifests: Vec<_> = input
+            .dash_manifests
+            .unwrap_or_default()
+            .into_iter()
+            .map(|manifest| crate::state::stored_dash_manifest(manifest, at))
+            .collect();
+        let mss_manifests: Vec<_> = input
+            .mss_manifests
+            .unwrap_or_default()
+            .into_iter()
+            .map(|manifest| crate::state::stored_mss_manifest(manifest, at))
+            .collect();
+
+        let created_at = crate::state::now();
+        let tags = input.tags.unwrap_or_default();
+        let arn =
+            crate::state::origin_endpoint_arn(&region, &group_name, &channel.name, &name);
+        let etag = crate::state::etag(&[
+            arn.clone(),
+            input.container_type.clone(),
+            input.description.clone().unwrap_or_default(),
+            input.startover_window_seconds.unwrap_or_default().to_string(),
+            crate::state::tag_fingerprint(&tags),
+        ]);
+
+        let endpoint = crate::state::OriginEndpoint {
+            name: name.clone(),
+            channel_name: channel.name.clone(),
+            group_name: group_name.clone(),
+            arn,
+            container_type: input.container_type,
+            // `Segment` is required in the response but optional in the request, and the
+            // model declares no default for any of its members, so an omitted segment
+            // configuration materializes as the empty one rather than as invented values.
+            segment: input.segment.unwrap_or_default(),
+            description: input.description,
+            startover_window_seconds: input.startover_window_seconds,
+            hls_manifests,
+            low_latency_hls_manifests,
+            dash_manifests,
+            mss_manifests,
+            force_endpoint_error_configuration: input.force_endpoint_error_configuration,
+            uri_separator: input.uri_separator,
+            stream_name_output_mode: input.stream_name_output_mode,
+            created_at,
+            modified_at: created_at,
+            reset_at: None,
+            etag,
+            tags,
+        };
+        channel.origin_endpoints.insert(name.clone(), endpoint);
+        // Answer from what was stored, so the response can only carry what a later
+        // `GetOriginEndpoint` will read.
+        let endpoint = &channel.origin_endpoints[&name];
+
+        Ok(CreateOriginEndpointOutput {
+            arn: endpoint.arn.clone(),
+            channel_group_name: endpoint.group_name.clone(),
+            channel_name: endpoint.channel_name.clone(),
+            origin_endpoint_name: endpoint.name.clone(),
+            container_type: endpoint.container_type.clone(),
+            segment: endpoint.segment.clone(),
+            created_at: endpoint.created_at,
+            modified_at: endpoint.modified_at,
+            description: endpoint.description.clone(),
+            startover_window_seconds: endpoint.startover_window_seconds,
+            hls_manifests: Some(endpoint.hls_manifests.clone()),
+            low_latency_hls_manifests: Some(endpoint.low_latency_hls_manifests.clone()),
+            dash_manifests: Some(endpoint.dash_manifests.clone()),
+            mss_manifests: Some(endpoint.mss_manifests.clone()),
+            force_endpoint_error_configuration: endpoint
+                .force_endpoint_error_configuration
+                .clone(),
+            uri_separator: endpoint.uri_separator.clone(),
+            stream_name_output_mode: endpoint.stream_name_output_mode.clone(),
+            e_tag: Some(endpoint.etag.clone()),
+            tags: Some(endpoint.tags.clone()),
+        })
     }
 }

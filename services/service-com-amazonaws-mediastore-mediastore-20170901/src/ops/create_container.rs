@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateContainer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateContainer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateContainer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: inserts a new container into [`crate::state`] and returns the stored
+//! record. Re-creating an existing name is refused with `ContainerInUseException`.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +82,31 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use sha2::{Digest, Sha256};
+use std::time::SystemTime;
+
+use crate::state::request_region;
+
+/// Containers one account may hold in one region.
+///
+/// AWS Elemental MediaStore's documented service quota (user-guide "Service quotas":
+/// Containers, 100 per account per Region), which is what `CreateContainer`'s modelled
+/// `LimitExceededException` reports. This service's store holds the containers of the
+/// one account and region the emulator serves, so its size is that quota's subject.
+const CONTAINER_QUOTA: usize = 100;
+
+/// The DNS endpoint MediaStore assigns a container when it is created:
+/// `https://<host label>.data.mediastore.<region>.amazonaws.com`.
+///
+/// The host label is a digest of the owning account, the region and the container
+/// name, so it is stable for the life of the container (the model: "Once the value has
+/// been assigned, it does not change") and distinct for distinct containers.
+fn container_endpoint(region: &str, name: &str) -> String {
+    let digest = Sha256::digest(format!("{}/{region}/{name}", ::engine::emulator_account_id()));
+    let label = hex::encode(digest);
+    format!("https://{}.data.mediastore.{region}.amazonaws.com", &label[..14])
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,18 +177,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateContainer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateContainerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateContainer"))
+        // `ContainerName`'s length and pattern are modelled constraints, already
+        // refused before this handler runs.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateContainerErrorModeled::InternalServerError(InternalServerError {
+                message: Some("MediaStore state is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        let region = request_region(ctx);
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // A name is unique to an account within a region: the existing container is
+        // never overwritten.
+        if store.containers.contains_key(&input.container_name) {
+            return Err(CreateContainerErrorModeled::ContainerInUseException(
+                ContainerInUseException {
+                    message: Some(format!(
+                        "The container {} already exists",
+                        input.container_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if store.containers.len() >= CONTAINER_QUOTA {
+            return Err(CreateContainerErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The maximum number of containers ({CONTAINER_QUOTA}) has been reached"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let arn = ::engine::emulator_arn(
+            "mediastore",
+            &region,
+            &format!("container/{}", input.container_name),
+        );
+        let endpoint = container_endpoint(&region, &input.container_name);
+        let record = crate::state::Container::new(
+            input.container_name.clone(),
+            arn,
+            endpoint,
+            input.tags.unwrap_or_default(),
+            now,
+        );
+        let mut container = record.to_wire();
+        store.containers.insert(input.container_name, record);
+
+        // "The return value does not include the container's endpoint. To make
+        // downstream requests, you must obtain this value by using DescribeContainer or
+        // ListContainers." — the endpoint is stored, just not reported here.
+        container.endpoint = None;
+        Ok(CreateContainerOutput { container })
     }
 }

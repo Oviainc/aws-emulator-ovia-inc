@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts a deployment of a revision to a deployment group and answers the
+//! `deploymentId` it minted and stored.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -286,18 +281,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDeployment"))
+        let _ = ctx;
+        // `deploymentGroupName` is modelled optional, but a deployment is always to a
+        // deployment group, so an absent one is refused here rather than at the
+        // boundary. An empty or malformed one never reaches the handler: the member
+        // carries a modelled length and pattern.
+        let Some(deployment_group_name) = input.deployment_group_name else {
+            return Err(
+                CreateDeploymentErrorModeled::DeploymentGroupNameRequiredException(
+                    DeploymentGroupNameRequiredException {
+                        message: Some("The deployment group name was not specified".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // A deployment needs something to deploy. The revision is STORED VERBATIM —
+        // nothing about it is inferred into the record — so it is only inspected far
+        // enough to tell an empty one from a usable one.
+        let Some(revision) = input.revision else {
+            return Err(CreateDeploymentErrorModeled::RevisionRequiredException(
+                RevisionRequiredException {
+                    message: Some("The revision was not specified".to_string()),
+                },
+            )
+            .into());
+        };
+        if revision_location_is_empty(&revision) {
+            return Err(CreateDeploymentErrorModeled::InvalidRevisionException(
+                InvalidRevisionException {
+                    message: Some(
+                        "The revision was specified in an invalid format: it names no S3, GitHub, \
+                         string or AppSpec content location"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let application_name = input.application_name;
+        let requested_config = input.deployment_config_name;
+
+        let outcome = crate::state::with_state(&*self.engine, |state| {
+            let Some(application) = state.applications.get(&application_name) else {
+                return Err(CreateDeploymentErrorModeled::ApplicationDoesNotExistException(
+                    ApplicationDoesNotExistException {
+                        message: Some(format!("No application found for name {application_name}")),
+                    },
+                ));
+            };
+            let Some(group) = application.deployment_groups.get(&deployment_group_name) else {
+                return Err(
+                    CreateDeploymentErrorModeled::DeploymentGroupDoesNotExistException(
+                        DeploymentGroupDoesNotExistException {
+                            message: Some(format!(
+                                "No deployment group found for name {deployment_group_name} in \
+                                 application {application_name}"
+                            )),
+                        },
+                    ),
+                );
+            };
+            let compute_platform = application.compute_platform.clone();
+            let group_config = group.deployment_config_name.clone();
+            let group_style = group.deployment_style.clone();
+            // The deployment it ran its predecessor from, which is what CodeDeploy
+            // reports as this deployment's `previousRevision`.
+            let previous_revision = state
+                .deployment_order
+                .iter()
+                .rev()
+                .filter_map(|id| state.deployments.get(id))
+                .find(|deployment| {
+                    deployment.application_name == application_name
+                        && deployment.deployment_group_name.as_deref()
+                            == Some(deployment_group_name.as_str())
+                })
+                .and_then(|deployment| deployment.revision.clone());
+
+            // The EFFECTIVE configuration: the request's, else the group's.
+            let deployment_config_name = match requested_config {
+                Some(name) => {
+                    if !state.deployment_configs.contains_key(&name) {
+                        return Err(
+                            CreateDeploymentErrorModeled::DeploymentConfigDoesNotExistException(
+                                DeploymentConfigDoesNotExistException {
+                                    message: Some(format!(
+                                        "No deployment configuration found for name {name}"
+                                    )),
+                                },
+                            ),
+                        );
+                    }
+                    name
+                }
+                None => group_config,
+            };
+
+            let create_time_ms = crate::state::now_ms();
+            let deployment_id = state.mint_deployment_id();
+            // `record_deployment` indexes it as the newest and drops the oldest
+            // history past the store's retention bound.
+            state.record_deployment(crate::state::Deployment {
+                deployment_id: deployment_id.clone(),
+                application_name: application_name.clone(),
+                deployment_group_name: Some(deployment_group_name.clone()),
+                deployment_config_name,
+                revision: Some(revision),
+                previous_revision,
+                // The deployment has only just been asked for; the clock owes it
+                // its start and then its terminal status.
+                status: crate::state::DEPLOYMENT_STATUS_CREATED.to_string(),
+                creator: crate::state::DEPLOYMENT_CREATOR_USER.to_string(),
+                description: input.description,
+                ignore_application_stop_failures: input.ignore_application_stop_failures,
+                update_outdated_instances_only: input.update_outdated_instances_only,
+                file_exists_behavior: input.file_exists_behavior,
+                deployment_mode: input.deployment_mode,
+                auto_rollback_configuration: input.auto_rollback_configuration,
+                target_instances: input.target_instances,
+                override_alarm_configuration: input.override_alarm_configuration,
+                ec2_deployment_options: input.ec2_deployment_options,
+                deployment_style: group_style,
+                compute_platform,
+                external_id: None,
+                create_time_ms,
+                start_time_ms: None,
+                complete_time_ms: None,
+                starts_at_ms: crate::state::deployment_start_due(create_time_ms),
+                completes_at_ms: crate::state::deployment_completion_due(create_time_ms),
+            });
+            Ok(deployment_id)
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        Ok(CreateDeploymentOutput {
+            deployment_id: Some(outcome?),
+        })
     }
+}
+
+/// Whether a `RevisionLocation` names nowhere to deploy from.
+///
+/// The model's `RevisionLocation` holds one location per `revisionType`
+/// (`smithy_query(query="shape",shape="RevisionLocation")`: s3Location,
+/// gitHubLocation, string, appSpecContent), and `revisionType` itself only says
+/// which of them to read. A revision carrying none of the four is what
+/// `InvalidRevisionException` describes; the stored record keeps the caller's
+/// own revision either way, so this inspects it without rewriting it.
+fn revision_location_is_empty(revision: &RevisionLocation) -> bool {
+    revision.s3_location.is_none()
+        && revision.git_hub_location.is_none()
+        && revision.string.is_none()
+        && revision.app_spec_content.is_none()
 }

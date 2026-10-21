@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIPSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIPSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIPSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: consumes the caller's change token and stores a new, empty `IPSet` in
+//! `crate::state` under a freshly minted `IPSetId`.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +170,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIPSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIPSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIPSet"))
+        // Request metadata plays no part: the IPSet is built from the input and state.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateIPSetErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the WAF emulator could not reach its state store".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // Bounded store: AWS WAF Classic caps the conditions of one type an account may
+        // hold, and `WAFLimitsExceededException` is modelled for exactly that ("the
+        // maximum number of … objects that you can create for an AWS account").
+        if state.ip_sets.len() >= crate::state::MAX_IP_SETS_PER_ACCOUNT {
+            return Err(CreateIPSetErrorModeled::WAFLimitsExceededException(
+                WAFLimitsExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} IPSet objects",
+                        crate::state::MAX_IP_SETS_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The change token is consumed only once the request is known to be servable, so
+        // a refused call leaves the caller's token usable. A token this service never
+        // minted, or one an earlier call already spent, is stale data.
+        if !state.consume_change_token(&input.change_token) {
+            return Err(CreateIPSetErrorModeled::WAFStaleDataException(
+                WAFStaleDataException {
+                    message: Some(
+                        "the change token is not provisioned: get a new one with GetChangeToken"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A created IPSet has a generated id and no descriptors; UpdateIPSet is what puts
+        // addresses in it.
+        let entry = state.insert_ip_set(&input.name);
+
+        Ok(CreateIPSetOutput {
+            ip_set: Some(IPSet {
+                ip_set_id: entry.ip_set_id,
+                name: Some(entry.name),
+                ip_set_descriptors: Vec::new(),
+            }),
+            // Modelled as "the ChangeToken that you used to submit the request".
+            change_token: Some(input.change_token),
+        })
     }
 }

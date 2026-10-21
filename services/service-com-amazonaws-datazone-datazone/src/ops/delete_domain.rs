@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts deleting a PERSISTED domain: the stored record moves to `DELETING`, which is
+//! the status this call reports, and the domain — together with every project stored
+//! under it — disappears once the clock passes the instant recorded in `status_due_ms`
+//! (see `crate::state::settle_clock`). After that, `GetDomain` answers
+//! `ResourceNotFoundException` and `ListDomains` no longer lists it.
+//!
+//! The `skipDeletionCheck` / `cascadeDelete` flags ask for the child entities to go
+//! with the domain, which is what this emulator always does, so neither changes the
+//! outcome. `clientToken` makes the call idempotent, and that idempotency needs no
+//! stored token: a repeat while the deletion is still in flight is recognised by the
+//! domain's own `DELETING` status and answers the same without restarting it.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +167,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDomain"))
+        let _ = ctx;
+        use crate::state::{now_ms, DOMAIN_STATUS_DELETING, LIFECYCLE_SETTLE_MS};
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteDomainErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        let domain = store.domains.get_mut(&input.identifier).ok_or_else(|| {
+            DeleteDomainErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("Domain {} was not found", input.identifier),
+            })
+        })?;
+
+        // A repeat of a delete already in flight reports the same status without
+        // moving the instant the deletion completes. The domain's own status is what
+        // makes the call idempotent, so no `clientToken` is remembered here.
+        if domain.status != DOMAIN_STATUS_DELETING {
+            domain.status = DOMAIN_STATUS_DELETING.to_string();
+            domain.last_updated_at_ms = now;
+            domain.status_due_ms = Some(now + LIFECYCLE_SETTLE_MS);
+        }
+        let status = domain.status.clone();
+
+        Ok(DeleteDomainOutput { status })
     }
 }

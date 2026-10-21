@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTrainingDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTrainingDataset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTrainingDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Releases the training dataset an ARN names: the record is removed from
+//! [`crate::state`], so a later `GetTrainingDataset` answers the modelled
+//! `ResourceNotFoundException` (404) and `ListTrainingDatasets` no longer reports it. A
+//! dataset any persisted audience model was trained from is kept and the call is refused
+//! with the modelled `ConflictException` (409), the dependency this operation documents.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +167,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTrainingDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTrainingDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTrainingDataset"))
+        // The ARN of the dataset to release is the whole request; the region it was
+        // signed for is the endpoint it reached, and a Clean Rooms ML endpoint only
+        // serves its own region's resources.
+        let region = crate::state::request_region(ctx.parts());
+        // See `CreateTrainingDataset` for why an engine with no store for this service
+        // answers the scaffold's 501.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        let mut store = state.lock();
+        if store
+            .training_dataset(&input.training_dataset_arn, &region)
+            .is_none()
+        {
+            return Err(DeleteTrainingDatasetErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(&input.training_dataset_arn),
+            )
+            .into());
+        }
+
+        // "You can't delete a training dataset if there are any audience models that
+        // depend on the training dataset." The dependents are named so the caller knows
+        // what to delete first, and the dataset is left exactly as it was.
+        let dependents = store.audience_models_depending_on(&input.training_dataset_arn);
+        if !dependents.is_empty() {
+            return Err(DeleteTrainingDatasetErrorModeled::ConflictException(
+                crate::state::dependency_conflict(&input.training_dataset_arn, &dependents),
+            )
+            .into());
+        }
+
+        store.training_datasets.remove(&input.training_dataset_arn);
+
+        Ok(DeleteTrainingDatasetOutput)
     }
 }

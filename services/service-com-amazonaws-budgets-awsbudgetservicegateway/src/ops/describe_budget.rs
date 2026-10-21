@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeBudget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeBudget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeBudget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads one budget back out of the store by `(AccountId, BudgetName)`. Reporting
+//! only — nothing is written. `FilterExpression` is withheld unless the caller asks
+//! for it with `ShowFilterExpression`.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +150,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeBudget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeBudgetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeBudget"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeBudgetErrorModeled::InternalErrorException(InternalErrorException {
+                message: Some(
+                    "budgets is mounted on an engine that holds no state for it".to_string(),
+                ),
+            })
+        })?;
+
+        // The `BudgetName` pattern the boundary validator cannot compile.
+        crate::state::validate_budget_name(&input.budget_name).map_err(|message| {
+            DescribeBudgetErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+        })?;
+
+        let store = state.lock();
+        let stored = store
+            .budgets
+            .get(&(input.account_id.clone(), input.budget_name.clone()))
+            .ok_or_else(|| {
+                DescribeBudgetErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!(
+                        "Unable to get budget: {} - the budget doesn't exist.",
+                        input.budget_name
+                    )),
+                })
+            })?;
+
+        let mut budget = stored.budget.clone();
+        // "Specifies whether the response includes the filter expression associated with
+        // the budget" — so it is left out until the caller asks for it.
+        if !input.show_filter_expression.unwrap_or(false) {
+            budget.filter_expression = None;
+        }
+
+        Ok(DescribeBudgetOutput {
+            budget: Some(budget),
+        })
     }
 }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports a persisted environment, including the state its deployments
+//! put it in.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +146,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEnvironment"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetEnvironmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(application) = store.applications.get_mut(&input.application_id) else {
+            return Err(GetEnvironmentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No application with id {} exists.",
+                        input.application_id
+                    )),
+                    resource_name: Some(input.application_id),
+                },
+            )
+            .into());
+        };
+        let Some(environment) = application.environments.get_mut(&input.environment_id) else {
+            return Err(GetEnvironmentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No environment with id {} exists in application {}.",
+                        input.environment_id, input.application_id
+                    )),
+                    resource_name: Some(input.environment_id),
+                },
+            )
+            .into());
+        };
+
+        // An environment is DEPLOYING exactly while one of its deployments is rolling
+        // out or baking, and both of those end at instants the CLOCK already fixed when
+        // the deployment started.
+        environment.materialize(now);
+
+        Ok(GetEnvironmentOutput {
+            application_id: Some(environment.application_id.clone()),
+            id: Some(environment.id.clone()),
+            name: Some(environment.name.clone()),
+            description: environment.description.clone(),
+            state: Some(environment.state.clone()),
+            monitors: (!environment.monitors.is_empty()).then(|| environment.monitors.clone()),
+        })
     }
 }

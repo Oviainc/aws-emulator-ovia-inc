@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListIPSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListIPSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListIPSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages through the `IPSet`s stored in `crate::state`, in creation order.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +74,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page this operation serves, and the page it serves when the caller asks
+/// for no particular size.
+///
+/// It is `Limit`'s own modelled maximum (smithy_query, `ListIPSetsRequest$Limit`: range
+/// 0..100), so a caller can never ask for more than this and a request that asks for
+/// nothing in particular is answered with the same bound.
+const MAX_PAGE_SIZE: usize = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -151,18 +151,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListIPSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListIPSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListIPSets"))
+        // A pure read: request metadata plays no part and nothing is written.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListIPSetsErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the WAF emulator could not reach its state store".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        let ordered = state.ip_sets_in_creation_order();
+
+        // A returned NextMarker is the id of the last IPSet on the page, so the next
+        // request resumes immediately AFTER it.
+        let start = match input.next_marker.as_deref() {
+            None => 0,
+            Some(marker) => {
+                match ordered
+                    .iter()
+                    .position(|entry| entry.ip_set_id == marker)
+                {
+                    Some(position) => position + 1,
+                    // ListIPSets models no parameter error, so a marker that names no
+                    // live IPSet is refused as an invalid request rather than silently
+                    // treated as the start of the list.
+                    None => {
+                        return Err(crate::scaffolded::Scaffolded::validation(format!(
+                            "NextMarker {marker} is not a pagination token this account issued"
+                        )))
+                    }
+                }
+            }
+        };
+
+        // `Limit` is modelled with a default of 0, which no page size can mean: a request
+        // that asks for no particular page size is served the modelled maximum page, and
+        // truncation (hence a NextMarker) happens whenever more are left. Every page is
+        // clamped to that maximum, so one small request cannot be amplified into an
+        // unbounded response.
+        let remaining = &ordered[start.min(ordered.len())..];
+        let page_size = match usize::try_from(input.limit).unwrap_or(0) {
+            0 => MAX_PAGE_SIZE,
+            limit => limit.min(MAX_PAGE_SIZE),
+        }
+        .min(remaining.len());
+        let page = &remaining[..page_size];
+
+        let next_marker = (page.len() < remaining.len())
+            .then(|| page.last().map(|entry| entry.ip_set_id.clone()))
+            .flatten();
+
+        Ok(ListIPSetsOutput {
+            ip_sets: Some(
+                page.iter()
+                    .map(|entry| IPSetSummary {
+                        ip_set_id: entry.ip_set_id.clone(),
+                        name: entry.name.clone(),
+                    })
+                    .collect(),
+            ),
+            next_marker,
+        })
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetChannelGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetChannelGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Reads one persisted channel group out of [`crate::state`] and reports
+//! it exactly as `CreateChannelGroup` stored it. Purely reporting: it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetChannelGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `handle` below is the implementation; `crate::state` holds the store it reads.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +164,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetChannelGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetChannelGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetChannelGroup"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetChannelGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        let Some(group) = store.channel_groups.get(&input.channel_group_name) else {
+            return Err(GetChannelGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Channel group {} not found",
+                        input.channel_group_name
+                    )),
+                    resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetChannelGroupOutput {
+            channel_group_name: group.name.clone(),
+            arn: group.arn.clone(),
+            egress_domain: group.egress_domain.clone(),
+            created_at: group.created_at,
+            modified_at: group.modified_at,
+            description: group.description.clone(),
+            e_tag: Some(group.etag.clone()),
+            tags: Some(group.tags.clone()),
+        })
     }
 }

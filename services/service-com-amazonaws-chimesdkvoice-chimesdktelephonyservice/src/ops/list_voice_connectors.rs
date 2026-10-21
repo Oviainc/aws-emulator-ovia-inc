@@ -152,10 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListVoiceConnectorsErrorModeled::ServiceFailureException(
-                ServiceFailureException {
-                    code: Some("ServiceFailure".to_string()),
-                    message: Some("the Voice Connector store is unavailable".to_string()),
-                },
+                crate::state::store_unavailable(),
             )
             .into());
         };
@@ -172,12 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(size) if size >= 1 => size,
             _ => {
                 return Err(ListVoiceConnectorsErrorModeled::BadRequestException(
-                    BadRequestException {
-                        code: Some("BadRequest".to_string()),
-                        message: Some(format!(
-                            "MaxResults must be at least 1, got {requested_page_size}"
-                        )),
-                    },
+                    crate::state::bad_request(format!(
+                        "MaxResults must be at least 1, got {requested_page_size}"
+                    )),
                 )
                 .into())
             }
@@ -191,12 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(last_id) => Some(last_id),
                 None => {
                     return Err(ListVoiceConnectorsErrorModeled::BadRequestException(
-                        BadRequestException {
-                            code: Some("BadRequest".to_string()),
-                            message: Some(
-                                "NextToken is not a token this service issued".to_string(),
-                            ),
-                        },
+                        crate::state::bad_request(
+                            "NextToken is not a token this service issued",
+                        ),
                     )
                     .into())
                 }

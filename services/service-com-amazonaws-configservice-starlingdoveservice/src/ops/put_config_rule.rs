@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutConfigRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutConfigRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutConfigRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates a Config rule in [`crate::state`]. A new rule is assigned and
+//! persisted a `ConfigRuleId`, a `ConfigRuleArn` and `ConfigRuleState = ACTIVE`, so
+//! `DescribeConfigRules` reads back exactly what was created.
 //!
 //! ## Shape of an operation
 //!
@@ -208,18 +202,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutConfigRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutConfigRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutConfigRule"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let requested = &input.config_rule;
+
+        // The name is required when adding a rule, and it is what the rule is keyed by.
+        let Some(name) = requested
+            .config_rule_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            return Err(PutConfigRuleErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(
+                        "ConfigRule.ConfigRuleName is required when adding a Config rule"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `CustomPolicyDetails` is required when the owner is CUSTOM_POLICY; for every
+        // other owner the rule is identified by its `SourceIdentifier` (a managed rule
+        // identifier, or the ARN of the rule's Lambda function).
+        if requested.source.owner == crate::state::OWNER_CUSTOM_POLICY {
+            if requested.source.custom_policy_details.is_none() {
+                return Err(PutConfigRuleErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "ConfigRule.Source.CustomPolicyDetails is required when \
+                             Source.Owner is {}",
+                            crate::state::OWNER_CUSTOM_POLICY,
+                        )),
+                    },
+                )
+                .into());
+            }
+        } else if requested
+            .source
+            .source_identifier
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            return Err(PutConfigRuleErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "ConfigRule.Source.SourceIdentifier is required when Source.Owner is {}",
+                        requested.source.owner,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // By default a rule evaluates in Detective mode only.
+        let evaluation_modes = match requested.evaluation_modes.as_deref() {
+            Some(modes) if !modes.is_empty() => modes.to_vec(),
+            _ => crate::state::default_evaluation_modes(),
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // A rule records configuration changes the recorder captures, so there has to
+        // be a recorder.
+        if store.recorders.is_empty() {
+            return Err(
+                PutConfigRuleErrorModeled::NoAvailableConfigurationRecorderException(
+                    NoAvailableConfigurationRecorderException {
+                        message: Some(
+                            "there are no customer managed configuration recorders available; \
+                             use PutConfigurationRecorder to create one"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A new rule has to fit under this Region's Config rules quota.
+        if !store.config_rules.contains_key(name)
+            && store.config_rules.len() >= crate::state::CONFIG_RULES_QUOTA
+        {
+            return Err(
+                PutConfigRuleErrorModeled::MaxNumberOfConfigRulesExceededException(
+                    MaxNumberOfConfigRulesExceededException {
+                        message: Some(format!(
+                            "this account already has the maximum of {} Config rules in this \
+                             Region",
+                            crate::state::CONFIG_RULES_QUOTA,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        if let Some(existing) = store.config_rules.get_mut(name) {
+            // An update keeps the id, ARN and creation time the rule was created with.
+            existing.description = requested.description.clone();
+            existing.scope = requested.scope.clone();
+            existing.source = requested.source.clone();
+            existing.input_parameters = requested.input_parameters.clone();
+            existing.maximum_execution_frequency = requested.maximum_execution_frequency.clone();
+            existing.evaluation_modes = evaluation_modes;
+            existing.rule_evaluation_visibility = requested.rule_evaluation_visibility.clone();
+        } else {
+            let sequence = store.next_rule_seq;
+            // A u64 counter cannot be exhausted by API calls, so it never reissues an
+            // id; saturating rather than wrapping keeps that true by construction.
+            store.next_rule_seq = sequence.saturating_add(1);
+            let id = crate::state::mint_config_rule_id(sequence);
+            let arn = crate::state::config_rule_arn(&region, &id);
+            store.config_rules.insert(
+                name.to_string(),
+                crate::state::ConfigRuleEntry {
+                    name: name.to_string(),
+                    arn,
+                    id,
+                    description: requested.description.clone(),
+                    scope: requested.scope.clone(),
+                    source: requested.source.clone(),
+                    input_parameters: requested.input_parameters.clone(),
+                    maximum_execution_frequency: requested.maximum_execution_frequency.clone(),
+                    state: crate::state::CONFIG_RULE_STATE_ACTIVE.to_string(),
+                    evaluation_modes,
+                    rule_evaluation_visibility: requested.rule_evaluation_visibility.clone(),
+                    created_at: ::std::time::SystemTime::now(),
+                    tags: input.tags.clone().unwrap_or_default(),
+                },
+            );
+        }
+
+        Ok(PutConfigRuleOutput)
     }
 }

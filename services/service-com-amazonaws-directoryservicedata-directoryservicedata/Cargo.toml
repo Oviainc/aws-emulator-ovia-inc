@@ -21,13 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Digests a `ClientToken`'s request so an idempotency replay is compared without the
+# ledger holding a copy of the (sensitive) values themselves.
+sha2 = { workspace = true }
+# Renders an opaque `NextToken` cursor, and the SHA-256 fingerprint above, as text.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetOriginEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetOriginEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Reads one persisted origin endpoint out of [`crate::state`] and reports
+//! it exactly as `CreateOriginEndpoint` stored it, manifest URLs included. Purely
+//! reporting: it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetOriginEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `handle` below is the implementation; `crate::state` holds the store it reads.
 //!
 //! ## Shape of an operation
 //!
@@ -200,18 +196,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetOriginEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetOriginEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetOriginEndpoint"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetOriginEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        let endpoint = store
+            .channel_groups
+            .get(&input.channel_group_name)
+            .and_then(|group| group.channels.get(&input.channel_name))
+            .and_then(|channel| channel.origin_endpoints.get(&input.origin_endpoint_name));
+        let Some(endpoint) = endpoint else {
+            return Err(GetOriginEndpointErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Origin endpoint {} not found on channel {} in channel group {}",
+                        input.origin_endpoint_name,
+                        input.channel_name,
+                        input.channel_group_name
+                    )),
+                    resource_type_not_found: Some("ORIGIN_ENDPOINT".to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetOriginEndpointOutput {
+            arn: endpoint.arn.clone(),
+            channel_group_name: endpoint.group_name.clone(),
+            channel_name: endpoint.channel_name.clone(),
+            origin_endpoint_name: endpoint.name.clone(),
+            container_type: endpoint.container_type.clone(),
+            segment: endpoint.segment.clone(),
+            created_at: endpoint.created_at,
+            modified_at: endpoint.modified_at,
+            reset_at: endpoint.reset_at,
+            description: endpoint.description.clone(),
+            startover_window_seconds: endpoint.startover_window_seconds,
+            hls_manifests: Some(endpoint.hls_manifests.clone()),
+            low_latency_hls_manifests: Some(endpoint.low_latency_hls_manifests.clone()),
+            dash_manifests: Some(endpoint.dash_manifests.clone()),
+            mss_manifests: Some(endpoint.mss_manifests.clone()),
+            force_endpoint_error_configuration: endpoint
+                .force_endpoint_error_configuration
+                .clone(),
+            uri_separator: endpoint.uri_separator.clone(),
+            stream_name_output_mode: endpoint.stream_name_output_mode.clone(),
+            e_tag: Some(endpoint.etag.clone()),
+            tags: Some(endpoint.tags.clone()),
+        })
     }
 }

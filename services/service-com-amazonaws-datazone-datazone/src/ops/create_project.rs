@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a project under a PERSISTED domain and stores it there, so
+//! `GetProject`/`ListProjects` answer from the stored record and the project disappears
+//! with its domain.
+//!
+//! `createdBy` is the CALLER's principal (derived from the request's SigV4 scope), not
+//! anything the request body carries.
+//!
+//! `ProjectStatus` has no in-progress member for creation, so a created project is
+//! `ACTIVE` at once and stays there: it owes the clock no transition.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +199,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProject"))
+        use crate::state::{
+            caller_principal, date_time, now_ms, Project, DOMAIN_STATUS_AVAILABLE,
+            PROJECT_STATUS_ACTIVE,
+        };
+
+        // Environment provisioning and membership assignment are separate resources
+        // this slice of the emulator does not serve yet. A request that asks for them
+        // is answered with the scaffold's honest "not written yet" rather than being
+        // accepted and silently dropped.
+        if input.user_parameters.is_some() || input.membership_assignments.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateProject with userParameters or membershipAssignments",
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateProjectErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        let created_by = caller_principal(ctx);
+        let (domain_status, project_count) = store
+            .domains
+            .get(&input.domain_identifier)
+            .map(|d| (d.status.clone(), d.projects.len()))
+            .ok_or_else(|| {
+                CreateProjectErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!("Domain {} was not found", input.domain_identifier),
+                })
+            })?;
+        // A domain still being created, or already being deleted, cannot take a
+        // project: the request conflicts with the domain's current state.
+        if domain_status != DOMAIN_STATUS_AVAILABLE {
+            return Err(CreateProjectErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Domain {} is {domain_status}, so it cannot accept a project",
+                    input.domain_identifier
+                ),
+            })
+            .into());
+        }
+        // The store is bounded, so a create loop cannot grow the emulator's heap
+        // without limit; the refusal is the error the operation already models.
+        if project_count >= crate::state::MAX_PROJECTS_PER_DOMAIN {
+            return Err(CreateProjectErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator stores at most {} projects in one domain",
+                        crate::state::MAX_PROJECTS_PER_DOMAIN
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_id(now);
+        let project = Project {
+            id: id.clone(),
+            domain_id: input.domain_identifier.clone(),
+            name: input.name,
+            description: input.description,
+            project_status: PROJECT_STATUS_ACTIVE.to_string(),
+            created_by,
+            created_at_ms: now,
+            last_updated_at_ms: now,
+            glossary_terms: input.glossary_terms.unwrap_or_default(),
+            domain_unit_id: input.domain_unit_id,
+            project_profile_id: input.project_profile_id,
+            resource_tags: input.resource_tags.unwrap_or_default().into_iter().collect(),
+            project_category: input.project_category,
+        };
+        let output = CreateProjectOutput {
+            domain_id: project.domain_id.clone(),
+            id: project.id.clone(),
+            name: project.name.clone(),
+            description: project.description.clone(),
+            project_status: Some(project.project_status.clone()),
+            // Nothing failed, so the project carries no deletion error.
+            failure_reasons: None,
+            created_by: project.created_by.clone(),
+            created_at: Some(date_time(project.created_at_ms)),
+            last_updated_at: Some(date_time(project.last_updated_at_ms)),
+            resource_tags: Some(
+                project
+                    .resource_tags
+                    .iter()
+                    .map(|(key, value)| ResourceTag {
+                        key: key.clone(),
+                        value: value.clone(),
+                        // `ResourceTagSource` is PROJECT | PROJECT_PROFILE
+                        // (smithy_query shape="ResourceTagSource"): a tag the
+                        // CreateProject request carried is the project's own, not one
+                        // inherited from a project profile.
+                        source: "PROJECT".to_string(),
+                    })
+                    .collect(),
+            ),
+            glossary_terms: (!project.glossary_terms.is_empty())
+                .then(|| project.glossary_terms.clone()),
+            domain_unit_id: project.domain_unit_id.clone(),
+            project_profile_id: project.project_profile_id.clone(),
+            // No environments were configured, so there is no user parameter set and
+            // no deployment to report.
+            user_parameters: None,
+            environment_deployment_details: None,
+            project_category: project.project_category.clone(),
+        };
+
+        // `domain_status` proved the domain is there; store the project under it.
+        if let Some(domain) = store.domains.get_mut(&input.domain_identifier) {
+            domain.projects.insert(id, project);
+        }
+        Ok(output)
     }
 }

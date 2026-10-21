@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports a persisted deployment, brought up to the progress the clock
+//! already owes it.
 //!
 //! ## Shape of an operation
 //!
@@ -155,6 +148,16 @@ impl From<GetDeploymentErrorModeled> for GetDeploymentError {
     }
 }
 
+/// A `ResourceNotFoundException` (HTTP 404) naming the resource that could not be
+/// resolved.
+fn not_found(message: String, resource_name: String) -> GetDeploymentError {
+    GetDeploymentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        resource_name: Some(resource_name),
+    })
+    .into()
+}
+
 /// The `GetDeployment` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -189,20 +192,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDeployment"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDeploymentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(application) = store.applications.get_mut(&input.application_id) else {
+            return Err(not_found(
+                format!("No application with id {} exists.", input.application_id),
+                input.application_id,
+            ));
+        };
+        let Some(environment) = application.environments.get_mut(&input.environment_id) else {
+            return Err(not_found(
+                format!(
+                    "No environment with id {} exists in application {}.",
+                    input.environment_id, input.application_id
+                ),
+                input.environment_id,
+            ));
+        };
+
+        // Reporting a deployment materialises only what the CLOCK already made due —
+        // the growth steps, the bake period and the completion the strategy's own
+        // durations schedule. Nothing here depends on this call happening.
+        environment.materialize(now);
+
+        let Some(deployment) = environment.deployments.get(&input.deployment_number) else {
+            return Err(not_found(
+                format!(
+                    "No deployment number {} exists in environment {}.",
+                    input.deployment_number, input.environment_id
+                ),
+                input.deployment_number.to_string(),
+            ));
+        };
+
+        Ok(GetDeploymentOutput {
+            application_id: Some(deployment.application_id.clone()),
+            environment_id: Some(deployment.environment_id.clone()),
+            deployment_strategy_id: Some(deployment.deployment_strategy_id.clone()),
+            configuration_profile_id: Some(deployment.configuration_profile_id.clone()),
+            deployment_number: deployment.deployment_number,
+            configuration_name: Some(deployment.configuration_name.clone()),
+            configuration_location_uri: Some(deployment.configuration_location_uri.clone()),
+            configuration_version: Some(deployment.configuration_version.clone()),
+            description: deployment.description.clone(),
+            deployment_duration_in_minutes: deployment.deployment_duration_in_minutes,
+            growth_type: Some(deployment.growth_type.clone()),
+            growth_factor: Some(deployment.growth_factor),
+            final_bake_time_in_minutes: deployment.final_bake_time_in_minutes,
+            state: Some(deployment.state.clone()),
+            event_log: Some(deployment.event_log_newest_first()),
+            percentage_complete: Some(deployment.percentage_complete),
+            started_at: Some(crate::state::to_date_time(deployment.started_at)),
+            completed_at: deployment.completed_at.map(crate::state::to_date_time),
+            // `AppliedExtensions` and `KmsKeyArn` are deliberately left unset, not
+            // overlooked: the first lists the extensions the deployment invoked, which
+            // this emulator does not run (extension associations are still a 501 of
+            // their own), and the second is the ARN of the key `KmsKeyIdentifier`
+            // resolves to, which this emulator does not resolve. Any value here would
+            // be fabricated rather than read from state.
+            applied_extensions: None,
+            kms_key_arn: None,
+            kms_key_identifier: deployment.kms_key_identifier.clone(),
+            version_label: deployment.version_label.clone(),
+        })
     }
 }

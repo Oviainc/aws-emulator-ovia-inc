@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateArchive
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateArchive`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateArchive::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mutates the stored archive record and bumps its
+//! `LastUpdatedTimestamp`. An archive in `PENDING_DELETION` is refused with the modelled
+//! `ConflictException`, because the model states "No further modifications can be made in
+//! this state".
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateArchive` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateArchiveErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateArchive"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateArchiveErrorModeled::ThrottlingException(ThrottlingException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+            .into());
+        };
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        store.purge_permanently_deleted(now);
+
+        let Some(current) = store.archives.get(&input.archive_id).cloned() else {
+            return Err(UpdateArchiveErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Archive {} not found.", input.archive_id)),
+                },
+            )
+            .into());
+        };
+
+        if current.archive_state == crate::state::ARCHIVE_STATE_PENDING_DELETION {
+            return Err(UpdateArchiveErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Archive {} is pending deletion; no further modifications can be made.",
+                    current.archive_id
+                )),
+            })
+            .into());
+        }
+
+        // An archive name is unique across the account, so a rename onto a name another
+        // archive holds conflicts exactly as a create under that name would.
+        let rename = input
+            .archive_name
+            .as_deref()
+            .filter(|name| *name != current.archive_name.as_str())
+            .map(ToString::to_string);
+        if let Some(new_name) = rename.as_deref() {
+            if let Some(existing) = store.archive_names.get(new_name) {
+                return Err(UpdateArchiveErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "Archive name {new_name} is already used by archive {existing}."
+                    )),
+                })
+                .into());
+            }
+        }
+
+        // The record itself is mutated FIRST, so the name index is only rewritten once
+        // the record it describes has actually changed: the two can never disagree.
+        let Some(record) = store.archives.get_mut(&input.archive_id) else {
+            // Unreachable: the record was read a few lines above under this same lock, so
+            // nothing can have removed it. Answered with the modelled error anyway rather
+            // than skipped, so a future edit that breaks the invariant cannot report a
+            // silent success.
+            return Err(UpdateArchiveErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Archive {} not found.", input.archive_id)),
+                },
+            )
+            .into());
+        };
+        if let Some(new_name) = input.archive_name {
+            record.archive_name = new_name;
+        }
+        if let Some(retention) = input.retention {
+            record.retention = retention;
+        }
+        record.last_updated_at_millis = crate::state::bump_millis(record.last_updated_at_millis, now);
+
+        if let Some(new_name) = rename {
+            store.archive_names.remove(&current.archive_name);
+            store
+                .archive_names
+                .insert(new_name, current.archive_id.clone());
+        }
+
+        Ok(UpdateArchiveOutput {})
     }
 }

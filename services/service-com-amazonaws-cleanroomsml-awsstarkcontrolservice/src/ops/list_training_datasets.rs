@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTrainingDatasets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTrainingDatasets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTrainingDatasets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the persisted training datasets in [`crate::state`], one
+//! `TrainingDatasetSummary` per record, in the one stable order the store's ARN keys
+//! give. `nextToken` is the ARN the next page resumes at, so following it to the end
+//! enumerates every persisted dataset exactly once. Reporting only: this handler writes
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +142,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTrainingDatasets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTrainingDatasetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTrainingDatasets"))
+        // This operation reports on the store; the region the request was signed for is
+        // the endpoint it reached, and a Clean Rooms ML endpoint is regional.
+        let region = crate::state::request_region(ctx.parts());
+        // See `CreateTrainingDataset` for why an engine with no store for this service
+        // answers the scaffold's 501.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        // The token is the ARN the next page starts at. `NextToken` is modelled only as
+        // a 1..10240 string, so a token this operation never issued is refused with the
+        // modelled `ValidationException` rather than silently serving page one.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_training_dataset_arn(token) {
+                return Err(ListTrainingDatasetsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "nextToken {token:?} is not a token returned by ListTrainingDatasets"
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // `maxResults` is modelled `@range(min: 1, max: 100)` and the boundary validator
+        // refused anything outside it before this handler ran, so the only case left is
+        // an absent value: serve the largest page the model allows. The `clamp` states
+        // that invariant rather than correcting a caller — a value reaching here outside
+        // the range is a validator bug, which the debug assertion surfaces instead of
+        // silently repairing.
+        let requested = input
+            .max_results
+            .unwrap_or(crate::state::TRAINING_DATASET_PAGE_LIMIT);
+        debug_assert!(
+            (1..=crate::state::TRAINING_DATASET_PAGE_LIMIT).contains(&requested),
+            "maxResults {requested} should have been refused at the boundary"
+        );
+        let page_size =
+            usize::try_from(requested.clamp(1, crate::state::TRAINING_DATASET_PAGE_LIMIT))
+                .expect("a page size clamped into 1..=100 fits in usize");
+
+        let store = state.lock();
+        let mut training_datasets = Vec::with_capacity(page_size);
+        let mut next_token = None;
+        for (arn, dataset) in &store.training_datasets {
+            // Resume at the first ARN at or after the token, so a page is still served
+            // when the dataset the token named was deleted meanwhile.
+            if input
+                .next_token
+                .as_deref()
+                .is_some_and(|token| arn.as_str() < token)
+            {
+                continue;
+            }
+            // A regional endpoint reports its own region's resources and no others.
+            if dataset.region != region {
+                continue;
+            }
+            if training_datasets.len() == page_size {
+                next_token = Some(arn.clone());
+                break;
+            }
+            training_datasets.push(dataset.to_summary());
+        }
+
+        Ok(ListTrainingDatasetsOutput {
+            next_token,
+            training_datasets,
+        })
     }
 }

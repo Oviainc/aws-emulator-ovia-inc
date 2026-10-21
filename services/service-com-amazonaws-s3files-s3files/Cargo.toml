@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Hashing for the unique ids this service mints (file-system ids, access-point ids and
+# the client token a create records when the caller sent none).
+sha2 = { workspace = true }
+# Hex codec for those ids and for the opaque `nextToken` the listings issue.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

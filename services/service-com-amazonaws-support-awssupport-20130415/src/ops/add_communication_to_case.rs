@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddCommunicationToCase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddCommunicationToCase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddCommunicationToCase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Appends a communication to the stored case's append-only correspondence log and
+//! answers `result: true`; `DescribeCommunications` and `DescribeCases` read it back.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +180,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddCommunicationToCase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddCommunicationToCaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddCommunicationToCase"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AddCommunicationToCaseErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the support case store is unavailable".to_string()),
+            })
+        })?;
+
+        // `caseId` is not modelled `@required`, but a communication has to land on
+        // some case: refuse a request that names none rather than inventing one.
+        let Some(case_id) = input.case_id else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "caseId must name the case the communication is added to",
+            ));
+        };
+
+        // No attachment set can exist yet: the attachment operations are still
+        // scaffolded, so any id a caller names is one this service never minted.
+        if let Some(attachment_set_id) = input.attachment_set_id.as_deref() {
+            return Err(AddCommunicationToCaseErrorModeled::AttachmentSetIdNotFound(
+                AttachmentSetIdNotFound {
+                    message: Some(format!(
+                        "An attachment set with the specified ID could not be found: \
+                         {attachment_set_id}"
+                    )),
+                },
+            )
+            .into());
+        }
+        if input.upload_ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "uploadIds names an upload that has not reached the attachment-ready state",
+            ));
+        }
+
+        let (time_created, time_created_instant) = crate::state::now().ok_or_else(|| {
+            AddCommunicationToCaseErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the communication time could not be rendered".to_string()),
+            })
+        })?;
+        let submitted_by = crate::state::submitted_by();
+
+        let mut store = state.lock();
+        let Some(case) = store.cases.get_mut(&case_id) else {
+            return Err(AddCommunicationToCaseErrorModeled::CaseIdNotFound(
+                CaseIdNotFound {
+                    message: Some("The requested CaseId could not be located.".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `dryRun`: the request is validated — including that the case exists —
+        // but nothing is appended, and the operation answers
+        // `DryRunOperationException`.
+        if input.dry_run == Some(true) {
+            return Err(AddCommunicationToCaseErrorModeled::DryRunOperationException(
+                DryRunOperationException {
+                    message: Some(
+                        "The request was valid, but the operation wasn't performed because \
+                         dryRun was set to true."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The addresses copied on this communication are copied on the case's
+        // correspondence from here on — refused, not partly applied, when they
+        // would take the case past the addresses a case may carry.
+        if let Err(total) =
+            case.merge_cc_email_addresses(input.cc_email_addresses.as_deref().unwrap_or_default())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "ccEmailAddresses would leave the case with {total} addresses, more than the {} \
+                 a case may carry",
+                crate::state::MAX_CC_EMAIL_ADDRESSES
+            )));
+        }
+        case.record_communication(
+            input.communication_body,
+            submitted_by,
+            time_created,
+            time_created_instant,
+        );
+
+        Ok(AddCommunicationToCaseOutput { result: true })
     }
 }

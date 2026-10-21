@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCommunications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCommunications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCommunications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every communication persisted for one case, newest first, filtered by
+//! `afterTime`/`beforeTime` and paginated with an opaque `nextToken`. A pure read:
+//! it never writes the store.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +170,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCommunications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCommunicationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCommunications"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeCommunicationsErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the support case store is unavailable".to_string()),
+            })
+        })?;
+
+        let window = crate::state::parse_date_window(
+            input.after_time.as_deref(),
+            input.before_time.as_deref(),
+        )
+        .map_err(|member| {
+            crate::scaffolded::Scaffolded::validation(format!(
+                "{member} must be an ISO 8601 instant"
+            ))
+        })?;
+        // A cursor is the sequence number of the next communication to report.
+        // Sequence numbers are monotonic per case and never reused, so a cursor
+        // stays on the same communication however many are added — or evicted by
+        // the case's retention bound — after the page was served.
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_token(token)
+                    .and_then(|cursor| cursor.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(
+                            "nextToken is not a resumption point this service issued",
+                        )
+                    })?,
+            ),
+        };
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE);
+
+        let store = state.lock();
+        let Some(case) = store.cases.get(&input.case_id) else {
+            return Err(DescribeCommunicationsErrorModeled::CaseIdNotFound(
+                CaseIdNotFound {
+                    message: Some("The requested CaseId could not be located.".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `dryRun`: validated, including that the case exists, but "no
+        // communications are returned".
+        if input.dry_run == Some(true) {
+            return Err(DescribeCommunicationsErrorModeled::DryRunOperationException(
+                DryRunOperationException {
+                    message: Some(
+                        "The request was valid, but the operation wasn't performed because \
+                         dryRun was set to true."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Newest first: the log is oldest-first, so walk it back.
+        let selected: Vec<&crate::state::CommunicationRecord> = case
+            .communications
+            .iter()
+            .rev()
+            .filter(|record| {
+                window.contains(record.time_created_instant)
+                    && resume_from.is_none_or(|cursor| record.sequence <= cursor)
+            })
+            .collect();
+
+        let communications: Vec<Communication> = selected
+            .iter()
+            .take(page_size)
+            .map(|record| record.to_modeled())
+            .collect();
+        let next_token = selected
+            .get(page_size)
+            .map(|record| crate::state::encode_token(&record.sequence.to_string()));
+
+        Ok(DescribeCommunicationsOutput {
+            communications: Some(communications),
+            next_token,
+        })
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Allocates a case in [`crate::state`]: a monotonic `displayId`, a `caseId` of the
+//! documented shape, `status` = `opened`, the submitting identity, the creation
+//! instant and the request's `communicationBody` as the case's first communication.
 //!
 //! ## Shape of an operation
 //!
@@ -214,18 +209,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCase"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateCaseErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the support case store is unavailable".to_string()),
+            })
+        })?;
+
+        // No attachment set can exist yet: `AddAttachmentsToSet` and the upload
+        // operations are still scaffolded, so any id a caller names is one this
+        // service never minted.
+        if let Some(attachment_set_id) = input.attachment_set_id.as_deref() {
+            return Err(CreateCaseErrorModeled::AttachmentSetIdNotFound(
+                AttachmentSetIdNotFound {
+                    message: Some(format!(
+                        "An attachment set with the specified ID could not be found: \
+                         {attachment_set_id}"
+                    )),
+                },
+            )
+            .into());
+        }
+        if input.upload_ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "uploadIds names an upload that has not reached the attachment-ready state",
+            ));
+        }
+
+        // `dryRun`: "the request is validated but no case is created, and the
+        // operation returns a DryRunOperationException" — so refuse here, before
+        // anything is allocated or stored.
+        if input.dry_run == Some(true) {
+            return Err(CreateCaseErrorModeled::DryRunOperationException(
+                DryRunOperationException {
+                    message: Some(
+                        "The request was valid, but the operation wasn't performed because \
+                         dryRun was set to true."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let (time_created, time_created_instant) = crate::state::now().ok_or_else(|| {
+            CreateCaseErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the case creation time could not be rendered".to_string()),
+            })
+        })?;
+        let submitted_by = crate::state::submitted_by();
+
+        let mut store = state.lock();
+        // The store holds at most `MAX_STORED_CASES` cases, so a client cannot
+        // grow it without limit; past that, this operation's own modelled
+        // creation-limit error is the answer.
+        if store.is_full() {
+            return Err(CreateCaseErrorModeled::CaseCreationLimitExceeded(
+                CaseCreationLimitExceeded {
+                    message: Some(
+                        "The case creation limit for the account has been exceeded.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let display_id = store.allocate_display_id();
+        let case_id = crate::state::new_case_id(display_id, &time_created);
+
+        let mut case = crate::state::Case::new(
+            case_id.clone(),
+            display_id,
+            input.subject,
+            input.service_code,
+            input.category_code,
+            input.severity_code,
+            input.issue_type,
+            input.language,
+            submitted_by.clone(),
+            time_created.clone(),
+            time_created_instant,
+        );
+        if let Err(total) =
+            case.merge_cc_email_addresses(input.cc_email_addresses.as_deref().unwrap_or_default())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "ccEmailAddresses has {total} addresses, more than the {} a case may carry",
+                crate::state::MAX_CC_EMAIL_ADDRESSES
+            )));
+        }
+        // The body that describes the issue is the case's first communication.
+        case.record_communication(
+            input.communication_body,
+            submitted_by,
+            time_created,
+            time_created_instant,
+        );
+        store.cases.insert(case_id.clone(), case);
+
+        Ok(CreateCaseOutput {
+            case_id: Some(case_id),
+        })
     }
 }

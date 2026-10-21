@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAgentSpaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAgentSpaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAgentSpaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages over the AgentSpaces stored in [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +100,9 @@ impl From<ListAgentSpacesErrorModeled> for ListAgentSpacesError {
     }
 }
 
+/// The page size `maxResults` defaults to, from the member's `@default(20)`.
+const DEFAULT_MAX_RESULTS: usize = 20;
+
 /// The `ListAgentSpaces` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -144,18 +139,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAgentSpaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAgentSpacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAgentSpaces"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAgentSpacesErrorModeled::InternalServerException(InternalServerException {
+                message: "the DevOps Agent state store is unavailable".to_string(),
+            })
+        })?;
+
+        // `maxResults` carries `@default(20)` and `@range(1..100)`, so a value outside
+        // the range is refused before this handler runs and the only way to see a
+        // non-positive value here is an absent member whose default was not applied.
+        // The `else` branch exists for exactly that case; normally the framework has
+        // already filled in the documented default.
+        let page_size = if input.max_results > 0 {
+            input.max_results as usize
+        } else {
+            DEFAULT_MAX_RESULTS
+        };
+
+        // `includedData` asks how much data to include. This output carries only the
+        // required `agentSpaces` list and the pagination token, so there is no
+        // optional data for it to select here — accepting it and listing everything is
+        // the `ALL_DATA` default. (`GetAgentSpace`, whose output has an optional tag
+        // set, does act on it.)
+        let _ = &input.included_data;
+
+        // A `nextToken` this service did not issue cannot name a position in the
+        // listing: refuse it with the modelled client error.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_next_token(token).ok_or_else(|| {
+                ListAgentSpacesErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a pagination token issued by this service"
+                        .to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        path: "nextToken".to_string(),
+                        message: "malformed pagination token".to_string(),
+                    }]),
+                })
+            })?),
+        };
+
+        // `@readonly`: the listing is computed from state and writes nothing.
+        let store = state.lock();
+        let ordered = store.agent_spaces_ordered();
+        let start = match resume_after.as_deref() {
+            None => 0,
+            // The cursor is exclusive: resume at the first space after it. A cursor
+            // whose space has since been deleted resumes at the next one still
+            // stored, which is why the position is found by comparison rather than
+            // by an index baked into the token.
+            Some(cursor) => ordered
+                .iter()
+                .position(|record| record.agent_space_id.as_str() > cursor)
+                .unwrap_or(ordered.len()),
+        };
+        let page: Vec<&crate::state::AgentSpaceRecord> =
+            ordered.iter().skip(start).take(page_size).copied().collect();
+        let more_follow = start + page.len() < ordered.len();
+        let next_token = page
+            .last()
+            .filter(|_| more_follow)
+            .map(|last| crate::state::encode_next_token(&last.agent_space_id));
+
+        Ok(ListAgentSpacesOutput {
+            agent_spaces: page.iter().map(|record| record.to_api()).collect(),
+            next_token,
+        })
     }
 }
