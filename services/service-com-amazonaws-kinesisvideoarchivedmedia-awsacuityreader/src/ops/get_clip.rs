@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetClip
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetClip`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Returns a clip of the archived media of one stream over a timestamp range.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetClip::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## Behaviour
+//!
+//! * The request names exactly one stream, by `StreamName` or `StreamARN`;
+//!   neither or both is `InvalidArgumentException` (400) and a name or ARN no
+//!   stream answers to is `ResourceNotFoundException` (404).
+//! * "Data retention must be greater than 0": a stream with
+//!   `DataRetentionInHours` of 0 is `NoDataRetentionException` (400).
+//! * The clip is assembled from the fragments the archive holds whose selected
+//!   timestamp falls inside the inclusive `ClipTimestampRange`, bounded by the
+//!   documented clip limits ("the first 100 MB or the first 200 fragments from
+//!   the specified start timestamp"). A range the archive holds no fragment in
+//!   is `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +127,23 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{date_time_millis, service_state, ArchivedStream, StreamLookupError, TimestampOrigin};
+
+/// The content type `GetClip` reports.
+///
+/// The operation "Downloads an MP4 file (clip) containing the archived,
+/// on-demand media", so the clip is always MP4 whatever container the archive
+/// holds.
+const CLIP_CONTENT_TYPE: &str = "video/mp4";
+
+/// The documented fragment ceiling of one clip: "The output will contain the
+/// first 100 MB or the first 200 fragments from the specified start timestamp."
+const MAX_CLIP_FRAGMENTS: usize = 200;
+
+/// The documented byte ceiling of one clip: the 100 MB of the same sentence.
+/// It is the same ceiling [`crate::state::MAX_PAYLOAD_BYTES`] applies to every
+/// payload this service assembles, named once there.
+const MAX_CLIP_BYTES: usize = crate::state::MAX_PAYLOAD_BYTES;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -200,16 +223,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetClip` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetClipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+
+        let invalid = |message: String| -> Self::Error {
+            GetClipErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        let Some(state) = service_state(&*self.engine) else {
+            // See the note in `list_fragments`: unreachable in the assembled
+            // emulator, and reported as a modelled failure rather than as an
+            // empty success.
+            return Err(GetClipErrorModeled::ClientLimitExceededException(
+                ClientLimitExceededException {
+                    message: Some("the archived-media store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        let stream = match state
+            .resolve_stream(input.stream_name.as_deref(), input.stream_arn.as_deref())
+        {
+            Ok(stream) => stream,
+            Err(StreamLookupError::InvalidArgument(message)) => return Err(invalid(message)),
+            Err(StreamLookupError::NotFound(message)) => {
+                return Err(GetClipErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // "Data retention must be greater than 0."
+        if !stream.retains_data() {
+            return Err(GetClipErrorModeled::NoDataRetentionException(
+                NoDataRetentionException {
+                    message: Some(format!(
+                        "Stream {} does not retain data (DataRetentionInHours is 0)",
+                        stream.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let selector = &input.clip_fragment_selector;
+        let Some(origin) = TimestampOrigin::parse(&selector.fragment_selector_type) else {
+            return Err(invalid(format!(
+                "ClipFragmentSelector.FragmentSelectorType must be one of [{}]",
+                CLIP_FRAGMENT_SELECTOR_TYPE_VALUES.join(", ")
+            )));
+        };
+        let start_millis = date_time_millis(&selector.timestamp_range.start_timestamp);
+        let end_millis = date_time_millis(&selector.timestamp_range.end_timestamp);
+        if end_millis < start_millis {
+            return Err(invalid(
+                "ClipFragmentSelector.TimestampRange.EndTimestamp must not be earlier than \
+                 StartTimestamp"
+                    .to_string(),
+            ));
+        }
+
+        let in_range = stream.fragments_in_range(origin, start_millis, end_millis);
+        if in_range.is_empty() {
+            return Err(GetClipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No fragments found in the requested time range for stream {}",
+                        stream.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The clip runs from the start of the range and stops at whichever
+        // documented limit it reaches first, so both factors — the fragment
+        // count AND the total bytes — are bounded before anything is
+        // allocated.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetClip"))
+        // The payload is the archive's OWN bytes for the selected fragments,
+        // concatenated: this emulator does not transmux media, so it never
+        // synthesises an MP4 container around bytes it cannot parse. What a
+        // caller gets back is exactly the media the archive holds for the range
+        // it asked for.
+        let mut clipped: Vec<&crate::state::StoredFragment> = Vec::new();
+        let mut bytes = 0usize;
+        for fragment in in_range {
+            let next = bytes.saturating_add(fragment.media.len());
+            if clipped.len() >= MAX_CLIP_FRAGMENTS || next > MAX_CLIP_BYTES {
+                break;
+            }
+            bytes = next;
+            clipped.push(fragment);
+        }
+
+        // Nothing fitted: the first fragment in the range is itself over the
+        // clip ceiling, so there is a clip to build and it cannot be built
+        // within the published limit — which is what the modelled limit error
+        // says ("you have exceeded a limit"). Tested on the selection, not on
+        // the assembled bytes, so a fragment that legitimately holds no media
+        // is still served.
+        if clipped.is_empty() {
+            return Err(GetClipErrorModeled::ClientLimitExceededException(
+                ClientLimitExceededException {
+                    message: Some(format!(
+                        "The first fragment in the requested time range for stream {} is over the \
+                         {MAX_CLIP_BYTES} byte limit for one clip",
+                        stream.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The ceiling is owned by `concatenate`, which refuses before it
+        // allocates; the loop above is the documented TRUNCATION rule that
+        // keeps a clip under it. The two agree, so this arm is the backstop
+        // that makes "no path allocates past the ceiling" true by construction
+        // rather than by reading the loop.
+        let payload = ArchivedStream::concatenate(&clipped).map_err(|total| -> Self::Error {
+            GetClipErrorModeled::ClientLimitExceededException(ClientLimitExceededException {
+                message: Some(format!(
+                    "The requested clip totals {total} bytes, over the {MAX_CLIP_BYTES} byte limit \
+                     for one clip"
+                )),
+            })
+            .into()
+        })?;
+
+        Ok(GetClipOutput {
+            content_type: Some(CLIP_CONTENT_TYPE.to_string()),
+            payload,
+        })
     }
 }
