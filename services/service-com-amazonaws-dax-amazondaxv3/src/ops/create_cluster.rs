@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints one DAX cluster from the request and stores it, then answers the `Cluster`
+//! built from what was stored. The name is lower-cased (`ClusterName`: "This parameter
+//! is stored as a lowercase string") after being checked against the name rule the same
+//! doc states, and the ARN, the discovery endpoint and one node per `ReplicationFactor`
+//! are all derived from it.
+//!
+//! The cluster is returned in the non-terminal `creating` status, with its nodes
+//! `creating` too; the move to `available` is owed by the CLOCK and becomes due
+//! [`crate::state::STATUS_SETTLE_DELAY`] after this call, materialised by whichever
+//! reporting operation next reads the store.
 //!
 //! ## Shape of an operation
 //!
@@ -228,18 +230,186 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCluster"))
+        let state = crate::state::store(&*self.engine, Self::NAME)?;
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // The name rule the `ClusterName` doc states, refused before anything is stored.
+        if let Some(reason) = crate::state::cluster_name_violation(&input.cluster_name) {
+            return Err(CreateClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+        // "A replication factor of 1 will create a single-node cluster" — so a cluster
+        // has at least one node, and at most MAX_NODES_PER_CLUSTER of them.
+        if input.replication_factor < 1 {
+            return Err(CreateClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "ReplicationFactor must be at least 1, got {}",
+                        input.replication_factor
+                    )),
+                },
+            )
+            .into());
+        }
+        if input.replication_factor > crate::state::MAX_NODES_PER_CLUSTER {
+            return Err(
+                CreateClusterErrorModeled::NodeQuotaForClusterExceededFault(
+                    NodeQuotaForClusterExceededFault {
+                        message: Some(format!(
+                            "ReplicationFactor {} exceeds the maximum of {} nodes per cluster",
+                            input.replication_factor,
+                            crate::state::MAX_NODES_PER_CLUSTER
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "If provided, the length of this list must equal the ReplicationFactor
+        // parameter" (`AvailabilityZones`).
+        let requested_zones = input.availability_zones.unwrap_or_default();
+        if !requested_zones.is_empty()
+            && i32::try_from(requested_zones.len()).unwrap_or(i32::MAX) != input.replication_factor
+        {
+            return Err(
+                CreateClusterErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(format!(
+                            "AvailabilityZones has {} entries but ReplicationFactor is {}",
+                            requested_zones.len(),
+                            input.replication_factor
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let tags = input.tags.unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateClusterErrorModeled::TagQuotaPerResourceExceeded(
+                TagQuotaPerResourceExceeded {
+                    message: Some(format!(
+                        "Tags carries {} entries, more than the {} allowed per cluster",
+                        tags.len(),
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let cluster_name = input.cluster_name.to_lowercase();
+        let mut store = state.lock();
+        // Read the clock's due transitions first, so a name freed by a settled deletion
+        // is available again.
+        store.settle_due(now);
+        if store.clusters.contains_key(&cluster_name) {
+            return Err(CreateClusterErrorModeled::ClusterAlreadyExistsFault(
+                ClusterAlreadyExistsFault {
+                    message: Some(format!("Cluster {cluster_name} already exists")),
+                },
+            )
+            .into());
+        }
+        // The store holds a bounded number of clusters, each with at most
+        // MAX_NODES_PER_CLUSTER nodes, so no sequence of creates grows it without limit.
+        if store.clusters.len() >= crate::state::MAX_CLUSTERS {
+            return Err(
+                CreateClusterErrorModeled::ClusterQuotaForCustomerExceededFault(
+                    ClusterQuotaForCustomerExceededFault {
+                        message: Some(format!(
+                            "the maximum of {} clusters already exist",
+                            crate::state::MAX_CLUSTERS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The nodes are placed in the subnet group's zones when the request names none,
+        // which also resolves `SubnetGroupName` against stored state.
+        let subnet_group = match input.subnet_group_name {
+            Some(name) => {
+                let name = name.to_lowercase();
+                let Some(group) = store.subnet_groups.get(&name) else {
+                    return Err(CreateClusterErrorModeled::SubnetGroupNotFoundFault(
+                        SubnetGroupNotFoundFault {
+                            message: Some(format!("Subnet group {name} does not exist")),
+                        },
+                    )
+                    .into());
+                };
+                Some((name, group.availability_zones()))
+            }
+            None => None,
+        };
+        let (subnet_group_name, group_zones) = match subnet_group {
+            Some((name, zones)) => (Some(name), zones),
+            None => (None, Vec::new()),
+        };
+        let zones = if requested_zones.is_empty() {
+            group_zones
+        } else {
+            requested_zones
+        };
+
+        let encryption_type = input
+            .cluster_endpoint_encryption_type
+            .unwrap_or_else(|| crate::state::ENCRYPTION_NONE.to_string());
+        // "If no explicit NetworkType is provided, the network type is derived based on
+        // the subnet group's configuration" — this emulator's subnets are IPv4-only.
+        let network_type = input
+            .network_type
+            .unwrap_or_else(|| crate::state::NETWORK_TYPE_IPV4.to_string());
+        let discovery = crate::state::EndpointRecord::new(
+            crate::state::discovery_endpoint_address(&cluster_name, &region),
+            &encryption_type,
+        );
+
+        let mut record = crate::state::ClusterRecord {
+            cluster_arn: crate::state::cluster_arn(&region, &cluster_name),
+            cluster_name: cluster_name.clone(),
+            description: input.description,
+            node_type: input.node_type,
+            status: crate::state::CLUSTER_CREATING.to_string(),
+            nodes: Vec::new(),
+            discovery_endpoint: discovery,
+            subnet_group: subnet_group_name,
+            security_group_ids: input.security_group_ids.unwrap_or_default(),
+            iam_role_arn: input.iam_role_arn,
+            availability_zones: zones,
+            preferred_maintenance_window: input.preferred_maintenance_window,
+            notification_topic_arn: input.notification_topic_arn,
+            notification_topic_status: None,
+            parameter_group_name: input.parameter_group_name,
+            sse_enabled: input.sse_specification.is_some_and(|sse| sse.enabled),
+            cluster_endpoint_encryption_type: encryption_type,
+            network_type,
+            tags: tags
+                .into_iter()
+                .map(|tag| (tag.key.unwrap_or_default(), tag.value.unwrap_or_default()))
+                .collect(),
+            create_time: now,
+            region,
+            settles_at: Some(now + crate::state::STATUS_SETTLE_DELAY),
+        };
+        for _ in 0..input.replication_factor {
+            let seq = store.next_node_seq();
+            record.push_node(seq, now);
+        }
+
+        let view = record.view();
+        store.clusters.insert(cluster_name, record);
+
+        Ok(CreateClusterOutput {
+            cluster: Some(view),
+        })
     }
 }

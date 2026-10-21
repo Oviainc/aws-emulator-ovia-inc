@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op IncreaseReplicationFactor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `IncreaseReplicationFactor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`IncreaseReplicationFactor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds nodes to the stored cluster until it holds `NewReplicationFactor` of them, so
+//! the next `DescribeClusters` reports that many `TotalNodes` and that many distinct
+//! `NodeId`s. An unknown name is answered with `ClusterNotFoundFault`, a cluster that is
+//! not `available` with `InvalidClusterStateFault`, a factor that would not grow the
+//! cluster with `InvalidParameterValueException`, and one past the documented maximum
+//! with `NodeQuotaForClusterExceededFault`.
+//!
+//! The cluster moves to `modifying` and the added nodes start `creating`; both settle
+//! when the CLOCK makes it due, [`crate::state::STATUS_SETTLE_DELAY`] after this call.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +165,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `IncreaseReplicationFactor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(IncreaseReplicationFactorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("IncreaseReplicationFactor"))
+        let _ = ctx;
+        let state = crate::state::store(&*self.engine, Self::NAME)?;
+        let now = ::std::time::SystemTime::now();
+
+        if input.new_replication_factor > crate::state::MAX_NODES_PER_CLUSTER {
+            return Err(
+                IncreaseReplicationFactorErrorModeled::NodeQuotaForClusterExceededFault(
+                    NodeQuotaForClusterExceededFault {
+                        message: Some(format!(
+                            "NewReplicationFactor {} exceeds the maximum of {} nodes per cluster",
+                            input.new_replication_factor,
+                            crate::state::MAX_NODES_PER_CLUSTER
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let cluster_name = input.cluster_name.to_lowercase();
+        let mut store = state.lock();
+        store.settle_due(now);
+
+        let next_seqs = {
+            let Some(cluster) = store.clusters.get(&cluster_name) else {
+                return Err(IncreaseReplicationFactorErrorModeled::ClusterNotFoundFault(
+                    ClusterNotFoundFault {
+                        message: Some(format!("Cluster {cluster_name} does not exist")),
+                    },
+                )
+                .into());
+            };
+            if cluster.status != crate::state::CLUSTER_AVAILABLE {
+                return Err(
+                    IncreaseReplicationFactorErrorModeled::InvalidClusterStateFault(
+                        InvalidClusterStateFault {
+                            message: Some(format!(
+                                "Cluster {cluster_name} is {}, not {}",
+                                cluster.status,
+                                crate::state::CLUSTER_AVAILABLE
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // This operation only ADDS nodes: a factor at or below the current node
+            // count would shrink the cluster, which is `DecreaseReplicationFactor`.
+            let current = i32::try_from(cluster.nodes.len()).unwrap_or(i32::MAX);
+            if input.new_replication_factor <= current {
+                return Err(
+                    IncreaseReplicationFactorErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(format!(
+                                "NewReplicationFactor {} must be greater than the cluster's \
+                                 current {current} nodes",
+                                input.new_replication_factor
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // Reserve one id per node to add, before the cluster is borrowed mutably.
+            let added = usize::try_from(input.new_replication_factor - current).unwrap_or(0);
+            (0..added).map(|_| store.next_node_seq()).collect::<Vec<_>>()
+        };
+
+        let Some(cluster) = store.clusters.get_mut(&cluster_name) else {
+            return Err(IncreaseReplicationFactorErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(format!("Cluster {cluster_name} does not exist")),
+                },
+            )
+            .into());
+        };
+        // "All nodes belonging to the cluster are placed in these Availability Zones":
+        // a named pool replaces the cluster's own for this and any later addition.
+        if let Some(zones) = input.availability_zones.filter(|zones| !zones.is_empty()) {
+            cluster.availability_zones = zones;
+        }
+        for seq in next_seqs {
+            cluster.push_node(seq, now);
+        }
+        cluster.status = crate::state::CLUSTER_MODIFYING.to_string();
+        cluster.settles_at = Some(now + crate::state::STATUS_SETTLE_DELAY);
+
+        Ok(IncreaseReplicationFactorOutput {
+            cluster: Some(cluster.view()),
+        })
     }
 }
