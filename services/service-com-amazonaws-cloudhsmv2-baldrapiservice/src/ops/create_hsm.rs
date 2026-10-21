@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHsm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateHsm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: attaches a new HSM to the cluster [`crate::state`] holds, so the
+//! cluster's `Hsms` list carries it on the next `DescribeClusters`. The notes below are
+//! the scaffold's, kept for the next reader.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateHsm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Nothing else about `CreateHsm` is asserted here — this file is the ONLY one to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +155,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateHsm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateHsmErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateHsm"))
+        // Reporting the HSM needs nothing from `ctx`: the Availability Zone comes from
+        // the request and the subnet from the cluster's stored mapping.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateHsmErrorModeled::CloudHsmInternalFailureException(
+                CloudHsmInternalFailureException {
+                    message: Some(
+                        "the cloudhsmv2 emulator is mounted on an engine that holds no state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // The cluster, the zone and the address are resolved BEFORE any id is minted, so
+        // a request that is refused neither burns ids nor bumps the store's counter.
+        let cluster = store
+            .clusters
+            .get(&input.cluster_id)
+            .filter(|cluster| !cluster.is_gone())
+            .ok_or_else(|| not_found(&input.cluster_id))?;
+
+        // The HSM goes in the cluster's subnet for that Availability Zone; a zone the
+        // cluster has no subnet in is not a zone an HSM can be created in.
+        let Some(subnet_id) = cluster.subnet_mapping.get(&input.availability_zone).cloned() else {
+            let mut zones: Vec<&str> = cluster
+                .subnet_mapping
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<&str>>();
+            zones.sort_unstable();
+            return Err(invalid_request(format!(
+                "cluster {} has no subnet in Availability Zone {}; its zones are {}",
+                input.cluster_id,
+                input.availability_zone,
+                zones.join(", ")
+            )));
+        };
+
+        let az_index = cluster.az_index(&input.availability_zone);
+        let hsm_type = cluster.hsm_type.clone();
+        let dualstack = cluster.network_type == crate::state::NETWORK_TYPE_DUALSTACK;
+
+        // "If you specify an IP address, use an available address from the subnet ... If
+        // you don't specify an IP address, one is chosen for you from that subnet."
+        let eni_ip = match &input.ip_address {
+            Some(requested) => {
+                if cluster.eni_ip_in_use(requested) {
+                    return Err(invalid_request(format!(
+                        "IpAddress {requested} is already held by an HSM in cluster {}",
+                        input.cluster_id
+                    )));
+                }
+                requested.clone()
+            }
+            None => {
+                let Some(host) = cluster.free_eni_host(az_index) else {
+                    return Err(invalid_request(format!(
+                        "no address is available in cluster {}'s subnet {subnet_id}",
+                        input.cluster_id
+                    )));
+                };
+                format!("10.0.{az_index}.{host}")
+            }
+        };
+        let eni_ip_v6 = dualstack.then(|| crate::state::synthesized_eni_ip_v6(az_index, &eni_ip));
+
+        // The emulator keeps every HSM in memory for the life of the process and this is
+        // the only operation that adds one, so the list needs a ceiling: without it a
+        // caller that supplies its own `IpAddress` walks past `free_eni_host` and grows
+        // the cluster without limit.
+        if cluster.hsms.len() >= crate::state::MAX_HSMS_PER_CLUSTER {
+            return Err(limit_exceeded(format!(
+                "cluster {} already contains the maximum of {} HSMs this emulator holds",
+                input.cluster_id,
+                crate::state::MAX_HSMS_PER_CLUSTER
+            )));
+        }
+
+        // Minting bumps the store's id counter, so it happens only once the request is
+        // known to be served.
+        let hsm_id = store.mint_hsm_id();
+        let eni_id = store.mint_eni_id();
+
+        let record = crate::state::HsmRecord {
+            hsm_id: hsm_id.clone(),
+            cluster_id: input.cluster_id.clone(),
+            availability_zone: input.availability_zone,
+            subnet_id,
+            eni_id,
+            eni_ip,
+            eni_ip_v6,
+            hsm_type,
+            state: crate::state::HSM_CREATE_IN_PROGRESS.to_string(),
+            state_message: None,
+            // CREATE_IN_PROGRESS is not terminal: the HSM is owed ACTIVE.
+            pending: Some(crate::state::Pending::after(
+                now,
+                crate::state::Owed::ToState(crate::state::HSM_ACTIVE),
+            )),
+        };
+
+        let hsm = record.to_shape();
+        let Some(cluster) = store.clusters.get_mut(&input.cluster_id) else {
+            return Err(not_found(&input.cluster_id));
+        };
+        cluster.hsms.push(record);
+
+        Ok(CreateHsmOutput { hsm: Some(hsm) })
     }
+}
+
+/// Refuse the request because serving it would grow this emulator's store past the
+/// ceiling it keeps on itself. `CloudHsmServiceException` is the error the operation
+/// models for a request it cannot serve for a reason of the service's own.
+fn limit_exceeded(message: String) -> CreateHsmError {
+    CreateHsmErrorModeled::CloudHsmServiceException(CloudHsmServiceException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the request with the error this operation models for a resource that cannot
+/// be found.
+fn not_found(cluster_id: &str) -> CreateHsmError {
+    CreateHsmErrorModeled::CloudHsmResourceNotFoundException(CloudHsmResourceNotFoundException {
+        message: Some(format!("cluster {cluster_id} does not exist")),
+    })
+    .into()
+}
+
+/// Refuse the request with the error this operation models for one that is not valid.
+fn invalid_request(message: String) -> CreateHsmError {
+    CreateHsmErrorModeled::CloudHsmInvalidRequestException(CloudHsmInvalidRequestException {
+        message: Some(message),
+    })
+    .into()
 }

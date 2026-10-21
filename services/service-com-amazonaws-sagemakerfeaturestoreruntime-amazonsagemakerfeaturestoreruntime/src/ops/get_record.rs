@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRecord
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRecord`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation serves one record from the feature group's OnlineStore
+//! held in [`crate::state`], as `PutRecord` wrote it: the stored feature values,
+//! projected to `FeatureNames` when the caller named any, and `ExpiresAt` when the
+//! caller asked for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRecord::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Authorization is not emulated, so the modelled `AccessForbidden` is unreachable.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +155,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRecord` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRecordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRecord"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetRecordErrorModeled::InternalFailure(InternalFailure {
+                message: Some("GetRecord: this service holds no state on the mounted engine".into()),
+            })
+            .into());
+        };
+
+        // The boundary validator refuses an undeclared enum value first; this is the
+        // handler's own guard, shared with BatchGetRecord so the two cannot drift.
+        let expiration_enabled = crate::state::expiration_time_enabled(
+            input.expiration_time_response.as_deref(),
+        )
+        .map_err(|message| {
+            GetRecordError::from(GetRecordErrorModeled::ValidationError(ValidationError {
+                message: Some(message),
+            }))
+        })?;
+
+        let mut store = state.lock();
+        let Some(group) = store.group_mut(&input.feature_group_name) else {
+            return Err(GetRecordErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!(
+                    "Feature group '{}' has no OnlineStore",
+                    input.feature_group_name
+                )),
+            })
+            .into());
+        };
+
+        // "If no Record with RecordIdentifierValue is found, then an empty result is
+        // returned" — the identifier was never written, was hard-deleted, is
+        // soft-deleted, or its TTL has expired.
+        let Some(record) = group.live_record(&input.record_identifier_value_as_string) else {
+            return Ok(GetRecordOutput::default());
+        };
+
+        let projected = record.project(input.feature_names.as_deref());
+        if projected.is_empty() {
+            // `Record` is modelled `len 1..`, so "no feature matched" is the same
+            // empty result an absent identifier gives, never an empty list.
+            return Ok(GetRecordOutput::default());
+        }
+
+        // "Parameter to request ExpiresAt in response. If Enabled, GetRecord will
+        // return the value of ExpiresAt, if it is not null."
+        let expires_at = expiration_enabled
+            .then(|| record.expires_at.clone())
+            .flatten();
+
+        Ok(GetRecordOutput {
+            record: Some(projected),
+            expires_at,
+        })
     }
 }

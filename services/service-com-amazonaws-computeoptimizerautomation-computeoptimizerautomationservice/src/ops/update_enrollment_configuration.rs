@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEnrollmentConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEnrollmentConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEnrollmentConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Persists the calling account's enrollment status and reports back
+//! what was stored, including the store time as `lastUpdatedTimestamp`.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +173,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEnrollmentConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEnrollmentConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEnrollmentConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateEnrollmentConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service is not mounted on a state-bearing engine".into()),
+                },
+            )
+            .into());
+        };
+
+        // `status` documents which members of the enum a CALLER may send: "The
+        // Pending and Failed options cannot be used to update the enrollment
+        // status of an account. They are returned in the response". Both are
+        // legal members of `EnrollmentStatus`, so the protocol boundary admits
+        // them and the refusal belongs here.
+        if input.status == "Pending" || input.status == "Failed" {
+            return Err(
+                UpdateEnrollmentConfigurationErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "The status '{}' cannot be used to update the enrollment status of an \
+                             account.",
+                            input.status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let account_id = crate::state::caller_account_id();
+        let mut probe = input.clone();
+        probe.client_token = None;
+        let request_fingerprint = crate::state::fingerprint(&probe);
+        let client_token = input.client_token.as_deref();
+
+        let mut guard = state.lock();
+
+        match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
+            crate::state::TokenOutcome::Fresh => {}
+            // A retry of the same call: report the enrollment as stored, without
+            // re-stamping its timestamp.
+            crate::state::TokenOutcome::Replay(_) => {
+                let stored = guard.enrollment(&account_id);
+                return Ok(UpdateEnrollmentConfigurationOutput {
+                    status: stored.status,
+                    status_reason: stored.status_reason,
+                    last_updated_timestamp: stored
+                        .last_updated_timestamp
+                        .unwrap_or_else(crate::state::now),
+                });
+            }
+            crate::state::TokenOutcome::ParameterMismatch => {
+                return Err(
+                    UpdateEnrollmentConfigurationErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(
+                                "The same client token was used with different parameters.".into(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::TokenOutcome::TokenInUse => {
+                return Err(
+                    UpdateEnrollmentConfigurationErrorModeled::IdempotencyTokenInUseException(
+                        IdempotencyTokenInUseException {
+                            message: Some("The specified client token is already in use.".into()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let stored_at = crate::state::now();
+        {
+            let enrollment = guard.enrollments.entry(account_id.clone()).or_default();
+            enrollment.status = input.status.clone();
+            // The reason belongs to the status it explains; a status the caller
+            // set successfully has none.
+            enrollment.status_reason = None;
+            enrollment.last_updated_timestamp = Some(stored_at);
+        }
+
+        // "Inactive - Disables the Automation feature for your account and stops
+        // all of your automation rules. If you opt in again later, all rules will
+        // be inactive" — so opting out deactivates every rule this account owns.
+        // `ruleRevision` is documented as incremented "each time the rule is
+        // updated" through `UpdateAutomationRule`, the caller's
+        // optimistic-concurrency token, so a service-driven stop leaves it alone.
+        if input.status == "Inactive" {
+            let arns: Vec<String> = guard
+                .rules
+                .iter_in_order()
+                .filter(|rule| rule.account_id == account_id && rule.status != "Inactive")
+                .map(|rule| rule.rule_arn.clone())
+                .collect();
+            for arn in arns {
+                if let Some(rule) = guard.rules.get_mut(&arn) {
+                    rule.status = "Inactive".to_string();
+                    rule.last_updated_timestamp = Some(stored_at);
+                }
+            }
+        }
+
+        guard.record_token(client_token, Self::NAME, &request_fingerprint, None);
+
+        // Read back what was just stored, rather than echoing the request.
+        let stored = guard.enrollment(&account_id);
+        Ok(UpdateEnrollmentConfigurationOutput {
+            status: stored.status,
+            status_reason: stored.status_reason,
+            last_updated_timestamp: stored.last_updated_timestamp.unwrap_or(stored_at),
+        })
     }
 }

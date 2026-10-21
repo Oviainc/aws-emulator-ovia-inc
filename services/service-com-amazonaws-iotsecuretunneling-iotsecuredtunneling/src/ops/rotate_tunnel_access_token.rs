@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RotateTunnelAccessToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RotateTunnelAccessToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RotateTunnelAccessToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the stored access tokens the requested `clientMode` selects with newly
+//! minted ones, so the tokens an earlier `OpenTunnel`/rotate handed out no longer
+//! name this tunnel. Rotating does not extend the tunnel's lifetime: the expiry
+//! stays the one `OpenTunnel` computed.
+//!
+//! Rotating against a tunnel that is already `CLOSED` (including one the expiry
+//! sweep just closed) succeeds and mints tokens: the model declares no error for
+//! that case, and the operation's own documentation conditions nothing on status,
+//! so refusing it would be an invented failure.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +150,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RotateTunnelAccessToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RotateTunnelAccessTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RotateTunnelAccessToken"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_implemented("RotateTunnelAccessToken")
+        })?;
+
+        // `ClientMode`'s modelled values, from `CLIENT_MODE_VALUES`.
+        let (rotate_source, rotate_destination) = match input.client_mode.as_str() {
+            "ALL" => (true, true),
+            "SOURCE" => (true, false),
+            "DESTINATION" => (false, true),
+            other => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "clientMode must be one of {}; got {other}",
+                    CLIENT_MODE_VALUES.join(", ")
+                )))
+            }
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_expired_tunnels(now);
+
+        let Some(tunnel) = store.tunnels.get_mut(&input.tunnel_id) else {
+            return Err(RotateTunnelAccessTokenErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Tunnel {} not found", input.tunnel_id)),
+                },
+            )
+            .into());
+        };
+
+        let source_access_token = rotate_source.then(crate::state::mint_access_token);
+        let destination_access_token = rotate_destination.then(crate::state::mint_access_token);
+        if let Some(token) = source_access_token.as_ref() {
+            tunnel.source_access_token = token.clone();
+        }
+        if let Some(token) = destination_access_token.as_ref() {
+            tunnel.destination_access_token = token.clone();
+        }
+        if let Some(config) = input.destination_config.as_ref() {
+            tunnel.destination_config = Some(crate::state::StoredDestinationConfig {
+                thing_name: config.thing_name.clone(),
+                services: config.services.clone(),
+            });
+        }
+        tunnel.last_updated_at = now;
+        let tunnel_arn = tunnel.tunnel_arn.clone();
+        drop(store);
+
+        Ok(RotateTunnelAccessTokenOutput {
+            tunnel_arn: Some(tunnel_arn),
+            source_access_token,
+            destination_access_token,
+        })
     }
 }

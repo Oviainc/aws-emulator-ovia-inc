@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBots
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBots`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBots::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Builds `botSummaries` from the bots stored in [`crate::state`], applies the
+//! requested `filters` and `sortBy`, and pages the result with `maxResults` /
+//! `nextToken`. Ordering is by `botName` ascending unless `sortBy` says otherwise, so
+//! paging is stable across calls.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +158,201 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBots` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBotsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBots"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListBotsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        // The sort and filter members carry modelled enums, which the wire renders as
+        // plain strings: refuse a value outside the enum rather than silently ignoring it.
+        let mut descending = false;
+        if let Some(sort_by) = &input.sort_by {
+            if !crate::state::BOT_SORT_ATTRIBUTES.contains(&sort_by.attribute.as_str()) {
+                return Err(invalid(format!(
+                    "sortBy.attribute must be one of [{}]; received {}",
+                    crate::state::BOT_SORT_ATTRIBUTES.join(", "),
+                    sort_by.attribute
+                )));
+            }
+            if !crate::state::SORT_ORDERS.contains(&sort_by.order.as_str()) {
+                return Err(invalid(format!(
+                    "sortBy.order must be one of [{}]; received {}",
+                    crate::state::SORT_ORDERS.join(", "),
+                    sort_by.order
+                )));
+            }
+            descending = sort_by.order == "Descending";
+        }
+        let filters = input.filters.unwrap_or_default();
+        for filter in &filters {
+            if !crate::state::BOT_FILTER_NAMES.contains(&filter.name.as_str()) {
+                return Err(invalid(format!(
+                    "filters.name must be one of [{}]; received {}",
+                    crate::state::BOT_FILTER_NAMES.join(", "),
+                    filter.name
+                )));
+            }
+            if !crate::state::BOT_FILTER_OPERATORS.contains(&filter.operator.as_str()) {
+                return Err(invalid(format!(
+                    "filters.operator must be one of [{}]; received {}",
+                    crate::state::BOT_FILTER_OPERATORS.join(", "),
+                    filter.operator
+                )));
+            }
+        }
+
+        // `maxResults` carries the modelled range 1..1000. A value outside it is refused,
+        // not reinterpreted, so a caller that asked for an illegal page size never gets a
+        // plausible success. A request that asks for no page size is served the modelled
+        // maximum, which keeps every response bounded.
+        let page_size = match input.max_results {
+            Some(max_results) => {
+                let requested = usize::try_from(max_results)
+                    .ok()
+                    .filter(|size| (1..=crate::state::MAX_LIST_PAGE).contains(size));
+                let Some(page_size) = requested else {
+                    return Err(invalid(format!(
+                        "maxResults must be between 1 and {}; received {max_results}",
+                        crate::state::MAX_LIST_PAGE
+                    )));
+                };
+                page_size
+            }
+            None => crate::state::MAX_LIST_PAGE,
+        };
+
+        let mut store = state.lock();
+        // Report the status every stored bot has reached by now, so a listing agrees
+        // with what `DescribeBot` would say about the same bot.
+        store.settle_all();
+
+        let mut summaries: Vec<BotSummary> = store
+            .bots
+            .values()
+            .filter(|bot| {
+                filters.iter().all(|filter| {
+                    let field = match filter.name.as_str() {
+                        "BotName" => Some(bot.bot_name.as_str()),
+                        // "BotType" — the only other modelled filter name.
+                        _ => bot.bot_type.as_deref(),
+                    };
+                    matches_filter(field, filter)
+                })
+            })
+            .map(crate::state::Bot::summary)
+            .collect();
+
+        // `BotName` is the only modelled sort attribute; the `botId` tiebreak keeps the
+        // order total, which is what makes `nextToken` paging stable.
+        summaries.sort_by(|left, right| {
+            (summary_name(left), summary_id(left)).cmp(&(summary_name(right), summary_id(right)))
+        });
+        if descending {
+            summaries.reverse();
+        }
+
+        // The cursor `nextToken` carries is the sort key of the first entry of the page
+        // it opens, so the remainder is resolved against the same total order and a bot
+        // deleted between pages does not strand the listing: paging resumes at the first
+        // entry at or after the cursor.
+        if let Some(token) = input.next_token.as_deref() {
+            let Some(cursor) = parse_cursor(token) else {
+                return Err(invalid(format!(
+                    "nextToken {token} is not a token this operation issued; restart the listing"
+                )));
+            };
+            let resume_at = summaries
+                .iter()
+                .position(|summary| at_or_after(summary, &cursor, descending))
+                .unwrap_or(summaries.len());
+            summaries.drain(..resume_at);
+        }
+
+        // Whatever is left over is handed back as an opaque token, so the page itself is
+        // always within `page_size`.
+        let next_token = if summaries.len() > page_size {
+            let remainder = summaries.split_off(page_size);
+            remainder.first().map(render_cursor)
+        } else {
+            None
+        };
+
+        Ok(ListBotsOutput {
+            bot_summaries: Some(summaries),
+            next_token,
+        })
     }
+}
+
+/// The opaque `nextToken` that resumes a listing at `summary`.
+///
+/// The cursor inside it is the entry's sort key; `botName` and `botId` cannot contain
+/// `/` (their modelled patterns allow only alphanumerics plus `_` and `-`), so the pair
+/// is unambiguous, and [`crate::state::encode_page_token`] renders it opaque.
+fn render_cursor(summary: &BotSummary) -> String {
+    crate::state::encode_page_token(&format!(
+        "{}/{}",
+        summary_name(summary),
+        summary_id(summary)
+    ))
+}
+
+/// The sort key a `nextToken` carries, or `None` when it is not a token this operation
+/// issued.
+fn parse_cursor(token: &str) -> Option<(String, String)> {
+    let cursor = crate::state::decode_page_token(token)?;
+    let (name, id) = cursor.split_once('/')?;
+    (!id.is_empty()).then(|| (name.to_string(), id.to_string()))
+}
+
+/// Does this summary sort at or after `cursor` in the order being returned?
+fn at_or_after(summary: &BotSummary, cursor: &(String, String), descending: bool) -> bool {
+    let key = (summary_name(summary), summary_id(summary));
+    let cursor = (cursor.0.as_str(), cursor.1.as_str());
+    if descending {
+        key <= cursor
+    } else {
+        key >= cursor
+    }
+}
+
+/// Refuse the request with the modelled `ValidationException` (HTTP 400).
+fn invalid(message: String) -> ListBotsError {
+    ListBotsErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Does the bot's value for a filtered field satisfy `filter`?
+///
+/// `EQ` is equality, `CO` containment and `NE` inequality
+/// (`smithy_query(query="shape",shape="BotFilterOperator")`). A bot that does not carry
+/// the field at all equals no value, so it passes only `NE`.
+fn matches_filter(field: Option<&str>, filter: &BotFilter) -> bool {
+    let equals = filter
+        .values
+        .iter()
+        .any(|value| field == Some(value.as_str()));
+    match filter.operator.as_str() {
+        "EQ" => equals,
+        "NE" => !equals,
+        // "CO" — the only other modelled operator.
+        _ => filter.values.iter().any(|value| {
+            field.is_some_and(|field| field.contains(value.as_str()))
+        }),
+    }
+}
+
+/// A summary's `botName`, for ordering. Every summary this handler builds carries one.
+fn summary_name(summary: &BotSummary) -> &str {
+    summary.bot_name.as_deref().unwrap_or_default()
+}
+
+/// A summary's `botId`, which is also the paging cursor.
+fn summary_id(summary: &BotSummary) -> &str {
+    summary.bot_id.as_deref().unwrap_or_default()
 }

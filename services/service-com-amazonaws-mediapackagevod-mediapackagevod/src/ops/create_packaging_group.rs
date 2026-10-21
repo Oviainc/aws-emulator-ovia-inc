@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePackagingGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePackagingGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePackagingGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a PackagingGroup — persists it under its caller-chosen `Id`
+//! in [`crate::state`] and answers with the record just stored, so the following
+//! `DescribePackagingGroup` returns the identical `Arn`, `DomainName` and
+//! `CreatedAt`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +152,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePackagingGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePackagingGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePackagingGroup"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePackagingGroupErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the MediaPackage VOD state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // The ARN and the egress domain name carry the region this request was
+        // signed for, so a group created in one region is not reported in another.
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = store.lock();
+
+        if input.id.is_empty() {
+            return Err(CreatePackagingGroupErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some("Id must not be empty.".to_string()),
+                },
+            )
+            .into());
+        }
+        if state.packaging_groups.contains_key(&input.id) {
+            return Err(CreatePackagingGroupErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some(format!(
+                        "A PackagingGroup with Id {} already exists.",
+                        input.id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store only grows on create, so it carries a capacity bound: past it
+        // the caller has exceeded this emulator's resource limits.
+        if state.packaging_groups.len() >= crate::state::MAX_PACKAGING_GROUPS {
+            return Err(CreatePackagingGroupErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "This account already holds the maximum of {} PackagingGroups.",
+                        crate::state::MAX_PACKAGING_GROUPS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let arn = crate::state::resource_arn("packaging-groups", &region, &input.id);        let record = crate::state::PackagingGroupRecord {
+            id: input.id.clone(),
+            arn: arn.clone(),
+            domain_name: crate::state::packaging_group_domain_name(&input.id, &region),
+            created_at: crate::state::now_iso8601(),
+            authorization: input.authorization,
+            egress_access_logs: input.egress_access_logs,
+        };
+        state.set_tags(&arn, input.tags.as_ref());
+        state.packaging_groups.insert(input.id.clone(), record);
+
+        // Answer from what is now stored, not from the request: a difference between
+        // the two would show up only on the next describe.
+        let Some(stored) = state.packaging_groups.get(&input.id) else {
+            return Err(CreatePackagingGroupErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the PackagingGroup could not be read back".to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(CreatePackagingGroupOutput {
+            arn: Some(stored.arn.clone()),
+            authorization: stored.authorization.clone(),
+            created_at: Some(stored.created_at.clone()),
+            domain_name: Some(stored.domain_name.clone()),
+            egress_access_logs: stored.egress_access_logs.clone(),
+            id: Some(stored.id.clone()),
+            tags: Some(state.tags_of(&arn)),
+        })
     }
 }

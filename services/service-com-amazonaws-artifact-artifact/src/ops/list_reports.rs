@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListReports
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListReports`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Enumerates the service-owned report catalog in [`crate::state`] as `ReportSummary`,
+//! one entry per report reporting its LATEST published version, in ascending report-id
+//! order. `@paginated(items: reports)`, so a page is cut at `maxResults` and `nextToken`
+//! carries the report id the next page resumes at. This handler only READS: the catalog
+//! is service-owned and is built by the state's `Default`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListReports::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The emulator models no IAM, so the modelled `AccessDeniedException` is never raised
+//! here: every caller the emulator's signature check admits sees the whole catalog, and a
+//! pass here is not a statement about an AWS-side authorisation decision.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +153,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListReports` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListReportsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListReports"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListReportsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the artifact report catalog is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // The token is the report id the next page starts at, so anything that is not a
+        // report id was never issued by this operation.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_report_id(token) {
+                return Err(ListReportsErrorModeled::ValidationException(
+                    crate::state::invalid_token(
+                        "nextToken is not a token returned by ListReports",
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let page_size = crate::state::page_size(input.max_results);
+
+        let store = state.lock();
+        let mut reports = Vec::with_capacity(page_size.min(store.reports.len()));
+        let mut next_token = None;
+        for (id, report) in &store.reports {
+            // Resume at the first id at or after the token, so a page is still served
+            // when the report the token named left the catalog meanwhile.
+            if input
+                .next_token
+                .as_deref()
+                .is_some_and(|token| id.as_str() < token)
+            {
+                continue;
+            }
+            if reports.len() >= page_size {
+                next_token = Some(id.clone());
+                break;
+            }
+            // A report exists because AWS published a version of it; one holding none has
+            // nothing to summarise, and is passed over rather than reported empty.
+            let Some(latest) = report.resolve(None) else {
+                continue;
+            };
+            reports.push(report.to_summary(latest, &region));
+        }
+
+        Ok(ListReportsOutput {
+            reports: Some(reports),
+            next_token,
+        })
     }
 }

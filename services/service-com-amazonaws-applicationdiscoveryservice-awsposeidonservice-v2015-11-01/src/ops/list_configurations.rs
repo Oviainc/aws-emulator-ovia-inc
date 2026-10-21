@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -137,6 +128,97 @@ impl From<ListConfigurationsErrorModeled> for ListConfigurationsError {
     }
 }
 
+/// The conditional operators a [`Filter`] may carry.
+///
+/// Source: this service's model, `Filter$condition` — "A conditional operator. The
+/// following operators are valid: EQUALS, NOT_EQUALS, CONTAINS, NOT_CONTAINS. If you
+/// specify multiple filters, the system utilizes all filters as though concatenated by
+/// AND."
+const FILTER_CONDITIONS: &[&str] = &["EQUALS", "NOT_EQUALS", "CONTAINS", "NOT_CONTAINS"];
+
+/// The documented ceiling on one page.
+///
+/// Source: this service's model, `ListConfigurationsRequest$maxResults` — "The total
+/// number of items to return. The maximum value is 100." The member's modeled `@default`
+/// is `0`, which is "unset": the whole listing is returned in one page.
+const MAX_RESULTS_LIMIT: i32 = 100;
+
+/// Refuse a parameter whose value the service does not accept.
+fn invalid_parameter_value(message: String) -> ListConfigurationsError {
+    ListConfigurationsErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The flat key holding a configuration item's own id, for `configuration_type`.
+///
+/// ADS names every attribute of an item `<configurationType in lower case>.<attribute>`,
+/// so the id of an `APPLICATION` row is `application.configurationId`.
+fn configuration_id_key(configuration_type: &str) -> String {
+    format!("{}.configurationId", configuration_type.to_lowercase())
+}
+
+/// Whether one configuration satisfies EVERY supplied filter (the model's own
+/// "concatenated by AND"), each filter matching when ANY of its values satisfies its
+/// condition against the named attribute.
+///
+/// An attribute the row does not carry has no value, so an `EQUALS`/`CONTAINS` test on
+/// it fails and its negation holds.
+fn matches_every_filter(
+    attributes: &std::collections::HashMap<String, String>,
+    filters: &[Filter],
+) -> bool {
+    filters.iter().all(|filter| {
+        let value = attributes.get(&filter.name).map(String::as_str);
+        match filter.condition.as_str() {
+            "EQUALS" => filter.values.iter().any(|want| value == Some(want.as_str())),
+            "NOT_EQUALS" => filter.values.iter().all(|want| value != Some(want.as_str())),
+            "CONTAINS" => filter
+                .values
+                .iter()
+                .any(|want| value.is_some_and(|have| have.contains(want.as_str()))),
+            "NOT_CONTAINS" => filter
+                .values
+                .iter()
+                .all(|want| !value.is_some_and(|have| have.contains(want.as_str()))),
+            // Unreachable: every condition is checked against `FILTER_CONDITIONS`
+            // before the scan, so an unknown one has already been refused.
+            _ => false,
+        }
+    })
+}
+
+/// Order two rows by each `orderBy` element in turn, ties broken on the configuration
+/// id so a page boundary is deterministic for any input.
+///
+/// A row that does not carry the named attribute has NO value for it — the same
+/// reading the filters take — so it sorts after every row that does, whichever
+/// direction was asked for, rather than sorting as if it held an empty string.
+fn compare_rows(
+    left: &std::collections::HashMap<String, String>,
+    right: &std::collections::HashMap<String, String>,
+    order_by: &[OrderByElement],
+    id_key: &str,
+) -> std::cmp::Ordering {
+    for element in order_by {
+        let l = left.get(&element.field_name).map(String::as_str);
+        let r = right.get(&element.field_name).map(String::as_str);
+        let ordering = match (l, r) {
+            (Some(l), Some(r)) if element.sort_order.as_deref() == Some("DESC") => r.cmp(l),
+            (Some(l), Some(r)) => l.cmp(r),
+            // Absent last, in either direction.
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    left.get(id_key).cmp(&right.get(id_key))
+}
+
 /// The `ListConfigurations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -173,18 +255,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConfigurations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListConfigurationsErrorModeled::ServerInternalErrorException(
+                ServerInternalErrorException {
+                    message: Some(
+                        "the Application Discovery Service store is not mounted on this engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `configurationType` is `@required` and an enum shape, so an absent or
+        // off-set value is refused before this runs; checking it here keeps the
+        // operation correct on its own terms rather than on the validator's.
+        let configuration_type = input.configuration_type;
+        if !CONFIGURATION_ITEM_TYPE_VALUES.contains(&configuration_type.as_str()) {
+            return Err(invalid_parameter_value(format!(
+                "configurationType must be one of [{}]; got {configuration_type}",
+                CONFIGURATION_ITEM_TYPE_VALUES.join(", ")
+            )));
+        }
+        if input.max_results < 0 || input.max_results > MAX_RESULTS_LIMIT {
+            return Err(invalid_parameter_value(format!(
+                "maxResults must be between 0 and {MAX_RESULTS_LIMIT}; got {}",
+                input.max_results
+            )));
+        }
+        let filters = input.filters.unwrap_or_default();
+        if let Some(bad) = filters
+            .iter()
+            .find(|f| !FILTER_CONDITIONS.contains(&f.condition.as_str()))
+        {
+            return Err(invalid_parameter_value(format!(
+                "filter condition must be one of [{}]; got {}",
+                FILTER_CONDITIONS.join(", "),
+                bad.condition
+            )));
+        }
+        let order_by = input.order_by.unwrap_or_default();
+        if let Some(bad) = order_by.iter().find(|e| {
+            e.sort_order
+                .as_deref()
+                .is_some_and(|order| !ORDER_STRING_VALUES.contains(&order))
+        }) {
+            return Err(invalid_parameter_value(format!(
+                "orderBy sortOrder must be one of [{}]; got {}",
+                ORDER_STRING_VALUES.join(", "),
+                bad.sort_order.clone().unwrap_or_default()
+            )));
+        }
+
+        let mut store = state.lock();
+
+        // A `nextToken` is opaque and server-minted: it resolves to the cursor this
+        // emulator stored for it, for the same `configurationType` the page was taken
+        // over. Anything else is a parameter value the service never handed out.
+        let offset = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => {
+                let Some(cursor) = store.resolve_list_token(token) else {
+                    return Err(invalid_parameter_value(
+                        "nextToken was not issued by this service; omit it to start a new listing"
+                            .to_string(),
+                    ));
+                };
+                if cursor.configuration_type != configuration_type {
+                    return Err(invalid_parameter_value(format!(
+                        "nextToken was issued for configurationType {}, not {configuration_type}",
+                        cursor.configuration_type
+                    )));
+                }
+                cursor.offset
+            }
+        };
+
+        // Every row is built from the persisted item through the one shared
+        // flattening, then filtered and ordered as the request asked.
+        let mut rows = store.configurations_of_type(&configuration_type);
+        rows.retain(|attributes| matches_every_filter(attributes, &filters));
+        if !order_by.is_empty() {
+            let id_key = configuration_id_key(&configuration_type);
+            rows.sort_by(|left, right| compare_rows(left, right, &order_by, &id_key));
+        }
+
+        let total = rows.len();
+        let start = offset.min(total);
+        let page_size = usize::try_from(input.max_results).unwrap_or(0);
+        let end = if page_size == 0 {
+            total
+        } else {
+            start.saturating_add(page_size).min(total)
+        };
+        let configurations = rows[start..end].to_vec();
+        // A token only where a later page exists, so the last page ends the walk.
+        let next_token =
+            (end < total).then(|| store.issue_list_token(&configuration_type, end));
+
+        Ok(ListConfigurationsOutput {
+            configurations: Some(configurations),
+            next_token,
+        })
     }
 }

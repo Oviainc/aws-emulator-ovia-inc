@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEnrollmentStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEnrollmentStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEnrollmentStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the account's enrollment record in this service's store — the
+//! status, whether member accounts are included, the reason, and when it was written —
+//! and answers with the status and reason it stored, which `GetEnrollmentStatus` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +168,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEnrollmentStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEnrollmentStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEnrollmentStatus"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateEnrollmentStatusErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The Compute Optimizer enrollment store is unavailable.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Only `Active` and `Inactive` are client-settable. From the model's own `status`
+        // documentation: "The Pending and Failed options cannot be used to update the
+        // enrollment status of an account. They are returned in the response of a request
+        // to update the enrollment status of an account." Refused before anything is
+        // written, so a refused call leaves the stored record exactly as it was.
+        if input.status != crate::state::STATUS_ACTIVE
+            && input.status != crate::state::STATUS_INACTIVE
+        {
+            return Err(
+                UpdateEnrollmentStatusErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "The value supplied for parameter status is not valid: {} cannot be \
+                             used to update the enrollment status of an account. Valid values are \
+                             {} and {}.",
+                            input.status,
+                            crate::state::STATUS_ACTIVE,
+                            crate::state::STATUS_INACTIVE,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut guard = state.lock();
+        let enrollment = &mut guard.enrollment;
+        enrollment.status = input.status.clone();
+        enrollment.member_accounts_enrolled = input.include_member_accounts;
+        enrollment.status_reason = Some(status_reason(&input.status));
+        enrollment.last_updated_timestamp = Some(::aws_smithy_types::DateTime::from(
+            ::std::time::SystemTime::now(),
+        ));
+        // "The count of organization member accounts that are opted in to the service, if
+        // your account is an organization management account." This emulator's
+        // organization holds no member accounts, so enrolling them opts in zero of them;
+        // a call that leaves member accounts out is not enrolling an organization at all,
+        // and the count is then absent.
+        enrollment.number_of_member_accounts_opted_in = (input.include_member_accounts
+            && input.status == crate::state::STATUS_ACTIVE)
+            .then_some(0);
+
+        Ok(UpdateEnrollmentStatusOutput {
+            status: Some(enrollment.status.clone()),
+            status_reason: enrollment.status_reason.clone(),
+        })
+    }
+}
+
+/// Why the account is in the status it was just put into — the `statusReason` both this
+/// operation and `GetEnrollmentStatus` report. Derived from the stored status, so the two
+/// operations cannot disagree.
+fn status_reason(status: &str) -> String {
+    if status == crate::state::STATUS_ACTIVE {
+        "The account is opted in to Compute Optimizer.".to_string()
+    } else {
+        "The account is opted out of Compute Optimizer.".to_string()
     }
 }

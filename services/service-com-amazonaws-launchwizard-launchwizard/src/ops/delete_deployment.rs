@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts the delete of a stored deployment in [`crate::state`] and reports its real
+//! status. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +144,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDeployment"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteDeploymentErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Launch Wizard state store is unavailable".to_string()),
+            })
+        })?;
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        let Some(deployment) = store.deployments.get_mut(&input.deployment_id) else {
+            return Err(DeleteDeploymentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Deployment '{}' was not found.",
+                        input.deployment_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // `@idempotent`: a delete of a deployment that is already going away changes
+        // nothing — it neither restarts the delete nor resurrects the record — and
+        // reports the status the deployment is actually in.
+        if !deployment.is_deleting_or_deleted() {
+            deployment.status = crate::state::STATUS_DELETE_IN_PROGRESS.to_string();
+            deployment.modified_at = now;
+            deployment.events.push(crate::state::DeploymentEvent::new(
+                "DeleteInProgress",
+                format!(
+                    "Deployment '{}' is deleting the resources it created.",
+                    deployment.name
+                ),
+                crate::state::EVENT_IN_PROGRESS,
+                now,
+            ));
+            // Deleting is not instantaneous: reaching DELETED is owed by the CLOCK one
+            // `TRANSITION_SPAN` from here, so a caller that reads straight back still
+            // sees DELETE_IN_PROGRESS. Any step the create had still owed is dropped:
+            // the deployment is going away instead.
+            let deleted_at = now + crate::state::TRANSITION_SPAN;
+            deployment.pending = ::std::collections::VecDeque::from(vec![
+                crate::state::PendingTransition {
+                    due_at: deleted_at,
+                    status: crate::state::STATUS_DELETED.to_string(),
+                    event: crate::state::DeploymentEvent::new(
+                        "DeleteCompleted",
+                        format!("Deployment '{}' was deleted.", deployment.name),
+                        crate::state::EVENT_COMPLETED,
+                        deleted_at,
+                    ),
+                },
+            ]);
+        }
+
+        Ok(DeleteDeploymentOutput {
+            status: Some(deployment.status.clone()),
+            status_reason: deployment.status_reason.clone(),
+        })
     }
 }

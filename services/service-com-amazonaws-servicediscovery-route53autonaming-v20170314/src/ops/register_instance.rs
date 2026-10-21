@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: creates or replaces the instance under its service, bumps that
+//! service's `InstancesRevision`, and files the `REGISTER_INSTANCE` operation this
+//! call returns the id of.
 //!
 //! ## Shape of an operation
 //!
@@ -154,6 +148,10 @@ impl From<RegisterInstanceErrorModeled> for RegisterInstanceError {
     }
 }
 
+/// The attribute key that carries a custom health check's initial status, documented
+/// on `RegisterInstanceRequest$Attributes`.
+const INIT_HEALTH_STATUS_ATTRIBUTE: &str = "AWS_INIT_HEALTH_STATUS";
+
 /// The `RegisterInstance` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -190,18 +188,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterInstance"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RegisterInstanceErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+
+        let Some(service_id) = state.resolve_service_id(&input.service_id) else {
+            return Err(RegisterInstanceErrorModeled::ServiceNotFound(ServiceNotFound {
+                message: Some(format!(
+                    "No service exists with the specified ID {}.",
+                    input.service_id
+                )),
+            })
+            .into());
+        };
+
+        // What the token identifies: this instance in this service.
+        let requested = format!("{service_id}/{}", input.instance_id);
+        // A replayed `CreatorRequestId` for the SAME instance returns the operation
+        // the first call filed, and leaves the stored attributes alone — but ONLY
+        // while that instance is still stored. Once it has been deregistered the
+        // token is stale, and replaying it would answer success for a write this call
+        // never made, so the registration is performed again.
+        let still_registered = state
+            .services
+            .get(&service_id)
+            .is_some_and(|service| service.instances.contains_key(&input.instance_id));
+        if still_registered {
+            if let Some(operation_id) = input.creator_request_id.as_deref().and_then(|token| {
+                state.replayed(
+                    crate::state::IdempotencyScope::RegisterInstance,
+                    token,
+                    &requested,
+                )
+            }) {
+                return Ok(RegisterInstanceOutput {
+                    operation_id: Some(operation_id),
+                });
+            }
+        }
+
+        // The initial health status, from `RegisterInstanceRequest$Attributes`: "If the
+        // service configuration includes HealthCheckCustomConfig, you can optionally
+        // use AWS_INIT_HEALTH_STATUS to specify the initial status of the custom health
+        // check, HEALTHY or UNHEALTHY. If you don't specify a value for
+        // AWS_INIT_HEALTH_STATUS, the initial status is HEALTHY." Without a custom
+        // config nothing has reported on the instance — no Route 53 checker runs in
+        // this emulator — so its status is UNKNOWN.
+        let custom_health_check = state
+            .services
+            .get(&service_id)
+            .is_some_and(|service| service.health_check_custom_config.is_some());
+        let initial = input.attributes.get(INIT_HEALTH_STATUS_ATTRIBUTE);
+        let health_status = if custom_health_check {
+            match initial.map(String::as_str) {
+                None => crate::state::HEALTH_STATUS_HEALTHY,
+                Some(value) if value == crate::state::HEALTH_STATUS_HEALTHY => {
+                    crate::state::HEALTH_STATUS_HEALTHY
+                }
+                Some(value) if value == crate::state::HEALTH_STATUS_UNHEALTHY => {
+                    crate::state::HEALTH_STATUS_UNHEALTHY
+                }
+                Some(other) => {
+                    return Err(RegisterInstanceErrorModeled::InvalidInput(InvalidInput {
+                        message: Some(format!(
+                            "The attribute {INIT_HEALTH_STATUS_ATTRIBUTE} must be {} or {}, not {other}.",
+                            crate::state::HEALTH_STATUS_HEALTHY,
+                            crate::state::HEALTH_STATUS_UNHEALTHY
+                        )),
+                    })
+                    .into());
+                }
+            }
+        } else {
+            crate::state::HEALTH_STATUS_UNKNOWN
+        };
+
+        let namespace_id = {
+            let service = state
+                .services
+                .get_mut(&service_id)
+                .expect("the resolved service id is present");
+            // A new instance is refused once the service holds its quota; replacing
+            // one that is already there adds nothing, so it is always allowed.
+            if !service.instances.contains_key(&input.instance_id)
+                && service.instances.len() >= crate::state::MAX_INSTANCES_PER_SERVICE
+            {
+                return Err(RegisterInstanceErrorModeled::ResourceLimitExceeded(
+                    ResourceLimitExceeded {
+                        message: Some(format!(
+                            "The instance can't be created because service {service_id} holds this \
+                             emulator's quota of {} instances.",
+                            crate::state::MAX_INSTANCES_PER_SERVICE
+                        )),
+                    },
+                )
+                .into());
+            }
+            // Re-registering an instance id REPLACES its attributes rather than
+            // adding a second instance. `AWS_INIT_HEALTH_STATUS` is a directive for
+            // the registration, not an attribute of the instance, so it is consumed
+            // here rather than stored and reported back.
+            let mut attributes = input.attributes;
+            attributes.remove(INIT_HEALTH_STATUS_ATTRIBUTE);
+            service.instances.insert(
+                input.instance_id.clone(),
+                crate::state::InstanceRecord {
+                    instance_id: input.instance_id.clone(),
+                    attributes,
+                    creator_request_id: input.creator_request_id.clone(),
+                    health_status: health_status.to_string(),
+                },
+            );
+            service.instances_revision += 1;
+            service.namespace_id.clone()
+        };
+
+        let operation_id = state.record_operation(
+            "REGISTER_INSTANCE",
+            now,
+            [
+                ("NAMESPACE".to_string(), namespace_id),
+                ("SERVICE".to_string(), service_id),
+                ("INSTANCE".to_string(), input.instance_id),
+            ],
+        );
+        if let Some(token) = input.creator_request_id.as_deref() {
+            state.remember(
+                crate::state::IdempotencyScope::RegisterInstance,
+                token,
+                &requested,
+                &operation_id,
+            );
+        }
+
+        Ok(RegisterInstanceOutput {
+            operation_id: Some(operation_id),
+        })
     }
 }

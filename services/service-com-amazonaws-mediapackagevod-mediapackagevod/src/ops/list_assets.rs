@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: pages the stored Assets in ascending `Id` order, filtered by the
+//! `packagingGroupId` query parameter when present, `maxResults` per page, with an
+//! opaque `NextToken` the next call resumes strictly after.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting only: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +75,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page `ListAssets` returns, and the page size a request that names no
+/// `MaxResults` gets: the maximum the model's `MaxResults` `range` trait allows
+/// (`min: 1, max: 1000`).
+const MAX_PAGE_SIZE: usize = 1000;
+
+/// The smallest page `ListAssets` returns: the minimum of that same `range` trait.
+const MIN_PAGE_SIZE: usize = 1;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -151,20 +155,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssets"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAssetsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the MediaPackage VOD state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A cursor this service did not issue cannot name a resume point.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(after) => Some(after),
+                None => {
+                    return Err(ListAssetsErrorModeled::UnprocessableEntityException(
+                        UnprocessableEntityException {
+                            message: Some("NextToken is not a cursor this service issued."
+                                .to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        // `MaxResults` is modelled `range(min: 1, max: 1000)`, so the boundary
+        // validator already refuses anything outside it; this handler enforces the
+        // same bound itself rather than depending on that, and a request that names
+        // no `MaxResults` gets the largest page the model allows.
+        let page_size = match input.max_results {
+            None => MAX_PAGE_SIZE,
+            Some(max) => match usize::try_from(max) {
+                Ok(max) if (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&max) => max,
+                _ => {
+                    return Err(ListAssetsErrorModeled::UnprocessableEntityException(
+                        UnprocessableEntityException {
+                            message: Some(format!(
+                                "MaxResults must be between {MIN_PAGE_SIZE} and \
+                                 {MAX_PAGE_SIZE}."
+                            )),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let state = store.lock();
+        let group_filter = input.packaging_group_id.as_deref();
+        // `assets` is a `BTreeMap`, so this is one stable id order across pages: a
+        // cursor can resume strictly after the id the previous page ended on.
+        let matching: Vec<&crate::state::AssetRecord> = state
+            .assets
+            .values()
+            .filter(|asset| {
+                group_filter.is_none_or(|group| asset.packaging_group_id == group)
+            })
+            .filter(|asset| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| asset.id.as_str() > after)
+            })
+            .collect();
+
+        let page_records: Vec<&crate::state::AssetRecord> =
+            matching.iter().take(page_size).copied().collect();
+        let page: Vec<AssetShallow> = page_records
+            .iter()
+            .map(|asset| AssetShallow {
+                arn: Some(asset.arn.clone()),
+                created_at: Some(asset.created_at.clone()),
+                id: Some(asset.id.clone()),
+                packaging_group_id: Some(asset.packaging_group_id.clone()),
+                resource_id: Some(asset.resource_id.clone()),
+                source_arn: Some(asset.source_arn.clone()),
+                source_role_arn: Some(asset.source_role_arn.clone()),
+                tags: Some(state.tags_of(&asset.arn)),
+            })
+            .collect();
+        // A cursor only when something is left to read, so a caller that follows
+        // tokens stops rather than asking for an empty page.
+        let next_token = if matching.len() > page_records.len() {
+            page_records
+                .last()
+                .map(|last| crate::state::encode_page_token(&last.id))
+        } else {
+            None
+        };
+
+        Ok(ListAssetsOutput {
+            assets: Some(page),
+            next_token,
+        })
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMountTargets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMountTargets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMountTargets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the mount targets [`crate::state`] holds, filtered by the
+//! `FileSystemId` / `MountTargetId` / `AccessPointId` query members and paginated by
+//! `MaxItems` / `Marker`. Each entry is the stored description CreateMountTarget
+//! returned. It writes only the lifecycle transitions the clock already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +172,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMountTargets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMountTargetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMountTargets"))
+        use crate::state as efs;
+
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        // `AccessPointId` "must be included in your request if a FileSystemId or
+        // MountTargetId is not included in your request", and the same holds the other
+        // way round: one of the three selects what to describe.
+        if input.file_system_id.is_none()
+            && input.mount_target_id.is_none()
+            && input.access_point_id.is_none()
+        {
+            return Err(bad_request(
+                "one of FileSystemId, MountTargetId or AccessPointId must be included in the \
+                 request",
+            ));
+        }
+
+        let mut state = state.lock();
+        state.materialize_due_transitions(now);
+
+        // Access points are a separate resource this emulator does not create yet, so no
+        // AccessPointId names one.
+        if let Some(access_point_id) = input.access_point_id.as_deref() {
+            let access_point_id = efs::access_point_id_of(access_point_id);
+            return Err(DescribeMountTargetsErrorModeled::AccessPointNotFound(
+                AccessPointNotFound {
+                    error_code: "AccessPointNotFound".to_string(),
+                    message: Some(format!("Access point {access_point_id} does not exist")),
+                },
+            )
+            .into());
+        }
+
+        if let Some(mount_target_id) = input.mount_target_id.as_deref() {
+            if !state.mount_targets.contains_key(mount_target_id) {
+                return Err(DescribeMountTargetsErrorModeled::MountTargetNotFound(
+                    MountTargetNotFound {
+                        error_code: "MountTargetNotFound".to_string(),
+                        message: Some(format!(
+                            "Mount target {mount_target_id} does not exist"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let wanted_file_system = input.file_system_id.as_deref().map(efs::file_system_id_of);
+        if let Some(file_system_id) = wanted_file_system {
+            if !state.file_systems.contains_key(file_system_id) {
+                return Err(DescribeMountTargetsErrorModeled::FileSystemNotFound(
+                    FileSystemNotFound {
+                        error_code: "FileSystemNotFound".to_string(),
+                        message: Some(format!("File system {file_system_id} does not exist")),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut matched: Vec<&efs::MountTarget> = state
+            .mount_targets
+            .values()
+            .filter(|mount_target| {
+                wanted_file_system.is_none_or(|id| mount_target.file_system_id == id)
+            })
+            .filter(|mount_target| {
+                input
+                    .mount_target_id
+                    .as_deref()
+                    .is_none_or(|id| mount_target.mount_target_id == id)
+            })
+            .collect();
+        matched.sort_by_key(|mount_target| mount_target.ordinal);
+
+        let start = match input.marker.as_deref() {
+            Some(marker) => matched
+                .iter()
+                .position(|mount_target| mount_target.mount_target_id == marker)
+                .ok_or_else(|| {
+                    bad_request(format!(
+                        "Marker {marker} does not name a mount target of this request's result \
+                         set"
+                    ))
+                })?,
+            None => 0,
+        };
+        let page_size = efs::page_size(input.max_items, efs::DEFAULT_MOUNT_TARGET_PAGE_SIZE);
+        let page: Vec<CreateMountTargetOutput> = matched[start..]
+            .iter()
+            .take(page_size)
+            .map(|mount_target| mount_target.describe())
+            .collect();
+        let next_marker = matched
+            .get(start + page.len())
+            .map(|mount_target| mount_target.mount_target_id.clone());
+
+        Ok(DescribeMountTargetsOutput {
+            marker: input.marker.clone(),
+            mount_targets: Some(page),
+            next_marker,
+        })
     }
+}
+
+/// A 400 `BadRequest`: "the request is malformed or contains an error such as an invalid
+/// parameter value or a missing required parameter".
+fn bad_request(message: impl Into<String>) -> DescribeMountTargetsError {
+    DescribeMountTargetsErrorModeled::BadRequest(BadRequest {
+        error_code: "BadRequest".to_string(),
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 500 `InternalServerError`, for the one case this handler cannot serve: the engine
+/// this service was mounted on holds no store for it.
+fn internal_server_error() -> DescribeMountTargetsError {
+    DescribeMountTargetsErrorModeled::InternalServerError(InternalServerError {
+        error_code: "InternalServerError".to_string(),
+        message: Some("the EFS emulator state store is unavailable".to_string()),
+    })
+    .into()
 }

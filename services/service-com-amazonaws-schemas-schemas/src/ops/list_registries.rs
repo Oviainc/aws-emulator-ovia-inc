@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRegistries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRegistries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRegistries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the stored registries, one page at a time. A pure read.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +145,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRegistries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRegistriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRegistries"))
+        // `ctx` carries request metadata only; a listing mints no ARN, so there is
+        // nothing in it this operation needs.
+        let _ = ctx;
+        // `Scope` is documented as "Local or AWS to limit responses to your custom
+        // registries, or the ones provided by AWS". Every registry this emulator
+        // holds was created through CreateRegistry, so all of them are custom: the
+        // `AWS` scope selects none of them, and any other value is not a scope.
+        let include_custom = match input.scope.as_deref() {
+            None => true,
+            Some(scope) if scope.eq_ignore_ascii_case("local") => true,
+            Some(scope) if scope.eq_ignore_ascii_case("aws") => false,
+            Some(_) => {
+                return Err(ListRegistriesErrorModeled::BadRequestException(
+                    crate::state::bad_request("Scope must be either Local or AWS."),
+                )
+                .into())
+            }
+        };
+
+        // The model gives `Limit` no range: fewer than one item is not a page, and
+        // more than `MAX_PAGE_SIZE` would materialise the whole selected store into
+        // one response, so the handler owns both bounds.
+        let page_size = crate::state::requested_page_size(input.limit).map_err(|refusal| {
+            ListRegistriesError::from(ListRegistriesErrorModeled::BadRequestException(refusal))
+        })?;
+
+        // The members that decide WHICH registries this listing contains. Bound into
+        // the `NextToken`, so a token cannot resume a differently-selected listing.
+        let selection = format!(
+            "registryNamePrefix={};custom={include_custom}",
+            input.registry_name_prefix.as_deref().unwrap_or_default()
+        );
+
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListRegistriesError::from(ListRegistriesErrorModeled::InternalServerErrorException(
+                crate::state::internal_error(),
+            ))
+        })?;
+        let state = store.lock();
+
+        // `AWS` scope: this emulator holds no AWS-provided registry, so the listing
+        // is empty. Answered before the walk rather than as a per-item predicate.
+        let empty = std::collections::BTreeMap::new();
+        let selected = if include_custom {
+            &state.registries
+        } else {
+            &empty
+        };
+        let matching = selected.iter().filter(|(name, _)| {
+            input
+                .registry_name_prefix
+                .as_deref()
+                .is_none_or(|prefix| name.starts_with(prefix))
+        });
+        let page = crate::state::page_by_key(
+            matching,
+            &selection,
+            input.next_token.as_deref(),
+            page_size,
+        )
+        .map_err(|_| {
+            ListRegistriesError::from(ListRegistriesErrorModeled::BadRequestException(
+                crate::state::invalid_next_token(),
+            ))
+        })?;
+
+        Ok(ListRegistriesOutput {
+            next_token: page.next_token,
+            registries: Some(
+                page.items
+                    .into_iter()
+                    .map(|registry| RegistrySummary {
+                        registry_arn: Some(registry.arn.clone()),
+                        registry_name: Some(registry.name.clone()),
+                        tags: crate::state::tags_to_output(&registry.tags),
+                    })
+                    .collect(),
+            ),
+        })
     }
 }

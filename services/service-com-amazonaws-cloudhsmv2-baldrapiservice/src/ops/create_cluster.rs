@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a cluster and persists it in [`crate::state`], so
+//! `DescribeClusters`, `CreateHsm`, `DeleteHsm` and `DeleteCluster` all read the same
+//! record. The notes below are the scaffold's, kept for the next reader.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +166,177 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCluster"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateClusterErrorModeled::CloudHsmInternalFailureException(
+                CloudHsmInternalFailureException {
+                    message: Some(
+                        "the cloudhsmv2 emulator is mounted on an engine that holds no state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The `HsmType` member doc publishes the catalog ("The allowed values are
+        // hsm1.medium and hsm2m.medium"); the modelled pattern is wider than that
+        // catalog, so a type outside it is refused here rather than stored.
+        if !crate::state::HSM_TYPES.contains(&input.hsm_type.as_str()) {
+            return Err(invalid_request(format!(
+                "HsmType {} is not supported; the allowed values are {}",
+                input.hsm_type,
+                crate::state::HSM_TYPES.join(" and ")
+            )));
+        }
+
+        // "You can specify only one subnet per Availability Zone" (`SubnetIds` doc), so
+        // the same subnet cannot be named twice.
+        for (index, subnet_id) in input.subnet_ids.iter().enumerate() {
+            if input.subnet_ids[..index].contains(subnet_id) {
+                return Err(invalid_request(format!(
+                    "SubnetIds names {subnet_id} more than once; specify only one subnet \
+                     per Availability Zone"
+                )));
+            }
+        }
+
+        let backup_retention_policy = retention_policy(input.backup_retention_policy.as_ref())?;
+
+        // A cluster is only restorable from a backup this emulator holds, and it holds
+        // none: every backup operation (DescribeBackups through RestoreBackup) is still
+        // scaffolded, so no source backup id can resolve.
+        if let Some(source_backup_id) = &input.source_backup_id {
+            return Err(
+                CreateClusterErrorModeled::CloudHsmResourceNotFoundException(
+                    CloudHsmResourceNotFoundException {
+                        message: Some(format!(
+                            "backup {source_backup_id} does not exist in this account"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        store.settle(now);
+
+        // The emulator keeps every cluster in memory for the life of the process and this
+        // is the only operation that adds one, so the store needs a maximum entry count:
+        // a deleted cluster is reclaimed only after its retention window, and nothing
+        // else evicts.
+        if store.clusters.len() >= crate::state::MAX_CLUSTERS {
+            return Err(limit_exceeded(format!(
+                "this emulator already holds the maximum of {} clusters",
+                crate::state::MAX_CLUSTERS
+            )));
+        }
+
+        let cluster_id = store.mint_cluster_id();
+        let vpc_id = store.mint_vpc_id();
+        let security_group = store.mint_security_group();
+
+        let record = crate::state::ClusterRecord {
+            cluster_id: cluster_id.clone(),
+            hsm_type: input.hsm_type,
+            state: crate::state::CLUSTER_CREATE_IN_PROGRESS.to_string(),
+            state_message: None,
+            create_timestamp: now,
+            subnet_mapping: crate::state::subnet_mapping(&region, &input.subnet_ids),
+            vpc_id,
+            security_group,
+            backup_policy: crate::state::BACKUP_POLICY_DEFAULT.to_string(),
+            backup_retention_policy,
+            mode: input
+                .mode
+                .unwrap_or_else(|| crate::state::DEFAULT_CLUSTER_MODE.to_string()),
+            network_type: input
+                .network_type
+                .unwrap_or_else(|| crate::state::DEFAULT_NETWORK_TYPE.to_string()),
+            source_backup_id: None,
+            // Both are produced by initialization, which `InitializeCluster` owns.
+            pre_co_password: None,
+            certificates: None,
+            hsms: Vec::new(),
+            tags: input.tag_list.unwrap_or_default(),
+            // CREATE_IN_PROGRESS is not terminal: the cluster is owed UNINITIALIZED,
+            // where it waits for `InitializeCluster`.
+            pending: Some(crate::state::Pending::after(
+                now,
+                crate::state::Owed::ToState(crate::state::CLUSTER_UNINITIALIZED),
+            )),
+            // Nothing to reclaim until the cluster is deleted.
+            reclaim_at: None,
+        };
+
+        let cluster = record.to_shape();
+        store.clusters.insert(cluster_id, record);
+
+        Ok(CreateClusterOutput {
+            cluster: Some(cluster),
+        })
     }
+}
+
+/// Refuse the request with the error this operation models for one that is not valid.
+fn invalid_request(message: String) -> CreateClusterError {
+    CreateClusterErrorModeled::CloudHsmInvalidRequestException(CloudHsmInvalidRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the request because serving it would grow this emulator's store past the
+/// ceiling it keeps on itself. `CloudHsmServiceException` is the error the operation
+/// models for a request it cannot serve for a reason of the service's own.
+fn limit_exceeded(message: String) -> CreateClusterError {
+    CreateClusterErrorModeled::CloudHsmServiceException(CloudHsmServiceException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The backup retention policy the new cluster gets.
+///
+/// Absent, it is the service default of [`crate::state::DEFAULT_BACKUP_RETENTION_DAYS`]
+/// days. Present, it must carry both members, and a `DAYS` value must lie inside the
+/// range the `BackupRetentionPolicy$Value` doc publishes ("Use a value between 7 -
+/// 379."), which the modelled `len 1..3` + `^[0-9]+$` constraints do not express.
+fn retention_policy(
+    requested: Option<&BackupRetentionPolicy>,
+) -> Result<BackupRetentionPolicy, CreateClusterError> {
+    let Some(requested) = requested else {
+        return Ok(BackupRetentionPolicy {
+            r#type: Some(crate::state::BACKUP_RETENTION_TYPE_DAYS.to_string()),
+            value: Some(crate::state::DEFAULT_BACKUP_RETENTION_DAYS.to_string()),
+        });
+    };
+
+    let (Some(retention_type), Some(value)) = (&requested.r#type, &requested.value) else {
+        return Err(invalid_request(
+            "BackupRetentionPolicy must carry both Type and Value".to_string(),
+        ));
+    };
+
+    if retention_type == crate::state::BACKUP_RETENTION_TYPE_DAYS {
+        let days: u32 = value.parse().map_err(|_| {
+            invalid_request(format!(
+                "BackupRetentionPolicy Value {value} is not a number of days"
+            ))
+        })?;
+        if !(crate::state::BACKUP_RETENTION_DAYS_MIN..=crate::state::BACKUP_RETENTION_DAYS_MAX)
+            .contains(&days)
+        {
+            return Err(invalid_request(format!(
+                "BackupRetentionPolicy Value {days} is outside the supported range {}-{}",
+                crate::state::BACKUP_RETENTION_DAYS_MIN,
+                crate::state::BACKUP_RETENTION_DAYS_MAX
+            )));
+        }
+    }
+
+    Ok(requested.clone())
 }

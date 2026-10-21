@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteHsm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteHsm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: resolves the HSM by whichever selector the request carries and takes it
+//! out of its cluster. The notes below are the scaffold's, kept for the next reader.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteHsm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Nothing else about `DeleteHsm` is asserted here — this file is the ONLY one to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +155,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteHsm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteHsmErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteHsm"))
+        // Selecting the HSM needs nothing from `ctx`: the selectors are in the request
+        // and the HSMs in the store.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteHsmErrorModeled::CloudHsmInternalFailureException(
+                CloudHsmInternalFailureException {
+                    message: Some(
+                        "the cloudhsmv2 emulator is mounted on an engine that holds no state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "To specify an HSM, you can use its identifier (ID), the IP address of the
+        // HSM's elastic network interface (ENI), or the ID of the HSM's ENI" — so a
+        // request that carries none of the three selects nothing.
+        let selectors: Vec<Selector<'_>> = [
+            input.hsm_id.as_deref().map(Selector::HsmId),
+            input.eni_id.as_deref().map(Selector::EniId),
+            input.eni_ip.as_deref().map(Selector::EniIp),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if selectors.is_empty() {
+            return Err(invalid_request(
+                "specify the HSM to delete with HsmId, EniId or EniIp".to_string(),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let cluster = store
+            .clusters
+            .get_mut(&input.cluster_id)
+            .filter(|cluster| !cluster.is_gone())
+            .ok_or_else(|| cluster_not_found(&input.cluster_id))?;
+
+        // Every selector the request carries must name the same HSM, so a request that
+        // mixes selectors from two HSMs deletes neither.
+        let mut selected: Option<usize> = None;
+        for selector in &selectors {
+            let found = cluster
+                .hsms
+                .iter()
+                .position(|hsm| !hsm.is_deleting() && selector.matches(hsm))
+                .ok_or_else(|| hsm_not_found(*selector, &input.cluster_id))?;
+            match selected {
+                Some(previous) if previous != found => {
+                    return Err(invalid_request(
+                        "HsmId, EniId and EniIp name different HSMs".to_string(),
+                    ))
+                }
+                _ => selected = Some(found),
+            }
+        }
+        let Some(index) = selected else {
+            return Err(invalid_request(
+                "specify the HSM to delete with HsmId, EniId or EniIp".to_string(),
+            ));
+        };
+
+        let hsm = &mut cluster.hsms[index];
+        hsm.state = crate::state::HSM_DELETE_IN_PROGRESS.to_string();
+        hsm.state_message = None;
+        // DELETE_IN_PROGRESS is not terminal: the HSM is owed removal from the cluster,
+        // after which `DescribeClusters` no longer lists it.
+        hsm.pending = Some(crate::state::Pending::after(
+            now,
+            crate::state::Owed::Removal,
+        ));
+
+        Ok(DeleteHsmOutput {
+            hsm_id: Some(hsm.hsm_id.clone()),
+        })
     }
+}
+
+/// One way of naming the HSM to delete.
+#[derive(Debug, Clone, Copy)]
+enum Selector<'a> {
+    /// By the HSM's own id.
+    HsmId(&'a str),
+    /// By the id of its elastic network interface.
+    EniId(&'a str),
+    /// By the IP address of its elastic network interface.
+    EniIp(&'a str),
+}
+
+impl Selector<'_> {
+    /// Whether this selector names `hsm`.
+    fn matches(self, hsm: &crate::state::HsmRecord) -> bool {
+        match self {
+            Self::HsmId(value) => hsm.hsm_id == value,
+            Self::EniId(value) => hsm.eni_id == value,
+            Self::EniIp(value) => hsm.eni_ip == value,
+        }
+    }
+
+    /// The member and value this selector came from, for an error message.
+    fn described(self) -> String {
+        match self {
+            Self::HsmId(value) => format!("HsmId {value}"),
+            Self::EniId(value) => format!("EniId {value}"),
+            Self::EniIp(value) => format!("EniIp {value}"),
+        }
+    }
+}
+
+/// Refuse the request with the error this operation models for a cluster that cannot be
+/// found.
+fn cluster_not_found(cluster_id: &str) -> DeleteHsmError {
+    DeleteHsmErrorModeled::CloudHsmResourceNotFoundException(CloudHsmResourceNotFoundException {
+        message: Some(format!("cluster {cluster_id} does not exist")),
+    })
+    .into()
+}
+
+/// Refuse the request with the error this operation models for a resource that cannot
+/// be found.
+fn hsm_not_found(selector: Selector<'_>, cluster_id: &str) -> DeleteHsmError {
+    DeleteHsmErrorModeled::CloudHsmResourceNotFoundException(CloudHsmResourceNotFoundException {
+        message: Some(format!(
+            "cluster {cluster_id} contains no HSM with {}",
+            selector.described()
+        )),
+    })
+    .into()
+}
+
+/// Refuse the request with the error this operation models for one that is not valid.
+fn invalid_request(message: String) -> DeleteHsmError {
+    DeleteHsmErrorModeled::CloudHsmInvalidRequestException(CloudHsmInvalidRequestException {
+        message: Some(message),
+    })
+    .into()
 }

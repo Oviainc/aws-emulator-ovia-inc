@@ -1,11 +1,565 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-servicediscovery-route53autonaming-v20170314 service.
+//!
+//! Cloud Map's resources form one tree — namespaces hold services, services hold
+//! instances — plus the asynchronous `Operation` records every mutating call files
+//! and `GetOperation` reads back. Everything the handlers in `src/ops/` answer with
+//! is computed from the records below; nothing is canned.
+//!
+//! Two name indexes exist because the API resolves resources BOTH ways: the control
+//! plane addresses a namespace/service by id, while `DiscoverInstances` addresses them
+//! by name. They are maintained beside the record maps on every write, so a lookup by
+//! either key reaches the one stored record.
+//!
+//! Every store here is BOUNDED, because it lives in memory for the life of the
+//! process and grows on request: a create past a resource quota is refused with the
+//! modelled `ResourceLimitExceeded` (`MAX_NAMESPACES`,
+//! `MAX_SERVICES_PER_NAMESPACE`, `MAX_INSTANCES_PER_SERVICE`), and the two stores no
+//! API can ever shrink — the operation records and the remembered idempotency tokens
+//! — evict their oldest entry instead (`MAX_RETAINED_OPERATIONS`,
+//! `MAX_RETAINED_IDEMPOTENCY_TOKENS`).
+
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::time::{Duration, SystemTime};
+
+use crate::ops::types::{
+    DnsConfig, HealthCheckConfig, HealthCheckCustomConfig, HttpProperties, Instance, Namespace,
+    NamespaceProperties, Operation, Service,
+};
+
+/// The region an ARN carries when the request is unsigned, matching the region a
+/// generated emulator defaults to (see `emulator_server::emulator_arn`).
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The ARN/`aws.api#service` namespace for this service, used for every ARN it mints.
+pub const ARN_NAMESPACE: &str = "servicediscovery";
+
+/// How long an asynchronous operation stays `SUBMITTED` before the clock owes it
+/// `SUCCESS`.
+///
+/// AWS documents no duration for this, so the span is CHOSEN: it sits inside the
+/// emulator's 250–750 ms window for a clock-owed transition, so a caller that polls
+/// `GetOperation` immediately still observes the non-terminal `SUBMITTED` status the
+/// real service reports. The due instant is stored and materialised on read — the
+/// service never sleeps for it.
+pub const OPERATION_SUCCESS_SPAN: Duration = Duration::from_millis(250);
+
+/// The quota on tags per resource, from the `TooManyTagsException` documentation:
+/// "The maximum number of tags that can be applied to a resource is 50."
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// How many operation records this store keeps.
+///
+/// AWS does not publish a retention rule for `Operation` records, so this bound is
+/// the EMULATOR's: the store is in memory for the life of the process, and every
+/// mutating call files a record, so without a bound the map would grow without
+/// limit. When the bound is passed the oldest record that has already reached a
+/// terminal status is dropped first, so a caller can still resolve an operation it is
+/// polling. `GetOperation` answers `OperationNotFound` for an evicted id, which is
+/// the same answer it gives for an id the service never filed.
+pub const MAX_RETAINED_OPERATIONS: usize = 1_000;
+
+/// How many `CreatorRequestId` tokens this store remembers, for the same reason as
+/// [`MAX_RETAINED_OPERATIONS`]. The oldest token is forgotten first; a retry whose
+/// token has been forgotten is served as a fresh request.
+pub const MAX_RETAINED_IDEMPOTENCY_TOKENS: usize = 1_000;
+
+/// How many namespaces this emulator holds before refusing to create another with
+/// the modelled `ResourceLimitExceeded` ("The resource can't be created because
+/// you've reached the quota on the number of resources").
+///
+/// Real Cloud Map publishes per-account, adjustable quotas; this emulator does not
+/// claim to reproduce their values, so the bound here is the EMULATOR's own: a
+/// resource store that only ever grows has no other limit, since the records live in
+/// the process for its lifetime. The bound is answered with the error the model
+/// declares for exactly this case, never by dropping a resource a caller created.
+pub const MAX_NAMESPACES: usize = 1_000;
+
+/// How many services one namespace holds, bounded for the reason [`MAX_NAMESPACES`]
+/// gives.
+pub const MAX_SERVICES_PER_NAMESPACE: usize = 1_000;
+
+/// How many instances one service holds, bounded for the reason [`MAX_NAMESPACES`]
+/// gives. Re-registering an instance that already exists is a replace, so it is never
+/// refused by this bound.
+pub const MAX_INSTANCES_PER_SERVICE: usize = 1_000;
+
+/// What a handler reports when this service was mounted on an engine that holds no
+/// state at all.
+///
+/// A wiring failure, not a bad request — but this service's model declares no
+/// server-fault shape (`InvalidInput` is its only service-wide error), and a 501 would
+/// claim the operation is unwritten, which is a different and false claim. So the
+/// handlers answer with `InvalidInput` carrying this message, which says plainly what
+/// went wrong. Unreachable in the assembled emulator, where every service is mounted
+/// on the one shared `InMemoryEngine`.
+pub const UNREACHABLE_STATE_MESSAGE: &str =
+    "the servicediscovery emulator is not mounted on the shared engine, so its stored \
+     namespaces, services, instances and operations are not reachable";
+
+/// `OperationStatus` values this service reports (see `OPERATION_STATUS_VALUES`).
+pub const OPERATION_STATUS_SUBMITTED: &str = "SUBMITTED";
+/// The terminal success status an operation reaches once its due instant passes.
+pub const OPERATION_STATUS_SUCCESS: &str = "SUCCESS";
+
+/// `HealthStatus` reported for an instance no health checker has reported on.
+pub const HEALTH_STATUS_UNKNOWN: &str = "UNKNOWN";
+/// `HealthStatus` of an instance a health checker reported healthy.
+pub const HEALTH_STATUS_HEALTHY: &str = "HEALTHY";
+/// `HealthStatus` of an instance a health checker reported unhealthy.
+pub const HEALTH_STATUS_UNHEALTHY: &str = "UNHEALTHY";
+
+/// A persisted namespace. `ServiceCount` is NOT a field: it is derived from
+/// [`ComAmazonawsServicediscoveryRoute53autonamingV20170314State::service_count`] so
+/// the namespace and the service map can never disagree.
+#[derive(Debug, Clone)]
+pub struct NamespaceRecord {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    /// A `NamespaceType` value (`HTTP`, `DNS_PRIVATE`, `DNS_PUBLIC`).
+    pub namespace_type: String,
+    pub description: Option<String>,
+    pub create_date: SystemTime,
+    pub creator_request_id: Option<String>,
+    /// `Properties.HttpProperties.HttpName` — the name instances are discovered under.
+    pub http_name: Option<String>,
+    /// `Properties.DnsProperties.HostedZoneId`, set only for a DNS namespace.
+    pub hosted_zone_id: Option<String>,
+    pub tags: Vec<(String, String)>,
+}
+
+/// A persisted service. `InstanceCount` is derived from `instances`, and
+/// `InstancesRevision` is bumped on every register/deregister.
+#[derive(Debug, Clone)]
+pub struct ServiceRecord {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub namespace_id: String,
+    pub description: Option<String>,
+    pub dns_config: Option<DnsConfig>,
+    pub health_check_config: Option<HealthCheckConfig>,
+    pub health_check_custom_config: Option<HealthCheckCustomConfig>,
+    /// A `ServiceType` value (`HTTP`, `DNS`, `DNS_HTTP`).
+    pub service_type: String,
+    pub create_date: SystemTime,
+    pub creator_request_id: Option<String>,
+    pub tags: Vec<(String, String)>,
+    /// Keyed by `InstanceId`; a `BTreeMap` so every read orders identically.
+    pub instances: BTreeMap<String, InstanceRecord>,
+    pub instances_revision: i64,
+}
+
+impl ServiceRecord {
+    /// `InstanceCount`, derived from what is stored rather than counted by hand.
+    pub fn instance_count(&self) -> i32 {
+        i32::try_from(self.instances.len()).unwrap_or(i32::MAX)
+    }
+
+    /// Whether the service configures health checking at all. Documented on
+    /// `DiscoverInstancesRequest$HealthStatus`: the filter "is ignored for services
+    /// that don't have a health check configured, and all instances are returned".
+    pub fn health_checked(&self) -> bool {
+        self.health_check_config.is_some() || self.health_check_custom_config.is_some()
+    }
+}
+
+/// A persisted service instance.
+#[derive(Debug, Clone)]
+pub struct InstanceRecord {
+    pub instance_id: String,
+    pub attributes: HashMap<String, String>,
+    pub creator_request_id: Option<String>,
+    /// A `HealthStatus` value. An instance starts `UNKNOWN`: nothing has reported on
+    /// it yet, neither a Route 53 health checker nor an
+    /// `UpdateInstanceCustomHealthStatus` call.
+    pub health_status: String,
+}
+
+/// A persisted asynchronous operation, the record `GetOperation` reads.
+#[derive(Debug, Clone)]
+pub struct OperationRecord {
+    pub id: String,
+    /// An `OperationType` value (`CREATE_NAMESPACE`, `REGISTER_INSTANCE`, …).
+    pub operation_type: String,
+    /// An `OperationStatus` value.
+    pub status: String,
+    pub create_date: SystemTime,
+    pub update_date: SystemTime,
+    /// When the clock owes this operation its terminal status.
+    pub success_due_at: SystemTime,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    /// `OperationTargetType` -> resource id (`NAMESPACE`, `SERVICE`, `INSTANCE`).
+    pub targets: HashMap<String, String>,
+}
+
+/// Which call an idempotency token was first seen on, so one client's
+/// `CreatorRequestId` cannot collide across unrelated operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IdempotencyScope {
+    CreateHttpNamespace,
+    CreateService,
+    RegisterInstance,
+}
+impl IdempotencyScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CreateHttpNamespace => "CreateHttpNamespace",
+            Self::CreateService => "CreateService",
+            Self::RegisterInstance => "RegisterInstance",
+        }
+    }
+}
 
 /// Per-service state for com-amazonaws-servicediscovery-route53autonaming-v20170314. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsServicediscoveryRoute53autonamingV20170314State {
-    // TODO: add service-specific state fields
+    /// Namespaces by `Id`.
+    pub namespaces: HashMap<String, NamespaceRecord>,
+    /// `Name` -> namespace `Id`: what `DiscoverInstances` resolves and what makes
+    /// `NamespaceAlreadyExists` detectable.
+    pub namespace_ids_by_name: HashMap<String, String>,
+    /// Services by `Id`.
+    pub services: HashMap<String, ServiceRecord>,
+    /// (namespace `Id`, service `Name`) -> service `Id`: resolves
+    /// `DiscoverInstances`' `ServiceName` and enforces `ServiceAlreadyExists`.
+    pub service_ids_by_namespace_and_name: HashMap<(String, String), String>,
+    /// Operations by `OperationId`, bounded by [`MAX_RETAINED_OPERATIONS`].
+    pub operations: HashMap<String, OperationRecord>,
+    /// scoped `CreatorRequestId` -> the id the first call returned, bounded by
+    /// [`MAX_RETAINED_IDEMPOTENCY_TOKENS`].
+    pub idempotency: HashMap<String, String>,
+    /// The idempotency keys in the order they were first remembered, so the oldest
+    /// token is the one forgotten when the bound is reached.
+    idempotency_order: VecDeque<String>,
+    /// Monotonic counter that makes every minted id unique within this emulator.
+    id_seq: u64,
+}
+
+impl ComAmazonawsServicediscoveryRoute53autonamingV20170314State {
+    /// Mint an opaque id of the form `<prefix>-<digits lowercase alphanumerics>`
+    /// (just the digits when `prefix` is empty), unique for the lifetime of this store.
+    ///
+    /// The digits come from a SHA-256 of the monotonic counter and the wall clock, so
+    /// an id is neither guessable nor derived from any request value. `digits` is
+    /// clamped to the digest width, so an id is at most 32 characters long.
+    pub fn next_id(&mut self, prefix: &str, digits: usize) -> String {
+        self.id_seq = self.id_seq.wrapping_add(1);
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let mut hasher = Sha256::new();
+        hasher.update(prefix.as_bytes());
+        hasher.update(self.id_seq.to_be_bytes());
+        hasher.update(nanos.to_be_bytes());
+        let digest = hasher.finalize();
+        // Cloud Map ids are lowercase alphanumeric, so the digest bytes are folded
+        // into base 36 rather than rendered as hex.
+        const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let body: String = digest
+            .iter()
+            .take(digits.min(digest.len()))
+            .map(|byte| char::from(ALPHABET[usize::from(*byte) % ALPHABET.len()]))
+            .collect();
+        if prefix.is_empty() {
+            body
+        } else {
+            format!("{prefix}-{body}")
+        }
+    }
+
+    /// File an operation record and return its `OperationId`.
+    ///
+    /// The record starts `SUBMITTED` with its success due [`OPERATION_SUCCESS_SPAN`]
+    /// later; [`Self::operation`] materialises the transition when the clock reaches it.
+    pub fn record_operation(
+        &mut self,
+        operation_type: &str,
+        now: SystemTime,
+        targets: impl IntoIterator<Item = (String, String)>,
+    ) -> String {
+        // An `OperationId` carries no prefix; 32 digits is the digest width.
+        let id = self.next_id("", 32);
+        self.operations.insert(
+            id.clone(),
+            OperationRecord {
+                id: id.clone(),
+                operation_type: operation_type.to_string(),
+                status: OPERATION_STATUS_SUBMITTED.to_string(),
+                create_date: now,
+                update_date: now,
+                success_due_at: now + OPERATION_SUCCESS_SPAN,
+                error_code: None,
+                error_message: None,
+                targets: targets.into_iter().collect(),
+            },
+        );
+        self.evict_oldest_operations();
+        id
+    }
+
+    /// Keep [`Self::operations`] within [`MAX_RETAINED_OPERATIONS`], dropping the
+    /// oldest record that has already reached a terminal status first so a caller
+    /// polling a fresh operation can still resolve it.
+    ///
+    /// A token remembered for an evicted operation is forgotten with it, so a replay
+    /// never hands back an id `GetOperation` can no longer resolve.
+    fn evict_oldest_operations(&mut self) {
+        while self.operations.len() > MAX_RETAINED_OPERATIONS {
+            let victim = self
+                .operations
+                .values()
+                .min_by_key(|record| {
+                    (
+                        record.status == OPERATION_STATUS_SUBMITTED,
+                        record.create_date,
+                    )
+                })
+                .map(|record| record.id.clone());
+            match victim {
+                Some(id) => {
+                    self.operations.remove(&id);
+                    // Forget every token that produced this id, and keep the order
+                    // queue in step with the map so no dead key is ever popped in
+                    // place of a live one.
+                    let tokens = &mut self.idempotency;
+                    let order = &mut self.idempotency_order;
+                    tokens.retain(|_, produced| *produced != id);
+                    order.retain(|key| tokens.contains_key(key));
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// The operation `id`, with any status transition the clock already owes it
+    /// applied first.
+    ///
+    /// Materialising here is what a reporting call may write: the operation was due to
+    /// succeed at `success_due_at` whether or not anybody asked.
+    pub fn operation(&mut self, id: &str, now: SystemTime) -> Option<&OperationRecord> {
+        let record = self.operations.get_mut(id)?;
+        if record.status == OPERATION_STATUS_SUBMITTED && now >= record.success_due_at {
+            record.status = OPERATION_STATUS_SUCCESS.to_string();
+            record.update_date = record.success_due_at;
+        }
+        Some(record)
+    }
+
+    /// `ServiceCount` for a namespace, derived from the service map.
+    pub fn service_count(&self, namespace_id: &str) -> i32 {
+        let count = self
+            .services
+            .values()
+            .filter(|service| service.namespace_id == namespace_id)
+            .count();
+        i32::try_from(count).unwrap_or(i32::MAX)
+    }
+
+    /// Resolve a namespace reference — the members that name one are modelled as
+    /// `Arn`, and the docs say a namespace shared with the account is named by its
+    /// ARN — to a stored namespace id.
+    pub fn resolve_namespace_id(&self, reference: &str) -> Option<String> {
+        if self.namespaces.contains_key(reference) {
+            return Some(reference.to_string());
+        }
+        self.namespaces
+            .values()
+            .find(|namespace| namespace.arn == reference)
+            .map(|namespace| namespace.id.clone())
+    }
+
+    /// Resolve a service reference (its id or its ARN) to a stored service id.
+    pub fn resolve_service_id(&self, reference: &str) -> Option<String> {
+        if self.services.contains_key(reference) {
+            return Some(reference.to_string());
+        }
+        self.services
+            .values()
+            .find(|service| service.arn == reference)
+            .map(|service| service.id.clone())
+    }
+
+    /// The namespace `DiscoverInstances`' `NamespaceName` names.
+    ///
+    /// That member is documented as the namespace's `HttpName`, which "in most cases"
+    /// equals its `Name`, so the `HttpName` is matched first and the `Name` index is
+    /// the fallback.
+    pub fn namespace_by_http_name(&self, http_name: &str) -> Option<&NamespaceRecord> {
+        if let Some(found) = self
+            .namespaces
+            .values()
+            .find(|namespace| namespace.http_name.as_deref() == Some(http_name))
+        {
+            return Some(found);
+        }
+        self.namespace_ids_by_name
+            .get(http_name)
+            .and_then(|id| self.namespaces.get(id))
+    }
+
+    /// The id a previous call with this `CreatorRequestId` returned, if any.
+    ///
+    /// `request` identifies WHAT was asked for (the namespace name, the service's
+    /// namespace and name, the service and instance id), so a token reused for a
+    /// different resource is not treated as a retry of the first one — a retry that
+    /// silently stored nothing while answering 200 would be indistinguishable from a
+    /// stored write.
+    pub fn replayed(
+        &self,
+        scope: IdempotencyScope,
+        token: &str,
+        request: &str,
+    ) -> Option<String> {
+        self.idempotency
+            .get(&Self::idempotency_key(scope, token, request))
+            .cloned()
+    }
+
+    /// Remember what a `CreatorRequestId` produced for this request, so a retry of the
+    /// SAME request replays it. Keeps the token store within
+    /// [`MAX_RETAINED_IDEMPOTENCY_TOKENS`], forgetting the oldest token first.
+    pub fn remember(
+        &mut self,
+        scope: IdempotencyScope,
+        token: &str,
+        request: &str,
+        produced: &str,
+    ) {
+        let key = Self::idempotency_key(scope, token, request);
+        if self
+            .idempotency
+            .insert(key.clone(), produced.to_string())
+            .is_none()
+        {
+            self.idempotency_order.push_back(key);
+        }
+        while self.idempotency_order.len() > MAX_RETAINED_IDEMPOTENCY_TOKENS {
+            match self.idempotency_order.pop_front() {
+                Some(forgotten) => {
+                    self.idempotency.remove(&forgotten);
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn idempotency_key(scope: IdempotencyScope, token: &str, request: &str) -> String {
+        format!("{}:{token}:{request}", scope.as_str())
+    }
+}
+
+/// The region the request was signed for, which every ARN this service mints carries.
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// An ARN for one of this service's resources, e.g. `namespace/ns-…`.
+pub fn service_arn(region: &str, resource: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, resource)
+}
+
+/// A per-call sort key for one instance id.
+///
+/// `DiscoverInstances` is documented to return "a randomized list of instances
+/// allowing customers to distribute traffic evenly": sorting by this key permutes the
+/// list from `nonce` (the caller's wall clock), so the permutation changes between
+/// calls without any stored counter being bumped by a read.
+pub fn shuffle_key(nonce: u128, instance_id: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(nonce.to_be_bytes());
+    hasher.update(instance_id.as_bytes());
+    hasher.finalize().into()
+}
+
+/// A stored instant as the wire `timestamp` the modelled shapes carry.
+pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    match at.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(since_epoch) => ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64()),
+        Err(_) => ::aws_smithy_types::DateTime::from_secs(0),
+    }
+}
+
+/// The modelled `Namespace` for a stored namespace, with `ServiceCount` passed in
+/// because it is derived from the service map rather than held on the record.
+pub fn namespace_view(record: &NamespaceRecord, service_count: i32) -> Namespace {
+    Namespace {
+        id: Some(record.id.clone()),
+        arn: Some(record.arn.clone()),
+        resource_owner: None,
+        name: Some(record.name.clone()),
+        r#type: Some(record.namespace_type.clone()),
+        description: record.description.clone(),
+        service_count: Some(service_count),
+        properties: Some(NamespaceProperties {
+            // A DNS namespace's hosted zone; absent for an HTTP namespace, which has none.
+            dns_properties: record.hosted_zone_id.as_ref().map(|hosted_zone_id| {
+                crate::ops::types::DnsProperties {
+                    hosted_zone_id: Some(hosted_zone_id.clone()),
+                    soa: None,
+                }
+            }),
+            http_properties: record
+                .http_name
+                .as_ref()
+                .map(|http_name| HttpProperties {
+                    http_name: Some(http_name.clone()),
+                }),
+        }),
+        create_date: Some(timestamp(record.create_date)),
+        creator_request_id: record.creator_request_id.clone(),
+    }
+}
+
+/// The modelled `Service` for a stored service.
+pub fn service_view(record: &ServiceRecord) -> Service {
+    Service {
+        id: Some(record.id.clone()),
+        arn: Some(record.arn.clone()),
+        resource_owner: None,
+        name: Some(record.name.clone()),
+        namespace_id: Some(record.namespace_id.clone()),
+        description: record.description.clone(),
+        instance_count: Some(record.instance_count()),
+        dns_config: record.dns_config.clone(),
+        r#type: Some(record.service_type.clone()),
+        health_check_config: record.health_check_config.clone(),
+        health_check_custom_config: record.health_check_custom_config.clone(),
+        create_date: Some(timestamp(record.create_date)),
+        creator_request_id: record.creator_request_id.clone(),
+        created_by_account: None,
+    }
+}
+
+/// The modelled `Instance` for a stored instance.
+pub fn instance_view(record: &InstanceRecord) -> Instance {
+    Instance {
+        id: record.instance_id.clone(),
+        creator_request_id: record.creator_request_id.clone(),
+        attributes: Some(record.attributes.clone()),
+        created_by_account: None,
+    }
+}
+
+/// The modelled `Operation` for a stored operation record.
+pub fn operation_view(record: &OperationRecord) -> Operation {
+    Operation {
+        id: Some(record.id.clone()),
+        owner_account: None,
+        r#type: Some(record.operation_type.clone()),
+        status: Some(record.status.clone()),
+        error_message: record.error_message.clone(),
+        error_code: record.error_code.clone(),
+        create_date: Some(timestamp(record.create_date)),
+        update_date: Some(timestamp(record.update_date)),
+        targets: Some(record.targets.clone()),
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

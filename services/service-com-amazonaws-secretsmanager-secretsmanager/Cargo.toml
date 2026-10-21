@@ -21,13 +21,19 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Secret version ids are UUIDs (SecretVersionIdType, len 32..64), and the six
+# random characters that end a secret's ARN are drawn from a random UUID too.
+uuid = { version = "1", features = ["v4"] }
+# Hex-encodes the ListSecrets pagination cursor into an opaque NextToken.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
+# SecretBinary is a blob, which awsJson1_1 carries base64-encoded on the wire.
+base64 = "0.22"
 
 [lints]
 workspace = true

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMonitor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMonitor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMonitor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a monitor into this service's store ([`crate::state`]) under the scope the
+//! request names, and answers with the stored record. `@idempotent` with an
+//! `@idempotencyToken`: a replay carrying a `clientToken` this store has already
+//! seen answers with the monitor that token minted, while a SECOND create of one
+//! `monitorName` is the modelled conflict.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +189,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMonitor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMonitorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMonitor"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateMonitorErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        // The `@idempotent` replay, before anything else this request would change:
+        // the same `clientToken` answers with the monitor it already minted, and a
+        // token reused with different parameters is a conflict.
+        if let Some(token) = input.client_token.as_deref() {
+            let minted = state.monitor_idempotency.get(token).cloned();
+            if let Some(monitor) = minted.and_then(|name| state.monitors.get(&name)) {
+                if monitor.matches_create(&input) {
+                    return Ok(output(monitor));
+                }
+                return Err(CreateMonitorErrorModeled::ConflictException(
+                    crate::state::idempotency_conflict(
+                        crate::state::MONITOR_RESOURCE,
+                        &monitor.monitor_name,
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // `scopeArn` is only constrained to be SOME ARN by the model, so whether it
+        // names a scope of this service is this handler's to enforce: a monitor
+        // cannot measure a topology that does not exist.
+        if state.scope_by_arn(&input.scope_arn).is_none() {
+            return Err(CreateMonitorErrorModeled::ValidationException(
+                crate::state::field_validation(
+                    "scopeArn",
+                    format!("{:?} does not name a scope", input.scope_arn),
+                ),
+            )
+            .into());
+        }
+
+        // A monitor is addressed by name, so one name is one monitor: a second
+        // create of a name the store holds is the modelled conflict rather than a
+        // silent overwrite of the first monitor.
+        if state.monitors.contains_key(&input.monitor_name) {
+            return Err(CreateMonitorErrorModeled::ConflictException(
+                crate::state::already_exists(
+                    crate::state::MONITOR_RESOURCE,
+                    &input.monitor_name,
+                ),
+            )
+            .into());
+        }
+
+        if state.monitors.len() >= crate::state::MAX_MONITORS {
+            return Err(CreateMonitorErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded(
+                    crate::state::MONITOR_RESOURCE,
+                    crate::state::MAX_MONITORS,
+                ),
+            )
+            .into());
+        }
+
+        let monitor_name = input.monitor_name;
+        let monitor_arn =
+            crate::state::resource_arn(&region, crate::state::MONITOR_RESOURCE, &monitor_name);
+        let monitor = crate::state::Monitor {
+            monitor_name: monitor_name.clone(),
+            monitor_arn: monitor_arn.clone(),
+            // "PENDING: The monitor is in the process of being created" — the
+            // monitor reports it until the clock owes it ACTIVE.
+            monitor_status: crate::state::MonitorStatus::Pending,
+            scope_arn: input.scope_arn,
+            local_resources: input.local_resources,
+            // `remoteResources` is optional on the way in and `@required` on the way
+            // out: a monitor created without any has none, not a missing member.
+            remote_resources: input.remote_resources.unwrap_or_default(),
+            tags: crate::state::tags_of(input.tags.as_ref()),
+            created_at: now,
+            modified_at: now,
+            active_at: now + crate::state::PROVISIONING_DELAY,
+        };
+
+        state.arn_index.insert(
+            monitor_arn,
+            crate::state::ResourceRef::Monitor(monitor_name.clone()),
+        );
+        if let Some(token) = input.client_token {
+            state
+                .monitor_idempotency
+                .insert(token, monitor_name.clone());
+        }
+        state.monitors.insert(monitor_name.clone(), monitor);
+        // Read the stored record back, so the response is the state rather than the
+        // value that went into it.
+        let stored = state.monitors.get(&monitor_name).ok_or_else(|| {
+            CreateMonitorErrorModeled::InternalServerException(crate::state::state_unavailable())
+        })?;
+        Ok(output(stored))
+    }
+}
+
+/// This operation's output for a stored monitor — every member read off the record,
+/// so a create answers exactly what the following `GetMonitor` answers.
+fn output(monitor: &crate::state::Monitor) -> CreateMonitorOutput {
+    CreateMonitorOutput {
+        monitor_arn: monitor.monitor_arn.clone(),
+        monitor_name: monitor.monitor_name.clone(),
+        monitor_status: monitor.monitor_status.as_wire().to_string(),
+        local_resources: monitor.local_resources.clone(),
+        remote_resources: monitor.remote_resources.clone(),
+        created_at: ::aws_smithy_types::DateTime::from(monitor.created_at),
+        modified_at: ::aws_smithy_types::DateTime::from(monitor.modified_at),
+        tags: crate::state::tags_for_output(&monitor.tags),
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTagKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTagKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTagKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the distinct tag keys in use across every stored resource, in key
+//! order — a pure projection of what `TagResources` wrote and `UntagResources`
+//! removed, so a key no resource carries any more is not reported.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +156,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTagKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTagKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTagKeys"))
+        let _ = ctx;
+
+        let token = input.pagination_token.as_deref().unwrap_or_default();
+        let fingerprint = crate::state::page_fingerprint(&[Self::NAME]);
+        let after = if token.is_empty() {
+            None
+        } else {
+            match crate::state::decode_pagination_token(token, &fingerprint) {
+                Some(after) => Some(after),
+                None => {
+                    return Err(GetTagKeysErrorModeled::PaginationTokenExpiredException(
+                        PaginationTokenExpiredException {
+                            message: Some(
+                                "the specified PaginationToken is not valid for this request"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            }
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetTagKeysErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the tagging store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // A `BTreeSet` both de-duplicates across resources and orders the keys,
+        // which is what makes the cursor below resumable.
+        let keys: std::collections::BTreeSet<&String> = state
+            .resources
+            .values()
+            .flat_map(|entry| entry.tags.keys())
+            .collect();
+        let keys: Vec<(String, String)> = keys
+            .into_iter()
+            .map(|key| (key.clone(), key.clone()))
+            .collect();
+
+        let (page, next) = crate::state::page(
+            keys,
+            after.as_deref(),
+            crate::state::KEYS_PER_PAGE,
+            None,
+            |_| 0,
+            &fingerprint,
+        );
+
+        Ok(GetTagKeysOutput {
+            pagination_token: Some(next.unwrap_or_default()),
+            tag_keys: Some(page),
+        })
     }
 }

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTaxRegistrations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTaxRegistrations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTaxRegistrations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages through every stored tax registration in account-id order. Purely
+//! reporting: it changes nothing a later caller sees.
+//!
+//! The cursor is opaque and names the account id the previous page stopped
+//! after, so resuming means "the first account strictly greater than it" — well
+//! defined because the store is ordered.
+//!
+//! The page size is the SERVER's decision: `maxResults` when the request names
+//! one, [`crate::state::DEFAULT_PAGE_SIZE`] when it does not, capped at
+//! [`crate::state::MAX_PAGE_SIZE`]. A request that names no page size therefore
+//! cannot ask for the whole store in one response, and the work done while the
+//! state lock is held is bounded by the page, not by the store.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +152,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTaxRegistrations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTaxRegistrationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTaxRegistrations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTaxRegistrationsErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+
+        // The page size is the server's decision: what `maxResults` asked for,
+        // else the emulator's default, and never more than its ceiling. The
+        // request's own 1..=1000 range is a modelled constraint the boundary
+        // already refused outside, but a request that names NO page size must
+        // still get a bounded page — otherwise one small request would serialise
+        // the whole store into one response.
+        let page_size = crate::state::page_size(input.max_results);
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .map_err(ListTaxRegistrationsErrorModeled::ValidationException)?,
+            ),
+            None => None,
+        };
+
+        // The page is built while the state lock is held, so the work done under
+        // it is bounded by `page_size` records, not by the size of the store; the
+        // guard is released before the response is assembled.
+        let (account_details, more_remain) = {
+            let store = state.lock();
+            let mut remaining = store
+                .registrations
+                .iter()
+                .filter(|(account_id, _)| {
+                    resume_after
+                        .as_ref()
+                        .is_none_or(|after| *account_id > after)
+                })
+                .peekable();
+            let page: Vec<AccountDetails> = remaining
+                .by_ref()
+                .take(page_size)
+                .map(|(account_id, stored)| AccountDetails {
+                    account_id: Some(account_id.clone()),
+                    tax_registration: Some(stored.to_tax_registration_with_jurisdiction()),
+                    // `taxInheritanceDetails` reports the parent entity an
+                    // account inherited its tax settings FROM, and
+                    // `accountMetaData` the account's legal profile. Neither is
+                    // written by any operation this service models, so there is
+                    // nothing stored to report.
+                    tax_inheritance_details: None,
+                    account_meta_data: None,
+                })
+                .collect();
+            let more_remain = remaining.peek().is_some();
+            (page, more_remain)
+        };
+
+        // A cursor is issued only when a further account remains, so the last
+        // page carries none.
+        let next_token = if more_remain {
+            account_details
+                .last()
+                .and_then(|last| last.account_id.as_deref())
+                .map(crate::state::encode_page_token)
+        } else {
+            None
+        };
+
+        Ok(ListTaxRegistrationsOutput {
+            account_details,
+            next_token,
+        })
     }
 }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLifecyclePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLifecyclePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLifecyclePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +180,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLifecyclePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLifecyclePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLifecyclePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateLifecyclePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the dlm lifecycle-policy store is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        // A default policy is one created either by naming `DefaultPolicy`, or by
+        // a `PolicyDetails` whose `PolicyLanguage` is `SIMPLIFIED` ("To create a
+        // default policy"); everything else is a custom policy.
+        let default_policy_type = input.default_policy.clone().or_else(|| {
+            input
+                .policy_details
+                .as_ref()
+                .and_then(|details| details.resource_type.clone())
+                .filter(|_| policy_language_is_simplified(input.policy_details.as_ref()))
+        });
+        let is_default = input.default_policy.is_some()
+            || policy_language_is_simplified(input.policy_details.as_ref());
+
+        // The one cross-member rule `CreateLifecyclePolicy` documents and the
+        // model cannot express: "If you create a default policy, you can specify
+        // the request parameters either in the request body, or in the
+        // PolicyDetails request structure, but not both."
+        if is_default && input.policy_details.is_some() {
+            let duplicated = duplicated_default_policy_parameters(&input);
+            if !duplicated.is_empty() {
+                let mut parameters = vec!["PolicyDetails".to_string()];
+                parameters.extend(duplicated.iter().map(|name| (*name).to_string()));
+                return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "a default policy specifies {} either in the request body or in \
+                             PolicyDetails, but not both",
+                            duplicated.join(", ")
+                        )),
+                        code: None,
+                        required_parameters: None,
+                        mutually_exclusive_parameters: Some(parameters),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // The store is bounded: past its bound a create is refused rather than
+        // adding another record. `LimitExceededException` is the modelled refusal.
+        if store.policies.len() >= crate::state::POLICY_QUOTA {
+            return Err(CreateLifecyclePolicyErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} lifecycle policies",
+                        crate::state::POLICY_QUOTA
+                    )),
+                    code: None,
+                    resource_type: Some(crate::state::POLICY_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let policy_id = store.mint_policy_id();
+        let record = crate::state::LifecyclePolicyRecord {
+            policy_arn: crate::state::policy_arn(&policy_id, &region),
+            policy_id: policy_id.clone(),
+            description: input.description,
+            // `State` is the "activation state of the lifecycle policy after
+            // creation", so the policy carries it the instant the create returns:
+            // there is no asynchronous settling for the clock to owe it. `ERROR`,
+            // the third `GettablePolicyStateValues` member, is only reached by a
+            // policy whose execution failed, which this emulator never runs.
+            state: input.state,
+            status_message: None,
+            execution_role_arn: input.execution_role_arn,
+            date_created: now,
+            date_modified: now,
+            policy_details: input.policy_details,
+            default_policy: is_default,
+            default_policy_type,
+            create_interval: input.create_interval,
+            retain_interval: input.retain_interval,
+            copy_tags: input.copy_tags,
+            extend_deletion: input.extend_deletion,
+            cross_region_copy_targets: input.cross_region_copy_targets.unwrap_or_default(),
+            exclusions: input.exclusions,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+        store.policies.insert(policy_id.clone(), record);
+
+        Ok(CreateLifecyclePolicyOutput {
+            policy_id: Some(policy_id),
+        })
     }
+}
+
+/// True when `details` declares the `SIMPLIFIED` policy language, which
+/// `PolicyDetails$PolicyLanguage` documents as "To create a default policy".
+fn policy_language_is_simplified(details: Option<&PolicyDetails>) -> bool {
+    details.is_some_and(|details| {
+        details.policy_language.as_deref() == Some(crate::state::SIMPLIFIED_POLICY_LANGUAGE)
+    })
+}
+
+/// The `[Default policies only]` parameters this request states in the request
+/// body while also carrying a `PolicyDetails` structure that can state them.
+fn duplicated_default_policy_parameters(input: &CreateLifecyclePolicyInput) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if input.create_interval.is_some() {
+        names.push("CreateInterval");
+    }
+    if input.retain_interval.is_some() {
+        names.push("RetainInterval");
+    }
+    if input.copy_tags.is_some() {
+        names.push("CopyTags");
+    }
+    if input.extend_deletion.is_some() {
+        names.push("ExtendDeletion");
+    }
+    if input.cross_region_copy_targets.is_some() {
+        names.push("CrossRegionCopyTargets");
+    }
+    if input.exclusions.is_some() {
+        names.push("Exclusions");
+    }
+    names
 }

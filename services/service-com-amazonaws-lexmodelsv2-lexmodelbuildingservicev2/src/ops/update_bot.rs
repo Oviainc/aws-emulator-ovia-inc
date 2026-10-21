@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the stored bot's definition with the one the request carries, stamps
+//! `lastUpdatedDateTime`, and answers from the updated record. A `botId` no stored bot
+//! carries is a modelled `PreconditionFailedException` (HTTP 412) — this operation
+//! declares no `ResourceNotFoundException`
+//! (`smithy_query(query="operation",operation="UpdateBot")`).
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +189,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBot"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateBotErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        // `botType` is a modelled enum; the wire accepts any string, so a value outside
+        // the enum is refused here rather than stored.
+        if let Some(bot_type) = input.bot_type.as_deref() {
+            if !crate::state::BOT_TYPES.contains(&bot_type) {
+                return Err(UpdateBotErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "botType must be one of [{}]; received {bot_type}",
+                        crate::state::BOT_TYPES.join(", ")
+                    )),
+                })
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+
+        // Resolved before the uniqueness scan below, which needs the whole map, so the
+        // two share one not-found refusal.
+        if !store.bots.contains_key(&input.bot_id) {
+            return Err(no_such_bot(&input.bot_id));
+        }
+
+        // A rename must keep bot names unique across the account, the same rule
+        // `CreateBot` enforces.
+        let renaming_to_a_taken_name = store
+            .bots
+            .values()
+            .any(|bot| bot.bot_name == input.bot_name && bot.bot_id != input.bot_id);
+        if renaming_to_a_taken_name {
+            return Err(UpdateBotErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "A bot with the name {} already exists; choose another name",
+                    input.bot_name
+                )),
+            })
+            .into());
+        }
+
+        let Some(bot) = store.settled_bot_mut(&input.bot_id) else {
+            return Err(no_such_bot(&input.bot_id));
+        };
+
+        // `UpdateBot` replaces the bot's definition, so an omitted optional member
+        // clears what was stored rather than leaving the old value in place.
+        bot.bot_name = input.bot_name;
+        bot.description = input.description;
+        bot.role_arn = input.role_arn;
+        bot.data_privacy = input.data_privacy;
+        bot.idle_session_ttl_in_seconds = input.idle_session_ttl_in_seconds;
+        bot.bot_type = input.bot_type;
+        bot.bot_members = input.bot_members.unwrap_or_default();
+        bot.error_log_settings = input.error_log_settings;
+        bot.last_updated_date_time = ::std::time::SystemTime::now();
+
+        Ok(UpdateBotOutput {
+            bot_id: Some(bot.bot_id.clone()),
+            bot_name: Some(bot.bot_name.clone()),
+            description: bot.description.clone(),
+            role_arn: Some(bot.role_arn.clone()),
+            data_privacy: Some(bot.data_privacy.clone()),
+            idle_session_ttl_in_seconds: Some(bot.idle_session_ttl_in_seconds),
+            bot_status: Some(bot.bot_status.clone()),
+            creation_date_time: Some(crate::state::to_date_time(bot.creation_date_time)),
+            last_updated_date_time: Some(crate::state::to_date_time(bot.last_updated_date_time)),
+            bot_type: bot.bot_type.clone(),
+            bot_members: bot.wire_bot_members(),
+            error_log_settings: bot.error_log_settings.clone(),
+        })
     }
+}
+
+/// The refusal for a `botId` no stored bot carries.
+///
+/// `PreconditionFailedException` (HTTP 412) and not `ResourceNotFoundException`: this
+/// operation does not declare the latter
+/// (`smithy_query(query="operation",operation="UpdateBot")`).
+fn no_such_bot(bot_id: &str) -> UpdateBotError {
+    UpdateBotErrorModeled::PreconditionFailedException(PreconditionFailedException {
+        message: Some(format!(
+            "Bot {bot_id} does not exist; check the botId and try again"
+        )),
+    })
+    .into()
 }

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePerformanceAnalysisReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePerformanceAnalysisReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a new performance analysis report for a window on a monitored
+//! DB resource and PERSISTS it in [`crate::state`], so the id it returns is the one
+//! the Get/List/Delete report operations resolve.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePerformanceAnalysisReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Authorization is NOT emulated: the emulator holds no IAM principals or
+//! policies, so the modelled `NotAuthorizedException` is never the answer and a
+//! well-formed request is served. That is a deliberate, documented divergence,
+//! not a permission decision.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +152,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePerformanceAnalysisReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePerformanceAnalysisReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePerformanceAnalysisReport"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreatePerformanceAnalysisReportErrorModeled::InternalServiceError(
+                    InternalServiceError {
+                        message: Some(
+                            "the Performance Insights report store is unavailable".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Documented on `StartTime`: "The value for StartTime must be earlier than
+        // the value for EndTime." An end at or before the start describes no
+        // window, so there is nothing to analyse. The modelled constraints
+        // (required members, the `Identifier` pattern, the `ServiceType` value
+        // set) are already refused before this handler runs.
+        if let Some(end_time) = input.end_time {
+            if crate::state::timestamp_key(input.start_time)
+                >= crate::state::timestamp_key(end_time)
+            {
+                return Err(
+                    CreatePerformanceAnalysisReportErrorModeled::InvalidArgumentException(
+                        InvalidArgumentException {
+                            message: Some(
+                                "The value for StartTime must be earlier than the value for EndTime."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let create_time = crate::state::now();
+        let region = crate::state::request_region(ctx.parts());
+        let tags = input.tags.unwrap_or_default();
+
+        let mut store = state.lock();
+        // Nothing is written until there is room for it: this store is in memory
+        // and only Delete ever drops an entry, so the emulator's own ceiling is
+        // checked first and a request past it is refused.
+        if let Some(reason) = store.capacity_refusal(&input.service_type, &input.identifier) {
+            return Err(
+                CreatePerformanceAnalysisReportErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(reason),
+                    },
+                )
+                .into(),
+            );
+        }
+        let (analysis_report_id, sequence) =
+            store.mint_report_id(&input.service_type, &input.identifier, create_time);
+        let resource_arn = crate::state::report_arn(
+            &region,
+            &input.service_type,
+            &input.identifier,
+            &analysis_report_id,
+        );
+        // The report's tags also go in under its ARN, the handle the
+        // Tag/Untag/ListTagsForResource slice addresses a report by.
+        store.tags_by_arn.insert(
+            resource_arn.clone(),
+            tags.iter()
+                .map(|tag| (tag.key.clone(), tag.value.clone()))
+                .collect(),
+        );
+        store.insert_report(crate::state::AnalysisReportRecord {
+            analysis_report_id: analysis_report_id.clone(),
+            service_type: input.service_type.clone(),
+            identifier: input.identifier.clone(),
+            resource_arn,
+            create_time,
+            start_time: input.start_time,
+            end_time: input.end_time,
+            // The real service answers Create with a report whose analysis is
+            // still running; the clock owes it SUCCEEDED one span later.
+            status: crate::state::STATUS_RUNNING.to_string(),
+            status_due: ::std::time::Instant::now() + crate::state::REPORT_ANALYSIS_SPAN,
+            tags,
+            sequence,
+            insights: Vec::new(),
+        });
+
+        Ok(CreatePerformanceAnalysisReportOutput {
+            analysis_report_id: Some(analysis_report_id),
+        })
     }
 }

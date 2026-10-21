@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRealtimeContactAnalysisSegments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRealtimeContactAnalysisSegments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRealtimeContactAnalysisSegments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one page of the analysis segments stored for a contact's real-time analysis
+//! session. This operation is a REPORTER: the segments are produced by Amazon Connect's
+//! voice analysis and written through the seeding API on [`crate::state`], never by this
+//! handler. The only state it changes is the 24-hour expiry the clock already made due
+//! and the page cursor behind the `NextToken` it returns — and that cursor is minted once
+//! per position, so two identical requests answer identically.
+//!
+//! ## Authorization is out of scope here, deliberately
+//!
+//! The emulator verifies every request signature at the framework boundary and models no
+//! IAM principal or policy, so there is nothing for a handler to evaluate: the modeled
+//! `AccessDeniedException` is intentionally unreachable rather than overlooked. Answering
+//! 403 would mean inventing an entitlement decision nothing computed. `ctx` is therefore
+//! bound and dropped below.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +167,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRealtimeContactAnalysisSegments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRealtimeContactAnalysisSegmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRealtimeContactAnalysisSegments"))
+        // Request metadata only; the store is reached through `self.engine`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListRealtimeContactAnalysisSegmentsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(
+                        "Contact Lens analysis state is unavailable on this engine.".to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        // ONE instant decides both expiry and this read: voice data is retained for 24
+        // hours, so a session past that is already gone whether or not anybody called.
+        // Materialising that here is the only write a reporting operation may make.
+        let now = ::std::time::SystemTime::now();
+        state.purge_expired(now);
+
+        let key: crate::state::SessionKey = (input.instance_id.clone(), input.contact_id.clone());
+
+        let Some(session) = state.session(&key) else {
+            return Err(
+                ListRealtimeContactAnalysisSegmentsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No real-time contact analysis session for ContactId '{}' in \
+                             InstanceId '{}'.",
+                            input.contact_id, input.instance_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let total = session.segments.len();
+        let completed = session.completed;
+
+        // A `NextToken` is resolved against the stored cursors, never parsed, and
+        // `cursor_for` resolves it only within THIS session: a token the service did not
+        // mint, or one minted for another contact, has no cursor here.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match state.cursor_for(&key, token) {
+                Some(cursor) => cursor.next_index,
+                None => {
+                    return Err(
+                        ListRealtimeContactAnalysisSegmentsErrorModeled::InvalidRequestException(
+                            InvalidRequestException {
+                                message: Some(
+                                    "The NextToken provided is not a valid pagination token for \
+                                     this contact's real-time analysis session."
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // `MaxResults` caps the page; absent, the page is the modeled maximum. The
+        // clamp is belt-and-braces — the modeled 1..100 range is refused before `handle`.
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE) as usize;
+        let start = start.min(total);
+        let end = start.saturating_add(page_size).min(total);
+
+        // Byte-for-byte what was stored, in stored (chronological) order.
+        let segments = session.segments[start..end].to_vec();
+
+        // Per the modeled `NextToken` doc: a token is returned when more segments are
+        // stored now, AND when the session is drained but analysis is still running
+        // (more may arrive later). It is omitted only once analysis has completed and
+        // every segment has been handed out.
+        let next_token = if end < total || !completed {
+            Some(state.token_for(&key, end))
+        } else {
+            None
+        };
+
+        Ok(ListRealtimeContactAnalysisSegmentsOutput {
+            segments,
+            next_token,
+        })
     }
 }

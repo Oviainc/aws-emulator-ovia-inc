@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRepositories
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRepositories`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRepositories::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored repositories: each `Repository` is exactly what
+//! `CreateRepository` persisted, in a deterministic order, one page at a time. A name
+//! in `repositoryNames` that no repository carries is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -129,6 +123,22 @@ impl From<DescribeRepositoriesErrorModeled> for DescribeRepositoriesError {
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors.
+fn fault_error(fault: crate::state::Fault) -> DescribeRepositoriesErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            DescribeRepositoriesErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException { message },
+            )
+        }
+        // `ImageNotFound` cannot arise here: this operation reads no image.
+        _ => DescribeRepositoriesErrorModeled::InvalidParameterException(
+            InvalidParameterException { message },
+        ),
+    }
+}
+
 /// The `DescribeRepositories` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -165,18 +175,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRepositories` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRepositoriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRepositories"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeRepositoriesErrorModeled::ServerException(ServerException {
+                message: Some("the ecr repository store is unavailable".to_string()),
+            })
+            .into());
+        };
+        let _ = ctx;
+
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        let store = state.lock();
+
+        // Every requested name must name a repository: ECR refuses the whole call
+        // rather than reporting the ones it could find.
+        let wanted = input.repository_names.unwrap_or_default();
+        for name in &wanted {
+            store.repository(name).map_err(fault_error)?;
+        }
+
+        // Keyed by name, which is the order the store holds them in, so a page boundary
+        // means the same thing on the next call.
+        let candidates: Vec<(String, Repository)> = store
+            .repositories
+            .iter()
+            .filter(|(name, _)| wanted.is_empty() || wanted.contains(name))
+            .map(|(name, repo)| (name.clone(), repo.to_repository()))
+            .collect();
+
+        let (repositories, next_token) = crate::state::paginate(
+            candidates,
+            input.next_token.as_ref(),
+            input.max_results,
+        )
+        .map_err(fault_error)?;
+
+        Ok(DescribeRepositoriesOutput {
+            repositories: Some(repositories),
+            next_token,
+        })
     }
 }

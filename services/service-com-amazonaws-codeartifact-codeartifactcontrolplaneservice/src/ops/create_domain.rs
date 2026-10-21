@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a domain in [`crate::state`] and answers with the stored record's
+//! `DomainDescription`. The domain name is unique per account+region, so a second
+//! `CreateDomain` for a name already held is a `ConflictException` (409) rather than a
+//! second domain or a silent overwrite.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +169,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDomain"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDomainErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Every ARN this domain reports is regional, and the region comes from the
+        // request's own SigV4 scope — not from a stored constant.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        if store.domains.contains_key(&input.domain) {
+            return Err(CreateDomainErrorModeled::ConflictException(ConflictException {
+                message: format!("Domain {} already exists.", input.domain),
+                resource_id: Some(input.domain.clone()),
+                resource_type: Some("domain".to_string()),
+            })
+            .into());
+        }
+
+        // A domain is freed only by an explicit DeleteDomain, so the account's domain
+        // quota is what bounds this store. Refused the way the real service refuses it.
+        if store.domains.len() >= crate::state::MAX_DOMAINS {
+            return Err(CreateDomainErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "Cannot create domain {}: the account already holds the maximum of {} domains.",
+                        input.domain,
+                        crate::state::MAX_DOMAINS
+                    ),
+                    resource_id: Some(input.domain.clone()),
+                    resource_type: Some("domain".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let domain = crate::state::Domain {
+            name: input.domain.clone(),
+            owner: ::engine::emulator_account_id().to_string(),
+            arn: crate::state::domain_arn(&region, &input.domain),
+            status: crate::state::DOMAIN_STATUS_ACTIVE.to_string(),
+            created_time: ::std::time::SystemTime::now(),
+            // CodeArtifact encrypts a domain with the key the caller named, or with a
+            // managed key it selects for the domain when the caller named none — and
+            // reports the key either way.
+            encryption_key: Some(input.encryption_key.clone().unwrap_or_else(|| {
+                crate::state::default_encryption_key_arn(&region, &input.domain)
+            })),
+            asset_size_bytes: 0,
+            s3_bucket_arn: crate::state::asset_bucket_arn(&region, &input.domain),
+            tags: input.tags.clone().unwrap_or_default(),
+            policy: None,
+            repositories: ::std::collections::BTreeMap::new(),
+        };
+
+        // The response is the projection of the record that was just STORED, so a later
+        // DescribeDomain cannot disagree with it.
+        let description = domain.description();
+        store.domains.insert(input.domain.clone(), domain);
+
+        Ok(CreateDomainOutput {
+            domain: Some(description),
+        })
     }
 }
+

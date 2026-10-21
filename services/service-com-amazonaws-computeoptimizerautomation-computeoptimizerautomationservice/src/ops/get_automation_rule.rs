@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAutomationRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAutomationRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAutomationRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Looks the rule up by ARN and reports every field the store holds
+//! for it. An ARN no rule has is `ResourceNotFoundException` (404); one that does
+//! not satisfy the modelled `RuleArn` pattern is refused at the boundary as
+//! `InvalidParameterValueException` (400) — see `src/service.rs`.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +181,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAutomationRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAutomationRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAutomationRule"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetAutomationRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service is not mounted on a state-bearing engine".into()),
+                },
+            )
+            .into());
+        };
+
+        let guard = state.lock();
+        let Some(rule) = guard.rules.get(&input.rule_arn) else {
+            return Err(GetAutomationRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No automation rule found with ARN '{}'.",
+                        input.rule_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetAutomationRuleOutput {
+            rule_arn: Some(rule.rule_arn.clone()),
+            rule_id: Some(rule.rule_id.clone()),
+            name: Some(rule.name.clone()),
+            description: rule.description.clone(),
+            rule_type: Some(rule.rule_type.clone()),
+            rule_revision: Some(rule.rule_revision),
+            account_id: Some(rule.account_id.clone()),
+            organization_configuration: rule.organization_configuration.clone(),
+            priority: rule.priority.clone(),
+            recommended_action_types: Some(rule.recommended_action_types.clone()),
+            criteria: rule.criteria.clone(),
+            schedule: Some(rule.schedule.clone()),
+            status: Some(rule.status.clone()),
+            tags: Some(rule.tags.clone()),
+            created_timestamp: Some(rule.created_timestamp),
+            last_updated_timestamp: rule.last_updated_timestamp,
+        })
     }
 }

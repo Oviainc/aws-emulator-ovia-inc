@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSignalCatalog
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSignalCatalog`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSignalCatalog::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: inserts a new signal catalog into this service's state and reports the
+//! name and the ARN it minted. Re-creating a name that is already taken is a
+//! `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -99,11 +93,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iotfleetwise-iotautobah
 // here — hence the `CreateSignalCatalogError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.iotfleetwise#CreateSignalCatalog")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.iotfleetwise#CreateSignalCatalog",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateSignalCatalogErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
+    InternalServerException(InternalServerException),
     InvalidNodeException(InvalidNodeException),
     InvalidSignalsException(InvalidSignalsException),
     LimitExceededException(LimitExceededException),
@@ -162,18 +160,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSignalCatalog` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSignalCatalogErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSignalCatalog"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateSignalCatalogErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(
+            &region,
+            crate::state::SIGNAL_CATALOG_RESOURCE_TYPE,
+            &input.name,
+        );
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
+        let mut store = state.lock();
+        if store.signal_catalogs.contains_key(&input.name) {
+            return Err(CreateSignalCatalogErrorModeled::ConflictException(ConflictException {
+                message: format!("signal catalog {} already exists", input.name),
+                resource: input.name.clone(),
+                resource_type: crate::state::SIGNAL_CATALOG_RESOURCE_TYPE.to_string(),
+            })
+            .into());
+        }
+
+        // Signal catalogs are metered per account and Region, and this operation models
+        // `LimitExceededException` for the case. Refusing here is also what bounds the
+        // store: every entry a create inserts lives until it is deleted.
+        if store.signal_catalogs.len() >= crate::state::MAX_SIGNAL_CATALOGS {
+            return Err(CreateSignalCatalogErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: format!(
+                        "the signal catalog quota of {} for this account and Region has been \
+                         reached",
+                        crate::state::MAX_SIGNAL_CATALOGS
+                    ),
+                    resource_id: input.name.clone(),
+                    resource_type: crate::state::SIGNAL_CATALOG_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        store.signal_catalogs.insert(
+            input.name.clone(),
+            crate::state::SignalCatalogRecord {
+                name: input.name.clone(),
+                arn: arn.clone(),
+                description: input.description,
+                nodes: input.nodes.unwrap_or_default(),
+                tags: input.tags.unwrap_or_default(),
+                creation_time: now,
+                last_modification_time: now,
+            },
+        );
+
+        Ok(CreateSignalCatalogOutput {
+            name: input.name,
+            arn,
+        })
     }
 }

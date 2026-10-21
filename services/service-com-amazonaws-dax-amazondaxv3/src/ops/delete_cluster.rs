@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves the stored cluster into the non-terminal `deleting` status and answers it as it
+//! stood. Removing it is owed by the CLOCK, due [`crate::state::STATUS_SETTLE_DELAY`]
+//! after this call: until then `DescribeClusters` still reports the cluster as
+//! `deleting`, and after it the name is free again and a describe for it answers
+//! `ClusterNotFoundFault`. An unknown name is answered with `ClusterNotFoundFault`, and
+//! a cluster that is not `available` with `InvalidClusterStateFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +147,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCluster"))
+        let _ = ctx;
+        let state = crate::state::store(&*self.engine, Self::NAME)?;
+        let now = ::std::time::SystemTime::now();
+
+        let cluster_name = input.cluster_name.to_lowercase();
+        let mut store = state.lock();
+        store.settle_due(now);
+
+        let Some(cluster) = store.clusters.get_mut(&cluster_name) else {
+            return Err(
+                DeleteClusterErrorModeled::ClusterNotFoundFault(ClusterNotFoundFault {
+                    message: Some(format!("Cluster {cluster_name} does not exist")),
+                })
+                .into(),
+            );
+        };
+        if cluster.status != crate::state::CLUSTER_AVAILABLE {
+            return Err(
+                DeleteClusterErrorModeled::InvalidClusterStateFault(InvalidClusterStateFault {
+                    message: Some(format!(
+                        "Cluster {cluster_name} is {}, not {}",
+                        cluster.status,
+                        crate::state::CLUSTER_AVAILABLE
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        cluster.status = crate::state::CLUSTER_DELETING.to_string();
+        for node in &mut cluster.nodes {
+            node.node_status = crate::state::NODE_DELETING.to_string();
+        }
+        cluster.settles_at = Some(now + crate::state::STATUS_SETTLE_DELAY);
+
+        Ok(DeleteClusterOutput {
+            cluster: Some(cluster.view()),
+        })
     }
 }

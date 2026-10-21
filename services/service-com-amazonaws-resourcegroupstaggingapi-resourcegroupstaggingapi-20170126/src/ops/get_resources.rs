@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored resources — ARN and tag set — that the request's filters
+//! select, one page at a time. It is a pure projection of what `TagResources` and
+//! `UntagResources` wrote: `TagFilters` are AND-ed across keys with each filter's
+//! `Values` OR-ed, `ResourceTypeFilters` match the `service[:resourceType]` key
+//! embedded in the ARN, and `ResourceARNList` restricts the answer to the named
+//! ARNs.
 //!
 //! ## Shape of an operation
 //!
@@ -220,18 +217,180 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResources"))
+        let _ = ctx;
+
+        /// A documented restriction the model cannot express, reported with the
+        /// error the service declares for it rather than the generic 400.
+        fn invalid(message: String) -> GetResourcesError {
+            GetResourcesErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+            .into()
+        }
+
+        let tag_filters: &[TagFilter] = input.tag_filters.as_deref().unwrap_or_default();
+        let type_filters: &[String] = input.resource_type_filters.as_deref().unwrap_or_default();
+        let arn_list: &[String] = input.resource_arn_list.as_deref().unwrap_or_default();
+        let token = input.pagination_token.as_deref().unwrap_or_default();
+
+        // "You can't specify both this parameter and the ResourceTypeFilters /
+        // TagFilters parameter … and any of the pagination parameters
+        // (ResourcesPerPage, TagsPerPage, PaginationToken) in the same request.
+        // If you do, you get an Invalid Parameter exception."
+        if !arn_list.is_empty() {
+            for (member, also_specified) in [
+                ("TagFilters", !tag_filters.is_empty()),
+                ("ResourceTypeFilters", !type_filters.is_empty()),
+                ("ResourcesPerPage", input.resources_per_page.is_some()),
+                ("TagsPerPage", input.tags_per_page.is_some()),
+                ("PaginationToken", !token.is_empty()),
+            ] {
+                if also_specified {
+                    return Err(invalid(format!(
+                        "ResourceARNList and {member} can't both be specified in the same request"
+                    )));
+                }
+            }
+        }
+
+        // Documented ranges neither member carries as a modelled constraint.
+        if let Some(per_page) = input.resources_per_page {
+            if !(crate::state::MIN_RESOURCES_PER_PAGE..=crate::state::MAX_RESOURCES_PER_PAGE)
+                .contains(&per_page)
+            {
+                return Err(invalid(format!(
+                    "ResourcesPerPage must be between {} and {}; got {per_page}",
+                    crate::state::MIN_RESOURCES_PER_PAGE,
+                    crate::state::MAX_RESOURCES_PER_PAGE,
+                )));
+            }
+        }
+        if let Some(tags_per_page) = input.tags_per_page {
+            if !(crate::state::MIN_TAGS_PER_PAGE..=crate::state::MAX_TAGS_PER_PAGE)
+                .contains(&tags_per_page)
+            {
+                return Err(invalid(format!(
+                    "TagsPerPage must be between {} and {}; got {tags_per_page}",
+                    crate::state::MIN_TAGS_PER_PAGE,
+                    crate::state::MAX_TAGS_PER_PAGE,
+                )));
+            }
+        }
+
+        let include_compliance_details = input.include_compliance_details.unwrap_or(false);
+        let exclude_compliant_resources = input.exclude_compliant_resources.unwrap_or(false);
+        // "You can use this parameter only if the IncludeComplianceDetails
+        // parameter is also set to true."
+        if exclude_compliant_resources && !include_compliance_details {
+            return Err(invalid(
+                "ExcludeCompliantResources can be specified only when IncludeComplianceDetails is true"
+                    .to_string(),
+            ));
+        }
+        // Reporting a resource's compliance, or selecting only the NONCOMPLIANT
+        // ones, needs an effective tag policy to judge resources against, and
+        // this emulator models none. Filling `ComplianceDetails` from an empty
+        // policy would claim every resource is compliant, and
+        // `ExcludeCompliantResources` would serve an empty "nothing is
+        // noncompliant" list — both answers for work nothing did — so both
+        // members are refused, honestly, as not written yet.
+        if include_compliance_details || exclude_compliant_resources {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetResources with IncludeComplianceDetails or ExcludeCompliantResources \
+                 (no effective tag policy is modelled)",
+            ));
+        }
+
+        // "Each TagFilter must contain a key with values optional."
+        if tag_filters.iter().any(|filter| filter.key.is_none()) {
+            return Err(invalid(
+                "each TagFilters entry must contain a Key".to_string(),
+            ));
+        }
+
+        // The token is minted for exactly this projection, so a token cut from
+        // another operation, another filter set or another compliance scope is
+        // refused rather than resumed against a list it never belonged to.
+        let mut scope: Vec<String> = vec![Self::NAME.to_string()];
+        for filter in tag_filters {
+            scope.push(filter.key.clone().unwrap_or_default());
+            let mut values = filter.values.clone().unwrap_or_default();
+            values.sort();
+            scope.push(values.len().to_string());
+            scope.extend(values);
+        }
+        scope.push(type_filters.len().to_string());
+        scope.extend(type_filters.iter().cloned());
+        scope.push(arn_list.len().to_string());
+        scope.extend(arn_list.iter().cloned());
+        scope.push(include_compliance_details.to_string());
+        scope.push(exclude_compliant_resources.to_string());
+        let scope: Vec<&str> = scope.iter().map(String::as_str).collect();
+        let fingerprint = crate::state::page_fingerprint(&scope);
+
+        let after = if token.is_empty() {
+            None
+        } else {
+            match crate::state::decode_pagination_token(token, &fingerprint) {
+                Some(after) => Some(after),
+                None => {
+                    return Err(GetResourcesErrorModeled::PaginationTokenExpiredException(
+                        PaginationTokenExpiredException {
+                            message: Some(
+                                "the specified PaginationToken is not valid for this request"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            }
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetResourcesErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the tagging store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // An ARN in `ResourceARNList` that nothing ever tagged "doesn't generate
+        // an error; it simply isn't included in the response". Rows are borrowed
+        // from the store, so no row the page discards is ever cloned.
+        let selected: Vec<(String, &crate::state::ResourceEntry)> = state
+            .resources
+            .values()
+            .filter(|entry| arn_list.is_empty() || arn_list.iter().any(|arn| arn == &entry.arn))
+            .filter(|entry| entry.matches_resource_type_filters(type_filters))
+            .filter(|entry| entry.matches_tag_filters(tag_filters))
+            .map(|entry| (entry.arn.clone(), entry))
+            .collect();
+
+        let per_page = input
+            .resources_per_page
+            .unwrap_or(crate::state::MAX_RESOURCES_PER_PAGE)
+            .max(crate::state::MIN_RESOURCES_PER_PAGE) as usize;
+        let tags_budget = input.tags_per_page.map(|budget| budget.max(0) as usize);
+
+        let (entries, next) = crate::state::page(
+            selected,
+            after.as_deref(),
+            per_page,
+            tags_budget,
+            crate::state::ResourceEntry::tags_per_page_cost_of,
+            &fingerprint,
+        );
+
+        Ok(GetResourcesOutput {
+            // Present but empty when the page is the last one: the token "indicates
+            // that there is more data available than this response contains".
+            pagination_token: Some(next.unwrap_or_default()),
+            resource_tag_mapping_list: Some(
+                entries.iter().map(|entry| entry.mapping()).collect(),
+            ),
+        })
     }
 }

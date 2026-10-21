@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateServiceNetworkServiceAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateServiceNetworkServiceAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateServiceNetworkServiceAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: resolves both identifiers against persisted records, mints the
+//! association and links the two resources.
 //!
 //! ## Shape of an operation
 //!
@@ -148,6 +142,37 @@ impl From<CreateServiceNetworkServiceAssociationErrorModeled> for CreateServiceN
     }
 }
 
+/// HTTP 404 for an identifier that names no persisted resource of `kind`.
+fn not_found(identifier: &str, kind: &str) -> CreateServiceNetworkServiceAssociationError {
+    CreateServiceNetworkServiceAssociationErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: format!("{kind} {identifier} not found"),
+            resource_id: identifier.to_string(),
+            resource_type: kind.to_string(),
+        },
+    )
+    .into()
+}
+
+/// The response for a stored association — every member read back out of state, with
+/// the status the clock owes it at `now`.
+fn output_of(
+    association: &crate::state::ServiceNetworkServiceAssociation,
+    now: std::time::SystemTime,
+) -> CreateServiceNetworkServiceAssociationOutput {
+    CreateServiceNetworkServiceAssociationOutput {
+        id: Some(association.id.clone()),
+        status: Some(association.status(now).to_string()),
+        arn: Some(association.arn.clone()),
+        created_by: Some(association.created_by.clone()),
+        custom_domain_name: association.custom_domain_name.clone(),
+        dns_entry: Some(DnsEntry {
+            domain_name: Some(association.dns_domain_name.clone()),
+            hosted_zone_id: Some(association.dns_hosted_zone_id.clone()),
+        }),
+    }
+}
+
 /// The `CreateServiceNetworkServiceAssociation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -184,18 +209,177 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateServiceNetworkServiceAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServiceNetworkServiceAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateServiceNetworkServiceAssociation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateServiceNetworkServiceAssociationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the vpc-lattice state store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::region_of(ctx.parts());
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The modelled `TagMap` ceiling, which the boundary does not refuse here.
+        if let Err(reason) = crate::state::check_tag_count(input.tags.as_ref()) {
+            return Err(
+                CreateServiceNetworkServiceAssociationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!("tags {reason}"),
+                        reason: "fieldValidationFailed".to_string(),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "tags".to_string(),
+                            message: reason,
+                        }]),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Both identifiers resolve in either modelled form (bare id or ARN).
+        let requested_service = crate::state::id_from_identifier(
+            &input.service_identifier,
+            crate::state::PREFIX_SERVICE,
+        );
+        let requested_network = crate::state::id_from_identifier(
+            &input.service_network_identifier,
+            crate::state::PREFIX_SERVICE_NETWORK,
+        );
+
+        // `clientToken` is an @idempotencyToken: a retry carrying the token of a
+        // completed create answers with that same association — and, as that member's
+        // documentation says, "If the parameters aren't identical, the retry fails."
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::token_key(Self::NAME, token));
+        if let Some(existing) = token
+            .as_ref()
+            .and_then(|key| store.idempotency_tokens.get(key))
+            .and_then(|id| store.service_associations.get(id))
+        {
+            if requested_service.as_ref() != Some(&existing.service_id)
+                || requested_network.as_ref() != Some(&existing.service_network_id)
+            {
+                return Err(
+                    CreateServiceNetworkServiceAssociationErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "clientToken was already used to associate service {} with service network {}",
+                                existing.service_id, existing.service_network_id
+                            ),
+                            resource_id: existing.id.clone(),
+                            resource_type: crate::state::KIND_SERVICE_ASSOCIATION.to_string(),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            return Ok(output_of(existing, now));
+        }
+
+        // Each identifier must name something actually persisted.
+        let Some(service_id) = requested_service.filter(|id| store.services.contains_key(id))
+        else {
+            return Err(not_found(
+                &input.service_identifier,
+                crate::state::KIND_SERVICE,
+            ));
+        };
+        let Some(network_id) =
+            requested_network.filter(|id| store.service_networks.contains_key(id))
+        else {
+            return Err(not_found(
+                &input.service_network_identifier,
+                crate::state::KIND_SERVICE_NETWORK,
+            ));
+        };
+
+        // "You can't use this operation if the service and service network are already
+        // associated" (the operation's own documentation).
+        if let Some(existing) = store.association_of(&network_id, &service_id) {
+            return Err(
+                CreateServiceNetworkServiceAssociationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "service {service_id} is already associated with service network {network_id}"
+                        ),
+                        resource_id: existing.id.clone(),
+                        resource_type: crate::state::KIND_SERVICE_ASSOCIATION.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The emulator's own ceiling on stored associations, answered with the modelled
+        // 402 so a caller looping on create cannot grow this process without bound.
+        if store.service_associations.len() >= crate::state::MAX_SERVICE_ASSOCIATIONS {
+            return Err(
+                CreateServiceNetworkServiceAssociationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this account already holds the maximum of {} service network service associations",
+                            crate::state::MAX_SERVICE_ASSOCIATIONS
+                        ),
+                        resource_id: None,
+                        resource_type: crate::state::KIND_SERVICE_ASSOCIATION.to_string(),
+                        service_code: crate::state::ARN_SERVICE.to_string(),
+                        quota_code: "service-network-service-associations-per-account".to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let service = store
+            .services
+            .get(&service_id)
+            .expect("the service id was just checked against the store")
+            .clone();
+        let network = store
+            .service_networks
+            .get(&network_id)
+            .expect("the service network id was just checked against the store")
+            .clone();
+
+        let id = crate::state::mint_id(crate::state::PREFIX_SERVICE_ASSOCIATION);
+        let sequence = store.next_sequence();
+        let (domain_name, hosted_zone_id) = service.dns_entry();
+        let record = crate::state::ServiceNetworkServiceAssociation {
+            arn: crate::state::arn_for(&region, crate::state::KIND_SERVICE_ASSOCIATION, &id),
+            id: id.clone(),
+            created_by: crate::state::account_id().to_string(),
+            created_at: now,
+            // Association is asynchronous: CREATE_IN_PROGRESS until this stored due
+            // instant passes, then ACTIVE.
+            active_at: now + crate::state::CREATE_TRANSITION,
+            service_id: service.id.clone(),
+            service_arn: service.arn.clone(),
+            service_name: service.name.clone(),
+            service_network_id: network.id.clone(),
+            service_network_arn: network.arn.clone(),
+            service_network_name: network.name.clone(),
+            dns_domain_name: domain_name,
+            dns_hosted_zone_id: hosted_zone_id,
+            custom_domain_name: service.custom_domain_name.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+            sequence,
+        };
+
+        if let Some(key) = token {
+            store.idempotency_tokens.record(key, id.clone());
+        }
+        store.service_associations.insert(id.clone(), record);
+        let stored = store
+            .service_associations
+            .get(&id)
+            .expect("the association was just inserted under this id");
+        Ok(output_of(stored, now))
     }
 }

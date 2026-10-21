@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAutomationRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAutomationRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAutomationRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Removes the rule from the store under an optimistic-concurrency
+//! check on `ruleRevision`, and answers an empty body. Every later reader of that
+//! ARN sees `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +155,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAutomationRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAutomationRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAutomationRule"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteAutomationRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service is not mounted on a state-bearing engine".into()),
+                },
+            )
+            .into());
+        };
+
+        let mut probe = input.clone();
+        probe.client_token = None;
+        let request_fingerprint = crate::state::fingerprint(&probe);
+        let client_token = input.client_token.as_deref();
+
+        let mut guard = state.lock();
+
+        match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
+            crate::state::TokenOutcome::Fresh => {}
+            // A retry of the same delete: the rule is already gone, which is the
+            // outcome the first call reported.
+            crate::state::TokenOutcome::Replay(_) => {
+                return Ok(DeleteAutomationRuleOutput {});
+            }
+            crate::state::TokenOutcome::ParameterMismatch => {
+                return Err(
+                    DeleteAutomationRuleErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(
+                                "The same client token was used with different parameters.".into(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::TokenOutcome::TokenInUse => {
+                return Err(DeleteAutomationRuleErrorModeled::IdempotencyTokenInUseException(
+                    IdempotencyTokenInUseException {
+                        message: Some("The specified client token is already in use.".into()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(rule) = guard.rules.get(&input.rule_arn) else {
+            return Err(DeleteAutomationRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No automation rule found with ARN '{}'.",
+                        input.rule_arn
+                    )),
+                },
+            )
+            .into());
+        };
+        // `ruleRevision` is the rule's optimistic-concurrency token here too: a
+        // delete carrying a stale revision is refused rather than applied to a
+        // rule that has changed since the caller read it.
+        if rule.rule_revision != input.rule_revision {
+            return Err(
+                DeleteAutomationRuleErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Value '{}' at 'ruleRevision' failed to satisfy constraint: Member \
+                             must match the current revision of rule '{}'",
+                            input.rule_revision, input.rule_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        guard.rules.remove(&input.rule_arn);
+        guard.record_token(
+            client_token,
+            Self::NAME,
+            &request_fingerprint,
+            Some(input.rule_arn.clone()),
+        );
+
+        Ok(DeleteAutomationRuleOutput {})
     }
 }
