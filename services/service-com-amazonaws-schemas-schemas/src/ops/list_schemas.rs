@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSchemas
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSchemas`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSchemas::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the schemas stored in one registry, one page at a time. A pure read.
 //!
 //! ## Shape of an operation
 //!
@@ -90,12 +83,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-schemas-schemas.json");
 // here — hence the `ListSchemasError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.schemas#ListSchemas")]
+//
+// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
+// that this operation's `errors` list omits: the registry whose schemas are listed is
+// named by an `@httpLabel`, so a listing of a registry that does not exist has no
+// empty answer to give — it is the same 404 every other registry-scoped operation
+// here declares.
+#[smithy_macros::operation_error(
+    "com.amazonaws.schemas#ListSchemas",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum ListSchemasErrorModeled {
     BadRequestException(BadRequestException),
     ForbiddenException(ForbiddenException),
     InternalServerErrorException(InternalServerErrorException),
+    NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
     UnauthorizedException(UnauthorizedException),
 }
@@ -151,18 +154,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSchemas` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSchemasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSchemas"))
+        // `ctx` carries request metadata only; a listing mints no ARN, so there is
+        // nothing in it this operation needs.
+        let _ = ctx;
+        // The model gives `Limit` no range: fewer than one item is not a page, and
+        // more than `MAX_PAGE_SIZE` would materialise the whole selected store into
+        // one response, so the handler owns both bounds.
+        let page_size = crate::state::requested_page_size(input.limit).map_err(|refusal| {
+            ListSchemasError::from(ListSchemasErrorModeled::BadRequestException(refusal))
+        })?;
+
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSchemasError::from(ListSchemasErrorModeled::InternalServerErrorException(
+                crate::state::internal_error(),
+            ))
+        })?;
+        let state = store.lock();
+
+        let registry = state.registries.get(&input.registry_name).ok_or_else(|| {
+            ListSchemasError::from(ListSchemasErrorModeled::NotFoundException(
+                crate::state::registry_not_found(&input.registry_name),
+            ))
+        })?;
+
+        // The members that decide WHICH schemas this listing contains. Bound into the
+        // `NextToken`, so a token cannot resume a differently-selected listing.
+        let selection = format!(
+            "registryName={};schemaNamePrefix={}",
+            input.registry_name,
+            input.schema_name_prefix.as_deref().unwrap_or_default()
+        );
+
+        let matching = registry.schemas.iter().filter(|(name, _)| {
+            input
+                .schema_name_prefix
+                .as_deref()
+                .is_none_or(|prefix| name.starts_with(prefix))
+        });
+        let page = crate::state::page_by_key(
+            matching,
+            &selection,
+            input.next_token.as_deref(),
+            page_size,
+        )
+        .map_err(|_| {
+            ListSchemasError::from(ListSchemasErrorModeled::BadRequestException(
+                crate::state::invalid_next_token(),
+            ))
+        })?;
+
+        Ok(ListSchemasOutput {
+            next_token: page.next_token,
+            schemas: Some(
+                page.items
+                    .into_iter()
+                    .map(|schema| SchemaSummary {
+                        last_modified: Some(schema.last_modified.into()),
+                        schema_arn: Some(schema.arn.clone()),
+                        schema_name: Some(schema.name.clone()),
+                        tags: crate::state::tags_to_output(&schema.tags),
+                        // "The number of versions available for the schema" —
+                        // counted from the versions actually stored, not from the
+                        // latest version number, which a DeleteSchemaVersion would
+                        // outrun.
+                        version_count: Some(
+                            i64::try_from(schema.versions.len()).unwrap_or(i64::MAX),
+                        ),
+                    })
+                    .collect(),
+            ),
+        })
     }
 }
