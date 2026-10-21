@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEntitlements
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEntitlements`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEntitlements::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages the entitlements actually stored for one application.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +153,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEntitlements` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEntitlementsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEntitlements"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEntitlementsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the account-access store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        store.settle(now);
+
+        if !store.applications.contains_key(&input.application_arn) {
+            return Err(ListEntitlementsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no application with ARN {}",
+                        input.application_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The token names the entitlement the previous page stopped on, so a resumed
+        // listing continues at exactly the next one.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(entitlement_id) => Some(entitlement_id),
+                None => {
+                    return Err(ListEntitlementsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "nextToken is not a token this service issued".to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let ids = store.entitlement_ids(&input.application_arn);
+        let start = match resume_after.as_deref() {
+            None => 0,
+            Some(entitlement_id) => match ids.iter().position(|stored| stored == entitlement_id) {
+                Some(position) => position + 1,
+                None => {
+                    return Err(ListEntitlementsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "nextToken resumes after entitlement {entitlement_id}, which is \
+                                 no longer an entitlement of application {}",
+                                input.application_arn
+                            )),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // A listing is always bounded: the model bounds `maxResults` to 1..100, so the
+        // boundary validator has already refused a value outside it; an absent one
+        // pages at the service's own default rather than collecting the whole store,
+        // and a supplied one is clamped to the modeled range before it is used.
+        let page_size = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .map_or(crate::state::DEFAULT_MAX_RESULTS, |max_results| {
+                max_results.clamp(1, crate::state::DEFAULT_MAX_RESULTS)
+            });
+
+        let matching: Vec<&crate::state::EntitlementRecord> = ids[start..]
+            .iter()
+            .filter_map(|entitlement_id| store.entitlements.get(entitlement_id))
+            .filter(|record| record.matches(&input.filter))
+            .collect();
+        let truncated = matching.len() > page_size;
+        let page = if truncated {
+            &matching[..page_size]
+        } else {
+            &matching[..]
+        };
+
+        Ok(ListEntitlementsOutput {
+            entitlements: page
+                .iter()
+                .map(|record| EntitlementsListMember {
+                    entitlement_id: record.entitlement_id.clone(),
+                    entitlement: EntitlementSummary::principalRole(
+                        PrincipalRoleEntitlementSummary {
+                            principal: record.principal.to_modeled(),
+                            role_arn: record.role_arn.clone(),
+                            account: record.account.clone(),
+                            account_name: record.account_name.clone(),
+                        },
+                    ),
+                    created_at: ::aws_smithy_types::DateTime::from_millis(
+                        record.created_at_millis,
+                    ),
+                })
+                .collect(),
+            // A token only when entitlements remain after this page.
+            next_token: if truncated {
+                page.last()
+                    .map(|record| crate::state::encode_page_token(&record.entitlement_id))
+            } else {
+                None
+            },
+        })
     }
 }
