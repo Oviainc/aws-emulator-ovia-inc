@@ -15,7 +15,10 @@ use std::collections::HashMap;
 
 use ::aws_smithy_types::DateTime;
 
-use crate::ops::types::VoiceConnector;
+use crate::ops::types::{
+    BadRequestException, NotFoundException, ResourceLimitExceededException,
+    ServiceFailureException, VoiceConnector,
+};
 
 /// The Region a Voice Connector is created in when the request names none.
 ///
@@ -45,6 +48,50 @@ pub const MAX_LIST_PAGE_SIZE: i32 = 100;
 /// while the refusal it produces is the error the model declares for exactly this case:
 /// `ResourceLimitExceededException` (HTTP 400, "The request exceeds the resource limit.").
 pub const MAX_VOICE_CONNECTORS: usize = 500;
+
+// The failures the Voice Connector operations share.
+//
+// Each of the five handlers raises these through its OWN operation's error enum (the
+// variants a model declares differ per operation), but the payload inside is the same
+// refusal, and a payload built inline in five places drifts in wording. These
+// constructors are the one place each payload's `Code` — a value of the model's
+// `ErrorCode` enum — and its message are chosen.
+
+/// `BadRequestException`'s payload: the request broke a rule the service enforces.
+pub fn bad_request(message: impl Into<String>) -> BadRequestException {
+    BadRequestException {
+        code: Some("BadRequest".to_string()),
+        message: Some(message.into()),
+    }
+}
+
+/// `NotFoundException`'s payload for a well-formed id that names no stored connector.
+pub fn voice_connector_not_found(voice_connector_id: &str) -> NotFoundException {
+    NotFoundException {
+        code: Some("NotFound".to_string()),
+        message: Some(format!("no Voice Connector with id {voice_connector_id}")),
+    }
+}
+
+/// `ServiceFailureException`'s payload for a state store that could not be reached —
+/// the one case a handler cannot serve from state at all.
+pub fn store_unavailable() -> ServiceFailureException {
+    ServiceFailureException {
+        code: Some("ServiceFailure".to_string()),
+        message: Some("the Voice Connector store is unavailable".to_string()),
+    }
+}
+
+/// `ResourceLimitExceededException`'s payload for a store already holding
+/// [`MAX_VOICE_CONNECTORS`] connectors.
+pub fn voice_connector_limit_reached() -> ResourceLimitExceededException {
+    ResourceLimitExceededException {
+        code: Some("ResourceLimitExceeded".to_string()),
+        message: Some(format!(
+            "this account already holds the maximum of {MAX_VOICE_CONNECTORS} Voice Connectors"
+        )),
+    }
+}
 
 /// One persisted Voice Connector.
 ///

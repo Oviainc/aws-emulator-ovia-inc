@@ -212,6 +212,16 @@ pub struct SipRule {
 // traits are deliberately absent: the validating walk runs on operation INPUTS only, and
 // `VoiceConnector` is an output shape, so the macro's captured constraints would be inert
 // here too (see the note in the vendored macro's `emit_struct_impls`).
+//
+// REMOVE THIS BLOCK when the vendored codegen learns `smithy.api#timestampFormat`: the
+// fix belongs there, not here, because every `@timestampFormat` member of every service
+// has the same defect and `vendor/` is outside what a fix may change. Once
+// `vendor/smithy-macros` emits `with_timestamp_format` (grep it: the only call sites in
+// the tree are the two below), delete the hand-written schema, the two impls and this
+// comment, and put `#[smithy_macros::smithy(shape =
+// "com.amazonaws.chimesdkvoice#VoiceConnector")]` back on the struct — the tests in
+// `tests/all/probe_scratch.rs` pin the format, so they fail if the attribute does not
+// carry it.
 #[derive(Debug, Clone, Default)]
 pub struct VoiceConnector {
     pub voice_connector_id: Option<String>,
