@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deploys a new environment from a stored environment template and answers with the
+//! record it stored. The environment's name is its identity (a second create of the
+//! same name is a `ConflictException`), the template it names must already exist
+//! (`ResourceNotFoundException` otherwise), and the deployment it starts is reported
+//! `IN_PROGRESS` until the clock makes it due.
 //!
 //! ## Shape of an operation
 //!
@@ -206,18 +203,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Every modelled constraint on the input (`name`, `templateName`, both template
+        // version parts, `spec`, the role ARNs, the connection id) was already refused
+        // by the centralized walk, so reaching here means the input satisfies them.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEnvironment"))
+        // An environment account connection and a linked provisioning repository are
+        // minted by `CreateEnvironmentAccountConnection` and `CreateRepository`, which
+        // are still scaffolded — so no such resource can exist in this emulator yet and
+        // a request naming one names an absent resource. Answer that with the modelled
+        // 404 rather than inventing the resource; when those operations are implemented,
+        // this becomes a lookup in their state.
+        if let Some(connection) = input.environment_account_connection_id.as_deref() {
+            return Err(CreateEnvironmentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Environment account connection {connection} not found"),
+                },
+            )
+            .into());
+        }
+        if let Some(repository) = input.provisioning_repository.as_ref() {
+            return Err(CreateEnvironmentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Repository {} ({}) not found",
+                        repository.name, repository.provider
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateEnvironmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Proton store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.settle_environments(now);
+
+        let Some(template) = state.environment_templates.get(&input.template_name) else {
+            return Err(CreateEnvironmentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Environment template {} not found",
+                        input.template_name
+                    ),
+                },
+            )
+            .into());
+        };
+        // An environment is customer-managed exactly when its template is.
+        let provisioning = template.provisioning.clone();
+
+        if state.environments.contains_key(&input.name) {
+            return Err(CreateEnvironmentErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!("Environment {} already exists", input.name),
+                },
+            )
+            .into());
+        }
+
+        if state.environments.len() >= crate::state::MAX_ENVIRONMENTS {
+            return Err(CreateEnvironmentErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The number of environments has reached the quota of {}",
+                        crate::state::MAX_ENVIRONMENTS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::EnvironmentRecord {
+            name: input.name.clone(),
+            arn: crate::state::environment_arn(&region, &input.name),
+            created_at: now,
+            last_deployment_attempted_at: now,
+            // No deployment has succeeded yet; the clock-owed completion below moves
+            // this to the instant the deployment fell due.
+            last_deployment_succeeded_at: now,
+            template_name: input.template_name,
+            template_major_version: input.template_major_version,
+            // The minor version is resolved against the major version's published
+            // versions; with none published, the only minor version of a major version
+            // is its first.
+            template_minor_version: input
+                .template_minor_version
+                .unwrap_or_else(|| "0".to_string()),
+            deployment_status: crate::state::DEPLOYMENT_IN_PROGRESS.to_string(),
+            deployment_status_message: None,
+            description: input.description,
+            spec: Some(input.spec),
+            provisioning,
+            proton_service_role_arn: input.proton_service_role_arn,
+            component_role_arn: input.component_role_arn,
+            codebuild_role_arn: input.codebuild_role_arn,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| (tag.key, tag.value))
+                .collect(),
+            pending: Some((
+                crate::state::PendingEnvironmentChange::Deploy,
+                now + crate::state::DEPLOYMENT_SETTLE_DELAY,
+            )),
+        };
+        let environment = record.view();
+        state.environments.insert(input.name, record);
+
+        Ok(CreateEnvironmentOutput { environment })
     }
 }
