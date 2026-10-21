@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetOfferTerms
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetOfferTerms`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetOfferTerms::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the terms stored against `offerId` in the emulator's seeded catalog, or
+//! answers `ResourceNotFoundException` when the catalog holds no such offer.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +146,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetOfferTerms` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetOfferTermsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetOfferTerms"))
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| GetOfferTermsError::validation("the catalog store is unavailable"))?;
+        let state = store.lock();
+
+        let preferred = crate::state::resolve_requested_locale(input.locale.as_deref())
+            .map_err(GetOfferTermsError::validation)?;
+
+        let offer = state.offers.get(&input.offer_id).ok_or_else(|| {
+            GetOfferTermsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "Offer '{}' does not exist in catalog '{}'",
+                    input.offer_id, state.catalog
+                )),
+            })
+        })?;
+
+        // An offer with no stored terms pages over an empty list; only an offer that does
+        // not exist is a `ResourceNotFoundException`.
+        let terms: &[OfferTerm] = state
+            .offer_terms
+            .get(&offer.offer_id)
+            .map_or(&[], Vec::as_slice);
+
+        // The terms do not vary by locale today, but the page identity carries the
+        // resolved locale like every other paginated operation's, so a token cannot
+        // resume a different content set if localized terms are ever stored.
+        let locale = offer.content_locale(preferred);
+        let identity = format!("GetOfferTerms/{locale}/{}", offer.offer_id);
+        let (page, next_token) = crate::state::page(
+            terms,
+            input.next_token.as_deref(),
+            &identity,
+            input.max_results,
+        )
+        .map_err(GetOfferTermsError::validation)?;
+
+        Ok(GetOfferTermsOutput {
+            locale: Some(locale.to_string()),
+            offer_terms: page.to_vec(),
+            next_token,
+        })
     }
 }
