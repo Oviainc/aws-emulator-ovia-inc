@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkgroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkgroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: inserts a workgroup keyed by `workgroupName` into
+//! [`crate::state::ComAmazonawsRedshiftserverlessRedshiftserverlessState::workgroups`]
+//! and answers with the record it stored, so `GetWorkgroup` / `ListWorkgroups` report
+//! exactly these bytes back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkgroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The workgroup is created in `CREATING` status — one of the four `WorkgroupStatus`
+//! values — and reaches `AVAILABLE` on its own a moment later, with nobody calling; see
+//! [`crate::state::WorkgroupRecord::settle`].
+//!
+//! The store this inserts into is bounded by the account's documented quota
+//! ([`crate::state::MAX_WORKGROUPS`]); past it the create is refused rather than growing
+//! the store without limit.
 //!
 //! ## Shape of an operation
 //!
@@ -196,18 +199,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkgroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkgroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkgroup"))
+        // `port`'s valid ranges are documented on the member, not modelled as a
+        // constraint, so the boundary validator cannot have refused a bad one.
+        if let Some(port) = input.port {
+            if !crate::state::port_in_documented_range(port) {
+                return Err(CreateWorkgroupErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "port {port} is outside the valid port ranges 5431-5455 and 8191-8215"
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateWorkgroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the redshift-serverless store is unreachable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.settle_due_transitions();
+        // The store grows one record per create, so the account's quota bounds it. Read
+        // before the `entry` below takes the borrow; it bounds only a NEW record.
+        let stored_workgroups = state.workgroups.len();
+
+        // A workgroup holds the compute for an existing namespace's database.
+        if !state.namespaces.contains_key(&input.namespace_name) {
+            return Err(CreateWorkgroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no namespace named {}", input.namespace_name),
+                    resource_name: Some(input.namespace_name.clone()),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let workgroup_id = crate::state::new_resource_id();
+        let port = input.port.unwrap_or(crate::state::DEFAULT_PORT);
+        let workgroup = Workgroup {
+            workgroup_arn: Some(crate::state::workgroup_arn(&region, &workgroup_id)),
+            workgroup_id: Some(workgroup_id),
+            workgroup_name: Some(input.workgroup_name.clone()),
+            namespace_name: Some(input.namespace_name.clone()),
+            base_capacity: Some(
+                input
+                    .base_capacity
+                    .unwrap_or(crate::state::DEFAULT_BASE_CAPACITY),
+            ),
+            max_capacity: input.max_capacity,
+            port: Some(port),
+            publicly_accessible: Some(input.publicly_accessible.unwrap_or(false)),
+            enhanced_vpc_routing: Some(input.enhanced_vpc_routing.unwrap_or(false)),
+            config_parameters: Some(input.config_parameters.unwrap_or_default()),
+            security_group_ids: Some(input.security_group_ids.unwrap_or_default()),
+            subnet_ids: Some(input.subnet_ids.unwrap_or_default()),
+            // The endpoint is DERIVED from the workgroup's name and port, not supplied.
+            endpoint: Some(Endpoint {
+                address: Some(crate::state::endpoint_address(
+                    &input.workgroup_name,
+                    &region,
+                )),
+                port: Some(port),
+                vpc_endpoints: Some(Vec::new()),
+            }),
+            creation_date: Some(crate::state::now_timestamp()),
+            workgroup_version: Some(crate::state::WORKGROUP_VERSION.to_string()),
+            // `IpAddressType`'s pattern admits exactly `ipv4` and `dualstack`; a
+            // workgroup created without the member is the plain IPv4 one.
+            ip_address_type: Some(input.ip_address_type.unwrap_or_else(|| "ipv4".to_string())),
+            price_performance_target: input.price_performance_target,
+            track_name: input.track_name,
+            extra_compute_for_automatic_optimization: Some(
+                input
+                    .extra_compute_for_automatic_optimization
+                    .unwrap_or(false),
+            ),
+            ..Workgroup::default()
+        };
+
+        let mut record = crate::state::WorkgroupRecord {
+            workgroup,
+            tags: input.tags.unwrap_or_default(),
+            pending_status: None,
+        };
+        record.begin_transition(
+            crate::state::WORKGROUP_CREATING,
+            crate::state::WORKGROUP_AVAILABLE,
+        );
+
+        // One lookup decides both the conflict and the insert: the name is the
+        // workgroup's identity, so an occupied slot IS the conflict. The answer comes out
+        // of the STORED record, so what the caller reads is what a later GetWorkgroup
+        // reads.
+        match state.workgroups.entry(input.workgroup_name) {
+            ::std::collections::btree_map::Entry::Occupied(occupied) => {
+                Err(CreateWorkgroupErrorModeled::ConflictException(ConflictException {
+                    message: format!("a workgroup named {} already exists", occupied.key()),
+                })
+                .into())
+            }
+            ::std::collections::btree_map::Entry::Vacant(slot) => {
+                if stored_workgroups >= crate::state::MAX_WORKGROUPS {
+                    return Err(CreateWorkgroupErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "this account has reached its quota of {} workgroups in this Region",
+                                crate::state::MAX_WORKGROUPS
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                Ok(CreateWorkgroupOutput {
+                    workgroup: Some(slot.insert(record).workgroup.clone()),
+                })
+            }
+        }
     }
 }
