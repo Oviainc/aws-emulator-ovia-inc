@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTermForReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTermForReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Serves the term document attached to one report version, and MINTS the `termToken`
+//! that document is served under — "a unique token representing this request event", as
+//! the model puts it, and the acceptance receipt `GetReport` requires. The grant is
+//! persisted in [`crate::state`] so `GetReport` can check a token against the report and
+//! version it was issued for; minting it is what this operation DOES, not a side effect
+//! of reading, and no earlier grant is altered or consumed.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTermForReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The grant store is bounded (`crate::state::TERM_GRANT_CAPACITY`), oldest released
+//! first, so repeated acceptance cannot grow the state without end. The emulator models
+//! no IAM, so the modelled `AccessDeniedException` is never raised here, and the grant
+//! records the report version it covers rather than a principal: a pass is not a
+//! statement about an AWS-side authorisation decision.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +157,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTermForReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTermForReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTermForReport"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetTermForReportErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the artifact report catalog is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Resolve the report version the grant will cover BEFORE minting anything, so a
+        // request naming no report leaves no grant behind.
+        let Some(report) = store.reports.get(&input.report_id) else {
+            return Err(GetTermForReportErrorModeled::ResourceNotFoundException(
+                crate::state::report_not_found(&input.report_id),
+            )
+            .into());
+        };
+        let Some(version) = report.resolve(input.report_version) else {
+            // Total in both shapes: the request either named a version this report never
+            // published, or named none and the report publishes none at all. Nothing a
+            // request carries may abort the handler, so neither arm unwraps.
+            let missing = match input.report_version {
+                Some(requested) => {
+                    crate::state::report_version_not_found(&input.report_id, requested)
+                }
+                None => crate::state::report_not_found(&input.report_id),
+            };
+            return Err(GetTermForReportErrorModeled::ResourceNotFoundException(missing).into());
+        };
+        let resolved_version = version.version;
+        let report = report.clone();
+
+        let term_token = store.mint_term_grant(&report.id, resolved_version, now);
+        let document_presigned_url =
+            crate::state::term_document_url(&region, &report, resolved_version, &term_token);
+
+        // The acceptance is a state change, so it is attributable: the report version
+        // accepted, never the token itself.
+        ::tracing::info!(
+            operation = "GetTermForReport",
+            report_id = %report.id,
+            report_version = resolved_version,
+            outcome = "issued",
+            "issued a term grant"
+        );
+
+        Ok(GetTermForReportOutput {
+            document_presigned_url: Some(document_presigned_url),
+            term_token: Some(term_token),
+        })
     }
 }

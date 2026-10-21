@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePerformanceAnalysisReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePerformanceAnalysisReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the stored report (and the tags filed under its ARN), so a
+//! later Get fails and a later List no longer includes it. An unknown id is
+//! `InvalidArgumentException` (HTTP 400).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePerformanceAnalysisReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Authorization is NOT emulated: the emulator holds no IAM principals or
+//! policies, so the modelled `NotAuthorizedException` is never the answer and a
+//! well-formed delete of a stored report is performed. That is a deliberate,
+//! documented divergence, not a permission decision.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +144,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePerformanceAnalysisReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePerformanceAnalysisReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePerformanceAnalysisReport"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeletePerformanceAnalysisReportErrorModeled::InternalServiceError(
+                    InternalServiceError {
+                        message: Some(
+                            "the Performance Insights report store is unavailable".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let _ = ctx;
+
+        let removed = state.lock().remove_report(
+            &input.service_type,
+            &input.identifier,
+            &input.analysis_report_id,
+        );
+        if !removed {
+            return Err(
+                DeletePerformanceAnalysisReportErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(format!(
+                            "AnalysisReportId {} was not found for the resource {}.",
+                            input.analysis_report_id, input.identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(DeletePerformanceAnalysisReportOutput {})
     }
 }

@@ -21,13 +21,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Encodes/decodes the opaque `NextToken` the paginated List* operations emit.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["time"] }
 sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

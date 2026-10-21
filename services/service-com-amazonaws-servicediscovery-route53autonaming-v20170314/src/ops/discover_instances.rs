@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DiscoverInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DiscoverInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DiscoverInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: resolves the namespace and service BY NAME, then answers with the
+//! attribute maps that were persisted by `RegisterInstance`, filtered as the
+//! `QueryParameters`, `OptionalParameters` and `HealthStatus` members document.
 //!
 //! ## Shape of an operation
 //!
@@ -165,6 +159,23 @@ impl<Eng> DiscoverInstances<Eng> {
     }
 }
 
+/// The number of instances returned when the request names no `MaxResults`, as
+/// `DiscoverInstancesRequest$MaxResults` documents: "If you don't specify a value for
+/// MaxResults, Cloud Map returns up to 100 instances."
+const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// Whether `attributes` carries every one of the `filters` key/value pairs, the rule
+/// `QueryParameters` states: "Only instances that match all the specified key-value
+/// pairs are returned."
+fn matches_every(
+    attributes: &std::collections::HashMap<String, String>,
+    filters: &std::collections::HashMap<String, String>,
+) -> bool {
+    filters
+        .iter()
+        .all(|(key, value)| attributes.get(key).is_some_and(|stored| stored == value))
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for DiscoverInstances<Eng>
 {
@@ -182,18 +193,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DiscoverInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DiscoverInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DiscoverInstances"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DiscoverInstancesErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        let state = state.lock();
+
+        // `NamespaceName` is the namespace's `HttpName` (which equals its `Name`
+        // unless a reused name forced a hash onto it), never its id.
+        let Some(namespace) = state.namespace_by_http_name(&input.namespace_name) else {
+            return Err(DiscoverInstancesErrorModeled::NamespaceNotFound(NamespaceNotFound {
+                message: Some(format!(
+                    "No namespace exists with the specified name {}.",
+                    input.namespace_name
+                )),
+            })
+            .into());
+        };
+        let Some(service) = state
+            .service_ids_by_namespace_and_name
+            .get(&(namespace.id.clone(), input.service_name.clone()))
+            .and_then(|service_id| state.services.get(service_id))
+        else {
+            return Err(DiscoverInstancesErrorModeled::ServiceNotFound(ServiceNotFound {
+                message: Some(format!(
+                    "No service exists with the specified name {} in namespace {}.",
+                    input.service_name, namespace.name
+                )),
+            })
+            .into());
+        };
+
+        let empty = std::collections::HashMap::new();
+        let query = input.query_parameters.as_ref().unwrap_or(&empty);
+        let optional = input.optional_parameters.as_ref().unwrap_or(&empty);
+
+        let matched: Vec<&crate::state::InstanceRecord> = service
+            .instances
+            .values()
+            .filter(|instance| matches_every(&instance.attributes, query))
+            .collect();
+
+        // `OptionalParameters` are opportunistic: they narrow the result only when
+        // something still matches, otherwise they are ignored.
+        let narrowed: Vec<&crate::state::InstanceRecord> = if optional.is_empty() {
+            matched.clone()
+        } else {
+            let both: Vec<&crate::state::InstanceRecord> = matched
+                .iter()
+                .copied()
+                .filter(|instance| matches_every(&instance.attributes, optional))
+                .collect();
+            if both.is_empty() {
+                matched.clone()
+            } else {
+                both
+            }
+        };
+
+        // The `HealthStatus` filter is ignored for a service that configures no
+        // health checking: all instances are returned.
+        let selected: Vec<&crate::state::InstanceRecord> = if !service.health_checked() {
+            narrowed
+        } else {
+            let healthy = |instance: &&crate::state::InstanceRecord| {
+                instance.health_status == crate::state::HEALTH_STATUS_HEALTHY
+            };
+            match input.health_status.as_deref() {
+                Some("HEALTHY") => narrowed.into_iter().filter(healthy).collect(),
+                Some("UNHEALTHY") => narrowed
+                    .into_iter()
+                    .filter(|instance| {
+                        instance.health_status == crate::state::HEALTH_STATUS_UNHEALTHY
+                    })
+                    .collect(),
+                // "Returns healthy instances, unless none are reporting a healthy
+                // state. In that case, return all instances" — failing open.
+                Some("HEALTHY_OR_ELSE_ALL") => {
+                    let only_healthy: Vec<&crate::state::InstanceRecord> =
+                        narrowed.iter().copied().filter(healthy).collect();
+                    if only_healthy.is_empty() {
+                        narrowed
+                    } else {
+                        only_healthy
+                    }
+                }
+                // `ALL`, and an absent filter, return everything that matched.
+                _ => narrowed,
+            }
+        };
+
+        // "DiscoverInstances returns a randomized list of instances allowing
+        // customers to distribute traffic evenly across instances": the order is
+        // permuted per call, from the wall clock rather than from any stored counter,
+        // so reading never changes what a later caller sees.
+        let mut ordered: Vec<&crate::state::InstanceRecord> = selected;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        ordered.sort_by_cached_key(|instance| {
+            crate::state::shuffle_key(nonce, &instance.instance_id)
+        });
+
+        let max_results = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        // Both names come from the STORED records, not from the request: the summary
+        // reports the namespace's `HttpName` (which the request may have reached
+        // through the `Name` fallback) and the service's own stored name.
+        let namespace_name = namespace
+            .http_name
+            .clone()
+            .unwrap_or_else(|| namespace.name.clone());
+        let service_name = service.name.clone();
+        let instances: Vec<HttpInstanceSummary> = ordered
+            .into_iter()
+            .take(max_results)
+            .map(|instance| HttpInstanceSummary {
+                instance_id: Some(instance.instance_id.clone()),
+                namespace_name: Some(namespace_name.clone()),
+                service_name: Some(service_name.clone()),
+                health_status: Some(instance.health_status.clone()),
+                attributes: Some(instance.attributes.clone()),
+            })
+            .collect();
+
+        Ok(DiscoverInstancesOutput {
+            instances: Some(instances),
+            instances_revision: Some(service.instances_revision),
+        })
     }
 }

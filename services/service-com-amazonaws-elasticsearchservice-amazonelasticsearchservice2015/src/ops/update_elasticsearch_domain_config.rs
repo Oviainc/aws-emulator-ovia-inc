@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateElasticsearchDomainConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateElasticsearchDomainConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateElasticsearchDomainConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! MERGES the options the request supplies into the stored domain: an option the
+//! request omits keeps its stored value, an option it carries replaces it and is
+//! stamped with the domain's new config version. `DryRun` persists nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +118,97 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{apply_option, DomainConfigRecord};
+
+/// Merge one request's options into a stored config record, at config version
+/// `version`.
+///
+/// The rule, applied uniformly to EVERY option member the operation models: a
+/// member the request carries replaces the stored option and is re-stamped; a
+/// member it omits is left exactly as stored. Answers whether anything changed,
+/// which is what decides whether a version bump is owed.
+fn merge_into(
+    config: &mut DomainConfigRecord,
+    input: UpdateElasticsearchDomainConfigInput,
+    now: ::std::time::SystemTime,
+    version: i32,
+) -> bool {
+    // The cluster config is not optional in the store (the status shape requires
+    // it), so it is merged on its own rather than through `apply_option`.
+    let mut changed = false;
+    if let Some(cluster_config) = input.elasticsearch_cluster_config {
+        config.cluster_config.replace(cluster_config, now, version);
+        changed = true;
+    }
+    changed |= apply_option(&mut config.ebs_options, input.ebs_options, now, version);
+    changed |= apply_option(&mut config.snapshot_options, input.snapshot_options, now, version);
+    changed |= apply_option(
+        &mut config.vpc_options,
+        input.vpc_options.map(crate::state::vpc_derived_info),
+        now,
+        version,
+    );
+    changed |= apply_option(&mut config.cognito_options, input.cognito_options, now, version);
+    changed |= apply_option(
+        &mut config.advanced_options,
+        input
+            .advanced_options
+            .map(|options| options.into_iter().collect()),
+        now,
+        version,
+    );
+    changed |= apply_option(&mut config.access_policies, input.access_policies, now, version);
+    changed |= apply_option(
+        &mut config.log_publishing_options,
+        input
+            .log_publishing_options
+            .map(|options| options.into_iter().collect()),
+        now,
+        version,
+    );
+    changed |= apply_option(
+        &mut config.domain_endpoint_options,
+        input.domain_endpoint_options,
+        now,
+        version,
+    );
+    changed |= apply_option(
+        &mut config.advanced_security_options,
+        input
+            .advanced_security_options
+            .map(crate::state::advanced_security_options),
+        now,
+        version,
+    );
+    changed |= apply_option(
+        &mut config.node_to_node_encryption_options,
+        input.node_to_node_encryption_options,
+        now,
+        version,
+    );
+    changed |= apply_option(
+        &mut config.encryption_at_rest_options,
+        input.encryption_at_rest_options,
+        now,
+        version,
+    );
+    changed |= apply_option(&mut config.auto_tune_options, input.auto_tune_options, now, version);
+    changed |= apply_option(
+        &mut config.deployment_strategy_options,
+        input.deployment_strategy_options,
+        now,
+        version,
+    );
+    changed |= apply_option(
+        &mut config.automated_snapshot_pause_options,
+        input.automated_snapshot_pause_options,
+        now,
+        version,
+    );
+    changed |= apply_option(&mut config.use_case, input.use_case, now, version);
+    changed |= apply_option(&mut config.engine_mode, input.engine_mode, now, version);
+    changed
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -198,18 +283,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateElasticsearchDomainConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateElasticsearchDomainConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateElasticsearchDomainConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateElasticsearchDomainConfigErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the Elasticsearch domain store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let dry_run = input.dry_run.unwrap_or(false);
+        let region = crate::state::request_region(&ctx.parts().headers);
+
+        // A suspension window the documented maximum cannot hold, or an
+        // access-policy document past the documented maximum size, is refused
+        // before anything is merged.
+        let refusal = input
+            .automated_snapshot_pause_options
+            .as_ref()
+            .and_then(crate::state::snapshot_pause_refusal)
+            .or_else(|| {
+                input
+                    .access_policies
+                    .as_deref()
+                    .and_then(crate::state::access_policy_refusal)
+            });
+        if let Some(reason) = refusal {
+            return Err(
+                UpdateElasticsearchDomainConfigErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(reason),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        let Some(domain) = store
+            .domains
+            .get_mut(&crate::state::domain_key(&region, &input.domain_name))
+        else {
+            return Err(
+                UpdateElasticsearchDomainConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Domain not found: {}", input.domain_name)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The merge runs on a COPY, which is committed only when this is not a dry
+        // run — so a dry run shows what the change would produce while leaving the
+        // store untouched.
+        let mut draft = domain.clone();
+        let version = domain.config_version + 1;
+        if merge_into(&mut draft.config, input, now, version) {
+            draft.begin_change(version, now);
+        }
+        let domain_config = draft.domain_config(now);
+        if !dry_run {
+            *domain = draft;
+        }
+
+        Ok(UpdateElasticsearchDomainConfigOutput {
+            domain_config,
+            // DryRunResults reports which deployment type the change would need
+            // (a dynamic update or a blue/green deployment). That classification
+            // is not modelled here, so no value is invented for it.
+            dry_run_results: None,
+        })
     }
 }

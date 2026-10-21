@@ -21,13 +21,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Stable, content-derived suffixes for the asset-bucket and KMS-key ARNs a domain
+# reports (SHA-256 of the domain's account/region/name), so the same domain reports the
+# same ARNs on every read.
+sha2 = { workspace = true }
+# Hex encoding for those ARN suffixes and for the opaque `nextToken` cursors.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

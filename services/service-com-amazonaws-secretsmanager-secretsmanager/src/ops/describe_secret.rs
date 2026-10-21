@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSecret
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSecret`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSecret::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a stored secret's metadata and the live staging state of its versions.
+//! A read: it does not change what a later caller sees, and it answers for a
+//! secret that is scheduled for deletion too — with its `DeletedDate`.
 //!
 //! ## Shape of an operation
 //!
@@ -216,20 +210,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSecret` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSecretErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSecret"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        // The only write a read performs: dropping secrets whose recovery window
+        // has already elapsed, which the clock made due whether or not anybody
+        // called.
+        store.expire_due(::std::time::SystemTime::now());
+
+        let Some(secret) = store.get(&input.secret_id) else {
+            return Err(DescribeSecretErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Secrets Manager can't find the specified secret: {}",
+                        input.secret_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeSecretOutput {
+            arn: Some(secret.arn.clone()),
+            name: Some(secret.name.clone()),
+            r#type: secret.secret_type.clone(),
+            description: secret.description.clone(),
+            kms_key_id: secret.kms_key_id.clone(),
+            rotation_enabled: Some(secret.rotation_enabled),
+            // Rotation is not emulated (`RotateSecret` carries its own stub
+            // issue), so nothing has ever configured or run it for this secret.
+            rotation_lambda_arn: None,
+            rotation_rules: None,
+            external_secret_rotation_metadata: None,
+            external_secret_rotation_role_arn: None,
+            last_rotated_date: None,
+            next_rotation_date: None,
+            last_changed_date: Some(crate::state::timestamp(secret.last_changed_date)),
+            last_accessed_date: secret.last_accessed_date.map(crate::state::timestamp),
+            // "The date the secret is scheduled for deletion. If it is not
+            // scheduled for deletion, this field is omitted."
+            deleted_date: secret.deleted_date.map(crate::state::timestamp),
+            tags: secret.tags_out(),
+            version_ids_to_stages: secret.versions_to_stages(),
+            owning_service: secret.owning_service.clone(),
+            created_date: Some(crate::state::timestamp(secret.created_date)),
+            // "The Region the secret is in."
+            primary_region: Some(secret.region.clone()),
+            // Replication is not emulated, so this secret has no replicas.
+            replication_status: None,
+        })
     }
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> DescribeSecretError {
+    DescribeSecretErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListModels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListModels`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: filters, sorts and pages the models stored in `crate::state`. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListModels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +123,27 @@ impl<Eng> ListModels<Eng> {
     }
 }
 
+/// `SortBy`'s documented default ("Sorts the list of results. The default is
+/// `CreationTime`.").
+const DEFAULT_SORT_BY: &str = "CreationTime";
+
+/// `SortOrder`'s documented default ("The sort order for results. The default is
+/// `Descending`.").
+const DEFAULT_SORT_ORDER: &str = "Descending";
+
+/// A page boundary as an opaque `NextToken`: the hex of the last-returned `ModelName`.
+///
+/// The token names the item the page stopped at rather than an offset, so resuming
+/// lands exactly after it even though the token is opaque to the caller.
+fn encode_token(model_name: &str) -> String {
+    hex::encode(model_name.as_bytes())
+}
+
+/// The `ModelName` a `NextToken` names, or `None` when the token was not minted here.
+fn decode_token(token: &str) -> Option<String> {
+    String::from_utf8(hex::decode(token).ok()?).ok()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListModels<Eng>
 {
@@ -145,20 +159,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListModels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListModelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListModels"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let sort_by = input.sort_by.as_deref().unwrap_or(DEFAULT_SORT_BY);
+        if !matches!(sort_by, "Name" | "CreationTime") {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of Name, CreationTime; got \"{sort_by}\"."
+            )));
+        }
+        let descending = match input.sort_order.as_deref().unwrap_or(DEFAULT_SORT_ORDER) {
+            "Descending" => true,
+            "Ascending" => false,
+            other => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "SortOrder must be one of Ascending, Descending; got \"{other}\"."
+                )))
+            }
+        };
+
+        let after = input.creation_time_after.map(crate::state::timestamp_key);
+        let before = input.creation_time_before.map(crate::state::timestamp_key);
+
+        let store = state.lock();
+        let mut matching: Vec<&crate::state::Model> = store
+            .models
+            .values()
+            .filter(|model| {
+                input
+                    .name_contains
+                    .as_deref()
+                    .is_none_or(|needle| model.name.contains(needle))
+            })
+            .filter(|model| {
+                // Both bounds are inclusive, so a timestamp copied straight out of a
+                // prior response's `CreationTime` still selects that model.
+                let created = crate::state::timestamp_key(crate::state::timestamp(
+                    model.creation_time,
+                ));
+                after.is_none_or(|bound| created >= bound)
+                    && before.is_none_or(|bound| created <= bound)
+            })
+            .collect();
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays `ModelName`
+        // ascending in both directions, so two models created in the same instant keep
+        // one order whichever way the page is sorted — and a `NextToken` resolved against
+        // a freshly computed result set lands on the same boundary.
+        matching.sort_by(|left, right| {
+            let by_key = if sort_by == "Name" {
+                left.name.cmp(&right.name)
+            } else {
+                crate::state::timestamp_key(crate::state::timestamp(left.creation_time)).cmp(
+                    &crate::state::timestamp_key(crate::state::timestamp(right.creation_time)),
+                )
+            };
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.name.cmp(&right.name))
+        });
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = decode_token(token)
+                    .and_then(|name| matching.iter().position(|model| model.name == name))
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(
+                            "NextToken does not name a page boundary of this result set; \
+                             restart the listing without it.",
+                        )
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // `MaxResults` caps the page, and so does the service's own ceiling: an absent or
+        // larger `MaxResults` still cannot make one call serialise the whole store. The
+        // token below is emitted whenever anything is left, so a paginating client walks
+        // the full result set exactly once either way.
+        let start = start.min(matching.len());
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_PAGE_SIZE, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end < matching.len() => Some(encode_token(&last.name)),
+            _ => None,
+        };
+
+        Ok(ListModelsOutput {
+            models: page
+                .iter()
+                .map(|model| ModelSummary {
+                    model_name: model.name.clone(),
+                    model_arn: model.arn.clone(),
+                    creation_time: crate::state::timestamp(model.creation_time),
+                })
+                .collect(),
+            next_token,
+        })
     }
 }

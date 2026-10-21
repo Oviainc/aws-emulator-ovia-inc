@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +157,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the S3 on Outposts endpoint store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `AccessType` documents the one cross-member rule the model cannot
+        // express: "If you choose CustomerOwnedIp, you must also provide the
+        // customer-owned IP address pool (CoIP pool)". An absent `AccessType` is
+        // `Private`, which the same documentation names "the default access
+        // type value".
+        let access_type = input
+            .access_type
+            .unwrap_or_else(|| crate::state::ACCESS_TYPE_PRIVATE.to_string());
+        if access_type == crate::state::ACCESS_TYPE_CUSTOMER_OWNED_IP
+            && input.customer_owned_ipv4_pool.is_none()
+        {
+            return Err(CreateEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "CustomerOwnedIpv4Pool is required when AccessType is {}",
+                        crate::state::ACCESS_TYPE_CUSTOMER_OWNED_IP
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let caller = crate::state::caller_account();
+        let mut store = state.lock();
+
+        // The endpoint hangs off an Outpost: one this caller owns, or one shared
+        // with it. An id that names neither is the modelled 404.
+        if !store.outposts.contains_key(&input.outpost_id) {
+            return Err(CreateEndpointErrorModeled::ResourceNotFoundException(
+                crate::state::outpost_not_found(&input.outpost_id),
+            )
+            .into());
+        }
+
+        // One endpoint per (Outpost, subnet, security group): a repeat of the
+        // same request would commit a second range of the same subnet to the
+        // same Outpost, which is the conflict this operation models.
+        if let Some(existing) = store.endpoints.values().find(|endpoint| {
+            endpoint.owner_account == caller
+                && endpoint.outpost_id == input.outpost_id
+                && endpoint.subnet_id == input.subnet_id
+                && endpoint.security_group_id == input.security_group_id
+        }) {
+            return Err(CreateEndpointErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "endpoint {} already uses subnet {} and security group {} on Outpost {}",
+                        existing.endpoint_id,
+                        existing.subnet_id,
+                        existing.security_group_id,
+                        existing.outpost_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every range the emulator reserves for endpoint commitments is in use,
+        // so there is none left to commit to another endpoint and the create
+        // cannot be completed.
+        let Some(cidr_block) = store.allocate_cidr_block() else {
+            return Err(CreateEndpointErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(
+                        "no VPC CIDR is available to commit to another endpoint".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let endpoint_id = store.mint_endpoint_id();
+        let vpc_id = store.vpc_for_subnet(&input.subnet_id);
+        let network_interface_id = store.mint_network_interface_id();
+        let endpoint = crate::state::EndpointRecord {
+            endpoint_id: endpoint_id.clone(),
+            outpost_id: input.outpost_id.clone(),
+            cidr_block,
+            // A new endpoint is not usable the instant the create returns —
+            // "it can take up to 5 minutes for this action to finish" — so it
+            // reports `Pending` until the clock owes it `Available`.
+            status: crate::state::ENDPOINT_STATUS_PENDING.to_string(),
+            pending: Some(crate::state::PendingTransition {
+                due: now + crate::state::ENDPOINT_TRANSITION,
+                status: crate::state::ENDPOINT_STATUS_AVAILABLE.to_string(),
+            }),
+            creation_time: now,
+            network_interfaces: vec![network_interface_id],
+            vpc_id,
+            subnet_id: input.subnet_id,
+            security_group_id: input.security_group_id,
+            access_type,
+            customer_owned_ipv4_pool: input.customer_owned_ipv4_pool,
+            owner_account: caller,
+        };
+
+        let endpoint_arn = endpoint.endpoint_arn(&region);
+        store
+            .endpoints
+            .insert((input.outpost_id, endpoint_id), endpoint);
+
+        Ok(CreateEndpointOutput {
+            endpoint_arn: Some(endpoint_arn),
+        })
     }
 }

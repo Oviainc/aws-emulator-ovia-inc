@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMonitor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMonitor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMonitor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the monitor this service's store ([`crate::state`]) holds under the
+//! requested `monitorName`, or the modelled `ResourceNotFoundException` when it
+//! holds none. `@readonly`: the only write it makes is materializing the status
+//! change the clock has already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +162,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMonitor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMonitorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMonitor"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetMonitorErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+        state.settle(::std::time::SystemTime::now());
+
+        let Some(monitor) = state.monitors.get(&input.monitor_name) else {
+            return Err(GetMonitorErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::MONITOR_RESOURCE, &input.monitor_name),
+            )
+            .into());
+        };
+
+        Ok(GetMonitorOutput {
+            monitor_arn: monitor.monitor_arn.clone(),
+            monitor_name: monitor.monitor_name.clone(),
+            monitor_status: monitor.monitor_status.as_wire().to_string(),
+            local_resources: monitor.local_resources.clone(),
+            remote_resources: monitor.remote_resources.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(monitor.created_at),
+            modified_at: ::aws_smithy_types::DateTime::from(monitor.modified_at),
+            tags: crate::state::tags_for_output(&monitor.tags),
+        })
     }
 }

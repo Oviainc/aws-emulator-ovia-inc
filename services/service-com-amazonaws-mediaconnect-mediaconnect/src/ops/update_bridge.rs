@@ -147,12 +147,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for UpdateBridge<Eng>
 {
     type Input = UpdateBridgeInput;
-    type Output = UpdateBridgeOutput;
+    type Output = UpdateBridgeResponse;
     type Error = UpdateBridgeError;
 
     const NAME: &'static str = "UpdateBridge";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_BRIDGE_INPUT_SCHEMA;
-    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_BRIDGE_OUTPUT_SCHEMA;
+    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_BRIDGE_RESPONSE_SCHEMA;
     const SUCCESS_STATUS: u16 = 202u16;
 
     async fn handle(

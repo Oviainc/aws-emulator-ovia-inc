@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSite
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSite`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSite::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored site the `SiteId` names, so every later call observes
+//! it gone. A site an Outpost still references is refused with `ConflictException` (409);
+//! an absent id is `NotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +136,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSite` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSiteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSite"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteSiteErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+        // `SiteId` accepts the bare id or the full site ARN; both name the same
+        // stored record.
+        let site_id = crate::state::resolve_site_id(&input.site_id).ok_or_else(|| {
+            DeleteSiteErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "SiteId must be a site id or site ARN, got {}",
+                    input.site_id
+                )),
+            })
+        })?;
+
+        let mut store = state.lock();
+        if !store.sites.contains_key(&site_id) {
+            return Err(DeleteSiteErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("the site {site_id} does not exist")),
+            })
+            .into());
+        }
+        // An Outpost names the site it lives at, so removing a site that still has
+        // one would leave that Outpost pointing at nothing: the service refuses with
+        // the conflict error it models, naming the Outpost that causes it.
+        if let Some(blocking) = store
+            .outposts
+            .values()
+            .find(|record| record.outpost.site_id.as_deref() == Some(site_id.as_str()))
+        {
+            let outpost_id = blocking.outpost.outpost_id.clone().unwrap_or_default();
+            return Err(DeleteSiteErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "the site {site_id} cannot be deleted while Outpost {outpost_id} is at it"
+                )),
+                resource_id: Some(outpost_id),
+                resource_type: Some("OUTPOST".to_string()),
+            })
+            .into());
+        }
+        store.sites.remove(&site_id);
+
+        Ok(DeleteSiteOutput {})
     }
 }

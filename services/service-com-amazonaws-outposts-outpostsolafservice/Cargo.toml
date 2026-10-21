@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Hashing for the unique `os-…` / `op-…` resource ids this service mints.
+sha2 = { workspace = true }
+# Hex codec for those ids, whose modelled patterns are 17 lowercase hex chars.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGraph
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGraph`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGraph::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a graph into the shared store and reports the stored record.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +186,287 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGraph` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGraphErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGraph"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateGraphErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `graphName`'s modelled pattern opens with a negative lookahead, which the
+        // boundary validator's regex engine cannot compile — and an uncompilable
+        // `@pattern` is treated as matching — so the one input constraint that reaches
+        // this handler unchecked is enforced here. Length (1..63) is already refused at
+        // the boundary by the `@length` trait.
+        if !graph_name_is_well_formed(&input.graph_name) {
+            return Err(CreateGraphErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "graphName '{}' does not satisfy the required pattern \
+                     ^(?!g-)[a-z][a-z0-9]*(-[a-z0-9]+)*$: it must start with a lowercase \
+                     letter, contain only lowercase letters, digits and hyphens, not start \
+                     with 'g-', not end with a hyphen, and not contain two consecutive \
+                     hyphens",
+                    input.graph_name
+                ),
+                reason: Some("CONSTRAINT_VIOLATION".to_string()),
+            })
+            .into());
+        }
+
+        let region = request_region(ctx);
+        let now = ::std::time::Instant::now();
+
+        // Nothing caller-sized reaches the store unchecked. The model's own `@length`
+        // traits on `TagMap`/`TagKey`/`TagValue` refuse these at the boundary too; the
+        // check is repeated at the growth site so the bound on what one record stores
+        // lives beside the insert that stores it.
+        if let Some(tags) = input.tags.as_ref() {
+            if let Err(message) = bound_tags(tags) {
+                return Err(CreateGraphErrorModeled::ValidationException(ValidationException {
+                    message,
+                    reason: Some("CONSTRAINT_VIOLATION".to_string()),
+                })
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+
+        // `graphName` is unique: a second graph by the same name conflicts with the
+        // stored one.
+        if let Some(existing) = store.graph_names.get(&input.graph_name) {
+            return Err(CreateGraphErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "a graph named '{}' already exists with id {existing}",
+                    input.graph_name
+                ),
+                reason: None,
+            })
+            .into());
+        }
+
+        // The store is shared and grows by one graph per call, so it has a ceiling
+        // (`crate::state::MAX_GRAPHS`). Reaching it is the condition the model's
+        // `ServiceQuotaExceededException` (402) describes.
+        if store.graphs.len() >= crate::state::MAX_GRAPHS {
+            return Err(CreateGraphErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator holds at most {} graphs; delete a graph before \
+                         creating another",
+                        crate::state::MAX_GRAPHS
+                    ),
+                    resource_id: None,
+                    resource_type: Some("Graph".to_string()),
+                    service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
+                    quota_code: None,
+                },
+            )
+            .into());
+        }
+
+        let id = store.next_graph_id();        let graph = crate::state::Graph {
+            arn: ::engine::emulator_arn(
+                crate::state::ARN_NAMESPACE,
+                &region,
+                &format!("graph/{id}"),
+            ),
+            endpoint: format!("{id}.{region}.{}.amazonaws.com", crate::state::ARN_NAMESPACE),
+            id,
+            name: input.graph_name,
+            // The graph is not usable when the call returns; the clock owes the move to
+            // AVAILABLE a fixed span later (see `crate::state::PROVISIONING_SPAN`).
+            status: crate::state::GraphStatus::Creating,
+            settles_at: Some(now + crate::state::PROVISIONING_SPAN),
+            status_reason: None,
+            create_time: ::std::time::SystemTime::now(),
+            provisioned_memory: input.provisioned_memory,
+            // Absent means "not enabled": the model declares no default for either
+            // boolean, so an unsupplied member is stored as `false`.
+            public_connectivity: input.public_connectivity.unwrap_or(false),
+            deletion_protection: input.deletion_protection.unwrap_or(false),
+            replica_count: input.replica_count.unwrap_or(DEFAULT_REPLICA_COUNT),
+            kms_key_identifier: input.kms_key_identifier,
+            vector_search_configuration: input.vector_search_configuration,
+            // Only `RestoreGraphFromSnapshot` / `CreateGraphUsingImportTask` give a
+            // graph a source snapshot, and `buildNumber` is the version of the graph
+            // software the real service runs, which this emulator does not have.
+            source_snapshot_id: None,
+            build_number: None,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        // Report the record that was stored, so this response cannot drift from what a
+        // later GetGraph answers.
+        let output = Self::Output::from(&graph);
+        store.insert_graph(graph);
+        Ok(output)
+    }
+}
+
+/// The number of replicas a graph gets when `replicaCount` is not supplied.
+///
+/// From the member's own documentation: "The number of replicas in other AZs. Min =0,
+/// Max = 2, Default = 1."
+const DEFAULT_REPLICA_COUNT: i32 = 1;
+
+/// The region this request was signed for — the region that names the graph's ARN and
+/// endpoint. Falls back to the emulator-wide default region when the request carries no
+/// SigV4 credential scope (request authentication may be off).
+fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map_or_else(|| "us-east-1".to_string(), |scope| scope.region)
+}
+
+/// Refuse a `tags` map that would put more into one stored record than it may hold
+/// (`crate::state::MAX_TAGS` entries of at most `MAX_TAG_KEY_CHARS` /
+/// `MAX_TAG_VALUE_CHARS` characters). `Err` carries the message, naming the member and
+/// the bound it broke, for the caller to fix the request from.
+fn bound_tags(tags: &::std::collections::HashMap<String, String>) -> Result<(), String> {
+    if tags.len() > crate::state::MAX_TAGS {
+        return Err(format!(
+            "tags may carry at most {} entries, got {}",
+            crate::state::MAX_TAGS,
+            tags.len()
+        ));
+    }
+    for (key, value) in tags {
+        let key_chars = key.chars().count();
+        if key_chars > crate::state::MAX_TAG_KEY_CHARS {
+            return Err(format!(
+                "a tag key may be at most {} characters, got {key_chars}",
+                crate::state::MAX_TAG_KEY_CHARS
+            ));
+        }
+        let value_chars = value.chars().count();
+        if value_chars > crate::state::MAX_TAG_VALUE_CHARS {
+            return Err(format!(
+                "the value of tag '{key}' may be at most {} characters, got {value_chars}",
+                crate::state::MAX_TAG_VALUE_CHARS
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `name` satisfies the modelled `GraphName` pattern
+/// `^(?!g-)[a-z][a-z0-9]*(-[a-z0-9]+)*$`, read literally: no `g-` prefix, a lowercase
+/// letter first, then lowercase letters, digits and single interior hyphens, and no
+/// trailing hyphen.
+fn graph_name_is_well_formed(name: &str) -> bool {
+    if name.starts_with("g-") {
+        return false;
+    }
+    let mut chars = name.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_lowercase()) {
+        return false;
+    }
+    let mut after_hyphen = false;
+    for c in chars {
+        if c == '-' {
+            // `(-[a-z0-9]+)*` requires at least one alphanumeric between hyphens.
+            if after_hyphen {
+                return false;
+            }
+            after_hyphen = true;
+        } else if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            after_hyphen = false;
+        } else {
+            return false;
+        }
+    }
+    // A trailing hyphen would leave the last group empty.
+    !after_hyphen
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bound_tags, graph_name_is_well_formed};
+
+    /// The bound on what one stored record may hold, at the limit and one past it for
+    /// the entry count, the key length and the value length.
+    #[test]
+    fn tag_bounds_accept_the_limit_and_refuse_one_past_it() {
+        let map = |pairs: Vec<(String, String)>| -> ::std::collections::HashMap<String, String> {
+            pairs.into_iter().collect()
+        };
+        let many = |count: usize| {
+            map((0..count)
+                .map(|index| (format!("key{index}"), "v".to_string()))
+                .collect())
+        };
+
+        // (case, tags, accepted)
+        let cases: Vec<(&str, ::std::collections::HashMap<String, String>, bool)> = vec![
+            ("no tags", map(Vec::new()), true),
+            ("at the entry limit", many(crate::state::MAX_TAGS), true),
+            ("one entry past the limit", many(crate::state::MAX_TAGS + 1), false),
+            (
+                "a key at the length limit",
+                map(vec![("k".repeat(crate::state::MAX_TAG_KEY_CHARS), "v".to_string())]),
+                true,
+            ),
+            (
+                "a key one character past the limit",
+                map(vec![("k".repeat(crate::state::MAX_TAG_KEY_CHARS + 1), "v".to_string())]),
+                false,
+            ),
+            (
+                "a value at the length limit",
+                map(vec![(
+                    "k".to_string(),
+                    "v".repeat(crate::state::MAX_TAG_VALUE_CHARS),
+                )]),
+                true,
+            ),
+            (
+                "a value one character past the limit",
+                map(vec![(
+                    "k".to_string(),
+                    "v".repeat(crate::state::MAX_TAG_VALUE_CHARS + 1),
+                )]),
+                false,
+            ),
+        ];
+        for (case, tags, accepted) in cases {
+            let actual = bound_tags(&tags);
+            assert_eq!(
+                actual.is_ok(),
+                accepted,
+                "case {case:?}: expected accepted={accepted}, got {actual:?}"
+            );
+        }
+    }
+
+    /// The name rule, with a row for each clause of the modelled pattern
+    /// `^(?!g-)[a-z][a-z0-9]*(-[a-z0-9]+)*$`
+    /// (smithy_query(query="operation",operation="CreateGraph") -> input.graphName).
+    #[test]
+    fn graph_name_rule_spans_every_clause_of_the_modelled_pattern() {
+        // (candidate name, whether the pattern accepts it)
+        let cases: &[(&str, bool)] = &[
+            ("a", true),
+            ("g", true),
+            ("my-graph-1", true),
+            ("graph9", true),
+            ("g0-x", true),
+            ("g-abc", false),     // the negative lookahead
+            ("1graph", false),    // must start with a letter
+            ("-graph", false),    // must start with a letter
+            ("My-Graph", false),  // lowercase only
+            ("my_graph", false),  // no underscores
+            ("my--graph", false), // no two consecutive hyphens
+            ("my-graph-", false), // no trailing hyphen
+            ("", false),          // at least one character
+        ];
+        for (name, accepted) in cases {
+            let actual = graph_name_is_well_formed(name);
+            assert_eq!(
+                actual, *accepted,
+                "case {name:?}: expected accepted={accepted}, got {actual}"
+            );
+        }
     }
 }

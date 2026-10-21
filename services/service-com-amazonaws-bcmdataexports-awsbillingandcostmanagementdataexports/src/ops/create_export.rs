@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateExport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateExport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateExport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a new data export and returns the ARN minted for it. The submitted `Export`
+//! is stored verbatim beside a fresh `ExportStatus` and the request's `ResourceTags`, so
+//! `GetExport`, `ListExports` and `ListTagsForResource` read back exactly what was
+//! created.
+//!
+//! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
+//! reaching this service's state and the modelled contract still apply.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +163,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateExport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateExportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateExportErrorModeled::InternalServerException(InternalServerException {
+                message: "The export store is unavailable.".to_string(),
+            })
+        })?;
+
+        // "Each tag consists of a key and a value, and each key must be unique for the
+        // resource" (the modelled doc for `ResourceTags`), so a request carrying one key
+        // twice names two values for one tag and cannot be satisfied.
+        let mut tags: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for tag in input.resource_tags.unwrap_or_default() {
+            if tags.insert(tag.key.clone(), tag.value).is_some() {
+                return Err(CreateExportErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "ResourceTags carries the key {} more than once; each tag key must be unique for the resource.",
+                        tag.key
+                    ),
+                    reason: Some("fieldValidationFailed".to_string()),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "ResourceTags".to_string(),
+                        message: "Each tag key must be unique for the resource.".to_string(),
+                    }]),
+                })
+                .into());
+            }
+        }
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let arn = crate::state::export_arn(&region, &input.export.name);
+        let created_at = crate::state::now();
+
+        let mut store = state.lock();
+        // The request is validated BEFORE the store bound is applied: a name already in
+        // use is owed the 400, not the quota 402, even when the store happens to be full.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateExport"))
+        // The minted ARN is a function of the region and the name, so an ARN already in
+        // the store is exactly "this region already holds an export with this name".
+        if store.exports.contains_key(&arn) {
+            return Err(CreateExportErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "An export named {} already exists; export names must be unique.",
+                    input.export.name
+                ),
+                reason: Some("fieldValidationFailed".to_string()),
+                fields: Some(vec![ValidationExceptionField {
+                    name: "Export.Name".to_string(),
+                    message: "An export with this name already exists.".to_string(),
+                }]),
+            })
+            .into());
+        }
+        if store.exports.len() >= crate::state::MAX_EXPORTS {
+            // The store lives for the life of the process, so the number of exports a
+            // caller can accumulate is bounded here and reported through the modelled
+            // quota error rather than by growing without limit.
+            return Err(CreateExportErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "This account already holds {} exports, the maximum this service retains.",
+                        crate::state::MAX_EXPORTS
+                    ),
+                    resource_id: None,
+                    resource_type: Some(crate::state::EXPORT_RESOURCE_TYPE.to_string()),
+                    quota_code: crate::state::EXPORTS_PER_ACCOUNT_QUOTA_CODE.to_string(),
+                    service_code: crate::state::SERVICE_CODE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let stored = crate::state::StoredExport {
+            arn: arn.clone(),
+            export: Export {
+                // The ARN is server-assigned: whatever the request carried in
+                // `Export.ExportArn` is not this export's identity.
+                export_arn: Some(arn.clone()),
+                ..input.export
+            },
+            status: crate::state::fresh_status(created_at),
+            tags,
+        };
+        store.exports.insert(arn.clone(), stored);
+        drop(store);
+
+        Ok(CreateExportOutput {
+            export_arn: Some(arn),
+        })
     }
 }

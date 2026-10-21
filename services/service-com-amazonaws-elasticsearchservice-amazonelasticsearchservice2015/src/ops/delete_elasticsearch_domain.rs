@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteElasticsearchDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteElasticsearchDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteElasticsearchDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the stored domain and reports its final status with `Deleted: true`.
+//! Deletion completes within the call, so `Processing` is false and the status
+//! is terminal: afterwards the domain is absent from `ListDomainNames` and every
+//! `Describe*` answers `ResourceNotFoundException`. There is no deleting window
+//! to poll.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +143,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteElasticsearchDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteElasticsearchDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteElasticsearchDomain"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteElasticsearchDomainErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the Elasticsearch domain store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let mut store = state.lock();
+        let Some(mut domain) = store
+            .domains
+            .remove(&crate::state::domain_key(&region, &input.domain_name))
+        else {
+            return Err(DeleteElasticsearchDomainErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Domain not found: {}", input.domain_name)),
+                },
+            )
+            .into());
+        };
+
+        // The removed record is what the response reports. The removal is
+        // complete when this call returns, so the reported status is terminal:
+        // Deleted, and no change left pending (`active_at` moves to now, so
+        // `Processing` is false rather than advertising a window no later read
+        // could observe).
+        domain.deleted = true;
+        domain.last_updated = now;
+        domain.active_at = now;
+
+        Ok(DeleteElasticsearchDomainOutput {
+            domain_status: Some(domain.domain_status(now)),
+        })
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVehicle
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVehicle`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVehicle::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: validates `modelManifestArn` against the model manifests in state, then
+//! inserts a vehicle and reports the vehicle name, the ARN it minted, and the ARN of the
+//! IoT thing the vehicle is associated with.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +168,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVehicle` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVehicleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVehicle"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateVehicleErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // One record's own size is bounded BEFORE the store lock is taken, so an
+        // oversized request never holds it. `attributesMap` carries no modelled
+        // `@length` and neither does `attributeValue`, so these are the only bounds on
+        // how much one vehicle stores.
+        if let Some(attributes) = &input.attributes {
+            if attributes.len() > crate::state::MAX_VEHICLE_ATTRIBUTES {
+                return Err(CreateVehicleErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: format!(
+                            "attributes carries {} entries, more than the {} one vehicle holds",
+                            attributes.len(),
+                            crate::state::MAX_VEHICLE_ATTRIBUTES
+                        ),
+                        resource_id: input.vehicle_name.clone(),
+                        resource_type: crate::state::VEHICLE_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into());
+            }
+            if let Some((name, value)) = attributes
+                .iter()
+                .find(|(_, value)| value.chars().count() > crate::state::MAX_ATTRIBUTE_VALUE_LENGTH)
+            {
+                return Err(CreateVehicleErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "the value of attribute {name} is {} characters, more than the {} an \
+                             attribute value holds",
+                            value.chars().count(),
+                            crate::state::MAX_ATTRIBUTE_VALUE_LENGTH
+                        ),
+                        reason: None,
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: format!("attributes.{name}"),
+                            message: format!(
+                                "must be at most {} characters",
+                                crate::state::MAX_ATTRIBUTE_VALUE_LENGTH
+                            ),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(
+            &region,
+            crate::state::VEHICLE_RESOURCE_TYPE,
+            &input.vehicle_name,
+        );
+        let thing_arn = crate::state::thing_arn(&region, &input.vehicle_name);
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
+        let mut store = state.lock();
+
+        // A vehicle is an INSTANCE of a vehicle model, so the model has to exist.
+        if store.model_manifest_by_arn(&input.model_manifest_arn).is_none() {
+            return Err(CreateVehicleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("vehicle model {} wasn't found", input.model_manifest_arn),
+                    resource_id: input.model_manifest_arn.clone(),
+                    resource_type: crate::state::MODEL_MANIFEST_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        if store.vehicles.contains_key(&input.vehicle_name) {
+            return Err(CreateVehicleErrorModeled::ConflictException(ConflictException {
+                message: format!("vehicle {} already exists", input.vehicle_name),
+                resource: input.vehicle_name.clone(),
+                resource_type: crate::state::VEHICLE_RESOURCE_TYPE.to_string(),
+            })
+            .into());
+        }
+
+        // Vehicles are metered per account and Region, and this operation models
+        // `LimitExceededException` for the case. Refusing here is also what bounds the
+        // store: every entry a create inserts lives until DeleteVehicle removes it.
+        if store.vehicles.len() >= crate::state::MAX_VEHICLES {
+            return Err(CreateVehicleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: format!(
+                        "the vehicle quota of {} for this account and Region has been reached",
+                        crate::state::MAX_VEHICLES
+                    ),
+                    resource_id: input.vehicle_name.clone(),
+                    resource_type: crate::state::VEHICLE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        store.vehicles.insert(
+            input.vehicle_name.clone(),
+            crate::state::VehicleRecord {
+                vehicle_name: input.vehicle_name.clone(),
+                arn: arn.clone(),
+                thing_arn: thing_arn.clone(),
+                model_manifest_arn: input.model_manifest_arn,
+                // The decoder-manifest lifecycle is not implemented yet, so this ARN is
+                // recorded as given rather than resolved against stored state.
+                decoder_manifest_arn: input.decoder_manifest_arn,
+                attributes: input
+                    .attributes
+                    .map(|attributes| attributes.into_iter().collect()),
+                state_templates: input.state_templates,
+                association_behavior: input.association_behavior,
+                tags: input.tags.unwrap_or_default(),
+                creation_time: now,
+                last_modification_time: now,
+            },
+        );
+
+        Ok(CreateVehicleOutput {
+            vehicle_name: Some(input.vehicle_name),
+            arn: Some(arn),
+            thing_arn: Some(thing_arn),
+        })
     }
 }

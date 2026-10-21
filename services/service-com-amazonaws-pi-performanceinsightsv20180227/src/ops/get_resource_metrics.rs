@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourceMetrics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourceMetrics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: computes the aligned window, the effective period and the metric
+//! keys of a request from the REQUEST itself — so this read persists nothing and
+//! repeating it answers identically.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourceMetrics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it does NOT do is invent telemetry. Performance Insights reports counters
+//! measured on a running DB engine; this emulator monitors none, so every series
+//! it returns is EMPTY rather than a plausible-looking number per period, and a
+//! query that asks for dimension-grouped or filtered data
+//! (`MetricQuery.GroupBy` / `MetricQuery.Filter`) is answered with the scaffold's
+//! 501, because there are no DB sessions to group or filter.
+//!
+//! Two further divergences are deliberate and documented rather than invented:
+//! authorization is not emulated (no IAM principals or policies exist here, so
+//! the modelled `NotAuthorizedException` is never the answer), and the
+//! documented 7-day-to-2-year `StartTime` retention bound is not enforced,
+//! because this emulator monitors no resource that has been retaining anything.
 //!
 //! ## Shape of an operation
 //!
@@ -196,18 +203,229 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourceMetrics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourceMetricsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = (ctx, &self.engine);
+
+        // Documented on `StartTime`: "The value for StartTime must be earlier than
+        // the value for EndTime."
+        let start_key = crate::state::timestamp_key(input.start_time);
+        let end_key = crate::state::timestamp_key(input.end_time);
+        if start_key >= end_key {
+            return Err(invalid_argument(
+                "The value for StartTime must be earlier than the value for EndTime.",
+            ));
+        }
+
+        // Dimension-grouped or filtered metrics are computed from individual DB
+        // sessions, which this emulator does not have. Answer them honestly
+        // rather than returning the ungrouped series under a grouped key.
+        for query in &input.metric_queries {
+            if query.group_by.is_some() {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "GetResourceMetrics with MetricQuery.GroupBy",
+                ));
+            }
+            if query.filter.as_ref().is_some_and(|f| !f.is_empty()) {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "GetResourceMetrics with MetricQuery.Filter",
+                ));
+            }
+        }
+
+        // Both timestamps are caller-chosen and a `timestamp` shape carries no
+        // `@range`, so the model cannot bound them and this handler must, before
+        // any arithmetic reads them. The bound is exactly what keeps the window
+        // arithmetic below TOTAL rather than a guess at what AWS accepts: it
+        // refuses no window the rest of this handler could have answered.
+        for (member, value) in [
+            ("StartTime", input.start_time),
+            ("EndTime", input.end_time),
+        ] {
+            let seconds = value.secs();
+            if !(-MAX_TIMESTAMP_MAGNITUDE..=MAX_TIMESTAMP_MAGNITUDE).contains(&seconds) {
+                return Err(invalid_argument(format!(
+                    "{member} must be within {MAX_TIMESTAMP_MAGNITUDE} seconds of the epoch \
+                     for its window to be computable; got {seconds}."
+                )));
+            }
+        }
+
+        let span_seconds = (input.end_time.secs() - input.start_time.secs()).max(1);
+        let period = match input.period_in_seconds {
+            None => choose_period(span_seconds),
+            Some(requested) => {
+                let requested = i64::from(requested);
+                if !VALID_PERIODS_IN_SECONDS.contains(&requested) {
+                    return Err(invalid_argument(format!(
+                        "PeriodInSeconds must be one of {}; got {requested}.",
+                        VALID_PERIODS_IN_SECONDS
+                            .iter()
+                            .map(i64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+                requested
+            }
+        };
+
+        // `AlignedStartTime` is documented to be less than or equal to the
+        // requested `StartTime`, and `AlignedEndTime` greater than or equal to the
+        // requested `EndTime`, each on a boundary of the effective period.
+        let aligned_start = align_floor(input.start_time.secs(), period);
+        let end_seconds =
+            input.end_time.secs() + i64::from(input.end_time.subsec_nanos() > 0);
+        let aligned_end = align_ceil(end_seconds, period);
+
+        // `MaxResults` pages the metric keys. A page size of zero could never
+        // advance a cursor, so 0 reads as "no caller-imposed page size".
+        let page_size = match input.max_results {
+            Some(max) if max > 0 => max as usize,
+            _ => input.metric_queries.len(),
+        };
+        let scope = page_scope(&input, period, aligned_start, aligned_end);
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::decode_page_token(token, &scope) {
+                Some(offset) => offset,
+                None => {
+                    return Err(invalid_argument(
+                        "The NextToken was not issued for this request's resource, window, \
+                         period and metric queries.",
+                    ))
+                }
+            },
+        };
+
+        // One entry per requested metric, keyed by that query's metric, with NO
+        // data points.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourceMetrics"))
+        // The window, the effective period and the key list above are all
+        // computed from the request, and are what a client needs to page and to
+        // interpret a series. The MAGNITUDES are not: Performance Insights
+        // reports counters measured on a running DB engine, and this emulator
+        // monitors none, so it has nothing to report for the periods the aligned
+        // window holds. An empty `DataPoints` says exactly that; a
+        // plausible-looking number per period would be invented telemetry a
+        // client could not tell from a real counter — the same reason
+        // `MetricQuery.GroupBy`/`Filter` answer 501 above. `PeriodAlignment`
+        // chooses whether a point is stamped with its period's start or its end,
+        // so with no points it has nothing to change.
+        let metric_list: Vec<MetricKeyDataPoints> = input
+            .metric_queries
+            .iter()
+            .skip(offset)
+            .take(page_size)
+            .map(|query| MetricKeyDataPoints {
+                key: Some(ResponseResourceMetricKey {
+                    metric: query.metric.clone(),
+                    dimensions: None,
+                }),
+                data_points: Some(Vec::new()),
+            })
+            .collect();
+
+        let resumed_at = offset.saturating_add(metric_list.len());
+        let next_token = (resumed_at < input.metric_queries.len())
+            .then(|| crate::state::encode_page_token(&scope, resumed_at));
+
+        Ok(GetResourceMetricsOutput {
+            aligned_start_time: Some(::aws_smithy_types::DateTime::from_secs(aligned_start)),
+            aligned_end_time: Some(::aws_smithy_types::DateTime::from_secs(aligned_end)),
+            identifier: Some(input.identifier.clone()),
+            metric_list: Some(metric_list),
+            next_token,
+        })
     }
+}
+
+/// The granularities `PeriodInSeconds` accepts, from that member's own
+/// documentation: 1 (one second), 60 (one minute), 300 (five minutes), 3600 (one
+/// hour) and 86400 (twenty-four hours).
+const VALID_PERIODS_IN_SECONDS: &[i64] = &[1, 60, 300, 3600, 86400];
+
+/// How far from the epoch a window's timestamps may lie, in either direction.
+///
+/// NOT a guess at what AWS accepts: it is the magnitude that keeps every step of
+/// the window arithmetic total. With both ends inside `±i64::MAX / 4`, the span
+/// (`end - start`), the end's round-up (`end + 1`, then up to one period more)
+/// and the aligned window (`aligned_end - aligned_start`) all stay inside i64,
+/// so a caller-chosen `ISOTimestamp` cannot overflow them. A value past it is
+/// answered with the modelled 400 instead.
+const MAX_TIMESTAMP_MAGNITUDE: i64 = i64::MAX / 4;
+
+/// The data-point budget the service aims at when the caller specifies no
+/// period. `PeriodInSeconds`' documentation: "If you don't specify
+/// PeriodInSeconds, then Performance Insights will choose a value for you, with a
+/// goal of returning roughly 100-200 data points in the response."
+const PERIOD_CHOICE_MAX_POINTS: i64 = 200;
+
+/// `InvalidArgumentException` (HTTP 400), this operation's modelled refusal for a
+/// request whose values do not hold together.
+fn invalid_argument(message: impl Into<String>) -> GetResourceMetricsError {
+    GetResourceMetricsErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// Align `seconds` DOWN to the nearest multiple of `period` — the granular
+/// boundary at or before the requested start.
+fn align_floor(seconds: i64, period: i64) -> i64 {
+    seconds - seconds.rem_euclid(period)
+}
+
+/// Align `seconds` UP to the nearest multiple of `period` — the granular
+/// boundary at or after the requested end.
+fn align_ceil(seconds: i64, period: i64) -> i64 {
+    let remainder = seconds.rem_euclid(period);
+    if remainder == 0 {
+        seconds
+    } else {
+        seconds + (period - remainder)
+    }
+}
+
+/// The period the service picks for a window of `span_seconds` when the caller
+/// specified none: the finest documented granularity that keeps the response
+/// inside [`PERIOD_CHOICE_MAX_POINTS`] data points, and the coarsest one for a
+/// window too long for any of them.
+fn choose_period(span_seconds: i64) -> i64 {
+    let coarsest = *VALID_PERIODS_IN_SECONDS
+        .last()
+        .expect("the documented period set is not empty");
+    VALID_PERIODS_IN_SECONDS
+        .iter()
+        .copied()
+        .find(|period| {
+            let points = span_seconds / period + i64::from(span_seconds % period != 0);
+            points <= PERIOD_CHOICE_MAX_POINTS
+        })
+        .unwrap_or(coarsest)
+}
+
+/// The result set a `NextToken` was handed out for, as a digest: the resource,
+/// the aligned window, the period and the metric queries. Hashed so the token
+/// stays far inside the modelled `NextToken` length bound however long the
+/// metric list is.
+fn page_scope(
+    input: &GetResourceMetricsInput,
+    period: i64,
+    aligned_start: i64,
+    aligned_end: i64,
+) -> String {
+    use sha2::Digest as _;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(input.service_type.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(input.identifier.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(period.to_be_bytes());
+    hasher.update(aligned_start.to_be_bytes());
+    hasher.update(aligned_end.to_be_bytes());
+    for query in &input.metric_queries {
+        hasher.update(query.metric.as_bytes());
+        hasher.update([0u8]);
+    }
+    hex::encode(hasher.finalize())
 }

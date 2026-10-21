@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListReportDefinitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListReportDefinitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListReportDefinitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +141,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListReportDefinitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListReportDefinitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListReportDefinitions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListReportDefinitionsErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the ApplicationCostProfiler state store is unavailable on this engine".into(),
+                ),
+            })
+        })?;
+
+        // The modelled `range 1..100` is enforced by the framework's constraint
+        // walk before `handle` runs, so a value that reaches here is already in
+        // range; the clamp only keeps the page size inside the modelled bound
+        // whatever arrives, and never changes a valid value.
+        let page_size = input.max_results.map_or(crate::state::MAX_RESULTS_MAX, |max_results| {
+            usize::try_from(max_results)
+                .unwrap_or(crate::state::MAX_RESULTS_MAX)
+                .clamp(1, crate::state::MAX_RESULTS_MAX)
+        });
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token("nextToken", token).map_err(invalid)?),
+            None => None,
+        };
+
+        let store = state.lock();
+        // The store is keyed by `reportId` in a `BTreeMap`, so one page is the
+        // range strictly after the previous page's last id: a stable order that
+        // resumes without holding server-side cursor state.
+        let lower = match resume_after.as_deref() {
+            Some(cursor) => ::std::ops::Bound::Excluded(cursor),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut remaining = store
+            .report_definitions
+            .range::<str, _>((lower, ::std::ops::Bound::Unbounded));
+
+        let mut report_definitions: Vec<ReportDefinition> = Vec::new();
+        let mut last_on_page: Option<String> = None;
+        for (report_id, record) in remaining.by_ref().take(page_size) {
+            last_on_page = Some(report_id.clone());
+            report_definitions.push(ReportDefinition {
+                report_id: Some(record.report_id.clone()),
+                report_description: Some(record.report_description.clone()),
+                report_frequency: Some(record.report_frequency.clone()),
+                format: Some(record.format.clone()),
+                destination_s3_location: Some(S3Location {
+                    bucket: record.destination_bucket.clone(),
+                    prefix: record.destination_prefix.clone(),
+                }),
+                created_at: Some(crate::state::to_date_time(record.created_at)),
+                last_updated_at: Some(crate::state::to_date_time(record.last_updated)),
+            });
+        }
+        // A token only where another definition remains; the last page omits it.
+        let next_token = remaining
+            .next()
+            .and(last_on_page.as_deref())
+            .map(crate::state::encode_page_token);
+        drop(store);
+
+        Ok(ListReportDefinitionsOutput {
+            report_definitions: Some(report_definitions),
+            next_token,
+        })
     }
+}
+
+/// Refuse the request with the service's own client-input error: HTTP 400
+/// `ValidationException`, whose message names the member and the constraint it
+/// broke.
+fn invalid(message: String) -> ListReportDefinitionsError {
+    ListReportDefinitionsErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }

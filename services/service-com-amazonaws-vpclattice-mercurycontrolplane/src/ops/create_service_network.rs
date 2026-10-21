@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateServiceNetwork
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateServiceNetwork`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateServiceNetwork::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints a service network, persists it in
+//! [`crate::state::ComAmazonawsVpclatticeMercurycontrolplaneState::service_networks`]
+//! and answers from what was stored.
 //!
 //! ## Shape of an operation
 //!
@@ -143,6 +138,22 @@ impl From<CreateServiceNetworkErrorModeled> for CreateServiceNetworkError {
     }
 }
 
+/// The response for a stored service network — every member read back out of state,
+/// never echoed from the request.
+fn output_of(network: &crate::state::ServiceNetwork) -> CreateServiceNetworkOutput {
+    CreateServiceNetworkOutput {
+        id: Some(network.id.clone()),
+        name: Some(network.name.clone()),
+        arn: Some(network.arn.clone()),
+        sharing_config: network
+            .sharing_enabled
+            .map(|enabled| SharingConfig {
+                enabled: Some(enabled),
+            }),
+        auth_type: Some(network.auth_type.clone()),
+    }
+}
+
 /// The `CreateServiceNetwork` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -179,18 +190,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateServiceNetwork` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServiceNetworkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateServiceNetwork"))
+        // Modeled constraints the framework CAN check (the `@length` bounds, the
+        // `authType` enum) are refused before this handler runs; `name`'s pattern is not
+        // one of them — see the check below.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateServiceNetworkErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let region = crate::state::region_of(ctx.parts());
+        let mut store = state.lock();
+
+        // The modelled `name` pattern is written with negative lookahead, which the
+        // boundary's regex engine cannot compile — so it is enforced here.
+        if let Err(reason) = crate::state::check_resource_name(&input.name, None) {
+            return Err(CreateServiceNetworkErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!("name {reason}"),
+                    reason: "fieldValidationFailed".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "name".to_string(),
+                        message: reason,
+                    }]),
+                },
+            )
+            .into());
+        }
+        if let Err(reason) = crate::state::check_tag_count(input.tags.as_ref()) {
+            return Err(CreateServiceNetworkErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!("tags {reason}"),
+                    reason: "fieldValidationFailed".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "tags".to_string(),
+                        message: reason,
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // `clientToken` is an @idempotencyToken: a retry carrying the token of a
+        // completed create answers with that same service network.
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::token_key(Self::NAME, token));
+        if let Some(existing) = token
+            .as_ref()
+            .and_then(|key| store.idempotency_tokens.get(key))
+            .and_then(|id| store.service_networks.get(id))
+        {
+            if existing.name != input.name {
+                return Err(CreateServiceNetworkErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "clientToken was already used to create service network {} with a different name",
+                            existing.id
+                        ),
+                        resource_id: existing.id.clone(),
+                        resource_type: crate::state::KIND_SERVICE_NETWORK.to_string(),
+                    },
+                )
+                .into());
+            }
+            return Ok(output_of(existing));
+        }
+
+        // The name must be unique to the account.
+        let name_key =
+            crate::state::name_key(crate::state::KIND_SERVICE_NETWORK, &input.name);
+        if let Some(taken_by) = store.name_index.get(&name_key) {
+            return Err(CreateServiceNetworkErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "a service network named {} already exists in this account",
+                        input.name
+                    ),
+                    resource_id: taken_by.clone(),
+                    resource_type: crate::state::KIND_SERVICE_NETWORK.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The emulator's own ceiling on stored service networks, answered with the
+        // modelled 402 so a caller looping on create cannot grow this process without
+        // bound.
+        if store.service_networks.len() >= crate::state::MAX_SERVICE_NETWORKS {
+            return Err(
+                CreateServiceNetworkErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this account already holds the maximum of {} service networks",
+                            crate::state::MAX_SERVICE_NETWORKS
+                        ),
+                        resource_id: None,
+                        resource_type: crate::state::KIND_SERVICE_NETWORK.to_string(),
+                        service_code: crate::state::ARN_SERVICE.to_string(),
+                        quota_code: "service-networks-per-account".to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let now = std::time::SystemTime::now();
+        let id = crate::state::mint_id(crate::state::PREFIX_SERVICE_NETWORK);
+        let sequence = store.next_sequence();
+        let record = crate::state::ServiceNetwork {
+            arn: crate::state::arn_for(&region, crate::state::KIND_SERVICE_NETWORK, &id),
+            id: id.clone(),
+            name: input.name.clone(),
+            // The model documents NONE as the default auth type.
+            auth_type: input.auth_type.clone().unwrap_or_else(|| "NONE".to_string()),
+            sharing_enabled: input
+                .sharing_config
+                .as_ref()
+                .and_then(|config| config.enabled),
+            tags: input.tags.clone().unwrap_or_default(),
+            created_at: now,
+            last_updated_at: now,
+            sequence,
+        };
+
+        store.name_index.insert(name_key, id.clone());
+        if let Some(key) = token {
+            store.idempotency_tokens.record(key, id.clone());
+        }
+        store.service_networks.insert(id.clone(), record);
+        let stored = store
+            .service_networks
+            .get(&id)
+            .expect("the service network was just inserted under this id");
+        Ok(output_of(stored))
     }
 }

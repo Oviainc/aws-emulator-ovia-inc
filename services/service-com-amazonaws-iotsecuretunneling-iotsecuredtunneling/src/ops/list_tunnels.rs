@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTunnels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTunnels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTunnels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `TunnelSummary` per stored tunnel, newest first, filtered by
+//! `thingName` and paged by `maxResults` with an opaque `nextToken` that resumes
+//! exactly where the previous page stopped.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +135,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTunnels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTunnelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("ListTunnels"))?;
+
+        // A page token this service did not mint cannot name a position in the
+        // listing. The operation models no error for it, so refuse it as invalid
+        // input rather than silently restarting the listing.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_next_token(token) {
+                Some(seq) => Some(seq),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "nextToken is not a token this service issued",
+                    ))
+                }
+            },
+        };
+
+        // `maxResults` is the page size; the model bounds it at 1..100, which is
+        // also the size of a page when the caller names none.
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::MAX_LIST_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_LIST_PAGE_SIZE);
+        let page_size = usize::try_from(page_size).unwrap_or(1);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Settle the transition the clock already made due before reporting.
+        store.materialize_expired_tunnels(now);
+
+        // "Tunnels are listed by creation time in descending order, newer tunnels
+        // will be listed before older tunnels." Creation order is the stored
+        // sequence, so two tunnels opened in the same instant still order stably.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTunnels"))
+        // Only the (sequence, id) of each candidate is collected here, and only
+        // the page's own records are projected: a list call costs no deep copy of
+        // the store, however many tunnels it holds.
+        let mut ordered: Vec<(u64, String)> = store
+            .tunnels
+            .values()
+            .filter(|tunnel| match input.thing_name.as_deref() {
+                None => true,
+                Some(thing_name) => tunnel
+                    .destination_config
+                    .as_ref()
+                    .and_then(|config| config.thing_name.as_deref())
+                    == Some(thing_name),
+            })
+            // Resume strictly after the position the token names: descending
+            // order, so the next page holds the tunnels created before it.
+            .filter(|tunnel| resume_after.is_none_or(|seq| tunnel.creation_seq < seq))
+            .map(|tunnel| (tunnel.creation_seq, tunnel.tunnel_id.clone()))
+            .collect();
+        ordered.sort_by_key(|(creation_seq, _)| ::std::cmp::Reverse(*creation_seq));
+
+        let has_more = ordered.len() > page_size;
+        ordered.truncate(page_size);
+        // The token names the last tunnel reported, so the next page resumes after
+        // it even if tunnels are opened or closed in between.
+        let next_token = if has_more {
+            ordered
+                .last()
+                .map(|(creation_seq, _)| crate::state::encode_next_token(*creation_seq))
+        } else {
+            None
+        };
+
+        let tunnel_summaries = ordered
+            .iter()
+            .filter_map(|(_, tunnel_id)| store.tunnels.get(tunnel_id))
+            .map(|tunnel| TunnelSummary {
+                tunnel_id: Some(tunnel.tunnel_id.clone()),
+                tunnel_arn: Some(tunnel.tunnel_arn.clone()),
+                status: Some(tunnel.status.as_wire().to_string()),
+                description: tunnel.description.clone(),
+                created_at: Some(::aws_smithy_types::DateTime::from(tunnel.created_at)),
+                last_updated_at: Some(::aws_smithy_types::DateTime::from(tunnel.last_updated_at)),
+            })
+            .collect();
+        drop(store);
+
+        Ok(ListTunnelsOutput {
+            tunnel_summaries: Some(tunnel_summaries),
+            next_token,
+        })
     }
 }

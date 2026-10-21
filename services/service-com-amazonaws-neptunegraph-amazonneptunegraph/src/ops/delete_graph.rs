@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteGraph
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteGraph`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteGraph::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored graph and reports its final record.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +163,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteGraph` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteGraphErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteGraph"))
+        // `skipSnapshot` is checked further down, once the graph has been resolved.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteGraphErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+        let Some(graph) = store.settled_graph(&input.graph_identifier, now) else {
+            return Err(DeleteGraphErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("graph {} not found", input.graph_identifier),
+                },
+            )
+            .into());
+        };
+
+        // "Graphs cannot be deleted if delete-protection is enabled."
+        if graph.deletion_protection {
+            return Err(DeleteGraphErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "graph {} cannot be deleted because deletion protection is enabled",
+                    graph.id
+                ),
+                reason: None,
+            })
+            .into());
+        }
+        // A graph still provisioning or reconfiguring cannot be deleted yet.
+        if graph.status != crate::state::GraphStatus::Available {
+            return Err(DeleteGraphErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "graph {} is in status {} and cannot be deleted",
+                    graph.id,
+                    graph.status.as_wire()
+                ),
+                reason: None,
+            })
+            .into());
+        }
+        // `skipSnapshot` is required and is honoured by not taking one: this slice of
+        // the emulator implements no snapshots, and `CreateGraphSnapshot` (still
+        // scaffolded) owns that behaviour, so a `skipSnapshot=false` delete is refused
+        // rather than silently losing the final snapshot the caller asked for.
+        if !input.skip_snapshot {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteGraph with skipSnapshot=false (a final snapshot)",
+            ));
+        }
+
+        let Some(mut deleted) = store.remove_graph(&input.graph_identifier) else {
+            // Unreachable: the lookup above resolved under the same lock.
+            return Err(DeleteGraphErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("graph {} not found", input.graph_identifier),
+                },
+            )
+            .into());
+        };
+        // The deletion is accepted, so the record this call reports is the graph on its
+        // way out; it is already gone from the store, so GetGraph and ListGraphs no
+        // longer show it.
+        deleted.status = crate::state::GraphStatus::Deleting;
+        deleted.settles_at = None;
+        Ok(Self::Output::from(&deleted))
     }
 }

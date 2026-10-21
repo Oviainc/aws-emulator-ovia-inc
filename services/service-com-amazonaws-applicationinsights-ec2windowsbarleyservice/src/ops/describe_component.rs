@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeComponent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeComponent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeComponent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored component through
+//! [`crate::state::Component::describe`], with the `ResourceList` exactly as
+//! `CreateComponent` supplied it.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +142,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeComponent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeComponentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeComponent"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeComponentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let (application_component, resource_list) = {
+            let store = state.lock();
+            let application = store
+                .applications
+                .get(&input.resource_group_name)
+                // `AccountId` names the account that owns the application; this
+                // emulator serves exactly one, so under any other account the
+                // application does not exist.
+                .filter(|application| {
+                    input
+                        .account_id
+                        .as_deref()
+                        .is_none_or(|asked| asked == application.account_id)
+                });
+            let Some(application) = application else {
+                return Err(DescribeComponentErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no application exists for resource group {}",
+                            input.resource_group_name
+                        )),
+                    },
+                )
+                .into());
+            };
+            let Some(component) = application.components.get(&input.component_name) else {
+                return Err(DescribeComponentErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no component {} exists in resource group {}",
+                            input.component_name, input.resource_group_name
+                        )),
+                    },
+                )
+                .into());
+            };
+            (component.describe(), component.resource_list.clone())
+        };
+
+        Ok(DescribeComponentOutput {
+            application_component: Some(application_component),
+            resource_list: Some(resource_list),
+        })
     }
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEntitlement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEntitlement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints and persists an entitlement under an existing application.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEntitlement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `@idempotent`: an entitlement is identified by its application, principal and role,
+//! so repeating the same request answers the stored entitlement id rather than minting
+//! a second entitlement for the same grant.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +157,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEntitlement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEntitlementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEntitlement"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateEntitlementErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the account-access store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let Entitlement::principalRole(principal_role) = &input.entitlement;
+        let principal = crate::state::StoredPrincipal::from_modeled(&principal_role.principal);
+        let role_arn = principal_role.role_arn.clone();
+        let Some(account) = crate::state::account_from_role_arn(&role_arn) else {
+            return Err(CreateEntitlementErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "entitlement.principalRole.roleArn must carry a 12-digit account id: \
+                         {role_arn}"
+                    )),
+                },
+            )
+            .into());
+        };
+        let account = account.to_string();
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let Some(application) = store.applications.get(&input.application_arn) else {
+            return Err(CreateEntitlementErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no application with ARN {}",
+                        input.application_arn
+                    )),
+                },
+            )
+            .into());
+        };
+        // An entitlement can only be added to an application the service has finished
+        // creating; while it is still `CREATE_IN_PROGRESS` the request conflicts with
+        // the resource's current state, which is what `ConflictException` states.
+        if application.status != crate::state::STATUS_ACTIVE {
+            let status = application.status.clone();
+            return Err(CreateEntitlementErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "application {} is {status}; an entitlement can only be created on an \
+                         {active} application",
+                        input.application_arn,
+                        active = crate::state::STATUS_ACTIVE,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `@idempotent`: the same grant on the same application is the same
+        // entitlement, so repeating the request answers the stored id.
+        if let Some(existing) = store.find_entitlement(&input.application_arn, &principal, &role_arn)
+        {
+            return Ok(CreateEntitlementOutput {
+                entitlement_id: existing.entitlement_id.clone(),
+            });
+        }
+
+        // The quota the service enforces per application, so the store cannot grow
+        // without bound.
+        if store.entitlement_ids(&input.application_arn).len()
+            >= crate::state::MAX_ENTITLEMENTS_PER_APPLICATION
+        {
+            return Err(CreateEntitlementErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "application {} already holds the maximum of {} entitlements",
+                        input.application_arn,
+                        crate::state::MAX_ENTITLEMENTS_PER_APPLICATION
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let sequence = store.next_sequence();
+        let entitlement_id = format!("ent-{sequence:016x}");
+        store.insert_entitlement(crate::state::EntitlementRecord {
+            entitlement_id: entitlement_id.clone(),
+            application_arn: input.application_arn,
+            principal,
+            role_arn,
+            account,
+            account_name: None,
+            created_at_millis: now,
+        });
+
+        Ok(CreateEntitlementOutput { entitlement_id })
     }
 }

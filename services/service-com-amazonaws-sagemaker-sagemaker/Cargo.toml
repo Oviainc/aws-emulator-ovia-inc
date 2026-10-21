@@ -21,6 +21,8 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Hex codec for ListModels' opaque NextToken (the page boundary, encoded).
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

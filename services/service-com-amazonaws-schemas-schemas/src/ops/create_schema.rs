@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSchema
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSchema`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSchema::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the first version of a schema inside a stored registry.
 //!
 //! ## Shape of an operation
 //!
@@ -93,12 +86,25 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-schemas-schemas.json");
 // here — hence the `CreateSchemaError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.schemas#CreateSchema")]
+//
+// `extra_errors` widens the set with two shapes the SERVICE models that this
+// operation's `errors` list omits, because creating a named resource has exactly two
+// client outcomes the model leaves unnameable: the registry it must live in does not
+// exist (404 `NotFoundException`, the error every other registry-scoped operation
+// here declares for that case), and a schema of that name already exists in it (409
+// `ConflictException`, as `CreateRegistry` declares for its own name collision).
+// Neither is a 400: the request is well-formed, the store's contents refuse it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.schemas#CreateSchema",
+    extra_errors = ["NotFoundException", "ConflictException"]
+)]
 #[derive(Debug)]
 pub enum CreateSchemaErrorModeled {
     BadRequestException(BadRequestException),
+    ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     InternalServerErrorException(InternalServerErrorException),
+    NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
 
@@ -153,18 +159,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSchema` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSchemaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSchema"))
+        let region = crate::state::request_region(ctx.parts());
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateSchemaError::from(CreateSchemaErrorModeled::InternalServerErrorException(
+                crate::state::internal_error(),
+            ))
+        })?;
+        let mut state = store.lock();
+
+        // The content budget is a property of the WHOLE store, so it is read while
+        // the borrow is still shared — but it is CHECKED below, after the registry
+        // and the name have been resolved: a request naming a registry that does not
+        // exist is a 404 whatever the store's size.
+        let stored_bytes = crate::state::stored_content_bytes(&state);
+
+        let registry = state
+            .registries
+            .get_mut(&input.registry_name)
+            .ok_or_else(|| {
+                CreateSchemaError::from(CreateSchemaErrorModeled::NotFoundException(
+                    crate::state::registry_not_found(&input.registry_name),
+                ))
+            })?;
+
+        // A schema name identifies the schema within its registry; a second create
+        // under the same name is a conflict, not a new version. Versions come from
+        // UpdateSchema.
+        if registry.schemas.contains_key(&input.schema_name) {
+            return Err(CreateSchemaErrorModeled::ConflictException(
+                crate::state::conflict(format!(
+                    "Schema {} already exists in registry {}.",
+                    input.schema_name, input.registry_name
+                )),
+            )
+            .into());
+        }
+
+        // The store lives for the life of the process and only a create adds to it,
+        // so both the number of schemas and the bytes they retain are capped. See
+        // `crate::state::MAX_REGISTRIES`.
+        if registry.schemas.len() >= crate::state::MAX_SCHEMAS_PER_REGISTRY {
+            return Err(CreateSchemaErrorModeled::BadRequestException(
+                crate::state::store_cap_reached(
+                    "schemas per registry",
+                    crate::state::MAX_SCHEMAS_PER_REGISTRY,
+                ),
+            )
+            .into());
+        }
+        if stored_bytes.saturating_add(input.content.len())
+            > crate::state::MAX_STORED_CONTENT_BYTES
+        {
+            return Err(CreateSchemaErrorModeled::BadRequestException(
+                crate::state::store_cap_reached(
+                    "bytes of schema content",
+                    crate::state::MAX_STORED_CONTENT_BYTES,
+                ),
+            )
+            .into());
+        }
+
+        // ONE clock reading for the whole write, so the version's creation date and
+        // the schema's last-modified instant agree for a schema that has only ever
+        // been created.
+        let now = ::std::time::SystemTime::now();
+        // A schema's first version is 1, and `SchemaVersion` is that number in
+        // decimal.
+        const FIRST_VERSION: u64 = 1;
+
+        let schema = crate::state::Schema {
+            name: input.schema_name.clone(),
+            arn: crate::state::schema_arn(&region, &input.registry_name, &input.schema_name),
+            description: input.description.clone(),
+            r#type: input.r#type.clone(),
+            tags: crate::state::tags_from_input(input.tags.as_ref()),
+            latest_version: FIRST_VERSION,
+            last_modified: now,
+            versions: ::std::iter::once((
+                FIRST_VERSION,
+                crate::state::SchemaVersion {
+                    version: FIRST_VERSION,
+                    content: input.content.clone(),
+                    r#type: input.r#type.clone(),
+                    description: input.description.clone(),
+                    created_date: now,
+                },
+            ))
+            .collect(),
+        };
+        registry.schemas.insert(input.schema_name.clone(), schema);
+
+        // Answer from the STORED schema and its stored version, never from `input`.
+        let stored = registry
+            .schemas
+            .get(&input.schema_name)
+            .expect("the schema inserted above is present");
+        let version = stored
+            .versions
+            .get(&stored.latest_version)
+            .expect("the first version was stored with the schema");
+        Ok(CreateSchemaOutput {
+            description: stored.description.clone(),
+            last_modified: Some(stored.last_modified.into()),
+            schema_arn: Some(stored.arn.clone()),
+            schema_name: Some(stored.name.clone()),
+            schema_version: Some(version.version.to_string()),
+            tags: crate::state::tags_to_output(&stored.tags),
+            r#type: Some(stored.r#type.clone()),
+            version_created_date: Some(version.created_date.into()),
+        })
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateComponent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateComponent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateComponent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores the component, with the resource list it was given, under
+//! the parent application in [`crate::state`], so `DescribeComponent` and
+//! `ListComponents` report it from there.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +137,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateComponent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateComponentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateComponent"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateComponentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Derived from the ARNs the caller grouped, not from the request's shape:
+        // see `crate::state::resource_type_of`.
+        let resource_type = crate::state::resource_type_of(&input.resource_list);
+
+        // `ResourceList` is stored verbatim and carries no modelled length bound,
+        // so the emulator's own bound is what stops one request growing the store
+        // without end.
+        if input.resource_list.len() > crate::state::COMPONENT_RESOURCE_QUOTA {
+            return Err(CreateComponentErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "ResourceList carries {} resources; this emulator stores at most {} per component",
+                    input.resource_list.len(),
+                    crate::state::COMPONENT_RESOURCE_QUOTA
+                )),
+            })
+            .into());
+        }
+
+        let mut store = state.lock();
+        let Some(application) = store.applications.get_mut(&input.resource_group_name) else {
+            return Err(CreateComponentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no application exists for resource group {}",
+                        input.resource_group_name
+                    )),
+                },
+            )
+            .into());
+        };
+        if application.components.contains_key(&input.component_name) {
+            return Err(CreateComponentErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "component {} already exists in resource group {}",
+                        input.component_name, input.resource_group_name
+                    )),
+                },
+            )
+            .into());
+        }
+        // The emulator's own bound on how many components one application holds.
+        if application.components.len() >= crate::state::COMPONENT_QUOTA {
+            return Err(CreateComponentErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "this emulator stores at most {} components per application; delete one before creating another",
+                    crate::state::COMPONENT_QUOTA
+                )),
+            })
+            .into());
+        }
+
+        application.components.insert(
+            input.component_name.clone(),
+            crate::state::Component {
+                component_name: input.component_name,
+                resource_list: input.resource_list,
+                resource_type,
+                os_type: None,
+                tier: crate::state::TIER_DEFAULT.to_string(),
+                monitor: false,
+                component_remarks: None,
+            },
+        );
+
+        Ok(CreateComponentOutput {})
     }
 }

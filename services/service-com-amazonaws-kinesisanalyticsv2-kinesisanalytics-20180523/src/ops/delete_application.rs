@@ -129,12 +129,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for DeleteApplication<Eng>
 {
     type Input = DeleteApplicationInput;
-    type Output = DeleteApplicationOutput;
+    type Output = DeleteApplicationResponse;
     type Error = DeleteApplicationError;
 
     const NAME: &'static str = "DeleteApplication";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_APPLICATION_INPUT_SCHEMA;
-    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_APPLICATION_OUTPUT_SCHEMA;
+    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_APPLICATION_RESPONSE_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
@@ -203,6 +203,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         store.applications.remove(&name);
-        Ok(DeleteApplicationOutput {})
+        Ok(DeleteApplicationResponse {})
     }
 }

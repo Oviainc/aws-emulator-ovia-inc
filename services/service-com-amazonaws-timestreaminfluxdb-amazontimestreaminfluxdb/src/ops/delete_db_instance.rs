@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDbInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDbInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDbInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -215,18 +206,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDbInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDbInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDbInstance"))
+        use crate::state as st;
+
+        let _ = ctx;
+        // `retainAutomatedBackups` is read by the backup operations, which are not
+        // implemented in this slice: no automated backup exists to retain or discard, so
+        // there is nothing for it to decide here yet.
+        let _ = input.retain_automated_backups;
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(DeleteDbInstanceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+        let Some(mut record) = state.db_instances.remove(&input.identifier) else {
+            return Err(DeleteDbInstanceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("DB instance {} not found", input.identifier),
+                    resource_id: input.identifier.clone(),
+                    resource_type: st::RESOURCE_TYPE_DB_INSTANCE.to_string(),
+                },
+            )
+            .into());
+        };
+        // The name index is released with the record, so the name can be reused in the
+        // region the record was created in.
+        state.release_db_instance_name(&record.region, &record.name);
+
+        // The deleted record is reported as DELETING: it is gone from state, so no
+        // further read resolves it and no clock transition is owed on it.
+        record.status = st::STATUS_DELETING.to_string();
+        record.settles_at = None;
+        Ok(record.to_delete_output())
     }
 }

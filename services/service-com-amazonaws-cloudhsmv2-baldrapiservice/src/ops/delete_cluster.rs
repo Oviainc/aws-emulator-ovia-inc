@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: moves the stored cluster into deletion, so a following
+//! `DescribeClusters` no longer reports it as a live cluster. The notes below are the
+//! scaffold's, kept for the next reader.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Nothing else about `DeleteCluster` is asserted here — this file is the ONLY one to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +153,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCluster"))
+        // Deleting the cluster needs nothing from `ctx`: the cluster is named by the
+        // request and held in the store.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteClusterErrorModeled::CloudHsmInternalFailureException(
+                CloudHsmInternalFailureException {
+                    message: Some(
+                        "the cloudhsmv2 emulator is mounted on an engine that holds no state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let cluster = store
+            .clusters
+            .get_mut(&input.cluster_id)
+            .filter(|cluster| !cluster.is_gone())
+            .ok_or_else(|| cluster_not_found(&input.cluster_id))?;
+
+        // "Before you can delete a cluster, you must delete all HSMs in the cluster."
+        if !cluster.hsms.is_empty() {
+            let hsm_ids: Vec<&str> = cluster
+                .hsms
+                .iter()
+                .map(|hsm| hsm.hsm_id.as_str())
+                .collect::<Vec<&str>>();
+            return Err(
+                DeleteClusterErrorModeled::CloudHsmInvalidRequestException(
+                    CloudHsmInvalidRequestException {
+                        message: Some(format!(
+                            "cluster {} still contains the HSMs {}; delete them before \
+                             deleting the cluster",
+                            input.cluster_id,
+                            hsm_ids.join(", ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        cluster.state = crate::state::CLUSTER_DELETE_IN_PROGRESS.to_string();
+        cluster.state_message = None;
+        // DELETE_IN_PROGRESS is not terminal: the cluster is owed DELETED.
+        cluster.pending = Some(crate::state::Pending::after(
+            now,
+            crate::state::Owed::ToState(crate::state::CLUSTER_DELETED),
+        ));
+        // And DELETED is readable only for the store's retention window, after which
+        // the record is reclaimed rather than kept for the life of the process.
+        cluster.reclaim_at = Some(now + crate::state::DELETED_CLUSTER_RETENTION);
+
+        Ok(DeleteClusterOutput {
+            cluster: Some(cluster.to_shape()),
+        })
     }
+}
+
+/// Refuse the request with the error this operation models for a cluster that cannot be
+/// found.
+fn cluster_not_found(cluster_id: &str) -> DeleteClusterError {
+    DeleteClusterErrorModeled::CloudHsmResourceNotFoundException(
+        CloudHsmResourceNotFoundException {
+            message: Some(format!("cluster {cluster_id} does not exist")),
+        },
+    )
+    .into()
 }

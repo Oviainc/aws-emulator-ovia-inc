@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeFileSystems
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeFileSystems`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeFileSystems::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the file systems [`crate::state`] holds, filtered by the
+//! `FileSystemId` and `CreationToken` query members and paginated by `MaxItems` /
+//! `Marker`. It writes only the lifecycle transitions the clock already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +165,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeFileSystems` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeFileSystemsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeFileSystems"))
+        use crate::state as efs;
+
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.materialize_due_transitions(now);
+
+        // "ID of the file system whose description you want to retrieve" — the member
+        // accepts an id or an ARN.
+        let wanted_id = input.file_system_id.as_deref().map(efs::file_system_id_of);
+        if let Some(id) = wanted_id {
+            if !state.file_systems.contains_key(id) {
+                return Err(not_found(format!("File system {id} does not exist")));
+            }
+        }
+        // A `CreationToken` names one file system exactly as a `FileSystemId` does, so a
+        // token this account holds no file system for is the same 404 — the observable
+        // DeleteFileSystem documents for a released token: "If you pass file system ID or
+        // creation token for the deleted file system, the DescribeFileSystems returns a
+        // 404 FileSystemNotFound error."
+        if let Some(token) = input.creation_token.as_deref() {
+            if !state.creation_tokens.contains_key(token) {
+                return Err(not_found(format!(
+                    "No file system exists with creation token {token}"
+                )));
+            }
+        }
+
+        let mut matched: Vec<&efs::FileSystem> = state
+            .file_systems
+            .values()
+            .filter(|file_system| wanted_id.is_none_or(|id| file_system.file_system_id == id))
+            .filter(|file_system| {
+                input
+                    .creation_token
+                    .as_deref()
+                    .is_none_or(|token| file_system.creation_token == token)
+            })
+            .collect();
+        matched.sort_by_key(|file_system| file_system.ordinal);
+
+        // The marker is the id the next page starts at, so resuming from a returned
+        // NextMarker continues exactly where the previous page stopped.
+        let start = match input.marker.as_deref() {
+            Some(marker) => matched
+                .iter()
+                .position(|file_system| file_system.file_system_id == marker)
+                .ok_or_else(|| {
+                    bad_request(format!(
+                        "Marker {marker} does not name a file system of this request's result set"
+                    ))
+                })?,
+            None => 0,
+        };
+        let page_size = efs::page_size(input.max_items, efs::DEFAULT_FILE_SYSTEM_PAGE_SIZE);
+        let page: Vec<CreateFileSystemOutput> = matched[start..]
+            .iter()
+            .take(page_size)
+            .map(|file_system| file_system.describe())
+            .collect();
+        let next_marker = matched
+            .get(start + page.len())
+            .map(|file_system| file_system.file_system_id.clone());
+
+        Ok(DescribeFileSystemsOutput {
+            marker: input.marker.clone(),
+            file_systems: Some(page),
+            next_marker,
+        })
     }
+}
+
+/// A 404 `FileSystemNotFound`: "the specified FileSystemId value doesn't exist in the
+/// requester's Amazon Web Services account".
+fn not_found(message: impl Into<String>) -> DescribeFileSystemsError {
+    DescribeFileSystemsErrorModeled::FileSystemNotFound(FileSystemNotFound {
+        error_code: "FileSystemNotFound".to_string(),
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 400 `BadRequest`: "the request is malformed or contains an error such as an invalid
+/// parameter value or a missing required parameter".
+fn bad_request(message: impl Into<String>) -> DescribeFileSystemsError {
+    DescribeFileSystemsErrorModeled::BadRequest(BadRequest {
+        error_code: "BadRequest".to_string(),
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 500 `InternalServerError`, for the one case this handler cannot serve: the engine
+/// this service was mounted on holds no store for it.
+fn internal_server_error() -> DescribeFileSystemsError {
+    DescribeFileSystemsErrorModeled::InternalServerError(InternalServerError {
+        error_code: "InternalServerError".to_string(),
+        message: Some("the EFS emulator state store is unavailable".to_string()),
+    })
+    .into()
 }

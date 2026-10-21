@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateElasticsearchDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateElasticsearchDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateElasticsearchDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an Elasticsearch domain and PERSISTS it: the stored record is what
+//! every later `Describe*`, `ListDomainNames` and `Update*` call answers from.
 //!
 //! ## Shape of an operation
 //!
@@ -129,6 +122,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    access_policy_refusal, apply_option, domain_key, snapshot_pause_refusal, Domain,
+    DomainConfigRecord, FIRST_CONFIG_VERSION, MAX_DOMAINS_PER_REGION, MAX_DOMAINS_TOTAL,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -204,18 +201,202 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateElasticsearchDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateElasticsearchDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateElasticsearchDomain"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateElasticsearchDomainErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the Elasticsearch domain store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(&ctx.parts().headers);
+
+        // A suspension window the documented maximum cannot hold, or an
+        // access-policy document past the documented maximum size, is refused
+        // before anything is stored.
+        let refusal = input
+            .automated_snapshot_pause_options
+            .as_ref()
+            .and_then(snapshot_pause_refusal)
+            .or_else(|| {
+                input
+                    .access_policies
+                    .as_deref()
+                    .and_then(access_policy_refusal)
+            });
+        if let Some(reason) = refusal {
+            return Err(CreateElasticsearchDomainErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // Domain names are unique per account and region (DomainName's own doc),
+        // which is the scope the store is keyed on.
+        let key = domain_key(&region, &input.domain_name);
+        if store.domains.contains_key(&key) {
+            return Err(
+                CreateElasticsearchDomainErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!("Domain already exists: {}", input.domain_name)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The account's per-region domain quota, and the store's hard ceiling
+        // across every region (the region is request-derived, so the per-region
+        // quota alone would not bound the store). The message names whichever
+        // bound was reached.
+        let limit_reached = if store.domain_count(&region) >= MAX_DOMAINS_PER_REGION {
+            Some(format!(
+                "Domain limit of {MAX_DOMAINS_PER_REGION} domains per account per region has \
+                 been reached"
+            ))
+        } else if store.domains.len() >= MAX_DOMAINS_TOTAL {
+            Some(format!(
+                "Domain limit of {MAX_DOMAINS_TOTAL} domains per account has been reached"
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = limit_reached {
+            return Err(CreateElasticsearchDomainErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let version = FIRST_CONFIG_VERSION;
+        let mut config = DomainConfigRecord::new(
+            input.elasticsearch_cluster_config.unwrap_or_default(),
+            now,
+        );
+        apply_option(
+            &mut config.elasticsearch_version,
+            input.elasticsearch_version,
+            now,
+            version,
+        );
+        apply_option(&mut config.ebs_options, input.ebs_options, now, version);
+        apply_option(
+            &mut config.access_policies,
+            input.access_policies,
+            now,
+            version,
+        );
+        // SnapshotOptions' own doc: "Option to set time, in UTC format, of the
+        // daily automated snapshot. Default value is 0 hours." — so a create that
+        // omits it stores that documented default rather than nothing.
+        apply_option(
+            &mut config.snapshot_options,
+            Some(input.snapshot_options.unwrap_or(SnapshotOptions {
+                automated_snapshot_start_hour: Some(0),
+            })),
+            now,
+            version,
+        );
+        apply_option(
+            &mut config.vpc_options,
+            input.vpc_options.map(crate::state::vpc_derived_info),
+            now,
+            version,
+        );
+        apply_option(
+            &mut config.cognito_options,
+            input.cognito_options,
+            now,
+            version,
+        );
+        apply_option(
+            &mut config.encryption_at_rest_options,
+            input.encryption_at_rest_options,
+            now,
+            version,
+        );
+        apply_option(
+            &mut config.node_to_node_encryption_options,
+            input.node_to_node_encryption_options,
+            now,
+            version,
+        );
+        apply_option(
+            &mut config.advanced_options,
+            input
+                .advanced_options
+                .map(|options| options.into_iter().collect()),
+            now,
+            version,
+        );
+        apply_option(
+            &mut config.log_publishing_options,
+            input
+                .log_publishing_options
+                .map(|options| options.into_iter().collect()),
+            now,
+            version,
+        );
+        apply_option(
+            &mut config.domain_endpoint_options,
+            input.domain_endpoint_options,
+            now,
+            version,
+        );
+        apply_option(
+            &mut config.advanced_security_options,
+            input
+                .advanced_security_options
+                .map(crate::state::advanced_security_options),
+            now,
+            version,
+        );
+        apply_option(
+            &mut config.auto_tune_options,
+            input.auto_tune_options.map(crate::state::auto_tune_options),
+            now,
+            version,
+        );
+        apply_option(
+            &mut config.deployment_strategy_options,
+            input.deployment_strategy_options,
+            now,
+            version,
+        );
+        apply_option(
+            &mut config.automated_snapshot_pause_options,
+            input.automated_snapshot_pause_options,
+            now,
+            version,
+        );
+        apply_option(&mut config.use_case, input.use_case, now, version);
+        apply_option(&mut config.engine_mode, input.engine_mode, now, version);
+
+        let seq = store.next_seq();
+        let domain = Domain::create(
+            input.domain_name,
+            &region,
+            seq,
+            config,
+            input.tag_list.unwrap_or_default(),
+            now,
+        );
+
+        // The response is the status of the record being stored — the same value
+        // the next DescribeElasticsearchDomain reads back — so the two cannot
+        // disagree.
+        let domain_status = domain.domain_status(now);
+        store.domains.insert(key, domain);
+        Ok(CreateElasticsearchDomainOutput {
+            domain_status: Some(domain_status),
+        })
     }
 }

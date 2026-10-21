@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTunnel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTunnel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTunnel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored tunnel `tunnelId` names, built entirely from [`crate::state`].
+//! A read: it never mints, rotates or echoes an access token (the real API does not
+//! return them here), and the only state it settles is the close the clock already
+//! owed a tunnel whose `maxLifetimeTimeoutMinutes` has elapsed.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +133,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTunnel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTunnelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTunnel"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("DescribeTunnel"))?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Settle the transition the clock already made due before reporting.
+        store.materialize_expired_tunnels(now);
+
+        let Some(stored) = store.tunnels.get(&input.tunnel_id).cloned() else {
+            return Err(DescribeTunnelErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Tunnel {} not found", input.tunnel_id)),
+                },
+            )
+            .into());
+        };
+        let tags = store.tag_list(&stored.tunnel_arn);
+        drop(store);
+
+        let connection_state = |state: &crate::state::StoredConnectionState| ConnectionState {
+            status: Some(state.status.as_wire().to_string()),
+            last_updated_at: Some(::aws_smithy_types::DateTime::from(state.last_updated_at)),
+        };
+
+        Ok(DescribeTunnelOutput {
+            tunnel: Some(Tunnel {
+                tunnel_id: Some(stored.tunnel_id.clone()),
+                tunnel_arn: Some(stored.tunnel_arn.clone()),
+                status: Some(stored.status.as_wire().to_string()),
+                source_connection_state: Some(connection_state(&stored.source_connection_state)),
+                destination_connection_state: Some(connection_state(
+                    &stored.destination_connection_state,
+                )),
+                description: stored.description.clone(),
+                destination_config: stored.destination_config.as_ref().map(|config| {
+                    DestinationConfig {
+                        thing_name: config.thing_name.clone(),
+                        services: config.services.clone(),
+                    }
+                }),
+                timeout_config: Some(TimeoutConfig {
+                    max_lifetime_timeout_minutes: Some(stored.max_lifetime_timeout_minutes),
+                }),
+                tags,
+                created_at: Some(::aws_smithy_types::DateTime::from(stored.created_at)),
+                last_updated_at: Some(::aws_smithy_types::DateTime::from(stored.last_updated_at)),
+            }),
+        })
     }
 }

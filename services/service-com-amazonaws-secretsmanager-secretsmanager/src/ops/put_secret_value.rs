@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutSecretValue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutSecretValue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Appends a new version to a stored secret and moves the staging labels the
+//! request claims onto it — `AWSCURRENT` by default, which demotes the version it
+//! was taken from to `AWSPREVIOUS`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutSecretValue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `RotationToken` identifies the caller of a cross-account managed rotation to
+//! IAM; it does not take part in choosing or storing the value, and this emulator
+//! does not evaluate IAM, so it is accepted and has no effect on what is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -234,20 +232,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutSecretValue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutSecretValueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutSecretValue"))
+        // "Either SecretString or SecretBinary must have a value, but not both."
+        let refusal = match (input.secret_string.is_some(), input.secret_binary.is_some()) {
+            (true, true) => Some(
+                "You can't specify both SecretString and SecretBinary in the same request.",
+            ),
+            (false, false) => {
+                Some("You must provide either SecretString or SecretBinary in the request.")
+            }
+            _ => None,
+        };
+        if let Some(refusal) = refusal {
+            return Err(PutSecretValueErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(refusal.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        store.expire_due(now);
+
+        // "If you don't include VersionStages, then Secrets Manager automatically
+        // moves the staging label AWSCURRENT to this version."
+        let stages = input
+            .version_stages
+            .clone()
+            .filter(|stages| !stages.is_empty())
+            .unwrap_or_else(|| vec![crate::state::STAGE_CURRENT.to_string()]);
+        let version_id = input
+            .client_request_token
+            .clone()
+            .unwrap_or_else(crate::state::new_version_id);
+
+        let Some(secret) = store.get_mut(&input.secret_id) else {
+            return Err(PutSecretValueErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Secrets Manager can't find the specified secret: {}",
+                        input.secret_id
+                    )),
+                },
+            )
+            .into());
+        };
+        if secret.scheduled_for_deletion() {
+            return Err(PutSecretValueErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "You can't perform this operation on the secret because it was marked \
+                         for deletion."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `ClientRequestToken` is the new version's id and an @idempotencyToken:
+        // a repeat carrying the same value is the same request and changes
+        // nothing, while the same id with a different value would modify an
+        // existing version, which this operation never does.
+        if let Some(existing) = secret.version(&version_id) {
+            if existing
+                .holds_same_value(input.secret_string.as_ref(), input.secret_binary.as_ref())
+            {
+                return Ok(PutSecretValueOutput {
+                    arn: Some(secret.arn.clone()),
+                    name: Some(secret.name.clone()),
+                    version_id: Some(existing.version_id.clone()),
+                    version_stages: existing.stages_out(),
+                });
+            }
+            return Err(PutSecretValueErrorModeled::ResourceExistsException(
+                ResourceExistsException {
+                    message: Some(format!(
+                        "The operation failed because a version with the id {version_id} already \
+                         exists and holds a different value."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Bound the secret before it grows: a put that leaves no deprecated
+        // version to evict would grow the store without end, so it is refused
+        // with "The request failed because it would exceed one of the Secrets
+        // Manager quotas." See `state::VERSIONS_PER_SECRET`.
+        if !secret.has_room_for_version(&stages) {
+            return Err(PutSecretValueErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The request failed because it would exceed the maximum of {} versions \
+                         this emulator stores for one secret.",
+                        crate::state::VERSIONS_PER_SECRET
+                    )),
+                },
+            )
+            .into());
+        }
+
+        secret.put_version(
+            crate::state::SecretVersion {
+                version_id: version_id.clone(),
+                secret_string: input.secret_string.clone(),
+                secret_binary: input.secret_binary.clone(),
+                version_stages: stages,
+                created_date: now,
+            },
+            now,
+        );
+        // Report the stored version, so the labels the caller is told about are
+        // the ones a later GetSecretValue will resolve.
+        let stored = secret.version(&version_id).ok_or_else(state_unavailable)?;
+        Ok(PutSecretValueOutput {
+            arn: Some(secret.arn.clone()),
+            name: Some(secret.name.clone()),
+            version_id: Some(stored.version_id.clone()),
+            version_stages: stored.stages_out(),
+        })
     }
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> PutSecretValueError {
+    PutSecretValueErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }

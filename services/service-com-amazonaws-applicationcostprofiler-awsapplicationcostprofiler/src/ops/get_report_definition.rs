@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetReportDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetReportDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetReportDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +148,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetReportDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetReportDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetReportDefinition"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetReportDefinitionErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the ApplicationCostProfiler state store is unavailable on this engine".into(),
+                ),
+            })
+        })?;
+
+        // A pure read: the response is rendered from the stored record, so what a
+        // reader sees is exactly what the last writer stored.
+        let store = state.lock();
+        let Some(record) = store.report_definitions.get(&input.report_id) else {
+            return Err(invalid(format!(
+                "Member reportId does not name a report definition: {}",
+                input.report_id
+            )));
+        };
+        Ok(GetReportDefinitionOutput {
+            report_id: record.report_id.clone(),
+            report_description: record.report_description.clone(),
+            report_frequency: record.report_frequency.clone(),
+            format: record.format.clone(),
+            destination_s3_location: S3Location {
+                bucket: record.destination_bucket.clone(),
+                prefix: record.destination_prefix.clone(),
+            },
+            created_at: crate::state::to_date_time(record.created_at),
+            last_updated: crate::state::to_date_time(record.last_updated),
+        })
     }
+}
+
+/// Refuse the request with the service's own client-input error: HTTP 400
+/// `ValidationException`. This service's model declares no `ResourceNotFound`,
+/// so an absent report definition is refused with the one client error it has.
+fn invalid(message: String) -> GetReportDefinitionError {
+    GetReportDefinitionErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }
