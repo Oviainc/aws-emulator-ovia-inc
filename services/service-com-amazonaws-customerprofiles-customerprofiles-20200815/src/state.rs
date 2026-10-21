@@ -1,11 +1,388 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-customerprofiles-customerprofiles-20200815 service.
+//!
+//! The service's one aggregate is the DOMAIN — "a container for all customer data, such
+//! as customer profile attributes, object types, profile keys, and encryption keys"
+//! (`CreateDomain`). Every profile, and the searchable key index profiles are found
+//! through, hangs off its domain, so `DeleteDomain` ("Deletes a specific domain and all
+//! of its customer data, such as customer profile attributes and their related objects")
+//! drops the whole subtree by removing one map entry.
+//!
+//! Domains are held in a `BTreeMap` and a domain's profiles in a `BTreeMap` keyed by
+//! profile id, so every listing and search walks state in one stable order — which is
+//! what makes the `NextToken` cursor below resumable.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::{Duration, SystemTime};
+
+use crate::ops::types::{
+    DataStoreResponse, MatchingResponse, Profile, Readiness, RuleBasedMatchingResponse,
+};
+
+/// How long after `CreateDomain` the asynchronous work a new domain kicks off is treated
+/// as finished: the rule-based matching rule reaches `ACTIVE`, and an enabled data store
+/// reaches 100% readiness.
+///
+/// AWS does not document a duration for either, so this is a CHOSEN span. It is
+/// deliberately non-zero: a caller that reads the domain back immediately must still
+/// observe the transient state the create call reported.
+pub const ASYNC_WORK_SPAN: Duration = Duration::from_millis(500);
+
+/// The page size applied when a caller sends no `MaxResults`. `SearchProfiles`
+/// documents its `MaxResults` as "The maximum number of objects returned per page. The
+/// default is 20 if this parameter is not included in the request." `ListDomains`
+/// documents no default for its own `MaxResults` ("The maximum number of objects
+/// returned per page"), so it serves the one this service states, which is this value.
+pub const DEFAULT_PAGE_SIZE: usize = 20;
+
+/// The largest number of search values one `SearchProfiles` request may carry in total,
+/// across its required `Values` list and every `AdditionalSearchKeys[*].Values` list.
+///
+/// The model bounds the number of search KEYS (one required plus up to four additional)
+/// but puts no length on a key's value list, so this is a CHOSEN protective cap. It
+/// bounds the index probes, and with [`DEFAULT_PAGE_SIZE`]/`MaxResults` bounding the
+/// page it bounds the PRODUCT of page size and value count that describing a page costs.
+/// It is far above any real search, which carries a handful of values.
+pub const MAX_SEARCH_VALUES: usize = 100;
+
+// ---------------------------------------------------------------------------
+// Store bounds
+//
+// Every record below is created by a caller and reclaimed only by an explicit delete, so
+// each growth site carries a cap checked BEFORE the insert and nothing caller-sized
+// reaches the store unchecked.
+//
+// The product is therefore finite: at most MAX_DOMAINS domains, each holding at most
+// MAX_PROFILES_PER_DOMAIN profiles, each profile indexed under at most the handful of
+// standard keys `standard_search_keys` can derive from it, and each caller-sized map on
+// a record (`Tags` 1..50, `Attributes` entries 1..255 characters) bounded by the length
+// the model declares for it and refused at the boundary before a handler runs.
+// ---------------------------------------------------------------------------
+
+/// Customer Profiles' published quota "Domains per AWS account per Region: 100".
+pub const MAX_DOMAINS: usize = 100;
+
+/// Emulator resource guard, NOT an AWS quota (the service publishes no per-domain
+/// profile limit): the most profiles this emulator stores for one domain. Set well above
+/// any realistic emulator workload.
+pub const MAX_PROFILES_PER_DOMAIN: usize = 10_000;
+
+/// `RuleBasedMatchingStatus` while the rule is being built. Its documentation: "The
+/// system is creating the rule-based matching rule." A domain created with rule-based
+/// matching enabled starts here rather than at `PENDING`, because `PENDING` is described
+/// as the wait an EXISTING domain serves — "If it is a new domain, the system will skip
+/// the PENDING stage."
+pub const RULE_BASED_MATCHING_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// `RuleBasedMatchingStatus` once the rule is built: "The rule is ready to use."
+pub const RULE_BASED_MATCHING_ACTIVE: &str = "ACTIVE";
+
+/// Predefined `SearchProfiles` key naming a profile by its own id.
+pub const KEY_PROFILE_ID: &str = "_profileId";
+/// Predefined `SearchProfiles` key naming a profile by its account number.
+pub const KEY_ACCOUNT: &str = "_account";
+/// Predefined `SearchProfiles` key naming a profile by any of its email addresses.
+pub const KEY_EMAIL: &str = "_email";
+/// Predefined `SearchProfiles` key naming a profile by any of its phone numbers.
+pub const KEY_PHONE: &str = "_phone";
+/// Predefined `SearchProfiles` key naming a profile by its full name.
+pub const KEY_FULL_NAME: &str = "_fullName";
 
 /// Per-service state for com-amazonaws-customerprofiles-customerprofiles-20200815. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCustomerprofilesCustomerprofiles20200815State {
-    // TODO: add service-specific state fields
+    /// Every domain this emulator holds, keyed by `DomainName` — the name is the
+    /// domain's identity (`@httpLabel` on every domain-scoped operation).
+    pub domains: BTreeMap<String, Domain>,
+}
+
+/// One stored domain: the configuration `CreateDomain` persisted, the timestamps it
+/// generated, and the customer data nested under it.
+#[derive(Debug, Clone)]
+pub struct Domain {
+    /// `DomainName`, as stored (also this domain's key in [`ComAmazonawsCustomerprofilesCustomerprofiles20200815State::domains`]).
+    pub name: String,
+    /// `DefaultExpirationDays`, as stored.
+    pub default_expiration_days: i32,
+    /// `DefaultEncryptionKey`, as stored.
+    pub default_encryption_key: Option<String>,
+    /// `DeadLetterQueueUrl`, as stored.
+    pub dead_letter_queue_url: Option<String>,
+    /// `Matching`, as the wire reports it. `MatchingResponse` has no status member, so
+    /// the stored value is the whole answer.
+    pub matching: Option<MatchingResponse>,
+    /// `RuleBasedMatching`, as stored, with `Status` left unset: the status is a
+    /// function of the clock, so it is computed on every read by
+    /// [`Domain::rule_based_matching_response`] rather than stored.
+    pub rule_based_matching: Option<RuleBasedMatchingResponse>,
+    /// Whether `DataStore` was requested enabled, as stored. The readiness beside it on
+    /// the wire is a function of the clock — see [`Domain::data_store_response`].
+    pub data_store_enabled: Option<bool>,
+    /// `Tags`, as stored.
+    pub tags: Option<HashMap<String, String>>,
+    /// `CreatedAt`: generated once, here, and never recomputed.
+    pub created_at: SystemTime,
+    /// `LastUpdatedAt`: the last time the DOMAIN's own configuration changed. Writing a
+    /// profile is not an edit of the domain, so it does not move this.
+    pub last_updated_at: SystemTime,
+    /// When the work [`ASYNC_WORK_SPAN`] covers falls due. Stored as an instant so no
+    /// handler ever sleeps for it.
+    pub ready_at: SystemTime,
+    /// The domain's profiles, keyed by `ProfileId`.
+    pub profiles: BTreeMap<String, StoredProfile>,
+    /// `KeyName` -> `Value` -> the ids of the profiles indexed under that pair. This is
+    /// what `SearchProfiles` reads; [`Domain::put_profile`] fills it and
+    /// [`Domain::remove_profile`] empties it. Nested rather than keyed by a
+    /// `(KeyName, Value)` tuple so a lookup probes it with borrowed strings and
+    /// allocates nothing per probe.
+    pub key_index: HashMap<String, HashMap<String, BTreeSet<String>>>,
+}
+
+/// One stored profile: the modelled shape plus the timestamps the service keeps for it.
+#[derive(Debug, Clone)]
+pub struct StoredProfile {
+    /// The profile exactly as it is reported back, `ProfileId` included. `FoundByItems`
+    /// is NOT stored: it describes which search keys matched one particular search, so
+    /// `SearchProfiles` computes it per response.
+    pub profile: Profile,
+    /// When the profile was created.
+    pub created_at: SystemTime,
+    /// When the profile was last written.
+    pub last_updated_at: SystemTime,
+}
+
+impl Domain {
+    /// A new domain holding no customer data: the two members `CreateDomain` requires,
+    /// the timestamps it generated, and the instant the asynchronous work its creation
+    /// starts falls due. The optional configuration members are set by the caller of
+    /// this constructor.
+    pub fn new(name: String, default_expiration_days: i32, now: SystemTime) -> Self {
+        Self {
+            name,
+            default_expiration_days,
+            default_encryption_key: None,
+            dead_letter_queue_url: None,
+            matching: None,
+            rule_based_matching: None,
+            data_store_enabled: None,
+            tags: None,
+            created_at: now,
+            last_updated_at: now,
+            ready_at: now + ASYNC_WORK_SPAN,
+            profiles: BTreeMap::new(),
+            key_index: HashMap::new(),
+        }
+    }
+
+    /// Whether the work [`ASYNC_WORK_SPAN`] covers is due as of `now`.
+    pub fn is_ready(&self, now: SystemTime) -> bool {
+        now >= self.ready_at
+    }
+
+    /// How far through [`ASYNC_WORK_SPAN`] this domain is, as a percentage in 0..=100
+    /// (the range `Readiness$ProgressPercentage` declares).
+    pub fn progress_percentage(&self, now: SystemTime) -> i32 {
+        let span = ASYNC_WORK_SPAN.as_secs_f64();
+        let elapsed = now
+            .duration_since(self.created_at)
+            .unwrap_or_default()
+            .as_secs_f64();
+        ((elapsed / span) * 100.0).clamp(0.0, 100.0).round() as i32
+    }
+
+    /// `Matching` as the wire reports it.
+    pub fn matching_response(&self) -> Option<MatchingResponse> {
+        self.matching.clone()
+    }
+
+    /// `RuleBasedMatching` as the wire reports it: the stored configuration with
+    /// `Status` resolved from the clock. A configuration that is not enabled builds no
+    /// rule, so it reports no status.
+    pub fn rule_based_matching_response(
+        &self,
+        now: SystemTime,
+    ) -> Option<RuleBasedMatchingResponse> {
+        let mut response = self.rule_based_matching.clone()?;
+        response.status = (response.enabled == Some(true)).then(|| {
+            if self.is_ready(now) {
+                RULE_BASED_MATCHING_ACTIVE.to_string()
+            } else {
+                RULE_BASED_MATCHING_IN_PROGRESS.to_string()
+            }
+        });
+        Some(response)
+    }
+
+    /// `DataStore` as the wire reports it: what was requested, plus the readiness of an
+    /// enabled store resolved from the clock.
+    pub fn data_store_response(&self, now: SystemTime) -> Option<DataStoreResponse> {
+        let enabled = self.data_store_enabled?;
+        let readiness = enabled.then(|| Readiness {
+            progress_percentage: Some(self.progress_percentage(now)),
+            message: Some(
+                if self.is_ready(now) {
+                    "The data store is ready."
+                } else {
+                    "The data store is being prepared."
+                }
+                .to_string(),
+            ),
+        });
+        Some(DataStoreResponse {
+            enabled: Some(enabled),
+            readiness,
+        })
+    }
+
+    /// Store `stored` and index it under every standard search key its attributes
+    /// populate. A profile already held under the same id is replaced, index included.
+    pub fn put_profile(&mut self, stored: StoredProfile) {
+        let Some(id) = stored.profile.profile_id.clone() else {
+            return;
+        };
+        self.remove_profile(&id);
+        for (key_name, value) in standard_search_keys(&stored.profile) {
+            self.key_index
+                .entry(key_name)
+                .or_default()
+                .entry(value)
+                .or_default()
+                .insert(id.clone());
+        }
+        self.profiles.insert(id, stored);
+    }
+
+    /// Remove the profile and every index entry that pointed at it.
+    pub fn remove_profile(&mut self, profile_id: &str) -> Option<StoredProfile> {
+        let stored = self.profiles.remove(profile_id)?;
+        for (key_name, value) in standard_search_keys(&stored.profile) {
+            let Some(by_value) = self.key_index.get_mut(&key_name) else {
+                continue;
+            };
+            if by_value.get_mut(&value).is_some_and(|ids| {
+                ids.remove(profile_id);
+                ids.is_empty()
+            }) {
+                by_value.remove(&value);
+            }
+            if by_value.is_empty() {
+                self.key_index.remove(&key_name);
+            }
+        }
+        Some(stored)
+    }
+
+    /// The ids of the profiles indexed under `key_name` for ANY of `values` — the
+    /// "key-value(s) pair" one `SearchProfiles` search key describes. Ascending by id,
+    /// so a page boundary is reproducible.
+    pub fn lookup(&self, key_name: &str, values: &[String]) -> BTreeSet<String> {
+        let Some(by_value) = self.key_index.get(key_name) else {
+            return BTreeSet::new();
+        };
+        values
+            .iter()
+            .filter_map(|value| by_value.get(value.as_str()))
+            .flatten()
+            .cloned()
+            .collect()
+    }
+}
+
+/// The predefined `SearchProfiles` keys a profile's OWN attributes populate.
+///
+/// `SearchProfiles$KeyName` lists the predefined keys: `_account`, `_profileId`,
+/// `_assetId`, `_caseId`, `_orderId`, `_fullName`, `_phone`, `_email`, `_ctrContactId`,
+/// and the connector ids (`_marketoLeadId`, `_salesforce*`, `_zendesk*`,
+/// `_serviceNow*`, `_segmentUserId`, `_shopify*`). Only the five returned here are
+/// derivable from a profile itself; the rest are carried by ingested profile OBJECTS,
+/// which no operation stores yet.
+///
+/// Every email member feeds `_email` and every phone member feeds `_phone`, because
+/// those keys name a class of value rather than one member. The result is sorted and
+/// deduplicated so indexing and un-indexing walk the same entries.
+pub fn standard_search_keys(profile: &Profile) -> Vec<(String, String)> {
+    let full = full_name(profile);
+    let singles = [
+        (KEY_PROFILE_ID, profile.profile_id.as_deref()),
+        (KEY_ACCOUNT, profile.account_number.as_deref()),
+        (KEY_EMAIL, profile.email_address.as_deref()),
+        (KEY_EMAIL, profile.personal_email_address.as_deref()),
+        (KEY_EMAIL, profile.business_email_address.as_deref()),
+        (KEY_PHONE, profile.phone_number.as_deref()),
+        (KEY_PHONE, profile.mobile_phone_number.as_deref()),
+        (KEY_PHONE, profile.home_phone_number.as_deref()),
+        (KEY_PHONE, profile.business_phone_number.as_deref()),
+        (KEY_FULL_NAME, full.as_deref()),
+    ];
+    let mut keys: Vec<(String, String)> = singles
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let value = value?;
+            (!value.is_empty()).then(|| (name.to_string(), value.to_string()))
+        })
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// A profile's full name: its given, middle and family names in that order, space
+/// separated, skipping the ones it does not carry. `None` when it carries none.
+fn full_name(profile: &Profile) -> Option<String> {
+    let parts: Vec<&str> = [
+        profile.first_name.as_deref(),
+        profile.middle_name.as_deref(),
+        profile.last_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|part| !part.is_empty())
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// Take one page out of `items`, already in ascending cursor order.
+///
+/// `next_token` is the cursor a previous page handed back: the page resumes at the first
+/// item whose cursor is not before it, so an item deleted between two pages is skipped
+/// rather than shifting the window. The returned token is the cursor of the first item
+/// that did not fit, and is `None` when the page is the last one.
+pub fn paginate<T>(
+    items: impl IntoIterator<Item = (String, T)>,
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+) -> (Vec<T>, Option<String>) {
+    let limit = max_results.map_or(DEFAULT_PAGE_SIZE, |max| max.max(1) as usize);
+    let mut page = Vec::new();
+    let mut token = None;
+    for (cursor, item) in items {
+        if next_token.is_some_and(|resume| cursor.as_str() < resume) {
+            continue;
+        }
+        if page.len() >= limit {
+            token = Some(cursor);
+            break;
+        }
+        page.push(item);
+    }
+    (page, token)
+}
+
+/// A stored instant as the modelled `timestamp` the wire carries.
+pub fn to_date_time(instant: SystemTime) -> ::aws_smithy_types::DateTime {
+    let since_epoch = instant
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
+}
+
+/// The server fault every handler answers with when the store cannot be reached. One
+/// wording, so a caller sees the same failure whichever operation it called.
+pub fn store_unavailable() -> crate::ops::types::InternalServerException {
+    crate::ops::types::InternalServerException {
+        message: Some("the Customer Profiles store is unavailable".to_string()),
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
