@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMediaForFragmentList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMediaForFragmentList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Returns the archived media of exactly the fragments the request names. This
+//! is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMediaForFragmentList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## Behaviour
+//!
+//! * The request names exactly one stream, by `StreamName` or `StreamARN`;
+//!   neither or both is `InvalidArgumentException` (400) and a name or ARN no
+//!   stream answers to is `ResourceNotFoundException` (404).
+//! * `Payload` is the stored media of the requested fragments, concatenated in
+//!   the order the request lists them — "a sequence of chunks from the
+//!   specified stream".
+//! * A fragment number the archive does not hold is
+//!   `InvalidArgumentException`, naming that fragment number.
+//! * `ContentType` is the archive's own container content type, held on the
+//!   stream.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +114,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{service_state, ArchivedStream, StreamLookupError, MAX_PAYLOAD_BYTES};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -180,18 +187,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMediaForFragmentList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMediaForFragmentListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+
+        let Some(state) = service_state(&*self.engine) else {
+            // See the note in `list_fragments`: unreachable in the assembled
+            // emulator, and reported as a modelled failure rather than as an
+            // empty success.
+            return Err(
+                GetMediaForFragmentListErrorModeled::ClientLimitExceededException(
+                    ClientLimitExceededException {
+                        message: Some("the archived-media store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
+
+        let stream = match state
+            .resolve_stream(input.stream_name.as_deref(), input.stream_arn.as_deref())
+        {
+            Ok(stream) => stream,
+            Err(StreamLookupError::InvalidArgument(message)) => {
+                return Err(GetMediaForFragmentListErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+            Err(StreamLookupError::NotFound(message)) => {
+                return Err(GetMediaForFragmentListErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // Exactly the requested fragments, in the order requested — a number
+        // the archive does not hold is refused rather than silently skipped,
+        // which would hand back a payload that is not what was asked for.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMediaForFragmentList"))
+        // The payload is the archive's own stored bytes. The real service also
+        // adds per-chunk MKV tags (AWS_KINESISVIDEO_FRAGMENT_NUMBER and the two
+        // timestamps) while re-framing the Matroska stream; this emulator does
+        // not parse or rewrite media, so it returns the stored chunks unaltered
+        // rather than synthesising a container it cannot read.
+        let mut requested = Vec::with_capacity(input.fragments.len());
+        for fragment_number in &input.fragments {
+            let Some(fragment) = stream.fragment(fragment_number) else {
+                return Err(GetMediaForFragmentListErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(format!(
+                            "Fragment {fragment_number} is not archived for stream {}",
+                            stream.name
+                        )),
+                    },
+                )
+                .into());
+            };
+            requested.push(fragment);
+        }
+
+        // The assembled payload is bounded in BYTES, not only in the number of
+        // fragments the model's list length allows: the same fragment may be
+        // named repeatedly, so a small request could otherwise ask for many
+        // copies of the largest archived fragment. Over the ceiling the request
+        // is refused with the modelled limit error — "Kinesis Video Streams has
+        // throttled the request because you have exceeded a limit" — and
+        // nothing is allocated.
+        let payload = ArchivedStream::concatenate(&requested).map_err(|total| -> Self::Error {
+            GetMediaForFragmentListErrorModeled::ClientLimitExceededException(
+                ClientLimitExceededException {
+                    message: Some(format!(
+                        "The requested fragments total {total} bytes, over the {MAX_PAYLOAD_BYTES} \
+                         byte limit for one response"
+                    )),
+                },
+            )
+            .into()
+        })?;
+
+        Ok(GetMediaForFragmentListOutput {
+            content_type: Some(stream.archive_content_type.clone()),
+            payload,
+        })
     }
 }
