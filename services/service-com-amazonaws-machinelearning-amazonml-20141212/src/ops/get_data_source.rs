@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDataSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDataSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Projects the stored `DataSource` record onto the modelled output. A reporting
+//! operation: the only state it writes is the `PENDING` -> `COMPLETED` move the clock
+//! already made due (see [`crate::state::DataSource::settle`]), which was owed at the
+//! same instant whether or not anybody called.
+//!
+//! `DataSourceSchema` is returned only when `Verbose` is true, and `StartedAt` only
+//! once the entity has left `PENDING`, both as the model documents. An id no record
+//! answers to is `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +194,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDataSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDataSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDataSource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDataSourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Amazon ML store is unavailable".to_string()),
+                    code: 500,
+                },
+            )
+            .into());
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_all(now);
+        let Some(data_source) = store.data_sources.get(&input.data_source_id) else {
+            return Err(GetDataSourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no DataSource with the id {}",
+                        input.data_source_id
+                    )),
+                    code: 404,
+                },
+            )
+            .into());
+        };
+
+        let pending = data_source.status == crate::state::entity_status::PENDING;
+        Ok(GetDataSourceOutput {
+            data_source_id: Some(data_source.id.clone()),
+            data_location_s3: Some(data_source.data_location_s3.clone()),
+            data_rearrangement: data_source.data_rearrangement.clone(),
+            created_by_iam_user: Some(data_source.created_by_iam_user.clone()),
+            created_at: Some(crate::state::to_date_time(data_source.created_at)),
+            last_updated_at: Some(crate::state::to_date_time(data_source.last_updated_at)),
+            data_size_in_bytes: data_source.data_size_in_bytes,
+            number_of_files: data_source.number_of_files,
+            name: data_source.name.clone(),
+            status: Some(data_source.status.clone()),
+            // No log is produced, and the RDS/Redshift metadata belongs to the two
+            // creates this slice does not implement.
+            log_uri: None,
+            message: data_source.message.clone(),
+            redshift_metadata: None,
+            rds_metadata: None,
+            role_arn: data_source.role_arn.clone(),
+            compute_statistics: data_source.compute_statistics,
+            compute_time: data_source.compute_time_ms,
+            finished_at: data_source.finished_at.map(crate::state::to_date_time),
+            // `StartedAt` is documented as unavailable while the entity is PENDING.
+            started_at: (!pending).then(|| crate::state::to_date_time(data_source.started_at)),
+            // `Verbose` selects whether the schema is returned.
+            data_source_schema: input
+                .verbose
+                .then(|| data_source.data_schema.clone())
+                .flatten(),
+        })
     }
 }

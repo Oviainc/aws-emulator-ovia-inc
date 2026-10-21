@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMLModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMLModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMLModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Assigns the `DELETED` status to the stored `MLModel` record: Amazon ML soft-deletes,
+//! so the record stays readable and `GetMLModel` reports `Status=DELETED` afterwards.
+//! An id no record answers to is `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +141,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMLModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMLModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMLModel"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteMLModelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Amazon ML store is unavailable".to_string()),
+                    code: 500,
+                },
+            )
+            .into());
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Materialise every transition the clock already owed BEFORE this delete, so a
+        // model whose training had already finished keeps its FinishedAt / ComputeTime
+        // instead of going straight from PENDING to DELETED.
+        store.settle_all(now);
+        let Some(model) = store.ml_models.get_mut(&input.ml_model_id) else {
+            crate::state::audit_mutation(
+                ctx,
+                Self::NAME,
+                "MLModel",
+                &input.ml_model_id,
+                "ResourceNotFoundException",
+            );
+            return Err(DeleteMLModelErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("no MLModel with the id {}", input.ml_model_id)),
+                    code: 404,
+                },
+            )
+            .into());
+        };
+
+        let outcome = if model.status == crate::state::entity_status::DELETED {
+            "already-deleted"
+        } else {
+            model.status = crate::state::entity_status::DELETED.to_string();
+            model.last_updated_at = now;
+            "deleted"
+        };
+        crate::state::audit_mutation(ctx, Self::NAME, "MLModel", &input.ml_model_id, outcome);
+
+        Ok(DeleteMLModelOutput {
+            ml_model_id: Some(input.ml_model_id),
+        })
     }
 }

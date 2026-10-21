@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataSourceFromS3
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataSourceFromS3`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataSourceFromS3::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a `DataSource` record in [`crate::state`] from an Amazon S3 data
+//! specification and answers with the caller-supplied id.
+//!
+//! Amazon ML documents this operation as asynchronous: it returns immediately with the
+//! `DataSource` `PENDING`, and the entity reaches `COMPLETED` once ingestion finishes,
+//! which [`crate::state::SETTLE_AFTER`] governs here.
+//!
+//! The id and the S3 locations carry modelled `length`/`pattern` constraints, so the
+//! centralized request walk refuses a malformed one with a 400 before this handler
+//! runs. What is left for the handler is the rule the model cannot express: a repeat
+//! of an id that is already taken is an idempotent success only when the request is
+//! the one that created it, and otherwise
+//! `IdempotentParameterMismatchException`.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +183,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataSourceFromS3` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataSourceFromS3ErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataSourceFromS3"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDataSourceFromS3ErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Amazon ML store is unavailable".to_string()),
+                    code: 500,
+                },
+            )
+            .into());
+        };
+
+        let spec = &input.data_spec;
+        // Every parameter the record is built from takes part in the fingerprint, so a
+        // retry that differs in any one of them is a mismatch rather than a no-op.
+        let request_fingerprint = crate::state::fingerprint([
+            ("DataSourceId", Some(input.data_source_id.as_str())),
+            ("DataSourceName", input.data_source_name.as_deref()),
+            ("DataLocationS3", Some(spec.data_location_s3.as_str())),
+            ("DataRearrangement", spec.data_rearrangement.as_deref()),
+            ("DataSchema", spec.data_schema.as_deref()),
+            (
+                "DataSchemaLocationS3",
+                spec.data_schema_location_s3.as_deref(),
+            ),
+            (
+                "ComputeStatistics",
+                Some(if input.compute_statistics {
+                    "true"
+                } else {
+                    "false"
+                }),
+            ),
+        ]);
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Every handler settles first, so no call can observe — or overwrite — a record
+        // whose clock-owed transition had not been applied yet.
+        store.settle_all(now);
+
+        if let Some(existing) = store.data_sources.get(&input.data_source_id) {
+            if existing.request_fingerprint != request_fingerprint {
+                crate::state::audit_mutation(
+                    ctx,
+                    Self::NAME,
+                    "DataSource",
+                    &input.data_source_id,
+                    "IdempotentParameterMismatchException",
+                );
+                return Err(
+                    CreateDataSourceFromS3ErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(format!(
+                                "a DataSource with the id {} already exists with different parameters",
+                                input.data_source_id
+                            )),
+                            code: 400,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // An identical retry of a create is the same call: answer with the id of
+            // the record that already exists and change nothing.
+            crate::state::audit_mutation(
+                ctx,
+                Self::NAME,
+                "DataSource",
+                &existing.id,
+                "idempotent-retry",
+            );
+            return Ok(CreateDataSourceFromS3Output {
+                data_source_id: Some(existing.id.clone()),
+            });
+        }
+
+        // The store lives for the life of the process and only a create adds to it, so
+        // the number of records a caller can accumulate is capped here, before the
+        // insert and after the idempotent-retry branch above (so a retry of an existing
+        // id stays a no-op whatever the store holds).
+        if store.data_sources.len() >= crate::state::MAX_DATA_SOURCES {
+            crate::state::audit_mutation(
+                ctx,
+                Self::NAME,
+                "DataSource",
+                &input.data_source_id,
+                "InternalServerException",
+            );
+            return Err(CreateDataSourceFromS3ErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!(
+                        "this emulator holds at most {} DataSources",
+                        crate::state::MAX_DATA_SOURCES
+                    )),
+                    code: 500,
+                },
+            )
+            .into());
+        }
+
+        store.data_sources.insert(
+            input.data_source_id.clone(),
+            crate::state::DataSource {
+                id: input.data_source_id.clone(),
+                name: input.data_source_name,
+                data_location_s3: spec.data_location_s3.clone(),
+                data_rearrangement: spec.data_rearrangement.clone(),
+                data_schema: spec.data_schema.clone(),
+                data_schema_location_s3: spec.data_schema_location_s3.clone(),
+                compute_statistics: input.compute_statistics,
+                // Only the RDS and Redshift creates carry a role.
+                role_arn: None,
+                status: crate::state::entity_status::PENDING.to_string(),
+                created_at: now,
+                last_updated_at: now,
+                started_at: now,
+                finished_at: None,
+                compute_time_ms: None,
+                data_size_in_bytes: None,
+                number_of_files: None,
+                message: None,
+                created_by_iam_user: crate::state::created_by_iam_user(),
+                settles_at: now + crate::state::SETTLE_AFTER,
+                request_fingerprint,
+            },
+        );
+
+        crate::state::audit_mutation(
+            ctx,
+            Self::NAME,
+            "DataSource",
+            &input.data_source_id,
+            "created",
+        );
+        Ok(CreateDataSourceFromS3Output {
+            data_source_id: Some(input.data_source_id),
+        })
     }
 }
