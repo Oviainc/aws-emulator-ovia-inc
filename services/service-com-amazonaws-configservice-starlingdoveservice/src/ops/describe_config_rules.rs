@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConfigRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConfigRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConfigRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Config rules read back out of [`crate::state`], each carrying the
+//! `ConfigRuleArn`, `ConfigRuleId` and `ConfigRuleState` persisted at creation, paged
+//! over the stable name ordering the store keeps.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +146,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConfigRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConfigRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConfigRules"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let names = input.config_rule_names.unwrap_or_default();
+        let store = state.lock();
+
+        // A requested name that names no rule is a failure, not an empty page.
+        for name in &names {
+            if !store.config_rules.contains_key(name) {
+                return Err(DescribeConfigRulesErrorModeled::NoSuchConfigRuleException(
+                    NoSuchConfigRuleException {
+                        message: Some(format!("there is no Config rule named '{name}'")),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(DescribeConfigRulesErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: Some(
+                                "the specified NextToken is not valid; use the NextToken a \
+                                 previous DescribeConfigRules response returned"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let selects = |entry: &crate::state::ConfigRuleEntry| -> bool {
+            if !names.is_empty() && !names.iter().any(|name| name == &entry.name) {
+                return false;
+            }
+            let Some(filters) = input.filters.as_ref() else {
+                return true;
+            };
+            if let Some(mode) = filters.evaluation_mode.as_deref() {
+                if !entry
+                    .evaluation_modes
+                    .iter()
+                    .any(|configured| configured.mode.as_deref() == Some(mode))
+                {
+                    return false;
+                }
+            }
+            if let Some(visibility) = filters.rule_evaluation_visibility.as_deref() {
+                if entry.rule_evaluation_visibility.as_deref() != Some(visibility) {
+                    return false;
+                }
+            }
+            true
+        };
+
+        // Page over the store's own name ordering, so a token holds the NAME the next
+        // page resumes at and survives rules inserted or deleted between pages.
+        let mut page = Vec::new();
+        let mut next_token = None;
+        for (name, entry) in &store.config_rules {
+            if resume_at.as_ref().is_some_and(|resume_at| name < resume_at) {
+                continue;
+            }
+            if !selects(entry) {
+                continue;
+            }
+            if page.len() == crate::state::DESCRIBE_CONFIG_RULES_PAGE_SIZE {
+                next_token = Some(crate::state::encode_page_token(name));
+                break;
+            }
+            page.push(entry.to_shape());
+        }
+
+        Ok(DescribeConfigRulesOutput {
+            config_rules: Some(page),
+            next_token,
+        })
     }
 }
