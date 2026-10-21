@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendVoiceMessage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendVoiceMessage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendVoiceMessage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +73,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The most accepted voice messages this emulator keeps a record of.
+///
+/// The record exists so a developer can observe what was sent; AWS imposes no limit on
+/// how many messages an account may send, so a cap here must NOT refuse a send. The
+/// log is therefore bounded by oldest-first eviction: past this many records the oldest
+/// are dropped, so a caller looping `SendVoiceMessage` keeps the heap flat instead of
+/// growing it without limit.
+const MAX_RECORDED_VOICE_MESSAGES: usize = 10_000;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -152,18 +152,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendVoiceMessage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendVoiceMessageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendVoiceMessage"))
+        let _ = ctx;
+
+        // There is no message without a recipient, and the member's shape is
+        // `NonEmptyString`, so a blank or absent destination is refused. The number is
+        // recorded EXACTLY as sent — trimming is only how blankness is detected.
+        let destination = input
+            .destination_phone_number
+            .filter(|number| !number.trim().is_empty())
+            .ok_or_else(|| {
+                SendVoiceMessageErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(
+                        "DestinationPhoneNumber must be a non-empty phone number".into(),
+                    ),
+                })
+            })?;
+
+        // `VoiceMessageContent` holds one message body of one kind: exactly one of
+        // `PlainTextMessage`, `SSMLMessage` and `CallInstructionsMessage`. None of them
+        // describes nothing to speak, and two of them describe no single message, so
+        // either way the request names no voice message to send.
+        let content = input.content.unwrap_or_default();
+        let bodies = usize::from(content.plain_text_message.is_some())
+            + usize::from(content.ssml_message.is_some())
+            + usize::from(content.call_instructions_message.is_some());
+        if bodies != 1 {
+            return Err(SendVoiceMessageErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(
+                        "Content must carry exactly one of PlainTextMessage, SSMLMessage or CallInstructionsMessage"
+                            .into(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SendVoiceMessageErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the service state store is unavailable".into()),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // The sequence advances before the id is minted, so no two accepted messages
+        // can ever be handed the same `MessageId`.
+        store.next_message_seq += 1;
+        let message_id = mint_message_id(store.next_message_seq);
+
+        // CAP (`MAX_RECORDED_VOICE_MESSAGES`): evict oldest-first BEFORE pushing, so
+        // the log never holds more than the bound. Sending is never refused for it —
+        // AWS caps no account's message count — only the emulator's record is trimmed.
+        let over = (store.sent_messages.len() + 1).saturating_sub(MAX_RECORDED_VOICE_MESSAGES);
+        if over > 0 {
+            store.sent_messages.drain(..over);
+        }
+
+        store.sent_messages.push(crate::state::SentVoiceMessage {
+            message_id: message_id.clone(),
+            configuration_set_name: input.configuration_set_name,
+            caller_id: input.caller_id,
+            destination_phone_number: Some(destination),
+            origination_phone_number: input.origination_phone_number,
+            content: crate::state::VoiceContentRecord {
+                call_instructions_text: content
+                    .call_instructions_message
+                    .and_then(|body| body.text),
+                plain_text: content.plain_text_message.map(|body| {
+                    crate::state::VoiceTextRecord {
+                        text: body.text,
+                        language_code: body.language_code,
+                        voice_id: body.voice_id,
+                    }
+                }),
+                ssml: content.ssml_message.map(|body| crate::state::VoiceTextRecord {
+                    text: body.text,
+                    language_code: body.language_code,
+                    voice_id: body.voice_id,
+                }),
+            },
+            sent_at: std::time::SystemTime::now(),
+        });
+
+        Ok(SendVoiceMessageOutput {
+            message_id: Some(message_id),
+        })
     }
+}
+
+/// Mint the opaque `MessageId` for the `seq`-th message this emulator accepted.
+///
+/// Uniqueness comes from `seq`, a monotonic per-service counter; the wall-clock
+/// nanosecond at mint time is mixed in so the id is not a readable call count. The
+/// result is 32 lowercase hex characters — an opaque identifier, derived from nothing
+/// in the request.
+fn mint_message_id(seq: u64) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u64, |since| since.as_nanos() as u64);
+    format!("{nanos:016x}{seq:016x}")
 }

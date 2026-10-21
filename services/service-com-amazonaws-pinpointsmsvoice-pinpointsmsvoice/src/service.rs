@@ -96,17 +96,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Pinpoint SMS Voice states "the input you provided is invalid" as its own
+        // modelled `BadRequestException` (HTTP 400) — the error every operation in this
+        // service declares for a bad request. A refusal the framework found from the
+        // model (an absent required member, a value outside a declared bound, an entry
+        // outside an enum's value set) is exactly that failure, so it is worded with
+        // this service's code rather than the framework's generic
+        // `ValidationException`; the status stays 400 either way, and a client
+        // branching on the code sees the one the real service sends.
+        //
+        // `Unauthenticated` keeps the framework's wording: it is not a modelled error
+        // of this service at all.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "BadRequestException".to_string(),
+                message: aws_smithy_schema_server::envelope(violations)
+                    .unwrap_or_else(|| "The input you provided is invalid.".to_string()),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(
