@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBrandProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBrandProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBrandProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored brand profile this request names, unless deletion
+//! protection is on.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +151,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBrandProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBrandProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBrandProfile"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteBrandProfileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+        let Some(id) = store
+            .resolve_brand_profile_id(&input.brand_profile_id)
+            .map(str::to_string)
+        else {
+            return Err(DeleteBrandProfileErrorModeled::ResourceNotFoundException(
+                crate::state::brand_profile_not_found(&input.brand_profile_id),
+            )
+            .into());
+        };
+
+        // Deletion protection refuses the delete and leaves the profile in place:
+        // `ConflictException` is the modelled failure for a resource whose current
+        // state forbids the request.
+        {
+            let profile = store
+                .brand_profiles
+                .get(&id)
+                .expect("the id just resolved against this store");
+            if profile.deletion_protection_enabled {
+                return Err(DeleteBrandProfileErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "Brand profile {id} cannot be deleted while deletion protection is enabled."
+                        ),
+                        resource_id: Some(id.clone()),
+                        resource_type: Some(
+                            crate::state::BRAND_PROFILE_RESOURCE_TYPE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let removed = store
+            .brand_profiles
+            .remove(&id)
+            .expect("the id just resolved against this store");
+        // The client token that minted it no longer names a profile, so drop it with
+        // the record rather than leaving a token that resolves to nothing.
+        store.forget_create_tokens_for(&id);
+
+        Ok(DeleteBrandProfileOutput {
+            brand_profile_id: removed.id,
+            brand_profile_arn: removed.arn,
+        })
     }
 }
