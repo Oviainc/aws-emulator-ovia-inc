@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConnections
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConnections`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConnections::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +133,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConnections` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConnectionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConnections"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeConnectionsErrorModeled::DirectConnectServerException(
+                DirectConnectServerException {
+                    message: Some(
+                        "the Direct Connect store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+        // Materialise only what the clock already made due: a connection whose
+        // `deleting` span has elapsed is `deleted` whether or not anybody asked.
+        store.settle_due_transitions();
+
+        // "Displays the specified connection or all connections in this Region."
+        let selected: Vec<&crate::state::Connection> = match &input.connection_id {
+            Some(connection_id) => match store.connections.get(connection_id) {
+                Some(connection) => vec![connection],
+                // An id that names nothing is a bad parameter, not an empty page.
+                None => {
+                    return Err(DescribeConnectionsErrorModeled::DirectConnectClientException(
+                        DirectConnectClientException {
+                            message: Some(format!("Connection ID {connection_id} does not exist")),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => store.connections.values().collect(),
+        };
+
+        let Some(page) = crate::state::paginate(
+            selected,
+            input.max_results,
+            input.next_token.as_deref(),
+            |connection| connection.connection_id.clone(),
+        ) else {
+            let token = input.next_token.unwrap_or_default();
+            return Err(DescribeConnectionsErrorModeled::DirectConnectClientException(
+                DirectConnectClientException {
+                    message: Some(format!("Pagination token {token} is not valid")),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeConnectionsOutput {
+            connections: Some(
+                page.items
+                    .into_iter()
+                    .map(|connection| {
+                        crate::connection_output!(AllocateConnectionOnInterconnectOutput, connection)
+                    })
+                    .collect(),
+            ),
+            next_token: page.next_token,
+        })
     }
 }
