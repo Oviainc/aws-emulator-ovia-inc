@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutMetricData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutMetricData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutMetricData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Publishes metric data into this service's store. Implemented here — this is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,13 +143,22 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutMetricDataOutput {
 // here — hence the `PutMetricDataError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#PutMetricData")]
+//
+// `LimitExceededFault` is widened in: it is THIS service's own limit error (the one
+// `PutMetricAlarm` declares, "The quota for alarms for this customer has already been
+// reached"), and it is the right answer when the in-memory store has no room for another
+// metric time series — refusing is the only alternative to growing without limit.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#PutMetricData",
+    extra_errors = ["LimitExceededFault"]
+)]
 #[derive(Debug)]
 pub enum PutMetricDataErrorModeled {
     InternalServiceFault(InternalServiceFault),
     InvalidParameterCombinationException(InvalidParameterCombinationException),
     InvalidParameterValueException(InvalidParameterValueException),
     MissingRequiredParameterException(MissingRequiredParameterException),
+    LimitExceededFault(LimitExceededFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -210,18 +212,292 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutMetricData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutMetricDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutMetricDataErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch metric store is unavailable".into()),
+            })
+        })?;
+
+        // `StrictEntityValidation` only chooses how an INVALID ENTITY is answered ("Whether
+        // to accept valid metric data when an invalid entity is sent"). No entity validation
+        // runs in this slice, so no entity is ever invalid and the switch has nothing to
+        // select between; metric-data validation below fails the whole request either way,
+        // which is what the member documents for both settings.
+        let _ = input.strict_entity_validation;
+
+        let now = crate::state::now_secs();
+
+        // The caps this operation documents on ONE request. None of these lists carries a
+        // modelled `length` constraint, so the boundary validator cannot refuse them and
+        // the handler has to: without them a single request sizes the batch it builds.
+        // (`Dimensions` is modelled `length 0..30`, so the "up to 30 dimensions per metric"
+        // cap is already refused before this handler runs.)
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutMetricData"))
+        // "Each request is also limited to no more than 1000 different metrics (across both
+        // the MetricData and EntityMetricData properties)."
+        const MAX_METRICS_PER_REQUEST: usize = 1000;
+        // "Using the Values and Counts method enables you to publish up to 150 values per
+        // metric with one PutMetricData request".
+        const MAX_VALUES_PER_METRIC: usize = 150;
+        // "You can include up to two EntityMetricData objects, each of which can contain a
+        // single Entity and associated metrics." (PutMetricDataInput$EntityMetricData)
+        const MAX_ENTITY_METRIC_DATA: usize = 2;
+        // The ceiling on what ONE request can make this handler build: no legal request
+        // carries more observations than the two caps above allow together, so a batch
+        // beyond this cannot be legal whichever way the two are combined.
+        const MAX_OBSERVATIONS_PER_REQUEST: usize =
+            MAX_METRICS_PER_REQUEST * MAX_VALUES_PER_METRIC;
+
+        let entities = input.entity_metric_data.as_deref().unwrap_or_default();
+        if entities.len() > MAX_ENTITY_METRIC_DATA {
+            return Err(invalid_value(format!(
+                "EntityMetricData must hold at most {MAX_ENTITY_METRIC_DATA} entries; got {}",
+                entities.len()
+            )));
+        }
+
+        // Entity-associated metric data carries the same `MetricDatum` list, and the
+        // operation documents that its metric data is ingested too ("The EntityMetricData
+        // structure includes MetricData structures for the metric data"), so both sources
+        // feed one ingest path — and one shared metric count.
+        let data: Vec<&MetricDatum> = input
+            .metric_data
+            .iter()
+            .flatten()
+            .chain(
+                entities
+                    .iter()
+                    .flat_map(|entity| entity.metric_data.iter().flatten()),
+            )
+            .collect();
+        if data.len() > MAX_OBSERVATIONS_PER_REQUEST {
+            return Err(invalid_value(format!(
+                "MetricData and EntityMetricData together must carry at most \
+                 {MAX_OBSERVATIONS_PER_REQUEST} data points ({MAX_METRICS_PER_REQUEST} metrics \
+                 of {MAX_VALUES_PER_METRIC} values); got {} entries",
+                data.len()
+            )));
+        }
+
+        // Validate EVERY datum before touching the store: the operation documents that a
+        // metric-data validation error "will fail the entire request, and no data will be
+        // ingested", so the whole batch is built first and committed only once it is sound.
+        // One entry per datum — the key is built once and the datum's observations ride with
+        // it, so a long `Values` array cannot multiply the key.
+        let mut ingest: Vec<(crate::state::MetricKey, Vec<crate::state::StoredDatum>)> =
+            Vec::with_capacity(data.len());
+        let mut observation_count = 0usize;
+        for datum in data {
+            let key = crate::state::MetricKey {
+                namespace: input.namespace.clone(),
+                metric_name: datum.metric_name.clone(),
+                dimensions: crate::state::dimension_set(datum.dimensions.as_deref()),
+            };
+            let timestamp_secs = datum
+                .timestamp
+                .as_ref()
+                .map_or(now, crate::state::from_timestamp);
+            let storage_resolution = storage_resolution(datum)?;
+
+            let forms = usize::from(datum.value.is_some())
+                + usize::from(datum.statistic_values.is_some())
+                + usize::from(datum.values.is_some());
+            if forms > 1 {
+                return Err(PutMetricDataErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(format!(
+                            "MetricData for metric {} must carry at most one of Value, \
+                             StatisticValues and Values",
+                            datum.metric_name
+                        )),
+                    },
+                )
+                .into());
+            }
+            // "Array of numbers that is used along with the Values array." — `Counts` has no
+            // meaning on its own, so a datum carrying it without `Values` is refused rather
+            // than quietly dropped.
+            if datum.counts.is_some() && datum.values.is_none() {
+                return Err(PutMetricDataErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(format!(
+                            "Counts for metric {} can only be used along with Values",
+                            datum.metric_name
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            let base = crate::state::StoredDatum {
+                timestamp_secs,
+                sample_count: 1.0,
+                sum: 0.0,
+                minimum: 0.0,
+                maximum: 0.0,
+                unit: datum.unit.clone(),
+                storage_resolution,
+            };
+
+            let observations = if let Some(value) = datum.value {
+                let value = checked_value(value, "Value")?;
+                vec![crate::state::StoredDatum {
+                    sample_count: 1.0,
+                    sum: value,
+                    minimum: value,
+                    maximum: value,
+                    ..base
+                }]
+            } else if let Some(set) = datum.statistic_values.as_ref() {
+                vec![crate::state::StoredDatum {
+                    sample_count: checked_value(set.sample_count, "StatisticValues.SampleCount")?,
+                    sum: checked_value(set.sum, "StatisticValues.Sum")?,
+                    minimum: checked_value(set.minimum, "StatisticValues.Minimum")?,
+                    maximum: checked_value(set.maximum, "StatisticValues.Maximum")?,
+                    ..base
+                }]
+            } else if let Some(values) = datum.values.as_ref() {
+                if values.len() > MAX_VALUES_PER_METRIC {
+                    return Err(invalid_value(format!(
+                        "Values for metric {} must hold at most {MAX_VALUES_PER_METRIC} values; \
+                         got {}",
+                        datum.metric_name,
+                        values.len()
+                    )));
+                }
+                // "If you omit the Counts array, the default of 1 is used as the value for
+                // each count. If you include a Counts array, it must include the same amount
+                // of values as the Values array." (MetricDatum$Counts)
+                if let Some(counts) = datum.counts.as_ref() {
+                    if counts.len() != values.len() {
+                        return Err(invalid_value(format!(
+                            "Counts for metric {} has {} entries but Values has {}; the arrays \
+                             must be the same length",
+                            datum.metric_name,
+                            counts.len(),
+                            values.len()
+                        )));
+                    }
+                }
+                let mut observations = Vec::with_capacity(values.len());
+                for (index, value) in values.iter().enumerate() {
+                    let value = checked_value(*value, "Values")?;
+                    let count = match datum.counts.as_ref().and_then(|c| c.get(index)) {
+                        Some(count) => checked_value(*count, "Counts")?,
+                        None => 1.0,
+                    };
+                    observations.push(crate::state::StoredDatum {
+                        sample_count: count,
+                        sum: value * count,
+                        minimum: value,
+                        maximum: value,
+                        ..base.clone()
+                    });
+                }
+                observations
+            } else {
+                // A datum carrying no observation at all. "If the specified metric does not
+                // exist, CloudWatch creates the metric", so the series is still created and
+                // ListMetrics reports it; there is simply no datapoint to append.
+                Vec::new()
+            };
+            observation_count += observations.len();
+            // The binding bound on what one request builds: neither the datum count nor the
+            // per-datum value cap limits their PRODUCT, so the total is checked here as well.
+            if observation_count > MAX_OBSERVATIONS_PER_REQUEST {
+                return Err(invalid_value(format!(
+                    "MetricData and EntityMetricData together must carry at most \
+                     {MAX_OBSERVATIONS_PER_REQUEST} data points \
+                     ({MAX_METRICS_PER_REQUEST} metrics of {MAX_VALUES_PER_METRIC} values)"
+                )));
+            }
+            ingest.push((key, observations));
+        }
+
+        // "Each request is also limited to no more than 1000 DIFFERENT metrics" — so the cap
+        // is on how many distinct series the batch names, not on how many data points it
+        // carries for them.
+        let distinct = ingest
+            .iter()
+            .map(|(key, _)| key)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        if distinct > MAX_METRICS_PER_REQUEST {
+            return Err(invalid_value(format!(
+                "MetricData and EntityMetricData together must name at most \
+                 {MAX_METRICS_PER_REQUEST} different metrics; got {distinct}"
+            )));
+        }
+
+        let mut store = state.lock();
+        for (key, observations) in ingest {
+            if store.append_datapoints(key, observations).is_err() {
+                return Err(PutMetricDataErrorModeled::LimitExceededFault(LimitExceededFault {
+                    message: Some(format!(
+                        "this emulator holds at most {} metric time series",
+                        crate::state::MAX_SERIES
+                    )),
+                })
+                .into());
+            }
+        }
+
+        Ok(PutMetricDataOutput)
+    }
+}
+
+/// Refuse an input value outside what this operation documents.
+fn invalid_value(message: String) -> PutMetricDataError {
+    PutMetricDataErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse a value this operation documents as unsupported.
+///
+/// "Although the Value parameter accepts numbers of type Double, CloudWatch rejects values
+/// that are either too small or too large. Values must be in the range of -2^360 to 2^360.
+/// In addition, special values (for example, NaN, +Infinity, -Infinity) are not supported."
+fn checked_value(value: f64, member: &str) -> Result<f64, PutMetricDataError> {
+    // 2^360, the published magnitude limit on a metric value.
+    let limit = 2.0_f64.powi(360);
+
+    if value.is_finite() && value.abs() <= limit {
+        return Ok(value);
+    }
+    Err(
+        PutMetricDataErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+            message: Some(format!(
+                "{member} must be a number in the range -2^360 to 2^360; got {value}"
+            )),
+        })
+        .into(),
+    )
+}
+
+/// The datum's storage resolution: "Valid values are 1 and 60. [...] This field is
+/// optional, if you do not specify it the default of 60 is used." (`MetricDatum$StorageResolution`)
+fn storage_resolution(datum: &MetricDatum) -> Result<i32, PutMetricDataError> {
+    /// The only resolutions `MetricDatum$StorageResolution` documents.
+    const VALID: [i32; 2] = [1, 60];
+    /// What the member documents as its default.
+    const DEFAULT: i32 = 60;
+
+    match datum.storage_resolution {
+        None => Ok(DEFAULT),
+        Some(resolution) if VALID.contains(&resolution) => Ok(resolution),
+        Some(resolution) => Err(
+            PutMetricDataErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "StorageResolution for metric {} must be 1 or 60; got {resolution}",
+                        datum.metric_name
+                    )),
+                },
+            )
+            .into(),
+        ),
     }
 }
