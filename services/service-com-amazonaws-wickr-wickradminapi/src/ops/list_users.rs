@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListUsers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListUsers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the users stored under one network: filtered by every filter the request
+//! carries, sorted, then paginated. Reporting only: it never writes.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListUsers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +182,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListUsers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListUsersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListUsers"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListUsersErrorModeled::InternalServerError(InternalServerError {
+                message: "the Wickr network store is unavailable".to_string(),
+            })
+        })?;
+
+        let start = crate::state::page_start(input.max_results, input.next_token.as_deref())
+            .map_err(|problem| refused(problem.field(), problem.reason()))?;
+
+        // `sortFields` names a member of the shape being listed; the model gives it no
+        // value set, so the accepted names are the `User` members this slice stores.
+        // A key is a string so one comparison orders every field; the numeric ones are
+        // zero-padded to their widest value so `10` still sorts after `9`.
+        let sort_field = input
+            .sort_fields
+            .as_deref()
+            .unwrap_or(DEFAULT_SORT_FIELD)
+            .to_string();
+        let key: fn(&crate::state::UserRecord) -> String = match sort_field.as_str() {
+            "userId" => |user| numeric_key(&user.user_id),
+            "username" => |user| user.username.clone(),
+            "firstName" => |user| user.first_name.clone().unwrap_or_default(),
+            "lastName" => |user| user.last_name.clone().unwrap_or_default(),
+            "status" => |user| format!("{:010}", user.status),
+            other => {
+                return Err(refused(
+                    "sortFields",
+                    format!(
+                        "sortFields must name one of {}, got {other}",
+                        SORTABLE_FIELDS.join(", ")
+                    ),
+                ))
+            }
+        };
+
+        let now = crate::state::now_epoch_secs();
+        let store = state.lock();
+        if !store.networks.contains_key(&input.network_id) {
+            return Err(
+                ListUsersErrorModeled::ResourceNotFoundError(ResourceNotFoundError {
+                    message: Some(format!("network {} does not exist", input.network_id)),
+                })
+                .into(),
+            );
+        }
+        let mut records = store.users_of(&input.network_id);
+        drop(store);
+
+        // Every filter the request carries narrows the stored set; a filter it omits
+        // narrows nothing.
+        records.retain(|user| {
+            matches_filter(input.username.as_deref(), Some(user.username.as_str()))
+                && matches_filter(input.first_name.as_deref(), user.first_name.as_deref())
+                && matches_filter(input.last_name.as_deref(), user.last_name.as_deref())
+                && input.status.is_none_or(|status| status == user.status)
+                && input
+                    .group_id
+                    .as_deref()
+                    .is_none_or(|group| user.security_group_ids.iter().any(|id| id == group))
+        });
+
+        records.sort_by(|left, right| {
+            key(left)
+                .cmp(&key(right))
+                .then_with(|| numeric_key(&left.user_id).cmp(&numeric_key(&right.user_id)))
+        });
+        if input.sort_direction.as_deref() == Some(crate::state::SORT_DIRECTION_DESC) {
+            records.reverse();
+        }
+
+        let (page, next_token) = crate::state::page(&records, start, input.max_results);
+        Ok(ListUsersOutput {
+            users: Some(
+                page.iter()
+                    .map(|record| crate::state::user_view(record, now))
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The default `sortFields` value: a listing nobody ordered comes back in id order.
+const DEFAULT_SORT_FIELD: &str = "userId";
+
+/// The `User` members `sortFields` accepts, for the refusal message.
+const SORTABLE_FIELDS: &[&str] = &["userId", "username", "firstName", "lastName", "status"];
+
+/// Whether a stored value satisfies a filter: an absent filter accepts anything,
+/// and a present one accepts only an equal stored value.
+fn matches_filter(filter: Option<&str>, stored: Option<&str>) -> bool {
+    filter.is_none_or(|wanted| stored == Some(wanted))
+}
+
+/// `user_id` zero-padded to the 10 digits `UserId` allows, so comparing two keys as
+/// strings orders them by their numeric value.
+fn numeric_key(user_id: &str) -> String {
+    format!("{user_id:0>10}")
+}
+
+/// A `ValidationError` (HTTP 422) naming the member that was wrong and why.
+fn refused(field: &str, reason: String) -> ListUsersError {
+    ListUsersErrorModeled::ValidationError(ValidationError {
+        reasons: Some(vec![ErrorDetail {
+            field: Some(field.to_string()),
+            reason: Some(reason),
+        }]),
+        message: Some("1 validation error detected".to_string()),
+    })
+    .into()
 }
