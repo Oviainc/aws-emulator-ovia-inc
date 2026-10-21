@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateInvestigationGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateInvestigationGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateInvestigationGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the stored investigation group `{identifier}` names: every member the
+//! request carries replaces the stored one, every member it omits is left alone, and
+//! `lastModifiedBy`/`lastModifiedAt` record the change.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +174,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateInvestigationGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateInvestigationGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateInvestigationGroup"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateInvestigationGroupErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the investigation group store is unavailable".to_string()),
+            })
+        })?;
+
+        if let Some(why) = crate::state::encryption_configuration_rejection(
+            input.encryption_configuration.as_ref(),
+        )
+        .or_else(|| {
+            // `tagKeyBoundaries` and `chatbotNotificationChannel` carry no modelled
+            // length, so a replacement is bounded here before it reaches the store.
+            // `UpdateInvestigationGroup` accepts no `tags` member.
+            crate::state::collection_bounds_rejection(
+                None,
+                input.tag_key_boundaries.as_deref(),
+                input.chatbot_notification_channel.as_ref(),
+            )
+        }) {
+            return Err(UpdateInvestigationGroupErrorModeled::ValidationException(
+                ValidationException { message: Some(why) },
+            )
+            .into());
+        }
+
+        let principal = crate::state::caller_principal(ctx.parts());
+        let modified_at = crate::state::now_epoch_seconds();
+
+        let mut store = state.lock();
+        let group = store.group_mut(&input.identifier).ok_or_else(|| {
+            UpdateInvestigationGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no investigation group matches identifier '{}'",
+                        input.identifier
+                    )),
+                },
+            )
+        })?;
+
+        // Each member the request carries replaces the stored value; each one it omits
+        // leaves the stored value untouched. `name` is not updatable — the model does
+        // not accept it here — so the group keeps its name and its name index entry.
+        if let Some(role_arn) = input.role_arn {
+            group.role_arn = role_arn;
+        }
+        if let Some(encryption_configuration) = input.encryption_configuration {
+            group.encryption_configuration = Some(encryption_configuration);
+        }
+        if let Some(tag_key_boundaries) = input.tag_key_boundaries {
+            group.tag_key_boundaries = tag_key_boundaries;
+        }
+        if let Some(chatbot_notification_channel) = input.chatbot_notification_channel {
+            group.chatbot_notification_channel =
+                chatbot_notification_channel.into_iter().collect();
+        }
+        if let Some(enabled) = input.is_cloud_trail_event_history_enabled {
+            group.is_cloud_trail_event_history_enabled = Some(enabled);
+        }
+        if let Some(cross_account_configurations) = input.cross_account_configurations {
+            group.cross_account_configurations = cross_account_configurations;
+        }
+        group.touch(&principal, modified_at);
+
+        Ok(UpdateInvestigationGroupOutput {})
     }
 }

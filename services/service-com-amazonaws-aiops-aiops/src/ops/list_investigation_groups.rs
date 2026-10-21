@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInvestigationGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInvestigationGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInvestigationGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the ARN and name of every investigation group in [`crate::state`], one
+//! `@paginated` page at a time. A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -111,6 +104,41 @@ impl From<ListInvestigationGroupsErrorModeled> for ListInvestigationGroupsError 
     }
 }
 
+/// The largest page this operation will ever build, and the page size applied when
+/// the request omits `maxResults`.
+///
+/// It is the maximum of the modelled `maxResults` range (1..50), which the
+/// centralized walk already refuses values outside of — but this handler does not
+/// depend on that: the size is clamped to this constant here, so the page it
+/// allocates is decided by the server, never by the request.
+const MAX_PAGE_SIZE: usize = 50;
+
+/// A page token naming the group the NEXT page starts at.
+///
+/// `nextToken` is modelled opaque, so the id is hex-encoded rather than handed back
+/// in the clear — this makes the token opaque to a caller, not secret: hex is
+/// trivially reversible and the token carries nothing beyond a group id. The 32
+/// characters it produces sit well inside the member's 0..2048 length bound.
+fn encode_page_token(id: &str) -> String {
+    hex::encode(id)
+}
+
+/// The group id a page token names, or a 400 refusal when the token is not one this
+/// operation issued. The token's own text is never echoed back: it is `@sensitive`.
+fn decode_page_token(token: &str) -> Result<String, ListInvestigationGroupsError> {
+    hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|id| {
+            id.len() == crate::state::GROUP_ID_LEN && id.bytes().all(|b| b.is_ascii_alphanumeric())
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(
+                "nextToken is not a pagination token issued by ListInvestigationGroups",
+            )
+        })
+}
+
 /// The `ListInvestigationGroups` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -147,18 +175,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInvestigationGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInvestigationGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInvestigationGroups"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListInvestigationGroupsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the investigation group store is unavailable".to_string()),
+            })
+        })?;
+
+        // The page size is the server's own decision: clamped into 1..=MAX_PAGE_SIZE
+        // whatever the request asked for, so no allocation below is sized by input.
+        let page_size = input.max_results.map_or(MAX_PAGE_SIZE, |requested| {
+            requested.clamp(1, MAX_PAGE_SIZE as i32) as usize
+        });
+        let start = input
+            .next_token
+            .as_deref()
+            .map(decode_page_token)
+            .transpose()?;
+
+        let store = state.lock();
+        let mut remaining = match &start {
+            Some(id) => store.investigation_groups.range(id.clone()..),
+            None => store.investigation_groups.range::<String, _>(..),
+        };
+
+        // Reserve no more than the store can actually yield.
+        let mut investigation_groups =
+            Vec::with_capacity(page_size.min(store.investigation_groups.len()));
+        let mut next_token = None;
+        for (id, group) in remaining.by_ref() {
+            // The first group that does not fit becomes the next page's start, and
+            // only then is a `nextToken` emitted — the last page carries none.
+            if investigation_groups.len() == page_size {
+                next_token = Some(encode_page_token(id));
+                break;
+            }
+            investigation_groups.push(ListInvestigationGroupsModel {
+                arn: Some(group.arn.clone()),
+                name: Some(group.name.clone()),
+            });
+        }
+
+        Ok(ListInvestigationGroupsOutput {
+            next_token,
+            investigation_groups: Some(investigation_groups),
+        })
     }
 }

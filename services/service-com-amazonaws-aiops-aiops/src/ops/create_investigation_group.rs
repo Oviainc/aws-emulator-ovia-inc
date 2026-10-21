@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInvestigationGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInvestigationGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInvestigationGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an investigation group: stores the whole request under a freshly generated
+//! 16-character id in [`crate::state`] and answers 201 with the ARN built from that
+//! id, the request's signing region and the emulator's account.
 //!
 //! ## Shape of an operation
 //!
@@ -209,18 +203,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInvestigationGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInvestigationGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInvestigationGroup"))
+        // `name`, `roleArn`, `retentionInDays`, `crossAccountConfigurations`' 0..25
+        // length and every string length and pattern on this input are modelled
+        // constraints, so the centralized walk has already refused anything outside
+        // them with a 400 `ValidationException` before this body runs. The `tags` and
+        // `chatbotNotificationChannel` maps and the `tagKeyBoundaries` list carry NO
+        // modelled length, so their bounds are checked here.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateInvestigationGroupErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the investigation group store is unavailable".to_string()),
+            })
+        })?;
+
+        if let Some(why) = crate::state::encryption_configuration_rejection(
+            input.encryption_configuration.as_ref(),
+        )
+        .or_else(|| {
+            crate::state::collection_bounds_rejection(
+                input.tags.as_ref(),
+                input.tag_key_boundaries.as_deref(),
+                input.chatbot_notification_channel.as_ref(),
+            )
+        }) {
+            return Err(CreateInvestigationGroupErrorModeled::ValidationException(
+                ValidationException { message: Some(why) },
+            )
+            .into());
+        }
+
+        let parts = ctx.parts();
+        let region = crate::state::request_region(parts);
+        let principal = crate::state::caller_principal(parts);
+        let created_at = crate::state::now_epoch_seconds();
+
+        let mut store = state.lock();
+
+        // A group's name identifies it (`{identifier}` resolves by name as well as by
+        // id or ARN), so a second group cannot take a name already in use.
+        if store.name_index.contains_key(&input.name) {
+            // Only the name the caller supplied is named back: the existing group's
+            // id is not something this caller asked about.
+            let message = format!(
+                "an investigation group named '{}' already exists",
+                input.name
+            );
+            return Err(CreateInvestigationGroupErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The store is finite: a create that would take it past its cap is refused
+        // rather than growing it, the way the service refuses one past its quota.
+        if store.investigation_groups.len() >= crate::state::MAX_INVESTIGATION_GROUPS {
+            return Err(
+                CreateInvestigationGroupErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} investigation groups",
+                            crate::state::MAX_INVESTIGATION_GROUPS
+                        )),
+                        resource_type: Some("investigation-group".to_string()),
+                        service_code: Some(crate::state::ARN_SERVICE.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.fresh_group_id();
+        let arn = crate::state::group_arn(&region, &id);
+        store.insert_group(crate::state::InvestigationGroup {
+            id,
+            arn: arn.clone(),
+            name: input.name,
+            role_arn: input.role_arn,
+            encryption_configuration: input.encryption_configuration,
+            // `retentionInDays` and `isCloudTrailEventHistoryEnabled` each document the
+            // value the service applies when the request omits them, so the stored
+            // group — and every later read of it — carries that value, not nothing.
+            retention_in_days: Some(
+                input
+                    .retention_in_days
+                    .unwrap_or(crate::state::DEFAULT_RETENTION_IN_DAYS),
+            ),
+            tag_key_boundaries: input.tag_key_boundaries.unwrap_or_default(),
+            chatbot_notification_channel: input
+                .chatbot_notification_channel
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            is_cloud_trail_event_history_enabled: Some(
+                input
+                    .is_cloud_trail_event_history_enabled
+                    .unwrap_or(crate::state::DEFAULT_CLOUD_TRAIL_EVENT_HISTORY_ENABLED),
+            ),
+            cross_account_configurations: input.cross_account_configurations.unwrap_or_default(),
+            policy: None,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_by: principal.clone(),
+            created_at,
+            last_modified_by: principal,
+            last_modified_at: created_at,
+        });
+
+        Ok(CreateInvestigationGroupOutput { arn: Some(arn) })
     }
 }
