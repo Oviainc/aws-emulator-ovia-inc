@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reconstructs the endpoint from `crate::state`, materialising the
+//! `Creating` -> `InService` transition the clock already owes, and refuses an unknown
+//! `EndpointName`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +165,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEndpoint"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+        let Some(endpoint) = store.endpoints.get_mut(&input.endpoint_name) else {
+            let arn = crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                "endpoint",
+                &input.endpoint_name,
+            );
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Could not find endpoint \"{arn}\"."
+            )));
+        };
+
+        // The only write a reporting call makes: the deployment the clock already owed.
+        // It was due at the stored instant whether or not anybody described the
+        // endpoint, so a waiter terminates and no caller's read changes the outcome.
+        let settled = endpoint.settle_status(::std::time::SystemTime::now());
+        let endpoint_arn = endpoint.arn.clone();
+
+        // CaptureStatus follows the stored EnableCapture, whose model doc says data
+        // capture "defaults to enabled". `KmsKeyId` is a required member of the summary
+        // shape (not an `Option`), so a configuration that named no key reports the empty
+        // string — the only value the shape allows for "no key".
+        let data_capture_config = endpoint.data_capture_config.as_ref().map(|capture| {
+            let enabled = capture.enable_capture.unwrap_or(true);
+            DataCaptureConfigSummary {
+                enable_capture: enabled,
+                capture_status: if enabled { "Started" } else { "Stopped" }.to_string(),
+                current_sampling_percentage: capture.initial_sampling_percentage,
+                destination_s3_uri: capture.destination_s3_uri.clone(),
+                kms_key_id: capture.kms_key_id.clone().unwrap_or_default(),
+            }
+        });
+
+        let output = DescribeEndpointOutput {
+            endpoint_name: endpoint.name.clone(),
+            endpoint_arn: endpoint.arn.clone(),
+            endpoint_config_name: Some(endpoint.config_name.clone()),
+            production_variants: (!endpoint.production_variants.is_empty())
+                .then(|| endpoint.production_variants.clone()),
+            data_capture_config,
+            endpoint_status: endpoint.status.clone(),
+            failure_reason: endpoint.failure_reason.clone(),
+            creation_time: crate::state::timestamp(endpoint.creation_time),
+            last_modified_time: crate::state::timestamp(endpoint.last_modified_time),
+            // This emulator runs no blue/green deployment and has no in-flight update, so
+            // there is nothing to report for either: the real service omits both on a
+            // settled endpoint.
+            last_deployment_config: None,
+            async_inference_config: endpoint.async_inference_config.clone(),
+            pending_deployment_summary: None,
+            explainer_config: endpoint.explainer_config.clone(),
+            // The shadow variants the stored configuration carried, summarised at create
+            // time. The list is `len 1..`, so an endpoint with none omits the member.
+            shadow_production_variants: (!endpoint.shadow_production_variants.is_empty())
+                .then(|| endpoint.shadow_production_variants.clone()),
+            metrics_config: endpoint.metrics_config.clone(),
+        };
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &endpoint_arn, ctx);
+        }
+        Ok(output)
     }
 }
