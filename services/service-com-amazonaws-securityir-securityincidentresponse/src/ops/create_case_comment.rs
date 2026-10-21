@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCaseComment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCaseComment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCaseComment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Appends a comment to an existing case: allocates a six-digit `commentId`, stores the
+//! body verbatim with its creator and timestamps, and answers with the allocated id.
+//! Replaying the same `clientToken` returns the first id and appends nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -80,9 +75,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-securityir-securityinci
 // here — hence the `CreateCaseCommentError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.securityir#CreateCaseComment")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.securityir#CreateCaseComment",
+    extra_errors = ["ResourceNotFoundException", "ServiceQuotaExceededException", "InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateCaseCommentErrorModeled {
+    /// No case is stored under the requested `caseId` (HTTP 404).
+    ResourceNotFoundException(ResourceNotFoundException),
+    /// The case already holds as many comments as this emulator stores for one case
+    /// (HTTP 402).
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
+    /// The service's common server error (HTTP 500). Answered only when this service's
+    /// store is unreachable.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -136,18 +142,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCaseComment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCaseCommentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCaseComment"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateCaseCommentErrorModeled::InternalServerException(InternalServerException {
+                message: "the Security IR case store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let mut state = state.lock();
+
+        // Replay an `@idempotencyToken`: the same token on the same case must answer
+        // with the id minted the first time, and must not append a second comment. The
+        // key carries the case id, so one token can address one case only.
+        let replay_key = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, &input.case_id, token));
+        if let Some(comment_id) = replay_key
+            .as_ref()
+            .and_then(|key| state.idempotency.get(key))
+            .cloned()
+        {
+            return Ok(CreateCaseCommentOutput { comment_id });
+        }
+
+        let created = crate::state::now();
+        // `PrincipalId` accepts a bare 12-digit account id; this emulator presents one
+        // account, so that is the caller every comment is created by.
+        let creator = ::engine::emulator_account_id().to_string();
+        let case = state.cases.get_mut(&input.case_id).ok_or_else(|| {
+            CreateCaseCommentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("No case found with caseId {}", input.case_id),
+            })
+        })?;
+
+        let comment_id = case
+            .allocate_comment_id()
+            .ok_or_else(|| case_comments_full(&input.case_id))?;
+        case.comments.insert(
+            comment_id.clone(),
+            crate::state::CaseComment {
+                comment_id: comment_id.clone(),
+                body: input.body,
+                last_updated_by: creator.clone(),
+                creator,
+                created_date: created,
+                last_updated_date: created,
+            },
+        );
+        // Commenting changes the case, so the case's own last-updated instant moves.
+        case.last_updated_date = created;
+
+        if let Some(key) = replay_key {
+            state.record_idempotency(key, &comment_id);
+        }
+        Ok(CreateCaseCommentOutput { comment_id })
     }
+}
+
+/// The modelled refusal for a case already holding
+/// [`crate::state::MAX_COMMENTS_PER_CASE`] comments: this emulator will not grow that
+/// case further, and the `^\d{6}$` id space would not describe the next comment anyway.
+///
+/// `quotaCode` and `serviceCode` name the limit that was actually reached — this
+/// emulator's own per-case storage bound and this service's code — rather than an AWS
+/// quota code, which only AWS can assign.
+fn case_comments_full(case_id: &str) -> CreateCaseCommentErrorModeled {
+    CreateCaseCommentErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message: format!(
+            "this emulator stores at most {} comments per case",
+            crate::state::MAX_COMMENTS_PER_CASE
+        ),
+        resource_id: case_id.to_string(),
+        resource_type: "case".to_string(),
+        // This service's code, as `awsService.arnNamespace` gives it.
+        service_code: "security-ir".to_string(),
+        quota_code: "CommentsPerCase".to_string(),
+    })
 }

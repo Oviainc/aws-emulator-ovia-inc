@@ -13,3 +13,5 @@
 // points it into `tests/all/`.
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/timestream_write_lifecycle.rs"]
+mod timestream_write_lifecycle;
