@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads the persisted `Schedule` out of [`crate::state`] and renders it
+//! field-for-field. A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +179,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSchedule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetScheduleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the scheduler state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+        let group_name = crate::state::effective_group_name(input.group_name.as_deref());
+        let store = state.lock();
+
+        let Some(record) = store.schedules.get(&(group_name.clone(), input.name.clone())) else {
+            return Err(GetScheduleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Schedule {} does not exist in schedule group {group_name}.",
+                        input.name
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetScheduleOutput {
+            arn: Some(record.arn.clone()),
+            group_name: Some(record.group_name.clone()),
+            name: Some(record.name.clone()),
+            schedule_expression: Some(record.schedule_expression.clone()),
+            start_date: record.start_date,
+            end_date: record.end_date,
+            description: record.description.clone(),
+            schedule_expression_timezone: record.schedule_expression_timezone.clone(),
+            state: Some(record.state.clone()),
+            creation_date: Some(crate::state::to_wire_timestamp(record.creation_date)),
+            last_modification_date: Some(crate::state::to_wire_timestamp(
+                record.last_modification_date,
+            )),
+            kms_key_arn: record.kms_key_arn.clone(),
+            target: Some(record.target.clone()),
+            flexible_time_window: Some(record.flexible_time_window.clone()),
+            action_after_completion: record.action_after_completion.clone(),
+        })
     }
 }

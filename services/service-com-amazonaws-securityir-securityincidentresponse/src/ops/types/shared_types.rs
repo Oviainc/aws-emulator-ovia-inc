@@ -23,6 +23,29 @@ pub struct ResourceNotFoundException {
     pub message: String,
 }
 
+/// The service's common `InternalServerException` (HTTP 500, retryable). Declared here
+/// — not under one operation's `_types` — because it is a service-wide error every
+/// operation may answer with, which an operation widens in through
+/// `#[operation_error(.., extra_errors = ["InternalServerException"])]`.
+#[smithy_macros::smithy(shape = "com.amazonaws.securityir#InternalServerException")]
+#[derive(Debug, Clone, Default)]
+pub struct InternalServerException {
+    pub message: String,
+    pub retry_after_seconds: Option<i32>,
+}
+
+/// The service's common `ServiceQuotaExceededException` (HTTP 402). Service-wide, like
+/// [`InternalServerException`], and widened into an operation the same way.
+#[smithy_macros::smithy(shape = "com.amazonaws.securityir#ServiceQuotaExceededException")]
+#[derive(Debug, Clone, Default)]
+pub struct ServiceQuotaExceededException {
+    pub message: String,
+    pub resource_id: String,
+    pub resource_type: String,
+    pub service_code: String,
+    pub quota_code: String,
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.securityir#ValidationException")]
 #[derive(Debug, Clone, Default)]
 pub struct ValidationException {
