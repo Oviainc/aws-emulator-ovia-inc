@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartJobRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartJobRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartJobRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a run id, persists a run of the named job under it with the job's dataset,
+//! outputs and recipe reference copied in, and returns that same id — so the
+//! `DescribeJobRun`/`ListJobRuns` that follow resolve it.
 //!
 //! ## Shape of an operation
 //!
@@ -83,10 +78,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-databrew-awsgluedatabre
 // here — hence the `StartJobRunError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.databrew#StartJobRun")]
+// `InternalServerException` (HTTP 500) is widened in: the service models it, this
+// operation does not list it, and it is the only honest answer for an engine that
+// holds no state — a mounting fault, never a client error.
+#[smithy_macros::operation_error(
+    "com.amazonaws.databrew#StartJobRun",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum StartJobRunErrorModeled {
     ConflictException(ConflictException),
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ValidationException(ValidationException),
@@ -143,18 +145,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartJobRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartJobRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartJobRun"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartJobRunErrorModeled::InternalServerException(InternalServerException {
+                message: Some("DataBrew is mounted on an engine that holds no state".to_string()),
+            })
+        })?;
+
+        let started_by = crate::state::request_principal(ctx);
+        let started_on = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        let Some(job) = store.jobs.get(&input.name).cloned() else {
+            return Err(StartJobRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "One or more resources can't be found. The job {} was not found.",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The id is minted from the stored counter and the run is stored under it, so
+        // the id handed back is the one a later describe resolves.
+        let run_id = store.mint_run_id();
+        let record = crate::state::JobRunRecord {
+            run_id: run_id.clone(),
+            job_name: job.name.clone(),
+            dataset_name: job.dataset_name.clone(),
+            // A DataBrew run starts non-terminal and reaches a terminal state on its
+            // own; the transition is owed to the clock, not to another call.
+            state: "STARTING".to_string(),
+            attempt: 0,
+            execution_time: 0,
+            started_on,
+            started_by,
+            completed_on: None,
+            error_message: None,
+            outputs: job.outputs.clone(),
+            recipe_reference: job.recipe_reference.clone(),
+            log_subscription: job.log_subscription.clone(),
+            log_group_name: job
+                .log_subscription
+                .as_deref()
+                .filter(|subscription| *subscription == "ENABLE")
+                .map(|_| crate::state::log_group_name(&job.name)),
+        };
+        // Stored through `record_run`, which evicts the oldest runs past the retained
+        // ceiling, so repeated starts grow the store to a fixed bound and no further.
+        store.record_run(record);
+
+        Ok(StartJobRunOutput { run_id })
     }
 }
