@@ -1,0 +1,1545 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end HTTP coverage of the transcoding-job lifecycle: `CreateQueue`,
+//! `GetQueue`, `CreateJob`, `GetJob`, `ListJobs` and `CancelJob`.
+//!
+//! Every case drives the real restJson1 wire path — the router picks the service from
+//! the request's SigV4 scope, the framework deserializes and validates, the handler
+//! runs, and the response is serialized — so what is asserted is the bytes a client
+//! would see, never an internal call.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{json, Value};
+use service_com_amazonaws_mediaconvert_mediaconvert::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// A SigV4 `Authorization` header in this service's scope, signed for `region`. It is
+/// what the router reads to pick the service, and what the handlers read the ARN region
+/// from.
+fn authorization(region: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 \
+         Credential=AKIDTESTTESTTESTTEST/20260101/{region}/mediaconvert/aws4_request, \
+         SignedHeaders=host;x-amz-date, Signature=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    )
+}
+
+/// The region every case signs for unless it names another.
+const REGION: &str = "us-west-2";
+
+/// An IAM role ARN of the shape the `Role` member documents.
+const ROLE: &str = "arn:aws:iam::123456789012:role/MediaConvertRole";
+
+/// Longer than any case takes to run, so a job stays `SUBMITTED` for the whole of a
+/// case that is not about the clock. Pinned rather than raced: the span is state, so no
+/// case depends on how fast the machine is.
+const HELD_IN_SUBMITTED: Duration = Duration::from_secs(3_600);
+
+/// A settle span short enough for the one case that waits past it.
+const SHORT_SETTLE: Duration = Duration::from_millis(50);
+
+/// Comfortably past [`SHORT_SETTLE`], so that case always observes the transition.
+const PAST_THE_SETTLE: Duration = Duration::from_millis(400);
+
+/// One emulator: a single shared engine behind the multi-service router, exactly as the
+/// production router assembles it.
+struct Emulator {
+    router: MultiServiceRouter,
+}
+
+/// One HTTP reply, decoded far enough to assert on.
+struct Reply {
+    status: u16,
+    /// `x-amzn-errortype`, the header restJson1 resolves an error shape from.
+    error_type: Option<String>,
+    /// The JSON body, or `Value::Null` for an empty one.
+    body: Value,
+}
+
+impl Reply {
+    /// A member of the body, or `Value::Null` when it is absent.
+    fn at(&self, pointer: &str) -> &Value {
+        self.body.pointer(pointer).unwrap_or(&Value::Null)
+    }
+
+    /// A string member of the body.
+    fn string(&self, pointer: &str) -> String {
+        self.at(pointer)
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+}
+
+impl Emulator {
+    /// An emulator whose jobs stay `SUBMITTED` for the whole case. Every suite but the
+    /// one about the clock wants this.
+    fn new() -> Self {
+        Self::with_settle_span(HELD_IN_SUBMITTED)
+    }
+
+    /// An emulator whose jobs are due to leave `SUBMITTED` after `span`.
+    fn with_settle_span(span: Duration) -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        // The settle span lives in the service's state, so a case pins it instead of
+        // racing the real clock. Nothing on a request path writes it.
+        engine
+            .state::<service_com_amazonaws_mediaconvert_mediaconvert::ComAmazonawsMediaconvertMediaconvertState>()
+            .lock()
+            .job_settles_after = span;
+        let mut router = MultiServiceRouter::new();
+        // The signature itself is the transport's business, not this suite's; the
+        // Authorization header is still present because routing and the ARN region read
+        // the credential scope out of it.
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router }
+    }
+
+    async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
+        self.send_in(REGION, method, uri, body).await
+    }
+
+    async fn send_in(
+        &self,
+        region: &str,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> Reply {
+        let payload = body.map(|value| value.to_string()).unwrap_or_default();
+        let request = ::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", format!("mediaconvert.{region}.amazonaws.com"))
+            .header("authorization", authorization(region))
+            .header("content-type", "application/json")
+            .body(::bytes::Bytes::from(payload))
+            .expect("build the request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let error_type = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let raw = response.body().clone();
+        let body = if raw.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&raw).unwrap_or(Value::Null)
+        };
+        Reply {
+            status,
+            error_type,
+            body,
+        }
+    }
+
+    async fn create_queue(&self, body: Value) -> Reply {
+        self.send("POST", "/2017-08-29/queues", Some(body)).await
+    }
+
+    async fn get_queue(&self, name: &str) -> Reply {
+        self.send("GET", &format!("/2017-08-29/queues/{name}"), None)
+            .await
+    }
+
+    async fn create_job(&self, body: Value) -> Reply {
+        self.send("POST", "/2017-08-29/jobs", Some(body)).await
+    }
+
+    async fn get_job(&self, id: &str) -> Reply {
+        self.send("GET", &format!("/2017-08-29/jobs/{id}"), None)
+            .await
+    }
+
+    async fn cancel_job(&self, id: &str) -> Reply {
+        self.send("DELETE", &format!("/2017-08-29/jobs/{id}"), None)
+            .await
+    }
+
+    async fn list_jobs(&self, query: &str) -> Reply {
+        let uri = if query.is_empty() {
+            "/2017-08-29/jobs".to_string()
+        } else {
+            format!("/2017-08-29/jobs?{query}")
+        };
+        self.send("GET", &uri, None).await
+    }
+}
+
+/// A minimal but structurally real `JobSettings`: one input file and one output group.
+fn settings(input_uri: &str, name_modifier: &str) -> Value {
+    json!({
+        "inputs": [{ "fileInput": input_uri }],
+        "outputGroups": [{
+            "name": "File Group",
+            "outputs": [{ "nameModifier": name_modifier }],
+            "outputGroupSettings": {
+                "type": "FILE_GROUP_SETTINGS",
+                "fileGroupSettings": { "destination": "s3://example-bucket/out/" }
+            }
+        }]
+    })
+}
+
+/// `arn:aws:mediaconvert:<region>:<account>:<resource>`, built the way the emulator's
+/// own ARN helper builds it, so the expectation is not a second hand-written format.
+fn arn(resource: &str) -> String {
+    arn_in(REGION, resource)
+}
+
+/// As [`arn`], for a region other than the suite's default.
+fn arn_in(region: &str, resource: &str) -> String {
+    engine::emulator_arn("mediaconvert", region, resource)
+}
+
+/// Caller-driven growth is bounded: the store accepts queues up to its capacity and
+/// then answers the modelled quota error instead of growing further. `CreateJob` guards
+/// its own capacity through the same path.
+#[tokio::test]
+async fn creating_past_the_store_capacity_is_a_quota_refusal() {
+    // The capacity the state module publishes, so this test cannot drift from it.
+    let capacity = service_com_amazonaws_mediaconvert_mediaconvert::state::MAX_QUEUES;
+    let emulator = Emulator::new();
+
+    // The built-in `Default` queue already occupies one slot.
+    for index in 1..capacity {
+        let reply = emulator
+            .create_queue(json!({ "name": format!("bulk-{index}") }))
+            .await;
+        assert_eq!(
+            reply.status, 201,
+            "case queue #{index} of {capacity}: expected HTTP 201, got {} with body {}",
+            reply.status, reply.body
+        );
+    }
+
+    for name in ["one-too-many", "and-another"] {
+        let reply = emulator.create_queue(json!({ "name": name })).await;
+        assert_eq!(
+            reply.status, 402,
+            "case {name:?}: expected HTTP 402 at capacity, got {} with body {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_type.as_deref(),
+            Some("ServiceQuotaExceededException"),
+            "case {name:?}: expected ServiceQuotaExceededException, got {:?}",
+            reply.error_type
+        );
+    }
+
+    // A queue already in the store still reads back, so the refusal did not break it.
+    let existing = emulator.get_queue("bulk-1").await;
+    assert_eq!(
+        existing.status, 200,
+        "an existing queue must still read back at capacity, got {} with body {}",
+        existing.status, existing.body
+    );
+}
+
+/// Every ARN names the region of the request that read it — not the region of whichever
+/// caller happened to touch the store first.
+///
+/// The table spans the regions a request can be signed for, including the one that
+/// created the resources and two that did not, and both resource kinds plus the built-in
+/// queue nobody created.
+#[tokio::test]
+async fn an_arn_names_the_region_of_the_request_that_reads_it() {
+    let emulator = Emulator::new();
+    let created = emulator
+        .send_in(
+            "eu-central-1",
+            "POST",
+            "/2017-08-29/queues",
+            Some(json!({ "name": "regional" })),
+        )
+        .await;
+    assert_eq!(
+        created.status, 201,
+        "the fixture queue must be created: got {} with body {}",
+        created.status, created.body
+    );
+    let job = emulator
+        .send_in(
+            "eu-central-1",
+            "POST",
+            "/2017-08-29/jobs",
+            Some(json!({
+                "role": ROLE,
+                "queue": "regional",
+                "settings": settings("s3://example-bucket/in/a.mp4", "_a")
+            })),
+        )
+        .await;
+    assert_eq!(
+        job.status, 201,
+        "the fixture job must be created: got {} with body {}",
+        job.status, job.body
+    );
+    let id = job.string("/job/id");
+
+    for region in ["eu-central-1", "us-west-2", "ap-southeast-2"] {
+        let queue = emulator
+            .send_in(region, "GET", "/2017-08-29/queues/regional", None)
+            .await;
+        assert_eq!(
+            queue.string("/queue/arn"),
+            arn_in(region, "queues/regional"),
+            "case {region:?}: expected the queue ARN in the reading region, got {}",
+            queue.body
+        );
+        let default_queue = emulator
+            .send_in(region, "GET", "/2017-08-29/queues/Default", None)
+            .await;
+        assert_eq!(
+            default_queue.string("/queue/arn"),
+            arn_in(region, "queues/Default"),
+            "case {region:?}: the built-in queue's ARN follows the reading region too, got {}",
+            default_queue.body
+        );
+        let fetched = emulator
+            .send_in(region, "GET", &format!("/2017-08-29/jobs/{id}"), None)
+            .await;
+        assert_eq!(
+            fetched.string("/job/arn"),
+            arn_in(region, &format!("jobs/{id}")),
+            "case {region:?}: expected the job ARN in the reading region, got {}",
+            fetched.body
+        );
+    }
+}
+
+/// A request the model's own rules refuse is answered with a code this service's model
+/// declares — `BadRequestException` — not with the framework's generic code.
+///
+/// The table spans the refusal class: an absent required member (either one) and a value
+/// outside a declared bound at each end of `Priority`'s range, plus a value outside an
+/// enumerated set.
+#[tokio::test]
+async fn a_request_the_model_refuses_is_a_bad_request() {
+    let good_settings = settings("s3://example-bucket/in/a.mp4", "_a");
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "Role absent",
+            json!({ "settings": good_settings.clone() }),
+        ),
+        ("Settings absent", json!({ "role": ROLE })),
+        ("both absent", json!({})),
+        (
+            "Priority one below the -50 minimum",
+            json!({ "role": ROLE, "priority": -51, "settings": good_settings.clone() }),
+        ),
+        (
+            "Priority one above the 50 maximum",
+            json!({ "role": ROLE, "priority": 51, "settings": good_settings.clone() }),
+        ),
+        (
+            "StatusUpdateInterval outside the enumerated set",
+            json!({
+                "role": ROLE,
+                "statusUpdateInterval": "SECONDS_7",
+                "settings": good_settings.clone()
+            }),
+        ),
+    ];
+
+    let emulator = Emulator::new();
+    for (label, request) in &cases {
+        let reply = emulator.create_job(request.clone()).await;
+        assert_eq!(
+            reply.status, 400,
+            "case {label:?}: expected HTTP 400, got {} with body {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_type.as_deref(),
+            Some("BadRequestException"),
+            "case {label:?}: expected BadRequestException, got {:?} with body {}",
+            reply.error_type,
+            reply.body
+        );
+    }
+
+    // And each published bound of Priority is accepted.
+    for priority in [-50, 0, 50] {
+        let reply = emulator
+            .create_job(json!({
+                "role": ROLE,
+                "priority": priority,
+                "settings": good_settings.clone()
+            }))
+            .await;
+        assert_eq!(
+            reply.status, 201,
+            "case priority {priority}: expected HTTP 201, got {} with body {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.at("/job/priority"),
+            &json!(priority),
+            "case priority {priority}: expected it stored, got {}",
+            reply.body
+        );
+    }
+}
+
+/// `CreateQueue` persists every member it accepts, derives the rest, and `GetQueue`
+/// reads back exactly what was stored.
+///
+/// The table spans the input class: which optional members are present, both
+/// `PricingPlan` values, both `QueueStatus` values, and whether tags are given. The
+/// `RESERVED` row is the one the issue did not cite.
+#[tokio::test]
+async fn create_queue_persists_its_input_and_get_queue_reads_it_back() {
+    struct Case {
+        label: &'static str,
+        request: Value,
+        pricing_plan: &'static str,
+        status: &'static str,
+    }
+
+    let cases = vec![
+        Case {
+            label: "name only",
+            request: json!({ "name": "minimal-queue" }),
+            pricing_plan: "ON_DEMAND",
+            status: "ACTIVE",
+        },
+        Case {
+            label: "paused on-demand queue with a description and a concurrency cap",
+            request: json!({
+                "name": "paused-queue",
+                "description": "holds overnight work",
+                "status": "PAUSED",
+                "concurrentJobs": 7,
+                "maximumConcurrentFeeds": 0
+            }),
+            pricing_plan: "ON_DEMAND",
+            status: "PAUSED",
+        },
+        Case {
+            label: "reserved queue with a reservation plan",
+            request: json!({
+                "name": "reserved-queue",
+                "pricingPlan": "RESERVED",
+                "reservationPlanSettings": {
+                    "commitment": "ONE_YEAR",
+                    "renewalType": "AUTO_RENEW",
+                    "reservedSlots": 3
+                }
+            }),
+            pricing_plan: "RESERVED",
+            status: "ACTIVE",
+        },
+        Case {
+            label: "tagged queue",
+            request: json!({
+                "name": "tagged-queue",
+                "tags": { "team": "video", "cost-centre": "42" }
+            }),
+            pricing_plan: "ON_DEMAND",
+            status: "ACTIVE",
+        },
+    ];
+
+    let emulator = Emulator::new();
+    for case in &cases {
+        let label = case.label;
+        let name = case.request["name"].as_str().expect("the case names a queue");
+
+        let created = emulator.create_queue(case.request.clone()).await;
+        assert_eq!(
+            created.status, 201,
+            "case {label:?}: expected HTTP 201, got {} with body {}",
+            created.status, created.body
+        );
+        assert_eq!(
+            created.string("/queue/name"),
+            name,
+            "case {label:?}: expected Name {name:?}, got {}",
+            created.body
+        );
+        assert_eq!(
+            created.string("/queue/arn"),
+            arn(&format!("queues/{name}")),
+            "case {label:?}: expected the queues/<Name> ARN, got {}",
+            created.body
+        );
+        assert_eq!(
+            created.string("/queue/pricingPlan"),
+            case.pricing_plan,
+            "case {label:?}: expected PricingPlan {:?}, got {}",
+            case.pricing_plan,
+            created.body
+        );
+        assert_eq!(
+            created.string("/queue/status"),
+            case.status,
+            "case {label:?}: expected Status {:?}, got {}",
+            case.status,
+            created.body
+        );
+        assert_eq!(
+            created.string("/queue/type"),
+            "CUSTOM",
+            "case {label:?}: a caller-created queue is CUSTOM, got {}",
+            created.body
+        );
+        assert_eq!(
+            created.at("/queue/submittedJobsCount"),
+            &json!(0),
+            "case {label:?}: a new queue holds no jobs, got {}",
+            created.body
+        );
+        assert_eq!(
+            created.at("/queue/progressingJobsCount"),
+            &json!(0),
+            "case {label:?}: a new queue holds no jobs, got {}",
+            created.body
+        );
+        let created_at = created.at("/queue/createdAt").as_i64();
+        assert!(
+            created_at.is_some_and(|secs| secs > 1_600_000_000),
+            "case {label:?}: expected CreatedAt in epoch seconds, got {}",
+            created.body
+        );
+        assert_eq!(
+            created.at("/queue/lastUpdated").as_i64(),
+            created_at,
+            "case {label:?}: an untouched queue's LastUpdated equals its CreatedAt, got {}",
+            created.body
+        );
+        // Every optional member the caller supplied comes back as supplied.
+        for member in ["description", "concurrentJobs", "maximumConcurrentFeeds"] {
+            if let Some(expected) = case.request.get(member) {
+                assert_eq!(
+                    created.at(&format!("/queue/{member}")),
+                    expected,
+                    "case {label:?}: expected {member} {expected}, got {}",
+                    created.body
+                );
+            }
+        }
+        if let Some(plan) = case.request.get("reservationPlanSettings") {
+            for member in ["commitment", "renewalType", "reservedSlots"] {
+                assert_eq!(
+                    created.at(&format!("/queue/reservationPlan/{member}")),
+                    &plan[member],
+                    "case {label:?}: expected ReservationPlan.{member} {}, got {}",
+                    plan[member],
+                    created.body
+                );
+            }
+            assert_eq!(
+                created.string("/queue/reservationPlan/status"),
+                "ACTIVE",
+                "case {label:?}: a just-purchased reservation plan is ACTIVE, got {}",
+                created.body
+            );
+            let purchased = created
+                .at("/queue/reservationPlan/purchasedAt")
+                .as_i64()
+                .expect("PurchasedAt is epoch seconds");
+            let expires = created
+                .at("/queue/reservationPlan/expiresAt")
+                .as_i64()
+                .expect("ExpiresAt is epoch seconds");
+            assert_eq!(
+                expires - purchased,
+                365 * 24 * 60 * 60,
+                "case {label:?}: a ONE_YEAR commitment expires a year after purchase, got {}",
+                created.body
+            );
+        }
+
+        // Round trip: the reader returns the stored resource, not the request.
+        let fetched = emulator.get_queue(name).await;
+        assert_eq!(
+            fetched.status, 200,
+            "case {label:?}: expected GetQueue HTTP 200, got {} with body {}",
+            fetched.status, fetched.body
+        );
+        assert_eq!(
+            fetched.at("/queue"),
+            created.at("/queue"),
+            "case {label:?}: GetQueue must return what CreateQueue persisted, got {}",
+            fetched.body
+        );
+    }
+
+    // The built-in queue exists without anybody creating it, and is SYSTEM.
+    let default_queue = emulator.get_queue("Default").await;
+    assert_eq!(
+        default_queue.status, 200,
+        "the built-in Default queue must exist: got {} with body {}",
+        default_queue.status, default_queue.body
+    );
+    assert_eq!(
+        default_queue.string("/queue/type"),
+        "SYSTEM",
+        "the built-in Default queue is SYSTEM, got {}",
+        default_queue.body
+    );
+}
+
+/// A second `CreateQueue` for a name already in the store conflicts, and an unknown name
+/// is not found — for any name, not just the one the issue cited.
+#[tokio::test]
+async fn queue_names_are_unique_and_unknown_queues_are_not_found() {
+    let emulator = Emulator::new();
+    for name in ["alpha", "a-queue-with-a-much-longer-name", "Default"] {
+        if name != "Default" {
+            let first = emulator.create_queue(json!({ "name": name })).await;
+            assert_eq!(
+                first.status, 201,
+                "case {name:?}: expected the first CreateQueue to succeed, got {} with body {}",
+                first.status, first.body
+            );
+        }
+        let again = emulator.create_queue(json!({ "name": name })).await;
+        assert_eq!(
+            again.status, 409,
+            "case {name:?}: re-creating an existing queue must conflict, got {} with body {}",
+            again.status, again.body
+        );
+        assert_eq!(
+            again.error_type.as_deref(),
+            Some("ConflictException"),
+            "case {name:?}: expected ConflictException, got {:?}",
+            again.error_type
+        );
+    }
+
+    for missing in ["nope", "also-missing"] {
+        let reply = emulator.get_queue(missing).await;
+        assert_eq!(
+            reply.status, 404,
+            "case {missing:?}: expected HTTP 404, got {} with body {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_type.as_deref(),
+            Some("NotFoundException"),
+            "case {missing:?}: expected NotFoundException, got {:?}",
+            reply.error_type
+        );
+    }
+}
+
+/// `ReservationPlanSettings` is "Required for reserved queues and not applicable to
+/// on-demand queues", so each pairing of `PricingPlan` with the member's presence is
+/// accepted or refused accordingly.
+#[tokio::test]
+async fn a_reservation_plan_is_required_exactly_for_reserved_queues() {
+    let plan = json!({
+        "commitment": "ONE_YEAR",
+        "renewalType": "EXPIRE",
+        "reservedSlots": 1
+    });
+    // (label, pricingPlan, reservation plan present, expected status)
+    let cases: Vec<(&str, Option<&str>, bool, u16)> = vec![
+        ("reserved without a plan", Some("RESERVED"), false, 400),
+        ("reserved with a plan", Some("RESERVED"), true, 201),
+        ("on-demand with a plan", Some("ON_DEMAND"), true, 400),
+        ("on-demand without a plan", Some("ON_DEMAND"), false, 201),
+        ("defaulted plan, no settings", None, false, 201),
+        ("defaulted plan with settings", None, true, 400),
+    ];
+
+    let emulator = Emulator::new();
+    for (index, (label, pricing_plan, with_plan, expected)) in cases.iter().enumerate() {
+        let mut request = json!({ "name": format!("queue-{index}") });
+        if let Some(pricing_plan) = pricing_plan {
+            request["pricingPlan"] = json!(pricing_plan);
+        }
+        if *with_plan {
+            request["reservationPlanSettings"] = plan.clone();
+        }
+        let reply = emulator.create_queue(request).await;
+        assert_eq!(
+            reply.status, *expected,
+            "case {label:?}: expected HTTP {expected}, got {} with body {}",
+            reply.status, reply.body
+        );
+        if *expected == 400 {
+            assert_eq!(
+                reply.error_type.as_deref(),
+                Some("BadRequestException"),
+                "case {label:?}: expected BadRequestException, got {:?}",
+                reply.error_type
+            );
+        }
+    }
+}
+
+/// `CreateJob` stores the job and `GetJob` hands back exactly what was stored.
+///
+/// The table spans what a caller can vary: the queue (absent, by name, by ARN), both
+/// ends of the `Priority` range, user metadata, the status-update interval, the billing
+/// tags source, and differing `Settings`.
+#[tokio::test]
+async fn create_job_persists_its_input_and_get_job_reads_it_back() {
+    struct Case {
+        label: &'static str,
+        request: Value,
+        queue: &'static str,
+    }
+
+    let emulator = Emulator::new();
+    let created_queue = emulator.create_queue(json!({ "name": "test-queue" })).await;
+    assert_eq!(
+        created_queue.status, 201,
+        "the fixture queue must be created: got {} with body {}",
+        created_queue.status, created_queue.body
+    );
+
+    let cases = vec![
+        Case {
+            label: "no queue, so the default queue",
+            request: json!({
+                "role": ROLE,
+                "settings": settings("s3://example-bucket/in/a.mp4", "_a")
+            }),
+            queue: "Default",
+        },
+        Case {
+            label: "queue by name, lowest priority, user metadata",
+            request: json!({
+                "role": ROLE,
+                "queue": "test-queue",
+                "priority": -50,
+                "userMetadata": { "k": "v", "batch": "nightly" },
+                "settings": settings("s3://example-bucket/in/b.mov", "_b")
+            }),
+            queue: "test-queue",
+        },
+        Case {
+            label: "queue by ARN, highest priority, status updates and billing source",
+            request: json!({
+                "role": ROLE,
+                "queue": arn("queues/test-queue"),
+                "priority": 50,
+                "statusUpdateInterval": "SECONDS_120",
+                "billingTagsSource": "JOB",
+                "settings": settings("s3://example-bucket/in/c.mkv", "_c")
+            }),
+            queue: "test-queue",
+        },
+        Case {
+            label: "job template name and an acceleration setting",
+            request: json!({
+                "role": ROLE,
+                "jobTemplate": "my-template",
+                "accelerationSettings": { "mode": "DISABLED" },
+                "settings": settings("s3://example-bucket/in/d.ts", "_d")
+            }),
+            queue: "Default",
+        },
+    ];
+
+    let mut seen_ids = BTreeMap::new();
+    for case in &cases {
+        let label = case.label;
+        let created = emulator.create_job(case.request.clone()).await;
+        assert_eq!(
+            created.status, 201,
+            "case {label:?}: expected HTTP 201, got {} with body {}",
+            created.status, created.body
+        );
+
+        let id = created.string("/job/id");
+        assert!(
+            !id.is_empty(),
+            "case {label:?}: CreateJob must mint an Id, got {}",
+            created.body
+        );
+        assert!(
+            seen_ids.insert(id.clone(), label).is_none(),
+            "case {label:?}: Id {id:?} was already minted for {:?}",
+            seen_ids.get(&id)
+        );
+        assert_eq!(
+            created.string("/job/arn"),
+            arn(&format!("jobs/{id}")),
+            "case {label:?}: expected the jobs/<Id> ARN, got {}",
+            created.body
+        );
+        assert_eq!(
+            created.string("/job/status"),
+            "SUBMITTED",
+            "case {label:?}: a new job is SUBMITTED, got {}",
+            created.body
+        );
+        assert_eq!(
+            created.string("/job/queue"),
+            case.queue,
+            "case {label:?}: expected Queue {:?}, got {}",
+            case.queue,
+            created.body
+        );
+        assert_eq!(
+            created.string("/job/role"),
+            ROLE,
+            "case {label:?}: Role must be stored as submitted, got {}",
+            created.body
+        );
+        assert_eq!(
+            created.at("/job/settings"),
+            &case.request["settings"],
+            "case {label:?}: Settings must be stored as submitted, got {}",
+            created.body
+        );
+        assert!(
+            created
+                .at("/job/createdAt")
+                .as_i64()
+                .is_some_and(|secs| secs > 1_600_000_000),
+            "case {label:?}: expected CreatedAt in epoch seconds, got {}",
+            created.body
+        );
+        assert_eq!(
+            created.at("/job/timing/submitTime").as_i64(),
+            created.at("/job/createdAt").as_i64(),
+            "case {label:?}: SubmitTime is when the job was created, got {}",
+            created.body
+        );
+        for member in [
+            "priority",
+            "userMetadata",
+            "statusUpdateInterval",
+            "billingTagsSource",
+            "jobTemplate",
+            "accelerationSettings",
+        ] {
+            if let Some(expected) = case.request.get(member) {
+                assert_eq!(
+                    created.at(&format!("/job/{member}")),
+                    expected,
+                    "case {label:?}: expected {member} {expected}, got {}",
+                    created.body
+                );
+            }
+        }
+
+        // Round trip: GetJob returns the stored job, byte for byte.
+        let fetched = emulator.get_job(&id).await;
+        assert_eq!(
+            fetched.status, 200,
+            "case {label:?}: expected GetJob HTTP 200, got {} with body {}",
+            fetched.status, fetched.body
+        );
+        assert_eq!(
+            fetched.at("/job"),
+            created.at("/job"),
+            "case {label:?}: GetJob must return what CreateJob persisted, got {}",
+            fetched.body
+        );
+    }
+
+    for missing in ["doesnotexist", "1700000000000-zzzzzz"] {
+        let reply = emulator.get_job(missing).await;
+        assert_eq!(
+            reply.status, 404,
+            "case {missing:?}: expected HTTP 404, got {} with body {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_type.as_deref(),
+            Some("NotFoundException"),
+            "case {missing:?}: expected NotFoundException, got {:?}",
+            reply.error_type
+        );
+    }
+}
+
+/// A `Queue` that names no stored queue is not found, whichever form it is given in.
+#[tokio::test]
+async fn create_job_into_an_unknown_queue_is_not_found() {
+    let emulator = Emulator::new();
+    for reference in ["no-such-queue", &arn("queues/no-such-queue")] {
+        let reply = emulator
+            .create_job(json!({
+                "role": ROLE,
+                "queue": reference,
+                "settings": settings("s3://example-bucket/in/a.mp4", "_a")
+            }))
+            .await;
+        assert_eq!(
+            reply.status, 404,
+            "case {reference:?}: expected HTTP 404, got {} with body {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_type.as_deref(),
+            Some("NotFoundException"),
+            "case {reference:?}: expected NotFoundException, got {:?}",
+            reply.error_type
+        );
+    }
+}
+
+/// Repeating a `ClientRequestToken` returns the job that token first created, and a
+/// different token creates a different job — for any token value.
+#[tokio::test]
+async fn a_repeated_client_request_token_returns_the_same_job() {
+    let emulator = Emulator::new();
+    let tokens = ["t", "9c1e5f70-0000-4000-8000-000000000001", &"x".repeat(64)];
+
+    let mut ids = Vec::new();
+    for token in tokens {
+        let request = json!({
+            "role": ROLE,
+            "clientRequestToken": token,
+            "settings": settings("s3://example-bucket/in/a.mp4", "_a")
+        });
+        let first = emulator.create_job(request.clone()).await;
+        assert_eq!(
+            first.status, 201,
+            "case {token:?}: expected HTTP 201, got {} with body {}",
+            first.status, first.body
+        );
+        let repeat = emulator.create_job(request).await;
+        assert_eq!(
+            repeat.at("/job"),
+            first.at("/job"),
+            "case {token:?}: the same token must return the same job, got {}",
+            repeat.body
+        );
+        ids.push(first.string("/job/id"));
+    }
+
+    let listed = emulator.list_jobs("").await;
+    let count = listed.at("/jobs").as_array().map_or(0, Vec::len);
+    assert_eq!(
+        count,
+        tokens.len(),
+        "expected one job per distinct token ({}), got {count} in {}",
+        tokens.len(),
+        listed.body
+    );
+    ids.sort();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        tokens.len(),
+        "expected a distinct Id per distinct token, got {ids:?}"
+    );
+}
+
+/// `ListJobs` reads the store: it honours the `queue` and `status` filters, orders by
+/// creation time in the requested direction (newest first by default), pages at
+/// `maxResults`, and sets `NextToken` only while a further page remains.
+#[tokio::test]
+async fn list_jobs_filters_orders_and_pages_over_the_store() {
+    let emulator = Emulator::new();
+    for name in ["queue-a", "queue-b"] {
+        let reply = emulator.create_queue(json!({ "name": name })).await;
+        assert_eq!(
+            reply.status, 201,
+            "the fixture queue {name:?} must be created: got {} with body {}",
+            reply.status, reply.body
+        );
+    }
+
+    // Six jobs, created in this order, across three queues.
+    let plan = [
+        ("queue-a", "_0"),
+        ("queue-b", "_1"),
+        ("queue-a", "_2"),
+        ("Default", "_3"),
+        ("queue-a", "_4"),
+        ("queue-b", "_5"),
+    ];
+    let mut created_order = Vec::new();
+    for (queue, modifier) in plan {
+        let reply = emulator
+            .create_job(json!({
+                "role": ROLE,
+                "queue": queue,
+                "settings": settings("s3://example-bucket/in/a.mp4", modifier)
+            }))
+            .await;
+        assert_eq!(
+            reply.status, 201,
+            "fixture job {modifier:?} must be created: got {} with body {}",
+            reply.status, reply.body
+        );
+        created_order.push((queue, reply.string("/job/id")));
+    }
+
+    let ids_in = |queue: Option<&str>, descending: bool| -> Vec<String> {
+        let mut ids: Vec<String> = created_order
+            .iter()
+            .filter(|(job_queue, _)| queue.is_none_or(|want| *job_queue == want))
+            .map(|(_, id)| id.clone())
+            .collect();
+        if descending {
+            ids.reverse();
+        }
+        ids
+    };
+
+    // (label, query string, expected ids)
+    let cases: Vec<(&str, String, Vec<String>)> = vec![
+        (
+            "no filter, default order is newest first",
+            String::new(),
+            ids_in(None, true),
+        ),
+        (
+            "explicit DESCENDING",
+            "order=DESCENDING".to_string(),
+            ids_in(None, true),
+        ),
+        (
+            "ASCENDING is oldest first",
+            "order=ASCENDING".to_string(),
+            ids_in(None, false),
+        ),
+        (
+            "filtered to one queue",
+            "queue=queue-a&order=ASCENDING".to_string(),
+            ids_in(Some("queue-a"), false),
+        ),
+        (
+            "filtered to another queue",
+            "queue=queue-b&order=ASCENDING".to_string(),
+            ids_in(Some("queue-b"), false),
+        ),
+        (
+            "filtered to the default queue",
+            "queue=Default".to_string(),
+            ids_in(Some("Default"), true),
+        ),
+        (
+            "queue given as an ARN",
+            format!("queue={}&order=ASCENDING", arn("queues/queue-a")),
+            ids_in(Some("queue-a"), false),
+        ),
+        (
+            "status SUBMITTED matches every job",
+            "status=SUBMITTED&order=ASCENDING".to_string(),
+            ids_in(None, false),
+        ),
+        (
+            "status CANCELED matches none yet",
+            "status=CANCELED".to_string(),
+            Vec::new(),
+        ),
+        (
+            "queue and status together",
+            "queue=queue-a&status=SUBMITTED&order=ASCENDING".to_string(),
+            ids_in(Some("queue-a"), false),
+        ),
+        (
+            "an empty queue lists nothing",
+            "queue=no-such-queue".to_string(),
+            Vec::new(),
+        ),
+    ];
+
+    for (label, query, expected) in &cases {
+        let reply = emulator.list_jobs(query).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {label:?}: expected HTTP 200, got {} with body {}",
+            reply.status, reply.body
+        );
+        let got: Vec<String> = reply
+            .at("/jobs")
+            .as_array()
+            .map(|jobs| {
+                jobs.iter()
+                    .map(|job| job["id"].as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            &got, expected,
+            "case {label:?}: expected ids {expected:?}, got {got:?} in {}",
+            reply.body
+        );
+        assert_eq!(
+            reply.at("/nextToken"),
+            &Value::Null,
+            "case {label:?}: a single complete page carries no NextToken, got {}",
+            reply.body
+        );
+    }
+
+    // Paging: every page size from 1 to one past the result count walks the same
+    // sequence the unpaged call returns, and NextToken stops exactly at the end.
+    let expected_sequence = ids_in(None, false);
+    for page_size in 1..=expected_sequence.len() + 1 {
+        let label = format!("maxResults={page_size}");
+        let mut walked: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let mut query = format!("order=ASCENDING&maxResults={page_size}");
+            if let Some(token) = token.as_deref() {
+                query.push_str(&format!("&nextToken={token}"));
+            }
+            let reply = emulator.list_jobs(&query).await;
+            assert_eq!(
+                reply.status, 200,
+                "case {label:?}: expected HTTP 200, got {} with body {}",
+                reply.status, reply.body
+            );
+            let page: Vec<String> = reply
+                .at("/jobs")
+                .as_array()
+                .map(|jobs| {
+                    jobs.iter()
+                        .map(|job| job["id"].as_str().unwrap_or_default().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(
+                page.len() <= page_size,
+                "case {label:?}: a page must not exceed maxResults, got {} ids",
+                page.len()
+            );
+            walked.extend(page);
+            pages += 1;
+            assert!(
+                pages <= expected_sequence.len() + 1,
+                "case {label:?}: paging did not terminate after {pages} pages"
+            );
+            match reply.at("/nextToken").as_str() {
+                Some(next) => token = Some(next.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(
+            walked, expected_sequence,
+            "case {label:?}: paging must walk every job exactly once, got {walked:?}"
+        );
+    }
+
+    // A token this service never issued is a bad request, not an empty page.
+    let bogus = emulator.list_jobs("nextToken=not-a-token").await;
+    assert_eq!(
+        bogus.status, 400,
+        "an unrecognised nextToken must be refused, got {} with body {}",
+        bogus.status, bogus.body
+    );
+    assert_eq!(
+        bogus.error_type.as_deref(),
+        Some("BadRequestException"),
+        "expected BadRequestException, got {:?}",
+        bogus.error_type
+    );
+}
+
+/// A `nextToken` keeps working when the job it anchors on stops matching the caller's
+/// filters between pages: the next page resumes at the first job past the anchor key,
+/// rather than failing because the anchor left the result set.
+#[tokio::test]
+async fn a_next_token_survives_the_anchor_job_leaving_the_result_set() {
+    const JOBS: usize = 4;
+
+    // Each row removes a different anchor from the filtered set between the two pages.
+    for anchor in 0..JOBS - 1 {
+        let emulator = Emulator::new();
+        let mut fresh = Vec::new();
+        for index in 0..JOBS {
+            let reply = emulator
+                .create_job(json!({
+                    "role": ROLE,
+                    "settings": settings("s3://example-bucket/in/a.mp4", &format!("_{index}"))
+                }))
+                .await;
+            assert_eq!(
+                reply.status, 201,
+                "case anchor {anchor}: fixture job {index} must be created, got {} with body {}",
+                reply.status, reply.body
+            );
+            fresh.push(reply.string("/job/id"));
+        }
+
+        let first = emulator
+            .list_jobs(&format!(
+                "status=SUBMITTED&order=ASCENDING&maxResults={}",
+                anchor + 1
+            ))
+            .await;
+        let token = first.string("/nextToken");
+        assert!(
+            !token.is_empty(),
+            "case anchor {anchor}: a further page must exist, got {}",
+            first.body
+        );
+
+        // The anchor is the last job of the page just returned; cancelling it drops it
+        // out of the `status=SUBMITTED` filter the next page is taken under.
+        let cancelled = emulator.cancel_job(&fresh[anchor]).await;
+        assert_eq!(
+            cancelled.status, 202,
+            "case anchor {anchor}: expected HTTP 202, got {} with body {}",
+            cancelled.status, cancelled.body
+        );
+
+        let next = emulator
+            .list_jobs(&format!(
+                "status=SUBMITTED&order=ASCENDING&maxResults=1&nextToken={token}"
+            ))
+            .await;
+        assert_eq!(
+            next.status, 200,
+            "case anchor {anchor}: the token must still be usable, got {} with body {}",
+            next.status, next.body
+        );
+        assert_eq!(
+            next.at("/jobs/0/id").as_str(),
+            Some(fresh[anchor + 1].as_str()),
+            "case anchor {anchor}: expected the job after the anchor, got {}",
+            next.body
+        );
+    }
+}
+
+/// `CancelJob` moves the stored job to `CANCELED`, which every later read observes, and
+/// a job that is no longer `SUBMITTED` cannot be cancelled again.
+#[tokio::test]
+async fn cancel_job_moves_the_stored_job_to_canceled() {
+    let emulator = Emulator::new();
+    let reply = emulator.create_queue(json!({ "name": "test-queue" })).await;
+    assert_eq!(
+        reply.status, 201,
+        "the fixture queue must be created: got {} with body {}",
+        reply.status, reply.body
+    );
+
+    // Each row is a job in a different queue, so cancellation is not keyed to one of them.
+    for (label, queue) in [("default queue", "Default"), ("custom queue", "test-queue")] {
+        let created = emulator
+            .create_job(json!({
+                "role": ROLE,
+                "queue": queue,
+                "settings": settings("s3://example-bucket/in/a.mp4", "_a")
+            }))
+            .await;
+        assert_eq!(
+            created.status, 201,
+            "case {label:?}: expected HTTP 201, got {} with body {}",
+            created.status, created.body
+        );
+        let id = created.string("/job/id");
+
+        let cancelled = emulator.cancel_job(&id).await;
+        assert_eq!(
+            cancelled.status, 202,
+            "case {label:?}: expected HTTP 202, got {} with body {}",
+            cancelled.status, cancelled.body
+        );
+        assert_eq!(
+            cancelled.body,
+            json!({}),
+            "case {label:?}: CancelJob has no output members, got {}",
+            cancelled.body
+        );
+
+        let fetched = emulator.get_job(&id).await;
+        assert_eq!(
+            fetched.string("/job/status"),
+            "CANCELED",
+            "case {label:?}: GetJob must observe the cancellation, got {}",
+            fetched.body
+        );
+        let listed = emulator
+            .list_jobs(&format!("queue={queue}&status=CANCELED"))
+            .await;
+        let listed_ids: Vec<String> = listed
+            .at("/jobs")
+            .as_array()
+            .map(|jobs| {
+                jobs.iter()
+                    .map(|job| job["id"].as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            listed_ids,
+            vec![id.clone()],
+            "case {label:?}: ListJobs must observe the cancellation, got {}",
+            listed.body
+        );
+
+        let again = emulator.cancel_job(&id).await;
+        assert_eq!(
+            again.status, 409,
+            "case {label:?}: cancelling a CANCELED job must conflict, got {} with body {}",
+            again.status, again.body
+        );
+        assert_eq!(
+            again.error_type.as_deref(),
+            Some("ConflictException"),
+            "case {label:?}: expected ConflictException, got {:?}",
+            again.error_type
+        );
+    }
+
+    for missing in ["doesnotexist", "1700000000000-zzzzzz"] {
+        let reply = emulator.cancel_job(missing).await;
+        assert_eq!(
+            reply.status, 404,
+            "case {missing:?}: expected HTTP 404, got {} with body {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_type.as_deref(),
+            Some("NotFoundException"),
+            "case {missing:?}: expected NotFoundException, got {:?}",
+            reply.error_type
+        );
+    }
+}
+
+/// A queue's job counts are counted off the stored jobs, so they move as the jobs do
+/// instead of being a second copy that can drift.
+#[tokio::test]
+async fn queue_job_counts_are_derived_from_the_stored_jobs() {
+    let emulator = Emulator::new();
+    let reply = emulator.create_queue(json!({ "name": "counted" })).await;
+    assert_eq!(
+        reply.status, 201,
+        "the fixture queue must be created: got {} with body {}",
+        reply.status, reply.body
+    );
+
+    let mut ids = Vec::new();
+    for expected in 1..=4 {
+        let created = emulator
+            .create_job(json!({
+                "role": ROLE,
+                "queue": "counted",
+                "settings": settings("s3://example-bucket/in/a.mp4", "_a")
+            }))
+            .await;
+        assert_eq!(
+            created.status, 201,
+            "case {expected} jobs: expected HTTP 201, got {} with body {}",
+            created.status, created.body
+        );
+        ids.push(created.string("/job/id"));
+
+        let queue = emulator.get_queue("counted").await;
+        assert_eq!(
+            queue.at("/queue/submittedJobsCount"),
+            &json!(expected),
+            "case {expected} jobs: expected SubmittedJobsCount {expected}, got {}",
+            queue.body
+        );
+        assert_eq!(
+            queue.at("/queue/progressingJobsCount"),
+            &json!(0),
+            "case {expected} jobs: nothing is PROGRESSING, got {}",
+            queue.body
+        );
+        // A job in one queue is never counted against another.
+        let default_queue = emulator.get_queue("Default").await;
+        assert_eq!(
+            default_queue.at("/queue/submittedJobsCount"),
+            &json!(0),
+            "case {expected} jobs: the Default queue holds none of them, got {}",
+            default_queue.body
+        );
+    }
+
+    // Cancelling drops the job out of the SUBMITTED count.
+    for (cancelled, id) in ids.iter().enumerate() {
+        let reply = emulator.cancel_job(id).await;
+        assert_eq!(
+            reply.status, 202,
+            "case cancel #{cancelled}: expected HTTP 202, got {} with body {}",
+            reply.status, reply.body
+        );
+        let queue = emulator.get_queue("counted").await;
+        let expected = ids.len() - cancelled - 1;
+        assert_eq!(
+            queue.at("/queue/submittedJobsCount"),
+            &json!(expected),
+            "case cancel #{cancelled}: expected SubmittedJobsCount {expected}, got {}",
+            queue.body
+        );
+    }
+}
+
+/// `SUBMITTED` is not a terminal status, so the clock owes a submitted job its exit from
+/// it. Because this emulator has no transcoding engine, the job ends in the service's
+/// own modelled failure status with a reason that says so — and a terminal job can no
+/// longer be cancelled.
+#[tokio::test]
+async fn a_submitted_job_leaves_submitted_once_the_clock_makes_it_due() {
+    // The span the service ships with is non-zero and inside the window the project
+    // allows for a clock-owed transition, so a caller acting straight after CreateJob
+    // always observes the transient status.
+    let shipped = engine::InMemoryEngine::new()
+        .state::<service_com_amazonaws_mediaconvert_mediaconvert::ComAmazonawsMediaconvertMediaconvertState>()
+        .lock()
+        .job_settles_after;
+    assert!(
+        shipped >= Duration::from_millis(250) && shipped <= Duration::from_millis(750),
+        "the shipped settle span must be a non-zero 250-750ms, got {shipped:?}"
+    );
+
+    let emulator = Emulator::with_settle_span(SHORT_SETTLE);
+    let created = emulator
+        .create_job(json!({
+            "role": ROLE,
+            "settings": settings("s3://example-bucket/in/a.mp4", "_a")
+        }))
+        .await;
+    assert_eq!(
+        created.status, 201,
+        "expected HTTP 201, got {} with body {}",
+        created.status, created.body
+    );
+    let id = created.string("/job/id");
+    assert_eq!(
+        created.string("/job/status"),
+        "SUBMITTED",
+        "a caller acting immediately after CreateJob still sees SUBMITTED, got {}",
+        created.body
+    );
+
+    // The due instant is stored, not slept for by the handler; this suite waits past it.
+    tokio::time::sleep(PAST_THE_SETTLE).await;
+
+    let settled = emulator.get_job(&id).await;
+    assert_eq!(
+        settled.string("/job/status"),
+        "ERROR",
+        "once due, the job must leave SUBMITTED, got {}",
+        settled.body
+    );
+    let reason = settled.string("/job/errorMessage");
+    assert!(
+        reason.contains("transcoding engine"),
+        "the failure must say why nothing transcoded, got {reason:?}"
+    );
+    assert_eq!(
+        settled.at("/job/createdAt").as_i64(),
+        created.at("/job/createdAt").as_i64(),
+        "settling must not rewrite CreatedAt, got {}",
+        settled.body
+    );
+    assert!(
+        settled.at("/job/timing/finishTime").as_i64().is_some(),
+        "a finished job carries a FinishTime, got {}",
+        settled.body
+    );
+
+    // The status is reported identically by every reader, and is stable across reads.
+    let again = emulator.get_job(&id).await;
+    assert_eq!(
+        again.at("/job"),
+        settled.at("/job"),
+        "a second read must report the same job, got {}",
+        again.body
+    );
+    let listed = emulator.list_jobs("status=ERROR").await;
+    let listed_ids: Vec<String> = listed
+        .at("/jobs")
+        .as_array()
+        .map(|jobs| {
+            jobs.iter()
+                .map(|job| job["id"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        listed_ids,
+        vec![id.clone()],
+        "ListJobs must observe the same status, got {}",
+        listed.body
+    );
+
+    let cancelled = emulator.cancel_job(&id).await;
+    assert_eq!(
+        cancelled.status, 409,
+        "a job that has left SUBMITTED can no longer be cancelled, got {} with body {}",
+        cancelled.status, cancelled.body
+    );
+}
+
+/// The whole workflow the issue describes, in one pass: create a queue, submit a job
+/// into it, read it back, list it under both filters, cancel it, and see CANCELED.
+#[tokio::test]
+async fn the_documented_job_workflow_runs_end_to_end() {
+    let emulator = Emulator::new();
+
+    let queue = emulator
+        .create_queue(json!({ "name": "workflow-queue" }))
+        .await;
+    assert_eq!(
+        queue.status, 201,
+        "CreateQueue: expected HTTP 201, got {} with body {}",
+        queue.status, queue.body
+    );
+
+    let job_settings = settings("s3://example-bucket/in/workflow.mp4", "_out");
+    let created = emulator
+        .create_job(json!({
+            "role": ROLE,
+            "queue": "workflow-queue",
+            "userMetadata": { "k": "v" },
+            "settings": job_settings
+        }))
+        .await;
+    assert_eq!(
+        created.status, 201,
+        "CreateJob: expected HTTP 201, got {} with body {}",
+        created.status, created.body
+    );
+    let id = created.string("/job/id");
+
+    let fetched = emulator.get_job(&id).await;
+    assert_eq!(
+        fetched.at("/job/settings"),
+        &job_settings,
+        "GetJob: Settings must match what was submitted, got {}",
+        fetched.body
+    );
+    assert_eq!(
+        fetched.at("/job/userMetadata"),
+        &json!({ "k": "v" }),
+        "GetJob: UserMetadata must match what was submitted, got {}",
+        fetched.body
+    );
+
+    let listed = emulator
+        .list_jobs("queue=workflow-queue&status=SUBMITTED&maxResults=1")
+        .await;
+    assert_eq!(
+        listed.at("/jobs").as_array().map(Vec::len),
+        Some(1),
+        "ListJobs: expected the one job, got {}",
+        listed.body
+    );
+    assert_eq!(
+        listed.at("/nextToken"),
+        &Value::Null,
+        "ListJobs: no further page exists, so no NextToken, got {}",
+        listed.body
+    );
+
+    let cancelled = emulator.cancel_job(&id).await;
+    assert_eq!(
+        cancelled.status, 202,
+        "CancelJob: expected HTTP 202, got {} with body {}",
+        cancelled.status, cancelled.body
+    );
+    assert_eq!(
+        emulator.get_job(&id).await.string("/job/status"),
+        "CANCELED",
+        "GetJob after CancelJob must report CANCELED"
+    );
+}

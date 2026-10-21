@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -214,18 +205,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateJobErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("this service's state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        if input.role.trim().is_empty() {
+            return Err(CreateJobErrorModeled::BadRequestException(BadRequestException {
+                message: Some("Role must not be empty.".to_string()),
+            })
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        // "If you reuse a client request token within one minute of a successful request,
+        // the API returns the job details for the original request." Inside that window
+        // the token names the job it first created, never a second one.
+        let token = input
+            .client_request_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+        if let Some(token) = token.as_deref() {
+            if let Some(job) = state.job_for_token(token, now) {
+                return Ok(CreateJobOutput {
+                    job: Some(job.view(&region)),
+                });
+            }
+        }
+
+        // "If you don't specify, the job will go to the default queue."
+        let queue = input
+            .queue
+            .as_deref()
+            .map(crate::state::queue_name_from_reference)
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::state::DEFAULT_QUEUE_NAME.to_string());
+        if !state.queues.contains_key(&queue) {
+            return Err(CreateJobErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("Queue {queue} not found.")),
+            })
+            .into());
+        }
+
+        // The id, the clock-owed exit from SUBMITTED and the idempotency entry are all
+        // owned by `accept_job`, which also enforces the store's `MAX_JOBS` ceiling, so
+        // caller-driven growth is bounded.
+        let record = crate::state::JobRecord {
+            // `accept_job` mints and assigns the id.
+            id: String::new(),
+            role: input.role,
+            settings: input.settings,
+            queue,
+            job_template: input.job_template,
+            priority: input.priority,
+            status: crate::state::JOB_STATUS_SUBMITTED.to_string(),
+            created_at: now,
+            status_update_interval: input.status_update_interval,
+            billing_tags_source: input.billing_tags_source,
+            acceleration_settings: input.acceleration_settings,
+            hop_destinations: input.hop_destinations.unwrap_or_default(),
+            job_engine_version_requested: input.job_engine_version,
+            simulate_reserved_queue: input.simulate_reserved_queue,
+            user_metadata: input.user_metadata.unwrap_or_default().into_iter().collect(),
+            client_request_token: token,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            timing: crate::state::JobTiming {
+                submit_time: Some(now),
+                start_time: None,
+                finish_time: None,
+            },
+            settles_at: None,
+            error_message: None,
+        };
+
+        let id = match state.accept_job(record, now) {
+            crate::state::AcceptOutcome::Stored(id) => id,
+            crate::state::AcceptOutcome::AtCapacity => {
+                return Err(CreateJobErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "You have reached the maximum of {} jobs.",
+                            crate::state::MAX_JOBS
+                        )),
+                    },
+                )
+                .into())
+            }
+        };
+
+        let Some(job) = state.jobs.get(&id) else {
+            return Err(CreateJobErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the job could not be read back after it was stored".to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(CreateJobOutput {
+            job: Some(job.view(&region)),
+        })
     }
 }

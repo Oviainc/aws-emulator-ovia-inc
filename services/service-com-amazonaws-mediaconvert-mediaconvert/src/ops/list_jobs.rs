@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +121,37 @@ impl From<ListJobsErrorModeled> for ListJobsError {
     }
 }
 
+/// Page size when the caller gives no `maxResults`: "Retrieve a JSON array of up to
+/// twenty of your most recently created jobs", which is also `MaxResults`' own maximum.
+const DEFAULT_PAGE_SIZE: i32 = 20;
+
+/// A `nextToken` that carries the ORDERING KEY of the last job of the page just
+/// returned — its creation instant and its id, the pair `ListJobs` orders by.
+///
+/// Encoding the key rather than just the id means the next page resumes at the first
+/// job strictly past that key in the requested direction, so a job whose status changed
+/// between pages (it settled, or was cancelled, and no longer matches the caller's
+/// `status` filter) is skipped instead of invalidating the token.
+///
+/// Hex-encoded so it is opaque to a caller — the documented contract is only that the
+/// string returned by one request is handed back to the next one.
+fn encode_token(job: &crate::state::JobRecord) -> String {
+    ::hex::encode(format!("{}:{}", crate::state::epoch_nanos(job.created_at), job.id))
+}
+
+/// The `(creation instant, id)` ordering key inside a `nextToken`, or `None` when the
+/// token is not one this service issued.
+fn decode_token(token: &str) -> Option<(u128, String)> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let (nanos, id) = decoded.split_once(':')?;
+    Some((nanos.parse().ok()?, id.to_string()))
+}
+
+/// The ordering key of one job: the pair the sort below is total on.
+fn ordering_key(job: &crate::state::JobRecord) -> (u128, &str) {
+    (crate::state::epoch_nanos(job.created_at), job.id.as_str())
+}
+
 /// The `ListJobs` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,18 +188,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListJobs"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListJobsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("this service's state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Reporting only: the one write is materialising the status changes the clock had
+        // already made due at `now`, which were owed whether or not anybody polled.
+        state.settle(now);
+
+        // `queue` accepts a queue name or a queue ARN; `status` is one `JobStatus`.
+        let queue = input
+            .queue
+            .as_deref()
+            .map(crate::state::queue_name_from_reference)
+            .map(str::to_string);
+        let status = input.status.clone();
+
+        let mut matching: Vec<&crate::state::JobRecord> = state
+            .jobs
+            .values()
+            .filter(|job| queue.as_deref().is_none_or(|name| job.queue == name))
+            .filter(|job| status.as_deref().is_none_or(|want| job.status == want))
+            .collect();
+        // "your most recently created jobs": ordered by creation time, newest first
+        // unless the caller asked for ASCENDING. The id breaks ties so the order is
+        // total and a page boundary cannot repeat or skip a job.
+        matching.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let order = input
+            .order
+            .as_deref()
+            .unwrap_or(crate::state::ORDER_DESCENDING);
+        if order == crate::state::ORDER_DESCENDING {
+            matching.reverse();
+        }
+
+        let ascending = order == crate::state::ORDER_ASCENDING;
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some((nanos, id)) = decode_token(token) else {
+                    return Err(ListJobsErrorModeled::BadRequestException(BadRequestException {
+                        message: Some(
+                            "nextToken is not a token this service issued.".to_string(),
+                        ),
+                    })
+                    .into());
+                };
+                let anchor = (nanos, id.as_str());
+                // Resume at the first job strictly past the anchor key in this
+                // direction. The anchor itself need not still be in the result set, so a
+                // job whose status changed between pages is skipped, not an error.
+                matching
+                    .iter()
+                    .position(|job| {
+                        if ascending {
+                            ordering_key(job) > anchor
+                        } else {
+                            ordering_key(job) < anchor
+                        }
+                    })
+                    .unwrap_or(matching.len())
+            }
+        };
+
+        // `maxResults` carries the model's own 1..20 range, so the framework has already
+        // refused anything outside it; the fallback only covers the absent case.
+        let page_size = usize::try_from(input.max_results.unwrap_or(DEFAULT_PAGE_SIZE))
+            .unwrap_or(DEFAULT_PAGE_SIZE as usize);
+        let page = &matching[start.min(matching.len())..];
+        let page = &page[..page_size.min(page.len())];
+        // A token only when there is a further page to fetch.
+        let next_token = (start + page.len() < matching.len())
+            .then(|| page.last().map(|job| encode_token(job)))
+            .flatten();
+        let jobs = page.iter().map(|job| job.view(&region)).collect();
+
+        Ok(ListJobsOutput {
+            jobs: Some(jobs),
+            next_token,
+        })
     }
 }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +169,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateQueue"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateQueueErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("this service's state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let name = input.name.trim().to_string();
+        if name.is_empty() {
+            return Err(CreateQueueErrorModeled::BadRequestException(BadRequestException {
+                message: Some("Name must not be empty.".to_string()),
+            })
+            .into());
+        }
+
+        // "When you use the API to create a queue, the default is on-demand."
+        let pricing_plan = input
+            .pricing_plan
+            .clone()
+            .unwrap_or_else(|| crate::state::PRICING_PLAN_ON_DEMAND.to_string());
+        // ReservationPlanSettings is "Required for reserved queues and not applicable to
+        // on-demand queues."
+        let reserved = pricing_plan == crate::state::PRICING_PLAN_RESERVED;
+        match (reserved, input.reservation_plan_settings.as_ref()) {
+            (true, None) => {
+                return Err(CreateQueueErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(
+                        "ReservationPlanSettings is required when PricingPlan is RESERVED."
+                            .to_string(),
+                    ),
+                })
+                .into())
+            }
+            (false, Some(_)) => {
+                return Err(CreateQueueErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(
+                        "ReservationPlanSettings does not apply when PricingPlan is ON_DEMAND."
+                            .to_string(),
+                    ),
+                })
+                .into())
+            }
+            _ => {}
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        if state.queues.contains_key(&name) {
+            return Err(CreateQueueErrorModeled::ConflictException(ConflictException {
+                message: Some(format!("Queue {name} already exists.")),
+            })
+            .into());
+        }
+        // Bounded growth: the store holds at most `MAX_QUEUES` queues, and a create past
+        // that is the quota refusal the model declares rather than more state.
+        if state.queues_at_capacity() {
+            return Err(CreateQueueErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "You have reached the maximum of {} queues.",
+                        crate::state::MAX_QUEUES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::QueueRecord {
+            name: name.clone(),
+            description: input.description,
+            pricing_plan,
+            // "Initial state of the queue" — ACTIVE unless the caller paused it.
+            status: input
+                .status
+                .unwrap_or_else(|| crate::state::QUEUE_STATUS_ACTIVE.to_string()),
+            queue_type: crate::state::QUEUE_TYPE_CUSTOM.to_string(),
+            concurrent_jobs: input.concurrent_jobs,
+            maximum_concurrent_feeds: input.maximum_concurrent_feeds,
+            reservation_plan: input
+                .reservation_plan_settings
+                .as_ref()
+                .map(|settings| crate::state::reservation_plan(settings, now)),
+            created_at: now,
+            last_updated: now,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        let (submitted, progressing) = state.job_counts(&name);
+        let queue = record.view(&region, submitted, progressing);
+        state.queues.insert(name, record);
+
+        Ok(CreateQueueOutput { queue: Some(queue) })
     }
 }

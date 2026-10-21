@@ -8,6 +8,8 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# Opaque pagination tokens: hex-encode the cursor so it is not readable client state.
+hex = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -28,6 +30,8 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `time` for the one integration case that waits past a job's settle instant.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

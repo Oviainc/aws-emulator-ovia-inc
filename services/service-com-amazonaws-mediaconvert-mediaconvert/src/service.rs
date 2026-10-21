@@ -96,17 +96,46 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // MediaConvert states every client-side refusal through one of its own modelled
+        // errors, so the code a client branches on is a code the model declares — not
+        // the framework's generic `ValidationException`, which this service never
+        // models. Both the code and the message are replaced together.
+        //
+        // * `BadRequestException` (400): "The service can't process your request because
+        //   of a problem in the request. Please check your request form and syntax."
+        // * `ForbiddenException` (403): "You don't have permissions for this action with
+        //   the credentials you sent."
+        //
+        // The status stays with the protocol, which already answers 400 for an invalid
+        // request and 403 for an unauthenticated one.
+        match refusal {
+            Refusal::Invalid(violations) => {
+                let detail = violations
+                    .iter()
+                    .map(smithy_server_runtime::Violation::message)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                Some(Refused {
+                    code: "BadRequestException".to_string(),
+                    message: if detail.is_empty() {
+                        "The service can't process your request because of a problem in \
+                         the request. Please check your request form and syntax."
+                            .to_string()
+                    } else {
+                        detail
+                    },
+                })
+            }
+            Refusal::Unauthenticated => Some(Refused {
+                code: "ForbiddenException".to_string(),
+                message: "You don't have permissions for this action with the credentials \
+                          you sent."
+                    .to_string(),
+            }),
+            // `Refusal` is `#[non_exhaustive]`: a kind added later keeps the framework's
+            // own wording until this service decides how to state it.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
