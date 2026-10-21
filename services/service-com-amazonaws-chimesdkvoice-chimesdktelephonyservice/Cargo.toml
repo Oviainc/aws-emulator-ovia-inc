@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Digest the id counter into the modelled `^[a-z0-9]{21,22}$` VoiceConnectorId.
+sha2 = { workspace = true }
+# Hex codec for the minted id and the opaque ListVoiceConnectors NextToken.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

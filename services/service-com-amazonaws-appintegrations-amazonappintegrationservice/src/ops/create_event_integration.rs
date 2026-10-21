@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEventIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEventIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEventIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a new event integration in this service's store and answers with the ARN
+//! it minted for it. The record is the only source `GetEventIntegration` and
+//! `ListEventIntegrations` read, so nothing here is echoed back to the caller
+//! without being persisted first.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +161,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEventIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEventIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEventIntegration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateEventIntegrationErrorModeled::InternalServiceError(InternalServiceError {
+                message: Some("the AppIntegrations store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // A retry carrying the `ClientToken` of an integration this service already
+        // created answers with the ARN it minted then: an @idempotencyToken makes the
+        // call repeatable, so it neither creates a second resource nor fails.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = state
+                .idempotency
+                .get(token)
+                .and_then(|name| state.event_integrations.get(name))
+            {
+                return Ok(CreateEventIntegrationOutput {
+                    event_integration_arn: Some(existing.arn.clone()),
+                });
+            }
+        }
+
+        if state.event_integrations.contains_key(&input.name) {
+            return Err(CreateEventIntegrationErrorModeled::DuplicateResourceException(
+                DuplicateResourceException {
+                    message: Some(format!(
+                        "An event integration named {} already exists.",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::event_integration_arn(&region, &input.name);
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::EventIntegrationRecord {
+            name: input.name.clone(),
+            arn: arn.clone(),
+            description: input.description,
+            event_bridge_bus: input.event_bridge_bus,
+            event_filter: crate::state::EventFilterRecord {
+                source: input.event_filter.source,
+            },
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<::std::collections::BTreeMap<String, String>>(),
+            client_token: input.client_token.clone(),
+            created_time: now,
+            last_modified_time: now,
+        };
+        if let Some(token) = input.client_token {
+            state.idempotency.insert(token, input.name.clone());
+        }
+        state.event_integrations.insert(input.name, record);
+
+        Ok(CreateEventIntegrationOutput {
+            event_integration_arn: Some(arn),
+        })
     }
 }
