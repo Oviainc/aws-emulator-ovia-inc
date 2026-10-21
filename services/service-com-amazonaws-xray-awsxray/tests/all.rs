@@ -13,3 +13,6 @@
 // points it into `tests/all/`.
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+
+#[path = "all/trace_ingest_and_groups.rs"]
+mod trace_ingest_and_groups;
