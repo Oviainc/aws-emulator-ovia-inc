@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartHumanLoop
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartHumanLoop`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartHumanLoop::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates and persists one human loop, keyed by `HumanLoopName`, and answers with the ARN
+//! minted for it. The record every other operation in this crate reads is written here.
+//!
+//! A stored record holds its name until `DeleteHumanLoop` removes it, whatever status it
+//! reached: A2I names a human loop uniquely, and the loop a terminal status belongs to is
+//! still readable by `DescribeHumanLoop` and `ListHumanLoops` until it is deleted. So a
+//! re-start that carries different input data is refused for a terminal record too —
+//! answering it with a second success would have to overwrite the record a caller can still
+//! read.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +163,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartHumanLoop` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartHumanLoopErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartHumanLoop"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartHumanLoopErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the human-loop store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Everything that does not need the lock, computed first.
+        let name = input.human_loop_name;
+        let flow_definition_arn = input.flow_definition_arn;
+        let input_digest = crate::state::input_content_digest(&input.human_loop_input.input_content);
+        let content_classifiers = input
+            .data_attributes
+            .map(|attributes| attributes.content_classifiers)
+            .unwrap_or_default();
+        let region = crate::state::request_region(ctx.parts());
+        let arn = ::engine::emulator_arn("sagemaker", &region, &format!("human-loop/{name}"));
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        if let Some(existing) = store.human_loops.get(&name) {
+            // The model's `ConflictException` is specifically "the same name as another
+            // active human loop but ... different input data", so a re-start of a name
+            // whose input data is identical is idempotent and returns the stored ARN,
+            // while any difference in the input data is refused.
+            let same_input_data = existing.flow_definition_arn == flow_definition_arn
+                && existing.input_digest == input_digest
+                && existing.content_classifiers == content_classifiers;
+            if same_input_data {
+                return Ok(StartHumanLoopOutput {
+                    human_loop_arn: Some(existing.arn.clone()),
+                });
+            }
+            return Err(StartHumanLoopErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Human loop with name {name} already exists with different input data."
+                )),
+            })
+            .into());
+        }
+
+        // The store is bounded: past the quota a new name is refused with the error the
+        // model declares for it rather than growing the store further. A record is released
+        // by `DeleteHumanLoop`, which frees the slot as well as the name.
+        if store.is_full() {
+            return Err(StartHumanLoopErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "The quota of {} human loops has been reached. Delete human loops \
+                         you no longer need, or request a quota increase.",
+                        crate::state::HUMAN_LOOP_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.human_loops.insert(
+            name.clone(),
+            crate::state::HumanLoop {
+                name,
+                arn: arn.clone(),
+                flow_definition_arn,
+                input_digest,
+                content_classifiers,
+                // A started loop waits on a human worker, so `InProgress` is where it
+                // rests: nothing the clock owes moves it on by itself.
+                status: crate::state::HumanLoopStatus::InProgress,
+                creation_time: now,
+                pending_status: None,
+                failure_reason: None,
+                failure_code: None,
+                output_s3_uri: None,
+            },
+        );
+
+        Ok(StartHumanLoopOutput {
+            human_loop_arn: Some(arn),
+        })
     }
 }

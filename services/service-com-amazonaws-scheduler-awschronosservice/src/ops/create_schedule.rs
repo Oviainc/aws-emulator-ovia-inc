@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a `Schedule` in [`crate::state`] under `(group name, schedule name)`
+//! and answers its generated ARN. The group must exist; the pair must be free.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +183,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSchedule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateScheduleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the scheduler state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        if let Some(message) =
+            crate::state::flexible_time_window_violation(&input.flexible_time_window)
+        {
+            return Err(
+                CreateScheduleErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let group_name = crate::state::effective_group_name(input.group_name.as_deref());
+        let mut store = state.lock();
+
+        if !store.group_exists(&group_name) {
+            return Err(CreateScheduleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Schedule group {group_name} does not exist."),
+                },
+            )
+            .into());
+        }
+
+        let key = (group_name.clone(), input.name.clone());
+        if store.schedules.contains_key(&key) {
+            return Err(
+                CreateScheduleErrorModeled::ConflictException(ConflictException {
+                    message: format!("Schedule {} already exists.", input.name),
+                })
+                .into(),
+            );
+        }
+
+        if store.schedules.len() >= crate::state::MAX_SCHEDULES {
+            return Err(CreateScheduleErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The number of schedules has reached the quota of {}.",
+                        crate::state::MAX_SCHEDULES
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let arn = crate::state::schedule_arn(&region, &group_name, &input.name);
+        store.schedules.insert(
+            key,
+            crate::state::ScheduleRecord {
+                name: input.name,
+                group_name,
+                arn: arn.clone(),
+                schedule_expression: input.schedule_expression,
+                schedule_expression_timezone: input.schedule_expression_timezone,
+                start_date: input.start_date,
+                end_date: input.end_date,
+                description: input.description,
+                state: input
+                    .state
+                    .unwrap_or_else(|| crate::state::DEFAULT_SCHEDULE_STATE.to_string()),
+                kms_key_arn: input.kms_key_arn,
+                action_after_completion: input.action_after_completion,
+                target: input.target,
+                flexible_time_window: input.flexible_time_window,
+                creation_date: now,
+                last_modification_date: now,
+            },
+        );
+
+        Ok(CreateScheduleOutput { schedule_arn: arn })
     }
 }
