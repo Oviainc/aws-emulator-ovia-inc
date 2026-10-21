@@ -1,11 +1,185 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-location-locationservice service.
+//!
+//! One lock holds every tracker resource plus its device position histories, so a
+//! position written by `BatchUpdateDevicePosition` is readable by
+//! `GetDevicePosition` on a later request and a deleted tracker takes its
+//! histories with it.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Epoch milliseconds. Amazon Location renders every timestamp in ISO 8601
+/// `YYYY-MM-DDThh:mm:ss.sssZ` (see the `CreateTime`/`SampleTime` member docs in the
+/// Smithy model), so millisecond resolution is the precision the wire carries.
+pub type EpochMillis = i64;
+
+/// The region used for generated ARNs when a request carries no SigV4 credential
+/// scope to read one from (an unsigned, host-routed request).
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// `PositionFiltering` applied when `CreateTracker` leaves it unset. The model's
+/// `CreateTrackerRequest$PositionFiltering` doc: "This field is optional. If not
+/// specified, the default value is `TimeBased`."
+pub const DEFAULT_POSITION_FILTERING: &str = "TimeBased";
+
+/// `PricingPlan` every tracker read reports. The model's
+/// `DescribeTrackerResponse$PricingPlan` doc: "Always returns `RequestBasedUsage`."
+pub const ALWAYS_PRICING_PLAN: &str = "RequestBasedUsage";
 
 /// Per-service state for com-amazonaws-location-locationservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsLocationLocationserviceState {
-    // TODO: add service-specific state fields
+    /// Tracker resources by `TrackerName`. A `BTreeMap` so list operations have a
+    /// stable, total order to paginate over with a key-based cursor.
+    pub trackers: BTreeMap<String, Tracker>,
+}
+
+/// One tracker resource and everything stored under it.
+#[derive(Debug, Clone)]
+pub struct Tracker {
+    pub name: String,
+    pub arn: String,
+    /// `DescribeTracker`/`ListTrackers` model `Description` as required, and the
+    /// member is `len 0..1000`, so an unset description is the empty string.
+    pub description: String,
+    pub position_filtering: String,
+    pub kms_key_id: Option<String>,
+    pub event_bridge_enabled: bool,
+    pub kms_key_enable_geospatial_queries: bool,
+    pub tags: BTreeMap<String, String>,
+    pub create_time: EpochMillis,
+    pub update_time: EpochMillis,
+    /// Geofence-collection ARNs associated through `AssociateTrackerConsumer`.
+    pub consumer_arns: BTreeSet<String>,
+    /// Position history per `DeviceId`, kept sorted ascending by `sample_time`, so
+    /// the latest position is the last element.
+    pub devices: BTreeMap<String, Vec<StoredPosition>>,
+}
+
+/// One stored device position sample.
+#[derive(Debug, Clone)]
+pub struct StoredPosition {
+    pub device_id: String,
+    pub sample_time: EpochMillis,
+    /// Stamped by the service when it accepted the update, never taken from the
+    /// request.
+    pub received_time: EpochMillis,
+    /// WGS 84 `[longitude, latitude]` — the `Position` shape is `len 2..2`.
+    pub position: [f64; 2],
+    /// `PositionalAccuracy$Horizontal`, in metres.
+    pub accuracy: Option<f64>,
+    pub position_properties: BTreeMap<String, String>,
+}
+
+/// Largest `Updates` batch `BatchUpdateDevicePosition` accepts, which is the API's
+/// own maximum: the `DevicePositionUpdateList` shape is `len 1..10`. The handler
+/// enforces it itself as well as relying on the request boundary, so the amount of
+/// work one request can ask for is never chosen by the caller.
+pub const MAX_BATCH_UPDATES: usize = 10;
+
+/// How long a device's position history is kept, as a span of SAMPLE time.
+///
+/// Amazon Location Service retains device position history for 30 days
+/// (<https://docs.aws.amazon.com/location/latest/developerguide/device-tracking.html>:
+/// "Device position history is stored for 30 days"). The window is measured from
+/// the newest stored sample rather than from the wall clock, so a client that
+/// writes historical samples still reads back the history it just wrote; the
+/// retained span is the documented one either way.
+pub const POSITION_HISTORY_RETENTION_MILLIS: EpochMillis = 30 * 24 * 60 * 60 * 1_000;
+
+/// Emulator memory bound, NOT an AWS quota: samples kept per device, oldest
+/// evicted first. The real service bounds history with position filtering plus
+/// retention; this cap exists so repeated writes cannot grow the in-memory store
+/// without limit, and is chosen large enough that a client never meets it in a
+/// normal session.
+pub const MAX_POSITIONS_PER_DEVICE: usize = 200;
+
+/// Emulator memory bound, NOT an AWS quota: devices tracked per tracker. When it
+/// is reached, the device whose newest sample is oldest is evicted to make room,
+/// so a caller minting unbounded device ids cannot grow the store without limit.
+pub const MAX_DEVICES_PER_TRACKER: usize = 1_000;
+
+/// Emulator memory bound, NOT an AWS quota: tracker resources held at once.
+/// `CreateTracker` refuses past it with the modelled `ServiceQuotaExceededException`
+/// rather than growing the store without limit.
+pub const MAX_TRACKERS: usize = 1_000;
+
+impl Tracker {
+    /// Record `sample` in its device's history, keeping the history sorted ascending
+    /// by `sample_time`, then apply the retention window and the memory bounds.
+    ///
+    /// A sample is keyed by `(DeviceId, SampleTime)`: an update for an instant the
+    /// device already holds REPLACES it rather than adding a second sample for the
+    /// same instant.
+    ///
+    /// Every other branch here shrinks or keeps the history, so the state this
+    /// tracker holds is bounded by
+    /// `MAX_DEVICES_PER_TRACKER * MAX_POSITIONS_PER_DEVICE` however many updates
+    /// arrive.
+    pub fn record_position(&mut self, sample: StoredPosition) {
+        if self.devices.len() >= MAX_DEVICES_PER_TRACKER
+            && !self.devices.contains_key(&sample.device_id)
+        {
+            self.evict_least_recently_sampled_device();
+        }
+
+        let history = self.devices.entry(sample.device_id.clone()).or_default();
+        // `partition_point` with `<` lands on the first sample at this instant, so
+        // an existing one is overwritten and a new instant is inserted in order.
+        let at = history.partition_point(|p| p.sample_time < sample.sample_time);
+        match history.get_mut(at) {
+            Some(existing) if existing.sample_time == sample.sample_time => *existing = sample,
+            _ => history.insert(at, sample),
+        }
+
+        // Retention: drop everything older than the window, measured back from
+        // the newest sample now held.
+        if let Some(newest) = history.last().map(|p| p.sample_time) {
+            let cutoff = newest.saturating_sub(POSITION_HISTORY_RETENTION_MILLIS);
+            let expired = history.partition_point(|p| p.sample_time < cutoff);
+            if expired > 0 {
+                history.drain(..expired);
+            }
+        }
+
+        // Memory bound: keep the newest `MAX_POSITIONS_PER_DEVICE` samples.
+        if history.len() > MAX_POSITIONS_PER_DEVICE {
+            let excess = history.len() - MAX_POSITIONS_PER_DEVICE;
+            history.drain(..excess);
+        }
+    }
+
+    /// Drop the device whose newest sample is the oldest, to make room under
+    /// [`MAX_DEVICES_PER_TRACKER`].
+    fn evict_least_recently_sampled_device(&mut self) {
+        let stale = self
+            .devices
+            .iter()
+            .min_by_key(|(_, history)| {
+                history.last().map_or(EpochMillis::MIN, |p| p.sample_time)
+            })
+            .map(|(device_id, _)| device_id.clone());
+        if let Some(device_id) = stale {
+            // Logged because this discards stored positions on an otherwise
+            // successful write: someone debugging a device that stopped answering
+            // GetDevicePosition needs to see that the bound, not the caller,
+            // dropped it.
+            ::tracing::warn!(
+                tracker = %self.name,
+                device_id = %device_id,
+                max_devices_per_tracker = MAX_DEVICES_PER_TRACKER,
+                "evicting the least recently sampled device to stay within the emulator's per-tracker device bound"
+            );
+            self.devices.remove(&device_id);
+        }
+    }
+
+    /// The most recently sampled position for `device_id`, or `None` when the
+    /// device has no stored position under this tracker.
+    pub fn latest_position(&self, device_id: &str) -> Option<&StoredPosition> {
+        self.devices.get(device_id)?.last()
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -18,3 +192,127 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsLocationLocationserviceState>)
 }
+
+/// Now, in epoch milliseconds. The one clock every handler in this crate reads.
+pub fn now_millis() -> EpochMillis {
+    let since_epoch = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    // `as i64` cannot overflow for any clock this emulator runs under: the value
+    // is milliseconds since 1970 and `i64` covers ~292 million years.
+    since_epoch.as_millis() as i64
+}
+
+/// The wire form of a stored timestamp.
+pub fn to_date_time(millis: EpochMillis) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from_millis(millis)
+}
+
+/// The stored form of a wire timestamp, truncated to the millisecond precision the
+/// service's ISO 8601 rendering carries.
+pub fn from_date_time(value: &::aws_smithy_types::DateTime) -> EpochMillis {
+    value
+        .to_millis()
+        .unwrap_or_else(|_| value.secs().saturating_mul(1_000))
+}
+
+/// The region a request is addressed to: the third field of its SigV4 credential
+/// scope, falling back to [`DEFAULT_REGION`] for an unsigned request.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// `arn:aws:geo:<region>:<account>:tracker/<name>` — the format
+/// `CreateTrackerResponse$TrackerArn` documents.
+pub fn tracker_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn("geo", region, &format!("tracker/{name}"))
+}
+
+/// An opaque pagination cursor: the INCLUSIVE start key of the next page (the key
+/// of its first item), tagged with the collection it was minted for.
+///
+/// Tagging is what makes a token checkable: a cursor from another list operation,
+/// or a client-invented string, fails [`decode_next_token`] and is refused with
+/// `ValidationException` rather than silently treated as a resource name.
+pub fn encode_next_token(kind: &str, key: &str) -> String {
+    format!("{kind}:{key}")
+}
+
+/// The inclusive start key a cursor carries, or `Err` with the reason it is
+/// malformed. `kind` is the collection the caller is paging. A key whose item has
+/// since been deleted still names the right page: the next item in key order
+/// follows it.
+pub fn decode_next_token(kind: &str, token: &str) -> Result<String, String> {
+    let key = token
+        .strip_prefix(kind)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .ok_or_else(|| format!("NextToken is not a valid pagination token for {kind}"))?;
+    if key.is_empty() {
+        return Err("NextToken is not a valid pagination token: it names no page".to_string());
+    }
+    Ok(key.to_string())
+}
+
+/// The cursor tag for `ListTrackers`.
+pub const TRACKERS_CURSOR: &str = "trackers";
+
+/// Largest page any list operation in this service returns, and the page size used
+/// when the caller sends no `MaxResults`: the model bounds `MaxResults` at
+/// `range 1..100`.
+pub const MAX_PAGE_SIZE: i32 = 100;
+
+/// The page size to use for a request's `MaxResults`.
+///
+/// The model already bounds `MaxResults` at `range 1..100` and the request
+/// boundary refuses a violation before any handler runs, so the clamp here is
+/// defence in depth: it keeps this helper total for every `i32` a future caller
+/// could hand it, including a member some other list operation models without a
+/// range.
+pub fn page_size(max_results: Option<i32>) -> usize {
+    max_results.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE) as usize
+}
+
+/// Longitude bound of the WGS 84 coordinate domain, in degrees.
+pub const MAX_LONGITUDE: f64 = 180.0;
+
+/// Latitude bound of the WGS 84 coordinate domain, in degrees.
+pub const MAX_LATITUDE: f64 = 90.0;
+
+/// The `[longitude, latitude]` pair a `Position` carries, or the reason it is not a
+/// WGS 84 coordinate.
+///
+/// The `Position` shape documents "WGS 84 format: `[X or longitude, Y or latitude]`"
+/// and is `len 2..2` (refused at the request boundary), but puts no `range` on its
+/// members, so the coordinate domain is the service's own check and belongs here.
+pub fn wgs84_position(position: &[f64]) -> Result<[f64; 2], String> {
+    let [longitude, latitude] = match position {
+        [longitude, latitude] => [*longitude, *latitude],
+        other => {
+            return Err(format!(
+                "Position must hold exactly 2 values, [longitude, latitude]; got {}",
+                other.len()
+            ))
+        }
+    };
+    if !(-MAX_LONGITUDE..=MAX_LONGITUDE).contains(&longitude) {
+        return Err(format!(
+            "Position longitude must be between {} and {MAX_LONGITUDE} degrees; got {longitude}",
+            -MAX_LONGITUDE
+        ));
+    }
+    if !(-MAX_LATITUDE..=MAX_LATITUDE).contains(&latitude) {
+        return Err(format!(
+            "Position latitude must be between {} and {MAX_LATITUDE} degrees; got {latitude}",
+            -MAX_LATITUDE
+        ));
+    }
+    Ok([longitude, latitude])
+}
+
+/// The `BatchItemError$Code` a per-entry input failure carries: the
+/// `BatchItemErrorCode` enum's "Input fails to satisfy the constraints specified by
+/// the service" member.
+pub const BATCH_VALIDATION_ERROR: &str = "ValidationError";
+
