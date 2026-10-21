@@ -1,0 +1,1161 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for the scaling-plan lifecycle, driven over the real wire path.
+//!
+//! Every call goes through [`MultiServiceRouter::dispatch`] — the same entry the
+//! production router serves — as an `awsJson1_1` `POST /` with
+//! `X-Amz-Target: AnyScaleScalingPlannerFrontendService.<Operation>`, so these tests
+//! exercise routing, deserialization, the handler and serialization together.
+//!
+//! The lifecycle transitions are due at a STORED instant, never at a slept-for one, so
+//! the tests drive them by moving that instant rather than by racing a wall clock:
+//! `hold_pending` pushes it out (the transient window), `make_due` pulls it into the
+//! past (the settled window). One test does sleep past the real span, to prove the
+//! default span actually elapses on its own.
+
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use serde_json::{json, Value};
+use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::state::{
+    self as plan_state, ComAmazonawsAutoscalingplansAnyscalescalingplannerfrontendserviceState as PlanState,
+    PendingOutcome, MAX_RESULTS_MAX, MAX_RESULTS_MIN, MAX_SCALING_PLANS, SETTLE_AFTER,
+};
+use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// The `X-Amz-Target` prefix from the crate's OPERATIONS.md wire-protocol section.
+const TARGET_PREFIX: &str = "AnyScaleScalingPlannerFrontendService.";
+
+/// A SigV4 `Authorization` header whose credential scope names this service's signing
+/// name (`autoscaling-plans`) — the routing signal the router reads. Request
+/// authentication is off in tests, so the signature itself is never verified.
+const SIGV4_HEADER: &str = "AWS4-HMAC-SHA256 \
+     Credential=AKIDEXAMPLE/20260101/us-east-1/autoscaling-plans/aws4_request, \
+     SignedHeaders=host;x-amz-target, Signature=00";
+
+/// One emulator: a single shared engine with this one service mounted on it.
+struct Emulator {
+    router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
+}
+
+impl Emulator {
+    fn new() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// Dispatch one operation and return `(http status, parsed body)`.
+    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+        let request = ::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", format!("{TARGET_PREFIX}{operation}"))
+            .header("authorization", SIGV4_HEADER)
+            .body(::bytes::Bytes::from(body.to_string()))
+            .expect("build the request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let parsed: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+        (status, parsed)
+    }
+
+    /// Dispatch one operation that must succeed, and return its body.
+    async fn ok(&self, operation: &str, body: Value) -> Value {
+        let (status, parsed) = self.call(operation, &body).await;
+        assert_eq!(
+            status, 200,
+            "case {operation} {body}: expected HTTP 200, got {status} with {parsed}"
+        );
+        parsed
+    }
+
+    /// Dispatch one operation that must fail, and return `(status, error code)`.
+    async fn err(&self, operation: &str, body: Value) -> (u16, String) {
+        let (status, parsed) = self.call(operation, &body).await;
+        assert_ne!(
+            status, 200,
+            "case {operation} {body}: expected a failure, got HTTP 200 with {parsed}"
+        );
+        let code = parsed
+            .get("__type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .rsplit(['#', '/'])
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        (status, code)
+    }
+
+    /// Read or write the stored state directly, WITHOUT going through a handler — so
+    /// nothing settles behind the test's back.
+    fn with_state<R>(&self, body: impl FnOnce(&mut PlanState) -> R) -> R {
+        let state = plan_state::service_state(&*self.engine).expect("this service's state");
+        let mut guard = state.lock();
+        body(&mut guard)
+    }
+
+    /// The stored `(status code, pending outcome, how long after the status started the
+    /// transition is due)` of one plan.
+    fn stored(&self, name: &str) -> (String, Option<PendingOutcome>, Option<Duration>) {
+        self.with_state(|state| {
+            let plan = state
+                .scaling_plans
+                .get(name)
+                .unwrap_or_else(|| panic!("no stored plan named {name:?}"));
+            let span = plan
+                .pending
+                .and_then(|pending| pending.due_at.duration_since(plan.status_start_time).ok());
+            (
+                plan.status_code.clone(),
+                plan.pending.map(|pending| pending.outcome),
+                span,
+            )
+        })
+    }
+
+    /// Hold a plan's pending transition open, so the transient window is deterministic.
+    fn hold_pending(&self, name: &str) {
+        self.with_state(|state| {
+            let plan = state
+                .scaling_plans
+                .get_mut(name)
+                .unwrap_or_else(|| panic!("no stored plan named {name:?}"));
+            let pending = plan
+                .pending
+                .as_mut()
+                .unwrap_or_else(|| panic!("plan {name:?} has no pending transition"));
+            pending.due_at = SystemTime::now() + Duration::from_secs(3600);
+        });
+    }
+
+    /// Make every plan's pending transition due, so the next call settles it.
+    fn make_all_due(&self) {
+        self.with_state(|state| {
+            let past = SystemTime::now() - Duration::from_secs(1);
+            for plan in state.scaling_plans.values_mut() {
+                if let Some(pending) = plan.pending.as_mut() {
+                    pending.due_at = past;
+                }
+            }
+        });
+    }
+}
+
+/// One `ScalingInstruction` as JSON.
+///
+/// `namespace` / `dimension` / `metric` are drawn from the model's own value lists
+/// (`smithy_query(query="shape",shape="ServiceNamespace,ScalableDimension,ScalingMetricType")`,
+/// mirrored in `src/ops/types/shared_types.rs` as `SERVICE_NAMESPACE_VALUES`,
+/// `SCALABLE_DIMENSION_VALUES` and `SCALING_METRIC_TYPE_VALUES`).
+fn instruction(
+    namespace: &str,
+    resource_id: &str,
+    dimension: &str,
+    min: i64,
+    max: i64,
+    metric: &str,
+    target: f64,
+) -> Value {
+    json!({
+        "ServiceNamespace": namespace,
+        "ResourceId": resource_id,
+        "ScalableDimension": dimension,
+        "MinCapacity": min,
+        "MaxCapacity": max,
+        "TargetTrackingConfigurations": [{
+            "PredefinedScalingMetricSpecification": { "PredefinedScalingMetricType": metric },
+            "TargetValue": target
+        }]
+    })
+}
+
+/// The one-instruction plan body most tests start from.
+fn simple_instructions() -> Vec<Value> {
+    vec![instruction(
+        "autoscaling",
+        "autoScalingGroup/my-asg",
+        "autoscaling:autoScalingGroup:DesiredCapacity",
+        1,
+        10,
+        "ASGAverageCPUUtilization",
+        40.0,
+    )]
+}
+
+/// A CloudFormation-stack application source, distinct per `n`.
+fn stack_source(n: usize) -> Value {
+    json!({
+        "CloudFormationStackARN":
+            format!("arn:aws:cloudformation:us-east-1:000000000000:stack/s{n}/abc")
+    })
+}
+
+/// A plan the tests create: name, application source, instruction list.
+struct PlanCase {
+    label: &'static str,
+    name: &'static str,
+    source: Value,
+    instructions: Vec<Value>,
+}
+
+/// The table the round-trip test spans. Rows differ along the things the rule
+/// generalises over: the FORM of the application source (a CloudFormation stack vs a
+/// tag-filter set), the NUMBER of tag filters, the NUMBER of scaling instructions, the
+/// service namespace / scalable dimension each instruction names, the capacity values,
+/// and which optional instruction members are present.
+fn plan_cases() -> Vec<PlanCase> {
+    vec![
+        PlanCase {
+            label: "cloudformation stack, one autoscaling instruction",
+            name: "cfn-single",
+            source: stack_source(1),
+            instructions: simple_instructions(),
+        },
+        PlanCase {
+            label: "one tag filter, two instructions across two namespaces",
+            name: "tags-one-filter",
+            source: json!({ "TagFilters": [{ "Key": "env", "Values": ["prod"] }] }),
+            instructions: vec![
+                instruction(
+                    "ecs",
+                    "service/default/sample-webapp",
+                    "ecs:service:DesiredCount",
+                    2,
+                    20,
+                    "ECSServiceAverageCPUUtilization",
+                    55.5,
+                ),
+                instruction(
+                    "dynamodb",
+                    "table/my-table",
+                    "dynamodb:table:WriteCapacityUnits",
+                    5,
+                    500,
+                    "DynamoDBWriteCapacityUtilization",
+                    70.0,
+                ),
+            ],
+        },
+        PlanCase {
+            label: "three tag filters, three instructions",
+            name: "tags-three-filters",
+            source: json!({
+                "TagFilters": [
+                    { "Key": "env", "Values": ["prod", "staging"] },
+                    { "Key": "team", "Values": ["platform"] },
+                    { "Key": "tier", "Values": ["web", "api", "worker"] }
+                ]
+            }),
+            instructions: vec![
+                instruction(
+                    "dynamodb",
+                    "table/my-table/index/my-index",
+                    "dynamodb:index:ReadCapacityUnits",
+                    1,
+                    100,
+                    "DynamoDBReadCapacityUtilization",
+                    65.0,
+                ),
+                instruction(
+                    "ec2",
+                    "spot-fleet-request/sfr-73fbd2ce-aa30-494c-8788-1cee4EXAMPLE",
+                    "ec2:spot-fleet-request:TargetCapacity",
+                    3,
+                    30,
+                    "EC2SpotFleetRequestAverageCPUUtilization",
+                    45.0,
+                ),
+                instruction(
+                    "rds",
+                    "cluster:my-db-cluster",
+                    "rds:cluster:ReadReplicaCount",
+                    1,
+                    15,
+                    "RDSReaderAverageCPUUtilization",
+                    50.0,
+                ),
+            ],
+        },
+        PlanCase {
+            label: "stack source with every optional instruction member set",
+            name: "cfn-with-optionals",
+            source: stack_source(2),
+            instructions: vec![json!({
+                "ServiceNamespace": "autoscaling",
+                "ResourceId": "autoScalingGroup/predictive-asg",
+                "ScalableDimension": "autoscaling:autoScalingGroup:DesiredCapacity",
+                "MinCapacity": 4,
+                "MaxCapacity": 40,
+                "TargetTrackingConfigurations": [{
+                    "PredefinedScalingMetricSpecification": {
+                        "PredefinedScalingMetricType": "ASGAverageNetworkIn"
+                    },
+                    "TargetValue": 1000.0,
+                    "DisableScaleIn": true,
+                    "ScaleOutCooldown": 60,
+                    "ScaleInCooldown": 300,
+                    "EstimatedInstanceWarmup": 120
+                }],
+                "PredefinedLoadMetricSpecification": {
+                    "PredefinedLoadMetricType": "ASGTotalNetworkIn"
+                },
+                "ScheduledActionBufferTime": 600,
+                "PredictiveScalingMaxCapacityBehavior": "SetMaxCapacityToForecastCapacity",
+                "PredictiveScalingMode": "ForecastOnly",
+                "ScalingPolicyUpdateBehavior": "ReplaceExternalPolicies",
+                "DisableDynamicScaling": false
+            })],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_created_plan_is_read_back_exactly_as_created() {
+    for case in plan_cases() {
+        let emulator = Emulator::new();
+        let label = case.label;
+
+        let created = emulator
+            .ok(
+                "CreateScalingPlan",
+                json!({
+                    "ScalingPlanName": case.name,
+                    "ApplicationSource": case.source,
+                    "ScalingInstructions": case.instructions,
+                }),
+            )
+            .await;
+        assert_eq!(
+            created.get("ScalingPlanVersion"),
+            Some(&json!(1)),
+            "case {label:?}: CreateScalingPlan must answer version 1, got {created:?}"
+        );
+
+        emulator.make_all_due();
+
+        let described = emulator
+            .ok(
+                "DescribeScalingPlans",
+                json!({ "ScalingPlanNames": [case.name] }),
+            )
+            .await;
+        let plans = described
+            .get("ScalingPlans")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {label:?}: no ScalingPlans in {described:?}"));
+        assert_eq!(
+            plans.len(),
+            1,
+            "case {label:?}: expected exactly one plan, got {plans:?}"
+        );
+        let plan = &plans[0];
+        assert_eq!(
+            plan.get("ScalingPlanName"),
+            Some(&json!(case.name)),
+            "case {label:?}: wrong ScalingPlanName in {plan:?}"
+        );
+        assert_eq!(
+            plan.get("ScalingPlanVersion"),
+            Some(&json!(1)),
+            "case {label:?}: wrong ScalingPlanVersion in {plan:?}"
+        );
+        assert_eq!(
+            plan.get("ApplicationSource"),
+            Some(&case.source),
+            "case {label:?}: ApplicationSource did not round-trip, got {plan:?}"
+        );
+        assert_eq!(
+            plan.get("ScalingInstructions"),
+            Some(&Value::Array(case.instructions.clone())),
+            "case {label:?}: ScalingInstructions did not round-trip, got {plan:?}"
+        );
+        assert_eq!(
+            plan.get("StatusCode"),
+            Some(&json!("Active")),
+            "case {label:?}: expected StatusCode Active once the plan settled, got {plan:?}"
+        );
+        for member in ["CreationTime", "StatusStartTime"] {
+            let seconds = plan.get(member).and_then(Value::as_f64);
+            assert!(
+                seconds.is_some_and(|seconds| seconds > 0.0),
+                "case {label:?}: {member} must be a populated epoch timestamp, got {plan:?}"
+            );
+        }
+
+        // One ScalingPlanResource per stored instruction, in the stored order.
+        let resources = emulator
+            .ok(
+                "DescribeScalingPlanResources",
+                json!({ "ScalingPlanName": case.name, "ScalingPlanVersion": 1 }),
+            )
+            .await;
+        let resources = resources
+            .get("ScalingPlanResources")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {label:?}: no ScalingPlanResources in {resources:?}"))
+            .clone();
+        assert_eq!(
+            resources.len(),
+            case.instructions.len(),
+            "case {label:?}: expected one resource per instruction, got {resources:?}"
+        );
+        for (index, (resource, source_instruction)) in
+            resources.iter().zip(case.instructions.iter()).enumerate()
+        {
+            for member in ["ServiceNamespace", "ResourceId", "ScalableDimension"] {
+                assert_eq!(
+                    resource.get(member),
+                    source_instruction.get(member),
+                    "case {label:?} resource {index}: {member} must come from the instruction, \
+                     got {resource:?}"
+                );
+            }
+            assert_eq!(
+                resource.get("ScalingPlanName"),
+                Some(&json!(case.name)),
+                "case {label:?} resource {index}: wrong ScalingPlanName in {resource:?}"
+            );
+            assert_eq!(
+                resource.get("ScalingPlanVersion"),
+                Some(&json!(1)),
+                "case {label:?} resource {index}: wrong ScalingPlanVersion in {resource:?}"
+            );
+            assert_eq!(
+                resource.get("ScalingStatusCode"),
+                Some(&json!("Active")),
+                "case {label:?} resource {index}: expected ScalingStatusCode Active, \
+                 got {resource:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_mutating_call_leaves_a_transition_the_clock_owes() {
+    // The due instant is read out of state, not raced against: a mutating call must
+    // store a NON-ZERO span, so a caller acting straight afterwards still sees the
+    // transient status.
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "CreateScalingPlan",
+            json!({
+                "ScalingPlanName": "my-plan",
+                "ApplicationSource": stack_source(1),
+                "ScalingInstructions": simple_instructions(),
+            }),
+        )
+        .await;
+
+    for (label, status, outcome) in [
+        ("after CreateScalingPlan", "CreationInProgress", PendingOutcome::Active),
+        ("after UpdateScalingPlan", "UpdateInProgress", PendingOutcome::Active),
+        ("after DeleteScalingPlan", "DeletionInProgress", PendingOutcome::Removed),
+    ] {
+        let (stored_status, stored_outcome, span) = emulator.stored("my-plan");
+        assert_eq!(
+            stored_status, status,
+            "case {label}: wrong stored StatusCode"
+        );
+        assert_eq!(
+            stored_outcome,
+            Some(outcome),
+            "case {label}: wrong pending outcome"
+        );
+        let span = span.unwrap_or_else(|| panic!("case {label}: no pending transition stored"));
+        assert!(
+            (Duration::from_millis(250)..=Duration::from_millis(750)).contains(&span),
+            "case {label}: the owed transition must be due 250-750 ms out, got {span:?}"
+        );
+
+        // Move on to the next mutating call: settle this transition first, because a
+        // plan with one pending cannot be updated or deleted.
+        emulator.make_all_due();
+        match status {
+            "CreationInProgress" => {
+                emulator
+                    .ok(
+                        "UpdateScalingPlan",
+                        json!({ "ScalingPlanName": "my-plan", "ScalingPlanVersion": 1 }),
+                    )
+                    .await;
+            }
+            "UpdateInProgress" => {
+                emulator
+                    .ok(
+                        "DeleteScalingPlan",
+                        json!({ "ScalingPlanName": "my-plan", "ScalingPlanVersion": 1 }),
+                    )
+                    .await;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_plan_with_a_pending_transition_is_reported_but_not_mutated() {
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "CreateScalingPlan",
+            json!({
+                "ScalingPlanName": "my-plan",
+                "ApplicationSource": stack_source(1),
+                "ScalingInstructions": simple_instructions(),
+            }),
+        )
+        .await;
+
+    // Each row: the transient status, the ScalingStatusCode its resources report, and
+    // the call that puts the plan into it.
+    for (label, status, scaling_status) in [
+        ("being created", "CreationInProgress", "Inactive"),
+        ("being updated", "UpdateInProgress", "PartiallyActive"),
+        ("being deleted", "DeletionInProgress", "PartiallyActive"),
+    ] {
+        emulator.hold_pending("my-plan");
+
+        let described = emulator.ok("DescribeScalingPlans", json!({})).await;
+        assert_eq!(
+            described["ScalingPlans"][0]["StatusCode"],
+            json!(status),
+            "case {label}: wrong reported StatusCode in {described:?}"
+        );
+        let resources = emulator
+            .ok(
+                "DescribeScalingPlanResources",
+                json!({ "ScalingPlanName": "my-plan", "ScalingPlanVersion": 1 }),
+            )
+            .await;
+        assert_eq!(
+            resources["ScalingPlanResources"][0]["ScalingStatusCode"],
+            json!(scaling_status),
+            "case {label}: wrong reported ScalingStatusCode in {resources:?}"
+        );
+
+        // "You cannot update a scaling plan if it is in the process of being created,
+        // updated, or deleted."
+        for operation in ["UpdateScalingPlan", "DeleteScalingPlan"] {
+            let (code_status, code) = emulator
+                .err(
+                    operation,
+                    json!({ "ScalingPlanName": "my-plan", "ScalingPlanVersion": 1 }),
+                )
+                .await;
+            assert_eq!(
+                (code_status, code.as_str()),
+                (500, "ConcurrentUpdateException"),
+                "case {label}/{operation}: a pending transition must refuse the mutation"
+            );
+        }
+
+        emulator.make_all_due();
+        match status {
+            "CreationInProgress" => {
+                emulator
+                    .ok(
+                        "UpdateScalingPlan",
+                        json!({ "ScalingPlanName": "my-plan", "ScalingPlanVersion": 1 }),
+                    )
+                    .await;
+            }
+            "UpdateInProgress" => {
+                emulator
+                    .ok(
+                        "DeleteScalingPlan",
+                        json!({ "ScalingPlanName": "my-plan", "ScalingPlanVersion": 1 }),
+                    )
+                    .await;
+            }
+            _ => {}
+        }
+    }
+
+    // The deletion was made due above: the plan is gone, and stays gone.
+    let gone = emulator.ok("DescribeScalingPlans", json!({})).await;
+    assert_eq!(
+        gone.get("ScalingPlans"),
+        Some(&json!([])),
+        "a deleted plan must no longer be listed, got {gone:?}"
+    );
+    for operation in ["DeleteScalingPlan", "UpdateScalingPlan"] {
+        let (status, code) = emulator
+            .err(
+                operation,
+                json!({ "ScalingPlanName": "my-plan", "ScalingPlanVersion": 1 }),
+            )
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ObjectNotFoundException"),
+            "case {operation}: a plan that is gone must be ObjectNotFoundException"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_owed_transition_settles_on_its_own_wall_clock() {
+    // The one test that waits for the real span rather than moving the due instant:
+    // nothing but the clock turns a created plan Active.
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "CreateScalingPlan",
+            json!({
+                "ScalingPlanName": "my-plan",
+                "ApplicationSource": stack_source(1),
+                "ScalingInstructions": simple_instructions(),
+            }),
+        )
+        .await;
+
+    tokio::time::sleep(SETTLE_AFTER + Duration::from_millis(400)).await;
+
+    let described = emulator.ok("DescribeScalingPlans", json!({})).await;
+    assert_eq!(
+        described["ScalingPlans"][0]["StatusCode"],
+        json!("Active"),
+        "waiting past the settle span must leave the plan Active, got {described:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_update_replaces_only_what_the_request_carries() {
+    let emulator = Emulator::new();
+    let source = stack_source(1);
+    let other_source = json!({ "TagFilters": [{ "Key": "env", "Values": ["prod"] }] });
+    let original = instruction(
+        "autoscaling",
+        "autoScalingGroup/my-asg",
+        "autoscaling:autoScalingGroup:DesiredCapacity",
+        1,
+        10,
+        "ASGAverageCPUUtilization",
+        40.0,
+    );
+    let updated = instruction(
+        "autoscaling",
+        "autoScalingGroup/my-asg",
+        "autoscaling:autoScalingGroup:DesiredCapacity",
+        3,
+        30,
+        "ASGAverageCPUUtilization",
+        75.0,
+    );
+
+    // Rows: which members the update carries, and what each one leaves behind.
+    for (label, request_extras, expect_source, expect_instructions) in [
+        (
+            "instructions only",
+            json!({ "ScalingInstructions": [updated] }),
+            source.clone(),
+            json!([updated]),
+        ),
+        (
+            "application source only",
+            json!({ "ApplicationSource": other_source }),
+            other_source.clone(),
+            json!([updated]),
+        ),
+        (
+            "neither member",
+            json!({}),
+            other_source.clone(),
+            json!([updated]),
+        ),
+        (
+            "both members",
+            json!({ "ApplicationSource": source, "ScalingInstructions": [original] }),
+            source.clone(),
+            json!([original]),
+        ),
+    ] {
+        if label == "instructions only" {
+            emulator
+                .ok(
+                    "CreateScalingPlan",
+                    json!({
+                        "ScalingPlanName": "my-plan",
+                        "ApplicationSource": source,
+                        "ScalingInstructions": [original],
+                    }),
+                )
+                .await;
+            emulator.make_all_due();
+        }
+
+        let mut request = json!({ "ScalingPlanName": "my-plan", "ScalingPlanVersion": 1 });
+        for (member, value) in request_extras.as_object().expect("an object") {
+            request[member] = value.clone();
+        }
+        emulator.ok("UpdateScalingPlan", request).await;
+        emulator.make_all_due();
+
+        let described = emulator
+            .ok(
+                "DescribeScalingPlans",
+                json!({ "ScalingPlanNames": ["my-plan"] }),
+            )
+            .await;
+        let plan = &described["ScalingPlans"][0];
+        assert_eq!(
+            plan.get("ScalingInstructions"),
+            Some(&expect_instructions),
+            "case {label}: wrong ScalingInstructions after the update, got {plan:?}"
+        );
+        assert_eq!(
+            plan.get("ApplicationSource"),
+            Some(&expect_source),
+            "case {label}: wrong ApplicationSource after the update, got {plan:?}"
+        );
+        assert_eq!(
+            plan.get("StatusCode"),
+            Some(&json!("Active")),
+            "case {label}: the plan must be Active again once the update settled, got {plan:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_plan_or_version_is_never_an_empty_success() {
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "CreateScalingPlan",
+            json!({
+                "ScalingPlanName": "known",
+                "ApplicationSource": stack_source(1),
+                "ScalingInstructions": simple_instructions(),
+            }),
+        )
+        .await;
+    emulator.make_all_due();
+
+    // `DescribeScalingPlanResources` models no not-found error, so an unknown plan —
+    // or a version this service does not have — is a validation failure, never a 200.
+    for (label, name, version) in [
+        ("unknown name", "missing", 1),
+        ("known name, unmodelled version", "known", 2),
+    ] {
+        let (status, code) = emulator
+            .err(
+                "DescribeScalingPlanResources",
+                json!({ "ScalingPlanName": name, "ScalingPlanVersion": version }),
+            )
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {label}: expected a 400 ValidationException"
+        );
+    }
+
+    // The same two inputs on the mutating operations, which DO model a not-found error.
+    for operation in ["UpdateScalingPlan", "DeleteScalingPlan"] {
+        for (label, name, version) in [
+            ("unknown name", "missing", 1),
+            ("known name, unmodelled version", "known", 2),
+        ] {
+            let (status, code) = emulator
+                .err(
+                    operation,
+                    json!({ "ScalingPlanName": name, "ScalingPlanVersion": version }),
+                )
+                .await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "ObjectNotFoundException"),
+                "case {operation}/{label}: expected a 400 ObjectNotFoundException"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_name_or_an_application_source_is_claimed_by_exactly_one_plan() {
+    let emulator = Emulator::new();
+    let stack = stack_source(1);
+    let tagged = json!({ "TagFilters": [{ "Key": "env", "Values": ["prod"] }] });
+    for (name, source) in [("first", &stack), ("tagged", &tagged)] {
+        emulator
+            .ok(
+                "CreateScalingPlan",
+                json!({
+                    "ScalingPlanName": name,
+                    "ApplicationSource": source,
+                    "ScalingInstructions": simple_instructions(),
+                }),
+            )
+            .await;
+    }
+    emulator.make_all_due();
+
+    // Rows: the same name again; a new name over an already-covered stack; a new name
+    // over an already-covered tag set; and the three application-source shapes that
+    // name no single application.
+    for (label, name, source) in [
+        ("duplicate name", "first", stack.clone()),
+        ("duplicate stack source", "second", stack.clone()),
+        ("duplicate tag source", "third", tagged.clone()),
+        ("empty application source", "fourth", json!({})),
+        ("empty tag filter list", "fifth", json!({ "TagFilters": [] })),
+        (
+            "both a stack and tag filters",
+            "sixth",
+            json!({
+                "CloudFormationStackARN":
+                    "arn:aws:cloudformation:us-east-1:000000000000:stack/other/abc",
+                "TagFilters": [{ "Key": "env", "Values": ["dev"] }]
+            }),
+        ),
+    ] {
+        let (status, code) = emulator
+            .err(
+                "CreateScalingPlan",
+                json!({
+                    "ScalingPlanName": name,
+                    "ApplicationSource": source,
+                    "ScalingInstructions": simple_instructions(),
+                }),
+            )
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {label}: expected a 400 ValidationException"
+        );
+    }
+
+    // An update may not name a contradictory application source either.
+    let (status, code) = emulator
+        .err(
+            "UpdateScalingPlan",
+            json!({
+                "ScalingPlanName": "first",
+                "ScalingPlanVersion": 1,
+                "ApplicationSource": { "TagFilters": [] }
+            }),
+        )
+        .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (400, "ValidationException"),
+        "an update naming no application must be a 400 ValidationException"
+    );
+}
+
+#[tokio::test]
+async fn the_plan_store_is_bounded_by_the_per_account_quota() {
+    // The quota is the published bound of this store: exactly `MAX_SCALING_PLANS`
+    // creates succeed and the one past it is refused, so a caller cannot grow the
+    // store without limit.
+    let emulator = Emulator::new();
+    for n in 0..MAX_SCALING_PLANS {
+        emulator
+            .ok(
+                "CreateScalingPlan",
+                json!({
+                    "ScalingPlanName": format!("plan-{n}"),
+                    "ApplicationSource": stack_source(n),
+                    "ScalingInstructions": simple_instructions(),
+                }),
+            )
+            .await;
+    }
+    let (status, code) = emulator
+        .err(
+            "CreateScalingPlan",
+            json!({
+                "ScalingPlanName": "one-too-many",
+                "ApplicationSource": stack_source(MAX_SCALING_PLANS),
+                "ScalingInstructions": simple_instructions(),
+            }),
+        )
+        .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (400, "LimitExceededException"),
+        "the create past the quota must be a 400 LimitExceededException"
+    );
+
+    // Deleting one frees exactly one slot.
+    emulator.make_all_due();
+    emulator
+        .ok(
+            "DeleteScalingPlan",
+            json!({ "ScalingPlanName": "plan-0", "ScalingPlanVersion": 1 }),
+        )
+        .await;
+    emulator.make_all_due();
+    emulator
+        .ok(
+            "CreateScalingPlan",
+            json!({
+                "ScalingPlanName": "one-too-many",
+                "ApplicationSource": stack_source(MAX_SCALING_PLANS),
+                "ScalingInstructions": simple_instructions(),
+            }),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn both_describe_operations_page_and_refuse_a_token_they_did_not_mint() {
+    let emulator = Emulator::new();
+    // Five plans, each with as many instructions as its index, so one fixture pages
+    // over plans AND over the instructions of a single plan.
+    let names: Vec<String> = (1..=5).map(|n| format!("plan-{n}")).collect();
+    for (index, name) in names.iter().enumerate() {
+        let instructions: Vec<Value> = (0..=index)
+            .map(|i| {
+                instruction(
+                    "autoscaling",
+                    &format!("autoScalingGroup/asg-{index}-{i}"),
+                    "autoscaling:autoScalingGroup:DesiredCapacity",
+                    1,
+                    10,
+                    "ASGAverageCPUUtilization",
+                    40.0,
+                )
+            })
+            .collect();
+        emulator
+            .ok(
+                "CreateScalingPlan",
+                json!({
+                    "ScalingPlanName": name,
+                    "ApplicationSource": stack_source(index),
+                    "ScalingInstructions": instructions,
+                }),
+            )
+            .await;
+    }
+    emulator.make_all_due();
+
+    // Page over the plans two at a time and check the pages reassemble the whole set
+    // in the service's stable ordering.
+    let mut seen: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    for page in 0..10 {
+        let mut request = json!({ "MaxResults": 2 });
+        if let Some(token) = token.as_deref() {
+            request["NextToken"] = json!(token);
+        }
+        let body = emulator.ok("DescribeScalingPlans", request).await;
+        let plans = body["ScalingPlans"].as_array().cloned().unwrap_or_default();
+        assert!(
+            plans.len() <= 2,
+            "page {page}: MaxResults=2 must cap the page, got {plans:?}"
+        );
+        seen.extend(plans.iter().map(|plan| {
+            plan["ScalingPlanName"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        }));
+        token = body["NextToken"].as_str().map(ToString::to_string);
+        if token.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        seen, names,
+        "paging must reassemble every plan exactly once, in order"
+    );
+
+    // Page over the five instructions of `plan-5` one at a time.
+    let mut resource_ids: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    for page in 0..10 {
+        let mut request = json!({
+            "ScalingPlanName": "plan-5",
+            "ScalingPlanVersion": 1,
+            "MaxResults": MAX_RESULTS_MIN,
+        });
+        if let Some(token) = token.as_deref() {
+            request["NextToken"] = json!(token);
+        }
+        let body = emulator.ok("DescribeScalingPlanResources", request).await;
+        let resources = body["ScalingPlanResources"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            resources.len() <= 1,
+            "page {page}: MaxResults=1 must cap the page, got {resources:?}"
+        );
+        resource_ids.extend(
+            resources
+                .iter()
+                .map(|r| r["ResourceId"].as_str().unwrap_or_default().to_string()),
+        );
+        token = body["NextToken"].as_str().map(ToString::to_string);
+        if token.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        resource_ids,
+        (0..5)
+            .map(|i| format!("autoScalingGroup/asg-4-{i}"))
+            .collect::<Vec<_>>(),
+        "paging must reassemble every instruction of the plan exactly once, in order"
+    );
+
+    // The documented MaxResults range is 1..=50: each published bound is accepted and
+    // one past each is refused.
+    for (operation, base) in [
+        ("DescribeScalingPlans", json!({})),
+        (
+            "DescribeScalingPlanResources",
+            json!({ "ScalingPlanName": "plan-1", "ScalingPlanVersion": 1 }),
+        ),
+    ] {
+        for accepted in [MAX_RESULTS_MIN, MAX_RESULTS_MAX] {
+            let mut request = base.clone();
+            request["MaxResults"] = json!(accepted);
+            emulator.ok(operation, request).await;
+        }
+        for refused in [MAX_RESULTS_MIN - 1, MAX_RESULTS_MAX + 1] {
+            let mut request = base.clone();
+            request["MaxResults"] = json!(refused);
+            let (status, code) = emulator.err(operation, request).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "ValidationException"),
+                "case {operation} MaxResults={refused}: expected a 400 ValidationException"
+            );
+        }
+
+        // A token neither operation minted does not decode, whatever its shape.
+        for token in ["garbage", "", "0", "7a7a7a", "plans:plan-1"] {
+            let mut request = base.clone();
+            request["NextToken"] = json!(token);
+            let (status, code) = emulator.err(operation, request).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "InvalidNextTokenException"),
+                "case {operation} NextToken={token:?}: expected a 400 InvalidNextTokenException"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn describe_scaling_plans_honours_its_documented_filter_rules() {
+    let emulator = Emulator::new();
+    let stack = stack_source(1);
+    let tagged = json!({ "TagFilters": [{ "Key": "env", "Values": ["prod"] }] });
+    for (name, source) in [("by-stack", &stack), ("by-tags", &tagged)] {
+        emulator
+            .ok(
+                "CreateScalingPlan",
+                json!({
+                    "ScalingPlanName": name,
+                    "ApplicationSource": source,
+                    "ScalingInstructions": simple_instructions(),
+                }),
+            )
+            .await;
+    }
+    emulator.make_all_due();
+
+    // Filtering by application source selects exactly the plan created over it.
+    let by_source = emulator
+        .ok(
+            "DescribeScalingPlans",
+            json!({ "ApplicationSources": [tagged.clone()] }),
+        )
+        .await;
+    assert_eq!(
+        by_source["ScalingPlans"].as_array().map(|plans| plans
+            .iter()
+            .map(|plan| plan["ScalingPlanName"].clone())
+            .collect::<Vec<_>>()),
+        Some(vec![json!("by-tags")]),
+        "ApplicationSources must select only the plan over that source, got {by_source:?}"
+    );
+
+    // With no filter at all, every plan is returned.
+    let all = emulator.ok("DescribeScalingPlans", json!({})).await;
+    assert_eq!(
+        all["ScalingPlans"].as_array().map(Vec::len),
+        Some(2),
+        "an unfiltered DescribeScalingPlans returns every plan, got {all:?}"
+    );
+
+    // The documented combination rules, each refused with ValidationException.
+    let eleven: Vec<String> = (0..11).map(|n| format!("name-{n}")).collect();
+    for (label, request) in [
+        (
+            "names and sources together",
+            json!({ "ScalingPlanNames": ["by-stack"], "ApplicationSources": [stack] }),
+        ),
+        ("version without a name", json!({ "ScalingPlanVersion": 1 })),
+        ("more than ten names", json!({ "ScalingPlanNames": eleven })),
+        // An ApplicationSources entry that identifies no application must be refused,
+        // never dropped: dropping it would widen the filter to "every plan" and
+        // answer a narrow question with an unfiltered 200.
+        (
+            "an application source naming nothing",
+            json!({ "ApplicationSources": [{}] }),
+        ),
+        (
+            "an application source with an empty tag filter list",
+            json!({ "ApplicationSources": [{ "TagFilters": [] }] }),
+        ),
+        (
+            "an application source naming both a stack and tag filters",
+            json!({ "ApplicationSources": [{
+                "CloudFormationStackARN":
+                    "arn:aws:cloudformation:us-east-1:000000000000:stack/s/1",
+                "TagFilters": [{ "Key": "env", "Values": ["prod"] }]
+            }] }),
+        ),
+        (
+            "one usable source beside one that names nothing",
+            json!({ "ApplicationSources": [tagged, {}] }),
+        ),
+    ] {
+        let (status, code) = emulator.err("DescribeScalingPlans", request).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {label}: expected a 400 ValidationException"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_forecast_operation_is_still_an_honest_501() {
+    // `GetScalingPlanResourceForecastData` is out of this slice: it must keep saying
+    // "not written yet" rather than inventing forecast datapoints nothing computed.
+    let emulator = Emulator::new();
+    let (status, code) = emulator
+        .err(
+            "GetScalingPlanResourceForecastData",
+            json!({
+                "ScalingPlanName": "any",
+                "ScalingPlanVersion": 1,
+                "ServiceNamespace": "autoscaling",
+                "ResourceId": "autoScalingGroup/my-asg",
+                "ScalableDimension": "autoscaling:autoScalingGroup:DesiredCapacity",
+                "ForecastDataType": "CapacityForecast",
+                "StartTime": 1_760_000_000,
+                "EndTime": 1_760_003_600,
+            }),
+        )
+        .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (501, "NotImplemented"),
+        "an unimplemented operation must answer 501 NotImplemented"
+    );
+}

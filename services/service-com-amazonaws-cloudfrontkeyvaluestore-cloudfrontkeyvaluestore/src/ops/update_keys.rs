@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies a whole batch of puts and deletes under ONE `If-Match` check and ONE new
+//! version. The batch is collapsed into one pending change per key (deletes first, then
+//! puts, so a key named by both ends up holding the value the batch puts), its result is
+//! projected against the store's quotas with lookups only — the existing map is never
+//! copied — and only then applied, which is infallible. So either the entire batch lands
+//! or none of it does, and the store answers a single new `ETag` for the whole update.
+//!
+//! A batch longer than the pairs a store may hold, or one whose result would take the
+//! store past the quotas in [`crate::state`], is refused with the modelled
+//! `ServiceQuotaExceededException` before anything is staged or written. The `If-Match`
+//! comparison happens against a READ-ONLY resolution of the store, so a refused request
+//! does not even materialise its record.
+//!
+//! ## Authorization is not modelled
+//!
+//! The emulator verifies request signatures, but no key value store resource policy is
+//! stored anywhere, so the modelled `AccessDeniedException` (403) is never produced by
+//! this operation. That is a deliberate partial implementation, not an oversight: do
+//! not write a test that depends on a 403 from here.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +165,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateKeys"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // Refuse an over-long batch BEFORE anything is allocated for it. A batch naming
+        // more pairs than one store may hold can never succeed, so this bound refuses
+        // nothing a caller could legitimately send.
+        let batch_len = input.puts.as_ref().map_or(0, Vec::len)
+            + input.deletes.as_ref().map_or(0, Vec::len);
+        if batch_len > crate::state::MAX_ITEMS_PER_STORE {
+            return Err(UpdateKeysErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the batch names {batch_len} keys, past the {} a Key Value Store may hold",
+                        crate::state::MAX_ITEMS_PER_STORE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateKeysErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the key value store state is unavailable".to_string()),
+            })
+        })?;
+        let mut guard = state.lock();
+
+        // Resolve the store READ-ONLY first and compare `If-Match` against its current
+        // version — the initial version when no record is held yet — so a request
+        // refused here mutates nothing at all, not even the store map.
+        let current_version = match guard.store(&input.kvs_arn) {
+            Err(_) => {
+                return Err(UpdateKeysErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "'{}' is not the ARN of a CloudFront key value store",
+                            input.kvs_arn
+                        )),
+                    },
+                )
+                .into())
+            }
+            Ok(Some(store)) => store.etag.clone(),
+            Ok(None) => crate::state::initial_etag(&input.kvs_arn),
+        };
+        // The ONE concurrency check that guards the whole batch, before any write.
+        if input.if_match != current_version {
+            return Err(UpdateKeysErrorModeled::ConflictException(ConflictException {
+                message: Some(
+                    "the If-Match version does not match the current version of the Key Value Store"
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
+        let store = guard
+            .store_mut(&input.kvs_arn, now)
+            .map_err(|error| match error {
+                crate::state::StoreError::NotAKeyValueStoreArn => {
+                    UpdateKeysErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                        message: Some(format!(
+                            "'{}' is not the ARN of a CloudFront key value store",
+                            input.kvs_arn
+                        )),
+                    })
+                }
+                crate::state::StoreError::StoreLimitReached => {
+                    UpdateKeysErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(format!(
+                                "this emulator holds at most {} key value stores",
+                                crate::state::MAX_STORES
+                            )),
+                        },
+                    )
+                }
+            })?;
+
+        // Collapse the batch into one pending change per key: deletes first, then puts,
+        // so a key named by both ends up holding the value the batch puts.
+        let mut changes = crate::state::PendingChanges::new();
+        for delete in input.deletes.iter().flatten() {
+            changes.insert(delete.key.as_str(), None);
+        }
+        for put in input.puts.iter().flatten() {
+            changes.insert(put.key.as_str(), Some(put.value.as_str()));
+        }
+
+        // All-or-nothing: the quota is checked against the PROJECTED result, so nothing
+        // can fail once `apply` starts.
+        let (next_count, next_bytes) = store.projected_after(&changes);
+        if !crate::state::within_quota(next_count, next_bytes) {
+            return Err(UpdateKeysErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the batch would take the Key Value Store to {next_count} items and \
+                         {next_bytes} bytes, past its quota of {} items and {} bytes",
+                        crate::state::MAX_ITEMS_PER_STORE,
+                        crate::state::MAX_STORE_BYTES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.apply(&changes);
+        store.commit(now);
+        let output = UpdateKeysOutput {
+            item_count: store.item_count(),
+            total_size_in_bytes: store.total_size_in_bytes(),
+            e_tag: store.etag.clone(),
+        };
+        // Attribution for the accepted mutation: the ARN, the batch size, the resulting
+        // counts and the new version — never a value, which the model marks @sensitive.
+        ::tracing::debug!(
+            kvs_arn = %input.kvs_arn,
+            batch_len,
+            item_count = output.item_count,
+            total_size_in_bytes = output.total_size_in_bytes,
+            etag = %output.e_tag,
+            "UpdateKeys applied"
+        );
+        Ok(output)
     }
 }

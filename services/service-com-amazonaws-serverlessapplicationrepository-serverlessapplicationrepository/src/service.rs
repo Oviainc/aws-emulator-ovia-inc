@@ -96,17 +96,36 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // This service words both framework refusals as the errors its own model
+        // declares, so a client branches on the code it would see from AWS rather than
+        // on the framework's generic `ValidationException`:
+        //
+        // * a member the model requires that is absent, or a value outside a declared
+        //   bound (`MaxItems`' `range 1..100` on both list operations), is
+        //   `BadRequestException` — "One of the parameters in the request is invalid"
+        //   (HTTP 400, which the protocol keeps);
+        // * an unverified caller is `ForbiddenException` — "The client is not
+        //   authenticated" (HTTP 403).
+        //
+        // Both the code and the message are replaced together: a client branches on the
+        // code, so a message without its matching code is worse than leaving both alone.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "BadRequestException".to_string(),
+                message: violations
+                    .iter()
+                    .map(smithy_server_runtime::Violation::message)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            }),
+            Refusal::Unauthenticated => Some(Refused {
+                code: "ForbiddenException".to_string(),
+                message: "The client is not authenticated.".to_string(),
+            }),
+            // Non-exhaustive: a refusal class added later keeps the framework's wording
+            // until this service words it.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
