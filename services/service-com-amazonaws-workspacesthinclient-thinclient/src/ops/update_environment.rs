@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the persisted environment: the members the request carries are written, the
+//! members it omits keep their stored values, and `updatedAt` moves forward.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +163,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEnvironment"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateEnvironmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the thinclient environment store is unavailable".to_string()),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // A new `desktopArn` carries a new `desktopType`, derived the same way
+        // `CreateEnvironment` derives it, so the two can never disagree.
+        let desktop_type = match input.desktop_arn.as_deref() {
+            None => None,
+            Some(desktop_arn) => match crate::state::desktop_type_from_desktop_arn(desktop_arn) {
+                Some(desktop_type) => Some(desktop_type),
+                None => {
+                    return Err(UpdateEnvironmentErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "desktopArn must name a desktop of one of {DESKTOP_TYPE_VALUES:?}; \
+                                 '{desktop_arn}' names none of them"
+                            )),
+                            reason: Some("fieldValidationFailed".to_string()),
+                            field_list: Some(vec![ValidationExceptionField {
+                                name: "desktopArn".to_string(),
+                                message: format!(
+                                    "the ARN's service must be one of {DESKTOP_TYPE_VALUES:?}"
+                                ),
+                            }]),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let mut guard = state.lock();
+        let store = &mut *guard;
+        let Some(environment) = store.environments.get_mut(&input.id) else {
+            return Err(UpdateEnvironmentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("environment '{}' was not found", input.id)),
+                    resource_id: Some(input.id.clone()),
+                    resource_type: Some(crate::state::ENVIRONMENT_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        };
+        // Issued after the record is found, so a 404 does not move the store's
+        // clock. A free function over the one field it advances, so it does not
+        // need the store while `environment` borrows it.
+        let now = crate::state::issue_timestamp_millis(&mut store.last_timestamp_millis);
+
+        if let Some(name) = input.name {
+            environment.name = Some(name);
+        }
+        if let Some(desktop_arn) = input.desktop_arn {
+            environment.desktop_arn = desktop_arn;
+        }
+        if let Some(desktop_type) = desktop_type {
+            environment.desktop_type = desktop_type.to_string();
+        }
+        if let Some(desktop_endpoint) = input.desktop_endpoint {
+            environment.desktop_endpoint = Some(desktop_endpoint);
+        }
+        if let Some(schedule) = input.software_set_update_schedule {
+            environment.software_set_update_schedule = Some(schedule);
+        }
+        if let Some(window) = input.maintenance_window {
+            environment.maintenance_window = Some(window);
+        }
+        if let Some(mode) = input.software_set_update_mode {
+            environment.software_set_update_mode = Some(mode);
+        }
+        if let Some(desired) = input.desired_software_set_id {
+            environment.desired_software_set_id = Some(desired);
+        }
+        if let Some(device_creation_tags) = input.device_creation_tags {
+            environment.device_creation_tags = device_creation_tags;
+        }
+        environment.updated_at_millis = now;
+
+        Ok(UpdateEnvironmentOutput {
+            environment: Some(environment.to_summary()),
+        })
     }
 }
