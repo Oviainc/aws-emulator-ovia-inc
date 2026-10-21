@@ -1,11 +1,476 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-databrew-awsgluedatabrew service.
+//!
+//! DataBrew addresses datasets and jobs by NAME (scoped to the caller's
+//! account/region), and a job run by its job's name plus the minted run id, so the
+//! maps below are keyed exactly that way. Everything an operation answers with is
+//! computed from these records — the handlers hold no state of their own.
+//!
+//! Besides the records this module carries the few derivations several handlers
+//! share (the caller's principal and region, a resource ARN, the `Source` a stored
+//! `Input` implies, name validation and page tokens). They live here rather than in
+//! one operation's file because `src/lib.rs` is generated and cannot declare another
+//! module, and because every one of them is a property of the stored record.
+
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
+use std::time::{Duration, SystemTime};
+
+use crate::ops::types::{Dataset, FormatOptions, Input, JobRun, Output, PathOptions, RecipeReference};
+
+/// The region an ARN carries when the request's SigV4 scope names none.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// `MaxResults100`'s modelled maximum, used as the page size when a request asks
+/// for none (model: `ListDatasets`/`ListJobRuns` `maxResults` range 1..100).
+pub const MAX_PAGE_SIZE: i32 = 100;
+
+/// The most datasets this emulator retains for one account/region.
+///
+/// Every create is a growth site a caller drives, so the store carries an explicit
+/// ceiling: past it the create is REFUSED with the modelled
+/// `ServiceQuotaExceededException` (the error AWS answers a quota with) rather than
+/// inserting, so emulator memory cannot be grown without bound.
+pub const MAX_DATASETS: usize = 1_000;
+
+/// The most jobs this emulator retains, for the reason [`MAX_DATASETS`] gives.
+pub const MAX_JOBS: usize = 1_000;
+
+/// The most runs this emulator retains for one job. `StartJobRun` inserts a record
+/// on every call and a run has no name of its own to collide on, so retention is
+/// bounded by EVICTING the oldest run of the job rather than by refusing the start:
+/// a run history is a rolling window, and the newest runs are the ones a caller
+/// polls.
+pub const MAX_RUNS_PER_JOB: usize = 100;
+
+/// The most runs this emulator retains across every job, evicted oldest-first for
+/// the reason [`MAX_RUNS_PER_JOB`] gives.
+pub const MAX_JOB_RUNS: usize = 10_000;
+
+/// How long after `StartJobRun` a run's `STARTING -> RUNNING` transition falls due.
+///
+/// A DataBrew run is returned in a non-terminal state and reaches a terminal one on
+/// its own, so the emulator owes the transition to the clock rather than to a later
+/// call. The span is chosen (AWS publishes no duration for it) and deliberately
+/// non-zero, so a caller that describes the run straight after starting it still
+/// observes `STARTING`.
+const RUN_RUNNING_DUE_AFTER: Duration = Duration::from_millis(300);
+
+/// How long after `StartJobRun` a run's terminal `SUCCEEDED` transition falls due.
+/// Chosen for the same reason as [`RUN_RUNNING_DUE_AFTER`].
+const RUN_TERMINAL_DUE_AFTER: Duration = Duration::from_millis(600);
+
+/// A stored DataBrew dataset. `Source`, the ARN and every `*By`/`*Date` member are
+/// server-derived at create time, never client-supplied.
+#[derive(Debug, Clone)]
+pub struct DatasetRecord {
+    pub name: String,
+    pub format: Option<String>,
+    pub format_options: Option<FormatOptions>,
+    pub input: Input,
+    pub path_options: Option<PathOptions>,
+    pub source: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    pub resource_arn: String,
+    pub create_date: SystemTime,
+    pub created_by: String,
+    pub last_modified_date: SystemTime,
+    pub last_modified_by: String,
+}
+
+/// A stored DataBrew job. `job_type` is the modelled `JobType` (`RECIPE` for a job
+/// created by `CreateRecipeJob`, `PROFILE` by `CreateProfileJob`).
+#[derive(Debug, Clone)]
+pub struct JobRecord {
+    pub name: String,
+    pub job_type: String,
+    pub dataset_name: Option<String>,
+    pub project_name: Option<String>,
+    pub recipe_reference: Option<RecipeReference>,
+    pub outputs: Vec<Output>,
+    pub role_arn: String,
+    pub max_capacity: i32,
+    pub max_retries: i32,
+    pub timeout: i32,
+    pub encryption_mode: Option<String>,
+    pub encryption_key_arn: Option<String>,
+    pub log_subscription: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    pub resource_arn: String,
+    pub create_date: SystemTime,
+    pub created_by: String,
+    pub last_modified_date: SystemTime,
+    pub last_modified_by: String,
+}
+
+/// A stored run of a job: what `StartJobRun` minted plus the job's shape copied at
+/// start time, so the run still reports what it ran with after the job changes.
+#[derive(Debug, Clone)]
+pub struct JobRunRecord {
+    pub run_id: String,
+    pub job_name: String,
+    pub dataset_name: Option<String>,
+    pub state: String,
+    pub attempt: i32,
+    pub execution_time: i32,
+    pub started_on: SystemTime,
+    pub started_by: String,
+    pub completed_on: Option<SystemTime>,
+    pub error_message: Option<String>,
+    pub outputs: Vec<Output>,
+    pub recipe_reference: Option<RecipeReference>,
+    pub log_subscription: Option<String>,
+    pub log_group_name: Option<String>,
+}
 
 /// Per-service state for com-amazonaws-databrew-awsgluedatabrew. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsDatabrewAwsgluedatabrewState {
-    // TODO: add service-specific state fields
+    /// Datasets by `Name`.
+    pub datasets: BTreeMap<String, DatasetRecord>,
+    /// Recipe and profile jobs by `Name`.
+    pub jobs: BTreeMap<String, JobRecord>,
+    /// Job runs by `(JobName, RunId)`, so one job's runs are a contiguous range.
+    pub job_runs: BTreeMap<(String, String), JobRunRecord>,
+    /// Monotonic source of the `RunId` values stored in `job_runs`.
+    pub next_run_seq: u64,
+}
+
+impl ComAmazonawsDatabrewAwsgluedatabrewState {
+    /// Mint the next run id. Monotonic and unique within this emulator, and the id
+    /// the run is stored under, so a `DescribeJobRun` with it resolves.
+    pub fn mint_run_id(&mut self) -> String {
+        self.next_run_seq += 1;
+        format!("db_{:024}", self.next_run_seq)
+    }
+
+    /// Store a run, then evict the oldest runs over [`MAX_RUNS_PER_JOB`] for its job
+    /// and over [`MAX_JOB_RUNS`] in total, so a caller that keeps starting runs grows
+    /// the store to a fixed ceiling and no further.
+    ///
+    /// Run ids are minted monotonically and zero-padded, so the LOWEST id of a job is
+    /// its oldest run and the lowest id overall is the oldest run held.
+    pub fn record_run(&mut self, record: JobRunRecord) {
+        let job_name = record.job_name.clone();
+        self.job_runs
+            .insert((job_name.clone(), record.run_id.clone()), record);
+
+        while self.runs_held_for(&job_name) > MAX_RUNS_PER_JOB {
+            let Some(oldest) = self.oldest_run_of(&job_name) else {
+                break;
+            };
+            self.job_runs.remove(&oldest);
+        }
+        while self.job_runs.len() > MAX_JOB_RUNS {
+            let Some(oldest) = self
+                .job_runs
+                .keys()
+                .min_by(|left, right| left.1.cmp(&right.1))
+                .cloned()
+            else {
+                break;
+            };
+            self.job_runs.remove(&oldest);
+        }
+    }
+
+    /// How many runs of `job_name` the store holds.
+    fn runs_held_for(&self, job_name: &str) -> usize {
+        self.job_runs.keys().filter(|key| key.0 == job_name).count()
+    }
+
+    /// The key of the oldest retained run of `job_name`; the map is ordered by
+    /// `(JobName, RunId)`, so that is the first key of the job's range.
+    fn oldest_run_of(&self, job_name: &str) -> Option<(String, String)> {
+        self.job_runs
+            .keys()
+            .find(|key| key.0 == job_name)
+            .cloned()
+    }
+
+    /// One page of the runs of `job_name`, in run-id order, materialising the
+    /// transitions the clock already owed the runs ON THIS PAGE.
+    ///
+    /// A reporting operation may materialise a transition the clock already made due
+    /// — it was owed at this instant whether or not anybody called. The walk is a
+    /// `BTreeMap` range that stops at the end of the page, so neither the work nor
+    /// the allocation is sized by the store.
+    pub fn page_runs_of_job(
+        &mut self,
+        job_name: &str,
+        resume_after: Option<&str>,
+        page_size: usize,
+        now: SystemTime,
+    ) -> Page<JobRun> {
+        let lower = match resume_after {
+            Some(run_id) => Bound::Excluded((job_name.to_string(), run_id.to_string())),
+            None => Bound::Included((job_name.to_string(), String::new())),
+        };
+
+        let mut items = Vec::new();
+        let mut last_key: Option<String> = None;
+        let mut more = false;
+        for (key, run) in self.job_runs.range_mut((lower, Bound::Unbounded)) {
+            // The key orders every run of one job before the next job's, so the
+            // first key of another job ends this job's range.
+            if key.0 != job_name {
+                break;
+            }
+            if items.len() == page_size {
+                more = true;
+                break;
+            }
+            run.advance_to(now);
+            items.push(run.to_wire());
+            last_key = Some(key.1.clone());
+        }
+
+        Page {
+            items,
+            next_token: match (more, last_key) {
+                (true, Some(key)) => Some(encode_page_token(&key)),
+                _ => None,
+            },
+        }
+    }
+}
+
+impl DatasetRecord {
+    /// This record as the modelled `Dataset` that `ListDatasets` returns.
+    pub fn to_wire(&self) -> Dataset {
+        Dataset {
+            account_id: Some(::engine::emulator_account_id().to_string()),
+            created_by: Some(self.created_by.clone()),
+            create_date: Some(wire_date(self.create_date)),
+            name: self.name.clone(),
+            format: self.format.clone(),
+            format_options: self.format_options.clone(),
+            input: self.input.clone(),
+            last_modified_date: Some(wire_date(self.last_modified_date)),
+            last_modified_by: Some(self.last_modified_by.clone()),
+            source: self.source.clone(),
+            path_options: self.path_options.clone(),
+            tags: wire_tags(&self.tags),
+            resource_arn: Some(self.resource_arn.clone()),
+        }
+    }
+}
+
+impl JobRunRecord {
+    /// Materialise the transitions the clock owes this run by `now`.
+    ///
+    /// `ExecutionTime` is the whole seconds the run consumed (model:
+    /// "The amount of time, in seconds, during which the job run consumed
+    /// resources"), measured from `StartedOn` to the instant the run completed.
+    pub fn advance_to(&mut self, now: SystemTime) {
+        if self.state == "STARTING" && now >= self.started_on + RUN_RUNNING_DUE_AFTER {
+            self.state = "RUNNING".to_string();
+        }
+        if self.state == "RUNNING" && now >= self.started_on + RUN_TERMINAL_DUE_AFTER {
+            let completed_on = self.started_on + RUN_TERMINAL_DUE_AFTER;
+            self.state = "SUCCEEDED".to_string();
+            self.completed_on = Some(completed_on);
+            self.execution_time = completed_on
+                .duration_since(self.started_on)
+                .unwrap_or_default()
+                .as_secs()
+                .min(i32::MAX as u64) as i32;
+        }
+    }
+
+    /// This record as the modelled `JobRun` that `ListJobRuns` returns.
+    pub fn to_wire(&self) -> JobRun {
+        JobRun {
+            attempt: self.attempt,
+            completed_on: self.completed_on.map(wire_date),
+            dataset_name: self.dataset_name.clone(),
+            error_message: self.error_message.clone(),
+            execution_time: self.execution_time,
+            job_name: Some(self.job_name.clone()),
+            run_id: Some(self.run_id.clone()),
+            state: Some(self.state.clone()),
+            log_subscription: self.log_subscription.clone(),
+            log_group_name: self.log_group_name.clone(),
+            outputs: wire_list(&self.outputs),
+            data_catalog_outputs: None,
+            database_outputs: None,
+            recipe_reference: self.recipe_reference.clone(),
+            started_by: Some(self.started_by.clone()),
+            started_on: Some(wire_date(self.started_on)),
+            job_sample: None,
+            validation_configurations: None,
+        }
+    }
+}
+
+/// An instant as the modelled `Date` timestamp.
+pub fn wire_date(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    let since_epoch = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
+}
+
+/// A stored tag map as the modelled `TagMap`: absent rather than empty, because
+/// `TagMap` is `len 1..200` and an untagged resource carries no map at all.
+pub fn wire_tags(tags: &BTreeMap<String, String>) -> Option<HashMap<String, String>> {
+    if tags.is_empty() {
+        None
+    } else {
+        Some(tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
+}
+
+/// A stored list as a modelled `len 1..` list member: absent rather than empty.
+pub fn wire_list<T: Clone>(items: &[T]) -> Option<Vec<T>> {
+    if items.is_empty() {
+        None
+    } else {
+        Some(items.to_vec())
+    }
+}
+
+/// The modelled `TagMap` as stored tags.
+pub fn stored_tags(tags: Option<&HashMap<String, String>>) -> BTreeMap<String, String> {
+    tags.map(|tags| tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default()
+}
+
+/// The region this request is scoped to: the one its SigV4 credential scope names,
+/// else [`DEFAULT_REGION`].
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The principal that made this request, as the ARN DataBrew reports in
+/// `CreatedBy`/`LastModifiedBy`/`StartedBy`. Server-derived from the caller's
+/// credentials — never read from the request body.
+pub fn request_principal(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+    ::engine::emulator_arn("iam", "", &format!("user/{akid}"))
+}
+
+/// The ARN of a DataBrew resource of `kind` (`dataset`, `job`, `recipe`, ...).
+pub fn resource_arn(region: &str, kind: &str, name: &str) -> String {
+    ::engine::emulator_arn("databrew", region, &format!("{kind}/{name}"))
+}
+
+/// The CloudWatch log group a job's runs log to, when the job subscribes to logs.
+pub fn log_group_name(job_name: &str) -> String {
+    format!("/aws-glue-databrew/jobs-{job_name}")
+}
+
+/// The `Source` a stored `Input` implies: which of the three input definitions it
+/// carries (model: `Source` is one of `S3`, `DATA-CATALOG`, `DATABASE`). `None`
+/// when the input carries none of them, which is not a dataset DataBrew can read.
+pub fn source_of(input: &Input) -> Option<&'static str> {
+    if input.s3_input_definition.is_some() {
+        Some("S3")
+    } else if input.data_catalog_input_definition.is_some() {
+        Some("DATA-CATALOG")
+    } else if input.database_input_definition.is_some() {
+        Some("DATABASE")
+    } else {
+        None
+    }
+}
+
+/// Refuse a name outside the character set DataBrew documents for it: "Valid
+/// characters are alphanumeric (A-Z, a-z, 0-9), hyphen (-), period (.), and space"
+/// (model: `CreateDatasetRequest$Name`, `CreateRecipeJobRequest$Name`). A name of
+/// nothing but spaces names no resource, so it is refused too.
+///
+/// `Err` carries the message of the `ValidationException` to answer with; the
+/// modelled length bounds are already enforced before a handler runs.
+pub fn validate_resource_name(member: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{member} must not be blank"));
+    }
+    match value
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '.' || *c == ' '))
+    {
+        Some(bad) => Err(format!(
+            "{member} contains the invalid character '{bad}': valid characters are \
+             alphanumeric (A-Z, a-z, 0-9), hyphen (-), period (.), and space"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// One page of a listing, and the token that resumes after it.
+#[derive(Debug, Clone)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_token: Option<String>,
+}
+
+/// Page `map` (a name-keyed store) from `resume_after` onwards, WITHOUT
+/// materialising it: the walk is a `BTreeMap` range that starts after the token's
+/// key and stops at the end of the page, so neither the work nor the allocation is
+/// sized by the store. `to_item` converts only the entries on this page.
+///
+/// The returned token is opaque and names where this page ENDED, so the next call
+/// resumes at the following entry rather than restarting.
+pub fn page_map<V, T>(
+    map: &BTreeMap<String, V>,
+    resume_after: Option<&str>,
+    page_size: usize,
+    to_item: impl Fn(&V) -> T,
+) -> Page<T> {
+    let lower = match resume_after {
+        Some(key) => Bound::Excluded(key.to_string()),
+        None => Bound::Unbounded,
+    };
+
+    let mut entries = map.range((lower, Bound::Unbounded));
+    let mut items = Vec::new();
+    let mut last_key: Option<String> = None;
+    for (key, value) in entries.by_ref().take(page_size) {
+        items.push(to_item(value));
+        last_key = Some(key.clone());
+    }
+
+    Page {
+        items,
+        next_token: match (entries.next().is_some(), last_key) {
+            (true, Some(key)) => Some(encode_page_token(&key)),
+            _ => None,
+        },
+    }
+}
+
+/// The page size to serve a request that asked for `max_results`, clamped
+/// server-side to the modelled 1..100 so a caller cannot ask for an unbounded page.
+pub fn page_size(max_results: Option<i32>) -> usize {
+    max_results.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE) as usize
+}
+
+/// The key a request's `nextToken` resumes after, or the `ValidationException`
+/// message to answer with for a token this service did not mint.
+pub fn page_resume_after(next_token: Option<&str>) -> Result<Option<String>, String> {
+    match next_token {
+        Some(token) => decode_page_token(token).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The opaque pagination token naming the last key of a page.
+fn encode_page_token(key: &str) -> String {
+    hex::encode(key.as_bytes())
+}
+
+/// The key an opaque pagination token names, or the `ValidationException` message
+/// for a token this service did not mint.
+fn decode_page_token(token: &str) -> Result<String, String> {
+    hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(|| "The nextToken is not a token this service issued".to_string())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

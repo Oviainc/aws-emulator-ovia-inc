@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeJobRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeJobRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeJobRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers from the run `StartJobRun` persisted, after materialising the
+//! `STARTING -> RUNNING -> SUCCEEDED` transitions the clock already owed it — a
+//! change that was due at this instant whether or not anybody described the run.
+//! Every member comes from the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -118,9 +114,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-databrew-awsgluedatabre
 // here — hence the `DescribeJobRunError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.databrew#DescribeJobRun")]
+// `InternalServerException` (HTTP 500) is widened in: the service models it, this
+// operation does not list it, and it is the only honest answer for an engine that
+// holds no state — a mounting fault, never a client error.
+#[smithy_macros::operation_error(
+    "com.amazonaws.databrew#DescribeJobRun",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DescribeJobRunErrorModeled {
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
 }
@@ -174,20 +177,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeJobRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeJobRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeJobRun"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeJobRunErrorModeled::InternalServerException(InternalServerException {
+                message: Some("DataBrew is mounted on an engine that holds no state".to_string()),
+            })
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(run) = store
+            .job_runs
+            .get_mut(&(input.name.clone(), input.run_id.clone()))
+        else {
+            return Err(DescribeJobRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "One or more resources can't be found. The job run {} of job {} was not found.",
+                        input.run_id, input.name
+                    )),
+                },
+            )
+            .into());
+        };
+        run.advance_to(now);
+
+        Ok(DescribeJobRunOutput {
+            attempt: run.attempt,
+            completed_on: run.completed_on.map(crate::state::wire_date),
+            dataset_name: run.dataset_name.clone(),
+            error_message: run.error_message.clone(),
+            execution_time: run.execution_time,
+            job_name: run.job_name.clone(),
+            profile_configuration: None,
+            validation_configurations: None,
+            run_id: Some(run.run_id.clone()),
+            state: Some(run.state.clone()),
+            log_subscription: run.log_subscription.clone(),
+            log_group_name: run.log_group_name.clone(),
+            outputs: crate::state::wire_list(&run.outputs),
+            data_catalog_outputs: None,
+            database_outputs: None,
+            recipe_reference: run.recipe_reference.clone(),
+            started_by: Some(run.started_by.clone()),
+            started_on: Some(crate::state::wire_date(run.started_on)),
+            job_sample: None,
+        })
     }
 }
