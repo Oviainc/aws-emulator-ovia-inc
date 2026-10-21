@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEnvironmentTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEnvironmentTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEnvironmentTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers a new environment template under its name and answers with the record it
+//! stored; the name is the template's identity, so a second create of the same name is
+//! a `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +165,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEnvironmentTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEnvironmentTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEnvironmentTemplate"))
+        // `name`'s length and pattern, and the bounds on `displayName`, `description`
+        // and `encryptionKey`, are modelled constraints the centralized walk already
+        // refused, so reaching here means they hold. The `Provisioning` enum is the one
+        // input value left to check before anything is stored.
+        if let Some(provisioning) = input.provisioning.as_deref() {
+            if provisioning != crate::state::PROVISIONING_CUSTOMER_MANAGED {
+                return Err(CreateEnvironmentTemplateErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "provisioning must be one of [{}], got {provisioning}",
+                            crate::state::PROVISIONING_CUSTOMER_MANAGED
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateEnvironmentTemplateErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Proton store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        if state.environment_templates.contains_key(&input.name) {
+            return Err(CreateEnvironmentTemplateErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!("Environment template {} already exists", input.name),
+                },
+            )
+            .into());
+        }
+
+        if state.environment_templates.len() >= crate::state::MAX_ENVIRONMENT_TEMPLATES {
+            return Err(
+                CreateEnvironmentTemplateErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The number of environment templates has reached the quota of {}",
+                            crate::state::MAX_ENVIRONMENT_TEMPLATES
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = crate::state::EnvironmentTemplateRecord {
+            name: input.name.clone(),
+            arn: crate::state::environment_template_arn(&region, &input.name),
+            created_at: now,
+            last_modified_at: now,
+            display_name: input.display_name,
+            description: input.description,
+            encryption_key: input.encryption_key,
+            provisioning: input.provisioning,
+            // A template has a recommended version only once one is published, and
+            // `CreateEnvironmentTemplateVersion` is what publishes it.
+            recommended_version: None,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| (tag.key, tag.value))
+                .collect(),
+        };
+        let environment_template = record.view();
+        state.environment_templates.insert(input.name, record);
+
+        Ok(CreateEnvironmentTemplateOutput {
+            environment_template,
+        })
     }
 }
