@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a channel under its parent space and PERSISTS it there: the response carries
+//! only the generated `channelId`, so `GetChannel` answers from the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +150,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChannel"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateChannelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the repostspace emulator is mounted on an engine that holds \
+                              no state"
+                        .to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        let Some(space) = guard.space_mut(&input.space_id) else {
+            return Err(CreateChannelErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Space {} was not found", input.space_id),
+                    resource_id: input.space_id.clone(),
+                    resource_type: crate::state::SPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A channel name identifies the channel inside its space.
+        if let Some(existing) = space
+            .channels
+            .values()
+            .find(|channel| channel.channel_name == input.channel_name)
+        {
+            let resource_id = existing.channel_id.clone();
+            return Err(CreateChannelErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Channel name {} is already in use in this space",
+                    input.channel_name
+                ),
+                resource_id,
+                resource_type: crate::state::CHANNEL_RESOURCE_TYPE.to_string(),
+            })
+            .into());
+        }
+
+        // The space's channel quota: a create beyond it is refused, which is also what
+        // keeps the store finite — a channel is released only with its space.
+        if space.channels.len() >= crate::state::MAX_CHANNELS_PER_SPACE {
+            let resource_id = space.space_id.clone();
+            return Err(CreateChannelErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The private re:Post already holds the maximum of {} channels",
+                        crate::state::MAX_CHANNELS_PER_SPACE
+                    ),
+                    resource_id,
+                    resource_type: crate::state::CHANNEL_RESOURCE_TYPE.to_string(),
+                    service_code: crate::state::SERVICE_CODE.to_string(),
+                    quota_code: crate::state::CHANNELS_QUOTA_CODE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let Some(channel_id) = space.mint_channel_id() else {
+            return Err(CreateChannelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "could not mint a unique channel id".to_string(),
+                    retry_after_seconds: Some(1),
+                },
+            )
+            .into());
+        };
+        let channel = crate::state::Channel {
+            channel_id: channel_id.clone(),
+            space_id: space.space_id.clone(),
+            channel_name: input.channel_name.clone(),
+            channel_description: input.channel_description.clone(),
+            create_date_time: ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+            delete_date_time: None,
+            channel_status: crate::state::CHANNEL_STATUS_CREATING.to_string(),
+            channel_roles: ::std::collections::HashMap::new(),
+            provisioning_due_at: ::std::time::Instant::now() + crate::state::PROVISIONING_SPAN,
+        };
+        space.channels.insert(channel_id.clone(), channel);
+
+        Ok(CreateChannelOutput { channel_id })
     }
 }

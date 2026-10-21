@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetOffer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetOffer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetOffer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns the seeded catalog's record for `offerId`, or `ResourceNotFoundException`
+//! when the catalog holds no offer under that id.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +159,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetOffer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetOfferErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetOffer"))
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| GetOfferError::validation("the catalog store is unavailable"))?;
+        let state = store.lock();
+
+        let preferred = crate::state::resolve_requested_locale(input.locale.as_deref())
+            .map_err(GetOfferError::validation)?;
+
+        let offer = state.offers.get(&input.offer_id).ok_or_else(|| {
+            GetOfferErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "Offer '{}' does not exist in catalog '{}'",
+                    input.offer_id, state.catalog
+                )),
+            })
+        })?;
+
+        let locale = offer.content_locale(preferred);
+
+        // One entity per product the offer covers, each carrying the offer set the offer
+        // belongs to when it belongs to one.
+        let offer_set = offer
+            .offer_set_id
+            .as_deref()
+            .and_then(|id| state.offer_set_information(id));
+        let associated_entities: Vec<OfferAssociatedEntity> = offer
+            .product_ids
+            .iter()
+            .filter_map(|id| state.product_information(id, preferred))
+            .map(|product| OfferAssociatedEntity {
+                product,
+                offer_set: offer_set.clone(),
+            })
+            .collect();
+
+        Ok(GetOfferOutput {
+            locale: Some(locale.to_string()),
+            offer_id: offer.offer_id.clone(),
+            catalog: state.catalog.clone(),
+            offer_name: offer.name(locale),
+            expiration_time: offer.expiration_time.map(crate::state::datetime),
+            available_from_time: offer.available_from_time.map(crate::state::datetime),
+            seller_of_record: offer.seller_of_record.clone(),
+            associated_entities,
+            agreement_proposal_id: offer.agreement_proposal_id.clone(),
+            replacement_agreement_id: offer.replacement_agreement_id.clone(),
+            pricing_model: offer.pricing_model.clone(),
+            badges: offer.badges.clone(),
+        })
     }
 }
