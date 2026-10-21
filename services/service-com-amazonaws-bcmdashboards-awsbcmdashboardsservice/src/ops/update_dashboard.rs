@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDashboard
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDashboard`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDashboard::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the stored dashboard in place: `name` (required) and `description` are
+//! replaced, `widgets` are replaced wholesale when the member is present and left
+//! untouched when it is absent, and `updatedAt` is set to the moment of the call while
+//! `createdAt` is preserved. An ARN no dashboard is stored under answers
+//! `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +156,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDashboard` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDashboardErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDashboard"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDashboardErrorModeled::InternalServerException(InternalServerException {
+                message: "the dashboard store is unavailable".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let arn = input.arn;
+        let not_found = || {
+            UpdateDashboardErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("No dashboard found for arn {arn}"),
+            })
+        };
+        // Resolve the record FIRST, so a request that names no dashboard mints no widget
+        // id and leaves the id counter where it was.
+        if !state.dashboards.contains_key(&arn) {
+            return Err(not_found().into());
+        }
+
+        // Minting an id for a widget that arrived without one needs the state's own
+        // counter, so the new widget list is built before the record is borrowed.
+        let widgets = input.widgets.map(|widgets| state.adopt_widgets(widgets));
+        let now = ::std::time::SystemTime::now();
+        let Some(dashboard) = state.dashboards.get_mut(&arn) else {
+            // Unreachable: the key was present a moment ago under this same lock.
+            return Err(not_found().into());
+        };
+
+        // `name` is @required on every UpdateDashboard call and documented as "The new
+        // name for the dashboard"; `description` is documented as "The new description
+        // for the dashboard" — both are replacements, so an absent `description` leaves
+        // the dashboard with none. `widgets` is documented as "The updated array of
+        // widget configurations for the dashboard. Replaces all existing widgets.", which
+        // is what a present list does; the model says nothing about an absent one, and
+        // this issue's plan has it leave the stored widgets untouched. (Doc text from
+        // smithy_query(query="shape",shape="UpdateDashboardRequest").)
+        dashboard.name = input.name;
+        dashboard.description = input.description;
+        if let Some(widgets) = widgets {
+            dashboard.widgets = widgets;
+        }
+        dashboard.updated_at = now;
+
+        Ok(UpdateDashboardOutput {
+            arn: dashboard.arn.clone(),
+        })
     }
 }

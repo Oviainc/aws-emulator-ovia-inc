@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a case: allocates a `caseId`, stores every submitted member verbatim, and
+//! answers with the stored id. The case starts in `CaseStatus` `Submitted`; `GetCase`,
+//! `ListCases`, `CreateCaseComment`, `ListComments` and `CloseCase` all read the record
+//! this handler wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -107,9 +103,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-securityir-securityinci
 // here — hence the `CreateCaseError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.securityir#CreateCase")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.securityir#CreateCase",
+    extra_errors = ["ServiceQuotaExceededException", "InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateCaseErrorModeled {
+    /// This emulator's case store is full (HTTP 402). Widened in from the service's
+    /// common errors, which `CreateCase` does not list operation-locally.
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
+    /// The service's common server error, widened in for the same reason. Answered only
+    /// when this service's store is unreachable.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -163,18 +168,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCase"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unreachable)?;
+        let mut state = state.lock();
+
+        // Replay an `@idempotencyToken`: the same token must answer with the id minted
+        // the first time, and must not mint a second case.
+        let replay_key = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, "", token));
+        if let Some(case_id) = replay_key
+            .as_ref()
+            .and_then(|key| state.idempotency.get(key))
+            .cloned()
+        {
+            return Ok(CreateCaseOutput { case_id });
+        }
+
+        if !state.accepts_another_case() {
+            return Err(store_full());
+        }
+
+        let case_id = state.allocate_case_id();
+        let created = crate::state::now();
+        let case = crate::state::Case {
+            case_arn: ::engine::emulator_arn(
+                ARN_NAMESPACE,
+                &signing_region(ctx),
+                &format!("case/{case_id}"),
+            ),
+            case_id: case_id.clone(),
+            title: input.title,
+            description: input.description,
+            case_status: crate::state::CASE_STATUS_SUBMITTED.to_string(),
+            engagement_type: input.engagement_type,
+            resolver_type: input.resolver_type,
+            reported_incident_start_date: input.reported_incident_start_date,
+            // `CreateCase` takes no actual start date: only the reported one.
+            actual_incident_start_date: None,
+            impacted_accounts: input.impacted_accounts,
+            impacted_aws_regions: input.impacted_aws_regions,
+            impacted_services: input.impacted_services,
+            threat_actor_ip_addresses: input.threat_actor_ip_addresses,
+            watchers: input.watchers,
+            pending_action: Some(crate::state::PENDING_ACTION_NONE.to_string()),
+            // No `ClosureCode` until the case is closed with one; `CloseCase` takes none.
+            closure_code: None,
+            created_date: created,
+            last_updated_date: created,
+            closed_date: None,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            comments: ::std::collections::BTreeMap::new(),
+            next_comment_id: 0,
+        };
+        state.cases.insert(case_id.clone(), case);
+        if let Some(key) = replay_key {
+            state.record_idempotency(key, &case_id);
+        }
+
+        Ok(CreateCaseOutput { case_id })
     }
+}
+
+/// This service's ARN namespace (`awsService.arnNamespace`), the third ARN segment of
+/// `CaseArn`'s `^arn:aws:security-ir:...` pattern.
+const ARN_NAMESPACE: &str = "security-ir";
+
+/// The region an emulated resource is created in when the request carries no usable
+/// one. Every generated emulator defaults here.
+const DEFAULT_REGION: &str = "us-east-1";
+
+/// The region segment for a minted `CaseArn`: the request's own SigV4 credential-scope
+/// region, or [`DEFAULT_REGION`] when the request is unsigned or scoped to something
+/// `CaseArn`'s `\w+?-\w+?-\d+` region segment cannot express.
+fn signing_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .filter(|region| is_case_arn_region(region))
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Whether `region` satisfies `CaseArn`'s region segment, `\w+?-\w+?-\d+`: two
+/// word-character groups and a numeric group, separated by hyphens.
+fn is_case_arn_region(region: &str) -> bool {
+    let mut segments = region.split('-');
+    let (Some(area), Some(direction), Some(index), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return false;
+    };
+    let word =
+        |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    word(area) && word(direction) && !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The modelled server error for a store this handler cannot reach. Unreachable in a
+/// running emulator — the engine every operation is constructed from IS the store — but
+/// it is the honest answer if that ever stops holding.
+fn store_unreachable() -> CreateCaseError {
+    CreateCaseErrorModeled::InternalServerException(InternalServerException {
+        message: "the Security IR case store is unavailable".to_string(),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
+/// The modelled refusal for a store already holding [`crate::state::MAX_STORED_CASES`]
+/// cases: this emulator will not grow its case store further, so the request is refused
+/// rather than served by allocating more.
+///
+/// `quotaCode` and `serviceCode` name the limit that was actually reached — this
+/// emulator's own storage bound and this service's code — rather than an AWS quota code,
+/// which only AWS can assign.
+fn store_full() -> CreateCaseError {
+    CreateCaseErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message: format!(
+            "this emulator stores at most {} cases",
+            crate::state::MAX_STORED_CASES
+        ),
+        resource_id: ::engine::emulator_account_id().to_string(),
+        resource_type: "case".to_string(),
+        service_code: ARN_NAMESPACE.to_string(),
+        quota_code: "CasesPerAccount".to_string(),
+    })
+    .into()
 }

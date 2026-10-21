@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Projects the stored case named by `caseId`. A pure read: it answers from the record
+//! `CreateCase` wrote and the mutations `CloseCase` applied, and writes nothing. An id
+//! no case is stored under is refused with the service's `ResourceNotFoundException`
+//! (HTTP 404), never with a zeroed success.
 //!
 //! ## Shape of an operation
 //!
@@ -118,9 +114,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-securityir-securityinci
 // here — hence the `GetCaseError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.securityir#GetCase")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.securityir#GetCase",
+    extra_errors = ["ResourceNotFoundException", "InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetCaseErrorModeled {
+    /// No case is stored under the requested `caseId` (HTTP 404). Widened in from the
+    /// service's common errors, which `GetCase` does not list operation-locally.
+    ResourceNotFoundException(ResourceNotFoundException),
+    /// The service's common server error (HTTP 500). Answered only when this service's
+    /// store is unreachable.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -174,18 +179,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCase"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetCaseErrorModeled::InternalServerException(InternalServerException {
+                message: "the Security IR case store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let state = state.lock();
+        let case = state.cases.get(&input.case_id).ok_or_else(|| {
+            GetCaseErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("No case found with caseId {}", input.case_id),
+            })
+        })?;
+
+        Ok(GetCaseOutput {
+            title: Some(case.title.clone()),
+            case_arn: Some(case.case_arn.clone()),
+            description: Some(case.description.clone()),
+            case_status: Some(case.case_status.clone()),
+            engagement_type: Some(case.engagement_type.clone()),
+            reported_incident_start_date: Some(case.reported_incident_start_date),
+            actual_incident_start_date: case.actual_incident_start_date,
+            impacted_aws_regions: Some(case.impacted_aws_regions.clone()),
+            threat_actor_ip_addresses: Some(case.threat_actor_ip_addresses.clone()),
+            pending_action: case.pending_action.clone(),
+            impacted_accounts: Some(case.impacted_accounts.clone()),
+            watchers: Some(case.watchers.clone()),
+            created_date: Some(case.created_date),
+            last_updated_date: Some(case.last_updated_date),
+            closure_code: case.closure_code.clone(),
+            resolver_type: Some(case.resolver_type.clone()),
+            impacted_services: Some(case.impacted_services.clone()),
+            // Attachments and case metadata are owned by operations that are still
+            // scaffolded (`GetCaseAttachmentUploadUrl`, `UpdateCase`), so no case
+            // carries any yet.
+            case_attachments: None,
+            closed_date: case.closed_date,
+            case_metadata: None,
+        })
     }
 }
