@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLogStreams
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLogStreams`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: lists the streams created in a log group, with the live event-time and
+//! sequence-token values `PutLogEvents` maintains, honouring the prefix, the ordering
+//! and the page bounds. This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeLogStreams::handle`] with real behaviour and
@@ -134,6 +134,65 @@ impl From<DescribeLogStreamsErrorModeled> for DescribeLogStreamsError {
     }
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by
+/// another paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "DescribeLogStreams";
+
+/// The ordering `orderBy` selects; the model's own enum, whose values the boundary
+/// validator has already checked. `LogStreamName` is "the default value".
+const ORDER_BY_LAST_EVENT_TIME: &str = "LastEventTime";
+const ORDER_BY_LOG_STREAM_NAME: &str = "LogStreamName";
+
+/// One stream's position in the requested order: the event time it is ordered by
+/// (zero for every stream when ordering by name) and the name that breaks ties.
+type StreamKey = (i64, String);
+
+/// Where the next page resumes: the last key returned, plus the scan it belongs to.
+/// A continuation whose scan differs from the token's is refused, because the token
+/// is only a position within one ordering.
+#[derive(Debug, Clone)]
+struct Cursor {
+    log_group_name: String,
+    order_by: String,
+    descending: bool,
+    log_stream_name_prefix: Option<String>,
+    after: StreamKey,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "logGroupName": self.log_group_name,
+            "orderBy": self.order_by,
+            "descending": self.descending,
+            "logStreamNamePrefix": self.log_stream_name_prefix,
+            "orderTime": self.after.0,
+            "logStreamName": self.after.1,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        Some(Self {
+            log_group_name: value.get("logGroupName")?.as_str()?.to_string(),
+            order_by: value.get("orderBy")?.as_str()?.to_string(),
+            descending: value.get("descending")?.as_bool()?,
+            log_stream_name_prefix: value
+                .get("logStreamNamePrefix")
+                .and_then(::serde_json::Value::as_str)
+                .map(ToString::to_string),
+            after: (
+                value.get("orderTime")?.as_i64()?,
+                value.get("logStreamName")?.as_str()?.to_string(),
+            ),
+        })
+    }
+}
+
 /// The `DescribeLogStreams` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -170,18 +229,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLogStreams` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLogStreamsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLogStreams"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeLogStreamsError::from(
+                DescribeLogStreamsErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let store = state.lock();
+
+        let invalid = |message: &str| {
+            DescribeLogStreamsError::from(
+                DescribeLogStreamsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                ),
+            )
+        };
+
+        let log_group_name = crate::state::resolve_log_group_target(
+            input.log_group_name.as_deref(),
+            input.log_group_identifier.as_deref(),
+        )
+        .map_err(|message| invalid(&message))?;
+
+        let order_by = input
+            .order_by
+            .clone()
+            .unwrap_or_else(|| ORDER_BY_LOG_STREAM_NAME.to_string());
+        // "If you order the results by event time, you cannot specify the
+        // logStreamNamePrefix parameter."
+        if order_by == ORDER_BY_LAST_EVENT_TIME && input.log_stream_name_prefix.is_some() {
+            return Err(invalid(
+                "logStreamNamePrefix cannot be specified when orderBy is LastEventTime",
+            ));
+        }
+        let descending = input.descending.unwrap_or(false);
+
+        let Some(group) = store.log_groups.get(&log_group_name) else {
+            return Err(DescribeLogStreamsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some("The specified log group does not exist".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token"));
+                };
+                if cursor.log_group_name != log_group_name
+                    || cursor.order_by != order_by
+                    || cursor.descending != descending
+                    || cursor.log_stream_name_prefix != input.log_stream_name_prefix
+                {
+                    return Err(invalid(
+                        "nextToken was issued for a different DescribeLogStreams request",
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        let mut ordered: Vec<(StreamKey, &crate::state::LogStreamRecord)> = group
+            .streams
+            .values()
+            .filter(|stream| {
+                input
+                    .log_stream_name_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| stream.name.starts_with(prefix))
+            })
+            .map(|stream| {
+                let order_time = if order_by == ORDER_BY_LAST_EVENT_TIME {
+                    stream.last_event_timestamp.unwrap_or(0)
+                } else {
+                    0
+                };
+                ((order_time, stream.name.clone()), stream)
+            })
+            .collect();
+        ordered.sort_by(|left, right| left.0.cmp(&right.0));
+        if descending {
+            ordered.reverse();
+        }
+
+        let first = match &cursor {
+            // Everything at or before the token's key in THIS order is already served.
+            Some(cursor) => ordered.partition_point(|(key, _)| {
+                if descending {
+                    *key >= cursor.after
+                } else {
+                    *key <= cursor.after
+                }
+            }),
+            None => 0,
+        };
+        // `limit` is modelled `range 1..50`, so the boundary validator has already
+        // refused a value outside it; `max(1)` only keeps the page bounds sane.
+        let limit = usize::try_from(input.limit.unwrap_or(crate::state::DEFAULT_DESCRIBE_LIMIT))
+            .unwrap_or(0)
+            .max(1);
+        let last = first.saturating_add(limit).min(ordered.len());
+        let page = &ordered[first..last];
+
+        let next_token = page.last().filter(|_| last < ordered.len()).map(|(key, _)| {
+            Cursor {
+                log_group_name,
+                order_by,
+                descending,
+                log_stream_name_prefix: input.log_stream_name_prefix.clone(),
+                after: key.clone(),
+            }
+            .encode()
+        });
+
+        Ok(DescribeLogStreamsOutput {
+            log_streams: Some(
+                page.iter()
+                    .map(|(_, stream)| LogStream {
+                        log_stream_name: Some(stream.name.clone()),
+                        creation_time: Some(stream.creation_time_ms),
+                        first_event_timestamp: stream.first_event_timestamp,
+                        last_event_timestamp: stream.last_event_timestamp,
+                        last_ingestion_time: stream.last_ingestion_time,
+                        upload_sequence_token: stream.upload_sequence_token.clone(),
+                        arn: Some(stream.arn.clone()),
+                        // "As of June 17, 2019, this parameter is no longer supported
+                        // for log streams, and is always reported as zero."
+                        stored_bytes: Some(0),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLogGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLogGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: inserts a log group into the shared store, or refuses a name that
+//! already exists. This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`CreateLogGroup::handle`] with real behaviour and
@@ -198,18 +197,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLogGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLogGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLogGroup"))
+        let region = crate::state::request_region(ctx.parts());
+
+        // "Log group names can't start with the string aws/" — a naming guideline this
+        // operation's own documentation states, so a name that breaks it is refused.
+        if input.log_group_name.starts_with("aws/") {
+            return Err(CreateLogGroupErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        "logGroupName must not start with the string 'aws/'".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `logGroupClass` is a modelled enum, so the boundary validator has already
+        // refused any value outside it; an absent one takes the documented default.
+        let log_group_class = input
+            .log_group_class
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_LOG_GROUP_CLASS.to_string());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateLogGroupError::from(CreateLogGroupErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = state.lock();
+
+        // "You can create up to 1,000,000 log groups per Region per account."
+        if store.log_groups.len() >= crate::state::MAX_LOG_GROUPS {
+            return Err(CreateLogGroupErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the maximum of {} log groups per Region per account has been reached",
+                        crate::state::MAX_LOG_GROUPS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if store.log_groups.contains_key(&input.log_group_name) {
+            return Err(CreateLogGroupErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some("The specified log group already exists".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let mut group =
+            crate::state::LogGroupRecord::new(&region, &input.log_group_name, crate::state::now_ms());
+        group.log_group_class = log_group_class;
+        group.kms_key_id = input.kms_key_id.clone();
+        group.deletion_protection_enabled = input.deletion_protection_enabled.unwrap_or(false);
+        if let Some(tags) = &input.tags {
+            group.tags = tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+        }
+        store.log_groups.insert(input.log_group_name.clone(), group);
+
+        Ok(CreateLogGroupOutput)
     }
 }

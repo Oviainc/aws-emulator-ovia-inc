@@ -1,9 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutLogEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutLogEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: appends the batch's events to the named stream in the shared store,
+//! stamping each with an ingestion time, and mints the stream's next sequence token.
+//! This is the ONLY file to touch for this operation.
+//!
+//! EMULATOR POLICY, stated here because it is visible to a client: a log stream holds at
+//! most [`crate::state::MAX_STREAM_EVENTS`] events and [`crate::state::MAX_STREAM_BYTES`]
+//! of message bytes. A batch is always accepted, and the OLDEST events are discarded to
+//! stay inside that ceiling — the same thing a caller observes when the real service
+//! deletes events that have passed a log group's retention period, except that the
+//! ceiling here is a size rather than an age, because this emulator holds its state in
+//! memory. Only the discarded events become unreadable; nothing else about the call
+//! changes, and a log group's `storedBytes` always reports what is still held.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`PutLogEvents::handle`] with real behaviour and
@@ -155,6 +164,14 @@ impl From<PutLogEventsErrorModeled> for PutLogEventsError {
     }
 }
 
+/// The largest batch `PutLogEvents` accepts: "The maximum batch size is 1,048,576
+/// bytes. This size is calculated as the sum of all event messages in UTF-8, plus 26
+/// bytes for each log event."
+const MAX_BATCH_BYTES: i64 = 1_048_576;
+
+/// The largest single event: "Each log event can be no larger than 1 MB."
+const MAX_EVENT_BYTES: i64 = 1_048_576;
+
 /// The `PutLogEvents` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -191,18 +208,179 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutLogEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutLogEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries only request metadata; this operation needs none of it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutLogEvents"))
+        // Two input members are deliberately accepted and not stored:
+        // * `sequenceToken` — the model states it "is now ignored in PutLogEvents
+        //   actions", which are "accepted and never return InvalidSequenceTokenException
+        //   or DataAlreadyAcceptedException even if the sequence token is not valid".
+        // * `entity` — the entity associated with the events. Nothing this emulator
+        //   serves can observe it: no implemented operation returns an entity, and the
+        //   operations that would (the application-signals surface) are still 501. It is
+        //   accepted without a `rejectedEntityInfo`, which the model reserves for a
+        //   REJECTED entity ("Only returned when the entity is rejected"), and storing it
+        //   belongs with the operation that reads it back.
+        let _ = (ctx, &input.sequence_token, &input.entity);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutLogEventsError::from(PutLogEventsErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = state.lock();
+
+        let invalid = |message: String| {
+            PutLogEventsError::from(PutLogEventsErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            ))
+        };
+
+        // Resolve the target BEFORE anything else: an unknown group or stream is the
+        // more specific client error, and resolution must not consume ingestion
+        // sequence numbers.
+        match store
+            .log_groups
+            .get(&input.log_group_name)
+            .map(|group| group.streams.contains_key(&input.log_stream_name))
+        {
+            None => {
+                return Err(PutLogEventsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some("The specified log group does not exist".to_string()),
+                    },
+                )
+                .into())
+            }
+            Some(false) => {
+                return Err(PutLogEventsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some("The specified log stream does not exist".to_string()),
+                    },
+                )
+                .into())
+            }
+            Some(true) => {}
+        }
+
+        // The documented batch constraints, which bound what one request may store:
+        // "The maximum batch size is 1,048,576 bytes. This size is calculated as the sum
+        // of all event messages in UTF-8, plus 26 bytes for each log event", and "Each
+        // log event can be no larger than 1 MB". (The maximum of 10,000 events per batch
+        // is the modelled `len 1..10000`, already refused at the boundary.)
+        let mut batch_bytes: i64 = 0;
+        for (index, event) in input.log_events.iter().enumerate() {
+            let event_bytes = i64::try_from(event.message.len()).unwrap_or(i64::MAX);
+            if event_bytes > MAX_EVENT_BYTES {
+                return Err(invalid(format!(
+                    "logEvents.{index}.message is {event_bytes} bytes; a log event can be no larger than {MAX_EVENT_BYTES} bytes"
+                )));
+            }
+            batch_bytes =
+                batch_bytes.saturating_add(event_bytes + crate::state::EVENT_OVERHEAD_BYTES);
+        }
+        if batch_bytes > MAX_BATCH_BYTES {
+            return Err(invalid(format!(
+                "logEvents is {batch_bytes} bytes; the maximum batch size is {MAX_BATCH_BYTES} bytes, \
+                 counted as the sum of all event messages in UTF-8 plus {} bytes for each log event",
+                crate::state::EVENT_OVERHEAD_BYTES
+            )));
+        }
+        // "The log events in the batch must be in chronological order by their
+        // timestamp." The model's own doc is explicit that a batch out of order fails,
+        // so the batch is refused rather than quietly reordered.
+        if let Some(index) = input
+            .log_events
+            .windows(2)
+            .position(|pair| pair[0].timestamp > pair[1].timestamp)
+        {
+            return Err(invalid(format!(
+                "logEvents.{} has a timestamp earlier than logEvents.{index}; the log events in a batch must be in chronological order",
+                index + 1
+            )));
+        }
+
+        // One ingestion instant for the whole batch, and one sequence number per event
+        // taken from the store's monotonic counter: the counter is what totally orders
+        // events that share a timestamp and what the pagination cursors resume from.
+        let ingestion_time = crate::state::now_ms();
+        let mut batch: Vec<crate::state::StoredEvent> =
+            Vec::with_capacity(input.log_events.len());
+        for event in &input.log_events {
+            let ingestion_seq = store.take_ingestion_seq();
+            batch.push(crate::state::StoredEvent {
+                timestamp: event.timestamp,
+                message: event.message.clone(),
+                ingestion_time,
+                ingestion_seq,
+            });
+        }
+        let added_bytes: i64 = batch
+            .iter()
+            .map(crate::state::StoredEvent::stored_bytes)
+            .sum();
+        // A fresh token on every accepted batch, minted from the same counter so it is
+        // unique for the life of the store, and persisted on the stream below.
+        let next_sequence_token = crate::state::mint_sequence_token(store.take_ingestion_seq());
+
+        // Both lookups succeeded above under this same lock, so neither `else` arm is
+        // reachable; each answers with the error that resolution would have given.
+        let Some(group) = store.log_groups.get_mut(&input.log_group_name) else {
+            return Err(PutLogEventsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some("The specified log group does not exist".to_string()),
+                },
+            )
+            .into());
+        };
+        let Some(stream) = group.streams.get_mut(&input.log_stream_name) else {
+            return Err(PutLogEventsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some("The specified log stream does not exist".to_string()),
+                },
+            )
+            .into());
+        };
+        // The batch is in chronological order and the stream is kept in
+        // `(timestamp, ingestion_seq)` order, so a batch that starts at or after the
+        // stream's newest event is simply appended; only a late batch, whose events
+        // predate stored ones, needs the merge. The sort is bounded by the stream's
+        // storage ceiling, enforced immediately below.
+        let appends_in_order = stream
+            .events
+            .last()
+            .zip(batch.first())
+            .is_none_or(|(newest, first)| first.key() > newest.key());
+        stream.events.extend(batch);
+        if !appends_in_order {
+            stream.events.sort_by_key(crate::state::StoredEvent::key);
+        }
+        // Keep the stream inside the emulator's storage ceiling by dropping its oldest
+        // events, so repeated writes cannot grow the store without bound.
+        let discarded_bytes = stream.enforce_storage_ceiling();
+        stream.refresh_event_times();
+        stream.last_ingestion_time = Some(ingestion_time);
+        stream.upload_sequence_token = Some(next_sequence_token.clone());
+        // The group's `storedBytes` reports what is held: this batch's bytes, less what
+        // the ceiling discarded. Written in one step, after the stream is settled, so no
+        // failure path can leave it half-applied.
+        group.stored_bytes = group
+            .stored_bytes
+            .saturating_add(added_bytes)
+            .saturating_sub(discarded_bytes)
+            .max(0);
+
+        Ok(PutLogEventsOutput {
+            next_sequence_token: Some(next_sequence_token),
+            // No event is rejected: `rejectedLogEventsInfo` reports events outside the
+            // clock-relative age windows (older than 14 days, more than 2 hours in the
+            // future), which this slice does not apply — so every accepted event is
+            // stored and readable, and none is reported as rejected.
+            rejected_log_events_info: None,
+            rejected_entity_info: None,
+        })
     }
 }
