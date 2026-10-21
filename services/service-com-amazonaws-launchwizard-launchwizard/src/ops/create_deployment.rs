@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a deployment against the seeded workload catalogue and stores it in
+//! [`crate::state`]. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +160,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDeploymentErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Launch Wizard state store is unavailable".to_string()),
+            })
+        })?;
+        let mut store = state.lock();
+        // Clock-owed status steps first, so the duplicate-name check below sees the
+        // deployments as they stand now (a deployment that has reached DELETED no
+        // longer holds its name).
+        store.materialize_due(now);
+
+        // The workload and its deployment pattern are resolved against the seeded
+        // catalogue: an unknown one is a 404, not a deployment of something that does
+        // not exist.
+        let Some(workload) = store.workloads.get(&input.workload_name) else {
+            return Err(CreateDeploymentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Workload '{}' was not found.",
+                        input.workload_name
+                    )),
+                },
+            )
+            .into());
+        };
+        if !workload.patterns.contains(&input.deployment_pattern_name) {
+            return Err(CreateDeploymentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Deployment pattern '{}' was not found for workload '{}'.",
+                        input.deployment_pattern_name, input.workload_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A deployment name identifies the deployment to a caller, so it cannot be
+        // reused while a deployment still holds it.
+        if store.live_name_taken(&input.name) {
+            return Err(CreateDeploymentErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "A deployment named '{}' already exists.",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `dryRun` checks the request without making it. The model declares no
+        // `DryRunOperation` error for this operation, so a dry run that passes every
+        // check above answers success — and, by definition, persists NOTHING, so it
+        // mints no id to report.
+        if input.dry_run {
+            return Ok(CreateDeploymentOutput {
+                deployment_id: None,
+            });
+        }
+
+        // The store lives as long as the process, so it has a ceiling; see
+        // `state::MAX_DEPLOYMENTS` for how room is made and why this is the error the
+        // service answers when there is none.
+        if !store.make_room_for_a_deployment() {
+            return Err(CreateDeploymentErrorModeled::ResourceLimitException(
+                ResourceLimitException {
+                    message: Some(format!(
+                        "The maximum of {} deployments has been reached; delete a deployment \
+                         before creating another.",
+                        crate::state::MAX_DEPLOYMENTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_deployment_id();
+        let deployment_arn = crate::state::deployment_arn(&region, &id);
+        let created = crate::state::DeploymentEvent::new(
+            "DeploymentCreated",
+            format!(
+                "Deployment '{}' was created for workload '{}' using deployment pattern '{}'.",
+                input.name, input.workload_name, input.deployment_pattern_name
+            ),
+            crate::state::EVENT_CREATED,
+            now,
+        );
+        // Launch Wizard returns a new deployment in CREATING, a non-terminal status, so
+        // the remaining steps are owed by the CLOCK: each becomes due one
+        // `TRANSITION_SPAN` after the previous one and is materialised by the first
+        // request at or after that instant.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDeployment"))
+        // COMPLETED is the honest terminal status here: what this service's control
+        // plane owns IS the deployment record, and by then the record is complete and
+        // readable. Nothing in it claims infrastructure the emulator did not build —
+        // `resourceGroup` stays absent because no resource group was created, and the
+        // events describe the record's own lifecycle rather than provisioned resources.
+        let in_progress_at = now + crate::state::TRANSITION_SPAN;
+        let completed_at = in_progress_at + crate::state::TRANSITION_SPAN;
+        let pending = ::std::collections::VecDeque::from(vec![
+            crate::state::PendingTransition {
+                due_at: in_progress_at,
+                status: crate::state::STATUS_IN_PROGRESS.to_string(),
+                event: crate::state::DeploymentEvent::new(
+                    "DeploymentInProgress",
+                    format!(
+                        "Deployment '{}' is provisioning the resources of deployment pattern '{}'.",
+                        input.name, input.deployment_pattern_name
+                    ),
+                    crate::state::EVENT_IN_PROGRESS,
+                    in_progress_at,
+                ),
+            },
+            crate::state::PendingTransition {
+                due_at: completed_at,
+                status: crate::state::STATUS_COMPLETED.to_string(),
+                event: crate::state::DeploymentEvent::new(
+                    "DeploymentCompleted",
+                    format!("Deployment '{}' completed.", input.name),
+                    crate::state::EVENT_COMPLETED,
+                    completed_at,
+                ),
+            },
+        ]);
+
+        let deployment = crate::state::Deployment {
+            id: id.clone(),
+            name: input.name,
+            workload_name: input.workload_name,
+            pattern_name: input.deployment_pattern_name,
+            status: crate::state::STATUS_CREATING.to_string(),
+            status_reason: None,
+            specifications: input.specifications.into_iter().collect(),
+            resource_group: None,
+            deployment_arn,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at: now,
+            modified_at: now,
+            deleted_at: None,
+            events: vec![created],
+            pending,
+        };
+        store.deployments.insert(id.clone(), deployment);
+
+        // The id is reported only because the record behind it is now stored.
+        Ok(CreateDeploymentOutput {
+            deployment_id: Some(id),
+        })
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDeployments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDeployments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDeployments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored deployments from [`crate::state`], filtered and paged. This is
+//! the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +144,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDeployments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDeploymentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDeployments"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDeploymentsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Launch Wizard state store is unavailable".to_string()),
+            })
+        })?;
+        let mut store = state.lock();
+        // The only write a read makes: the status steps the clock already made due.
+        store.materialize_due(now);
+
+        let filters = input.filters.unwrap_or_default();
+        for filter in &filters {
+            let Some(name) = filter.name.as_deref() else {
+                continue;
+            };
+            if !DEPLOYMENT_FILTER_KEY_VALUES.contains(&name) {
+                return Err(ListDeploymentsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "'{name}' is not a supported filter name; supported names are {}.",
+                            DEPLOYMENT_FILTER_KEY_VALUES.join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Only the summaries each matching deployment reports are materialised, so a
+        // read does not copy the stored records (events and all) to serve one page.
+        let matching: Vec<DeploymentDataSummary> = store
+            .deployments_in_order()
+            .into_iter()
+            .filter(|deployment| filters.iter().all(|filter| matches_filter(deployment, filter)))
+            .map(crate::state::Deployment::to_summary)
+            .collect();
+        let (page, next_token) = crate::state::paginate(
+            matching,
+            input.max_results,
+            input.next_token.as_deref(),
+            |summary| summary.id.clone().unwrap_or_default(),
+        )
+        .map_err(|message| {
+            ListDeploymentsErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        })?;
+
+        Ok(ListDeploymentsOutput {
+            deployments: Some(page),
+            next_token,
+        })
     }
+}
+
+/// Whether `deployment` satisfies one `DeploymentFilter`.
+///
+/// The member a filter reads is named by its `DeploymentFilterKey`
+/// (`DEPLOYMENT_FILTER_KEY_VALUES`), its values are compared case-sensitively as the
+/// model documents, and several values are joined with OR. A filter that carries no
+/// values constrains nothing; the caller gets the unfiltered result set rather than an
+/// empty one.
+fn matches_filter(deployment: &crate::state::Deployment, filter: &DeploymentFilter) -> bool {
+    let values = match filter.values.as_deref() {
+        None | Some([]) => return true,
+        Some(values) => values,
+    };
+    let field = match filter.name.as_deref() {
+        Some("WORKLOAD_NAME") => &deployment.workload_name,
+        Some("DEPLOYMENT_STATUS") => &deployment.status,
+        // No filter name: nothing is being filtered on.
+        _ => return true,
+    };
+    values.iter().any(|value| value == field)
 }
