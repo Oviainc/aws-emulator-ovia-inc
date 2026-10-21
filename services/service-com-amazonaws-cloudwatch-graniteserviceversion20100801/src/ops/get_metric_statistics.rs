@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMetricStatistics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMetricStatistics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMetricStatistics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Aggregates the stored datapoints of one metric into period windows. Implemented
+//! here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -221,18 +214,257 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMetricStatistics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMetricStatisticsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMetricStatistics"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetMetricStatisticsErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch metric store is unavailable".into()),
+            })
+        })?;
+
+        // "The maximum number of data points returned from a single call is 1,440. If you
+        // request more than 1,440 data points, CloudWatch returns an error."
+        const MAX_DATAPOINTS: f64 = 1440.0;
+
+        let statistics: Vec<&str> = input
+            .statistics
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let extended: Vec<&str> = input
+            .extended_statistics
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        if statistics.is_empty() && extended.is_empty() {
+            return Err(
+                GetMetricStatisticsErrorModeled::MissingRequiredParameterException(
+                    MissingRequiredParameterException {
+                        message: Some(
+                            "either Statistics or ExtendedStatistics must name at least one \
+                             statistic"
+                                .into(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Resolve every extended statistic BEFORE any data is read, so an unsupported name is
+        // refused whether or not the requested range happens to hold datapoints.
+        let percentiles: Vec<(&str, f64)> = extended
+            .iter()
+            .map(|name| {
+                parse_percentile(name)
+                    .map(|percentile| (*name, percentile))
+                    .ok_or_else(|| invalid_value(format!("{name} is not a supported statistic")))
+            })
+            .collect::<Result<_, _>>()?;
+        validate_period(input.period)?;
+
+        let start = crate::state::from_timestamp(&input.start_time);
+        let end = crate::state::from_timestamp(&input.end_time);
+        if end <= start {
+            return Err(invalid_value(format!(
+                "EndTime must be later than StartTime; got StartTime {start} and EndTime {end} \
+                 (epoch seconds)"
+            )));
+        }
+        let period = f64::from(input.period);
+        let windows = ((end - start) / period).ceil();
+        if windows > MAX_DATAPOINTS {
+            return Err(
+                GetMetricStatisticsErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(format!(
+                            "the requested time range and Period span {windows} periods; at most \
+                             {MAX_DATAPOINTS} data points can be returned from one call"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A metric's identity includes its dimension set, so only the series published with
+        // exactly these dimensions answers this request.
+        let key = crate::state::MetricKey {
+            namespace: input.namespace.clone(),
+            metric_name: input.metric_name.clone(),
+            dimensions: crate::state::dimension_set(input.dimensions.as_deref()),
+        };
+
+        let store = state.lock();
+
+        // `StartTime` inclusive, `EndTime` exclusive; windows are `Period` seconds wide and
+        // anchored at `StartTime`. A window with no datapoint is never emitted, so the
+        // bucket map only ever holds windows that have data.
+        let mut buckets: std::collections::BTreeMap<i64, Vec<&crate::state::StoredDatum>> =
+            std::collections::BTreeMap::new();
+        for datum in store.metrics.get(&key).into_iter().flatten() {
+            if datum.timestamp_secs < start || datum.timestamp_secs >= end {
+                continue;
+            }
+            if input
+                .unit
+                .as_deref()
+                .is_some_and(|unit| datum.unit.as_deref() != Some(unit))
+            {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let index = ((datum.timestamp_secs - start) / period).floor() as i64;
+            buckets.entry(index).or_default().push(datum);
+        }
+
+        let mut datapoints = Vec::with_capacity(buckets.len());
+        for (index, data) in buckets {
+            #[allow(clippy::cast_precision_loss)]
+            let window_start = start + (index as f64) * period;
+            datapoints.push(aggregate(
+                window_start,
+                &data,
+                &statistics,
+                &percentiles,
+                input.unit.as_deref(),
+            ));
+        }
+
+        Ok(GetMetricStatisticsOutput {
+            // "A label for the specified metric." — the metric this call aggregated.
+            label: Some(input.metric_name.clone()),
+            datapoints: Some(datapoints),
+        })
     }
+}
+
+/// Refuse an out-of-range input value.
+fn invalid_value(message: String) -> GetMetricStatisticsError {
+    GetMetricStatisticsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// Refuse a `Period` the member does not document.
+///
+/// "For metrics with regular resolution, a period can be as short as one minute (60
+/// seconds) and must be a multiple of 60. For high-resolution metrics that are collected at
+/// intervals of less than one minute, the period can be 1, 5, 10, 20, 30, 60, or any
+/// multiple of 60." (`GetMetricStatisticsInput$Period`)
+fn validate_period(period: i32) -> Result<(), GetMetricStatisticsError> {
+    // The sub-minute periods the member lists; every other legal period is a multiple of 60.
+    const SUB_MINUTE: [i32; 5] = [1, 5, 10, 20, 30];
+
+    // A period is a span of seconds, so it is at least one — the model says so (`Period`
+    // carries `range min 1`) and so does the member ("as short as one minute […] the period
+    // can be 1, 5, 10, 20, 30, 60"). Stated here as well, so the rule the windows are built
+    // on does not depend on the boundary validator having run.
+    if period >= 1 && (SUB_MINUTE.contains(&period) || period % 60 == 0) {
+        return Ok(());
+    }
+    Err(invalid_value(format!(
+        "Period must be a positive 1, 5, 10, 20, 30 or multiple of 60; got {period}"
+    )))
+}
+
+/// Aggregate one window's datapoints, emitting ONLY the statistics the caller asked for.
+fn aggregate(
+    window_start: f64,
+    data: &[&crate::state::StoredDatum],
+    statistics: &[&str],
+    percentiles: &[(&str, f64)],
+    requested_unit: Option<&str>,
+) -> Datapoint {
+    let sample_count: f64 = data.iter().map(|datum| datum.sample_count).sum();
+    let sum: f64 = data.iter().map(|datum| datum.sum).sum();
+    let minimum = data
+        .iter()
+        .map(|datum| datum.minimum)
+        .fold(f64::INFINITY, f64::min);
+    let maximum = data
+        .iter()
+        .map(|datum| datum.maximum)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    let mut extended_statistics = std::collections::HashMap::new();
+    for (name, percentile) in percentiles {
+        if let Some(value) = weighted_percentile(data, *percentile) {
+            extended_statistics.insert((*name).to_string(), value);
+        }
+    }
+
+    Datapoint {
+        timestamp: Some(crate::state::to_timestamp(window_start)),
+        sample_count: statistics.contains(&"SampleCount").then_some(sample_count),
+        average: statistics
+            .contains(&"Average")
+            .then(|| sum / sample_count)
+            .filter(|average: &f64| average.is_finite()),
+        sum: statistics.contains(&"Sum").then_some(sum),
+        minimum: statistics
+            .contains(&"Minimum")
+            .then_some(minimum)
+            .filter(|value: &f64| value.is_finite()),
+        maximum: statistics
+            .contains(&"Maximum")
+            .then_some(maximum)
+            .filter(|value: &f64| value.is_finite()),
+        // The unit the caller filtered on, else the one the window's data was published
+        // with — reported only when that is unambiguous.
+        unit: requested_unit
+            .map(ToString::to_string)
+            .or_else(|| window_unit(data)),
+        extended_statistics: (!extended_statistics.is_empty()).then_some(extended_statistics),
+    }
+}
+
+/// The one unit every datapoint in the window was published with, if they agree.
+fn window_unit(data: &[&crate::state::StoredDatum]) -> Option<String> {
+    let first = data.first()?.unit.clone();
+    data.iter()
+        .all(|datum| datum.unit == first)
+        .then_some(first)
+        .flatten()
+}
+
+/// The percentile a `pNN`/`pNN.NN` extended statistic names, in percent.
+fn parse_percentile(name: &str) -> Option<f64> {
+    let digits = name.strip_prefix('p')?;
+    let percentile: f64 = digits.parse().ok()?;
+    (0.0..=100.0).contains(&percentile).then_some(percentile)
+}
+
+/// The `percentile`-th percentile of the window's published values, by nearest rank.
+///
+/// `None` when the window holds a datapoint whose individual values were never published,
+/// or any negative value: "Percentile statistics are not available for metrics when any of
+/// the metric values are negative numbers." (`GetMetricStatistics`)
+fn weighted_percentile(data: &[&crate::state::StoredDatum], percentile: f64) -> Option<f64> {
+    let mut values: Vec<(f64, f64)> = Vec::with_capacity(data.len());
+    for datum in data {
+        let value = datum.single_value()?;
+        if value < 0.0 {
+            return None;
+        }
+        values.push((value, datum.sample_count));
+    }
+    values.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+    let total: f64 = values.iter().map(|(_, weight)| weight).sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let target = percentile / 100.0 * total;
+    let mut seen = 0.0;
+    for (value, weight) in &values {
+        seen += weight;
+        if seen >= target {
+            return Some(*value);
+        }
+    }
+    values.last().map(|(value, _)| *value)
 }
