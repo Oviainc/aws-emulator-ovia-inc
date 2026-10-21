@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one stored domain. A pure read: it answers from the record `CreateDomain`
+//! wrote and changes nothing, so two reads of an unchanged domain are identical.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +167,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDomain"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        let domain = store.domains.get(&input.domain_name).ok_or_else(|| {
+            GetDomainError::from(GetDomainErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("The domain {} does not exist", input.domain_name)),
+                },
+            ))
+        })?;
+
+        Ok(GetDomainOutput {
+            domain_name: domain.name.clone(),
+            default_expiration_days: Some(domain.default_expiration_days),
+            default_encryption_key: domain.default_encryption_key.clone(),
+            dead_letter_queue_url: domain.dead_letter_queue_url.clone(),
+            // Every statistic is counted off this domain's own stored data.
+            // `ObjectCount` ("The total number of objects in domain") and `TotalSize`
+            // ("The total size, in bytes, of all objects in the domain") are zero
+            // because no operation that ingests a profile OBJECT is implemented yet, so
+            // the domain holds none. `MeteringProfileCount` counts a profile twice only
+            // once it carries more than 100 objects, which none can here, so it equals
+            // `ProfileCount`.
+            stats: Some(DomainStats {
+                profile_count: domain.profiles.len() as i64,
+                metering_profile_count: domain.profiles.len() as i64,
+                object_count: 0,
+                total_size: 0,
+            }),
+            matching: domain.matching_response(),
+            rule_based_matching: domain.rule_based_matching_response(now),
+            data_store: domain.data_store_response(now),
+            created_at: crate::state::to_date_time(domain.created_at),
+            last_updated_at: crate::state::to_date_time(domain.last_updated_at),
+            tags: domain.tags.clone(),
+        })
     }
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> GetDomainError {
+    GetDomainErrorModeled::InternalServerException(crate::state::store_unavailable()).into()
 }
