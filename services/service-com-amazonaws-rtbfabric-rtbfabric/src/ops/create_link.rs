@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Opens a link from one stored gateway to another and persists it in
+//! [`crate::state`], including the members this response shape does not carry
+//! (`tags`, `httpResponderAllowed`, `timeoutInMillis`) so `GetLink` can report them.
+//! An id that names no stored gateway -> `ResourceNotFoundException` (404); a second
+//! link for the same ordered pair -> `ConflictException` (409).
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +184,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLink"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateLinkErrorModeled::InternalServerException(InternalServerException {
+                message: "the rtbfabric emulator has no state store for this request".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        // A link joins two gateways, so the direction is a fact about which kind of
+        // gateway opened it — read from which store holds the calling id, not from
+        // anything in the request.
+        let direction = if store.requester_gateways.contains_key(&input.gateway_id) {
+            crate::state::LINK_DIRECTION_REQUEST
+        } else if store.responder_gateways.contains_key(&input.gateway_id) {
+            crate::state::LINK_DIRECTION_RESPONSE
+        } else {
+            return Err(CreateLinkErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no gateway with id {} exists", input.gateway_id),
+                },
+            )
+            .into());
+        };
+        if !store.gateway_exists(&input.peer_gateway_id) {
+            return Err(CreateLinkErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no gateway with id {} exists", input.peer_gateway_id),
+                },
+            )
+            .into());
+        }
+        if input.gateway_id == input.peer_gateway_id {
+            return Err(CreateLinkErrorModeled::ValidationException(ValidationException {
+                message: "peerGatewayId must name a gateway other than gatewayId".to_string(),
+            })
+            .into());
+        }
+        if let Some(existing) = store.link_joining(&input.gateway_id, &input.peer_gateway_id) {
+            return Err(CreateLinkErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "link {} already joins gateway {} to gateway {}",
+                    existing.link_id, input.gateway_id, input.peer_gateway_id
+                ),
+            })
+            .into());
+        }
+
+        // The store's own bound, checked before the insert; `DeleteLink` releases
+        // a record, so this bounds what is live.
+        if store.links.len() >= crate::state::LINK_QUOTA {
+            return Err(CreateLinkErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator holds its limit of {} links",
+                        crate::state::LINK_QUOTA
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let link_id = store.mint_link_id();
+        let link = crate::state::Link {
+            link_id: link_id.clone(),
+            gateway_id: input.gateway_id.clone(),
+            peer_gateway_id: input.peer_gateway_id,
+            // A fresh request is not yet put to the peer; the clock owes the move
+            // to REQUESTED, and only AcceptLink can take it further.
+            status: crate::state::LINK_STATUS_PENDING_REQUEST.to_string(),
+            settles_at: Some(now + crate::state::PROVISIONING_DELAY),
+            direction: direction.to_string(),
+            // Both ends are gateways inside the fabric; the external connectivity
+            // types belong to the Create*ExternalLink operations.
+            connectivity_type: crate::state::CONNECTIVITY_TYPE_DEFAULT.to_string(),
+            attributes: input.attributes,
+            log_settings: input.log_settings,
+            http_responder_allowed: input.http_responder_allowed,
+            timeout_in_millis: input.timeout_in_millis,
+            // No module flow is configured until UpdateLinkModuleFlow runs.
+            flow_modules: Vec::new(),
+            pending_flow_modules: Vec::new(),
+            tags: input.tags.unwrap_or_default(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let output = CreateLinkOutput {
+            gateway_id: link.gateway_id.clone(),
+            peer_gateway_id: link.peer_gateway_id.clone(),
+            status: link.status.clone(),
+            created_at: crate::state::timestamp(link.created_at),
+            updated_at: crate::state::timestamp(link.updated_at),
+            direction: Some(link.direction.clone()),
+            flow_modules: Some(link.flow_modules.clone()),
+            pending_flow_modules: Some(link.pending_flow_modules.clone()),
+            attributes: link.attributes.clone(),
+            log_settings: Some(link.log_settings.clone()),
+            connectivity_type: Some(link.connectivity_type.clone()),
+            link_id: link.link_id.clone(),
+            // The caller's own id for the link travels in `attributes`.
+            customer_provided_id: link
+                .attributes
+                .as_ref()
+                .and_then(|attributes| attributes.customer_provided_id.clone()),
+        };
+        store.links.insert((input.gateway_id, link_id), link);
+        Ok(output)
     }
 }

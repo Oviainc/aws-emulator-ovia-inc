@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResponderGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResponderGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResponderGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the responder gateway `CreateResponderGateway` stored, with the link
+//! counts derived from the stored links. Unknown id -> `ResourceNotFoundException`
+//! (404).
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +183,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResponderGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResponderGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResponderGateway"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetResponderGatewayErrorModeled::InternalServerException(InternalServerException {
+                message: "the rtbfabric emulator has no state store for this request".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        // Reporting only: see `get_requester_gateway`.
+        store.settle_all(now);
+
+        let counts = store.link_counts(&input.gateway_id);
+        let Some(gateway) = store.responder_gateways.get(&input.gateway_id) else {
+            return Err(GetResponderGatewayErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no responder gateway with id {} exists",
+                        input.gateway_id
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetResponderGatewayOutput {
+            gateway_id: gateway.gateway_id.clone(),
+            vpc_id: gateway.vpc_id.clone(),
+            subnet_ids: gateway.subnet_ids.clone(),
+            security_group_ids: gateway.security_group_ids.clone(),
+            status: gateway.status.clone(),
+            description: gateway.description.clone(),
+            created_at: Some(crate::state::timestamp(gateway.created_at)),
+            updated_at: Some(crate::state::timestamp(gateway.updated_at)),
+            domain_name: gateway.domain_name.clone(),
+            port: gateway.port,
+            protocol: gateway.protocol.clone(),
+            listener_config: gateway.listener_config.clone(),
+            trust_store_configuration: gateway.trust_store_configuration.clone(),
+            managed_endpoint_configuration: gateway.managed_endpoint_configuration.clone(),
+            tags: (!gateway.tags.is_empty()).then(|| gateway.tags.clone()),
+            // Derived, never stored: the links this gateway is an end of.
+            active_links_count: Some(counts.active),
+            total_links_count: Some(counts.total),
+            links_requested_count: Some(counts.requested),
+            gateway_type: gateway.gateway_type.clone(),
+            external_inbound_endpoint: gateway.external_inbound_endpoint.clone(),
+            client_routing_policy: gateway.client_routing_policy.clone(),
+        })
     }
 }

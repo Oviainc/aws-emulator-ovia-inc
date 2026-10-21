@@ -16,10 +16,15 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `time` is needed by this crate's tests, which wait for a clock-owed status
+# transition to come due (`tokio::time::sleep`).
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# SHA-256 for the fixed-size digests the idempotency store is keyed and compared
+# by, so a caller-chosen clientToken cannot grow the bytes retained per record.
+sha2 = { workspace = true }
 tracing = { workspace = true }
 
 [build-dependencies]
