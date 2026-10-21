@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePortfolio
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePortfolio`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePortfolio::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +147,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePortfolio` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePortfolioErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut state = state.lock();
+
+        // `IdempotencyToken` is `@idempotencyToken`: "If multiple requests differ only
+        // by the idempotency token, the same response is returned for each repeated
+        // request" — so a token already seen REPLAYS the portfolio it created rather
+        // than minting a second one. A token whose portfolio has since been deleted is
+        // no longer a replay, and falls through to a fresh create below.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePortfolio"))
+        // The replay keys on the TOKEN ALONE, deliberately: this operation's model
+        // declares no mismatch error (its errors are InvalidParameters, LimitExceeded
+        // and TagOptionNotMigrated), so there is no faithful way to refuse a token
+        // reused with different members, and inventing one would answer a code AWS
+        // never sends here.
+        if let Some(existing) = state.idempotency.get(&input.idempotency_token).cloned() {
+            if let Some(portfolio) = state.portfolios.get(&existing) {
+                return Ok(CreatePortfolioOutput {
+                    portfolio_detail: Some(portfolio.detail()),
+                    tags: Some(portfolio.tag_list()),
+                });
+            }
+        }
+
+        // The account's portfolio quota. Refused before anything is stored, so a
+        // caller cannot grow the store past it by repeating the call.
+        if state.portfolios.len() >= crate::state::MAX_PORTFOLIOS {
+            return Err(CreatePortfolioErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "An account cannot hold more than {} portfolios.",
+                        crate::state::MAX_PORTFOLIOS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A portfolio holds each tag key once, so a repeated key in `Tags` collapses to
+        // its last value. The modelled 0..20 bound on the input list is already
+        // enforced by the time this handler runs.
+        let tags: std::collections::BTreeMap<String, String> = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        let id = state.next_portfolio_id();
+        // AWS addresses Service Catalog resources under the `catalog` ARN namespace:
+        // the IAM service-authorization reference gives a portfolio as
+        // `arn:${Partition}:catalog:${Region}:${Account}:portfolio/${PortfolioId}`.
+        let arn = ::emulator_server::emulator_arn(
+            "catalog",
+            &request_region(ctx),
+            &format!("portfolio/{id}"),
+        );
+        let portfolio = crate::state::Portfolio {
+            id: id.clone(),
+            arn,
+            display_name: input.display_name,
+            description: input.description,
+            provider_name: input.provider_name,
+            created_time: std::time::SystemTime::now(),
+            tags,
+        };
+
+        let detail = portfolio.detail();
+        let tag_list = portfolio.tag_list();
+        state.portfolios.insert(id.clone(), portfolio);
+        state.idempotency.insert(input.idempotency_token, id);
+
+        Ok(CreatePortfolioOutput {
+            portfolio_detail: Some(detail),
+            tags: Some(tag_list),
+        })
     }
+}
+
+/// The region this request was signed for, which the minted ARN carries. Falls back
+/// to the emulator's default region for an unsigned request, which has no scope to
+/// read a region from.
+fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| "us-east-1".to_string())
 }
