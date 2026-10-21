@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopHumanLoop
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopHumanLoop`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopHumanLoop::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts an asynchronous stop of one persisted human loop: the record moves to `Stopping`
+//! and the clock settles it on `Stopped` after
+//! [`crate::state::STOP_SETTLE_DELAY`].
 //!
 //! ## Shape of an operation
 //!
@@ -142,17 +137,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopHumanLoop` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopHumanLoopErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopHumanLoop"))
+        // request metadata, which this operation does not need.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StopHumanLoopErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the human-loop store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(human_loop) = store.human_loops.get_mut(&input.human_loop_name) else {
+            return Err(StopHumanLoopErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Human loop with name {} does not exist.",
+                        input.human_loop_name
+                    )),
+                },
+            )
+            .into());
+        };
+        human_loop.settle(now);
+
+        // Only an open loop can be stopped: a loop that already reached a terminal status
+        // keeps it, and a stop already in flight is not restarted, so repeating the call
+        // neither moves a settled status back nor extends the pending one.
+        if human_loop.status == crate::state::HumanLoopStatus::InProgress {
+            human_loop.status = crate::state::HumanLoopStatus::Stopping;
+            human_loop.pending_status = Some((
+                now.checked_add(crate::state::STOP_SETTLE_DELAY).unwrap_or(now),
+                crate::state::HumanLoopStatus::Stopped,
+            ));
+        }
+
+        Ok(StopHumanLoopOutput {})
     }
 }
