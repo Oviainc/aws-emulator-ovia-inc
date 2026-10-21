@@ -85,7 +85,9 @@ pub fn build_router(engine: Arc<InMemoryEngine>) -> MultiServiceRouter {
     let router = mount_chunk_06(router, &engine);
     let router = mount_chunk_07(router, &engine);
     let router = mount_chunk_08(router, &engine);
-    mount_chunk_09(router, &engine)
+    let router = mount_chunk_09(router, &engine);
+    let router = mount_chunk_10(router, &engine);
+    mount_chunk_11(router, &engine)
 }
 
 /// Register services 00 of this workspace on `router`.
@@ -304,7 +306,56 @@ fn mount_chunk_09(
     mut router: MultiServiceRouter,
     engine: &Arc<InMemoryEngine>,
 ) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_computeoptimizer_computeoptimizerservice::EmulatedService::new(engine.clone()));
     router.register_service(service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_configservice_starlingdoveservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_connect_amazonconnectservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_connectcampaigns_amazonconnectcampaignservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_connectcases_amazonconnectcases::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_connectcontactlens_amazonconnectcontactlens::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_connecthealth_connecthealth::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_connectparticipant_amazonconnectparticipantservicelambda::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_controlcatalog_controlcatalog::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 10 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_10(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_controltower_awscontroltowerapis::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_costandusagereportservice_awsorigamiservicegatewayservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_costexplorer_awsinsightsindexservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_costoptimizationhub_costoptimizationhubservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_customerprofiles_customerprofiles_20200815::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_databasemigrationservice_amazondmsv20160101::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_databrew_awsgluedatabrew::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_dataexchange_dataexchange::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_datapipeline_datapipeline::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_datasync_fmrsservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_datazone_datazone::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 11 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_11(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_dax_amazondaxv3::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_deadline_deadline::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_detective_amazondetective::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_devicefarm_devicefarm_20150623::EmulatedService::new(engine.clone()));
     router
 }
 

@@ -99,7 +99,32 @@ members = [
     "services/service-com-amazonaws-cognitosync-awscognitosyncservice",
     "services/service-com-amazonaws-comprehend-comprehend-20171127",
     "services/service-com-amazonaws-comprehendmedical-comprehendmedical-20181030",
+    "services/service-com-amazonaws-computeoptimizer-computeoptimizerservice",
     "services/service-com-amazonaws-computeoptimizerautomation-computeoptimizerautomationservice",
+    "services/service-com-amazonaws-configservice-starlingdoveservice",
+    "services/service-com-amazonaws-connect-amazonconnectservice",
+    "services/service-com-amazonaws-connectcampaigns-amazonconnectcampaignservice",
+    "services/service-com-amazonaws-connectcampaignsv2-amazonconnectcampaignservicev2",
+    "services/service-com-amazonaws-connectcases-amazonconnectcases",
+    "services/service-com-amazonaws-connectcontactlens-amazonconnectcontactlens",
+    "services/service-com-amazonaws-connecthealth-connecthealth",
+    "services/service-com-amazonaws-connectparticipant-amazonconnectparticipantservicelambda",
+    "services/service-com-amazonaws-controlcatalog-controlcatalog",
+    "services/service-com-amazonaws-controltower-awscontroltowerapis",
+    "services/service-com-amazonaws-costandusagereportservice-awsorigamiservicegatewayservice",
+    "services/service-com-amazonaws-costexplorer-awsinsightsindexservice",
+    "services/service-com-amazonaws-costoptimizationhub-costoptimizationhubservice",
+    "services/service-com-amazonaws-customerprofiles-customerprofiles-20200815",
+    "services/service-com-amazonaws-databasemigrationservice-amazondmsv20160101",
+    "services/service-com-amazonaws-databrew-awsgluedatabrew",
+    "services/service-com-amazonaws-dataexchange-dataexchange",
+    "services/service-com-amazonaws-datapipeline-datapipeline",
+    "services/service-com-amazonaws-datasync-fmrsservice",
+    "services/service-com-amazonaws-datazone-datazone",
+    "services/service-com-amazonaws-dax-amazondaxv3",
+    "services/service-com-amazonaws-deadline-deadline",
+    "services/service-com-amazonaws-detective-amazondetective",
+    "services/service-com-amazonaws-devicefarm-devicefarm-20150623",
     "core/router",
     "core/embedded",
 ]
@@ -234,7 +259,32 @@ service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice 
 service-com-amazonaws-cognitosync-awscognitosyncservice = { path = "services/service-com-amazonaws-cognitosync-awscognitosyncservice" }
 service-com-amazonaws-comprehend-comprehend-20171127 = { path = "services/service-com-amazonaws-comprehend-comprehend-20171127" }
 service-com-amazonaws-comprehendmedical-comprehendmedical-20181030 = { path = "services/service-com-amazonaws-comprehendmedical-comprehendmedical-20181030" }
+service-com-amazonaws-computeoptimizer-computeoptimizerservice = { path = "services/service-com-amazonaws-computeoptimizer-computeoptimizerservice" }
 service-com-amazonaws-computeoptimizerautomation-computeoptimizerautomationservice = { path = "services/service-com-amazonaws-computeoptimizerautomation-computeoptimizerautomationservice" }
+service-com-amazonaws-configservice-starlingdoveservice = { path = "services/service-com-amazonaws-configservice-starlingdoveservice" }
+service-com-amazonaws-connect-amazonconnectservice = { path = "services/service-com-amazonaws-connect-amazonconnectservice" }
+service-com-amazonaws-connectcampaigns-amazonconnectcampaignservice = { path = "services/service-com-amazonaws-connectcampaigns-amazonconnectcampaignservice" }
+service-com-amazonaws-connectcampaignsv2-amazonconnectcampaignservicev2 = { path = "services/service-com-amazonaws-connectcampaignsv2-amazonconnectcampaignservicev2" }
+service-com-amazonaws-connectcases-amazonconnectcases = { path = "services/service-com-amazonaws-connectcases-amazonconnectcases" }
+service-com-amazonaws-connectcontactlens-amazonconnectcontactlens = { path = "services/service-com-amazonaws-connectcontactlens-amazonconnectcontactlens" }
+service-com-amazonaws-connecthealth-connecthealth = { path = "services/service-com-amazonaws-connecthealth-connecthealth" }
+service-com-amazonaws-connectparticipant-amazonconnectparticipantservicelambda = { path = "services/service-com-amazonaws-connectparticipant-amazonconnectparticipantservicelambda" }
+service-com-amazonaws-controlcatalog-controlcatalog = { path = "services/service-com-amazonaws-controlcatalog-controlcatalog" }
+service-com-amazonaws-controltower-awscontroltowerapis = { path = "services/service-com-amazonaws-controltower-awscontroltowerapis" }
+service-com-amazonaws-costandusagereportservice-awsorigamiservicegatewayservice = { path = "services/service-com-amazonaws-costandusagereportservice-awsorigamiservicegatewayservice" }
+service-com-amazonaws-costexplorer-awsinsightsindexservice = { path = "services/service-com-amazonaws-costexplorer-awsinsightsindexservice" }
+service-com-amazonaws-costoptimizationhub-costoptimizationhubservice = { path = "services/service-com-amazonaws-costoptimizationhub-costoptimizationhubservice" }
+service-com-amazonaws-customerprofiles-customerprofiles-20200815 = { path = "services/service-com-amazonaws-customerprofiles-customerprofiles-20200815" }
+service-com-amazonaws-databasemigrationservice-amazondmsv20160101 = { path = "services/service-com-amazonaws-databasemigrationservice-amazondmsv20160101" }
+service-com-amazonaws-databrew-awsgluedatabrew = { path = "services/service-com-amazonaws-databrew-awsgluedatabrew" }
+service-com-amazonaws-dataexchange-dataexchange = { path = "services/service-com-amazonaws-dataexchange-dataexchange" }
+service-com-amazonaws-datapipeline-datapipeline = { path = "services/service-com-amazonaws-datapipeline-datapipeline" }
+service-com-amazonaws-datasync-fmrsservice = { path = "services/service-com-amazonaws-datasync-fmrsservice" }
+service-com-amazonaws-datazone-datazone = { path = "services/service-com-amazonaws-datazone-datazone" }
+service-com-amazonaws-dax-amazondaxv3 = { path = "services/service-com-amazonaws-dax-amazondaxv3" }
+service-com-amazonaws-deadline-deadline = { path = "services/service-com-amazonaws-deadline-deadline" }
+service-com-amazonaws-detective-amazondetective = { path = "services/service-com-amazonaws-detective-amazondetective" }
+service-com-amazonaws-devicefarm-devicefarm-20150623 = { path = "services/service-com-amazonaws-devicefarm-devicefarm-20150623" }
 
 # The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
 #

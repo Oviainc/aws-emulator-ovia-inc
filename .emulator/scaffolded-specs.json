@@ -397,8 +397,108 @@
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/comprehendmedical/service/2018-10-30/comprehendmedical-2018-10-30.json"
     },
     {
+      "shape_id": "com.amazonaws.computeoptimizer#ComputeOptimizerService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/compute-optimizer/service/2019-11-01/compute-optimizer-2019-11-01.json"
+    },
+    {
       "shape_id": "com.amazonaws.computeoptimizerautomation#ComputeOptimizerAutomationService",
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/compute-optimizer-automation/service/2025-09-22/compute-optimizer-automation-2025-09-22.json"
+    },
+    {
+      "shape_id": "com.amazonaws.configservice#StarlingDoveService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/config-service/service/2014-11-12/config-service-2014-11-12.json"
+    },
+    {
+      "shape_id": "com.amazonaws.connect#AmazonConnectService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/connect/service/2017-08-08/connect-2017-08-08.json"
+    },
+    {
+      "shape_id": "com.amazonaws.connectcampaigns#AmazonConnectCampaignService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/connectcampaigns/service/2021-01-30/connectcampaigns-2021-01-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.connectcampaignsv2#AmazonConnectCampaignServiceV2",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/connectcampaignsv2/service/2024-04-23/connectcampaignsv2-2024-04-23.json"
+    },
+    {
+      "shape_id": "com.amazonaws.connectcases#AmazonConnectCases",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/connectcases/service/2022-10-03/connectcases-2022-10-03.json"
+    },
+    {
+      "shape_id": "com.amazonaws.connectcontactlens#AmazonConnectContactLens",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/connect-contact-lens/service/2020-08-21/connect-contact-lens-2020-08-21.json"
+    },
+    {
+      "shape_id": "com.amazonaws.connecthealth#ConnectHealth",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/connecthealth/service/2025-01-29/connecthealth-2025-01-29.json"
+    },
+    {
+      "shape_id": "com.amazonaws.connectparticipant#AmazonConnectParticipantServiceLambda",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/connectparticipant/service/2018-09-07/connectparticipant-2018-09-07.json"
+    },
+    {
+      "shape_id": "com.amazonaws.controlcatalog#ControlCatalog",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/controlcatalog/service/2018-05-10/controlcatalog-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.controltower#AWSControlTowerApis",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/controltower/service/2018-05-10/controltower-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.costandusagereportservice#AWSOrigamiServiceGatewayService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/cost-and-usage-report-service/service/2017-01-06/cost-and-usage-report-service-2017-01-06.json"
+    },
+    {
+      "shape_id": "com.amazonaws.costexplorer#AWSInsightsIndexService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/cost-explorer/service/2017-10-25/cost-explorer-2017-10-25.json"
+    },
+    {
+      "shape_id": "com.amazonaws.costoptimizationhub#CostOptimizationHubService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/cost-optimization-hub/service/2022-07-26/cost-optimization-hub-2022-07-26.json"
+    },
+    {
+      "shape_id": "com.amazonaws.customerprofiles#CustomerProfiles_20200815",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/customer-profiles/service/2020-08-15/customer-profiles-2020-08-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.databasemigrationservice#AmazonDMSv20160101",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/database-migration-service/service/2016-01-01/database-migration-service-2016-01-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.databrew#AWSGlueDataBrew",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/databrew/service/2017-07-25/databrew-2017-07-25.json"
+    },
+    {
+      "shape_id": "com.amazonaws.dataexchange#DataExchange",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/dataexchange/service/2017-07-25/dataexchange-2017-07-25.json"
+    },
+    {
+      "shape_id": "com.amazonaws.datapipeline#DataPipeline",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/data-pipeline/service/2012-10-29/data-pipeline-2012-10-29.json"
+    },
+    {
+      "shape_id": "com.amazonaws.datasync#FmrsService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/datasync/service/2018-11-09/datasync-2018-11-09.json"
+    },
+    {
+      "shape_id": "com.amazonaws.datazone#DataZone",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/datazone/service/2018-05-10/datazone-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.dax#AmazonDAXV3",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/dax/service/2017-04-19/dax-2017-04-19.json"
+    },
+    {
+      "shape_id": "com.amazonaws.deadline#Deadline",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/deadline/service/2023-10-12/deadline-2023-10-12.json"
+    },
+    {
+      "shape_id": "com.amazonaws.detective#AmazonDetective",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/detective/service/2018-10-26/detective-2018-10-26.json"
+    },
+    {
+      "shape_id": "com.amazonaws.devicefarm#DeviceFarm_20150623",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/device-farm/service/2015-06-23/device-farm-2015-06-23.json"
     }
   ]
 }
