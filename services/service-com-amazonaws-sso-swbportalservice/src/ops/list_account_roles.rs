@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAccountRoles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAccountRoles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAccountRoles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the roles assigned to the presented sign-in session in ONE account, a page
+//! at a time, from [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +148,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAccountRoles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAccountRolesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAccountRoles"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // UNREACHABLE with the engine the router mounts (see `ListAccounts` for the
+            // full note): answered rather than panicked, and the 429 is the only
+            // modelled error that does not blame the caller.
+            return Err(ListAccountRolesErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some("the SSO portal store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let state = state.lock();
+        let Some(session) = state.session(&input.access_token, now) else {
+            return Err(ListAccountRolesErrorModeled::UnauthorizedException(
+                UnauthorizedException {
+                    message: Some(
+                        "the access token presented in x-amz-sso_bearer_token is not a valid \
+                         IAM Identity Center sign-in session"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // An account the presented session is not assigned to does not exist as far as
+        // that session is concerned.
+        let Some(account) = state.visible_account(session, &input.account_id) else {
+            return Err(ListAccountRolesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no account {} is assigned to this sign-in session",
+                        input.account_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let assigned = account.roles.iter().map(|role_name| {
+            (
+                role_name.clone(),
+                RoleInfo {
+                    role_name: Some(role_name.clone()),
+                    account_id: Some(account.account_id.clone()),
+                },
+            )
+        });
+        // The cursor is scoped to this account's role listing AND to this session, so a
+        // token issued for another account's roles, or to another sign-in, cannot be
+        // continued here.
+        let page = crate::state::page_of(
+            assigned,
+            &crate::state::cursor_scope(
+                &format!("roles:{}", account.account_id),
+                &input.access_token,
+            ),
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|_| {
+            ListAccountRolesErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(
+                    "nextToken is not a page token this operation issued for this listing"
+                        .to_string(),
+                ),
+            })
+        })?;
+
+        Ok(ListAccountRolesOutput {
+            next_token: page.next_token,
+            role_list: Some(page.items),
+        })
     }
 }

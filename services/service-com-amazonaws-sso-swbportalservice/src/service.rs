@@ -41,9 +41,141 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// This service's modeled endpoint prefix (`portal.sso`), as `OPERATIONS.md` and the
+/// model's `awsService` trait give it. Used by [`EmulatedService::can_handle`] to claim
+/// an unsigned request addressed to the portal endpoint.
+const PORTAL_ENDPOINT_PREFIX: &str = "portal.sso";
+
+/// The host a request is addressed to, from the `Host` header or (HTTP/2) the URI
+/// authority, lowercased with any `:port` removed. `None` when the request names none.
+fn endpoint_host(parts: &http::request::Parts) -> Option<String> {
+    let host = parts
+        .headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| parts.uri.authority().map(|a| a.as_str().to_string()))?;
+    let without_userinfo = host.rsplit('@').next().unwrap_or(&host).to_string();
+    let without_port = without_userinfo
+        .split(':')
+        .next()
+        .unwrap_or(&without_userinfo)
+        .to_ascii_lowercase();
+    (!without_port.is_empty()).then_some(without_port)
+}
+
+/// Where an http-bound member rides on the wire.
+enum BoundIn {
+    Header,
+    Query,
+}
+
+/// One `@required` http-bound member of a route: the Smithy member name, where it
+/// rides, and the name it rides under.
+struct RequiredMember {
+    member: &'static str,
+    bound_in: BoundIn,
+    name: &'static str,
+}
+
+const ACCESS_TOKEN: RequiredMember = RequiredMember {
+    member: "accessToken",
+    bound_in: BoundIn::Header,
+    name: "x-amz-sso_bearer_token",
+};
+const ACCOUNT_ID: RequiredMember = RequiredMember {
+    member: "accountId",
+    bound_in: BoundIn::Query,
+    name: "account_id",
+};
+const ROLE_NAME: RequiredMember = RequiredMember {
+    member: "roleName",
+    bound_in: BoundIn::Query,
+    name: "role_name",
+};
+
+/// Every route this service serves and the `@required` http-bound members of each, as
+/// the model declares them (`OPERATIONS.md` lists the same four).
+///
+/// `restJson1` selects a route only when every one of those members is on the request,
+/// so a request that omits one matches no operation at all. This table is what lets
+/// [`Service::override_routing_error`] tell that case — a readable request missing a
+/// required parameter — from a path this service does not serve.
+///
+/// DRIFT: this is model-derived data held by hand, because the generated
+/// `ServiceDefinition`'s routing table exposes no required-member set to read it from.
+/// A route or required member the model gains and this table misses is not answered
+/// WRONGLY, just unreworded — the request falls back to the framework's routing
+/// answer. The invalid-request test in `tests/all/portal_session.rs` carries one row
+/// per (route, required member) pair here, so a row that disagrees with the model
+/// fails there.
+const ROUTES: &[(&str, &str, &[RequiredMember])] = &[
+    ("GET", "/assignment/accounts", &[ACCESS_TOKEN]),
+    ("GET", "/assignment/roles", &[ACCESS_TOKEN, ACCOUNT_ID]),
+    (
+        "GET",
+        "/federation/credentials",
+        &[ACCESS_TOKEN, ACCOUNT_ID, ROLE_NAME],
+    ),
+    ("POST", "/logout", &[ACCESS_TOKEN]),
+];
+
+/// The path portion of a request URI: no scheme, no authority, no query string.
+///
+/// DUPLICATION, knowingly: the framework has the same splitter in
+/// `vendor/smithy-schema-server/src/rest_xml.rs` (`pub(crate) fn request_path`), which
+/// is crate-private and so unreachable from a service crate; the vendored tree is
+/// read-only from here, so it cannot be exposed in this change. Reconcile the two by
+/// making that one public. It is used only to recognise one of this service's own four
+/// literal routes, never to bind a value out of the path.
+fn request_path(uri: &str) -> &str {
+    let without_query = uri.split('?').next().unwrap_or(uri);
+    if without_query.starts_with('/') {
+        return without_query;
+    }
+    // Absolute form (scheme, authority, then the path): the path starts at the third
+    // slash, and there is none when the URI names only an authority.
+    without_query
+        .match_indices('/')
+        .nth(2)
+        .map_or("/", |(index, _)| &without_query[index..])
+}
+
+/// Whether the request's query string carries `name` as a key, with or without a value
+/// — the same presence test the REST router applies to a required query binding.
+fn query_has(uri: &str, name: &str) -> bool {
+    let Some((_, query)) = uri.split_once('?') else {
+        return false;
+    };
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .any(|pair| pair.split_once('=').map_or(pair, |(key, _)| key) == name)
+}
+
+/// The `@required` members of `req`'s route that are absent from it, or `None` when
+/// `req` names no route this service serves.
+fn absent_required_members(req: &aws_smithy_runtime_api::http::Request) -> Option<Vec<String>> {
+    let uri = req.uri();
+    let path = request_path(uri);
+    let (.., required) = ROUTES
+        .iter()
+        .find(|(method, route, _)| *method == req.method() && *route == path)?;
+    Some(
+        required
+            .iter()
+            .filter(|member| match member.bound_in {
+                BoundIn::Header => req.headers().get(member.name).is_none(),
+                BoundIn::Query => !query_has(uri, member.name),
+            })
+            .map(|member| member.member.to_string())
+            .collect(),
+    )
+}
 
 /// The `com-amazonaws-sso-swbportalservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -74,13 +206,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+        let resolved = smithy_server_runtime::resolve_route_key(parts);
+        // Claim a request whose resolved route key is this service's signing name
+        // (`awsssoportal`).
+        if resolved.as_deref() == Some(self.entry.identity().signing_name()) {
+            return true;
         }
+        // ... and also one addressed to this service's ENDPOINT, which the model does
+        // express but the routing key cannot carry: every portal operation is
+        // `@optionalAuth` with an empty `@auth`, so an SDK sends it unsigned and there
+        // is no SigV4 credential scope to resolve. The host-style fallback then yields
+        // only the endpoint's first label (`portal`), which is not the signing name, and
+        // the request would reach no service at all.
+        let Some(host) = endpoint_host(parts) else {
+            return false;
+        };
+        // Only when nothing stronger than the host named a service: a SigV4 credential
+        // scope or an `X-Amz-Target` naming another service wins, so a request meant for
+        // someone else is never claimed here (two claimants are an error to the router).
+        if resolved.is_some_and(|key| Some(key.as_str()) != host.split('.').next()) {
+            return false;
+        }
+        host == PORTAL_ENDPOINT_PREFIX
+            || host
+                .strip_prefix(PORTAL_ENDPOINT_PREFIX)
+                .is_some_and(|rest| rest.starts_with('.'))
     }
 
     fn override_operation(
@@ -96,16 +246,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
+        // This service states a request it will not read as `InvalidRequestException`,
+        // the error its model declares for exactly that — "a required parameter might
+        // be missing or out of range" — rather than the framework's generic
+        // `ValidationException`. The status (400) is the protocol's and matches the
+        // modelled `@httpError`. Both the code and the message are replaced together.
+        if let Refusal::Invalid(violations) = refusal {
+            return Some(Refused {
+                code: "InvalidRequestException".to_string(),
+                message: aws_smithy_schema_server::envelope(violations)
+                    .unwrap_or_else(|| "the request is not valid".to_string()),
+            });
+        }
+        // Every other refusal class (an unauthenticated caller) keeps the
+        // framework's default wording: this service's model declares no error for it.
         None
     }
 
@@ -113,14 +267,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<aws_smithy_runtime_api::http::Response> {
-        // The router calls this when a request reached this service but named no
-        // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // A request that named no operation but DOES name one of this service's routes
+        // got there by omitting a required, http-bound member: the REST router selects a
+        // route only when every one of them is present. That is a missing required
+        // parameter, which this service's model has an error for
+        // (`InvalidRequestException`, "a required parameter might be missing or out of
+        // range"), so it is stated as that rather than as "not implemented".
+        let absent = absent_required_members(req)?;
+        let violations: Vec<aws_smithy_schema_server::Violation> = absent
+            .into_iter()
+            .map(|member| aws_smithy_schema_server::Violation {
+                path: member,
+                kind: aws_smithy_schema_server::ViolationKind::MissingRequiredMember,
+                value: None,
+            })
+            .collect();
+        // Nothing was absent after all, so the miss is not about a required member and
+        // the framework's own routing answer stands.
+        let message = aws_smithy_schema_server::envelope(&violations)?;
+        Some(self.entry.refusal_response(
+            aws_smithy_schema_server::ProtocolError::Invalid(violations),
+            Some(Refused {
+                code: "InvalidRequestException".to_string(),
+                message,
+            }),
+        ))
     }
 
     fn override_framework_error(

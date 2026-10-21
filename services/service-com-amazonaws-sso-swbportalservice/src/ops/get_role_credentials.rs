@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRoleCredentials
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRoleCredentials`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRoleCredentials::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints — and stores — the role-session credentials for one (account, role) the
+//! presented sign-in session is assigned to. The spec for this operation is to RETURN
+//! short-term credentials, so minting here is the operation's own job; the id and both
+//! secrets come from the emulator's credential store, and the record is kept in
+//! [`crate::state`] so the same session asking again sees the same credential until it
+//! expires.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +149,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRoleCredentials` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRoleCredentialsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRoleCredentials"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // UNREACHABLE with the engine the router mounts (see `ListAccounts` for the
+            // full note): answered rather than panicked, and the 429 is the only
+            // modelled error that does not blame the caller.
+            return Err(GetRoleCredentialsErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some("the SSO portal store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+
+        // Resolve the session, then the assignment, before anything is minted. Both
+        // answers are read out as plain values so the shared borrow of the store ends
+        // here and the issuing step below can write.
+        let role_assigned = match state.session(&input.access_token, now) {
+            Some(session) => state
+                .visible_account(session, &input.account_id)
+                .is_some_and(|account| account.roles.contains(&input.role_name)),
+            None => {
+                return Err(GetRoleCredentialsErrorModeled::UnauthorizedException(
+                    UnauthorizedException {
+                        message: Some(
+                            "the access token presented in x-amz-sso_bearer_token is not a \
+                             valid IAM Identity Center sign-in session"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
+        if !role_assigned {
+            // Either the account is not one this session can see or the role is not
+            // assigned in it: either way there is no such role session to return.
+            return Err(GetRoleCredentialsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "role {} is not assigned to this sign-in session in account {}",
+                        input.role_name, input.account_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let key = (
+            input.access_token.clone(),
+            input.account_id.clone(),
+            input.role_name.clone(),
+        );
+        let held = state
+            .issued_credentials
+            .get(&key)
+            .filter(|record| record.is_valid_at(now))
+            .cloned();
+        let record = match held {
+            Some(record) => record,
+            None => {
+                // A record that is present but past its expiration is spent: forget the
+                // credential it names before minting its replacement, so the emulator
+                // stops accepting it.
+                if let Some(spent) = state.issued_credentials.remove(&key) {
+                    let _ = ctx.credential_store().delete(&spent.access_key_id);
+                }
+                // The emulator mints every id and secret: a handler never invents one.
+                let minted = ctx
+                    .credential_store()
+                    .create(&::emulator_server::aws_credentials::AWS_SESSION);
+                let secrets = (
+                    minted.secret(::emulator_server::aws_credentials::SECRET_ACCESS_KEY),
+                    minted.secret(::emulator_server::aws_credentials::SESSION_TOKEN),
+                );
+                let (Some(secret_access_key), Some(session_token)) = secrets else {
+                    // The session kind always mints both secrets, so this is an
+                    // emulator-side fault rather than anything the caller can fix.
+                    return Err(GetRoleCredentialsErrorModeled::TooManyRequestsException(
+                        TooManyRequestsException {
+                            message: Some(
+                                "the emulator could not mint role session credentials"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                let record = crate::state::RoleCredentialRecord {
+                    access_key_id: minted.id.clone(),
+                    secret_access_key: secret_access_key.to_string(),
+                    session_token: session_token.to_string(),
+                    expiration_millis: crate::state::epoch_millis(
+                        now + crate::state::ROLE_SESSION_DURATION,
+                    ),
+                };
+                state.issued_credentials.insert(key, record.clone());
+                record
+            }
+        };
+
+        Ok(GetRoleCredentialsOutput {
+            role_credentials: Some(RoleCredentials {
+                access_key_id: Some(record.access_key_id),
+                secret_access_key: Some(record.secret_access_key),
+                session_token: Some(record.session_token),
+                expiration: record.expiration_millis,
+            }),
+        })
     }
 }

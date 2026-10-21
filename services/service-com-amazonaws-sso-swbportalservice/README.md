@@ -105,3 +105,22 @@ State lives in the SINGLE shared engine, keyed by type. Reach it through
 Do not add a second engine crate — the router and every service must share
 one `InMemoryEngine` type or the engine the router injects cannot be handed to this
 service's operations.
+
+## Seeding the portal fixture
+
+The portal API is read-only: it has no operation that creates a sign-in session, an
+account or a role assignment. A session is minted by the OIDC service's `CreateToken`,
+and the assignments are made by an administrator — so the emulator takes them through
+`state.rs` instead, and the four operations only ever report what is there:
+
+```rust
+let store = service_com_amazonaws_sso_swbportalservice::state::service_state(&*engine)
+    .expect("the portal store");
+let mut store = store.lock();
+store.put_account("111111111111", "Production", "production@example.com", ["AdministratorAccess", "ReadOnly"]);
+store.put_session("tok-1", "alice@example.com", ["111111111111"], std::time::Duration::from_secs(8 * 60 * 60));
+```
+
+With nothing seeded there are no sessions, so every operation answers
+`UnauthorizedException` (401) — which is what a portal holding no sign-in sessions
+should say. `tests/all/portal_session.rs` drives the whole loop through HTTP.

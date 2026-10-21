@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAccounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAccounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAccounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the accounts the presented sign-in session is assigned to, a page at a
+//! time, from [`crate::state`] — the accounts an administrator's assignments put
+//! there, never a synthesized list.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +149,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAccounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAccountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAccounts"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // UNREACHABLE with the engine the router mounts: `service_state` answers
+            // `None` only when the service was built on something that is not the shared
+            // `InMemoryEngine`. It is still answered rather than panicked (a panic
+            // renders as a 500 the real service never gives). Of the errors this
+            // operation models, the 429 is the only one that says "not your request's
+            // fault" — the model declares no server-fault error, and a 501 would claim
+            // the operation is unwritten.
+            return Err(ListAccountsErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some("the SSO portal store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let state = state.lock();
+        // Reporting only: a listing writes nothing, so an expired session is simply not
+        // usable here rather than being swept.
+        let Some(session) = state.session(&input.access_token, now) else {
+            return Err(ListAccountsErrorModeled::UnauthorizedException(UnauthorizedException {
+                message: Some(
+                    "the access token presented in x-amz-sso_bearer_token is not a valid \
+                     IAM Identity Center sign-in session"
+                        .to_string(),
+                ),
+            })
+            .into());
+        };
+
+        let assigned = state.visible_accounts(session).into_iter().map(|account| {
+            (
+                account.account_id.clone(),
+                AccountInfo {
+                    account_id: Some(account.account_id.clone()),
+                    account_name: Some(account.account_name.clone()),
+                    email_address: Some(account.email_address.clone()),
+                },
+            )
+        });
+        let page = crate::state::page_of(
+            assigned,
+            &crate::state::cursor_scope("accounts", &input.access_token),
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|_| {
+            ListAccountsErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(
+                    "nextToken is not a page token this operation issued for this listing"
+                        .to_string(),
+                ),
+            })
+        })?;
+
+        Ok(ListAccountsOutput {
+            next_token: page.next_token,
+            account_list: Some(page.items),
+        })
     }
 }
