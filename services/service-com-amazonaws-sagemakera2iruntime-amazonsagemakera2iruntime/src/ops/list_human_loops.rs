@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListHumanLoops
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListHumanLoops`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListHumanLoops::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the persisted human loops of one flow definition, filtered by creation time,
+//! ordered on creation time and paged with an opaque token built from the position already
+//! returned. A reporting operation: the only write it makes is settling status transitions
+//! the clock had already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -163,17 +159,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListHumanLoops` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListHumanLoopsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListHumanLoops"))
+        // request metadata, which this reporting operation does not need.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListHumanLoopsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the human-loop store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A2I orders on CreationTime and defaults to Descending (newest first). The enum
+        // itself is already refused at the boundary, so the last arm cannot be reached by a
+        // modelled value — it refuses anything else rather than silently picking an order.
+        let descending = match input.sort_order.as_deref() {
+            None | Some("Descending") => true,
+            Some("Ascending") => false,
+            Some(other) => {
+                return Err(ListHumanLoopsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "SortOrder must be one of {:?}, got {other}",
+                            SORT_ORDER_VALUES
+                        )),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // The page already returned, as the sort key of its last summary.
+        let resume_after = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListHumanLoopsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "NextToken is not a pagination token issued by ListHumanLoops"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let after = input.creation_time_after.as_ref().map(crate::state::date_time_millis);
+        let before = input
+            .creation_time_before
+            .as_ref()
+            .map(crate::state::date_time_millis);
+
+        // `MaxResults` is already range-checked (1..100) at the boundary; absent, the page
+        // is the model's maximum page size, so one request is never served the whole store.
+        // Clamped as well, so the bound holds whatever reaches the handler.
+        let limit = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::HUMAN_LOOP_PAGE_LIMIT)
+            .clamp(1, crate::state::HUMAN_LOOP_PAGE_LIMIT);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // ONE bounded pass over the store: every record is settled (a transition the clock
+        // had already made due, so a list never changes what a later caller would otherwise
+        // have seen) and, when it matches, its SORT KEY alone is offered to a set that never
+        // holds more than one page plus the one row that proves another page remains. The
+        // keys, not the records, are what is sorted, so the work and the memory held under
+        // the state lock are bounded by the page size rather than by the store.
+        let mut keys: ::std::collections::BTreeSet<(i64, String)> =
+            ::std::collections::BTreeSet::new();
+        for human_loop in store.human_loops.values_mut() {
+            human_loop.settle(now);
+            if human_loop.flow_definition_arn != input.flow_definition_arn {
+                continue;
+            }
+            let created = crate::state::epoch_millis(human_loop.creation_time);
+            if after.is_some_and(|bound| created < bound)
+                || before.is_some_and(|bound| created > bound)
+            {
+                continue;
+            }
+            let key = human_loop.sort_key();
+            // Drop everything at or before the position the token names. Comparing keys
+            // rather than counting rows keeps a token resolvable after the loop it names is
+            // deleted.
+            if let Some(resume) = resume_after.as_ref() {
+                let already_returned = if descending {
+                    key >= *resume
+                } else {
+                    key <= *resume
+                };
+                if already_returned {
+                    continue;
+                }
+            }
+            keys.insert(key);
+            if keys.len() > limit + 1 {
+                // Keep the end of the order this request asked for.
+                if descending {
+                    keys.pop_first();
+                } else {
+                    keys.pop_last();
+                }
+            }
+        }
+
+        let mut ordered: Vec<(i64, String)> = keys.into_iter().collect();
+        if descending {
+            ordered.reverse();
+        }
+        let more_remain = ordered.len() > limit;
+        ordered.truncate(limit);
+        let next_token = if more_remain {
+            ordered.last().map(crate::state::encode_page_token)
+        } else {
+            None
+        };
+
+        let human_loop_summaries = ordered
+            .iter()
+            .filter_map(|(_, name)| store.human_loops.get(name))
+            .map(|human_loop| HumanLoopSummary {
+                human_loop_name: Some(human_loop.name.clone()),
+                human_loop_status: Some(human_loop.status.as_wire().to_string()),
+                creation_time: Some(crate::state::to_date_time(human_loop.creation_time)),
+                failure_reason: human_loop.failure_reason.clone(),
+                flow_definition_arn: Some(human_loop.flow_definition_arn.clone()),
+            })
+            .collect();
+
+        Ok(ListHumanLoopsOutput {
+            human_loop_summaries,
+            next_token,
+        })
     }
 }
