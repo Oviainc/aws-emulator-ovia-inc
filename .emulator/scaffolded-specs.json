@@ -1299,6 +1299,106 @@
     {
       "shape_id": "com.amazonaws.rdsdata#RdsDataService",
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/rds-data/service/2018-08-01/rds-data-2018-08-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.redshift#RedshiftServiceVersion20121201",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/redshift/service/2012-12-01/redshift-2012-12-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.redshiftdata#RedshiftData",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/redshift-data/service/2019-12-20/redshift-data-2019-12-20.json"
+    },
+    {
+      "shape_id": "com.amazonaws.redshiftserverless#RedshiftServerless",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/redshift-serverless/service/2021-04-21/redshift-serverless-2021-04-21.json"
+    },
+    {
+      "shape_id": "com.amazonaws.rekognition#RekognitionService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/rekognition/service/2016-06-27/rekognition-2016-06-27.json"
+    },
+    {
+      "shape_id": "com.amazonaws.repostspace#RepostSpace",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/repostspace/service/2022-05-13/repostspace-2022-05-13.json"
+    },
+    {
+      "shape_id": "com.amazonaws.resiliencehub#AwsResilienceHub",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/resiliencehub/service/2020-04-30/resiliencehub-2020-04-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.resiliencehubv2#NGRHServiceCore",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/resiliencehubv2/service/2026-02-17/resiliencehubv2-2026-02-17.json"
+    },
+    {
+      "shape_id": "com.amazonaws.resourceexplorer2#ResourceExplorer",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/resource-explorer-2/service/2022-07-28/resource-explorer-2-2022-07-28.json"
+    },
+    {
+      "shape_id": "com.amazonaws.resourcegroups#Ardi",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/resource-groups/service/2017-11-27/resource-groups-2017-11-27.json"
+    },
+    {
+      "shape_id": "com.amazonaws.resourcegroupstaggingapi#ResourceGroupsTaggingAPI_20170126",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/resource-groups-tagging-api/service/2017-01-26/resource-groups-tagging-api-2017-01-26.json"
+    },
+    {
+      "shape_id": "com.amazonaws.rolesanywhere#RolesAnywhere",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/rolesanywhere/service/2018-05-10/rolesanywhere-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.route53#AWSDnsV20130401",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/route-53/service/2013-04-01/route-53-2013-04-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.route53domains#Route53Domains_v20140515",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/route-53-domains/service/2014-05-15/route-53-domains-2014-05-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.route53globalresolver#EC2DNSGlobalResolverCustomerAPI",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/route53globalresolver/service/2022-09-27/route53globalresolver-2022-09-27.json"
+    },
+    {
+      "shape_id": "com.amazonaws.route53profiles#Route53Profiles",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/route53profiles/service/2018-05-10/route53profiles-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.route53recoverycluster#ToggleCustomerAPI",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/route53-recovery-cluster/service/2019-12-02/route53-recovery-cluster-2019-12-02.json"
+    },
+    {
+      "shape_id": "com.amazonaws.route53recoverycontrolconfig#Route53RecoveryControlConfig",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/route53-recovery-control-config/service/2020-11-02/route53-recovery-control-config-2020-11-02.json"
+    },
+    {
+      "shape_id": "com.amazonaws.route53recoveryreadiness#Route53RecoveryReadiness",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/route53-recovery-readiness/service/2019-12-02/route53-recovery-readiness-2019-12-02.json"
+    },
+    {
+      "shape_id": "com.amazonaws.route53resolver#Route53Resolver",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/route53resolver/service/2018-04-01/route53resolver-2018-04-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.rtbfabric#RTBFabric",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/rtbfabric/service/2023-05-15/rtbfabric-2023-05-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.rum#RUM",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/rum/service/2018-05-10/rum-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.s3#AmazonS3",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/s3/service/2006-03-01/s3-2006-03-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.s3control#AWSS3ControlServiceV20180820",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/s3-control/service/2018-08-20/s3-control-2018-08-20.json"
+    },
+    {
+      "shape_id": "com.amazonaws.s3files#S3Files",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/s3files/service/2025-05-05/s3files-2025-05-05.json"
+    },
+    {
+      "shape_id": "com.amazonaws.s3outposts#S3Outposts",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/s3outposts/service/2017-07-25/s3outposts-2017-07-25.json"
     }
   ]
 }

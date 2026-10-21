@@ -325,6 +325,31 @@ members = [
     "services/service-com-amazonaws-rbin-amazonrecyclebin",
     "services/service-com-amazonaws-rds-amazonrdsv19",
     "services/service-com-amazonaws-rdsdata-rdsdataservice",
+    "services/service-com-amazonaws-redshift-redshiftserviceversion20121201",
+    "services/service-com-amazonaws-redshiftdata-redshiftdata",
+    "services/service-com-amazonaws-redshiftserverless-redshiftserverless",
+    "services/service-com-amazonaws-rekognition-rekognitionservice",
+    "services/service-com-amazonaws-repostspace-repostspace",
+    "services/service-com-amazonaws-resiliencehub-awsresiliencehub",
+    "services/service-com-amazonaws-resiliencehubv2-ngrhservicecore",
+    "services/service-com-amazonaws-resourceexplorer2-resourceexplorer",
+    "services/service-com-amazonaws-resourcegroups-ardi",
+    "services/service-com-amazonaws-resourcegroupstaggingapi-resourcegroupstaggingapi-20170126",
+    "services/service-com-amazonaws-rolesanywhere-rolesanywhere",
+    "services/service-com-amazonaws-route53-awsdnsv20130401",
+    "services/service-com-amazonaws-route53domains-route53domains-v20140515",
+    "services/service-com-amazonaws-route53globalresolver-ec2dnsglobalresolvercustomerapi",
+    "services/service-com-amazonaws-route53profiles-route53profiles",
+    "services/service-com-amazonaws-route53recoverycluster-togglecustomerapi",
+    "services/service-com-amazonaws-route53recoverycontrolconfig-route53recoverycontrolconfig",
+    "services/service-com-amazonaws-route53recoveryreadiness-route53recoveryreadiness",
+    "services/service-com-amazonaws-route53resolver-route53resolver",
+    "services/service-com-amazonaws-rtbfabric-rtbfabric",
+    "services/service-com-amazonaws-rum-rum",
+    "services/service-com-amazonaws-s3-amazons3",
+    "services/service-com-amazonaws-s3control-awss3controlservicev20180820",
+    "services/service-com-amazonaws-s3files-s3files",
+    "services/service-com-amazonaws-s3outposts-s3outposts",
     "core/router",
     "core/embedded",
 ]
@@ -685,6 +710,31 @@ service-com-amazonaws-ram-amazonresourcesharing = { path = "services/service-com
 service-com-amazonaws-rbin-amazonrecyclebin = { path = "services/service-com-amazonaws-rbin-amazonrecyclebin" }
 service-com-amazonaws-rds-amazonrdsv19 = { path = "services/service-com-amazonaws-rds-amazonrdsv19" }
 service-com-amazonaws-rdsdata-rdsdataservice = { path = "services/service-com-amazonaws-rdsdata-rdsdataservice" }
+service-com-amazonaws-redshift-redshiftserviceversion20121201 = { path = "services/service-com-amazonaws-redshift-redshiftserviceversion20121201" }
+service-com-amazonaws-redshiftdata-redshiftdata = { path = "services/service-com-amazonaws-redshiftdata-redshiftdata" }
+service-com-amazonaws-redshiftserverless-redshiftserverless = { path = "services/service-com-amazonaws-redshiftserverless-redshiftserverless" }
+service-com-amazonaws-rekognition-rekognitionservice = { path = "services/service-com-amazonaws-rekognition-rekognitionservice" }
+service-com-amazonaws-repostspace-repostspace = { path = "services/service-com-amazonaws-repostspace-repostspace" }
+service-com-amazonaws-resiliencehub-awsresiliencehub = { path = "services/service-com-amazonaws-resiliencehub-awsresiliencehub" }
+service-com-amazonaws-resiliencehubv2-ngrhservicecore = { path = "services/service-com-amazonaws-resiliencehubv2-ngrhservicecore" }
+service-com-amazonaws-resourceexplorer2-resourceexplorer = { path = "services/service-com-amazonaws-resourceexplorer2-resourceexplorer" }
+service-com-amazonaws-resourcegroups-ardi = { path = "services/service-com-amazonaws-resourcegroups-ardi" }
+service-com-amazonaws-resourcegroupstaggingapi-resourcegroupstaggingapi-20170126 = { path = "services/service-com-amazonaws-resourcegroupstaggingapi-resourcegroupstaggingapi-20170126" }
+service-com-amazonaws-rolesanywhere-rolesanywhere = { path = "services/service-com-amazonaws-rolesanywhere-rolesanywhere" }
+service-com-amazonaws-route53-awsdnsv20130401 = { path = "services/service-com-amazonaws-route53-awsdnsv20130401" }
+service-com-amazonaws-route53domains-route53domains-v20140515 = { path = "services/service-com-amazonaws-route53domains-route53domains-v20140515" }
+service-com-amazonaws-route53globalresolver-ec2dnsglobalresolvercustomerapi = { path = "services/service-com-amazonaws-route53globalresolver-ec2dnsglobalresolvercustomerapi" }
+service-com-amazonaws-route53profiles-route53profiles = { path = "services/service-com-amazonaws-route53profiles-route53profiles" }
+service-com-amazonaws-route53recoverycluster-togglecustomerapi = { path = "services/service-com-amazonaws-route53recoverycluster-togglecustomerapi" }
+service-com-amazonaws-route53recoverycontrolconfig-route53recoverycontrolconfig = { path = "services/service-com-amazonaws-route53recoverycontrolconfig-route53recoverycontrolconfig" }
+service-com-amazonaws-route53recoveryreadiness-route53recoveryreadiness = { path = "services/service-com-amazonaws-route53recoveryreadiness-route53recoveryreadiness" }
+service-com-amazonaws-route53resolver-route53resolver = { path = "services/service-com-amazonaws-route53resolver-route53resolver" }
+service-com-amazonaws-rtbfabric-rtbfabric = { path = "services/service-com-amazonaws-rtbfabric-rtbfabric" }
+service-com-amazonaws-rum-rum = { path = "services/service-com-amazonaws-rum-rum" }
+service-com-amazonaws-s3-amazons3 = { path = "services/service-com-amazonaws-s3-amazons3" }
+service-com-amazonaws-s3control-awss3controlservicev20180820 = { path = "services/service-com-amazonaws-s3control-awss3controlservicev20180820" }
+service-com-amazonaws-s3files-s3files = { path = "services/service-com-amazonaws-s3files-s3files" }
+service-com-amazonaws-s3outposts-s3outposts = { path = "services/service-com-amazonaws-s3outposts-s3outposts" }
 
 # The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
 #
