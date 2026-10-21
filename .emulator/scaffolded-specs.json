@@ -1097,8 +1097,108 @@
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/mwaa-serverless/service/2024-07-26/mwaa-serverless-2024-07-26.json"
     },
     {
+      "shape_id": "com.amazonaws.neptune#AmazonRDSv19",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/neptune/service/2014-10-31/neptune-2014-10-31.json"
+    },
+    {
       "shape_id": "com.amazonaws.neptunedata#AmazonNeptuneDataplane",
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/neptunedata/service/2023-08-01/neptunedata-2023-08-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.neptunegraph#AmazonNeptuneGraph",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/neptune-graph/service/2023-11-29/neptune-graph-2023-11-29.json"
+    },
+    {
+      "shape_id": "com.amazonaws.networkfirewall#NetworkFirewall_20201112",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/network-firewall/service/2020-11-12/network-firewall-2020-11-12.json"
+    },
+    {
+      "shape_id": "com.amazonaws.networkflowmonitor#NetworkFlowMonitor",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/networkflowmonitor/service/2023-04-19/networkflowmonitor-2023-04-19.json"
+    },
+    {
+      "shape_id": "com.amazonaws.networkmanager#NetworkManager",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/networkmanager/service/2019-07-05/networkmanager-2019-07-05.json"
+    },
+    {
+      "shape_id": "com.amazonaws.networkmonitor#NetworkMonitor",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/networkmonitor/service/2023-08-01/networkmonitor-2023-08-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.networksecuritymanager#PiccoloCustomerAPIService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/network-security-manager/service/2025-10-30/network-security-manager-2025-10-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.notifications#Notifications",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/notifications/service/2018-05-10/notifications-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.notificationscontacts#NotificationsContacts",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/notificationscontacts/service/2018-05-10/notificationscontacts-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.novaact#AmazonNovaAgentsDataPlane",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/nova-act/service/2025-08-22/nova-act-2025-08-22.json"
+    },
+    {
+      "shape_id": "com.amazonaws.oam#oamservice",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/oam/service/2022-06-10/oam-2022-06-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.observabilityadmin#ObservabilityAdmin",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/observabilityadmin/service/2018-05-10/observabilityadmin-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.odb#Odb",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/odb/service/2024-08-20/odb-2024-08-20.json"
+    },
+    {
+      "shape_id": "com.amazonaws.omics#Omics",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/omics/service/2022-11-28/omics-2022-11-28.json"
+    },
+    {
+      "shape_id": "com.amazonaws.opensearch#AmazonOpenSearchService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/opensearch/service/2021-01-01/opensearch-2021-01-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.opensearchserverless#OpenSearchServerless",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/opensearchserverless/service/2021-11-01/opensearchserverless-2021-11-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.organizations#AWSOrganizationsV20161128",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/organizations/service/2016-11-28/organizations-2016-11-28.json"
+    },
+    {
+      "shape_id": "com.amazonaws.osis#AmazonOpenSearchIngestionService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/osis/service/2022-01-01/osis-2022-01-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.outposts#OutpostsOlafService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/outposts/service/2019-12-03/outposts-2019-12-03.json"
+    },
+    {
+      "shape_id": "com.amazonaws.partnercentralaccount#PartnerCentralAccount",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/partnercentral-account/service/2025-04-04/partnercentral-account-2025-04-04.json"
+    },
+    {
+      "shape_id": "com.amazonaws.partnercentralbenefits#PartnerCentralBenefitsService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/partnercentral-benefits/service/2018-05-10/partnercentral-benefits-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.partnercentralchannel#PartnerCentralChannel",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/partnercentral-channel/service/2024-03-18/partnercentral-channel-2024-03-18.json"
+    },
+    {
+      "shape_id": "com.amazonaws.partnercentralrevenuemeasurement#PartnerCentralRevenueMeasurement",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/partnercentral-revenue-measurement/service/2022-07-26/partnercentral-revenue-measurement-2022-07-26.json"
+    },
+    {
+      "shape_id": "com.amazonaws.partnercentralselling#AWSPartnerCentralSelling",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/partnercentral-selling/service/2022-07-26/partnercentral-selling-2022-07-26.json"
+    },
+    {
+      "shape_id": "com.amazonaws.paymentcryptographydata#PaymentCryptographyDataPlane",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/payment-cryptography-data/service/2022-02-03/payment-cryptography-data-2022-02-03.json"
     }
   ]
 }

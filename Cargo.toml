@@ -274,7 +274,32 @@ members = [
     "services/service-com-amazonaws-mturk-mturkrequesterservicev20170117",
     "services/service-com-amazonaws-mwaa-amazonmwaa",
     "services/service-com-amazonaws-mwaaserverless-amazonmwaaserverless",
+    "services/service-com-amazonaws-neptune-amazonrdsv19",
     "services/service-com-amazonaws-neptunedata-amazonneptunedataplane",
+    "services/service-com-amazonaws-neptunegraph-amazonneptunegraph",
+    "services/service-com-amazonaws-networkfirewall-networkfirewall-20201112",
+    "services/service-com-amazonaws-networkflowmonitor-networkflowmonitor",
+    "services/service-com-amazonaws-networkmanager-networkmanager",
+    "services/service-com-amazonaws-networkmonitor-networkmonitor",
+    "services/service-com-amazonaws-networksecuritymanager-piccolocustomerapiservice",
+    "services/service-com-amazonaws-notifications-notifications",
+    "services/service-com-amazonaws-notificationscontacts-notificationscontacts",
+    "services/service-com-amazonaws-novaact-amazonnovaagentsdataplane",
+    "services/service-com-amazonaws-oam-oamservice",
+    "services/service-com-amazonaws-observabilityadmin-observabilityadmin",
+    "services/service-com-amazonaws-odb-odb",
+    "services/service-com-amazonaws-omics-omics",
+    "services/service-com-amazonaws-opensearch-amazonopensearchservice",
+    "services/service-com-amazonaws-opensearchserverless-opensearchserverless",
+    "services/service-com-amazonaws-organizations-awsorganizationsv20161128",
+    "services/service-com-amazonaws-osis-amazonopensearchingestionservice",
+    "services/service-com-amazonaws-outposts-outpostsolafservice",
+    "services/service-com-amazonaws-partnercentralaccount-partnercentralaccount",
+    "services/service-com-amazonaws-partnercentralbenefits-partnercentralbenefitsservice",
+    "services/service-com-amazonaws-partnercentralchannel-partnercentralchannel",
+    "services/service-com-amazonaws-partnercentralrevenuemeasurement-partnercentralrevenuemeasurement",
+    "services/service-com-amazonaws-partnercentralselling-awspartnercentralselling",
+    "services/service-com-amazonaws-paymentcryptographydata-paymentcryptographydataplane",
     "core/router",
     "core/embedded",
 ]
@@ -584,7 +609,32 @@ service-com-amazonaws-mq-mq = { path = "services/service-com-amazonaws-mq-mq" }
 service-com-amazonaws-mturk-mturkrequesterservicev20170117 = { path = "services/service-com-amazonaws-mturk-mturkrequesterservicev20170117" }
 service-com-amazonaws-mwaa-amazonmwaa = { path = "services/service-com-amazonaws-mwaa-amazonmwaa" }
 service-com-amazonaws-mwaaserverless-amazonmwaaserverless = { path = "services/service-com-amazonaws-mwaaserverless-amazonmwaaserverless" }
+service-com-amazonaws-neptune-amazonrdsv19 = { path = "services/service-com-amazonaws-neptune-amazonrdsv19" }
 service-com-amazonaws-neptunedata-amazonneptunedataplane = { path = "services/service-com-amazonaws-neptunedata-amazonneptunedataplane" }
+service-com-amazonaws-neptunegraph-amazonneptunegraph = { path = "services/service-com-amazonaws-neptunegraph-amazonneptunegraph" }
+service-com-amazonaws-networkfirewall-networkfirewall-20201112 = { path = "services/service-com-amazonaws-networkfirewall-networkfirewall-20201112" }
+service-com-amazonaws-networkflowmonitor-networkflowmonitor = { path = "services/service-com-amazonaws-networkflowmonitor-networkflowmonitor" }
+service-com-amazonaws-networkmanager-networkmanager = { path = "services/service-com-amazonaws-networkmanager-networkmanager" }
+service-com-amazonaws-networkmonitor-networkmonitor = { path = "services/service-com-amazonaws-networkmonitor-networkmonitor" }
+service-com-amazonaws-networksecuritymanager-piccolocustomerapiservice = { path = "services/service-com-amazonaws-networksecuritymanager-piccolocustomerapiservice" }
+service-com-amazonaws-notifications-notifications = { path = "services/service-com-amazonaws-notifications-notifications" }
+service-com-amazonaws-notificationscontacts-notificationscontacts = { path = "services/service-com-amazonaws-notificationscontacts-notificationscontacts" }
+service-com-amazonaws-novaact-amazonnovaagentsdataplane = { path = "services/service-com-amazonaws-novaact-amazonnovaagentsdataplane" }
+service-com-amazonaws-oam-oamservice = { path = "services/service-com-amazonaws-oam-oamservice" }
+service-com-amazonaws-observabilityadmin-observabilityadmin = { path = "services/service-com-amazonaws-observabilityadmin-observabilityadmin" }
+service-com-amazonaws-odb-odb = { path = "services/service-com-amazonaws-odb-odb" }
+service-com-amazonaws-omics-omics = { path = "services/service-com-amazonaws-omics-omics" }
+service-com-amazonaws-opensearch-amazonopensearchservice = { path = "services/service-com-amazonaws-opensearch-amazonopensearchservice" }
+service-com-amazonaws-opensearchserverless-opensearchserverless = { path = "services/service-com-amazonaws-opensearchserverless-opensearchserverless" }
+service-com-amazonaws-organizations-awsorganizationsv20161128 = { path = "services/service-com-amazonaws-organizations-awsorganizationsv20161128" }
+service-com-amazonaws-osis-amazonopensearchingestionservice = { path = "services/service-com-amazonaws-osis-amazonopensearchingestionservice" }
+service-com-amazonaws-outposts-outpostsolafservice = { path = "services/service-com-amazonaws-outposts-outpostsolafservice" }
+service-com-amazonaws-partnercentralaccount-partnercentralaccount = { path = "services/service-com-amazonaws-partnercentralaccount-partnercentralaccount" }
+service-com-amazonaws-partnercentralbenefits-partnercentralbenefitsservice = { path = "services/service-com-amazonaws-partnercentralbenefits-partnercentralbenefitsservice" }
+service-com-amazonaws-partnercentralchannel-partnercentralchannel = { path = "services/service-com-amazonaws-partnercentralchannel-partnercentralchannel" }
+service-com-amazonaws-partnercentralrevenuemeasurement-partnercentralrevenuemeasurement = { path = "services/service-com-amazonaws-partnercentralrevenuemeasurement-partnercentralrevenuemeasurement" }
+service-com-amazonaws-partnercentralselling-awspartnercentralselling = { path = "services/service-com-amazonaws-partnercentralselling-awspartnercentralselling" }
+service-com-amazonaws-paymentcryptographydata-paymentcryptographydataplane = { path = "services/service-com-amazonaws-paymentcryptographydata-paymentcryptographydataplane" }
 
 # The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
 #
