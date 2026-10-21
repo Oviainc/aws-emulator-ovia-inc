@@ -96,17 +96,33 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // This service names a request that failed the model's own rules
+        // `ValidationError` — the shape every operation declares for "one or more
+        // fields in the request failed validation" — rather than the framework's
+        // generic `ValidationException`, so a client branching on the Wickr error
+        // code sees one code whether the value was refused at the boundary (a
+        // `networkId` that is not 8 digits) or by a handler (a `networkName`
+        // longer than the 20 characters the model documents). The HTTP status of a
+        // boundary refusal stays with the protocol (400); only a handler-returned
+        // `ValidationError` carries the modelled 422.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "ValidationError".to_string(),
+                message: format!(
+                    "{} validation error{} detected: {}",
+                    violations.len(),
+                    if violations.len() == 1 { "" } else { "s" },
+                    violations
+                        .iter()
+                        .map(|violation| violation.path.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }),
+            // An authentication refusal is not a field-level validation failure,
+            // so it keeps the framework's wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
