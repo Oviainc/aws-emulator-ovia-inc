@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Encodes/decodes the opaque pagination tokens ListVehicles mints.
+hex = { workspace = true }
+# Digests a list request's filter set into its pagination token.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

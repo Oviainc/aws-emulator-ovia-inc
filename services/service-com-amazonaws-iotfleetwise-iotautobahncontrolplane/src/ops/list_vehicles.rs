@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListVehicles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListVehicles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListVehicles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: enumerates the vehicles in state in a stable order, applies the
+//! `modelManifestArn` and `attributeNames`/`attributeValues` filters, and pages with an
+//! opaque `nextToken` that names the key the next page resumes at.
 //!
 //! ## Shape of an operation
 //!
@@ -175,20 +169,184 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListVehicles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListVehiclesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListVehicles"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListVehiclesErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // The attributes filter is a set of name/value PAIRS, so the two lists have to
+        // line up and a name may appear only once.
+        let attribute_filter: Vec<(String, String)> =
+            match (&input.attribute_names, &input.attribute_values) {
+                (None, None) => Vec::new(),
+                (Some(names), Some(values)) if names.len() == values.len() => {
+                    let mut seen = ::std::collections::BTreeSet::new();
+                    for name in names {
+                        if !seen.insert(name.as_str()) {
+                            return Err(validation_error(format!(
+                                "attributeNames must be unique; {name} appears more than once"
+                            )));
+                        }
+                    }
+                    names.iter().cloned().zip(values.iter().cloned()).collect()
+                }
+                _ => {
+                    return Err(validation_error(
+                        "attributeNames and attributeValues must both be present and hold the \
+                         same number of entries"
+                            .to_string(),
+                    ));
+                }
+            };
+
+        // A page continues ONE enumeration, so the token carries a digest of the filter
+        // set that produced it: a token this service did not mint, or one handed back
+        // with different filters, is a refusal rather than a silently different query.
+        let filter_digest = crate::state::filter_digest(&canonical_filter(
+            input.model_manifest_arn.as_deref(),
+            &attribute_filter,
+        ));
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(cursor) if cursor.filter_digest == filter_digest => Some(cursor.resume_key),
+                Some(_) => {
+                    return Err(validation_error(
+                        "nextToken was issued for a different set of filters".to_string(),
+                    ))
+                }
+                None => {
+                    return Err(validation_error(
+                        "nextToken is not a token this service issued".to_string(),
+                    ))
+                }
+            },
+        };
+
+        // The page size is the modelled `maxResults` range or nothing: an out-of-range
+        // value is refused rather than quietly turned into a full page. The boundary
+        // validator already refuses one (`@range(1..100)`); this is the handler's own
+        // bound on how much one response amplifies.
+        let page_size: usize = match input.max_results {
+            None => MAX_RESULTS_CEILING,
+            Some(requested) => match usize::try_from(requested) {
+                Ok(size) if (1..=MAX_RESULTS_CEILING).contains(&size) => size,
+                _ => {
+                    return Err(validation_error(format!(
+                        "maxResults must be between 1 and {MAX_RESULTS_CEILING}; got {requested}"
+                    )))
+                }
+            },
+        };
+        let metadata_only = input.list_response_scope.as_deref() == Some(METADATA_ONLY_SCOPE);
+
+        let store = state.lock();
+        let matching = store
+            .vehicles
+            .range::<String, _>(resume_at.as_ref().map_or(
+                (::std::ops::Bound::Unbounded, ::std::ops::Bound::Unbounded),
+                |key| (::std::ops::Bound::Included(key), ::std::ops::Bound::Unbounded),
+            ))
+            .map(|(_, vehicle)| vehicle)
+            .filter(|vehicle| {
+                input
+                    .model_manifest_arn
+                    .as_ref()
+                    .is_none_or(|arn| &vehicle.model_manifest_arn == arn)
+            })
+            .filter(|vehicle| {
+                attribute_filter.iter().all(|(name, value)| {
+                    vehicle
+                        .attributes
+                        .as_ref()
+                        .and_then(|attributes| attributes.get(name))
+                        == Some(value)
+                })
+            });
+
+        // One more than the page is read, so the token is minted only when a vehicle
+        // really follows the last one reported.
+        let mut page: Vec<&crate::state::VehicleRecord> = Vec::new();
+        let mut next_token = None;
+        for vehicle in matching {
+            if page.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(&crate::state::PageCursor {
+                    filter_digest: filter_digest.clone(),
+                    resume_key: vehicle.vehicle_name.clone(),
+                }));
+                break;
+            }
+            page.push(vehicle);
+        }
+
+        Ok(ListVehiclesOutput {
+            vehicle_summaries: Some(
+                page.into_iter()
+                    .map(|vehicle| VehicleSummary {
+                        vehicle_name: vehicle.vehicle_name.clone(),
+                        arn: vehicle.arn.clone(),
+                        model_manifest_arn: vehicle.model_manifest_arn.clone(),
+                        decoder_manifest_arn: vehicle.decoder_manifest_arn.clone(),
+                        creation_time: vehicle.creation_time,
+                        last_modification_time: vehicle.last_modification_time,
+                        // METADATA_ONLY asks for the vehicle's identity and timestamps;
+                        // `attributes` is the one member of the summary the model leaves
+                        // optional, so it is the one this scope drops.
+                        attributes: if metadata_only {
+                            None
+                        } else {
+                            vehicle
+                                .attributes
+                                .as_ref()
+                                .map(|attributes| attributes.clone().into_iter().collect())
+                        },
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The largest page `maxResults` accepts (`listVehiclesMaxResults`, range 1..100), and
+/// therefore the page size a request that names none gets. It is what caps how much one
+/// response amplifies.
+const MAX_RESULTS_CEILING: usize = 100;
+
+/// The one `ListResponseScope` value the model declares (`LIST_RESPONSE_SCOPE_VALUES`).
+const METADATA_ONLY_SCOPE: &str = "METADATA_ONLY";
+
+/// Refuse the request with this operation's own modeled `ValidationException`, which
+/// carries more than a message, rather than the scaffold's synthetic one.
+fn validation_error(message: String) -> ListVehiclesError {
+    ListVehiclesErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: None,
+        field_list: None,
+    })
+    .into()
+}
+
+/// One rendering of this request's filter set, canonical so that two requests asking the
+/// same question digest the same: the attribute pairs are sorted by name (their order on
+/// the wire does not change which vehicles match) and `listResponseScope` is excluded
+/// (it changes what a summary reports, not which vehicles are enumerated).
+fn canonical_filter(
+    model_manifest_arn: Option<&str>,
+    attribute_filter: &[(String, String)],
+) -> String {
+    let mut pairs: Vec<&(String, String)> = attribute_filter.iter().collect();
+    pairs.sort_by(|left, right| left.0.cmp(&right.0));
+    ::serde_json::json!({
+        "modelManifestArn": model_manifest_arn,
+        "attributes": pairs
+            .into_iter()
+            .map(|(name, value)| ::serde_json::json!([name, value]))
+            .collect::<Vec<_>>(),
+    })
+    .to_string()
 }

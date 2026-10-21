@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateModelManifest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateModelManifest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateModelManifest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: validates `signalCatalogArn` against the signal catalogs in state and
+//! that every requested node is one the catalog declares, then inserts a `DRAFT` model
+//! manifest and reports the name and the ARN it minted.
 //!
 //! ## Shape of an operation
 //!
@@ -100,11 +94,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iotfleetwise-iotautobah
 // here — hence the `CreateModelManifestError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.iotfleetwise#CreateModelManifest")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.iotfleetwise#CreateModelManifest",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateModelManifestErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
+    InternalServerException(InternalServerException),
     InvalidSignalsException(InvalidSignalsException),
     LimitExceededException(LimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -163,18 +161,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateModelManifest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateModelManifestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateModelManifest"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateModelManifestErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // Sized BEFORE the store lock is taken, so an oversized request never holds it.
+        // The boundary validator already refuses a longer list (the member's modelled
+        // `@length(max: 500)`); restating the bound here is what caps the membership
+        // check below no matter how this handler is reached.
+        if input.nodes.len() > crate::state::MAX_MODEL_MANIFEST_NODES {
+            return Err(CreateModelManifestErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "nodes carries {} entries, more than the {} a vehicle model selects",
+                        input.nodes.len(),
+                        crate::state::MAX_MODEL_MANIFEST_NODES
+                    ),
+                    reason: None,
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(
+            &region,
+            crate::state::MODEL_MANIFEST_RESOURCE_TYPE,
+            &input.name,
+        );
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
+        let mut store = state.lock();
+
+        // A vehicle model selects signals OUT OF one signal catalog, so the catalog has
+        // to exist before the model can name it, and every node the model selects must
+        // be one that catalog declares.
+        let (catalog_name, missing_nodes) = {
+            let Some(catalog) = store.signal_catalog_by_arn(&input.signal_catalog_arn) else {
+                return Err(CreateModelManifestErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "signal catalog {} wasn't found",
+                            input.signal_catalog_arn
+                        ),
+                        resource_id: input.signal_catalog_arn.clone(),
+                        resource_type: crate::state::SIGNAL_CATALOG_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into());
+            };
+            // One set built once, so the check costs one lookup per requested node
+            // rather than a scan of the catalog's whole node vector per node.
+            let declared = catalog.node_names();
+            let missing: Vec<String> = input
+                .nodes
+                .iter()
+                .filter(|node| !declared.contains(node.as_str()))
+                .cloned()
+                .collect();
+            (catalog.name.clone(), missing)
+        };
+
+        // The ones that are not declared are reported as the invalid signals they are.
+        if !missing_nodes.is_empty() {
+            return Err(CreateModelManifestErrorModeled::InvalidSignalsException(
+                InvalidSignalsException {
+                    message: Some(format!(
+                        "{} of the requested nodes are not declared by signal catalog {}",
+                        missing_nodes.len(),
+                        catalog_name
+                    )),
+                    invalid_signals: Some(
+                        missing_nodes
+                            .into_iter()
+                            .map(|node| InvalidSignal {
+                                name: Some(node),
+                                reason: Some("NOT_FOUND_IN_SIGNAL_CATALOG".to_string()),
+                            })
+                            .collect(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        if store.model_manifests.contains_key(&input.name) {
+            return Err(CreateModelManifestErrorModeled::ConflictException(ConflictException {
+                message: format!("model manifest {} already exists", input.name),
+                resource: input.name.clone(),
+                resource_type: crate::state::MODEL_MANIFEST_RESOURCE_TYPE.to_string(),
+            })
+            .into());
+        }
+
+        // Vehicle models are metered per account and Region, and this operation models
+        // `LimitExceededException` for the case. Refusing here is also what bounds the
+        // store: every entry a create inserts lives until it is deleted.
+        if store.model_manifests.len() >= crate::state::MAX_MODEL_MANIFESTS {
+            return Err(CreateModelManifestErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: format!(
+                        "the vehicle model quota of {} for this account and Region has been \
+                         reached",
+                        crate::state::MAX_MODEL_MANIFESTS
+                    ),
+                    resource_id: input.name.clone(),
+                    resource_type: crate::state::MODEL_MANIFEST_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        store.model_manifests.insert(
+            input.name.clone(),
+            crate::state::ModelManifestRecord {
+                name: input.name.clone(),
+                arn: arn.clone(),
+                description: input.description,
+                signal_catalog_arn: input.signal_catalog_arn,
+                nodes: input.nodes,
+                // A newly created vehicle model is not active until it is explicitly
+                // activated through UpdateModelManifest, so it starts out DRAFT.
+                status: MODEL_MANIFEST_DRAFT_STATUS.to_string(),
+                tags: input.tags.unwrap_or_default(),
+                creation_time: now,
+                last_modification_time: now,
+            },
+        );
+
+        Ok(CreateModelManifestOutput {
+            name: input.name,
+            arn,
+        })
     }
 }
+
+/// The `ManifestStatus` a freshly created model manifest carries, taken from the
+/// model's own enum (`MANIFEST_STATUS_VALUES`).
+pub const MODEL_MANIFEST_DRAFT_STATUS: &str = "DRAFT";
