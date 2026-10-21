@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRecords::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: applies a batch of record patches to one dataset in [`crate::state`]
+//! under the optimistic-concurrency rule the operation's own doc states — "The server
+//! will reject an UpdateRecords request with a ResourceConflictException if you try to
+//! patch a record with a new value but a stale sync count" — and persists nothing when
+//! any patch in the batch is stale.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +178,250 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRecords"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(state_unavailable());
+        };
+
+        let key = crate::state::dataset_key(
+            &input.identity_pool_id,
+            &input.identity_id,
+            &input.dataset_name,
+        );
+        let patches = input.record_patches.clone().unwrap_or_default();
+        // Refused BEFORE the store is locked, so an over-long batch costs no other
+        // caller anything: every step below is per-patch work done under the lock.
+        if patches.len() > MAX_RECORD_PATCHES {
+            return Err(limit_exceeded(format!(
+                "RecordPatches carries {} patches, past the {MAX_RECORD_PATCHES} \
+                 patches one UpdateRecords call may apply",
+                patches.len()
+            )));
+        }
+        let applied_at = crate::state::now();
+
+        let mut store = state.lock();
+
+        // `SyncSessionToken` is "The SyncSessionToken returned by a previous call to
+        // ListRecords for this dataset and identity", so a token this service never
+        // minted for THIS dataset is a parameter that does not meet its constraint.
+        match store.sync_session_dataset(&input.sync_session_token) {
+            Some(session_key) if *session_key == key => {}
+            _ => {
+                return Err(invalid_parameter(format!(
+                    "SyncSessionToken '{}' is not a token returned by a previous ListRecords \
+                     call for identity '{}' and dataset '{}'",
+                    input.sync_session_token, input.identity_id, input.dataset_name
+                )));
+            }
+        }
+
+        // Every patch is checked against stored state BEFORE anything is written, so a
+        // batch with one stale or oversized patch leaves the dataset exactly as it was.
+        let stored = store.datasets.get(&key);
+        for patch in &patches {
+            if !crate::ops::types::OPERATION_VALUES.contains(&patch.op.as_str()) {
+                return Err(invalid_parameter(format!(
+                    "RecordPatches entry for key '{}' has Op '{}'; expected one of {:?}",
+                    patch.key,
+                    patch.op,
+                    crate::ops::types::OPERATION_VALUES
+                )));
+            }
+            let stored_sync_count = stored
+                .and_then(|dataset| dataset.records.get(&patch.key))
+                .map_or(0, |record| record.sync_count);
+            if patch.sync_count < stored_sync_count {
+                return Err(UpdateRecordsErrorModeled::ResourceConflictException(
+                    ResourceConflictException {
+                        message: format!(
+                            "the sync count for key '{}' in dataset '{}' is {stored_sync_count}; \
+                             the patch presented {}",
+                            patch.key, input.dataset_name, patch.sync_count
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "a dataset can hold up to 1MB of key-value pairs" (the `Dataset` shape's doc),
+        // so a batch that would push the dataset past that is refused whole — as is one
+        // that would push it past the record count or the store size this emulator holds.
+        let (projected_bytes, projected_records) = projected_totals(stored, &patches);
+        if projected_bytes > MAX_DATASET_BYTES {
+            return Err(limit_exceeded(format!(
+                "dataset '{}' would hold {projected_bytes} bytes, past the \
+                 {MAX_DATASET_BYTES} byte limit of a dataset",
+                input.dataset_name
+            )));
+        }
+        if projected_records > crate::state::MAX_DATASET_RECORDS {
+            return Err(limit_exceeded(format!(
+                "dataset '{}' would hold {projected_records} records, past the {} records \
+                 one dataset may hold",
+                input.dataset_name,
+                crate::state::MAX_DATASET_RECORDS
+            )));
+        }
+        if stored.is_none() {
+            // Creating a dataset is what grows the store, so the ceilings on how many
+            // datasets are held are checked here, before the entry is inserted.
+            if store.datasets.len() >= crate::state::MAX_DATASETS {
+                return Err(limit_exceeded(format!(
+                    "this service already holds the {} datasets it may hold",
+                    crate::state::MAX_DATASETS
+                )));
+            }
+            let held = store.dataset_count_of_identity(&input.identity_pool_id, &input.identity_id);
+            if held >= crate::state::MAX_DATASETS_PER_IDENTITY {
+                return Err(limit_exceeded(format!(
+                    "identity '{}' already holds the {} datasets one identity may hold",
+                    input.identity_id,
+                    crate::state::MAX_DATASETS_PER_IDENTITY
+                )));
+            }
+        }
+
+        // Nothing to apply: no record is written, so the dataset's sync count does not
+        // move and a dataset that does not exist is not created.
+        if patches.is_empty() {
+            return Ok(UpdateRecordsOutput {
+                records: Some(Vec::new()),
+            });
+        }
+
+        // "The ClientContext field is not yet implemented" in the real service, so the
+        // device that made the change is `DeviceId`, else the identity itself.
+        let last_modified_by = input
+            .device_id
+            .clone()
+            .unwrap_or_else(|| input.identity_id.clone());
+
+        // "Datasets are automatically created if they don't exist" (the `Dataset` doc).
+        let dataset = store
+            .datasets
+            .entry(key.clone())
+            .or_insert_with(|| crate::state::DatasetEntry::created_at(applied_at));
+        // One successful call advances the dataset's server sync count once, and every
+        // record it writes carries that new count — which the caller presents next time.
+        let new_sync_count = dataset.sync_count + 1;
+        for patch in &patches {
+            match patch.op.as_str() {
+                "remove" => {
+                    dataset.records.remove(&patch.key);
+                }
+                // Checked above, so the remaining modelled operation is `replace`.
+                _ => {
+                    dataset.records.insert(
+                        patch.key.clone(),
+                        crate::state::RecordEntry {
+                            value: patch.value.clone(),
+                            sync_count: new_sync_count,
+                            last_modified_date: applied_at,
+                            last_modified_by: Some(last_modified_by.clone()),
+                            device_last_modified_date: patch.device_last_modified_date,
+                        },
+                    );
+                }
+            }
+        }
+        dataset.sync_count = new_sync_count;
+        dataset.last_modified_date = applied_at;
+        dataset.last_modified_by = Some(last_modified_by);
+
+        // "On a successful update of the record, the response returns the new sync count
+        // for that record": read every patched record back out of state, in patch order.
+        // A removed record is no longer there, so it is not reported.
+        let mut records: Vec<Record> = Vec::new();
+        // A set, not a scanned list: a batch patching the same key twice must report it
+        // once, and the cost of that must stay linear-ish in the batch size rather than
+        // quadratic, since the whole read-back runs under the store lock.
+        let mut reported: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for patch in &patches {
+            if !reported.insert(patch.key.as_str()) {
+                continue;
+            }
+            if let Some(record) = dataset.records.get(&patch.key) {
+                records.push(record.to_shape(&patch.key));
+            }
+        }
+
+        // A dataset that is written again is no longer a deleted one.
+        store.forget_deletion(&key);
+        drop(store);
+
+        Ok(UpdateRecordsOutput {
+            records: Some(records),
+        })
     }
+}
+
+/// The size limit of one dataset: "a dataset can hold up to 1MB of key-value pairs"
+/// (`smithy_query(query="doc",shape="Dataset")`).
+const MAX_DATASET_BYTES: i64 = 1_048_576;
+
+/// How many patches one call may carry.
+///
+/// Not an AWS-documented rule: a bound on the work ONE request can ask of this
+/// emulator, since every patch is validated, applied and read back while the service's
+/// store is locked and the modelled `RecordPatchList` carries no length constraint. It
+/// is refused with `LimitExceededException`, the modelled error for "the limit on the
+/// number of objects or operations has been exceeded".
+const MAX_RECORD_PATCHES: usize = 1024;
+
+/// `Dataset.DataStorage` and the record count as they would stand after `patches` are
+/// applied to `dataset`.
+fn projected_totals(
+    dataset: Option<&crate::state::DatasetEntry>,
+    patches: &[RecordPatch],
+) -> (i64, usize) {
+    let mut records: std::collections::BTreeMap<&str, usize> = dataset
+        .map(|dataset| {
+            dataset
+                .records
+                .iter()
+                .map(|(key, record)| {
+                    (
+                        key.as_str(),
+                        key.len() + record.value.as_ref().map_or(0, String::len),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for patch in patches {
+        if patch.op == "remove" {
+            records.remove(patch.key.as_str());
+        } else {
+            records.insert(
+                patch.key.as_str(),
+                patch.key.len() + patch.value.as_ref().map_or(0, String::len),
+            );
+        }
+    }
+    (
+        i64::try_from(records.values().sum::<usize>()).unwrap_or(i64::MAX),
+        records.len(),
+    )
+}
+
+/// Refuse a request that would take this service past a limit it enforces.
+fn limit_exceeded(message: String) -> UpdateRecordsError {
+    UpdateRecordsErrorModeled::LimitExceededException(LimitExceededException { message }).into()
+}
+
+/// Refuse a request parameter that does not comply with its documented constraint.
+fn invalid_parameter(message: String) -> UpdateRecordsError {
+    UpdateRecordsErrorModeled::InvalidParameterException(InvalidParameterException { message })
+        .into()
+}
+
+/// This service's store is not mounted on the engine the operation was built from — a
+/// server fault, answered with the modelled server error rather than a panic.
+fn state_unavailable() -> UpdateRecordsError {
+    UpdateRecordsErrorModeled::InternalErrorException(InternalErrorException {
+        message: crate::state::STORE_UNAVAILABLE.to_string(),
+    })
+    .into()
 }
