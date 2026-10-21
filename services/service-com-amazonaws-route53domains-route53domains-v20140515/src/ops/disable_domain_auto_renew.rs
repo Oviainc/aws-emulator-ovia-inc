@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableDomainAutoRenew
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableDomainAutoRenew`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableDomainAutoRenew::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Clears the stored domain's auto-renew flag, which `GetDomainDetail` and `ListDomains`
+//! then report, and appends a `DISABLE_AUTORENEW` operation record. A name the account
+//! does not hold is refused with `InvalidInput`.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +96,29 @@ impl From<DisableDomainAutoRenewErrorModeled> for DisableDomainAutoRenewError {
     }
 }
 
+/// How this operation refuses a `DomainName` it cannot resolve: `InvalidInput` for a
+/// malformed name, `UnsupportedTLD` for a TLD the registrar does not offer. Both are
+/// errors this operation's model declares.
+fn refuse_domain_name(
+    raw: &str,
+    err: crate::state::DomainNameError,
+) -> DisableDomainAutoRenewError {
+    match err {
+        crate::state::DomainNameError::Invalid => {
+            DisableDomainAutoRenewErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::invalid_domain_name_message(raw)),
+            })
+            .into()
+        }
+        crate::state::DomainNameError::UnsupportedTld => {
+            DisableDomainAutoRenewErrorModeled::UnsupportedTLD(UnsupportedTLD {
+                message: Some(crate::state::unsupported_tld_message(raw)),
+            })
+            .into()
+        }
+    }
+}
+
 /// The `DisableDomainAutoRenew` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -138,18 +155,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableDomainAutoRenew` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableDomainAutoRenewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableDomainAutoRenew"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let name = crate::state::resolve_domain_name(&input.domain_name)
+            .map_err(|err| refuse_domain_name(&input.domain_name, err))?;
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::state::state_unavailable(Self::NAME))?;
+        let mut state = state.lock();
+
+        let now = crate::state::now_millis();
+        let Some(domain) = state.domains.get_mut(&name) else {
+            return Err(
+                DisableDomainAutoRenewErrorModeled::InvalidInput(InvalidInput {
+                    message: Some(crate::state::unknown_domain_message(&name)),
+                })
+                .into(),
+            );
+        };
+        domain.auto_renew = false;
+        domain.updated_millis = now;
+
+        // Every mutating Route 53 Domains call appends an operation record, even where
+        // the response has no member to return its id in; `ListOperations` reports them.
+        state.record_operation(&name, crate::state::TYPE_DISABLE_AUTORENEW, now);
+        Ok(DisableDomainAutoRenewOutput {})
     }
 }

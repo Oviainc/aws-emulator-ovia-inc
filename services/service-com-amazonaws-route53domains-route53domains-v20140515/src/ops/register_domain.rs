@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the account's domain record and the `REGISTER_DOMAIN` operation record that
+//! tracks the registration, then returns that record's `OperationId`. Re-registering a
+//! name the account already holds is refused with the modelled `DuplicateRequest`.
+//! Every value `GetDomainDetail` later reports comes from this record: the contacts as
+//! sent, the privacy flags, the delegation set, and the registration period.
 //!
 //! ## Shape of an operation
 //!
@@ -184,6 +180,26 @@ impl From<RegisterDomainErrorModeled> for RegisterDomainError {
     }
 }
 
+/// How this operation refuses a `DomainName` it cannot resolve: `InvalidInput` for a
+/// malformed name, `UnsupportedTLD` for a TLD the registrar does not offer. Both are
+/// errors this operation's model declares.
+fn refuse_domain_name(raw: &str, err: crate::state::DomainNameError) -> RegisterDomainError {
+    match err {
+        crate::state::DomainNameError::Invalid => {
+            RegisterDomainErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::invalid_domain_name_message(raw)),
+            })
+            .into()
+        }
+        crate::state::DomainNameError::UnsupportedTld => {
+            RegisterDomainErrorModeled::UnsupportedTLD(UnsupportedTLD {
+                message: Some(crate::state::unsupported_tld_message(raw)),
+            })
+            .into()
+        }
+    }
+}
+
 /// The `RegisterDomain` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -220,18 +236,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterDomain"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        // `IdnLangCode` is "[r]eserved for future use" and `Consent` caps a premium
+        // registry price this emulator does not model, so neither selects any behaviour
+        // here. `DurationInYears` (1..10) and the three required contacts are modelled
+        // constraints the boundary validator already refused, so reaching this handler
+        // means they hold.
+        let name = crate::state::resolve_domain_name(&input.domain_name)
+            .map_err(|err| refuse_domain_name(&input.domain_name, err))?;
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::state::state_unavailable(Self::NAME))?;
+        let mut state = state.lock();
+
+        if state.domains.contains_key(&name) {
+            // `DuplicateRequest`: "The request is already in progress for the domain."
+            return Err(RegisterDomainErrorModeled::DuplicateRequest(DuplicateRequest {
+                request_id: None,
+                message: Some(format!(
+                    "Domain {name} is already registered, so it cannot be registered again"
+                )),
+            })
+            .into());
+        }
+
+        let now = crate::state::now_millis();
+        let tld = crate::state::tld_of(&name).to_string();
+        // The domain store is driven by the caller, so it has a stated ceiling; the model
+        // declares the refusal for reaching it.
+        if state.domains.len() >= crate::state::MAX_DOMAINS {
+            return Err(RegisterDomainErrorModeled::DomainLimitExceeded(
+                DomainLimitExceeded {
+                    message: Some(crate::state::domain_limit_message()),
+                },
+            )
+            .into());
+        }
+        let domain = crate::state::Domain {
+            name: name.clone(),
+            // Documented input defaults: `AutoRenew` "Default: true" (and the operation
+            // documentation: registration "[e]nables auto renew").
+            auto_renew: input.auto_renew.unwrap_or(true),
+            // ICANN forbids transferring a domain away within 60 days of registration, so
+            // a newly registered domain carries the transfer lock.
+            transfer_lock: true,
+            // The contacts are STORED as sent, so `GetDomainDetail` reports the contacts
+            // that were registered rather than echoing a later request.
+            admin_contact: input.admin_contact,
+            registrant_contact: input.registrant_contact,
+            tech_contact: input.tech_contact,
+            billing_contact: input.billing_contact,
+            // `PrivacyProtect{Admin,Registrant,Tech}Contact` each document "Default:
+            // true". `PrivacyProtectBillingContact` documents no default of its own, and
+            // the other three add "You must specify the same privacy setting for the
+            // administrative, billing, registrant, and technical contacts", so it takes
+            // the same default.
+            admin_privacy: input.privacy_protect_admin_contact.unwrap_or(true),
+            registrant_privacy: input.privacy_protect_registrant_contact.unwrap_or(true),
+            tech_privacy: input.privacy_protect_tech_contact.unwrap_or(true),
+            billing_privacy: input.privacy_protect_billing_contact.unwrap_or(true),
+            nameservers: crate::state::default_nameservers(&name),
+            status_list: vec![crate::state::STATUS_CLIENT_TRANSFER_PROHIBITED.to_string()],
+            registrar_name: crate::state::registrar_name(&tld).to_string(),
+            creation_millis: now,
+            updated_millis: now,
+            expiration_millis: crate::state::expiration_millis(now, input.duration_in_years),
+        };
+        state.domains.insert(name.clone(), domain);
+
+        // The returned id IS the key of the record just appended, so
+        // `GetOperationDetail` resolves it.
+        let operation_id = state.record_operation(&name, crate::state::TYPE_REGISTER_DOMAIN, now);
+        Ok(RegisterDomainOutput {
+            operation_id: Some(operation_id),
+        })
     }
 }
