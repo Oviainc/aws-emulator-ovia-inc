@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Creates a channel under an existing channel group and persists it in
+//! [`crate::state`], including the pair of ingest endpoints derived from the parent
+//! group's egress domain. An unknown parent is a `ResourceNotFoundException`; a channel
+//! name already used in that group is a `ConflictException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `handle` below is the implementation; `crate::state` holds the store it reads and
+//! writes.
 //!
 //! ## Shape of an operation
 //!
@@ -245,18 +243,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChannel"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateChannelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // A channel only exists inside a channel group, so the parent has to be there.
+        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+            return Err(CreateChannelErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Channel group {} not found",
+                        input.channel_group_name
+                    )),
+                    resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
+                },
+            )
+            .into());
+        };
+        if group.channels.contains_key(&input.channel_name) {
+            return Err(CreateChannelErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Channel {} already exists in channel group {}",
+                    input.channel_name, group.name
+                )),
+                conflict_exception_type: Some("RESOURCE_ALREADY_EXISTS".to_string()),
+            })
+            .into());
+        }
+
+        // A group's channel map only shrinks on an explicit delete, so its size is
+        // bounded here rather than by how many requests arrive.
+        if group.channels.len() >= crate::state::MAX_CHANNELS_PER_GROUP {
+            return Err(CreateChannelErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "Channel group {} already has the maximum of {} channels",
+                        group.name,
+                        crate::state::MAX_CHANNELS_PER_GROUP
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let name = input.channel_name.clone();
+        let created_at = crate::state::now();
+        let tags = input.tags.unwrap_or_default();
+        let arn = crate::state::channel_arn(&region, &group.name, &name);
+        // The ingest URLs are a function of the parent group's egress domain and this
+        // channel's name, computed once and stored: a later read returns these bytes.
+        let ingest_endpoints =
+            crate::state::ingest_endpoints(&group.egress_domain, &group.name, &name);
+        let etag = crate::state::etag(&[
+            arn.clone(),
+            input.description.clone().unwrap_or_default(),
+            input.input_type.clone().unwrap_or_default(),
+            input.output_locking_mode.clone().unwrap_or_default(),
+            crate::state::tag_fingerprint(&tags),
+        ]);
+
+        let channel = crate::state::Channel {
+            name: name.clone(),
+            group_name: group.name.clone(),
+            arn,
+            description: input.description,
+            input_type: input.input_type,
+            ingest_endpoints,
+            input_switch_configuration: input.input_switch_configuration,
+            output_header_configuration: input.output_header_configuration,
+            multiview_configuration: input.multiview_configuration,
+            output_locking_mode: input.output_locking_mode,
+            created_at,
+            modified_at: created_at,
+            // Nothing has reset this channel yet, so it reports no reset instant.
+            reset_at: None,
+            etag,
+            tags,
+            origin_endpoints: ::std::collections::BTreeMap::new(),
+        };
+        group.channels.insert(name.clone(), channel);
+        // Answer from what was stored, so the response can only carry what a later
+        // `GetChannel` will read.
+        let channel = &group.channels[&name];
+
+        Ok(CreateChannelOutput {
+            multiview_configuration: channel.multiview_configuration.clone(),
+            // Creating a channel attaches no multiview source channels to it.
+            attached_multiview_channels: None,
+            arn: channel.arn.clone(),
+            channel_name: channel.name.clone(),
+            channel_group_name: channel.group_name.clone(),
+            created_at: channel.created_at,
+            modified_at: channel.modified_at,
+            description: channel.description.clone(),
+            ingest_endpoints: Some(channel.ingest_endpoints.clone()),
+            input_type: channel.input_type.clone(),
+            e_tag: Some(channel.etag.clone()),
+            tags: Some(channel.tags.clone()),
+            input_switch_configuration: channel.input_switch_configuration.clone(),
+            output_header_configuration: channel.output_header_configuration.clone(),
+            output_locking_mode: channel.output_locking_mode.clone(),
+        })
     }
 }
