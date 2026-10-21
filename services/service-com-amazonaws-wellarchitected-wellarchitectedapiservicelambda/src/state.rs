@@ -1,11 +1,287 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-wellarchitected-wellarchitectedapiservicelambda service.
+//!
+//! The workload lifecycle (`CreateWorkload`, `GetWorkload`, `ListWorkloads`,
+//! `UpdateWorkload`, `DeleteWorkload`) is backed entirely by the maps below, so a
+//! create is visible to the next request on the same engine. The record type and its
+//! two projections live here rather than in a handler because five operations reach
+//! them.
+
+use std::collections::{BTreeMap, HashMap};
+use std::time::SystemTime;
+
+use sha2::{Digest, Sha256};
+
+use crate::ops::types::{
+    Workload, WorkloadDiscoveryConfig, WorkloadJiraConfigurationInput,
+    WorkloadJiraConfigurationOutput, WorkloadSummary,
+};
+
+/// `Workload$ImprovementStatus` before any lens review has been answered. The
+/// `WorkloadImprovementStatus` enum's `NOT_APPLICABLE` member — see
+/// `smithy_query(query="shape", shape="WorkloadImprovementStatus")`.
+pub const DEFAULT_IMPROVEMENT_STATUS: &str = "NOT_APPLICABLE";
+
+/// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for a
+/// workload.
+pub const WORKLOAD_RESOURCE_TYPE: &str = "WORKLOAD";
+
+/// The ARN service namespace (`OPERATIONS.md`: "ARN namespace: `wellarchitected`").
+pub const ARN_NAMESPACE: &str = "wellarchitected";
+
+/// The region an unsigned request is attributed to, when no SigV4 credential scope
+/// names one.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The most workloads this emulator holds for its one account and Region.
+///
+/// The Well-Architected Tool meters workloads per account per Region and models
+/// `ServiceQuotaExceededException` (HTTP 402, "The user has reached their resource
+/// quota") on `CreateWorkload` for exactly that case; the real quota is adjustable
+/// through Service Quotas, so the number here is this emulator's own ceiling rather
+/// than a value read off a doc page. It is what bounds the store's growth: the name
+/// index holds one entry per workload, and `remove_workload` drops the create tokens
+/// that resolve to a deleted workload, so no token outlives its workload and all three
+/// maps are bounded by this one count. It sits far above any realistic client workflow,
+/// so a caller never meets it by accident.
+pub const MAX_WORKLOADS_PER_ACCOUNT_REGION: usize = 10_000;
+
+/// One stored workload. Every member of the modelled `Workload` output that this
+/// service can know about is persisted here; the two `to_*` projections below are the
+/// only places a response is built from it.
+#[derive(Debug, Clone)]
+pub struct WorkloadRecord {
+    pub workload_id: String,
+    pub workload_arn: String,
+    pub workload_name: String,
+    pub description: String,
+    pub environment: String,
+    pub updated_at: SystemTime,
+    pub account_ids: Vec<String>,
+    pub aws_regions: Vec<String>,
+    pub non_aws_regions: Vec<String>,
+    pub pillar_priorities: Vec<String>,
+    pub architectural_design: Option<String>,
+    pub review_owner: Option<String>,
+    pub is_review_owner_update_acknowledged: bool,
+    pub industry_type: Option<String>,
+    pub industry: Option<String>,
+    pub notes: Option<String>,
+    pub improvement_status: String,
+    pub lenses: Vec<String>,
+    pub owner: String,
+    pub tags: BTreeMap<String, String>,
+    pub applications: Vec<String>,
+    /// Risk counts per `Risk` value, derived from this workload's lens-review answers.
+    /// Lens reviews and answers are not implemented yet (each is tracked by its own
+    /// stub issue), so no answer can exist and the map is empty — not canned.
+    pub risk_counts: BTreeMap<String, i32>,
+    pub discovery_config: Option<WorkloadDiscoveryConfig>,
+    pub jira_configuration: Option<WorkloadJiraConfigurationInput>,
+}
+
+impl WorkloadRecord {
+    /// The `Workload` shape `GetWorkload`/`UpdateWorkload` return.
+    pub fn to_workload(&self) -> Workload {
+        Workload {
+            workload_id: Some(self.workload_id.clone()),
+            workload_arn: Some(self.workload_arn.clone()),
+            workload_name: Some(self.workload_name.clone()),
+            description: Some(self.description.clone()),
+            environment: Some(self.environment.clone()),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+            account_ids: Some(self.account_ids.clone()),
+            aws_regions: Some(self.aws_regions.clone()),
+            non_aws_regions: Some(self.non_aws_regions.clone()),
+            architectural_design: self.architectural_design.clone(),
+            review_owner: self.review_owner.clone(),
+            // Only a workload shared through a share invitation carries these, and
+            // workload shares are still a stub.
+            review_restriction_date: None,
+            share_invitation_id: None,
+            is_review_owner_update_acknowledged: Some(self.is_review_owner_update_acknowledged),
+            industry_type: self.industry_type.clone(),
+            industry: self.industry.clone(),
+            notes: self.notes.clone(),
+            improvement_status: Some(self.improvement_status.clone()),
+            risk_counts: Some(risk_counts_to_map(&self.risk_counts)),
+            pillar_priorities: Some(self.pillar_priorities.clone()),
+            lenses: Some(self.lenses.clone()),
+            owner: Some(self.owner.clone()),
+            // `TagMap` is modelled `@length(min: 1)`, so an untagged workload omits
+            // the member rather than sending an empty map.
+            tags: (!self.tags.is_empty()).then(|| self.tags.clone().into_iter().collect()),
+            discovery_config: self.discovery_config.clone(),
+            applications: Some(self.applications.clone()),
+            // A workload's profiles, and the risk counts restricted to the questions a
+            // profile prioritises, exist only once a profile is associated; profiles
+            // are still a stub, so there is nothing to project.
+            profiles: None,
+            prioritized_risk_counts: None,
+            jira_configuration: self.jira_configuration.as_ref().map(|input| {
+                WorkloadJiraConfigurationOutput {
+                    issue_management_status: input.issue_management_status.clone(),
+                    issue_management_type: input.issue_management_type.clone(),
+                    jira_project_key: input.jira_project_key.clone(),
+                    status_message: None,
+                }
+            }),
+        }
+    }
+
+    /// The `WorkloadSummary` projection `ListWorkloads` pages over.
+    pub fn to_summary(&self) -> WorkloadSummary {
+        WorkloadSummary {
+            workload_id: Some(self.workload_id.clone()),
+            workload_arn: Some(self.workload_arn.clone()),
+            workload_name: Some(self.workload_name.clone()),
+            owner: Some(self.owner.clone()),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+            lenses: Some(self.lenses.clone()),
+            risk_counts: Some(risk_counts_to_map(&self.risk_counts)),
+            improvement_status: Some(self.improvement_status.clone()),
+            profiles: None,
+            prioritized_risk_counts: None,
+        }
+    }
+}
+
+fn risk_counts_to_map(counts: &BTreeMap<String, i32>) -> HashMap<String, i32> {
+    counts.iter().map(|(k, v)| (k.clone(), *v)).collect()
+}
+
+/// What a `CreateWorkload` idempotency token resolves to: the workload the original
+/// request created, plus a fingerprint of that request's parameters so a reuse of the
+/// token with DIFFERENT parameters can be told apart from a genuine replay.
+#[derive(Debug, Clone)]
+pub struct CreateWorkloadToken {
+    pub workload_id: String,
+    pub fingerprint: String,
+}
 
 /// Per-service state for com-amazonaws-wellarchitected-wellarchitectedapiservicelambda. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
-    // TODO: add service-specific state fields
+    /// Every stored workload, keyed by its 32-lowercase-hex `WorkloadId`.
+    pub workloads: HashMap<String, WorkloadRecord>,
+    /// Normalized workload name -> `WorkloadId`. Backs the documented "name must be
+    /// unique within an account within a Region; spaces and capitalization are
+    /// ignored" rule.
+    pub workload_name_index: HashMap<String, String>,
+    /// `CreateWorkload`'s `ClientRequestToken` -> what the original request created.
+    pub create_workload_tokens: HashMap<String, CreateWorkloadToken>,
+    /// Monotonic input to [`Self::mint_workload_id`]; never returned to a caller.
+    id_counter: u64,
+}
+
+impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
+    /// A fresh `WorkloadId`: 32 lowercase hex characters, as
+    /// `^[0-9a-f]{32}$` requires, and unused by any stored workload.
+    ///
+    /// Derived from a per-store counter and the wall clock — never from the request —
+    /// so two identical requests still get distinct ids.
+    pub fn mint_workload_id(&mut self) -> String {
+        loop {
+            self.id_counter = self.id_counter.wrapping_add(1);
+            let nanos = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0u128, |d| d.as_nanos());
+            let mut hasher = Sha256::new();
+            hasher.update(self.id_counter.to_le_bytes());
+            hasher.update(nanos.to_le_bytes());
+            let id = hex::encode(&hasher.finalize()[..16]);
+            if !self.workloads.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// The service's stable list order: workload name, then id to break ties between
+    /// two names that normalize apart but sort equal.
+    pub fn workload_order(&self) -> Vec<(String, String)> {
+        let mut keys: Vec<(String, String)> = self
+            .workloads
+            .values()
+            .map(|w| (w.workload_name.clone(), w.workload_id.clone()))
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Drop a workload and everything keyed to it: the name that reserved uniqueness
+    /// and any create token that resolved to it.
+    pub fn remove_workload(&mut self, workload_id: &str) -> Option<WorkloadRecord> {
+        let record = self.workloads.remove(workload_id)?;
+        self.workload_name_index
+            .remove(&normalize_workload_name(&record.workload_name));
+        self.create_workload_tokens
+            .retain(|_, token| token.workload_id != workload_id);
+        Some(record)
+    }
+}
+
+/// The form a workload name is compared in: "Spaces and capitalization are ignored
+/// when checking for uniqueness" (`CreateWorkloadInput$WorkloadName` doc).
+pub fn normalize_workload_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// A stable fingerprint of an idempotent request's parameters.
+pub fn parameter_fingerprint(parameters: &::serde_json::Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(parameters.to_string().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Encode a `ListWorkloads` cursor as an opaque, self-describing `NextToken`.
+///
+/// Hex of the JSON cursor: it satisfies the modelled `NextToken` pattern
+/// `^[A-Za-z0-9+/=_-]+$` and carries the whole cursor, so paging needs no
+/// server-side token table — a reporting operation must not write to state.
+pub fn encode_next_token(workload_name: &str, workload_id: &str) -> String {
+    let cursor = ::serde_json::json!({ "n": workload_name, "i": workload_id });
+    hex::encode(cursor.to_string())
+}
+
+/// The `(workload name, workload id)` a `NextToken` points just past, or `None` when
+/// the token is not one this service issued.
+pub fn decode_next_token(token: &str) -> Option<(String, String)> {
+    let bytes = hex::decode(token).ok()?;
+    let cursor: ::serde_json::Value = ::serde_json::from_slice(&bytes).ok()?;
+    let name = cursor.get("n")?.as_str()?.to_string();
+    let id = cursor.get("i")?.as_str()?.to_string();
+    Some((name, id))
+}
+
+/// The `message` and `Fields` a modelled `ValidationException` carries for one member
+/// that failed one constraint. Shared so every operation words a refusal identically;
+/// each operation still wraps it in its OWN modelled error enum.
+pub fn validation_detail(
+    member: &str,
+    constraint: &str,
+) -> (String, Vec<crate::ops::types::ValidationExceptionField>) {
+    (
+        format!(
+            "1 validation error detected: Value at {member} failed to satisfy constraint: {constraint}"
+        ),
+        vec![crate::ops::types::ValidationExceptionField {
+            name: member.to_string(),
+            message: constraint.to_string(),
+        }],
+    )
+}
+
+/// The region this request was signed for, from its SigV4 credential scope; an
+/// unsigned request is attributed to [`DEFAULT_REGION`].
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

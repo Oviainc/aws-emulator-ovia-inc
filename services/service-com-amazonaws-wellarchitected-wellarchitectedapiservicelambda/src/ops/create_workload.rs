@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkload
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkload`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkload::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a workload and stores the whole record in
+//! [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::workloads`],
+//! so `GetWorkload`, `ListWorkloads`, `UpdateWorkload` and `DeleteWorkload` all see it.
 //!
 //! ## Shape of an operation
 //!
@@ -216,18 +210,220 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkload` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkloadErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkload"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWorkloadErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        // `Environment` is a modelled enum, so the boundary validator normally refuses an
+        // out-of-set value before this handler runs; checking it here keeps the refusal
+        // correct for any path that does not.
+        if !WORKLOAD_ENVIRONMENT_VALUES.contains(&input.environment.as_str()) {
+            return Err(field_validation(
+                "Environment",
+                &format!(
+                    "Member must satisfy enum value set: [{}]",
+                    WORKLOAD_ENVIRONMENT_VALUES.join(", ")
+                ),
+            ));
+        }
+
+        let aws_regions = input.aws_regions.unwrap_or_default();
+        let non_aws_regions = input.non_aws_regions.unwrap_or_default();
+        // "Either AwsRegions, NonAwsRegions, or both must be specified when creating a
+        // workload." (CreateWorkload doc)
+        if aws_regions.is_empty() && non_aws_regions.is_empty() {
+            return Err(field_validation(
+                "AwsRegions",
+                "Either AwsRegions, NonAwsRegions, or both must be specified",
+            ));
+        }
+        // "You also must specify ReviewOwner, even though the parameter is listed as not
+        // being required" (CreateWorkload doc).
+        let review_owner = match input.review_owner.filter(|owner| !owner.is_empty()) {
+            Some(owner) => owner,
+            None => {
+                return Err(field_validation("ReviewOwner", "Member must not be null"));
+            }
+        };
+
+        // A profile or review template named here has to exist to be associated. Neither
+        // resource can be created in this emulator yet (CreateProfile / CreateReviewTemplate
+        // are still stubs), so no ARN a caller passes resolves.
+        for (member, resource_type, arns) in [
+            (
+                "ProfileArns",
+                "PROFILE",
+                input.profile_arns.unwrap_or_default(),
+            ),
+            (
+                "ReviewTemplateArns",
+                "REVIEW_TEMPLATE",
+                input.review_template_arns.unwrap_or_default(),
+            ),
+        ] {
+            if let Some(arn) = arns.first() {
+                return Err(CreateWorkloadErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("{member} references a resource that does not exist"),
+                        resource_id: arn.clone(),
+                        resource_type: resource_type.to_string(),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let tags: std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
+        let account_ids = input.account_ids.unwrap_or_default();
+        let applications = input.applications.unwrap_or_default();
+        let pillar_priorities = input.pillar_priorities.unwrap_or_default();
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "AccountIds": &account_ids,
+            "Applications": &applications,
+            "ArchitecturalDesign": &input.architectural_design,
+            "AwsRegions": &aws_regions,
+            "Description": &input.description,
+            "Environment": &input.environment,
+            "Industry": &input.industry,
+            "IndustryType": &input.industry_type,
+            "Lenses": &input.lenses,
+            "NonAwsRegions": &non_aws_regions,
+            "Notes": &input.notes,
+            "PillarPriorities": &pillar_priorities,
+            "ReviewOwner": &review_owner,
+            "Tags": &tags,
+            "WorkloadName": &input.workload_name,
+        }));
+
+        let region = crate::state::request_region(ctx.parts());
+        let normalized_name = crate::state::normalize_workload_name(&input.workload_name);
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken` replay: the same token with the same parameters returns the
+        // result of the original request instead of creating a second workload.
+        if let Some(token) = store.create_workload_tokens.get(&input.client_request_token) {
+            if token.fingerprint != fingerprint {
+                let workload_id = token.workload_id.clone();
+                return Err(CreateWorkloadErrorModeled::ConflictException(ConflictException {
+                    message: "ClientRequestToken was already used with different parameters"
+                        .to_string(),
+                    resource_id: workload_id,
+                    resource_type: crate::state::WORKLOAD_RESOURCE_TYPE.to_string(),
+                })
+                .into());
+            }
+            if let Some(existing) = store.workloads.get(&token.workload_id) {
+                return Ok(CreateWorkloadOutput {
+                    workload_id: Some(existing.workload_id.clone()),
+                    workload_arn: Some(existing.workload_arn.clone()),
+                });
+            }
+        }
+
+        // "The name must be unique within an account within an Amazon Web Services Region.
+        // Spaces and capitalization are ignored when checking for uniqueness."
+        if let Some(existing_id) = store.workload_name_index.get(&normalized_name) {
+            return Err(CreateWorkloadErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "A workload named {:?} already exists in this account and Region",
+                    input.workload_name
+                ),
+                resource_id: existing_id.clone(),
+                resource_type: crate::state::WORKLOAD_RESOURCE_TYPE.to_string(),
+            })
+            .into());
+        }
+
+        // Workloads are metered per account and Region, and this operation models
+        // `ServiceQuotaExceededException` for the case. Refusing here is also what keeps
+        // the store bounded: the name index and the create tokens are both 1:1 with a
+        // live workload.
+        if store.workloads.len() >= crate::state::MAX_WORKLOADS_PER_ACCOUNT_REGION {
+            return Err(CreateWorkloadErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The workload quota of {} for this account and Region has been reached",
+                        crate::state::MAX_WORKLOADS_PER_ACCOUNT_REGION
+                    ),
+                    resource_id: None,
+                    resource_type: Some(crate::state::WORKLOAD_RESOURCE_TYPE.to_string()),
+                    // `QuotaCode` and `ServiceCode` are modelled `@required`. The service
+                    // code is this service's own (`OPERATIONS.md`: signing name
+                    // `wellarchitected`); the model publishes no numeric Service Quotas
+                    // code for the workload quota, so the quota is named by what it
+                    // meters.
+                    quota_code: "WorkloadsPerAccountPerRegion".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let workload_id = store.mint_workload_id();
+        let record = crate::state::WorkloadRecord {
+            workload_arn: ::engine::emulator_arn(
+                crate::state::ARN_NAMESPACE,
+                &region,
+                &format!("workload/{workload_id}"),
+            ),
+            workload_id: workload_id.clone(),
+            workload_name: input.workload_name,
+            description: input.description,
+            environment: input.environment,
+            updated_at: std::time::SystemTime::now(),
+            account_ids,
+            aws_regions,
+            non_aws_regions,
+            pillar_priorities,
+            architectural_design: input.architectural_design,
+            review_owner: Some(review_owner),
+            is_review_owner_update_acknowledged: false,
+            industry_type: input.industry_type,
+            industry: input.industry,
+            notes: input.notes,
+            improvement_status: crate::state::DEFAULT_IMPROVEMENT_STATUS.to_string(),
+            lenses: input.lenses,
+            owner: ::engine::emulator_account_id().to_string(),
+            tags,
+            applications,
+            risk_counts: std::collections::BTreeMap::new(),
+            discovery_config: input.discovery_config,
+            jira_configuration: input.jira_configuration,
+        };
+        let workload_arn = record.workload_arn.clone();
+
+        store.workloads.insert(workload_id.clone(), record);
+        store
+            .workload_name_index
+            .insert(normalized_name, workload_id.clone());
+        store.create_workload_tokens.insert(
+            input.client_request_token,
+            crate::state::CreateWorkloadToken {
+                workload_id: workload_id.clone(),
+                fingerprint,
+            },
+        );
+
+        Ok(CreateWorkloadOutput {
+            workload_id: Some(workload_id),
+            workload_arn: Some(workload_arn),
+        })
     }
+}
+
+/// The service's own modelled `ValidationException` (HTTP 400) naming the member that
+/// failed and the constraint it violated — preferred over the scaffold's synthetic one
+/// because the modelled shape carries `Reason` and `Fields`, which a client reads.
+fn field_validation(member: &str, constraint: &str) -> CreateWorkloadError {
+    let (message, fields) = crate::state::validation_detail(member, constraint);
+    CreateWorkloadErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: Some(fields),
+    })
+    .into()
 }

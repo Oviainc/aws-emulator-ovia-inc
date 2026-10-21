@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkloads
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkloads`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkloads::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages over the stored workloads, projected to `WorkloadSummary`.
+//! Reporting only — the `NextToken` it emits carries the whole cursor, so listing never
+//! writes to state.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +142,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkloads` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkloadsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkloads"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListWorkloadsErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        // `MaxResults` is modelled `@range(min: 1, max: 50)`; a request that omits it asks
+        // for a full page, so the modelled maximum is the default. The clamp restates that
+        // bound in the handler, so the page size is in 1..=50 whatever reaches here.
+        let clamped = input
+            .max_results
+            .unwrap_or(MAX_RESULTS_CEILING)
+            .clamp(1, MAX_RESULTS_CEILING);
+        let page_size = usize::try_from(clamped)
+            .expect("MaxResults is clamped into 1..=50, which always fits in a usize");
+
+        // An opaque token this service did not issue is a bad request, not an empty page.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_next_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    let (message, fields) = crate::state::validation_detail(
+                        "NextToken",
+                        "Member must be a token returned by a previous ListWorkloads call",
+                    );
+                    return Err(ListWorkloadsErrorModeled::ValidationException(
+                        ValidationException {
+                            message,
+                            reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                            fields: Some(fields),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let store = state.lock();
+        let order = store.workload_order();
+        // The cursor is start-EXCLUSIVE: the page resumes just past the last key already
+        // returned, so every workload is enumerated exactly once across the pages.
+        let start = match &cursor {
+            Some(key) => order.partition_point(|candidate| candidate <= key),
+            None => 0,
+        };
+
+        let matching: Vec<&(String, String)> = order[start..]
+            .iter()
+            .filter(|(name, _)| {
+                input
+                    .workload_name_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| name.starts_with(prefix))
+            })
+            .collect();
+
+        let page = &matching[..matching.len().min(page_size)];
+        let next_token = match page.last() {
+            Some((name, id)) if matching.len() > page.len() => {
+                Some(crate::state::encode_next_token(name, id))
+            }
+            _ => None,
+        };
+
+        let workload_summaries = page
+            .iter()
+            .filter_map(|(_, id)| store.workloads.get(id))
+            .map(crate::state::WorkloadRecord::to_summary)
+            .collect();
+
+        Ok(ListWorkloadsOutput {
+            workload_summaries: Some(workload_summaries),
+            next_token,
+        })
     }
 }
+
+/// The largest page `ListWorkloads` serves, and the page size a request that omits
+/// `MaxResults` gets: the modelled `MaxResults` `@range(min: 1, max: 50)` maximum
+/// (`smithy_query(query="operation", operation="ListWorkloads")`).
+const MAX_RESULTS_CEILING: i32 = 50;

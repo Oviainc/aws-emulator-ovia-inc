@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWorkload
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWorkload`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWorkload::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: merges the members the request carries into the stored record — an
+//! absent member is left untouched, never nulled — refreshes `UpdatedAt`, and returns
+//! the full updated `Workload`.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +187,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWorkload` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWorkloadErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWorkload"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateWorkloadErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        for (member, value, allowed) in [
+            (
+                "Environment",
+                input.environment.as_deref(),
+                WORKLOAD_ENVIRONMENT_VALUES,
+            ),
+            (
+                "ImprovementStatus",
+                input.improvement_status.as_deref(),
+                WORKLOAD_IMPROVEMENT_STATUS_VALUES,
+            ),
+        ] {
+            if let Some(value) = value {
+                if !allowed.contains(&value) {
+                    return Err(field_validation(
+                        member,
+                        &format!(
+                            "Member must satisfy enum value set: [{}]",
+                            allowed.join(", ")
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let mut store = state.lock();
+
+        if !store.workloads.contains_key(&input.workload_id) {
+            return Err(UpdateWorkloadErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("No workload exists with id {}", input.workload_id),
+                    resource_id: input.workload_id.clone(),
+                    resource_type: crate::state::WORKLOAD_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // A rename has to keep the name index unique, so resolve it before mutating: the
+        // same documented "unique per account and Region, ignoring spaces and
+        // capitalization" rule `CreateWorkload` enforces.
+        let rename = match &input.workload_name {
+            None => None,
+            Some(new_name) => {
+                let normalized = crate::state::normalize_workload_name(new_name);
+                match store.workload_name_index.get(&normalized) {
+                    Some(owner) if *owner != input.workload_id => {
+                        return Err(UpdateWorkloadErrorModeled::ConflictException(
+                            ConflictException {
+                                message: format!(
+                                    "A workload named {new_name:?} already exists in this account and Region"
+                                ),
+                                resource_id: owner.clone(),
+                                resource_type: crate::state::WORKLOAD_RESOURCE_TYPE.to_string(),
+                            },
+                        )
+                        .into());
+                    }
+                    _ => Some(normalized),
+                }
+            }
+        };
+
+        if let Some(normalized) = rename {
+            let previous = store
+                .workloads
+                .get(&input.workload_id)
+                .map(|record| crate::state::normalize_workload_name(&record.workload_name));
+            if let Some(previous) = previous {
+                store.workload_name_index.remove(&previous);
+            }
+            store
+                .workload_name_index
+                .insert(normalized, input.workload_id.clone());
+        }
+
+        let Some(record) = store.workloads.get_mut(&input.workload_id) else {
+            return Err(UpdateWorkloadErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("No workload exists with id {}", input.workload_id),
+                    resource_id: input.workload_id.clone(),
+                    resource_type: crate::state::WORKLOAD_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Only the members the request carries are applied; every `None` leaves the stored
+        // value alone.
+        if let Some(workload_name) = input.workload_name {
+            record.workload_name = workload_name;
+        }
+        if let Some(description) = input.description {
+            record.description = description;
+        }
+        if let Some(environment) = input.environment {
+            record.environment = environment;
+        }
+        if let Some(account_ids) = input.account_ids {
+            record.account_ids = account_ids;
+        }
+        if let Some(aws_regions) = input.aws_regions {
+            record.aws_regions = aws_regions;
+        }
+        if let Some(non_aws_regions) = input.non_aws_regions {
+            record.non_aws_regions = non_aws_regions;
+        }
+        if let Some(pillar_priorities) = input.pillar_priorities {
+            record.pillar_priorities = pillar_priorities;
+        }
+        if let Some(architectural_design) = input.architectural_design {
+            record.architectural_design = Some(architectural_design);
+        }
+        if let Some(review_owner) = input.review_owner {
+            record.review_owner = Some(review_owner);
+        }
+        if let Some(acknowledged) = input.is_review_owner_update_acknowledged {
+            record.is_review_owner_update_acknowledged = acknowledged;
+        }
+        if let Some(industry_type) = input.industry_type {
+            record.industry_type = Some(industry_type);
+        }
+        if let Some(industry) = input.industry {
+            record.industry = Some(industry);
+        }
+        if let Some(notes) = input.notes {
+            record.notes = Some(notes);
+        }
+        if let Some(improvement_status) = input.improvement_status {
+            record.improvement_status = improvement_status;
+        }
+        if let Some(discovery_config) = input.discovery_config {
+            record.discovery_config = Some(discovery_config);
+        }
+        if let Some(applications) = input.applications {
+            record.applications = applications;
+        }
+        if let Some(jira_configuration) = input.jira_configuration {
+            record.jira_configuration = Some(jira_configuration);
+        }
+        record.updated_at = std::time::SystemTime::now();
+
+        Ok(UpdateWorkloadOutput {
+            workload: Some(record.to_workload()),
+        })
     }
+}
+
+/// The service's own modelled `ValidationException` (HTTP 400) naming the member that
+/// failed and the constraint it violated.
+fn field_validation(member: &str, constraint: &str) -> UpdateWorkloadError {
+    let (message, fields) = crate::state::validation_detail(member, constraint);
+    UpdateWorkloadErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: Some(fields),
+    })
+    .into()
 }

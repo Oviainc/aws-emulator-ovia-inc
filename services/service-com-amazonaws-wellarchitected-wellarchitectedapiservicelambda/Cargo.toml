@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Mints the 32-hex WorkloadId and fingerprints idempotent request parameters.
+sha2 = { workspace = true }
+# Hex codec for the minted ids and the opaque ListWorkloads NextToken.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
