@@ -1399,6 +1399,106 @@
     {
       "shape_id": "com.amazonaws.s3outposts#S3Outposts",
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/s3outposts/service/2017-07-25/s3outposts-2017-07-25.json"
+    },
+    {
+      "shape_id": "com.amazonaws.s3tables#S3TableBuckets",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/s3tables/service/2018-05-10/s3tables-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.s3vectors#S3Vectors",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/s3vectors/service/2025-07-15/s3vectors-2025-07-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.sagemaker#SageMaker",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sagemaker/service/2017-07-24/sagemaker-2017-07-24.json"
+    },
+    {
+      "shape_id": "com.amazonaws.sagemakera2iruntime#AmazonSageMakerA2IRuntime",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sagemaker-a2i-runtime/service/2019-11-07/sagemaker-a2i-runtime-2019-11-07.json"
+    },
+    {
+      "shape_id": "com.amazonaws.sagemakeredge#AmazonSageMakerEdge",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sagemaker-edge/service/2020-09-23/sagemaker-edge-2020-09-23.json"
+    },
+    {
+      "shape_id": "com.amazonaws.sagemakerfeaturestoreruntime#AmazonSageMakerFeatureStoreRuntime",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sagemaker-featurestore-runtime/service/2020-07-01/sagemaker-featurestore-runtime-2020-07-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.sagemakergeospatial#SageMakerGeospatial",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sagemaker-geospatial/service/2020-05-27/sagemaker-geospatial-2020-05-27.json"
+    },
+    {
+      "shape_id": "com.amazonaws.sagemakerjobruntime#AgenticRFTRuntimeService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sagemakerjobruntime/service/2026-02-01/sagemakerjobruntime-2026-02-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.sagemakermetrics#SageMakerMetricsService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sagemaker-metrics/service/2022-09-30/sagemaker-metrics-2022-09-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.sagemakerruntime#AmazonSageMakerRuntime",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sagemaker-runtime/service/2017-05-13/sagemaker-runtime-2017-05-13.json"
+    },
+    {
+      "shape_id": "com.amazonaws.sagemakerruntimehttp2#AmazonSageMakerRuntimeHttp2",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sagemaker-runtime-http2/service/2025-10-01/sagemaker-runtime-http2-2025-10-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.sagemakertrainingsessionruntime#LegoRouterService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sagemakertrainingsessionruntime/service/2025-02-10/sagemakertrainingsessionruntime-2025-02-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.savingsplans#AWSSavingsPlan",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/savingsplans/service/2019-06-28/savingsplans-2019-06-28.json"
+    },
+    {
+      "shape_id": "com.amazonaws.scheduler#AWSChronosService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/scheduler/service/2021-06-30/scheduler-2021-06-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.schemas#schemas",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/schemas/service/2019-12-02/schemas-2019-12-02.json"
+    },
+    {
+      "shape_id": "com.amazonaws.secretsmanager#secretsmanager",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/secrets-manager/service/2017-10-17/secrets-manager-2017-10-17.json"
+    },
+    {
+      "shape_id": "com.amazonaws.securityagent#SecurityAgent",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/securityagent/service/2025-09-06/securityagent-2025-09-06.json"
+    },
+    {
+      "shape_id": "com.amazonaws.securityhub#SecurityHubAPIService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/securityhub/service/2018-10-26/securityhub-2018-10-26.json"
+    },
+    {
+      "shape_id": "com.amazonaws.securityir#SecurityIncidentResponse",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/security-ir/service/2018-05-10/security-ir-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.securitylake#SecurityLake",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/securitylake/service/2018-05-10/securitylake-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.serverlessapplicationrepository#ServerlessApplicationRepository",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/serverlessapplicationrepository/service/2017-09-08/serverlessapplicationrepository-2017-09-08.json"
+    },
+    {
+      "shape_id": "com.amazonaws.servicecatalog#AWS242ServiceCatalogService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/service-catalog/service/2015-12-10/service-catalog-2015-12-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.servicecatalogappregistry#AWS242AppRegistry",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/service-catalog-appregistry/service/2020-06-24/service-catalog-appregistry-2020-06-24.json"
+    },
+    {
+      "shape_id": "com.amazonaws.servicediscovery#Route53AutoNaming_v20170314",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/servicediscovery/service/2017-03-14/servicediscovery-2017-03-14.json"
+    },
+    {
+      "shape_id": "com.amazonaws.servicequotas#ServiceQuotasV20190624",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/service-quotas/service/2019-06-24/service-quotas-2019-06-24.json"
     }
   ]
 }

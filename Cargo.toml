@@ -350,6 +350,31 @@ members = [
     "services/service-com-amazonaws-s3control-awss3controlservicev20180820",
     "services/service-com-amazonaws-s3files-s3files",
     "services/service-com-amazonaws-s3outposts-s3outposts",
+    "services/service-com-amazonaws-s3tables-s3tablebuckets",
+    "services/service-com-amazonaws-s3vectors-s3vectors",
+    "services/service-com-amazonaws-sagemaker-sagemaker",
+    "services/service-com-amazonaws-sagemakera2iruntime-amazonsagemakera2iruntime",
+    "services/service-com-amazonaws-sagemakeredge-amazonsagemakeredge",
+    "services/service-com-amazonaws-sagemakerfeaturestoreruntime-amazonsagemakerfeaturestoreruntime",
+    "services/service-com-amazonaws-sagemakergeospatial-sagemakergeospatial",
+    "services/service-com-amazonaws-sagemakerjobruntime-agenticrftruntimeservice",
+    "services/service-com-amazonaws-sagemakermetrics-sagemakermetricsservice",
+    "services/service-com-amazonaws-sagemakerruntime-amazonsagemakerruntime",
+    "services/service-com-amazonaws-sagemakerruntimehttp2-amazonsagemakerruntimehttp2",
+    "services/service-com-amazonaws-sagemakertrainingsessionruntime-legorouterservice",
+    "services/service-com-amazonaws-savingsplans-awssavingsplan",
+    "services/service-com-amazonaws-scheduler-awschronosservice",
+    "services/service-com-amazonaws-schemas-schemas",
+    "services/service-com-amazonaws-secretsmanager-secretsmanager",
+    "services/service-com-amazonaws-securityagent-securityagent",
+    "services/service-com-amazonaws-securityhub-securityhubapiservice",
+    "services/service-com-amazonaws-securityir-securityincidentresponse",
+    "services/service-com-amazonaws-securitylake-securitylake",
+    "services/service-com-amazonaws-serverlessapplicationrepository-serverlessapplicationrepository",
+    "services/service-com-amazonaws-servicecatalog-aws242servicecatalogservice",
+    "services/service-com-amazonaws-servicecatalogappregistry-aws242appregistry",
+    "services/service-com-amazonaws-servicediscovery-route53autonaming-v20170314",
+    "services/service-com-amazonaws-servicequotas-servicequotasv20190624",
     "core/router",
     "core/embedded",
 ]
@@ -735,6 +760,31 @@ service-com-amazonaws-s3-amazons3 = { path = "services/service-com-amazonaws-s3-
 service-com-amazonaws-s3control-awss3controlservicev20180820 = { path = "services/service-com-amazonaws-s3control-awss3controlservicev20180820" }
 service-com-amazonaws-s3files-s3files = { path = "services/service-com-amazonaws-s3files-s3files" }
 service-com-amazonaws-s3outposts-s3outposts = { path = "services/service-com-amazonaws-s3outposts-s3outposts" }
+service-com-amazonaws-s3tables-s3tablebuckets = { path = "services/service-com-amazonaws-s3tables-s3tablebuckets" }
+service-com-amazonaws-s3vectors-s3vectors = { path = "services/service-com-amazonaws-s3vectors-s3vectors" }
+service-com-amazonaws-sagemaker-sagemaker = { path = "services/service-com-amazonaws-sagemaker-sagemaker" }
+service-com-amazonaws-sagemakera2iruntime-amazonsagemakera2iruntime = { path = "services/service-com-amazonaws-sagemakera2iruntime-amazonsagemakera2iruntime" }
+service-com-amazonaws-sagemakeredge-amazonsagemakeredge = { path = "services/service-com-amazonaws-sagemakeredge-amazonsagemakeredge" }
+service-com-amazonaws-sagemakerfeaturestoreruntime-amazonsagemakerfeaturestoreruntime = { path = "services/service-com-amazonaws-sagemakerfeaturestoreruntime-amazonsagemakerfeaturestoreruntime" }
+service-com-amazonaws-sagemakergeospatial-sagemakergeospatial = { path = "services/service-com-amazonaws-sagemakergeospatial-sagemakergeospatial" }
+service-com-amazonaws-sagemakerjobruntime-agenticrftruntimeservice = { path = "services/service-com-amazonaws-sagemakerjobruntime-agenticrftruntimeservice" }
+service-com-amazonaws-sagemakermetrics-sagemakermetricsservice = { path = "services/service-com-amazonaws-sagemakermetrics-sagemakermetricsservice" }
+service-com-amazonaws-sagemakerruntime-amazonsagemakerruntime = { path = "services/service-com-amazonaws-sagemakerruntime-amazonsagemakerruntime" }
+service-com-amazonaws-sagemakerruntimehttp2-amazonsagemakerruntimehttp2 = { path = "services/service-com-amazonaws-sagemakerruntimehttp2-amazonsagemakerruntimehttp2" }
+service-com-amazonaws-sagemakertrainingsessionruntime-legorouterservice = { path = "services/service-com-amazonaws-sagemakertrainingsessionruntime-legorouterservice" }
+service-com-amazonaws-savingsplans-awssavingsplan = { path = "services/service-com-amazonaws-savingsplans-awssavingsplan" }
+service-com-amazonaws-scheduler-awschronosservice = { path = "services/service-com-amazonaws-scheduler-awschronosservice" }
+service-com-amazonaws-schemas-schemas = { path = "services/service-com-amazonaws-schemas-schemas" }
+service-com-amazonaws-secretsmanager-secretsmanager = { path = "services/service-com-amazonaws-secretsmanager-secretsmanager" }
+service-com-amazonaws-securityagent-securityagent = { path = "services/service-com-amazonaws-securityagent-securityagent" }
+service-com-amazonaws-securityhub-securityhubapiservice = { path = "services/service-com-amazonaws-securityhub-securityhubapiservice" }
+service-com-amazonaws-securityir-securityincidentresponse = { path = "services/service-com-amazonaws-securityir-securityincidentresponse" }
+service-com-amazonaws-securitylake-securitylake = { path = "services/service-com-amazonaws-securitylake-securitylake" }
+service-com-amazonaws-serverlessapplicationrepository-serverlessapplicationrepository = { path = "services/service-com-amazonaws-serverlessapplicationrepository-serverlessapplicationrepository" }
+service-com-amazonaws-servicecatalog-aws242servicecatalogservice = { path = "services/service-com-amazonaws-servicecatalog-aws242servicecatalogservice" }
+service-com-amazonaws-servicecatalogappregistry-aws242appregistry = { path = "services/service-com-amazonaws-servicecatalogappregistry-aws242appregistry" }
+service-com-amazonaws-servicediscovery-route53autonaming-v20170314 = { path = "services/service-com-amazonaws-servicediscovery-route53autonaming-v20170314" }
+service-com-amazonaws-servicequotas-servicequotasv20190624 = { path = "services/service-com-amazonaws-servicequotas-servicequotasv20190624" }
 
 # The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
 #
