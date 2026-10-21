@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTrailStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTrailStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTrailStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the logging state of one trail from the shared trail registry
+//! (`crate::state`).
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +195,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTrailStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTrailStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTrailStatus"))
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTrailStatusErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "GetTrailStatus needs the CloudTrail trail registry, which this \
+                         engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        let record = store
+            .resolve(&input.name, &region)
+            .map_err(|rejection| match rejection {
+                crate::state::IdentifierRejection::InvalidArn(message) => {
+                    GetTrailStatusErrorModeled::CloudTrailARNInvalidException(
+                        CloudTrailARNInvalidException {
+                            message: Some(message),
+                        },
+                    )
+                }
+                crate::state::IdentifierRejection::InvalidName(message) => {
+                    GetTrailStatusErrorModeled::InvalidTrailNameException(
+                        InvalidTrailNameException {
+                            message: Some(message),
+                        },
+                    )
+                }
+            })?
+            .ok_or_else(|| {
+                GetTrailStatusErrorModeled::TrailNotFoundException(TrailNotFoundException {
+                    message: Some(format!("Unknown trail: {}", input.name)),
+                })
+            })?;
+
+        Ok(GetTrailStatusOutput {
+            is_logging: Some(record.status.is_logging),
+            start_logging_time: record
+                .status
+                .start_logging_time
+                .map(::aws_smithy_types::DateTime::from),
+            stop_logging_time: record
+                .status
+                .stop_logging_time
+                .map(::aws_smithy_types::DateTime::from),
+            // The deprecated string forms of the two instants above.
+            time_logging_started: record.status.start_logging_time.and_then(crate::state::iso8601),
+            time_logging_stopped: record.status.stop_logging_time.and_then(crate::state::iso8601),
+            // Nothing has delivered a log or digest file or sent a notification for
+            // this trail, so there is no delivery time, attempt or error to report.
+            latest_delivery_error: None,
+            latest_notification_error: None,
+            latest_delivery_time: None,
+            latest_notification_time: None,
+            latest_cloud_watch_logs_delivery_error: None,
+            latest_cloud_watch_logs_delivery_time: None,
+            latest_digest_delivery_time: None,
+            latest_digest_delivery_error: None,
+            latest_delivery_attempt_time: None,
+            latest_notification_attempt_time: None,
+            latest_notification_attempt_succeeded: None,
+            latest_delivery_attempt_succeeded: None,
+        })
     }
 }

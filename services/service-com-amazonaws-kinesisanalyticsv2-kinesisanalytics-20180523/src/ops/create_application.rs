@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: persists a new application in this service's store and answers with the
+//! stored `ApplicationDetail`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +174,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplication"))
+        // Every modelled constraint on the input — `ApplicationName`'s length and
+        // `^[a-zA-Z0-9_.-]+$` pattern, `RuntimeEnvironment`'s and `ApplicationMode`'s
+        // enum value sets, `ServiceExecutionRole`'s `^arn:` pattern — is refused at the
+        // boundary with HTTP 400 before this handler runs, so reaching here means the
+        // request satisfies all of them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateApplicationErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "this service is not mounted on a stateful engine, so no \
+                         application can be stored"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let tags = input.tags.clone().unwrap_or_default();
+        // "the maximum number of user-defined application tags is 50" — the
+        // `CreateApplication$Tags` doc; the modelled `Tags` bound (1..200) counts system
+        // tags too, so the user-tag ceiling is the service's own rule to enforce here.
+        if tags.len() > MAX_USER_TAGS {
+            return Err(CreateApplicationErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "{} tags were supplied; at most {MAX_USER_TAGS} user-defined \
+                         application tags are allowed",
+                        tags.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let name = input.application_name.clone();
+        let now = crate::state::now_timestamp();
+        let region = crate::state::region_from_headers(&ctx.parts().headers);
+
+        let mut store = state.lock();
+        store.settle_named(&name);
+
+        if store.applications.contains_key(&name) {
+            return Err(CreateApplicationErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!("Application {name} already exists")),
+                },
+            )
+            .into());
+        }
+
+        // The store holds every application for the life of the process, so a create is
+        // refused once it is full rather than growing it without limit. See
+        // `crate::state::MAX_APPLICATIONS` for why the bound is the emulator's own.
+        if store.applications.len() >= crate::state::MAX_APPLICATIONS {
+            return Err(CreateApplicationErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The number of allowed resources has been exceeded: at most {} \
+                         applications can be stored",
+                        crate::state::MAX_APPLICATIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let configuration = input
+            .application_configuration
+            .as_ref()
+            .map(|cfg| store.describe_configuration(cfg));
+        let cloud_watch_logging_options = input
+            .cloud_watch_logging_options
+            .as_deref()
+            .map(|options| store.describe_logging_options(options))
+            .unwrap_or_default();
+        let conditional_token = store.mint_id("ConditionalToken");
+
+        let application = crate::state::Application {
+            arn: crate::state::application_arn(&region, &name),
+            name: name.clone(),
+            description: input.application_description,
+            runtime_environment: input.runtime_environment,
+            service_execution_role: input.service_execution_role,
+            application_mode: input.application_mode,
+            // A newly created application is returned READY: it exists and is
+            // configured, and only StartApplication moves it on from there.
+            status: crate::state::STATUS_READY.to_string(),
+            pending: None,
+            version_id: 1,
+            create_timestamp: now,
+            version_create_timestamp: now,
+            last_update_timestamp: None,
+            configuration,
+            cloud_watch_logging_options,
+            conditional_token: Some(conditional_token),
+            tags: tags
+                .into_iter()
+                .map(|tag| (tag.key, tag.value.unwrap_or_default()))
+                .collect(),
+            operations: Vec::new(),
+        };
+
+        store.applications.insert(name.clone(), application);
+
+        // Read the response back out of the store, so what the caller receives is
+        // exactly what a later DescribeApplication will report.
+        let application_detail = store
+            .applications
+            .get(&name)
+            .expect("the application was just inserted under this name")
+            .detail();
+        Ok(CreateApplicationOutput { application_detail })
     }
 }
+
+/// The ceiling on user-defined application tags, from the `CreateApplication$Tags` and
+/// `TooManyTagsException` docs: "the maximum number of user-defined application tags is 50".
+const MAX_USER_TAGS: usize = 50;
