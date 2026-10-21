@@ -31,9 +31,15 @@ pub struct UpdateMaintenance {
     pub maintenance_start_hour: Option<String>,
 }
 
+// Named after the Smithy shape (`UpdateFlowResponse`) rather than the scaffold's default
+// `{Operation}Output`, because this service ALSO models an operation called
+// `UpdateFlowOutput`. With both named `UpdateFlowOutput`, the two globs `ops/mod.rs`
+// re-exports — `types::*` and `update_flow_output::*` — re-export one name twice, and the
+// crate fails to build under `-D warnings` (`ambiguous_glob_reexports`). The wire shape is
+// unchanged: it is named by the `shape` argument below, not by this struct's Rust name.
 #[smithy_macros::smithy(shape = "com.amazonaws.mediaconnect#UpdateFlowResponse")]
 #[derive(Debug, Clone, Default)]
-pub struct UpdateFlowOutput {
+pub struct UpdateFlowResponse {
     pub flow: Option<Flow>,
 }
 

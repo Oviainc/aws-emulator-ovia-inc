@@ -33,9 +33,15 @@ pub struct UpdateIngressGatewayBridgeRequest {
     pub max_outputs: Option<i32>,
 }
 
+// Named after the Smithy shape (`UpdateBridgeResponse`) rather than the scaffold's default
+// `{Operation}Output`, because this service ALSO models an operation called
+// `UpdateBridgeOutput`. With both named `UpdateBridgeOutput`, the two globs `ops/mod.rs`
+// re-exports — `types::*` and `update_bridge_output::*` — re-export one name twice, and the
+// crate fails to build under `-D warnings` (`ambiguous_glob_reexports`). The wire shape is
+// unchanged: it is named by the `shape` argument below, not by this struct's Rust name.
 #[smithy_macros::smithy(shape = "com.amazonaws.mediaconnect#UpdateBridgeResponse")]
 #[derive(Debug, Clone, Default)]
-pub struct UpdateBridgeOutput {
+pub struct UpdateBridgeResponse {
     pub bridge: Option<Bridge>,
 }
 

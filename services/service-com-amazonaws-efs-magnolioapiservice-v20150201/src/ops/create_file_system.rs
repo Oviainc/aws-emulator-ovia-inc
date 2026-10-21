@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFileSystem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFileSystem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFileSystem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints and persists a file system in [`crate::state`], keyed by its
+//! `CreationToken` so a repeat of the same call answers `FileSystemAlreadyExists` with
+//! the id the first call minted rather than creating a second file system.
 //!
 //! ## Shape of an operation
 //!
@@ -301,18 +295,235 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFileSystem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFileSystemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFileSystem"))
+        use crate::state as efs;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+        let region = efs::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // Defaults. The modelled enum closure of `PerformanceMode` / `ThroughputMode`
+        // is already refused at the boundary, so a value reaching here is one of them.
+        let performance_mode = input
+            .performance_mode
+            .clone()
+            .unwrap_or_else(|| efs::DEFAULT_PERFORMANCE_MODE.to_string());
+        let throughput_mode = input
+            .throughput_mode
+            .clone()
+            .unwrap_or_else(|| efs::DEFAULT_THROUGHPUT_MODE.to_string());
+
+        // "Required if ThroughputMode is set to provisioned" / "Valid for file systems
+        // using ThroughputMode set to provisioned".
+        let provisioned = throughput_mode == efs::THROUGHPUT_MODE_PROVISIONED;
+        match (provisioned, input.provisioned_throughput_in_mibps) {
+            (true, None) => {
+                return Err(bad_request(
+                    "ProvisionedThroughputInMibps is required when ThroughputMode is provisioned",
+                ))
+            }
+            (false, Some(_)) => {
+                return Err(bad_request(format!(
+                    "ProvisionedThroughputInMibps is valid only when ThroughputMode is \
+                     provisioned; ThroughputMode is {throughput_mode}"
+                )))
+            }
+            (true, Some(mibps)) if mibps > efs::MAX_PROVISIONED_THROUGHPUT_MIBPS => {
+                return Err(CreateFileSystemErrorModeled::ThroughputLimitExceeded(
+                    ThroughputLimitExceeded {
+                        error_code: "ThroughputLimitExceeded".to_string(),
+                        message: Some(format!(
+                            "ProvisionedThroughputInMibps must be at most {}; got {mibps}",
+                            efs::MAX_PROVISIONED_THROUGHPUT_MIBPS
+                        )),
+                    },
+                )
+                .into())
+            }
+            _ => {}
+        }
+
+        // "MaxIO mode is not supported for One Zone file systems or file systems that
+        // use Elastic throughput."
+        if performance_mode == efs::PERFORMANCE_MODE_MAX_IO {
+            if throughput_mode == efs::THROUGHPUT_MODE_ELASTIC {
+                return Err(bad_request(
+                    "PerformanceMode maxIO is not supported with ThroughputMode elastic",
+                ));
+            }
+            if input.availability_zone_name.is_some() {
+                return Err(bad_request(
+                    "PerformanceMode maxIO is not supported on a One Zone file system",
+                ));
+            }
+        }
+
+        // A One Zone file system's Availability Zone has to be one of the Region the
+        // request is signed for.
+        if let Some(az_name) = input.availability_zone_name.as_deref() {
+            let in_region = efs::split_availability_zone_name(az_name)
+                .is_some_and(|(az_region, _)| az_region == region);
+            if !in_region {
+                return Err(CreateFileSystemErrorModeled::UnsupportedAvailabilityZone(
+                    UnsupportedAvailabilityZone {
+                        error_code: "UnsupportedAvailabilityZone".to_string(),
+                        message: Some(format!(
+                            "AvailabilityZoneName {az_name} is not an Availability Zone of \
+                             Region {region}"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "This parameter is required only if you want to use a non-default KMS key" —
+        // a KMS key is meaningful only on an encrypted file system.
+        if input.kms_key_id.is_some() && input.encrypted != Some(true) {
+            return Err(bad_request(
+                "KmsKeyId is valid only when Encrypted is true",
+            ));
+        }
+
+        // "Each key must be unique." The modelled `Tags` list carries no length bound,
+        // so the published per-file-system quota is enforced first; the key scan then
+        // runs over a bounded list through a set, not a nested loop.
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > efs::MAX_TAGS_PER_FILE_SYSTEM {
+            return Err(bad_request(format!(
+                "Tags must hold at most {} tags; got {}",
+                efs::MAX_TAGS_PER_FILE_SYSTEM,
+                tags.len()
+            )));
+        }
+        let mut keys = ::std::collections::BTreeSet::new();
+        for tag in &tags {
+            if !keys.insert(tag.key.as_str()) {
+                return Err(bad_request(format!(
+                    "Tags must each have a unique Key; Key {} appears more than once",
+                    tag.key
+                )));
+            }
+        }
+
+        let mut state = state.lock();
+        state.materialize_due_transitions(now);
+
+        // The idempotency rule: "Otherwise, this operation returns a
+        // FileSystemAlreadyExists error with the ID of the existing file system."
+        if let Some(existing) = state.creation_tokens.get(&input.creation_token) {
+            return Err(CreateFileSystemErrorModeled::FileSystemAlreadyExists(
+                FileSystemAlreadyExists {
+                    error_code: "FileSystemAlreadyExists".to_string(),
+                    message: Some(format!(
+                        "File system already exists with CreationToken {}",
+                        input.creation_token
+                    )),
+                    file_system_id: existing.clone(),
+                },
+            )
+            .into());
+        }
+
+        // The published quota: "File systems per account, per Region: 1,000". It also
+        // bounds this store, so a repeated create cannot grow the process without limit.
+        if state.file_systems.len() >= efs::MAX_FILE_SYSTEMS_PER_REGION {
+            return Err(CreateFileSystemErrorModeled::FileSystemLimitExceeded(
+                FileSystemLimitExceeded {
+                    error_code: "FileSystemLimitExceeded".to_string(),
+                    message: Some(format!(
+                        "this account already holds the maximum of {} file systems in \
+                         Region {region}",
+                        efs::MAX_FILE_SYSTEMS_PER_REGION
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let ordinal = state.next_ordinal();
+        let file_system_id = format!("fs-{}", state.mint_hex());
+        let file_system_arn = ::engine::emulator_arn(
+            "elasticfilesystem",
+            &region,
+            &format!("file-system/{file_system_id}"),
+        );
+        // "If the file system has a Name tag, Amazon EFS returns the value in this field."
+        let name = tags
+            .iter()
+            .find(|tag| tag.key == "Name")
+            .map(|tag| tag.value.clone());
+        let kms_key_id = (input.encrypted == Some(true)).then(|| {
+            efs::kms_key_arn(
+                input
+                    .kms_key_id
+                    .as_deref()
+                    .unwrap_or(efs::DEFAULT_EFS_KMS_ALIAS),
+                &region,
+            )
+        });
+        let availability_zone_id = input
+            .availability_zone_name
+            .as_deref()
+            .map(efs::availability_zone_id);
+        // "Default is false. However, if you specify an AvailabilityZoneName, the
+        // default is true."
+        let backup = input
+            .backup
+            .unwrap_or(input.availability_zone_name.is_some());
+
+        let file_system = efs::FileSystem {
+            ordinal,
+            file_system_id: file_system_id.clone(),
+            file_system_arn,
+            owner_id: ::engine::emulator_account_id().to_string(),
+            creation_token: input.creation_token.clone(),
+            creation_time: now,
+            available_at: now + efs::CREATING_FOR,
+            // "The file system will have an Amazon EFS assigned ID, and an initial
+            // lifecycle state creating"; the clock owes it `available`.
+            life_cycle_state: efs::LIFE_CYCLE_CREATING.to_string(),
+            name,
+            performance_mode,
+            throughput_mode,
+            provisioned_throughput_in_mibps: input.provisioned_throughput_in_mibps,
+            encrypted: input.encrypted,
+            kms_key_id,
+            availability_zone_name: input.availability_zone_name.clone(),
+            availability_zone_id,
+            backup,
+            size_in_bytes: 0,
+            size_measured_at: now,
+            tags,
+            mount_target_ids: Vec::new(),
+        };
+
+        let description = file_system.describe();
+        state
+            .creation_tokens
+            .insert(input.creation_token.clone(), file_system_id.clone());
+        state.file_systems.insert(file_system_id, file_system);
+        Ok(description)
     }
+}
+
+/// A 400 `BadRequest`: "the request is malformed or contains an error such as an invalid
+/// parameter value or a missing required parameter".
+fn bad_request(message: impl Into<String>) -> CreateFileSystemError {
+    CreateFileSystemErrorModeled::BadRequest(BadRequest {
+        error_code: "BadRequest".to_string(),
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 500 `InternalServerError`, for the one case this handler cannot serve: the engine
+/// this service was mounted on holds no store for it.
+fn internal_server_error() -> CreateFileSystemError {
+    CreateFileSystemErrorModeled::InternalServerError(InternalServerError {
+        error_code: "InternalServerError".to_string(),
+        message: Some("the EFS emulator state store is unavailable".to_string()),
+    })
+    .into()
 }

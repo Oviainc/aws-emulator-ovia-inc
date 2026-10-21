@@ -18,8 +18,15 @@ pub struct DeleteApplicationInput {
     pub create_timestamp: ::aws_smithy_types::DateTime,
 }
 
+// Named after the Smithy shape (`DeleteApplicationResponse`) rather than the scaffold's
+// default `{Operation}Output`, because this service ALSO models an operation called
+// `DeleteApplicationOutput`. With both named `DeleteApplicationOutput`, the two globs
+// `ops/mod.rs` re-exports — `types::*` and `delete_application_output::*` — re-export one
+// name twice, and the crate fails to build under `-D warnings`
+// (`ambiguous_glob_reexports`). The wire shape is unchanged: it is named by the `shape`
+// argument below, not by this struct's Rust name.
 #[smithy_macros::smithy(shape = "com.amazonaws.kinesisanalytics#DeleteApplicationResponse")]
 #[derive(Debug, Clone, Default)]
-pub struct DeleteApplicationOutput {
+pub struct DeleteApplicationResponse {
 }
 

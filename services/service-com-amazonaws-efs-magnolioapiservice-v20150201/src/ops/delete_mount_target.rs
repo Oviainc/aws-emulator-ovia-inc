@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMountTarget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMountTarget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMountTarget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the mount target from [`crate::state`] and from its file
+//! system's mount-target list, so the count a later DescribeFileSystems reports moves
+//! with it.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +171,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMountTarget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMountTargetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMountTarget"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.materialize_due_transitions(now);
+
+        let Some(removed) = state.mount_targets.remove(&input.mount_target_id) else {
+            return Err(DeleteMountTargetErrorModeled::MountTargetNotFound(
+                MountTargetNotFound {
+                    error_code: "MountTargetNotFound".to_string(),
+                    message: Some(format!(
+                        "Mount target {} does not exist",
+                        input.mount_target_id
+                    )),
+                },
+            )
+            .into());
+        };
+        if let Some(file_system) = state.file_systems.get_mut(&removed.file_system_id) {
+            file_system
+                .mount_target_ids
+                .retain(|id| *id != removed.mount_target_id);
+        }
+        Ok(DeleteMountTargetOutput)
     }
+}
+
+/// A 500 `InternalServerError`, for the one case this handler cannot serve: the engine
+/// this service was mounted on holds no store for it.
+fn internal_server_error() -> DeleteMountTargetError {
+    DeleteMountTargetErrorModeled::InternalServerError(InternalServerError {
+        error_code: "InternalServerError".to_string(),
+        message: Some("the EFS emulator state store is unavailable".to_string()),
+    })
+    .into()
 }
