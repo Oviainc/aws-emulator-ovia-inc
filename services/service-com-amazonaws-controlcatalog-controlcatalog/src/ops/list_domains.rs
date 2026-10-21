@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDomains
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDomains`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDomains::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the catalog's domains, a page at a time, out of this service's state
+//! (`crate::state`): the whole collection in ARN order, honouring `MaxResults` and
+//! resuming after the item a `NextToken` names.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +70,21 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page `ListDomains` returns, and the page size a request that sends no
+/// `MaxResults` gets: the maximum of the modeled `MaxListDomainsResults` range (1..100).
+const MAX_LIST_DOMAINS_RESULTS: i32 = 100;
+
+/// Project a stored domain into the modeled `DomainSummary`.
+fn domain_summary(domain: &crate::state::Domain) -> DomainSummary {
+    DomainSummary {
+        arn: domain.arn.clone(),
+        name: domain.name.clone(),
+        description: domain.description.clone(),
+        create_time: ::aws_smithy_types::DateTime::from_secs(domain.create_time),
+        last_update_time: ::aws_smithy_types::DateTime::from_secs(domain.last_update_time),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +157,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDomains` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDomainsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDomains"))
+        // `ctx` carries request metadata only; this operation reads none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDomainsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Control Catalog store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // ListDomains takes no filter, so every page of this collection is produced
+        // under the same (empty) filter.
+        let fingerprint = crate::state::filter_fingerprint(&[]);
+        let page = crate::state::page(
+            "domains",
+            &fingerprint,
+            state
+                .domains
+                .iter()
+                .map(|(arn, domain)| (arn.clone(), domain_summary(domain))),
+            input.next_token.as_deref(),
+            input.max_results,
+            MAX_LIST_DOMAINS_RESULTS,
+        )
+        .map_err(|error| {
+            ListDomainsErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::page_refusal("ListDomains", error)),
+            })
+        })?;
+
+        Ok(ListDomainsOutput {
+            domains: page.items,
+            next_token: page.next_token,
+        })
     }
 }
