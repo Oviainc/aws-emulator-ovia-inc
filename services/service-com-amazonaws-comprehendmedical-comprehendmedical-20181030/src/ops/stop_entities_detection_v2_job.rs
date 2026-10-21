@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopEntitiesDetectionV2Job
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopEntitiesDetectionV2Job`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopEntitiesDetectionV2Job::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. A job still running is moved to `STOP_REQUESTED`, from where the clock
+//! owes its move to `STOPPED` with an `EndTime`; a job that already reached a terminal
+//! status keeps it. The stored job is what a later describe or list reports.
 //!
 //! ## Shape of an operation
 //!
@@ -144,17 +139,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopEntitiesDetectionV2Job` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopEntitiesDetectionV2JobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopEntitiesDetectionV2Job"))
+        // request metadata only, and this operation needs none of it.
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                StopEntitiesDetectionV2JobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("The service's job store is unavailable.".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let now = crate::state::now_epoch_secs();
+        let mut state = store.lock();
+        state.expire_jobs(now);
+        let Some(job) = state.entities_detection_v2_jobs.get_mut(&input.job_id) else {
+            return Err(
+                StopEntitiesDetectionV2JobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No entities detection job was found for JobId '{}'.",
+                            input.job_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // Apply what the clock owes first: a job that finished before the stop could
+        // take effect keeps the status it reached. "Stops a medical entities detection
+        // job in progress" — only a job still running has a stop to request.
+        job.advance(now);
+        job.request_stop(now);
+
+        Ok(StopEntitiesDetectionV2JobOutput {
+            job_id: Some(input.job_id),
+        })
     }
 }

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateScalingPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateScalingPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Inserts one scaling plan, keyed by `ScalingPlanName`, into [`crate::state`] and
+//! answers with its version.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateScalingPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The plan is stored in `CreationInProgress` — the status AWS reports while "the
+//! scaling plan is being created" — with the move to `Active` already owed on the
+//! clock, so a caller that describes it straight away sees the transient status.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +149,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateScalingPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateScalingPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateScalingPlan"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal)?;
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Clock-owed work first, so this call decides against the state the clock
+        // already made due (a plan whose deletion came due is gone, and its name is
+        // free again).
+        state.settle_due(now);
+
+        // "A CloudFormation stack or a set of tags": the two are alternatives, so a
+        // source naming neither identifies no application and one naming both is
+        // contradictory.
+        let source_key = crate::state::validate_application_source(&input.application_source)
+            .map_err(validation)?;
+
+        if state.scaling_plans.contains_key(&input.scaling_plan_name) {
+            return Err(validation(format!(
+                "A scaling plan named '{}' already exists",
+                input.scaling_plan_name
+            )));
+        }
+
+        // "You can create one scaling plan per application source."
+        let covered_by = state.scaling_plans.values().find(|plan| {
+            crate::state::application_source_key(&plan.application_source)
+                .is_some_and(|key| key == source_key)
+        });
+        if let Some(existing) = covered_by {
+            return Err(validation(format!(
+                "The application source is already covered by the scaling plan '{}'",
+                existing.name
+            )));
+        }
+
+        // The store this call grows is bounded: past the per-account quota a create
+        // is refused rather than allowed to consume memory without limit.
+        if state.scaling_plans.len() >= crate::state::MAX_SCALING_PLANS {
+            return Err(limit_exceeded(format!(
+                "The maximum number of scaling plans for this account ({}) has been reached",
+                crate::state::MAX_SCALING_PLANS
+            )));
+        }
+
+        let record = crate::state::ScalingPlanRecord::creating(
+            input.scaling_plan_name.clone(),
+            input.application_source,
+            input.scaling_instructions,
+            now,
+        );
+        let scaling_plan_version = record.version;
+        state.scaling_plans.insert(input.scaling_plan_name, record);
+
+        Ok(CreateScalingPlanOutput {
+            scaling_plan_version,
+        })
     }
+}
+
+/// This operation's own modelled `ValidationException` (HTTP 400), naming what the
+/// caller has to change.
+fn validation(message: impl Into<String>) -> CreateScalingPlanError {
+    CreateScalingPlanErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled `LimitExceededException` (HTTP 400): the per-account scaling-plan
+/// quota is already used up.
+fn limit_exceeded(message: impl Into<String>) -> CreateScalingPlanError {
+    CreateScalingPlanErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The service's state is unreachable: a server fault, never a client error.
+fn internal() -> CreateScalingPlanError {
+    CreateScalingPlanErrorModeled::InternalServiceException(InternalServiceException {
+        message: Some("the scaling-plan store is unavailable".to_string()),
+    })
+    .into()
 }

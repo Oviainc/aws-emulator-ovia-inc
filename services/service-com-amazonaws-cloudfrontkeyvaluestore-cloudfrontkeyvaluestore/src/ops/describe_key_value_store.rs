@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeKeyValueStore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeKeyValueStore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeKeyValueStore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the metadata of the key value store `KvsARN` names, computed from the
+//! persisted store: `ItemCount` and `TotalSizeInBytes` are derived from the pairs it
+//! actually holds, and `ETag` carries the store's CURRENT version identifier — the
+//! value a caller then spends as `If-Match` on `PutKey` / `DeleteKey` / `UpdateKeys`.
+//!
+//! ## Why this read materialises the record
+//!
+//! The store resource is created by CloudFront's `CreateKeyValueStore`, which lives in
+//! the CloudFront service crate and is still scaffolded, so this is the operation a
+//! store first comes into existence through here — and the ONLY way a client obtains a
+//! store's initial `ETag`, without which no mutating call can be made at all. The one
+//! write is idempotent, is bounded by [`crate::state::MAX_STORES`], and every later
+//! call (read or write) observes the same record, so a read never changes what a later
+//! caller sees. `GetKey` and `ListKeys` need no `Created`/`ETag` and so resolve through
+//! the read-only accessor instead, allocating nothing.
+//!
+//! ## Authorization is not modelled
+//!
+//! The emulator verifies request signatures, but no key value store resource policy is
+//! stored anywhere, so the modelled `AccessDeniedException` (403) is never produced by
+//! this operation. That is a deliberate partial implementation, not an oversight: do
+//! not write a test that depends on a 403 from here.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +165,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeKeyValueStore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeKeyValueStoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeKeyValueStore"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeKeyValueStoreErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the key value store state is unavailable".to_string()),
+            })
+        })?;
+        let mut guard = state.lock();
+        let store = guard
+            .store_mut(&input.kvs_arn, ::std::time::SystemTime::now())
+            .map_err(|error| {
+                // This operation models no quota error, so a refusal to materialise
+                // another record is reported as the store not being resolvable — with a
+                // message that says which of the two it was.
+                let message = match error {
+                    crate::state::StoreError::NotAKeyValueStoreArn => format!(
+                        "'{}' is not the ARN of a CloudFront key value store",
+                        input.kvs_arn
+                    ),
+                    crate::state::StoreError::StoreLimitReached => format!(
+                        "this emulator holds at most {} key value stores, and '{}' is not one of them",
+                        crate::state::MAX_STORES, input.kvs_arn
+                    ),
+                };
+                DescribeKeyValueStoreErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                )
+            })?;
+
+        Ok(DescribeKeyValueStoreOutput {
+            item_count: store.item_count(),
+            total_size_in_bytes: store.total_size_in_bytes(),
+            kvs_arn: store.kvs_arn.clone(),
+            created: crate::state::as_date_time(store.created),
+            e_tag: store.etag.clone(),
+            last_modified: Some(crate::state::as_date_time(store.last_modified)),
+            status: Some(store.status.clone()),
+            failure_reason: store.failure_reason.clone(),
+        })
     }
 }

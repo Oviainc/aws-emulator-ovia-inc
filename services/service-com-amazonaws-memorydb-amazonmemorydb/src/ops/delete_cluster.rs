@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the cluster from [`crate::state`] and answers with the record
+//! as it stood, marked `deleting`, so the next `DescribeClusters` reports it gone.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `FinalSnapshotName` and `MultiRegionClusterName` are REFUSED rather than accepted
+//! and dropped: taking a final snapshot needs the snapshot slice and a multi-Region
+//! cluster needs the multi-Region slice, and both are still scaffolded, so a caller
+//! asking for either is told so (400 `InvalidParameterValueException`) instead of
+//! getting a success that did neither.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +152,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCluster"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); this operation models no server fault, so
+            // the request is refused rather than reporting a deletion that never ran.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        let mut state = state.lock();
+        state.settle(std::time::Instant::now());
+
+        // Refused BEFORE anything is removed, so a request this emulator cannot serve
+        // faithfully leaves the cluster exactly where it was. A final snapshot would
+        // have to be a real snapshot (the operation even models
+        // `SnapshotAlreadyExistsFault` for a colliding name), and this slice has no
+        // snapshot store — `CreateSnapshot`/`DescribeSnapshots` are still scaffolded —
+        // so the alternative would be a 200 that silently took no snapshot. Likewise
+        // `MultiRegionClusterName` names a resource the multi-Region slice owns.
+        if let Some(final_snapshot_name) = input.final_snapshot_name.as_deref() {
+            return Err(DeleteClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "FinalSnapshotName {final_snapshot_name} cannot be honoured: this \
+                         emulator does not implement MemoryDB snapshots yet, so no final \
+                         snapshot would be taken."
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(multi_region_cluster_name) = input.multi_region_cluster_name.as_deref() {
+            return Err(DeleteClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "MultiRegionClusterName {multi_region_cluster_name} cannot be honoured: \
+                         this emulator does not implement multi-Region clusters yet."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(mut cluster) = state.clusters.remove(&input.cluster_name) else {
+            return Err(DeleteClusterErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(format!("Cluster {} not found.", input.cluster_name)),
+                },
+            )
+            .into());
+        };
+        // The cluster is gone from state, so no later call reports it; the response
+        // describes it as the caller last had it, in the terminal `deleting` status.
+        // Nothing settles a removed cluster, so it carries no due transition.
+        cluster.status = crate::state::cluster_status::DELETING.to_string();
+        cluster.settles_at = None;
+        // Its tags go with it: a tag store keyed by an ARN nothing resolves would be
+        // read by a later `ListTags` for a resource that no longer exists.
+        state.tags.remove(&cluster.arn);
+        Ok(DeleteClusterOutput {
+            cluster: Some(cluster.to_api(true)),
+        })
     }
 }

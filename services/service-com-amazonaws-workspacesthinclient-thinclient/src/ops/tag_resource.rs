@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches tags to a resource this service holds, keyed by the resource's ARN, so
+//! `ListTagsForResource` reports them back verbatim.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +67,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::collections::HashMap;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +142,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the thinclient environment store is unavailable".to_string()),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        if store.environment_id_for_arn(&input.resource_arn).is_none() {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no resource with ARN '{}' was found",
+                        input.resource_arn
+                    )),
+                    resource_id: Some(input.resource_arn.clone()),
+                    resource_type: Some(crate::state::ENVIRONMENT_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The merge is judged on what the resource would hold afterwards: keys it
+        // already carries are overwritten, only new ones grow it. Past the tagging
+        // limits the request is refused WITHOUT storing any of it — not even an
+        // empty entry for the ARN.
+        let attached = store.tags.get(&input.resource_arn);
+        let resulting_count = attached.map_or(0, HashMap::len)
+            + input
+                .tags
+                .keys()
+                .filter(|key| attached.is_none_or(|held| !held.contains_key(*key)))
+                .count();
+        if let Err(message) = crate::state::bound_tags(&input.tags, resulting_count) {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message.clone()),
+                    reason: Some("fieldValidationFailed".to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "tags".to_string(),
+                        message,
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        let attached = store.tags.entry(input.resource_arn).or_default();
+        for (key, value) in input.tags {
+            attached.insert(key, value);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }
