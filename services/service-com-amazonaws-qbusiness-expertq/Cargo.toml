@@ -21,13 +21,18 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque pagination cursors: hex-encode the internal list cursor so `nextToken` is a
+# single-token string a client only ever echoes back.
+hex = { workspace = true }
+# Server-generated resource ids: a hyphenated UUID is exactly the 36-char
+# `^[a-zA-Z0-9][a-zA-Z0-9-]{35}$` shape this service's `ApplicationId`/`IndexId` model.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
