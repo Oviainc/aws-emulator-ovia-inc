@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the store's pairs in key order, at most `MaxResults` per page (the
+//! model's default is 10). When pairs remain beyond the page, `NextToken` names the
+//! last key returned; passing it back resumes strictly after that key, so the whole
+//! store is walked exactly once.
+//!
+//! Resolves the store through the READ-ONLY [`crate::state::ComAmazonawsCloudfrontkeyvaluestoreCloudfrontkeyvaluestoreState::store`]
+//! accessor: this operation needs no `Created` or `ETag`, so it allocates no record
+//! however many distinct ARNs a caller names, and an ARN with no record lists nothing.
+//!
+//! ## Authorization is not modelled
+//!
+//! The emulator verifies request signatures, but no key value store resource policy is
+//! stored anywhere, so the modelled `AccessDeniedException` (403) is never produced by
+//! this operation. That is a deliberate partial implementation, not an oversight: do
+//! not write a test that depends on a 403 from here.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +156,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListKeys"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListKeysErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the key value store state is unavailable".to_string()),
+            })
+        })?;
+        let guard = state.lock();
+        let store = guard.store(&input.kvs_arn).map_err(|_| {
+            ListKeysErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "'{}' is not the ARN of a CloudFront key value store",
+                    input.kvs_arn
+                )),
+            })
+        })?;
+
+        // A token this service did not mint names no position in the listing, so the
+        // request is refused rather than silently answered from the first key.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListKeysErrorModeled::ValidationException(ValidationException {
+                    message: Some(
+                        "NextToken is not a token returned by a previous ListKeys call"
+                            .to_string(),
+                    ),
+                })
+            })?),
+        };
+
+        // The page bound. `MaxResults` carries the model's `@default` of 10 when the
+        // caller omits it; this handler clamps it to the model's own `@range(1..50)`
+        // ITSELF rather than trusting the boundary validator, because the value reaches
+        // an allocation and `MAX_LIST_PAGE` is the only thing that keeps a 4-byte
+        // request from asking for a multi-gigabyte `Vec`.
+        const MAX_LIST_PAGE: usize = 50;
+        let page_size = usize::try_from(input.max_results)
+            .unwrap_or(10)
+            .clamp(1, MAX_LIST_PAGE);
+
+        let Some(store) = store else {
+            // A well-formed ARN this emulator holds no record for has no pairs.
+            return Ok(ListKeysOutput {
+                next_token: None,
+                items: Some(Vec::new()),
+            });
+        };
+
+        // The token's own key was the last one returned, so the resumed page starts
+        // strictly after it — `Bound::Excluded`, not an inclusive range.
+        let lower = match &resume_after {
+            Some(last) => ::std::ops::Bound::Excluded(last.clone()),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut remaining = store.keys.range((lower, ::std::ops::Bound::Unbounded));
+
+        let mut items = Vec::with_capacity(page_size);
+        for (key, value) in remaining.by_ref().take(page_size) {
+            items.push(ListKeysResponseListItem {
+                key: key.clone(),
+                value: value.clone(),
+            });
+        }
+        // Only emit a token when a key actually remains after this page.
+        let next_token = if remaining.next().is_some() {
+            items
+                .last()
+                .map(|last| crate::state::encode_page_token(&last.key))
+        } else {
+            None
+        };
+
+        Ok(ListKeysOutput {
+            next_token,
+            items: Some(items),
+        })
     }
 }

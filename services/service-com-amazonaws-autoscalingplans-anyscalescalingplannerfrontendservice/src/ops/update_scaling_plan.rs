@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateScalingPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateScalingPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mutates the stored plan in place: the members the request carries replace what is
+//! stored, the ones it omits are left intact.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateScalingPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "You cannot update a scaling plan if it is in the process of being created,
+//! updated, or deleted" — such a call is refused with `ConcurrentUpdateException`.
+//! A successful update leaves the plan in `UpdateInProgress`, with the move back to
+//! `Active` already owed on the clock.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +145,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateScalingPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateScalingPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateScalingPlan"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal)?;
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle_due(now);
+
+        // An application source the request carries must still name exactly one
+        // application: a stack or a tag set, never neither and never both.
+        if let Some(source) = input.application_source.as_ref() {
+            crate::state::validate_application_source(source).map_err(validation)?;
+        }
+
+        let plan = state
+            .plan_mut(&input.scaling_plan_name, input.scaling_plan_version)
+            .ok_or_else(|| {
+                not_found(format!(
+                    "No scaling plan found with name '{}' and version {}",
+                    input.scaling_plan_name, input.scaling_plan_version
+                ))
+            })?;
+
+        if plan.is_in_progress() {
+            return Err(concurrent_update(format!(
+                "The scaling plan '{}' is in status {} and cannot be updated",
+                input.scaling_plan_name, plan.status_code
+            )));
+        }
+
+        // Replace only what the request carries; everything else stays as stored.
+        if let Some(source) = input.application_source {
+            plan.application_source = source;
+        }
+        if let Some(instructions) = input.scaling_instructions {
+            plan.scaling_instructions = instructions;
+        }
+        plan.begin(
+            crate::state::STATUS_UPDATE_IN_PROGRESS,
+            crate::state::PendingOutcome::Active,
+            now,
+        );
+
+        Ok(UpdateScalingPlanOutput {})
     }
+}
+
+/// This operation's own modelled `ValidationException` (HTTP 400).
+fn validation(message: impl Into<String>) -> UpdateScalingPlanError {
+    UpdateScalingPlanErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled `ObjectNotFoundException` (HTTP 400): no plan with that name and version.
+fn not_found(message: impl Into<String>) -> UpdateScalingPlanError {
+    UpdateScalingPlanErrorModeled::ObjectNotFoundException(ObjectNotFoundException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled `ConcurrentUpdateException` (HTTP 500): the plan already has a
+/// pending lifecycle transition.
+fn concurrent_update(message: impl Into<String>) -> UpdateScalingPlanError {
+    UpdateScalingPlanErrorModeled::ConcurrentUpdateException(ConcurrentUpdateException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The service's state is unreachable: a server fault, never a client error.
+fn internal() -> UpdateScalingPlanError {
+    UpdateScalingPlanErrorModeled::InternalServiceException(InternalServiceException {
+        message: Some("the scaling-plan store is unavailable".to_string()),
+    })
+    .into()
 }
