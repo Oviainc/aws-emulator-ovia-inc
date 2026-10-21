@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAsset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAsset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAsset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: ingests an Asset into an existing PackagingGroup. Refuses an unknown
+//! `PackagingGroupId` with `NotFoundException` (404), persists the asset, and answers
+//! with the record just stored plus the `EgressEndpoints` DERIVED from the packaging
+//! configurations attached to that group.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +157,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAsset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAssetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAsset"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAssetErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the MediaPackage VOD state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = store.lock();
+
+        if input.id.is_empty() {
+            return Err(CreateAssetErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some("Id must not be empty.".to_string()),
+                },
+            )
+            .into());
+        }
+        if !state
+            .packaging_groups
+            .contains_key(&input.packaging_group_id)
+        {
+            return Err(CreateAssetErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "PackagingGroup with Id {} does not exist.",
+                    input.packaging_group_id
+                )),
+            })
+            .into());
+        }
+        if state.assets.contains_key(&input.id) {
+            return Err(CreateAssetErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some(format!("An Asset with Id {} already exists.", input.id)),
+                },
+            )
+            .into());
+        }
+
+        // The asset store only grows on create, so it carries a capacity bound.
+        if state.assets.len() >= crate::state::MAX_ASSETS {
+            return Err(CreateAssetErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "This account already holds the maximum of {} Assets.",
+                        crate::state::MAX_ASSETS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let arn = crate::state::resource_arn("assets", &region, &input.id);
+        // `ResourceId` is "The resource ID to include in SPEKE key requests"; when
+        // the caller names none the asset's own id identifies it.
+        let resource_id = input.resource_id.unwrap_or_else(|| input.id.clone());
+        let record = crate::state::AssetRecord {
+            id: input.id.clone(),
+            arn: arn.clone(),
+            created_at: crate::state::now_iso8601(),
+            packaging_group_id: input.packaging_group_id,
+            resource_id,
+            source_arn: input.source_arn,
+            source_role_arn: input.source_role_arn,
+            created_instant: std::time::Instant::now(),
+        };
+        state.set_tags(&arn, input.tags.as_ref());
+        state.assets.insert(input.id.clone(), record);
+
+        let Some(stored) = state.assets.get(&input.id) else {
+            return Err(CreateAssetErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the Asset could not be read back".to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(CreateAssetOutput {
+            arn: Some(stored.arn.clone()),
+            created_at: Some(stored.created_at.clone()),
+            egress_endpoints: Some(
+                state.egress_endpoints(stored, std::time::Instant::now()),
+            ),
+            id: Some(stored.id.clone()),
+            packaging_group_id: Some(stored.packaging_group_id.clone()),
+            resource_id: Some(stored.resource_id.clone()),
+            source_arn: Some(stored.source_arn.clone()),
+            source_role_arn: Some(stored.source_role_arn.clone()),
+            tags: Some(state.tags_of(&arn)),
+        })
     }
 }

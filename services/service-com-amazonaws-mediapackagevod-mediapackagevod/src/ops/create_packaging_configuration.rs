@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePackagingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePackagingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePackagingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a PackagingConfiguration against an existing PackagingGroup.
+//! Refuses an unknown `PackagingGroupId` with `NotFoundException` (404), persists the
+//! package block verbatim, and answers with the record just stored.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +157,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePackagingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePackagingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePackagingConfiguration"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreatePackagingConfigurationErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: Some(
+                            "the MediaPackage VOD state store is unavailable".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = store.lock();
+
+        // Exactly one package block decides the packaging format, and so the parent
+        // manifest the egress endpoints of every asset in the group expose.
+        let package_blocks = usize::from(input.hls_package.is_some())
+            + usize::from(input.dash_package.is_some())
+            + usize::from(input.cmaf_package.is_some())
+            + usize::from(input.mss_package.is_some());
+        if input.id.is_empty() || package_blocks != 1 {
+            return Err(
+                CreatePackagingConfigurationErrorModeled::UnprocessableEntityException(
+                    UnprocessableEntityException {
+                        message: Some(if input.id.is_empty() {
+                            "Id must not be empty.".to_string()
+                        } else {
+                            "Exactly one of CmafPackage, DashPackage, HlsPackage or MssPackage \
+                             must be specified."
+                                .to_string()
+                        }),
+                    },
+                )
+                .into(),
+            );
+        }
+        if !state
+            .packaging_groups
+            .contains_key(&input.packaging_group_id)
+        {
+            return Err(CreatePackagingConfigurationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "PackagingGroup with Id {} does not exist.",
+                        input.packaging_group_id
+                    )),
+                },
+            )
+            .into());
+        }
+        if state.packaging_configurations.contains_key(&input.id) {
+            return Err(
+                CreatePackagingConfigurationErrorModeled::UnprocessableEntityException(
+                    UnprocessableEntityException {
+                        message: Some(format!(
+                            "A PackagingConfiguration with Id {} already exists.",
+                            input.id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Two capacity bounds: the whole store, and this one group. The per-group
+        // bound also caps the `EgressEndpoints` list every asset in the group
+        // derives, so a read's cost and response size stay bounded.
+        if state.packaging_configurations.len() >= crate::state::MAX_PACKAGING_CONFIGURATIONS {
+            return Err(
+                CreatePackagingConfigurationErrorModeled::TooManyRequestsException(
+                    TooManyRequestsException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} \
+                             PackagingConfigurations.",
+                            crate::state::MAX_PACKAGING_CONFIGURATIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if state.configuration_count(&input.packaging_group_id)
+            >= crate::state::MAX_PACKAGING_CONFIGURATIONS_PER_GROUP
+        {
+            return Err(
+                CreatePackagingConfigurationErrorModeled::TooManyRequestsException(
+                    TooManyRequestsException {
+                        message: Some(format!(
+                            "PackagingGroup {} already holds the maximum of {} \
+                             PackagingConfigurations.",
+                            input.packaging_group_id,
+                            crate::state::MAX_PACKAGING_CONFIGURATIONS_PER_GROUP
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let arn = crate::state::resource_arn("packaging-configurations", &region, &input.id);
+        let record = crate::state::PackagingConfigurationRecord {
+            id: input.id.clone(),
+            arn: arn.clone(),
+            created_at: crate::state::now_iso8601(),
+            packaging_group_id: input.packaging_group_id,
+            hls_package: input.hls_package,
+            dash_package: input.dash_package,
+            cmaf_package: input.cmaf_package,
+            mss_package: input.mss_package,
+            created_instant: std::time::Instant::now(),
+        };
+        state.set_tags(&arn, input.tags.as_ref());
+        state.packaging_configurations.insert(input.id.clone(), record);
+
+        let Some(stored) = state.packaging_configurations.get(&input.id) else {
+            return Err(
+                CreatePackagingConfigurationErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: Some(
+                            "the PackagingConfiguration could not be read back".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(CreatePackagingConfigurationOutput {
+            arn: Some(stored.arn.clone()),
+            cmaf_package: stored.cmaf_package.clone(),
+            created_at: Some(stored.created_at.clone()),
+            dash_package: stored.dash_package.clone(),
+            hls_package: stored.hls_package.clone(),
+            id: Some(stored.id.clone()),
+            mss_package: stored.mss_package.clone(),
+            packaging_group_id: Some(stored.packaging_group_id.clone()),
+            tags: Some(state.tags_of(&arn)),
+        })
     }
 }

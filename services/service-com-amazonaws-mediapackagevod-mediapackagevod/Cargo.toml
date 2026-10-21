@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Derives the stable, opaque egress domain label and playback path segment a
+# packaging group / asset / configuration triple is addressed by.
+sha2 = { workspace = true }
+# Hex-encodes those digests and the opaque `ListAssets` pagination cursor.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -28,6 +33,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `time` on top of the workspace features, so a test can await a sleep rather than
+# blocking the runtime thread.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true
