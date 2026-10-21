@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: adds a child `Resource` under `parentId`, with its full `path`
+//! materialised from the parent's stored path, and answers from the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +75,74 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::collections::{BTreeMap, HashMap};
+
+use crate::state::ResourceEntry;
+
+/// The `path` of a child resource: its parent's stored path with the child's path part
+/// appended as one more segment. The root resource's path is already `/`, so it is the
+/// one parent whose path must not gain a second separator.
+pub fn child_path(parent_path: &str, path_part: &str) -> String {
+    if parent_path.ends_with('/') {
+        format!("{parent_path}{path_part}")
+    } else {
+        format!("{parent_path}/{path_part}")
+    }
+}
+
+/// Whether a request's `embed` query parameter asks for the embedded `Method`
+/// resources.
+///
+/// From the member's documentation: "Currently, the request supports only retrieval of
+/// the embedded Method resources this way. The query parameter value must be a
+/// single-valued list and contain the `"methods"` string."
+pub fn embeds_methods(embed: Option<&Vec<String>>) -> bool {
+    embed.is_some_and(|values| values.iter().any(|value| value == "methods"))
+}
+
+/// The `resourceMethods` map a `Resource` body reports.
+///
+/// The keys are the verbs put on the resource. Each value is the embedded `Method` only
+/// when the caller asked for it with `embed=methods`; without it the verbs are reported
+/// on their own, which is what `embed` documents. A resource with no methods reports no
+/// map at all.
+pub fn resource_methods(
+    entry: &ResourceEntry,
+    embed_methods: bool,
+) -> Option<HashMap<String, GetMethodOutput>> {
+    if entry.methods.is_empty() {
+        return None;
+    }
+    Some(
+        entry
+            .methods
+            .iter()
+            .map(|(verb, method)| {
+                let body = if embed_methods {
+                    GetMethodOutput::from(method)
+                } else {
+                    GetMethodOutput::default()
+                };
+                (verb.clone(), body)
+            })
+            .collect(),
+    )
+}
+
+/// The `Resource` body for a stored resource — the one place this crate renders that
+/// shape, so `CreateResource` and `GetResources` cannot report a record differently.
+///
+/// `embed_methods` is [`embeds_methods`] for the request being served.
+pub fn resource_body(entry: &ResourceEntry, embed_methods: bool) -> CreateResourceOutput {
+    CreateResourceOutput {
+        id: Some(entry.id.clone()),
+        parent_id: entry.parent_id.clone(),
+        path_part: entry.path_part.clone(),
+        path: Some(entry.path.clone()),
+        resource_methods: resource_methods(entry, embed_methods),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,18 +217,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized reaches the store unchecked, and the check runs before
+        // the store lock is taken. An empty path part would materialise the parent's
+        // own path again, so there is no resource it could name.
+        if input.path_part.is_empty() {
+            return Err(CreateResourceErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some("pathPart must not be empty".to_string()),
+                },
+            )
+            .into());
+        }
+        crate::state::bound_chars(
+            "pathPart",
+            &input.path_part,
+            crate::state::MAX_PATH_PART_CHARS,
+        )
+        .map_err(|message| {
+            CreateResourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        let parent_path = {
+            let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
+                CreateResourceErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+                })
+            })?;
+            // One resource per request, and at most this many per API: the store cannot
+            // grow past the quota however many requests arrive.
+            if api.resources.len() >= crate::state::MAX_RESOURCES_PER_API {
+                return Err(CreateResourceErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        retry_after_seconds: None,
+                        message: Some(format!(
+                            "Maximum number of resources exceeded for this API: {}",
+                            crate::state::MAX_RESOURCES_PER_API
+                        )),
+                    },
+                )
+                .into());
+            }
+            let parent = api.resources.get(&input.parent_id).ok_or_else(|| {
+                CreateResourceErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::NO_SUCH_RESOURCE.to_string()),
+                })
+            })?;
+            // One path part per parent: two siblings with the same part would share one
+            // path, and a path is what routes a request.
+            let taken = api.resources.values().any(|resource| {
+                resource.parent_id.as_deref() == Some(input.parent_id.as_str())
+                    && resource.path_part.as_deref() == Some(input.path_part.as_str())
+            });
+            if taken {
+                return Err(CreateResourceErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "Another child resource with the path part '{}' already exists for this resource",
+                        input.path_part
+                    )),
+                })
+                .into());
+            }
+            parent.path.clone()
+        };
+
+        // The materialised path is bounded too, which is what bounds how deeply
+        // resources may nest: each level appends a segment to its parent's path.
+        let path = child_path(&parent_path, &input.path_part);
+        crate::state::bound_chars("the resource path", &path, crate::state::MAX_PATH_CHARS).map_err(
+            |message| {
+                CreateResourceErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+            },
+        )?;
+
+        let id = store.mint_id();
+        let sequence = store.next_sequence();
+
+        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+            CreateResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+            })
+        })?;
+        api.resources.insert(
+            id.clone(),
+            ResourceEntry {
+                id: id.clone(),
+                parent_id: Some(input.parent_id),
+                path_part: Some(input.path_part),
+                path,
+                methods: BTreeMap::new(),
+                sequence,
+            },
+        );
+        let stored = api.resources.get(&id).ok_or_else(|| {
+            CreateResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_RESOURCE.to_string()),
+            })
+        })?;
+        // A resource is created with no methods, so `embed` has nothing to vary here.
+        Ok(resource_body(stored, false))
     }
 }

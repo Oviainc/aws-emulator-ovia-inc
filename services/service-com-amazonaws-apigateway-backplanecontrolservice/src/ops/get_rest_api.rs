@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRestApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRestApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRestApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored `RestApi` record for `restApiId`, or
+//! `NotFoundException` when no API has that id. Reads only.
 //!
 //! ## Shape of an operation
 //!
@@ -113,6 +106,37 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::RestApiEntry;
+
+impl From<&RestApiEntry> for GetRestApiOutput {
+    /// The `RestApi` body for a stored API. `GetRestApi` and `CreateRestApi` share the
+    /// `RestApi` shape but the scaffold renders it as two Rust types, so this mirrors
+    /// the `CreateRestApiOutput` conversion member for member.
+    fn from(entry: &RestApiEntry) -> Self {
+        let body = CreateRestApiOutput::from(entry);
+        Self {
+            id: body.id,
+            name: body.name,
+            description: body.description,
+            created_date: body.created_date,
+            version: body.version,
+            warnings: body.warnings,
+            binary_media_types: body.binary_media_types,
+            minimum_compression_size: body.minimum_compression_size,
+            api_key_source: body.api_key_source,
+            endpoint_configuration: body.endpoint_configuration,
+            policy: body.policy,
+            tags: body.tags,
+            disable_execute_api_endpoint: body.disable_execute_api_endpoint,
+            root_resource_id: body.root_resource_id,
+            security_policy: body.security_policy,
+            endpoint_access_mode: body.endpoint_access_mode,
+            api_status: body.api_status,
+            api_status_message: body.api_status_message,
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -184,18 +208,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRestApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRestApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRestApi"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let store = state.lock();
+        let entry = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
+            GetRestApiErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+            })
+        })?;
+        Ok(GetRestApiOutput::from(entry))
     }
 }

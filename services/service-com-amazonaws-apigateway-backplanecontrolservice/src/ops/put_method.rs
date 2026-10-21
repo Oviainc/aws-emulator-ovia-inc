@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutMethod
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutMethod`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutMethod::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores a `Method` on a resource, keyed by its HTTP verb, so a later
+//! `GetMethod`/`GetResource`/`GetResources` surfaces it. Answers from the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -146,6 +139,70 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+
+use crate::state::MethodEntry;
+
+/// The HTTP verbs API Gateway accepts for a `Method`, plus the `ANY` catch-all that
+/// matches every verb.
+///
+/// Hand-written because the model types `httpMethod` as a bare `String` and declares no
+/// enum for it; the set is the one the API Gateway developer guide lists for a method's
+/// HTTP verb (`ANY`, `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT`).
+pub const HTTP_METHODS: &[&str] = &[
+    "ANY", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT",
+];
+
+/// The key a method is stored under: its verb, uppercased, because an HTTP verb is
+/// case-insensitive on the wire but names one method on a resource.
+pub fn method_key(http_method: &str) -> String {
+    http_method.to_ascii_uppercase()
+}
+
+/// Refuse a request whose caller-sized members would grow the store past a bound.
+///
+/// Called BEFORE the store lock is taken, so an over-sized request never reaches the
+/// records at all. The method COUNT per resource needs no cap of its own: a method is
+/// keyed by a verb from [`HTTP_METHODS`], so a resource holds at most that many.
+fn bound_input(input: &PutMethodInput) -> Result<(), String> {
+    use crate::state::{bound_chars, bound_entries, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS};
+
+    bound_chars("authorizationType", &input.authorization_type, MAX_STRING_CHARS)?;
+    for (member, value) in [
+        ("authorizerId", &input.authorizer_id),
+        ("operationName", &input.operation_name),
+        ("requestValidatorId", &input.request_validator_id),
+    ] {
+        if let Some(value) = value {
+            bound_chars(member, value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(parameters) = &input.request_parameters {
+        bound_entries(
+            "requestParameters",
+            parameters.len(),
+            MAX_COLLECTION_ENTRIES,
+        )?;
+        for key in parameters.keys() {
+            bound_chars("a requestParameters key", key, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(models) = &input.request_models {
+        bound_entries("requestModels", models.len(), MAX_COLLECTION_ENTRIES)?;
+        for (key, value) in models {
+            bound_chars("a requestModels key", key, MAX_STRING_CHARS)?;
+            bound_chars("a requestModels value", value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(scopes) = &input.authorization_scopes {
+        bound_entries("authorizationScopes", scopes.len(), MAX_COLLECTION_ENTRIES)?;
+        for value in scopes {
+            bound_chars("authorizationScopes", value, MAX_STRING_CHARS)?;
+        }
+    }
+    Ok(())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -219,18 +276,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutMethod` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutMethodErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutMethod"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        bound_input(&input).map_err(|message| {
+            PutMethodErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        let verb = method_key(&input.http_method);
+        if !HTTP_METHODS.contains(&verb.as_str()) {
+            return Err(PutMethodErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "Invalid HTTP method specified: {}; expected one of {}",
+                    input.http_method,
+                    HTTP_METHODS.join(", ")
+                )),
+            })
+            .into());
+        }
+
+        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+            PutMethodErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+            })
+        })?;
+        let resource = api.resources.get_mut(&input.resource_id).ok_or_else(|| {
+            PutMethodErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_RESOURCE.to_string()),
+            })
+        })?;
+        // A verb names at most one method on a resource: re-putting one is a conflict,
+        // not an overwrite.
+        if resource.methods.contains_key(&verb) {
+            return Err(PutMethodErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Method already exists for this resource: {verb}"
+                )),
+            })
+            .into());
+        }
+
+        resource.methods.insert(
+            verb.clone(),
+            MethodEntry {
+                http_method: verb.clone(),
+                authorization_type: input.authorization_type,
+                authorizer_id: input.authorizer_id,
+                api_key_required: input.api_key_required,
+                operation_name: input.operation_name,
+                request_parameters: input
+                    .request_parameters
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<BTreeMap<String, bool>>(),
+                request_models: input
+                    .request_models
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<BTreeMap<String, String>>(),
+                request_validator_id: input.request_validator_id,
+                authorization_scopes: input.authorization_scopes.unwrap_or_default(),
+                // `PutMethodResponse` and `PutIntegration` write these; both are still
+                // stubs, so a method is stored with neither.
+                method_responses: BTreeMap::new(),
+                integration: None,
+            },
+        );
+
+        let stored = resource.methods.get(&verb).ok_or_else(|| {
+            PutMethodErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_METHOD.to_string()),
+            })
+        })?;
+        let body = GetMethodOutput::from(stored);
+        Ok(PutMethodOutput {
+            http_method: body.http_method,
+            authorization_type: body.authorization_type,
+            authorizer_id: body.authorizer_id,
+            api_key_required: body.api_key_required,
+            request_validator_id: body.request_validator_id,
+            operation_name: body.operation_name,
+            request_parameters: body.request_parameters,
+            request_models: body.request_models,
+            method_responses: body.method_responses,
+            method_integration: body.method_integration,
+            authorization_scopes: body.authorization_scopes,
+        })
     }
 }

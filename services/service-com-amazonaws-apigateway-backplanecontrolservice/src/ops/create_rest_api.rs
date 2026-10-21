@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRestApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRestApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRestApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: persists a `RestApi` record in [`crate::state`] together with the
+//! implicit root resource every API is created with, and answers from the stored
+//! record.
 //!
 //! ## Shape of an operation
 //!
@@ -148,6 +142,132 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+
+use crate::state::{ResourceEntry, RestApiEntry};
+
+/// The smallest `minimumCompressionSize` API Gateway accepts, from the member's own
+/// documentation: "non-negative between 0 and 10485760 (10M) bytes, inclusive".
+const MIN_COMPRESSION_SIZE: i32 = 0;
+
+/// The largest `minimumCompressionSize` API Gateway accepts; see
+/// [`MIN_COMPRESSION_SIZE`].
+const MAX_COMPRESSION_SIZE: i32 = 10_485_760;
+
+/// The `apiStatus` a freshly created API is in: it is immediately usable, so it is
+/// created in the terminal `AVAILABLE` state and no later call moves it.
+const API_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// The `path` of an API's implicit root resource.
+pub const ROOT_RESOURCE_PATH: &str = "/";
+
+/// Refuse a request whose caller-sized members would grow the store past a bound.
+///
+/// Called BEFORE the store lock is taken, so an over-sized request never reaches the
+/// records at all. Each bound is a published API Gateway/AWS quota or, where the
+/// service publishes none, this emulator's own resource guard — see `crate::state`.
+fn bound_input(input: &CreateRestApiInput) -> Result<(), String> {
+    use crate::state::{
+        bound_chars, bound_entries, MAX_COLLECTION_ENTRIES, MAX_POLICY_CHARS, MAX_STRING_CHARS,
+        MAX_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS,
+    };
+
+    bound_chars("name", &input.name, MAX_STRING_CHARS)?;
+    for (member, value) in [
+        ("description", &input.description),
+        ("version", &input.version),
+        ("cloneFrom", &input.clone_from),
+        ("apiKeySource", &input.api_key_source),
+        ("securityPolicy", &input.security_policy),
+        ("endpointAccessMode", &input.endpoint_access_mode),
+    ] {
+        if let Some(value) = value {
+            bound_chars(member, value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(policy) = &input.policy {
+        bound_chars("policy", policy, MAX_POLICY_CHARS)?;
+    }
+    if let Some(types) = &input.binary_media_types {
+        bound_entries("binaryMediaTypes", types.len(), MAX_COLLECTION_ENTRIES)?;
+        for value in types {
+            bound_chars("binaryMediaTypes", value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(tags) = &input.tags {
+        bound_entries("tags", tags.len(), MAX_TAGS)?;
+        for (key, value) in tags {
+            bound_chars("a tag key", key, MAX_TAG_KEY_CHARS)?;
+            bound_chars("a tag value", value, MAX_TAG_VALUE_CHARS)?;
+        }
+    }
+    if let Some(configuration) = &input.endpoint_configuration {
+        if let Some(types) = &configuration.types {
+            bound_entries(
+                "endpointConfiguration.types",
+                types.len(),
+                MAX_COLLECTION_ENTRIES,
+            )?;
+            for value in types {
+                bound_chars("endpointConfiguration.types", value, MAX_STRING_CHARS)?;
+            }
+        }
+        if let Some(ids) = &configuration.vpc_endpoint_ids {
+            bound_entries(
+                "endpointConfiguration.vpcEndpointIds",
+                ids.len(),
+                MAX_COLLECTION_ENTRIES,
+            )?;
+            for value in ids {
+                bound_chars("endpointConfiguration.vpcEndpointIds", value, MAX_STRING_CHARS)?;
+            }
+        }
+        if let Some(value) = &configuration.ip_address_type {
+            bound_chars(
+                "endpointConfiguration.ipAddressType",
+                value,
+                MAX_STRING_CHARS,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+impl From<&RestApiEntry> for CreateRestApiOutput {
+    /// The `RestApi` body for a stored API — the one place this crate renders that
+    /// shape, so `CreateRestApi` and `GetRestApis` cannot report a record differently.
+    fn from(entry: &RestApiEntry) -> Self {
+        Self {
+            id: Some(entry.id.clone()),
+            name: Some(entry.name.clone()),
+            description: entry.description.clone(),
+            created_date: entry.created_date,
+            version: entry.version.clone(),
+            // Only an import reports warnings, and nothing here imports.
+            warnings: None,
+            binary_media_types: (!entry.binary_media_types.is_empty())
+                .then(|| entry.binary_media_types.clone()),
+            minimum_compression_size: entry.minimum_compression_size,
+            api_key_source: entry.api_key_source.clone(),
+            endpoint_configuration: entry.endpoint_configuration.clone(),
+            policy: entry.policy.clone(),
+            tags: (!entry.tags.is_empty()).then(|| {
+                entry
+                    .tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+            disable_execute_api_endpoint: entry.disable_execute_api_endpoint,
+            root_resource_id: Some(entry.root_resource_id.clone()),
+            security_policy: entry.security_policy.clone(),
+            endpoint_access_mode: entry.endpoint_access_mode.clone(),
+            api_status: entry.api_status.clone(),
+            api_status_message: entry.api_status_message.clone(),
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -220,18 +340,205 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRestApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRestApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRestApi"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized reaches the store unchecked: the request's members are
+        // bounded first, before the store lock is taken at all.
+        bound_input(&input).map_err(|message| {
+            CreateRestApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        })?;
+
+        // The model declares no range on `minimumCompressionSize`, so the boundary
+        // validator passes any integer; the member's documented bounds are enforced
+        // here, and the message names the member and the bound it broke.
+        if let Some(size) = input.minimum_compression_size {
+            if !(MIN_COMPRESSION_SIZE..=MAX_COMPRESSION_SIZE).contains(&size) {
+                return Err(CreateRestApiErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!(
+                            "minimumCompressionSize must be between {MIN_COMPRESSION_SIZE} and {MAX_COMPRESSION_SIZE}, inclusive: {size}"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // FIRST critical section: refuse past the API quota, resolve `cloneFrom`, take
+        // a bounded snapshot of the tree to copy, and reserve every id this call needs.
+        // The lock is then RELEASED, so the copy below — the only part whose cost grows
+        // with a caller-chosen API rather than with the request — does not run with the
+        // store held against every other caller.
+        let (ids, sequence, snapshot, source_root) = {
+            let mut store = state.lock();
+
+            if store.rest_apis.len() >= crate::state::MAX_REST_APIS {
+                return Err(CreateRestApiErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        retry_after_seconds: None,
+                        message: Some(format!(
+                            "Maximum number of REST APIs exceeded: {}",
+                            crate::state::MAX_REST_APIS
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // `cloneFrom` names the API whose resource tree the new API starts from. It
+            // is resolved BEFORE anything is minted, so a bad id or an over-quota tree
+            // leaves no partial API behind. `CreateRestApi` models no
+            // `NotFoundException`, so an unknown id is refused as the bad request it is.
+            let (snapshot, source_root) = match input.clone_from.as_deref() {
+                None => (Vec::new(), None),
+                Some(clone_from) => {
+                    let source = store.rest_apis.get(clone_from).ok_or_else(|| {
+                        CreateRestApiErrorModeled::BadRequestException(BadRequestException {
+                            message: Some(format!(
+                                "Invalid REST API identifier specified: {clone_from}"
+                            )),
+                        })
+                    })?;
+                    // The copy is capped at the same per-API resource quota a built
+                    // tree is, so one constant-size request can never copy more than
+                    // one API's worth of records.
+                    if source.resources.len() > crate::state::MAX_RESOURCES_PER_API {
+                        return Err(CreateRestApiErrorModeled::LimitExceededException(
+                            LimitExceededException {
+                                retry_after_seconds: None,
+                                message: Some(format!(
+                                    "Maximum number of resources exceeded for this API: {}",
+                                    crate::state::MAX_RESOURCES_PER_API
+                                )),
+                            },
+                        )
+                        .into());
+                    }
+                    let root = source.root_resource_id.clone();
+                    let tree: Vec<ResourceEntry> = source
+                        .resources_in_creation_order()
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                    (tree, Some(root))
+                }
+            };
+
+            // One id for the API, one for its root resource, and one per non-root
+            // resource copied from the source.
+            let ids = store.reserve_ids(2 + snapshot.len());
+            let sequence = store.next_sequence();
+            (ids, sequence, snapshot, source_root)
+        };
+
+        // Built with the store lock RELEASED.
+        let mut minted = ids.into_iter();
+        let id = minted.next().ok_or_else(crate::state::state_unavailable)?;
+        let root_resource_id = minted.next().ok_or_else(crate::state::state_unavailable)?;
+
+        let mut resources = BTreeMap::new();
+        resources.insert(
+            root_resource_id.clone(),
+            ResourceEntry {
+                id: root_resource_id.clone(),
+                // The root resource has neither a parent nor a path part; its path is
+                // the API's root.
+                parent_id: None,
+                path_part: None,
+                path: ROOT_RESOURCE_PATH.to_string(),
+                methods: BTreeMap::new(),
+                sequence: 0,
+            },
+        );
+
+        let mut entry = RestApiEntry {
+            id: id.clone(),
+            name: input.name,
+            description: input.description,
+            version: input.version,
+            created_date: Some(::aws_smithy_types::DateTime::from(
+                ::std::time::SystemTime::now(),
+            )),
+            binary_media_types: input.binary_media_types.unwrap_or_default(),
+            minimum_compression_size: input.minimum_compression_size,
+            api_key_source: input.api_key_source,
+            endpoint_configuration: input.endpoint_configuration,
+            policy: input.policy,
+            security_policy: input.security_policy,
+            endpoint_access_mode: input.endpoint_access_mode,
+            api_status: Some(API_STATUS_AVAILABLE.to_string()),
+            api_status_message: None,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<String, String>>(),
+            disable_execute_api_endpoint: input.disable_execute_api_endpoint,
+            root_resource_id: root_resource_id.clone(),
+            resources,
+            sequence,
+        };
+
+        if let Some(source_root) = source_root {
+            // A clone copies the source's resource tree under FRESH ids: the paths and
+            // methods carry over, the identifiers do not. Walking the snapshot in
+            // creation order means a resource's parent is always remapped before the
+            // resource itself. The API's other sub-resources (models, authorizers,
+            // deployments, stages) have no records yet — their operations are still
+            // stubs — so there is nothing else to copy.
+            let mut remapped: BTreeMap<String, String> = BTreeMap::new();
+            remapped.insert(source_root.clone(), root_resource_id.clone());
+            for source_resource in &snapshot {
+                let resource_id = if source_resource.id == source_root {
+                    root_resource_id.clone()
+                } else {
+                    let fresh = minted.next().ok_or_else(crate::state::state_unavailable)?;
+                    remapped.insert(source_resource.id.clone(), fresh.clone());
+                    fresh
+                };
+                let parent_id = source_resource
+                    .parent_id
+                    .as_ref()
+                    .and_then(|parent| remapped.get(parent).cloned());
+                entry.resources.insert(
+                    resource_id.clone(),
+                    ResourceEntry {
+                        id: resource_id,
+                        parent_id,
+                        path_part: source_resource.path_part.clone(),
+                        path: source_resource.path.clone(),
+                        methods: source_resource.methods.clone(),
+                        sequence: source_resource.sequence,
+                    },
+                );
+            }
+        }
+
+        // SECOND critical section: insert and read back. The quota is re-checked
+        // because the first section's lock was released, so another caller may have
+        // filled the last slot in between.
+        let mut store = state.lock();
+        if store.rest_apis.len() >= crate::state::MAX_REST_APIS {
+            return Err(CreateRestApiErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    retry_after_seconds: None,
+                    message: Some(format!(
+                        "Maximum number of REST APIs exceeded: {}",
+                        crate::state::MAX_REST_APIS
+                    )),
+                },
+            )
+            .into());
+        }
+        store.rest_apis.insert(id.clone(), entry);
+        let stored = store
+            .rest_apis
+            .get(&id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        Ok(CreateRestApiOutput::from(stored))
     }
 }
