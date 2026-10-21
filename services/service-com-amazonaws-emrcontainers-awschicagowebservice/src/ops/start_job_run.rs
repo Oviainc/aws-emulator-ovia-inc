@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartJobRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartJobRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartJobRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a job run on a virtual cluster and persists everything the request submitted,
+//! so `DescribeJobRun` and `ListJobRuns` read it back rather than recomputing it. The
+//! run starts `PENDING` and the clock owes it `RUNNING`
+//! ([`crate::state::TRANSITION_SPAN`]).
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +162,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartJobRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartJobRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartJobRun"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartJobRunError::Modeled(StartJobRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the job run store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let region = crate::state::request_region(ctx);
+        let scope = crate::state::start_job_run_scope(&input.virtual_cluster_id);
+        let mut state = store.lock();
+        state.settle();
+
+        // A job run runs IN a virtual cluster, so the cluster is resolved out of state
+        // first: a cluster that was never created, or one that is no longer RUNNING
+        // because it was deleted, cannot accept work.
+        let cluster_running = state
+            .virtual_clusters
+            .get(&input.virtual_cluster_id)
+            .is_some_and(|cluster| cluster.state == crate::state::CLUSTER_RUNNING);
+        if !cluster_running {
+            return Err(StartJobRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Virtual cluster {} is not available to run jobs",
+                        input.virtual_cluster_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A job template is resolved, never assumed: this service stores no templates
+        // yet (`CreateJobTemplate` is still a stub), so a `jobTemplateId` names a
+        // template that does not exist and the modelled not-found is the honest answer.
+        // Resolved BEFORE the idempotency replay, so which requests this operation
+        // refuses does not depend on whether one of them was retried.
+        if let Some(template_id) = input.job_template_id.as_deref() {
+            return Err(StartJobRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Job template {template_id} was not found")),
+                },
+            )
+            .into());
+        }
+        // `jobTemplateParameters` only has meaning as the parameters OF a job template,
+        // so parameters without one are refused rather than quietly dropped.
+        if input.job_template_parameters.is_some() {
+            return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "jobTemplateParameters requires jobTemplateId to be specified".to_string(),
+                ),
+            })
+            .into());
+        }
+
+        // `clientToken` is `@idempotencyToken`: the same token replayed names the job
+        // run the first call minted rather than submitting the work twice.
+        let replayed = state.replayed_idempotency(&scope, &input.client_token).cloned();
+        if let Some(existing) = replayed.and_then(|id| state.job_runs.get(&id)) {
+            return Ok(StartJobRunOutput {
+                id: Some(existing.id.clone()),
+                name: existing.name.clone(),
+                arn: Some(existing.arn.clone()),
+                virtual_cluster_id: Some(existing.virtual_cluster_id.clone()),
+            });
+        }
+
+        // The store is capped, and a finished run is reclaimed to make room. Once every
+        // slot holds a run that has not finished there is nothing to reclaim, and the
+        // submission is refused instead of growing the store without bound.
+        if !state.reserve_job_run() {
+            return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "This emulator retains at most {} job runs; cancel one and retry",
+                    crate::state::MAX_JOB_RUNS
+                )),
+            })
+            .into());
+        }
+
+        let id = state.mint_id();
+        let sequence = state.id_counter;
+        let arn = crate::state::job_run_arn(&region, &input.virtual_cluster_id, &id);
+        let record = crate::state::JobRunRecord {
+            id: id.clone(),
+            name: input.name.clone(),
+            virtual_cluster_id: input.virtual_cluster_id.clone(),
+            arn: arn.clone(),
+            // A submitted job run is accepted PENDING and reaches RUNNING on the clock,
+            // so a caller that reads straight back sees the transient state.
+            state: crate::state::JOB_PENDING.to_string(),
+            client_token: input.client_token.clone(),
+            execution_role_arn: input.execution_role_arn,
+            release_label: input.release_label,
+            job_driver: input.job_driver,
+            configuration_overrides: input.configuration_overrides,
+            retry_policy_configuration: input.retry_policy_configuration,
+            created_at_millis: crate::state::now_millis(),
+            finished_at_millis: None,
+            state_details: None,
+            tags: input.tags.unwrap_or_default(),
+            sequence,
+            pending: Some(crate::state::PendingTransition::due(
+                crate::state::JOB_RUNNING,
+            )),
+        };
+        state.insert_job_run(record);
+
+        Ok(StartJobRunOutput {
+            id: Some(id),
+            name: input.name,
+            arn: Some(arn),
+            virtual_cluster_id: Some(input.virtual_cluster_id),
+        })
     }
 }

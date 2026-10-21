@@ -738,6 +738,129 @@ async fn get_clip_assembles_the_fragments_the_archive_holds_in_range() {
     }
 }
 
+/// RULE: a clip carries at most the documented number of fragments — "The
+/// output will contain the first 100 MB or the first 200 fragments from the
+/// specified start timestamp" — counted from the start of the range, so a range
+/// holding more than that is TRUNCATED rather than refused or served whole.
+#[tokio::test]
+async fn get_clip_truncates_at_the_documented_fragment_ceiling() {
+    /// The published ceiling this test pins, from the `GetClip$Payload` doc
+    /// sentence quoted above.
+    const MAX_CLIP_FRAGMENTS: usize = 200;
+    /// A stream holding more fragments in range than one clip may carry.
+    const DEEP_STREAM: &str = "deep-archive-stream";
+    /// The size of each of its fragments: small, so the whole archive is
+    /// cheap and only the FRAGMENT ceiling can be the one that bites.
+    const FRAGMENT_SIZE: usize = 8;
+
+    // The filler varies with the index, so the expected clip pins WHICH
+    // fragments were taken and in what order, not only how many bytes came
+    // back: a handler that returned the LAST 200 fragments of the range, or
+    // any other 200, produces different bytes of the same length.
+    let filler = |index: usize| b'a' + u8::try_from(index % 26).expect("a letter");
+
+    let harness = seeded();
+    let held = MAX_CLIP_FRAGMENTS + 50;
+    {
+        let state = service_state(&*harness.engine).expect("the service store");
+        let mut state = state.lock();
+        state.put_stream(ArchivedStream::new(
+            DEEP_STREAM,
+            REGION,
+            from_epoch_millis(T0_SECS * 1000),
+            24,
+        ));
+        for index in 0..held {
+            let at = from_epoch_millis((T0_SECS + index as i64) * 1000);
+            assert!(
+                state.append_fragment(
+                    DEEP_STREAM,
+                    StoredFragment::new(
+                        fragment_number(index as u64),
+                        at,
+                        at,
+                        1000,
+                        vec![filler(index); FRAGMENT_SIZE],
+                    ),
+                ),
+                "case seed fragment {index}: the deep stream must exist"
+            );
+        }
+    }
+
+    let body = serde_json::json!({
+        "StreamName": DEEP_STREAM,
+        "ClipFragmentSelector": {
+            "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+            "TimestampRange": {
+                "StartTimestamp": T0_SECS,
+                "EndTimestamp": T0_SECS + held as i64,
+            },
+        },
+    });
+    let response = harness.post("/getClip", &body).await;
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "case truncated clip: expected HTTP 200, got {} with body {:?}",
+        response.status(),
+        String::from_utf8_lossy(response.body())
+    );
+    assert_eq!(
+        content_type(&response),
+        "video/mp4",
+        "case truncated clip: a truncated clip is still an MP4 clip"
+    );
+    let expected: Vec<u8> = (0..MAX_CLIP_FRAGMENTS)
+        .flat_map(|index| vec![filler(index); FRAGMENT_SIZE])
+        .collect();
+    assert_eq!(
+        response.body().len(),
+        expected.len(),
+        "case truncated clip: a clip must stop at the first {MAX_CLIP_FRAGMENTS} fragments of the \
+         range, got {} bytes for an archive of {held} fragments in range",
+        response.body().len()
+    );
+    assert_eq!(
+        response.body().as_ref(),
+        expected.as_slice(),
+        "case truncated clip: a clip must be the archive's own bytes for the FIRST \
+         {MAX_CLIP_FRAGMENTS} fragments of the range, in order"
+    );
+
+    // The same range read through ListFragments still reports every fragment:
+    // the ceiling is GetClip's own output limit, not a limit on the archive.
+    let listed = harness
+        .post(
+            "/listFragments",
+            &serde_json::json!({
+                "StreamName": DEEP_STREAM,
+                "MaxResults": 1000,
+                "FragmentSelector": {
+                    "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                    "TimestampRange": {
+                        "StartTimestamp": T0_SECS,
+                        "EndTimestamp": T0_SECS + held as i64,
+                    },
+                },
+            }),
+        )
+        .await;
+    assert_eq!(
+        listed.status().as_u16(),
+        200,
+        "case the archive behind the clip: expected HTTP 200, got {}",
+        listed.status()
+    );
+    assert_eq!(
+        body_json(&listed)["Fragments"]
+            .as_array()
+            .map_or(0, Vec::len),
+        held,
+        "case the archive behind the clip: ListFragments must still report every fragment in range"
+    );
+}
+
 /// RULE: a stream that retains no data is `NoDataRetentionException` (400) —
 /// "Data retention must be greater than 0" — and a range the archive holds no
 /// fragment in is `ResourceNotFoundException` (404).

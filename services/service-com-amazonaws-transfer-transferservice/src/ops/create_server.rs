@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateServer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateServer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateServer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `ServerId` and PERSISTS the server in this service's engine store, so
+//! `DescribeServer` / `ListServers` rebuild their answers from it. Every member the
+//! model gives a documented default (`Domain`, `IdentityProviderType`, `EndpointType`,
+//! `Protocols`, `IpAddressType`, `SecurityPolicyName`) is resolved here, once, at
+//! create time — a reader never re-applies a default.
 //!
 //! ## Shape of an operation
 //!
@@ -275,18 +272,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateServer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateServer"))
+        use crate::state as st;
+
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            CreateServerErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+        let region = st::request_region(ctx.parts());
+        let now = ::std::time::Instant::now();
+
+        let mut guard = state.lock();
+
+        // The store is BOUNDED: past its capacity a create is refused rather than
+        // adding another record. The modelled `ServiceUnavailableException` is the
+        // refusal that says the service cannot take this request; the capacity is
+        // released by `DeleteServer`.
+        if !guard.has_server_capacity() {
+            return Err(CreateServerErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some(format!(
+                        "this emulator already holds the maximum of {} servers; \
+                         delete one before creating another",
+                        st::MAX_STORED_SERVERS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let server_id = guard.mint_id("s");
+        let (due, next_state) =
+            crate::state::ComAmazonawsTransferTransferserviceState::server_start_due(now);
+
+        let server = st::Server {
+            arn: st::server_arn(&region, &server_id),
+            domain: input.domain.unwrap_or_else(|| st::DEFAULT_DOMAIN.to_string()),
+            identity_provider_type: input
+                .identity_provider_type
+                .unwrap_or_else(|| st::DEFAULT_IDENTITY_PROVIDER_TYPE.to_string()),
+            identity_provider_details: input.identity_provider_details,
+            endpoint_type: input
+                .endpoint_type
+                .unwrap_or_else(|| st::DEFAULT_ENDPOINT_TYPE.to_string()),
+            endpoint_details: input.endpoint_details,
+            protocols: input
+                .protocols
+                .filter(|protocols| !protocols.is_empty())
+                .unwrap_or_else(|| vec![st::DEFAULT_PROTOCOL.to_string()]),
+            protocol_details: input.protocol_details,
+            logging_role: input.logging_role,
+            security_policy_name: input
+                .security_policy_name
+                .unwrap_or_else(|| st::DEFAULT_SECURITY_POLICY_NAME.to_string()),
+            pre_authentication_login_banner: input.pre_authentication_login_banner,
+            post_authentication_login_banner: input.post_authentication_login_banner,
+            // No honest value exists yet: see the field's own documentation.
+            host_key_fingerprint: None,
+            structured_log_destinations: input.structured_log_destinations.unwrap_or_default(),
+            s3_storage_options: input.s3_storage_options,
+            ip_address_type: input
+                .ip_address_type
+                .unwrap_or_else(|| st::DEFAULT_IP_ADDRESS_TYPE.to_string()),
+            workflow_details: input.workflow_details,
+            certificate: input.certificate,
+            // A created server is instantiated but not yet able to serve file
+            // operations; the start it began comes due on the clock, not on a read.
+            state: st::SERVER_STATE_STARTING.to_string(),
+            state_due: Some((due, next_state)),
+            tags: input.tags.unwrap_or_default(),
+            server_id: server_id.clone(),
+        };
+        guard.servers.insert(server_id.clone(), server);
+        drop(guard);
+
+        Ok(CreateServerOutput { server_id })
     }
 }

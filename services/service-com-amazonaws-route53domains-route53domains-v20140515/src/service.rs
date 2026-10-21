@@ -45,6 +45,16 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The routing key an UNSIGNED awsJson request to this service resolves to.
+///
+/// The framework reads the SigV4 credential scope first — `route53domains`, this
+/// service's signing name — and falls back to the `X-Amz-Target` prefix with a trailing
+/// `_<digits>` API version stripped. This service's prefix is
+/// `Route53Domains_v20140515` (OPERATIONS.md), whose version suffix starts with a letter
+/// and so survives that stripping, which leaves the key below. It names this service and
+/// no other, so claiming it costs nothing and lets an anonymous client reach the service.
+const TARGET_ROUTE_KEY: &str = "route53domains_v20140515";
+
 /// The `com-amazonaws-route53domains-route53domains-v20140515` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,11 +84,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // Claim a request whose resolved route key is this service's signing name, or
+        // the `X-Amz-Target` spelling an unsigned awsJson request resolves to — see
+        // [`TARGET_ROUTE_KEY`] for why the two differ for this service.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
+            Some(key) => key == self.entry.identity().signing_name() || key == TARGET_ROUTE_KEY,
             None => false,
         }
     }
@@ -96,17 +106,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Route 53 Domains has ONE client-input error, and every operation in the
+        // model lists it: `InvalidInput`, HTTP 400 — it is this service's
+        // `common_errors` entry (smithy_query(query="service_info")). So a request
+        // the framework refused against the model's own rules — an absent
+        // `AdminContact`, a `DurationInYears` outside the modelled 1..10 range, a
+        // `DomainName` past 255 characters — must come back under that code rather
+        // than the framework's generic `ValidationException`, because that is the
+        // code a Route 53 Domains client branches on. The message keeps the
+        // framework's clause, which names the member and the constraint it failed.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "InvalidInput".to_string(),
+                message: violations
+                    .iter()
+                    .map(smithy_server_runtime::Violation::message)
+                    .collect::<Vec<String>>()
+                    .join("; "),
+            }),
+            // An unauthenticated caller is not an input problem: leave the
+            // framework's 403 wording alone.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

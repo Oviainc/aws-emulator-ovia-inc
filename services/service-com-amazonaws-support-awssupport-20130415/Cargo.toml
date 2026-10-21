@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Digest behind the opaque 16-hex segment of a `caseId`.
+sha2 = { workspace = true }
+# Hex for that segment and for the opaque `nextToken` pagination cursors.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

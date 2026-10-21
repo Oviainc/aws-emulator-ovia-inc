@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Removes one channel from [`crate::state`], so a following `GetChannel`
+//! reports it as absent. A channel that still has origin endpoints is refused with
+//! `ConflictException` — they have to be deleted first. Idempotent: deleting a channel
+//! (or a parent) that is not there succeeds and changes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `handle` below is the implementation; `crate::state` holds the store it writes.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +150,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteChannel"))
+        // A delete needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteChannelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+            // `@idempotent`: with no such group there is no such channel, which is the
+            // state this call promises.
+            return Ok(DeleteChannelOutput {});
+        };
+        let Some(channel) = group.channels.get(&input.channel_name) else {
+            return Ok(DeleteChannelOutput {});
+        };
+        // Deleting a channel that still has origin endpoints would orphan them, so the
+        // service refuses while any child is left.
+        if !channel.origin_endpoints.is_empty() {
+            return Err(DeleteChannelErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Channel {} still has {} origin endpoint(s); delete them first",
+                    channel.name,
+                    channel.origin_endpoints.len()
+                )),
+                conflict_exception_type: Some("RESOURCE_IN_USE".to_string()),
+            })
+            .into());
+        }
+        group.channels.remove(&input.channel_name);
+
+        Ok(DeleteChannelOutput {})
     }
 }

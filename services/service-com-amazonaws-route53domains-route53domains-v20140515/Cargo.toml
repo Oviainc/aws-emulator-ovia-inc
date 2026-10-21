@@ -21,6 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Calendar arithmetic: a domain's ExpirationDate is its registration date advanced by
+# `DurationInYears` CALENDAR years, which needs civil-date conversion, not 365-day steps.
+# Pinned to the version already in the resolved graph (vendor/server and
+# vendor/emulator-telemetry pin the same), so the workspace keeps one `time`. The root
+# manifest is not editable here, so this cannot be a `workspace = true` reference.
+time = "0.3.55"
+# The Public Suffix List, compiled in: which suffixes a registry actually delegates
+# under, so `DomainName` resolution asks a real rule rather than a hand-cut TLD table.
+psl = "2"
+# `OperationId` values: AWS renders them as UUIDs, so mint real v4 UUIDs.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -28,6 +39,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The operation-settle test waits out a wall-clock span, so the test target needs tokio's
+# timer; `features` here apply to test builds only.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

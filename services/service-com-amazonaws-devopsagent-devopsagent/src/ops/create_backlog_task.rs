@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBacklogTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBacklogTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBacklogTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a backlog task under its parent AgentSpace in [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -98,13 +90,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-devopsagent-devopsagent
 // here — hence the `CreateBacklogTaskError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.devopsagent#CreateBacklogTask")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.devopsagent#CreateBacklogTask",
+    extra_errors = ["ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum CreateBacklogTaskErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
+    // Widened in through `extra_errors`: the SERVICE declares
+    // `ServiceQuotaExceededException` (HTTP 402) as a common error, which is what a
+    // per-agent-space task quota has to answer with.
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -123,6 +122,18 @@ impl From<CreateBacklogTaskErrorModeled> for CreateBacklogTaskError {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
 }
+
+/// The status a freshly created backlog task carries.
+///
+/// From the model's `TaskStatus` enum: `PENDING_TRIAGE` is documented as "Task is
+/// awaiting triage analysis", which is where a task created through this operation
+/// sits until something triages it. Nothing triages it inside this emulator, so the
+/// status stays put rather than advancing on its own.
+const INITIAL_TASK_STATUS: &str = "PENDING_TRIAGE";
+
+/// The version a freshly created task carries; `Task$version` is documented as the
+/// optimistic-locking version, so the first stored revision is 1.
+const INITIAL_TASK_VERSION: i32 = 1;
 
 /// The `CreateBacklogTask` operation.
 ///
@@ -160,18 +171,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBacklogTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBacklogTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBacklogTask"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBacklogTaskErrorModeled::InternalServerException(InternalServerException {
+                message: "the DevOps Agent state store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let task_count = match store.agent_spaces.get(&input.agent_space_id) {
+            Some(space) => space.tasks.len(),
+            None => {
+                return Err(CreateBacklogTaskErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("agent space {} was not found", input.agent_space_id),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // Every task is a stored record under its agent space, so the number of them
+        // one space can hold is bounded: past the quota this operation answers the
+        // service's `ServiceQuotaExceededException` (HTTP 402) instead of growing the
+        // space without end.
+        if task_count >= crate::state::MAX_TASKS_PER_AGENT_SPACE {
+            return Err(CreateBacklogTaskErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The request would exceed the maximum number of backlog tasks ({}) for agent space {}",
+                        crate::state::MAX_TASKS_PER_AGENT_SPACE, input.agent_space_id
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `@idempotent` + `@idempotencyToken`: a repeat with the same token returns the
+        // task the first call created instead of minting a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = store
+                .replayed_id(Self::NAME, token, now)
+                .and_then(|task_id| {
+                    store
+                        .agent_spaces
+                        .get(&input.agent_space_id)
+                        .and_then(|space| space.tasks.get(&task_id))
+                })
+            {
+                return Ok(CreateBacklogTaskOutput {
+                    task: existing.to_api(),
+                });
+            }
+        }
+
+        let task_id = store.mint_id("task");
+        let record = crate::state::TaskRecord {
+            task_id: task_id.clone(),
+            agent_space_id: input.agent_space_id.clone(),
+            title: input.title,
+            description: input.description,
+            task_type: input.task_type,
+            priority: input.priority,
+            status: INITIAL_TASK_STATUS.to_string(),
+            reference: input.reference.map(|reference| ReferenceOutput {
+                system: reference.system,
+                title: reference.title,
+                reference_id: reference.reference_id,
+                reference_url: reference.reference_url,
+                association_id: reference.association_id,
+            }),
+            execution_id: None,
+            metadata: None,
+            created_at: now,
+            updated_at: now,
+            version: INITIAL_TASK_VERSION,
+        };
+        if let Some(token) = input.client_token.as_deref() {
+            store.record_client_token(Self::NAME, token, &task_id, now);
+        }
+        let space = store
+            .agent_spaces
+            .get_mut(&input.agent_space_id)
+            .ok_or_else(|| {
+                CreateBacklogTaskErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("agent space {} was not found", input.agent_space_id),
+                    },
+                )
+            })?;
+        space.tasks.insert(task_id.clone(), record);
+
+        // Read the response back out of the store, so what the caller sees is what
+        // was persisted.
+        let stored = space.tasks.get(&task_id).ok_or_else(|| {
+            CreateBacklogTaskErrorModeled::InternalServerException(InternalServerException {
+                message: format!("task {task_id} was not persisted"),
+            })
+        })?;
+        Ok(CreateBacklogTaskOutput {
+            task: stored.to_api(),
+        })
     }
 }

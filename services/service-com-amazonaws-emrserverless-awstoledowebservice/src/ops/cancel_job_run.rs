@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelJobRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelJobRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelJobRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +139,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelJobRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelJobRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelJobRun"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CancelJobRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the EMR Serverless application store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let record = store
+            .settled_mut(&input.application_id, now)
+            .ok_or_else(|| {
+                CancelJobRunErrorModeled::ResourceNotFoundException(
+                    crate::state::application_not_found(&input.application_id),
+                )
+            })?;
+        let job_run = record.job_runs.get_mut(&input.job_run_id).ok_or_else(|| {
+            CancelJobRunErrorModeled::ResourceNotFoundException(crate::state::job_run_not_found(
+                &input.application_id,
+                &input.job_run_id,
+            ))
+        })?;
+
+        // A job run that has already finished cannot be cancelled; there is nothing
+        // left to stop and its terminal state must not be overwritten.
+        if crate::state::is_terminal_job_run_state(&job_run.job_run.state) {
+            return Err(CancelJobRunErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "Job run {} is in {} state and cannot be cancelled",
+                    input.job_run_id, job_run.job_run.state
+                ),
+            })
+            .into());
+        }
+
+        // `shutdownGracePeriodInSeconds` is "the duration in seconds to wait before
+        // forcefully terminating the job after cancellation is requested" — a wait the
+        // CALLER asked for, so it keeps its value. With none named, the emulator's own
+        // transition span applies.
+        let grace = input
+            .shutdown_grace_period_in_seconds
+            .and_then(|seconds| u64::try_from(seconds).ok())
+            .map(::std::time::Duration::from_secs)
+            .unwrap_or(crate::state::LIFECYCLE_TRANSITION);
+
+        // `@idempotent`: a job run already cancelling keeps the cancellation it has,
+        // so a retried cancel neither restarts the grace period nor moves the state
+        // back.
+        if job_run.job_run.state != "CANCELLING" {
+            job_run.job_run.state = "CANCELLING".to_string();
+            job_run.job_run.updated_at = crate::state::now_timestamp(now);
+            job_run.job_run.attempt_updated_at = Some(crate::state::now_timestamp(now));
+            job_run.pending = Some(crate::state::PendingState {
+                due: now + grace,
+                state: "CANCELLED".to_string(),
+                state_details: Some(crate::state::CANCELLED_STATE_DETAILS.to_string()),
+            });
+        }
+
+        Ok(CancelJobRunOutput {
+            application_id: job_run.job_run.application_id.clone(),
+            job_run_id: job_run.job_run.job_run_id.clone(),
+        })
     }
 }

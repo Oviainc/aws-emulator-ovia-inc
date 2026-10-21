@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: creates an environment under an application and persists it.
 //!
 //! ## Shape of an operation
 //!
@@ -166,20 +158,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEnvironment"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateEnvironmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // An environment only exists under an application, so the parent is resolved
+        // before an id is minted for the child.
+        let Some(application) = store.applications.get(&input.application_id) else {
+            return Err(CreateEnvironmentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No application with id {} exists.",
+                        input.application_id
+                    )),
+                    resource_name: Some(input.application_id),
+                },
+            )
+            .into());
+        };
+        // Bounded so a loop of create calls cannot grow this emulator's heap without
+        // limit; see `state::MAX_ENVIRONMENTS_PER_APPLICATION`.
+        if application.environments.len() >= crate::state::MAX_ENVIRONMENTS_PER_APPLICATION {
+            return Err(CreateEnvironmentErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "Cannot create another environment: application {} already holds the \
+                         maximum of {} environments.",
+                        input.application_id,
+                        crate::state::MAX_ENVIRONMENTS_PER_APPLICATION
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_id();
+        let Some(application) = store.applications.get_mut(&input.application_id) else {
+            return Err(CreateEnvironmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The application could not be re-read while creating the environment"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let environment = crate::state::Environment::new(
+            id.clone(),
+            application.id.clone(),
+            input.name,
+            input.description,
+            input.monitors.unwrap_or_default(),
+            input.tags.unwrap_or_default(),
+        );
+        // `mint_id` rejects every id any resource already holds, so the slot is vacant.
+        // An occupied one is refused rather than answered from: reporting 201 with
+        // another environment's record would describe a resource this call never made.
+        let stored = match application.environments.entry(id) {
+            std::collections::hash_map::Entry::Vacant(slot) => slot.insert(environment),
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(CreateEnvironmentErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The minted environment id was already in use".to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // Answered from the stored record, including the `State` a brand-new
+        // environment carries: nothing is deploying into it yet.
+        Ok(CreateEnvironmentOutput {
+            application_id: Some(stored.application_id.clone()),
+            id: Some(stored.id.clone()),
+            name: Some(stored.name.clone()),
+            description: stored.description.clone(),
+            state: Some(stored.state.clone()),
+            monitors: (!stored.monitors.is_empty()).then(|| stored.monitors.clone()),
+        })
     }
 }

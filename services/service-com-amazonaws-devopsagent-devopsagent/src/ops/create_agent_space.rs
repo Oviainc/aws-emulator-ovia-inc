@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAgentSpace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAgentSpace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAgentSpace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints an AgentSpace and stores it in [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +157,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAgentSpace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAgentSpaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAgentSpace"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAgentSpaceErrorModeled::InternalServerException(InternalServerException {
+                message: "the DevOps Agent state store is unavailable".to_string(),
+            })
+        })?;
+
+        // The model's `AgentSpacePreferences` map rejects unrecognized keys, and the
+        // framework's constraint walk does not validate map KEYS, so refuse them here
+        // with the modelled client error rather than storing a key the service does
+        // not know.
+        let preferences = input.preferences.unwrap_or_default();
+        let mut unknown: Vec<&str> = preferences
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !crate::state::AGENT_SPACE_PREFERENCE_KEYS.contains(key))
+            .collect();
+        if !unknown.is_empty() {
+            unknown.sort_unstable();
+            return Err(CreateAgentSpaceErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "preferences contains unrecognized preference key(s): {}",
+                        unknown.join(", ")
+                    ),
+                    field_list: Some(
+                        unknown
+                            .iter()
+                            .map(|key| ValidationExceptionField {
+                                path: format!("preferences.{key}"),
+                                message: "unrecognized preference key".to_string(),
+                            })
+                            .collect(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // Every AgentSpace is a stored record, so the number of them a caller can
+        // create is bounded: past the quota this operation answers its own modelled
+        // `ServiceQuotaExceededException` (HTTP 402) instead of growing the store
+        // without end.
+        if store.agent_spaces.len() >= crate::state::MAX_AGENT_SPACES {
+            return Err(CreateAgentSpaceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The request would exceed the maximum number of agent spaces ({}) for this account",
+                        crate::state::MAX_AGENT_SPACES
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `@idempotent` + `@idempotencyToken`: a repeat with the same token returns the
+        // resource the first call created instead of minting a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = store
+                .replayed_id(Self::NAME, token, now)
+                .and_then(|id| store.agent_spaces.get(&id))
+            {
+                return Ok(CreateAgentSpaceOutput {
+                    agent_space: existing.to_api(),
+                    tags: existing.tags_to_api(),
+                });
+            }
+        }
+
+        let agent_space_id = store.mint_id("as");
+        let record = crate::state::AgentSpaceRecord {
+            agent_space_id: agent_space_id.clone(),
+            name: input.name,
+            description: input.description,
+            locale: input.locale,
+            kms_key_arn: input.kms_key_arn,
+            preferences,
+            tags: input.tags.unwrap_or_default(),
+            created_at: now,
+            updated_at: now,
+            tasks: ::std::collections::HashMap::new(),
+        };
+        if let Some(token) = input.client_token.as_deref() {
+            store.record_client_token(Self::NAME, token, &agent_space_id, now);
+        }
+        store.agent_spaces.insert(agent_space_id.clone(), record);
+
+        // Read the response back out of the store, so what the caller sees is what
+        // was persisted.
+        let stored = store.agent_spaces.get(&agent_space_id).ok_or_else(|| {
+            CreateAgentSpaceErrorModeled::InternalServerException(InternalServerException {
+                message: format!("agent space {agent_space_id} was not persisted"),
+            })
+        })?;
+        Ok(CreateAgentSpaceOutput {
+            agent_space: stored.to_api(),
+            tags: stored.tags_to_api(),
+        })
     }
 }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEntities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEntities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEntities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the stored entities whose type matches `EntityType`, filtered and ordered as
+//! `Filter` and `Sort` ask, one `MaxResults` page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +163,184 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEntities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEntitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEntities"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEntitiesErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the marketplace catalog store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        if input.catalog != crate::state::AWS_MARKETPLACE_CATALOG {
+            return Err(ListEntitiesErrorModeled::ValidationException(
+                crate::state::wrong_catalog(&input.catalog),
+            )
+            .into());
+        }
+
+        // `EntityTypeFilters` / `EntityTypeSort` select and order on members
+        // that belong to one entity type's own shape (an offer's buyer
+        // accounts, a product's title). This slice stores an entity's common
+        // members only, so rather than answer as if a type-specific filter had
+        // been applied, the request is refused and the generic `FilterList` /
+        // `Sort` named instead.
+        if input.entity_type_filters.is_some() || input.entity_type_sort.is_some() {
+            let member = if input.entity_type_filters.is_some() {
+                "EntityTypeFilters"
+            } else {
+                "EntityTypeSort"
+            };
+            return Err(ListEntitiesErrorModeled::ValidationException(
+                crate::state::validation(
+                    member,
+                    format!(
+                        "this emulator lists entities by FilterList and Sort; the type-specific \
+                         {member} is not implemented"
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // `OwnershipType` SELF is "entities the account owns" and SHARED those
+        // another account shared with it. Every entity in this store was
+        // created here by a change set of this account, so SELF lists them all
+        // and SHARED lists none. The member is a modelled enum, so a value
+        // outside it was refused at the boundary.
+        let ownership = input
+            .ownership_type
+            .clone()
+            .unwrap_or_else(|| "SELF".to_string());
+
+        let filters = input.filter_list.unwrap_or_default();
+        let mut predicates: Vec<(String, Vec<String>)> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let Some(name) = filter.name else {
+                return Err(ListEntitiesErrorModeled::ValidationException(
+                    crate::state::validation("FilterList.Name", "every filter names an attribute"),
+                )
+                .into());
+            };
+            if !crate::state::ENTITY_FILTER_NAMES.contains(&name.as_str()) {
+                return Err(ListEntitiesErrorModeled::ValidationException(
+                    crate::state::validation(
+                        "FilterList.Name",
+                        format!(
+                            "ListEntities filters on {:?}, not on {name:?}",
+                            crate::state::ENTITY_FILTER_NAMES
+                        ),
+                    ),
+                )
+                .into());
+            }
+            let values = filter.value_list.unwrap_or_default();
+            if values.is_empty() {
+                return Err(ListEntitiesErrorModeled::ValidationException(
+                    crate::state::validation(
+                        "FilterList.ValueList",
+                        format!("filter {name} carries no value to match"),
+                    ),
+                )
+                .into());
+            }
+            predicates.push((name, values));
+        }
+
+        let sort = input.sort.unwrap_or_default();
+        let sort_by = sort
+            .sort_by
+            .unwrap_or_else(|| crate::state::ENTITY_SORT_BY[0].to_string());
+        if !crate::state::ENTITY_SORT_BY.contains(&sort_by.as_str()) {
+            return Err(ListEntitiesErrorModeled::ValidationException(
+                crate::state::validation(
+                    "Sort.SortBy",
+                    format!(
+                        "ListEntities sorts by {:?}, not by {sort_by:?}",
+                        crate::state::ENTITY_SORT_BY
+                    ),
+                ),
+            )
+            .into());
+        }
+        // `Sort$SortOrder` is a modelled enum, already refused at the boundary
+        // if it carried anything else; its documented default is DESCENDING.
+        let sort_order = sort
+            .sort_order
+            .unwrap_or_else(|| crate::state::DEFAULT_SORT_ORDER.to_string());
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                match crate::state::decode_page_token(crate::state::ENTITY_PAGE_PREFIX, token) {
+                    Some(offset) => offset,
+                    None => {
+                        return Err(ListEntitiesErrorModeled::ValidationException(
+                            crate::state::validation(
+                                "NextToken",
+                                format!("{token:?} is not a token returned by ListEntities"),
+                            ),
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        // `MaxResults` is modelled `@range(min: 1, max: 50)`.
+        let requested = input
+            .max_results
+            .unwrap_or(crate::state::LIST_ENTITIES_PAGE_LIMIT);
+        debug_assert!(
+            (1..=crate::state::LIST_ENTITIES_PAGE_LIMIT).contains(&requested),
+            "MaxResults {requested} should have been refused at the boundary"
+        );
+        let page_size = usize::try_from(requested.clamp(1, crate::state::LIST_ENTITIES_PAGE_LIMIT))
+            .expect("a page size clamped into 1..=50 fits in usize");
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let mut matched: Vec<&crate::state::EntityRecord> = if ownership == "SHARED" {
+            Vec::new()
+        } else {
+            store
+                .entities
+                .values()
+                .filter(|record| record.entity_type == input.entity_type)
+                .filter(|record| {
+                    predicates
+                        .iter()
+                        .all(|(name, values)| record.matches_filter(name, values))
+                })
+                .collect()
+        };
+        matched.sort_by(|left, right| {
+            let ordering = left
+                .sort_key(&sort_by)
+                .cmp(right.sort_key(&sort_by))
+                .then_with(|| left.id.cmp(&right.id));
+            if sort_order == "DESCENDING" {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+
+        let summaries: Vec<EntitySummary> =
+            matched.iter().map(|record| record.to_summary()).collect();
+        let page = crate::state::paginate(
+            summaries,
+            offset,
+            page_size,
+            crate::state::ENTITY_PAGE_PREFIX,
+        );
+
+        Ok(ListEntitiesOutput {
+            entity_summary_list: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

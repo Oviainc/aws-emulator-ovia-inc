@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartJobRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartJobRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartJobRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +163,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartJobRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartJobRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartJobRun"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartJobRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the EMR Serverless application store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let created_by = crate::state::caller_arn(ctx.parts());
+        let mut store = state.lock();
+        let record = store
+            .settled_mut(&input.application_id, now)
+            .ok_or_else(|| {
+                StartJobRunErrorModeled::ResourceNotFoundException(
+                    crate::state::application_not_found(&input.application_id),
+                )
+            })?;
+
+        // `clientToken` is `@idempotencyToken` on an `@idempotent` operation: the same
+        // token names the same job run, so a retried submit reports the first one
+        // rather than starting a second.
+        if let Some(job_run_id) = record.job_run_tokens.get(&input.client_token).cloned() {
+            if let Some(existing) = record.job_runs.get(&job_run_id) {
+                return Ok(StartJobRunOutput {
+                    application_id: existing.job_run.application_id.clone(),
+                    job_run_id: existing.job_run.job_run_id.clone(),
+                    arn: existing.job_run.arn.clone(),
+                });
+            }
+        }
+
+        // `JobRun$jobDriver` is REQUIRED on everything that reports a job run, so a
+        // submit that names no driver describes no runnable work and is refused rather
+        // than stored as a record no reader could render.
+        let Some(job_driver) = input.job_driver else {
+            return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
+                message: "Member must name the work to run: jobDriver".to_string(),
+            })
+            .into());
+        };
+
+        // A job run only reaches an application that is running. `AutoStartConfig`
+        // documents the alternative — "Enables the application to automatically start
+        // on job submission" — so an application configured that way is started by this
+        // submit instead of refusing it.
+        if record.application.state != "STARTED" {
+            if !record.auto_start_enabled() {
+                return Err(StartJobRunErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "Application {} is in {} state and does not start automatically on \
+                             job submission; call StartApplication first",
+                            input.application_id, record.application.state
+                        ),
+                    },
+                )
+                .into());
+            }
+            if record.application.state != "STARTING" {
+                record.application.state = "STARTING".to_string();
+                record.application.updated_at = crate::state::now_timestamp(now);
+                record.pending = Some(crate::state::PendingState {
+                    due: now + crate::state::LIFECYCLE_TRANSITION,
+                    state: "STARTED".to_string(),
+                    state_details: None,
+                });
+            }
+        }
+
+        // The job runs one application holds are bounded, the same way the application
+        // store is; this operation models no quota error, so the refusal is its
+        // modelled `ValidationException`.
+        if record.job_runs.len() >= crate::state::MAX_JOB_RUNS_PER_APPLICATION {
+            return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "Application {} already holds the maximum of {} job runs",
+                    input.application_id,
+                    crate::state::MAX_JOB_RUNS_PER_APPLICATION
+                ),
+            })
+            .into());
+        }
+
+        let job_run_id = record.mint_job_run_id();
+        let arn = crate::state::job_run_arn(&record.application.arn, &job_run_id);
+        let created_at = crate::state::now_timestamp(now);
+        let job_run = JobRun {
+            application_id: record.application.application_id.clone(),
+            job_run_id: job_run_id.clone(),
+            name: input.name,
+            arn: arn.clone(),
+            created_by,
+            created_at,
+            updated_at: created_at,
+            execution_role: input.execution_role_arn,
+            execution_iam_policy: input.execution_iam_policy,
+            state: "SUBMITTED".to_string(),
+            state_details: crate::state::SUBMITTED_STATE_DETAILS.to_string(),
+            // The release the job runs on is the application's, never the request's.
+            release_label: record.application.release_label.clone(),
+            configuration_overrides: input.configuration_overrides,
+            job_driver,
+            tags: input.tags,
+            // Resource utilisation is measured while a job executes. Nothing executes
+            // here, so there is nothing to report.
+            total_resource_utilization: None,
+            network_configuration: record.application.network_configuration.clone(),
+            total_execution_duration_seconds: None,
+            execution_timeout_minutes: Some(
+                input
+                    .execution_timeout_minutes
+                    .unwrap_or(crate::state::DEFAULT_EXECUTION_TIMEOUT_MINUTES),
+            ),
+            billed_resource_utilization: None,
+            mode: input.mode,
+            retry_policy: input.retry_policy,
+            // The first attempt of this job run.
+            attempt: Some(1),
+            attempt_created_at: Some(created_at),
+            attempt_updated_at: Some(created_at),
+            // The job never moved to RUNNING, so it has no start instant.
+            started_at: None,
+            ended_at: None,
+            queued_duration_milliseconds: None,
+            image_configuration: record.application.image_configuration.clone(),
+            worker_type_specifications: record.application.worker_type_specifications.clone(),
+        };
+
+        record.job_runs.insert(
+            job_run_id.clone(),
+            crate::state::JobRunRecord {
+                job_run,
+                job_run_type: record.application.r#type.clone(),
+                // This emulator runs no Spark or Hive workload, so the clock owes the
+                // job run the modelled failure state with a reason that says so — it
+                // can never be reported as a success nothing computed.
+                pending: Some(crate::state::PendingState {
+                    due: now + crate::state::LIFECYCLE_TRANSITION,
+                    state: "FAILED".to_string(),
+                    state_details: Some(crate::state::NOT_EXECUTED_STATE_DETAILS.to_string()),
+                }),
+            },
+        );
+        record
+            .job_run_tokens
+            .insert(input.client_token, job_run_id.clone());
+
+        Ok(StartJobRunOutput {
+            application_id: input.application_id,
+            job_run_id,
+            arn,
+        })
     }
 }

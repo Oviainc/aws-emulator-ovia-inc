@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListChangeSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListChangeSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListChangeSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the change sets the store holds, filtered and ordered as `Filter` and `Sort`
+//! ask, one `MaxResults` page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +150,185 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListChangeSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListChangeSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListChangeSets"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListChangeSetsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the marketplace catalog store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        if input.catalog != crate::state::AWS_MARKETPLACE_CATALOG {
+            return Err(ListChangeSetsErrorModeled::ValidationException(
+                crate::state::wrong_catalog(&input.catalog),
+            )
+            .into());
+        }
+
+        // Each filter has to name one of the attributes this list filters on,
+        // and a before/after filter one instant to compare against.
+        let filters = input.filter_list.unwrap_or_default();
+        let mut predicates: Vec<(String, Vec<String>)> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let Some(name) = filter.name else {
+                return Err(ListChangeSetsErrorModeled::ValidationException(
+                    crate::state::validation("FilterList.Name", "every filter names an attribute"),
+                )
+                .into());
+            };
+            if !crate::state::CHANGE_SET_FILTER_NAMES.contains(&name.as_str()) {
+                return Err(ListChangeSetsErrorModeled::ValidationException(
+                    crate::state::validation(
+                        "FilterList.Name",
+                        format!(
+                            "ListChangeSets filters on {:?}, not on {name:?}",
+                            crate::state::CHANGE_SET_FILTER_NAMES
+                        ),
+                    ),
+                )
+                .into());
+            }
+            let values = filter.value_list.unwrap_or_default();
+            if values.is_empty() {
+                return Err(ListChangeSetsErrorModeled::ValidationException(
+                    crate::state::validation(
+                        "FilterList.ValueList",
+                        format!("filter {name} carries no value to match"),
+                    ),
+                )
+                .into());
+            }
+            if crate::state::CHANGE_SET_TIME_FILTER_NAMES.contains(&name.as_str()) {
+                // A before/after filter compares against one instant, and only
+                // another `DateTimeISO8601` is an instant this list can compare
+                // its records' timestamps with: anything else would silently
+                // select everything or nothing.
+                if values.len() != 1 {
+                    return Err(ListChangeSetsErrorModeled::ValidationException(
+                        crate::state::validation(
+                            "FilterList.ValueList",
+                            format!("filter {name} compares against exactly one instant"),
+                        ),
+                    )
+                    .into());
+                }
+                if !crate::state::is_iso8601(&values[0]) {
+                    return Err(ListChangeSetsErrorModeled::ValidationException(
+                        crate::state::cannot_parse(
+                            "FilterList.ValueList",
+                            format!(
+                                "filter {name} compares against an ISO-8601 instant \
+                                 (2018-02-27T13:45:22Z), not {:?}",
+                                values[0]
+                            ),
+                        ),
+                    )
+                    .into());
+                }
+            }
+            predicates.push((name, values));
+        }
+
+        // `Sort$SortBy` names the attribute to order by and `Sort$SortOrder`
+        // the direction, whose default is DESCENDING.
+        let sort = input.sort.unwrap_or_default();
+        let sort_by = sort
+            .sort_by
+            .unwrap_or_else(|| crate::state::CHANGE_SET_SORT_BY[0].to_string());
+        if !crate::state::CHANGE_SET_SORT_BY.contains(&sort_by.as_str()) {
+            return Err(ListChangeSetsErrorModeled::ValidationException(
+                crate::state::validation(
+                    "Sort.SortBy",
+                    format!(
+                        "ListChangeSets sorts by {:?}, not by {sort_by:?}",
+                        crate::state::CHANGE_SET_SORT_BY
+                    ),
+                ),
+            )
+            .into());
+        }
+        // `Sort$SortOrder` is a modelled enum, already refused at the boundary
+        // if it carried anything else; its documented default is DESCENDING.
+        let sort_order = sort
+            .sort_order
+            .unwrap_or_else(|| crate::state::DEFAULT_SORT_ORDER.to_string());
+
+        // The token is the offset the next page resumes at; one this service
+        // never issued names no page.
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                match crate::state::decode_page_token(crate::state::CHANGE_SET_PAGE_PREFIX, token) {
+                    Some(offset) => offset,
+                    None => {
+                        return Err(ListChangeSetsErrorModeled::ValidationException(
+                            crate::state::validation(
+                                "NextToken",
+                                format!("{token:?} is not a token returned by ListChangeSets"),
+                            ),
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        // `MaxResults` is modelled `@range(min: 1, max: 20)`, so the boundary
+        // validator already refused anything outside it; an absent value serves
+        // the largest page the model allows.
+        let requested = input
+            .max_results
+            .unwrap_or(crate::state::LIST_CHANGE_SETS_PAGE_LIMIT);
+        debug_assert!(
+            (1..=crate::state::LIST_CHANGE_SETS_PAGE_LIMIT).contains(&requested),
+            "MaxResults {requested} should have been refused at the boundary"
+        );
+        let page_size =
+            usize::try_from(requested.clamp(1, crate::state::LIST_CHANGE_SETS_PAGE_LIMIT))
+                .expect("a page size clamped into 1..=20 fits in usize");
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let mut matched: Vec<&crate::state::ChangeSetRecord> = store
+            .change_sets
+            .values()
+            .filter(|record| {
+                predicates
+                    .iter()
+                    .all(|(name, values)| record.matches_filter(name, values))
+            })
+            .collect();
+        // The id is the tie-break, so change sets that share a timestamp still
+        // come out in one stable total order and a page boundary never repeats
+        // or skips one.
+        matched.sort_by(|left, right| {
+            let ordering = left
+                .sort_key(&sort_by)
+                .cmp(right.sort_key(&sort_by))
+                .then_with(|| left.id.cmp(&right.id));
+            if sort_order == "DESCENDING" {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+
+        let summaries: Vec<ChangeSetSummaryListItem> =
+            matched.iter().map(|record| record.to_summary()).collect();
+        let page = crate::state::paginate(
+            summaries,
+            offset,
+            page_size,
+            crate::state::CHANGE_SET_PAGE_PREFIX,
+        );
+
+        Ok(ListChangeSetsOutput {
+            change_set_summary_list: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

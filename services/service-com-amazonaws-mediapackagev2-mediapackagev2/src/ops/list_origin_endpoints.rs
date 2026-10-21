@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOriginEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOriginEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Pages over the origin endpoints persisted under one channel in
+//! [`crate::state`], in name order, reporting one list configuration per endpoint of
+//! THAT channel. Purely reporting: it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOriginEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `handle` below is the implementation; `crate::state` holds the store it reads.
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +122,77 @@ impl From<ListOriginEndpointsErrorModeled> for ListOriginEndpointsError {
     }
 }
 
+/// The smallest `MaxResults` the model's `ListResourceMaxResults` range allows.
+const MAX_RESULTS_MIN: usize = 1;
+/// The largest `MaxResults` the model's `ListResourceMaxResults` range allows.
+const MAX_RESULTS_MAX: usize = 100;
+/// The page size the model declares as `MaxResults`'s default.
+const MAX_RESULTS_DEFAULT: usize = 10;
+
+/// The list projection of a persisted origin endpoint: its identity, its container type
+/// and the name, child name and URL of each of its manifests. The list form omits the
+/// per-manifest packaging detail a `Get` reports, so this is a narrowing of what is
+/// stored, never a recomputation of it.
+fn list_configuration(
+    endpoint: &crate::state::OriginEndpoint,
+) -> OriginEndpointListConfiguration {
+    OriginEndpointListConfiguration {
+        arn: endpoint.arn.clone(),
+        channel_group_name: endpoint.group_name.clone(),
+        channel_name: endpoint.channel_name.clone(),
+        origin_endpoint_name: endpoint.name.clone(),
+        container_type: endpoint.container_type.clone(),
+        description: endpoint.description.clone(),
+        created_at: Some(endpoint.created_at),
+        modified_at: Some(endpoint.modified_at),
+        hls_manifests: Some(
+            endpoint
+                .hls_manifests
+                .iter()
+                .map(|manifest| ListHlsManifestConfiguration {
+                    manifest_name: manifest.manifest_name.clone(),
+                    child_manifest_name: manifest.child_manifest_name.clone(),
+                    url: Some(manifest.url.clone()),
+                })
+                .collect(),
+        ),
+        low_latency_hls_manifests: Some(
+            endpoint
+                .low_latency_hls_manifests
+                .iter()
+                .map(|manifest| ListLowLatencyHlsManifestConfiguration {
+                    manifest_name: manifest.manifest_name.clone(),
+                    child_manifest_name: manifest.child_manifest_name.clone(),
+                    url: Some(manifest.url.clone()),
+                })
+                .collect(),
+        ),
+        dash_manifests: Some(
+            endpoint
+                .dash_manifests
+                .iter()
+                .map(|manifest| ListDashManifestConfiguration {
+                    manifest_name: manifest.manifest_name.clone(),
+                    url: Some(manifest.url.clone()),
+                })
+                .collect(),
+        ),
+        mss_manifests: Some(
+            endpoint
+                .mss_manifests
+                .iter()
+                .map(|manifest| ListMssManifestConfiguration {
+                    manifest_name: manifest.manifest_name.clone(),
+                    url: Some(manifest.url.clone()),
+                })
+                .collect(),
+        ),
+        force_endpoint_error_configuration: endpoint.force_endpoint_error_configuration.clone(),
+        uri_separator: endpoint.uri_separator.clone(),
+        stream_name_output_mode: endpoint.stream_name_output_mode.clone(),
+    }
+}
+
 /// The `ListOriginEndpoints` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -162,18 +229,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOriginEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOriginEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOriginEndpoints"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListOriginEndpointsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        let Some(group) = store.channel_groups.get(&input.channel_group_name) else {
+            return Err(ListOriginEndpointsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Channel group {} not found",
+                        input.channel_group_name
+                    )),
+                    resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
+                },
+            )
+            .into());
+        };
+        let Some(channel) = group.channels.get(&input.channel_name) else {
+            return Err(ListOriginEndpointsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Channel {} not found in channel group {}",
+                        input.channel_name, input.channel_group_name
+                    )),
+                    resource_type_not_found: Some("CHANNEL".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The model bounds `MaxResults` to 1..100 and defaults it to 10, and the
+        // boundary validator has already refused anything outside that range, so a value
+        // outside it here means the member was absent: fall back to the modelled default.
+        let page_size = match usize::try_from(input.max_results) {
+            Ok(size) if (MAX_RESULTS_MIN..=MAX_RESULTS_MAX).contains(&size) => size,
+            _ => MAX_RESULTS_DEFAULT,
+        };
+
+        // A token names the endpoint the previous page stopped after, so this page starts
+        // strictly beyond it: no endpoint is returned twice and none is skipped.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::page_resume_after(token) {
+                Some(after) => Some(after),
+                None => {
+                    return Err(ListOriginEndpointsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "The pagination token is not one this service issued"
+                                    .to_string(),
+                            ),
+                            validation_exception_type: Some(
+                                "INVALID_PAGINATION_TOKEN".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let mut remaining = channel
+            .origin_endpoints
+            .iter()
+            .filter(|(name, _)| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| name.as_str() > after)
+            })
+            .map(|(_, endpoint)| endpoint);
+        let page: Vec<&crate::state::OriginEndpoint> =
+            remaining.by_ref().take(page_size).collect();
+        // A token is issued only when an endpoint is actually left over, so the last page
+        // of a list ends without one.
+        let next_token = page
+            .last()
+            .filter(|_| remaining.next().is_some())
+            .map(|last| crate::state::page_token(&last.name));
+
+        Ok(ListOriginEndpointsOutput {
+            items: Some(page.into_iter().map(list_configuration).collect()),
+            next_token,
+        })
     }
 }

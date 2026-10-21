@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProjects
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProjects`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProjects::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `ProjectSummary` per PERSISTED project of ONE domain, in the stored
+//! map's order, with `@paginated` `nextToken` pages and the `name` / `projectCategory`
+//! query filters applied. It is a reporting operation: the only write it makes is
+//! materialising a domain lifecycle step the clock already owed.
+//!
+//! The `userIdentifier` / `groupIdentifier` filters select by project MEMBERSHIP, a
+//! resource this slice of the emulator does not serve yet, so a request using one is
+//! answered with the scaffold's 501 rather than a list that ignored the filter.
 //!
 //! ## Shape of an operation
 //!
@@ -145,6 +145,13 @@ impl<Eng> ListProjects<Eng> {
     }
 }
 
+/// The `maxResults` range the model declares for this operation (`@range` min 1, max
+/// 50 on `MaxResults`). A request naming no `maxResults` gets the top of the range, and
+/// a value is clamped into it rather than trusted: a 0 would otherwise answer an empty
+/// page while the domain has projects.
+const MIN_MAX_RESULTS: usize = 1;
+const MAX_MAX_RESULTS: usize = 50;
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListProjects<Eng>
 {
@@ -162,18 +169,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProjects` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProjectsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProjects"))
+        let _ = ctx;
+        use crate::state::{date_time, decode_page_token, encode_page_token, now_ms};
+
+        if input.user_identifier.is_some() || input.group_identifier.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListProjects filtered by userIdentifier or groupIdentifier",
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListProjectsErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_clock(now_ms());
+
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                ListProjectsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                })
+            })?),
+            None => None,
+        };
+        let page_size = input
+            .max_results
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(MAX_MAX_RESULTS)
+            .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
+
+        // This operation models no `ResourceNotFoundException`, so an unknown domain is
+        // refused as a bad request rather than reported as a domain with no projects.
+        let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {
+            ListProjectsErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "domainIdentifier {} does not identify a domain",
+                    input.domain_identifier
+                ),
+            })
+        })?;
+
+        let matching = domain
+            .projects
+            .values()
+            .filter(|p| resume_after.as_deref().is_none_or(|after| p.id.as_str() > after))
+            .filter(|p| input.name.as_deref().is_none_or(|name| p.name == name))
+            .filter(|p| {
+                input.project_category.as_deref().is_none_or(|category| {
+                    p.project_category.as_deref() == Some(category)
+                })
+            });
+
+        let mut items: Vec<ProjectSummary> = Vec::new();
+        let mut next_token = None;
+        for project in matching {
+            if items.len() == page_size {
+                next_token = items.last().map(|last| encode_page_token(&last.id));
+                break;
+            }
+            items.push(ProjectSummary {
+                domain_id: project.domain_id.clone(),
+                id: project.id.clone(),
+                name: project.name.clone(),
+                description: project.description.clone(),
+                project_status: Some(project.project_status.clone()),
+                failure_reasons: None,
+                created_by: project.created_by.clone(),
+                created_at: Some(date_time(project.created_at_ms)),
+                updated_at: Some(date_time(project.last_updated_at_ms)),
+                domain_unit_id: project.domain_unit_id.clone(),
+                project_category: project.project_category.clone(),
+            });
+        }
+
+        Ok(ListProjectsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }

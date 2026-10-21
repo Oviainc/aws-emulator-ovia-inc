@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a domain and PERSISTS it in [`crate::state`], keyed by the `dzd_…` id it
+//! returns, so `GetDomain`/`ListDomains` answer from the stored record.
+//!
+//! The domain is returned `CREATING` — the status the real service reports for a
+//! domain it has just accepted — and settles to `AVAILABLE` once the clock passes the
+//! instant recorded in `status_due_ms` (see `crate::state::settle_clock`).
+//!
+//! `clientToken` is the operation's `@idempotencyToken`: a repeat carrying a token
+//! already seen returns the domain that token created rather than a second domain.
 //!
 //! ## Shape of an operation
 //!
@@ -160,6 +161,30 @@ impl From<CreateDomainErrorModeled> for CreateDomainError {
     }
 }
 
+/// This operation's view of a stored domain: every member the model declares on
+/// `CreateDomainOutput`, read from the persisted record rather than from the request.
+fn domain_output(domain: &crate::state::Domain) -> CreateDomainOutput {
+    CreateDomainOutput {
+        id: domain.id.clone(),
+        root_domain_unit_id: Some(domain.root_domain_unit_id.clone()),
+        name: Some(domain.name.clone()),
+        description: domain.description.clone(),
+        single_sign_on: domain.single_sign_on.as_ref().map(|sso| SingleSignOn {
+            r#type: sso.sso_type.clone(),
+            user_assignment: sso.user_assignment.clone(),
+            idc_instance_arn: sso.idc_instance_arn.clone(),
+        }),
+        domain_execution_role: Some(domain.domain_execution_role.clone()),
+        arn: Some(domain.arn.clone()),
+        kms_key_identifier: domain.kms_key_identifier.clone(),
+        status: Some(domain.status.clone()),
+        portal_url: domain.portal_url.clone(),
+        tags: Some(domain.tags.clone().into_iter().collect()),
+        domain_version: Some(domain.domain_version.clone()),
+        service_role: domain.service_role.clone(),
+    }
+}
+
 /// The `CreateDomain` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -196,18 +221,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDomain"))
+        use crate::state::{
+            caller_region, now_ms, Domain, StoredSingleSignOn, DEFAULT_DOMAIN_VERSION,
+            DOMAIN_STATUS_CREATING, LIFECYCLE_SETTLE_MS,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDomainErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        // The `@idempotencyToken`: a repeat of the SAME request returns the domain the
+        // first one created, so a retry never leaves two domains behind.
+        if let Some(existing) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.idempotent_domain(token))
+        {
+            return Ok(domain_output(existing));
+        }
+
+        let region = caller_region(ctx);
+        // The store is bounded, so a create loop cannot grow the emulator's heap
+        // without limit; the refusal is the error the operation already models.
+        if store.domains.len() >= crate::state::MAX_DOMAINS {
+            return Err(CreateDomainErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator stores at most {} domains",
+                        crate::state::MAX_DOMAINS
+                    ),
+                },
+            )
+            .into());
+        }
+        let id = format!("dzd_{}", store.mint_id(now));
+        let domain = Domain {
+            arn: ::engine::emulator_arn("datazone", &region, &format!("domain/{id}")),
+            // The data portal the real service stands up for the domain is addressed
+            // by the domain id, in the region the domain lives in.
+            portal_url: Some(format!("https://{id}.datazone.{region}.on.aws")),
+            root_domain_unit_id: store.mint_id(now),
+            managed_account_id: ::engine::emulator_account_id().to_string(),
+            name: input.name,
+            description: input.description,
+            single_sign_on: input.single_sign_on.map(|sso| StoredSingleSignOn {
+                sso_type: sso.r#type,
+                user_assignment: sso.user_assignment,
+                idc_instance_arn: sso.idc_instance_arn,
+            }),
+            // `domainExecutionRole` is optional on input but REQUIRED on
+            // `GetDomainOutput` (smithy_query operation="GetDomain"), because the real
+            // service creates the role itself when the request names none. This is that
+            // service-created role, built through `emulator_arn` — not a recorded value.
+            domain_execution_role: input.domain_execution_role.unwrap_or_else(|| {
+                ::engine::emulator_arn(
+                    "iam",
+                    "",
+                    "role/service-role/AmazonDataZoneDomainExecution",
+                )
+            }),
+            service_role: input.service_role,
+            kms_key_identifier: input.kms_key_identifier,
+            status: DOMAIN_STATUS_CREATING.to_string(),
+            domain_version: input
+                .domain_version
+                .unwrap_or_else(|| DEFAULT_DOMAIN_VERSION.to_string()),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at_ms: now,
+            last_updated_at_ms: now,
+            status_due_ms: Some(now + LIFECYCLE_SETTLE_MS),
+            projects: std::collections::BTreeMap::new(),
+            id: id.clone(),
+        };
+
+        let output = domain_output(&domain);
+        store.domains.insert(id.clone(), domain);
+        // Recorded AFTER the domain is stored: the bound this applies releases a token
+        // whose domain is not in the store.
+        if let Some(token) = input.client_token {
+            store.record_idempotency(token, id, now);
+        }
+        Ok(output)
     }
 }

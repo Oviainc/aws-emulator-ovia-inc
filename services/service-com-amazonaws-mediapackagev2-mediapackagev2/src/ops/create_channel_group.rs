@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannelGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChannelGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Mints a channel group and persists it in [`crate::state`]. The group's
+//! ARN, egress domain, timestamps and ETag are computed here, once, and stored, so
+//! `GetChannelGroup` reads them back unchanged. A name that already exists is refused
+//! with `ConflictException` and the group it names is left exactly as it was.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChannelGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `handle` below is the implementation; `crate::state` holds the store it reads and
+//! writes.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +184,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChannelGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChannelGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChannelGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateChannelGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // One channel group per name per account and region: a repeat create conflicts
+        // rather than replacing the group that is already there.
+        if store.channel_groups.contains_key(&input.channel_group_name) {
+            return Err(CreateChannelGroupErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Channel group {} already exists",
+                    input.channel_group_name
+                )),
+                conflict_exception_type: Some("RESOURCE_ALREADY_EXISTS".to_string()),
+            })
+            .into());
+        }
+
+        // The store only shrinks on an explicit delete, so the number of groups it holds
+        // is bounded here rather than by how many requests arrive: past the ceiling the
+        // create is refused with the quota error the model declares, and nothing is
+        // stored.
+        if store.channel_groups.len() >= crate::state::MAX_CHANNEL_GROUPS {
+            return Err(
+                CreateChannelGroupErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "This account already has the maximum of {} channel groups in {region}",
+                            crate::state::MAX_CHANNEL_GROUPS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let name = input.channel_group_name.clone();
+        let created_at = crate::state::now();
+        let tags = input.tags.unwrap_or_default();
+        let arn = crate::state::channel_group_arn(&region, &name);
+        let egress_domain = crate::state::egress_domain(&region, &name);
+        let etag = crate::state::etag(&[
+            arn.clone(),
+            egress_domain.clone(),
+            input.description.clone().unwrap_or_default(),
+            crate::state::tag_fingerprint(&tags),
+        ]);
+
+        let group = crate::state::ChannelGroup {
+            name: name.clone(),
+            arn,
+            egress_domain,
+            description: input.description,
+            created_at,
+            // A group that has only just been created has never been modified, so both
+            // stamps are the instant it came into being.
+            modified_at: created_at,
+            etag,
+            tags,
+            channels: ::std::collections::BTreeMap::new(),
+        };
+        store.channel_groups.insert(name.clone(), group);
+        // Answer from what was stored, so the response can only carry what a later
+        // `GetChannelGroup` will read.
+        let group = &store.channel_groups[&name];
+
+        Ok(CreateChannelGroupOutput {
+            channel_group_name: group.name.clone(),
+            arn: group.arn.clone(),
+            egress_domain: group.egress_domain.clone(),
+            created_at: group.created_at,
+            modified_at: group.modified_at,
+            e_tag: Some(group.etag.clone()),
+            description: group.description.clone(),
+            tags: Some(group.tags.clone()),
+        })
     }
 }
