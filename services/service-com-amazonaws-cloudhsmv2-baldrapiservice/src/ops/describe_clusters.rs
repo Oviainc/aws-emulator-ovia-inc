@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeClusters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeClusters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the clusters [`crate::state`] holds — their live state and
+//! their live `Hsms` list — paged by `MaxResults`/`NextToken` and narrowed by the
+//! documented filters. The notes below are the scaffold's, kept for the next reader.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeClusters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Nothing else about `DescribeClusters` is asserted here — this file is the ONLY one
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +164,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeClusters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeClustersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeClusters"))
+        // Reporting only: `ctx` carries nothing this operation needs, since every
+        // answer comes from the store.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeClustersErrorModeled::CloudHsmInternalFailureException(
+                CloudHsmInternalFailureException {
+                    message: Some(
+                        "the cloudhsmv2 emulator is mounted on an engine that holds no state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let empty = ::std::collections::HashMap::new();
+        let filters = input.filters.as_ref().unwrap_or(&empty);
+        check_filter_fields(filters)?;
+
+        let page_size = usize::try_from(match input.max_results {
+            Some(requested) => requested.clamp(1, MAX_PAGE_SIZE),
+            None => MAX_PAGE_SIZE,
+        })
+        .unwrap_or(1);
+
+        let resume_at = match &input.next_token {
+            Some(token) => Some(crate::state::decode_next_token(token).ok_or_else(|| {
+                invalid_request(
+                    "NextToken was not produced by a DescribeClusters response".to_string(),
+                )
+            })?),
+            None => None,
+        };
+
+        let mut store = state.lock();
+        // A read reports what the clock has already made due: a cluster whose
+        // CREATE_IN_PROGRESS span has elapsed reads UNINITIALIZED here, whether or not
+        // anybody called in between.
+        store.settle(::std::time::SystemTime::now());
+
+        let matching: Vec<&crate::state::ClusterRecord> = store
+            .ordered_clusters()
+            .into_iter()
+            .filter(|record| matches_filters(record, filters))
+            .collect();
+
+        let start = match &resume_at {
+            Some(cluster_id) => matching
+                .iter()
+                .position(|record| &record.cluster_id == cluster_id)
+                .ok_or_else(|| {
+                    invalid_request(
+                        "NextToken resumes at a cluster that is no longer described".to_string(),
+                    )
+                })?,
+            None => 0,
+        };
+
+        let remaining = &matching[start..];
+        let (page, next_token) = if remaining.len() > page_size {
+            (
+                &remaining[..page_size],
+                Some(crate::state::encode_next_token(
+                    &remaining[page_size].cluster_id,
+                )),
+            )
+        } else {
+            (remaining, None)
+        };
+
+        Ok(DescribeClustersOutput {
+            clusters: Some(
+                page.iter()
+                    .map(|record| crate::state::ClusterRecord::to_shape(record))
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The most clusters one page carries: `ClustersMaxSize` models `range 1..25`, and a
+/// request that names no `MaxResults` gets that maximum.
+const MAX_PAGE_SIZE: i32 = 25;
+
+/// The filter fields the `Filters` member doc publishes: `clusterIds`, `vpcIds` and
+/// `states`.
+const DOCUMENTED_FILTERS: &[&str] = &["clusterIds", "vpcIds", "states"];
+
+/// Refuse the request with the error this operation models for one that is not valid.
+fn invalid_request(message: String) -> DescribeClustersError {
+    DescribeClustersErrorModeled::CloudHsmInvalidRequestException(
+        CloudHsmInvalidRequestException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// Refuse a filter field this operation does not document, rather than ignoring it and
+/// answering with clusters the caller asked to exclude.
+fn check_filter_fields(
+    filters: &::std::collections::HashMap<String, Vec<String>>,
+) -> Result<(), DescribeClustersError> {
+    for field in filters.keys() {
+        if !DOCUMENTED_FILTERS.contains(&field.as_str()) {
+            return Err(invalid_request(format!(
+                "{field} is not a supported filter; the supported filters are {}",
+                DOCUMENTED_FILTERS.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `record` satisfies every filter the request carries: each field narrows the
+/// answer to the clusters whose matching attribute is one of that field's values.
+fn matches_filters(
+    record: &crate::state::ClusterRecord,
+    filters: &::std::collections::HashMap<String, Vec<String>>,
+) -> bool {
+    filters.iter().all(|(field, values)| match field.as_str() {
+        "clusterIds" => values.contains(&record.cluster_id),
+        "vpcIds" => values.contains(&record.vpc_id),
+        "states" => values.contains(&record.state),
+        // `check_filter_fields` has already refused every other field.
+        _ => true,
+    })
 }
