@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEarthObservationJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEarthObservationJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one Earth Observation job out of the store, addressed by its ARN. An ARN
+//! this service holds no record of is a `ResourceNotFoundException` (404); an ARN
+//! outside the modelled pattern is refused as a `ValidationException` (400) before
+//! this handler runs.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEarthObservationJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The one write this reporting operation makes is materialising the status
+//! transitions the clock already owed — see `crate::state::EarthObservationJob::materialize`.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +173,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEarthObservationJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEarthObservationJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEarthObservationJob"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetEarthObservationJobError::from(
+                GetEarthObservationJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the sagemaker-geospatial store is unavailable".to_string(),
+                        resource_id: None,
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // Only this job's clock-owed transitions are materialised: this call
+        // addresses one record, so its work does not grow with the store.
+        if !store.materialize_job(&input.arn, now) {
+            return Err(GetEarthObservationJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "No Earth Observation job exists with the ARN {}",
+                        input.arn
+                    ),
+                    resource_id: Some(input.arn.clone()),
+                },
+            )
+            .into());
+        }
+        let job = store
+            .earth_observation_jobs
+            .get(&input.arn)
+            .expect("the record this ARN names");
+
+        Ok(GetEarthObservationJobOutput {
+            arn: job.arn.clone(),
+            name: job.name.clone(),
+            creation_time: job.creation_time,
+            duration_in_seconds: job.duration_in_seconds(now),
+            status: job.status.clone(),
+            kms_key_id: job.kms_key_id.clone(),
+            input_config: store.input_config_output(job),
+            job_config: job.job_config.clone(),
+            output_bands: job.output_bands_for_output(),
+            execution_role_arn: Some(job.execution_role_arn.clone()),
+            error_details: job.error_details.clone(),
+            export_status: job.export_status.clone(),
+            export_error_details: job.export_error_details.clone(),
+            tags: job.tags_for_output(),
+        })
     }
 }
