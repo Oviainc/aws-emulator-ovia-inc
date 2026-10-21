@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an index under an existing application: mints and stores the index record
+//! that GetIndex / ListIndices read back.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +172,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIndex"))
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateIndexErrorModeled::InternalServerException(InternalServerException {
+                message: "the Amazon Q Business store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle(now);
+
+        // An index is a child of an application: there is nothing to create one under
+        // when the parent does not exist.
+        if !store.applications.contains_key(&input.application_id) {
+            return Err(CreateIndexErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Application with ID {} not found",
+                        input.application_id
+                    ),
+                    resource_id: input.application_id.clone(),
+                    resource_type: "APPLICATION".to_string(),
+                },
+            )
+            .into());
+        }
+
+        // `clientToken` is an @idempotencyToken: a replay returns the index the first
+        // request minted instead of creating a second one. An index is a child resource,
+        // so the token is scoped to its application: the same token used under another
+        // application is a different create, and must not overwrite this one's record.
+        let token_scope = format!("{}/{}", Self::NAME, input.application_id);
+        let client_token = input.client_token.clone();
+        let replayed = store
+            .replayed_id(&token_scope, client_token.as_deref())
+            .filter(|index_id| {
+                store
+                    .applications
+                    .get(&input.application_id)
+                    .is_some_and(|application| application.indices.contains_key(index_id))
+            });
+
+        let index_id = match replayed {
+            Some(index_id) => index_id,
+            None => {
+                // The real service caps indices per application, and this operation
+                // models ServiceQuotaExceededException for exceeding it. The emulator's
+                // own ceiling is what keeps a create loop from growing this process
+                // without bound.
+                if store
+                    .applications
+                    .get(&input.application_id)
+                    .is_some_and(|application| {
+                        application.indices.len() >= crate::state::MAX_INDICES_PER_APPLICATION
+                    })
+                {
+                    return Err(CreateIndexErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: format!(
+                                "You have reached the maximum number of indices ({}) for this \
+                                 Amazon Q Business application",
+                                crate::state::MAX_INDICES_PER_APPLICATION
+                            ),
+                            resource_id: input.application_id.clone(),
+                            resource_type: "INDEX".to_string(),
+                        },
+                    )
+                    .into());
+                }
+                let index_id = crate::state::mint_resource_id();
+                let sequence = store.next_sequence();
+                let record = crate::state::StoredIndex {
+                    index_arn: crate::state::index_arn(&region, &input.application_id, &index_id),
+                    index_id: index_id.clone(),
+                    application_id: input.application_id.clone(),
+                    display_name: input.display_name,
+                    description: input.description,
+                    index_type: input.r#type,
+                    capacity_configuration: input.capacity_configuration,
+                    document_attribute_configurations: Vec::new(),
+                    tags: input.tags.unwrap_or_default(),
+                    // A new index is not ready yet: the clock owes it ACTIVE.
+                    status: crate::state::STATUS_CREATING.to_string(),
+                    active_due_at: now + crate::state::PROVISIONING_SPAN,
+                    created_at: now,
+                    updated_at: now,
+                    sequence,
+                };
+                let Some(application) = store.applications.get_mut(&input.application_id) else {
+                    return Err(CreateIndexErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: "the application vanished while creating its index"
+                                .to_string(),
+                        },
+                    )
+                    .into());
+                };
+                application.indices.insert(index_id.clone(), record);
+                store.remember_client_token(&token_scope, client_token.as_deref(), &index_id);
+                index_id
+            }
+        };
+
+        // Answer from the stored record, so the response cannot drift from the state a
+        // later GetIndex / ListIndices reads.
+        let stored = store
+            .applications
+            .get(&input.application_id)
+            .and_then(|application| application.indices.get(&index_id))
+            .ok_or_else(|| {
+                CreateIndexErrorModeled::InternalServerException(InternalServerException {
+                    message: "the created index was not stored".to_string(),
+                })
+            })?;
+        Ok(CreateIndexOutput {
+            index_id: Some(stored.index_id.clone()),
+            index_arn: Some(stored.index_arn.clone()),
+        })
     }
 }
