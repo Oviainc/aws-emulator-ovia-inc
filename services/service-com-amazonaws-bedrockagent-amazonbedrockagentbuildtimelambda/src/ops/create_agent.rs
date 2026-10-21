@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAgent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAgent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAgent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an agent and STORES it in [`crate::state`]: the response is projected
+//! from the stored record, so a following `GetAgent` / `ListAgents` reports the
+//! same agent.
 //!
 //! ## Shape of an operation
 //!
@@ -214,18 +209,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAgent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAgentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAgent"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAgentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialise_due_transitions(now);
+
+        // `clientToken` is an @idempotencyToken: a repeat of the same request
+        // returns the agent it already created rather than minting a second one.
+        if let Some(existing) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| state.client_tokens.get(token))
+            .and_then(|agent_id| state.agents.get(agent_id))
+        {
+            return Ok(CreateAgentOutput {
+                agent: existing.to_agent(),
+            });
+        }
+
+        if state.agent_names.contains_key(&input.agent_name) {
+            return Err(CreateAgentErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "an agent named {} already exists in this account",
+                    input.agent_name
+                )),
+            })
+            .into());
+        }
+
+        // The store is bounded: past its quota a create is refused rather than
+        // adding another record. `ServiceQuotaExceededException` is the modelled
+        // refusal for exactly this, and it is checked AFTER the idempotency replay
+        // above so a retry of an accepted create is still served.
+        if state.agents.len() >= crate::state::AGENT_QUOTA {
+            return Err(CreateAgentErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} agents",
+                        crate::state::AGENT_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(agent_id) = state.mint_agent_id(now) else {
+            return Err(CreateAgentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("could not mint an unused agentId".to_string()),
+                },
+            )
+            .into());
+        };
+        let agent_arn = ::engine::emulator_arn("bedrock", &region, &format!("agent/{agent_id}"));
+        // `agentResourceRoleArn` is optional on the request but required on
+        // `Agent`, so an omitted role resolves to the service role AWS creates for
+        // an agent that does not name one.
+        let agent_resource_role_arn = input.agent_resource_role_arn.clone().unwrap_or_else(|| {
+            ::engine::emulator_arn(
+                "iam",
+                "",
+                &format!("role/service-role/AmazonBedrockExecutionRoleForAgents_{agent_id}"),
+            )
+        });
+
+        let record = crate::state::AgentRecord {
+            agent_id: agent_id.clone(),
+            agent_name: input.agent_name.clone(),
+            agent_arn,
+            agent_version: crate::state::DRAFT_VERSION.to_string(),
+            agent_status: crate::state::AgentStatus::NotPrepared,
+            pending_status: None,
+            instruction: input.instruction,
+            foundation_model: input.foundation_model,
+            description: input.description,
+            idle_session_ttl_in_seconds: input
+                .idle_session_ttl_in_seconds
+                .unwrap_or(crate::state::DEFAULT_IDLE_SESSION_TTL_SECONDS),
+            agent_resource_role_arn,
+            customer_encryption_key_arn: input.customer_encryption_key_arn,
+            orchestration_type: input.orchestration_type,
+            custom_orchestration: input.custom_orchestration,
+            agent_collaboration: input.agent_collaboration,
+            prompt_override_configuration: input.prompt_override_configuration,
+            guardrail_configuration: input.guardrail_configuration,
+            memory_configuration: input.memory_configuration,
+            tags: input.tags.unwrap_or_default(),
+            client_token: input.client_token.clone(),
+            created_at: now,
+            updated_at: now,
+            prepared_at: None,
+        };
+
+        let agent = record.to_agent();
+        state.agent_names.insert(input.agent_name, agent_id.clone());
+        if let Some(token) = input.client_token {
+            state.client_tokens.insert(token, agent_id.clone());
+        }
+        state.agents.insert(agent_id, record);
+
+        Ok(CreateAgentOutput { agent })
     }
 }
