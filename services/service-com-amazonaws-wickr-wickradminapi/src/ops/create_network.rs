@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNetwork
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNetwork`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNetwork::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a network: an unused 8-digit `networkId`, a `Network` record built from the
+//! request plus the server-owned members (account id, ARN, standing, migration state,
+//! free-trial expiry), and the network's default security group, so the users
+//! operations have a group to reference.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +171,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNetwork` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNetworkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNetwork"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+
+        // `CreateNetworkRequest$networkName` documents "Must be between 1 and 20
+        // characters"; the shape carries no `@length`, so the boundary validator
+        // cannot have refused it and this operation owns the bound.
+        let name_chars = input.network_name.chars().count();
+        if name_chars == 0 || name_chars > crate::state::NETWORK_NAME_MAX_CHARS {
+            return Err(CreateNetworkErrorModeled::ValidationError(ValidationError {
+                reasons: Some(vec![ErrorDetail {
+                    field: Some("networkName".to_string()),
+                    reason: Some(format!(
+                        "networkName must be between 1 and {} characters, got {name_chars}",
+                        crate::state::NETWORK_NAME_MAX_CHARS
+                    )),
+                }]),
+                message: Some("1 validation error detected".to_string()),
+            })
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let created_at = crate::state::now_epoch_secs();
+
+        let mut store = state.lock();
+        let network_id = store.mint_network_id().ok_or_else(|| {
+            CreateNetworkErrorModeled::InternalServerError(InternalServerError {
+                message: "the 8-digit network id space is exhausted".to_string(),
+            })
+        })?;
+
+        let record = crate::state::NetworkRecord {
+            network_arn: ::engine::emulator_arn(
+                "wickr",
+                &region,
+                &format!("network/{network_id}"),
+            ),
+            network_id: network_id.clone(),
+            network_name: input.network_name,
+            access_level: input.access_level,
+            aws_account_id: ::engine::emulator_account_id().to_string(),
+            standing: crate::state::NETWORK_STANDING_GOOD,
+            // A free-trial expiry exists only for a network that asked for the
+            // trial; `enablePremiumFreeTrial` "has a default value as false".
+            free_trial_expiration: input
+                .enable_premium_free_trial
+                .unwrap_or(false)
+                .then(|| crate::state::free_trial_expiration(created_at)),
+            migration_state: crate::state::MIGRATION_STATE_NOT_STARTED,
+            encryption_key_arn: input.encryption_key_arn,
+        };
+
+        // Every network starts with its default security group, and with no users.
+        store.users.insert(network_id.clone(), Default::default());
+        store.security_groups.insert(
+            network_id.clone(),
+            [(
+                crate::state::DEFAULT_SECURITY_GROUP_ID.to_string(),
+                crate::state::SecurityGroupRecord {
+                    group_id: crate::state::DEFAULT_SECURITY_GROUP_ID.to_string(),
+                    name: crate::state::DEFAULT_SECURITY_GROUP_NAME.to_string(),
+                    is_default: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        store.networks.insert(network_id.clone(), record);
+
+        // Answer from what was stored, so the response cannot drift from the record
+        // `GetNetwork` will read back.
+        let stored = store
+            .networks
+            .get(&network_id)
+            .ok_or_else(store_unavailable)?;
+        Ok(CreateNetworkOutput {
+            network_id: Some(stored.network_id.clone()),
+            network_name: Some(stored.network_name.clone()),
+            encryption_key_arn: stored.encryption_key_arn.clone(),
+        })
     }
+}
+
+/// The modelled server error for a store this service cannot reach — the one
+/// failure that is the emulator's own fault rather than the request's.
+fn store_unavailable() -> CreateNetworkError {
+    CreateNetworkErrorModeled::InternalServerError(InternalServerError {
+        message: "the Wickr network store is unavailable".to_string(),
+    })
+    .into()
 }
