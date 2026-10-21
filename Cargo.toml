@@ -25,6 +25,31 @@ members = [
     "services/service-com-amazonaws-applicationdiscoveryservice-awsposeidonservice-v2015-11-01",
     "services/service-com-amazonaws-applicationinsights-ec2windowsbarleyservice",
     "services/service-com-amazonaws-applicationsignals-applicationsignals",
+    "services/service-com-amazonaws-appmesh-appmesh",
+    "services/service-com-amazonaws-apprunner-apprunner",
+    "services/service-com-amazonaws-appstream-photonadminproxyservice",
+    "services/service-com-amazonaws-appsync-awsdeepdishcontrolplaneservice",
+    "services/service-com-amazonaws-arcregionswitch-arcregionswitch",
+    "services/service-com-amazonaws-arczonalshift-percdataplane",
+    "services/service-com-amazonaws-artifact-artifact",
+    "services/service-com-amazonaws-athena-amazonathena",
+    "services/service-com-amazonaws-auditmanager-bedrockassessmentmanagerlambda",
+    "services/service-com-amazonaws-autoscaling-autoscaling-2011-01-01",
+    "services/service-com-amazonaws-autoscalingplans-anyscalescalingplannerfrontendservice",
+    "services/service-com-amazonaws-b2bi-b2bi",
+    "services/service-com-amazonaws-backup-cryocontrollerusermanager",
+    "services/service-com-amazonaws-backupgateway-backuponpremises-v20210101",
+    "services/service-com-amazonaws-backupsearch-cryobackupsearchservice",
+    "services/service-com-amazonaws-batch-awsbatchv20160810",
+    "services/service-com-amazonaws-bcmdashboards-awsbcmdashboardsservice",
+    "services/service-com-amazonaws-bcmdataexports-awsbillingandcostmanagementdataexports",
+    "services/service-com-amazonaws-bcmpricingcalculator-awsbcmpricingcalculator",
+    "services/service-com-amazonaws-bcmrecommendedactions-awsbillingandcostmanagementrecommendedactions",
+    "services/service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda",
+    "services/service-com-amazonaws-bedrockagentcore-amazonbedrockagentcore",
+    "services/service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol",
+    "services/service-com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice",
+    "services/service-com-amazonaws-bedrockdataautomationruntime-amazonbedrockkeystoneruntimeservice",
     "core/router",
     "core/embedded",
 ]
@@ -85,6 +110,31 @@ service-com-amazonaws-applicationcostprofiler-awsapplicationcostprofiler = { pat
 service-com-amazonaws-applicationdiscoveryservice-awsposeidonservice-v2015-11-01 = { path = "services/service-com-amazonaws-applicationdiscoveryservice-awsposeidonservice-v2015-11-01" }
 service-com-amazonaws-applicationinsights-ec2windowsbarleyservice = { path = "services/service-com-amazonaws-applicationinsights-ec2windowsbarleyservice" }
 service-com-amazonaws-applicationsignals-applicationsignals = { path = "services/service-com-amazonaws-applicationsignals-applicationsignals" }
+service-com-amazonaws-appmesh-appmesh = { path = "services/service-com-amazonaws-appmesh-appmesh" }
+service-com-amazonaws-apprunner-apprunner = { path = "services/service-com-amazonaws-apprunner-apprunner" }
+service-com-amazonaws-appstream-photonadminproxyservice = { path = "services/service-com-amazonaws-appstream-photonadminproxyservice" }
+service-com-amazonaws-appsync-awsdeepdishcontrolplaneservice = { path = "services/service-com-amazonaws-appsync-awsdeepdishcontrolplaneservice" }
+service-com-amazonaws-arcregionswitch-arcregionswitch = { path = "services/service-com-amazonaws-arcregionswitch-arcregionswitch" }
+service-com-amazonaws-arczonalshift-percdataplane = { path = "services/service-com-amazonaws-arczonalshift-percdataplane" }
+service-com-amazonaws-artifact-artifact = { path = "services/service-com-amazonaws-artifact-artifact" }
+service-com-amazonaws-athena-amazonathena = { path = "services/service-com-amazonaws-athena-amazonathena" }
+service-com-amazonaws-auditmanager-bedrockassessmentmanagerlambda = { path = "services/service-com-amazonaws-auditmanager-bedrockassessmentmanagerlambda" }
+service-com-amazonaws-autoscaling-autoscaling-2011-01-01 = { path = "services/service-com-amazonaws-autoscaling-autoscaling-2011-01-01" }
+service-com-amazonaws-autoscalingplans-anyscalescalingplannerfrontendservice = { path = "services/service-com-amazonaws-autoscalingplans-anyscalescalingplannerfrontendservice" }
+service-com-amazonaws-b2bi-b2bi = { path = "services/service-com-amazonaws-b2bi-b2bi" }
+service-com-amazonaws-backup-cryocontrollerusermanager = { path = "services/service-com-amazonaws-backup-cryocontrollerusermanager" }
+service-com-amazonaws-backupgateway-backuponpremises-v20210101 = { path = "services/service-com-amazonaws-backupgateway-backuponpremises-v20210101" }
+service-com-amazonaws-backupsearch-cryobackupsearchservice = { path = "services/service-com-amazonaws-backupsearch-cryobackupsearchservice" }
+service-com-amazonaws-batch-awsbatchv20160810 = { path = "services/service-com-amazonaws-batch-awsbatchv20160810" }
+service-com-amazonaws-bcmdashboards-awsbcmdashboardsservice = { path = "services/service-com-amazonaws-bcmdashboards-awsbcmdashboardsservice" }
+service-com-amazonaws-bcmdataexports-awsbillingandcostmanagementdataexports = { path = "services/service-com-amazonaws-bcmdataexports-awsbillingandcostmanagementdataexports" }
+service-com-amazonaws-bcmpricingcalculator-awsbcmpricingcalculator = { path = "services/service-com-amazonaws-bcmpricingcalculator-awsbcmpricingcalculator" }
+service-com-amazonaws-bcmrecommendedactions-awsbillingandcostmanagementrecommendedactions = { path = "services/service-com-amazonaws-bcmrecommendedactions-awsbillingandcostmanagementrecommendedactions" }
+service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda = { path = "services/service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda" }
+service-com-amazonaws-bedrockagentcore-amazonbedrockagentcore = { path = "services/service-com-amazonaws-bedrockagentcore-amazonbedrockagentcore" }
+service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol = { path = "services/service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol" }
+service-com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice = { path = "services/service-com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice" }
+service-com-amazonaws-bedrockdataautomationruntime-amazonbedrockkeystoneruntimeservice = { path = "services/service-com-amazonaws-bedrockdataautomationruntime-amazonbedrockkeystoneruntimeservice" }
 
 # The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
 #

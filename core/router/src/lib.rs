@@ -78,7 +78,9 @@ pub fn build_router(engine: Arc<InMemoryEngine>) -> MultiServiceRouter {
     let router = MultiServiceRouter::new();
     let router = mount_chunk_00(router, &engine);
     let router = mount_chunk_01(router, &engine);
-    mount_chunk_02(router, &engine)
+    let router = mount_chunk_02(router, &engine);
+    let router = mount_chunk_03(router, &engine);
+    mount_chunk_04(router, &engine)
 }
 
 /// Register services 00 of this workspace on `router`.
@@ -139,6 +141,55 @@ fn mount_chunk_02(
     router.register_service(service_com_amazonaws_applicationdiscoveryservice_awsposeidonservice_v2015_11_01::EmulatedService::new(engine.clone()));
     router.register_service(service_com_amazonaws_applicationinsights_ec2windowsbarleyservice::EmulatedService::new(engine.clone()));
     router.register_service(service_com_amazonaws_applicationsignals_applicationsignals::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_appmesh_appmesh::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_apprunner_apprunner::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_appstream_photonadminproxyservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_appsync_awsdeepdishcontrolplaneservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_arcregionswitch_arcregionswitch::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_arczonalshift_percdataplane::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_artifact_artifact::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_athena_amazonathena::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 03 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_03(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_auditmanager_bedrockassessmentmanagerlambda::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_autoscaling_autoscaling_2011_01_01::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_b2bi_b2bi::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_backup_cryocontrollerusermanager::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_backupgateway_backuponpremises_v20210101::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_backupsearch_cryobackupsearchservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_batch_awsbatchv20160810::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_bcmdashboards_awsbcmdashboardsservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_bcmpricingcalculator_awsbcmpricingcalculator::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 04 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_04(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_bcmrecommendedactions_awsbillingandcostmanagementrecommendedactions::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_bedrockagentcore_amazonbedrockagentcore::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_bedrockagentcorecontrol_amazonbedrockagentcorecontrol::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_bedrockagentruntime_amazonbedrockagentruntimeservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_bedrockdataautomationruntime_amazonbedrockkeystoneruntimeservice::EmulatedService::new(engine.clone()));
     router
 }
 
