@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an application: a new 26-character id, the `/applications/<id>` ARN for the
+//! request's region, `creationTime == lastUpdateTime`, and the record persisted in
+//! [`crate::state`] so every later read computes from it. A repeated `clientToken`
+//! replays the stored application; the same token with different parameters, or a name
+//! another application already holds, is a `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +151,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplication"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateApplicationError::Modeled(CreateApplicationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the AppRegistry store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // The parameters this `clientToken` is being used with, so a retry can be told
+        // apart from a different request that reuses the token.
+        let tags: std::collections::BTreeMap<String, String> =
+            input.tags.clone().unwrap_or_default().into_iter().collect();
+        let mut fields = vec![
+            "CreateApplication",
+            input.name.as_str(),
+            if input.description.is_some() { "1" } else { "0" },
+            input.description.as_deref().unwrap_or(""),
+        ];
+        for (key, value) in &tags {
+            fields.push(key);
+            fields.push(value);
+        }
+        let fingerprint = crate::state::fingerprint(&fields);
+
+        if let Some(prior) = store.idempotency.get(&input.client_token).cloned() {
+            if prior.resource_kind != crate::state::ResourceKind::Application
+                || prior.request_fingerprint != fingerprint
+            {
+                return Err(CreateApplicationErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "the client token {} was already used for a request with different parameters",
+                        input.client_token
+                    )),
+                })
+                .into());
+            }
+            if let Some(record) = store.applications.get(&prior.resource_id) {
+                return Ok(CreateApplicationOutput {
+                    application: Some(record.application()),
+                });
+            }
+        }
+
+        if store.application_names.contains_key(&input.name) {
+            return Err(CreateApplicationErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "an application named {} already exists in this region",
+                    input.name
+                )),
+            })
+            .into());
+        }
+
+        // The store is bounded: past the cap this is the modelled refusal, not another
+        // record. See `crate::state::APPLICATION_QUOTA`.
+        if store.application_quota_reached() {
+            return Err(CreateApplicationErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the maximum number of applications per account ({}) has been reached",
+                        crate::state::APPLICATION_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_application_id();
+        let arn =
+            ::engine::emulator_arn("servicecatalog", &region, &format!("/applications/{id}"));
+        // One instant for both timestamps: a freshly created application has never been
+        // updated, so its `lastUpdateTime` IS its `creationTime`.
+        let now = std::time::SystemTime::now();
+        let record = crate::state::ApplicationRecord {
+            id: id.clone(),
+            arn: arn.clone(),
+            name: input.name.clone(),
+            description: input.description.clone(),
+            creation_time: now,
+            last_update_time: now,
+            tags,
+            attribute_group_ids: std::collections::BTreeSet::new(),
+            resources: std::collections::BTreeSet::new(),
+            // The key-value pair AppRegistry identifies this application's resources by.
+            application_tag: std::collections::BTreeMap::from([(
+                "awsApplication".to_string(),
+                arn.clone(),
+            )]),
+        };
+
+        store
+            .application_names
+            .insert(input.name.clone(), id.clone());
+        store.remember_token(
+            input.client_token.clone(),
+            crate::state::ResourceKind::Application,
+            id.clone(),
+            fingerprint,
+        );
+        store.applications.insert(id.clone(), record);
+
+        // Audit record for a state-changing operation: who asked, what changed, how it
+        // ended. Only wire metadata and server-minted identifiers — never the request's
+        // own description, tags or client token.
+        tracing::info!(
+            audit = true,
+            operation = "CreateApplication",
+            outcome = "created",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            resource_arn = %arn,
+            "application created"
+        );
+
+        // Read the response back out of the store, so the caller sees what was persisted
+        // rather than a second rendering of the request.
+        let application = store
+            .applications
+            .get(&id)
+            .map(crate::state::ApplicationRecord::application);
+        Ok(CreateApplicationOutput { application })
     }
 }

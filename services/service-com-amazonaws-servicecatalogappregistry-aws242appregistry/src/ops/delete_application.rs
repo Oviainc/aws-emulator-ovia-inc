@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one application from the store — its record, its name reservation and the
+//! idempotency tokens that minted it — and answers with the `ApplicationSummary` of the
+//! record as it was immediately before removal. An application that still holds
+//! associations is refused, as the model's own documentation requires. A second delete,
+//! like any later read, is a `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +138,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteApplication"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteApplicationError::Modeled(
+                DeleteApplicationErrorModeled::InternalServerException(InternalServerException {
+                    message: Some("the AppRegistry store is unavailable".to_string()),
+                }),
+            )
+        })?;
+        let mut store = state.lock();
+
+        let id = store
+            .resolve_application_id(&input.application)
+            .filter(|id| store.applications.contains_key(id))
+            .ok_or_else(|| {
+                DeleteApplicationError::Modeled(
+                    DeleteApplicationErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "no application named, identified by or addressed as {} exists",
+                                input.application
+                            )),
+                        },
+                    ),
+                )
+            })?;
+
+        // The model states the precondition: "All associated attribute groups and
+        // resources must be disassociated from it before deleting an application"
+        // (smithy_query query="doc" shape="DeleteApplication"). So a still-linked
+        // application is refused rather than deleted with a cascade, and
+        // `ValidationException` is the client-input error this operation models.
+        let still_linked = store.applications.get(&id).map_or((0, 0), |application| {
+            (
+                application.attribute_group_ids.len(),
+                application.resources.len(),
+            )
+        });
+        if still_linked != (0, 0) {
+            return Err(DeleteApplicationErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "the application still has {} associated attribute group(s) and {} \
+                     associated resource(s); all of them must be disassociated before it \
+                     can be deleted",
+                    still_linked.0, still_linked.1
+                )),
+            })
+            .into());
+        }
+
+        let record = store
+            .applications
+            .remove(&id)
+            .expect("the id was just resolved against this map");
+        store.application_names.remove(&record.name);
+        // The tokens that created it no longer have a resource to replay, so a retry with
+        // one of them creates a new application rather than resurrecting this one.
+        store.idempotency.retain(|_, prior| {
+            prior.resource_kind != crate::state::ResourceKind::Application
+                || prior.resource_id != id
+        });
+
+        // Audit record for the destructive operation: who asked, what was removed, how it
+        // ended — wire metadata and the stored ARN only.
+        tracing::info!(
+            audit = true,
+            operation = "DeleteApplication",
+            outcome = "deleted",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            resource_arn = %record.arn,
+            "application deleted"
+        );
+
+        Ok(DeleteApplicationOutput {
+            application: Some(record.summary()),
+        })
     }
 }

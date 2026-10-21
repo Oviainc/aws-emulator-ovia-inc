@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAttributeGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAttributeGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAttributeGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an attribute group: a new id, the `/attribute-groups/<id>` ARN for the request's
+//! region, `creationTime == lastUpdateTime`, and `attributes` stored verbatim so
+//! `GetAttributeGroup` hands back the same string. A repeated `clientToken` replays the
+//! stored group; the same token with different parameters, or a name another group already
+//! holds, is a `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +155,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAttributeGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAttributeGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAttributeGroup"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAttributeGroupError::Modeled(
+                CreateAttributeGroupErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the AppRegistry store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        let tags: std::collections::BTreeMap<String, String> =
+            input.tags.clone().unwrap_or_default().into_iter().collect();
+        let mut fields = vec![
+            "CreateAttributeGroup",
+            input.name.as_str(),
+            if input.description.is_some() { "1" } else { "0" },
+            input.description.as_deref().unwrap_or(""),
+            input.attributes.as_str(),
+        ];
+        for (key, value) in &tags {
+            fields.push(key);
+            fields.push(value);
+        }
+        let fingerprint = crate::state::fingerprint(&fields);
+
+        if let Some(prior) = store.idempotency.get(&input.client_token).cloned() {
+            if prior.resource_kind != crate::state::ResourceKind::AttributeGroup
+                || prior.request_fingerprint != fingerprint
+            {
+                return Err(CreateAttributeGroupErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "the client token {} was already used for a request with different parameters",
+                            input.client_token
+                        )),
+                    },
+                )
+                .into());
+            }
+            if let Some(record) = store.attribute_groups.get(&prior.resource_id) {
+                return Ok(CreateAttributeGroupOutput {
+                    attribute_group: Some(record.attribute_group()),
+                });
+            }
+        }
+
+        if store.attribute_group_names.contains_key(&input.name) {
+            return Err(CreateAttributeGroupErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "an attribute group named {} already exists in this region",
+                    input.name
+                )),
+            })
+            .into());
+        }
+
+        // The store is bounded: past the cap this is the modelled refusal, not another
+        // record. See `crate::state::ATTRIBUTE_GROUP_QUOTA`.
+        if store.attribute_group_quota_reached() {
+            return Err(
+                CreateAttributeGroupErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "the maximum number of attribute groups per account ({}) has been reached",
+                            crate::state::ATTRIBUTE_GROUP_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.mint_attribute_group_id();
+        let arn =
+            ::engine::emulator_arn("servicecatalog", &region, &format!("/attribute-groups/{id}"));
+        // One instant for both timestamps: the model states `lastUpdateTime` "is the same
+        // as the creationTime for a newly created attribute group".
+        let now = std::time::SystemTime::now();
+        let record = crate::state::AttributeGroupRecord {
+            id: id.clone(),
+            arn: arn.clone(),
+            name: input.name.clone(),
+            description: input.description.clone(),
+            // Verbatim: `attributes` is the caller's own JSON document and a read of it
+            // must be byte-for-byte what was written.
+            attributes: input.attributes.clone(),
+            creation_time: now,
+            last_update_time: now,
+            tags,
+            // `createdBy` names the AWS service principal that created the group on the
+            // caller's behalf; a group the caller created directly carries none.
+            created_by: None,
+        };
+
+        store
+            .attribute_group_names
+            .insert(input.name.clone(), id.clone());
+        store.remember_token(
+            input.client_token.clone(),
+            crate::state::ResourceKind::AttributeGroup,
+            id.clone(),
+            fingerprint,
+        );
+        store.attribute_groups.insert(id.clone(), record);
+
+        // Audit record for a state-changing operation: who asked, what changed, how it
+        // ended. Only wire metadata and server-minted identifiers — never the caller's
+        // own attributes document, tags or client token.
+        tracing::info!(
+            audit = true,
+            operation = "CreateAttributeGroup",
+            outcome = "created",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            resource_arn = %arn,
+            "attribute group created"
+        );
+
+        let attribute_group = store
+            .attribute_groups
+            .get(&id)
+            .map(crate::state::AttributeGroupRecord::attribute_group);
+        Ok(CreateAttributeGroupOutput { attribute_group })
     }
 }
