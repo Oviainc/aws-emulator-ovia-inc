@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFeed
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFeed`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFeed::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: overwrites the stored feed's name, outputs and access role, so a
+//! later GetFeed/ListFeeds reports the new values. PUT overwrite semantics: the
+//! payload replaces the existing one, so an omitted `accessRoleArn` clears the role.
+//! The reconfiguration is accepted into the transient `UPDATING` status, which the
+//! clock moves back to `AVAILABLE`.
 //!
 //! ## Shape of an operation
 //!
@@ -187,17 +183,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFeed` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFeedErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFeed"))
+        // request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateFeedErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the com.amazonaws.elementalinference state store is unavailable"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let now = std::time::Instant::now();
+
+        let mut state = state.lock();
+        state.settle_due_transitions(now);
+
+        let Some(feed) = state.feeds.get_mut(&input.id) else {
+            return Err(UpdateFeedErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("No feed with id {} exists.", input.id),
+                },
+            )
+            .into());
+        };
+
+        // A feed whose deletion has been accepted is on its way out; updating it
+        // would cancel a deletion the clock already owes, so it is refused with the
+        // modelled ConflictException (HTTP 409).
+        if feed.status == crate::state::FeedStatus::Deleting {
+            return Err(UpdateFeedErrorModeled::ConflictException(ConflictException {
+                message: format!("Feed {} is being deleted and cannot be updated.", input.id),
+            })
+            .into());
+        }
+
+        // PUT: the payload completely overwrites the existing one, so the new list
+        // replaces the stored outputs and an omitted access role clears it.
+        feed.name = input.name;
+        feed.outputs = input
+            .outputs
+            .into_iter()
+            .map(|output| crate::state::Output {
+                name: output.name,
+                output_config: output.output_config,
+                status: output.status,
+                description: output.description,
+                // `fromAssociation` is carried by the caller (it is an UpdateOutput
+                // member); an output the caller does not mark came from this call,
+                // not from AssociateFeed.
+                from_association: output.from_association.unwrap_or(false),
+            })
+            .collect();
+        feed.access_role_arn = input.access_role_arn;
+        // The feed is being reconfigured: UPDATING is the modelled transient status,
+        // and the clock moves it back to AVAILABLE.
+        let due = feed.enter_transient(crate::state::FeedStatus::Updating, now);
+
+        let output = UpdateFeedOutput {
+            arn: feed.arn.clone(),
+            name: feed.name.clone(),
+            id: feed.id.clone(),
+            data_endpoints: feed.data_endpoints.clone(),
+            outputs: feed.get_outputs(),
+            access_role_arn: feed.access_role_arn.clone(),
+            status: feed.status.as_wire().to_string(),
+            association: feed.association.clone(),
+            tags: feed.tag_map(),
+        };
+        state.note_due(due);
+        Ok(output)
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFeeds
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFeeds`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFeeds::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: enumerates the persisted feeds as `FeedSummary` items in stable id
+//! order, one page at a time. Reporting only: it materialises the feed transitions
+//! the clock already owes (they were due at this instant whether or not anybody
+//! called) and writes nothing else.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +125,40 @@ impl From<ListFeedsErrorModeled> for ListFeedsError {
     }
 }
 
+/// The page size this operation uses when a request omits `maxResults`: "If MaxResults
+/// is not included in the request, the service defaults to pagination with a maximum of
+/// 10 results per page" (`ListFeedsRequest$maxResults`, quoted in this file's header).
+const DEFAULT_MAX_RESULTS: usize = 10;
+
+/// Encode a `nextToken` for the last feed id on a page.
+///
+/// The token is opaque to the caller: it is the hex encoding of the id, so a client
+/// cannot read a feed id out of it and the service can resume from the next id in
+/// order. Hex comes from the `hex` crate rather than being hand-rolled.
+fn encode_next_token(last_id: &str) -> String {
+    hex::encode(last_id.as_bytes())
+}
+
+/// Decode a `nextToken` back into the feed id a page resumes after.
+///
+/// `None` for a token that is not the hex encoding of a feed id, which the handler
+/// refuses as a `ValidationException`. A token that does decode names a position in
+/// the id order rather than a feed that must still exist, so paging survives a feed
+/// deleted between two pages: the next page simply resumes at the next id.
+fn decode_next_token(token: &str) -> Option<String> {
+    String::from_utf8(hex::decode(token).ok()?).ok()
+}
+
+/// The most feeds one page may carry, whatever the request asks for.
+///
+/// `smithy_query(query="operation",operation="ListFeeds")` gives `maxResults` the
+/// range `{min: 1, max: 100}`, so this is the model's own ceiling (the prose quoted
+/// in this file's header says 1000, but the `@range` trait is what the service
+/// enforces). Clamping here rather than trusting the boundary keeps one small
+/// request from serialising a response proportional to the whole store, and
+/// [`crate::state::MAX_FEEDS`] bounds that store in turn.
+const MAX_PAGE_SIZE: usize = 100;
+
 /// The `ListFeeds` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -167,17 +196,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFeeds` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFeedsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFeeds"))
+        // request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListFeedsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the com.amazonaws.elementalinference state store is unavailable"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A token that is not a pagination token at all cannot name a page, so it is
+        // refused rather than silently treated as the first page.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match decode_next_token(token) {
+                Some(id) => Some(id),
+                None => {
+                    return Err(ListFeedsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "nextToken is not a valid pagination token.".to_string(),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        // `maxResults` is modelled with range 1..100, so the boundary has already
+        // refused anything outside it; the clamp is the server-side bound that does
+        // not depend on that, so a page can never exceed MAX_PAGE_SIZE items.
+        let page_size = input
+            .max_results
+            .map_or(DEFAULT_MAX_RESULTS, |max| max.max(1) as usize)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        let mut state = state.lock();
+        state.settle_due_transitions(std::time::Instant::now());
+
+        // BTreeMap order, so paging is stable and resuming after an id that has
+        // since been deleted still continues at the next feed.
+        let mut remaining = state.feeds.iter().filter(|(id, _)| match &resume_after {
+            Some(after) => id.as_str() > after.as_str(),
+            None => true,
+        });
+        let feeds: Vec<FeedSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(_, feed)| feed.summary())
+            .collect();
+        // A token only when a further feed is actually there to be fetched.
+        let next_token = match (remaining.next(), feeds.last()) {
+            (Some(_), Some(last)) => Some(encode_next_token(&last.id)),
+            _ => None,
+        };
+
+        Ok(ListFeedsOutput { feeds, next_token })
     }
 }

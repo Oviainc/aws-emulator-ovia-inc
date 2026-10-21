@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFeed
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFeed`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a feed, persists it in `crate::state` and builds the response
+//! from the stored record. The feed is accepted asynchronously (HTTP 202), so it is
+//! stored in the transient `CREATING` status with the instant its move to `AVAILABLE`
+//! falls due; the feed readers materialise that move.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFeed::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The scaffold's own notes on the operation shape and on reaching state are kept
+//! below, minus the line that recorded this operation as a stub.
 //!
 //! ## Shape of an operation
 //!
@@ -192,17 +190,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFeed` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFeedErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFeed"))
+        // request metadata.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFeedErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the com.amazonaws.elementalinference state store is unavailable"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = std::time::Instant::now();
+
+        let mut state = state.lock();
+        state.settle_due_transitions(now);
+
+        // The feed store is BOUNDED: past the quota the service refuses the create
+        // rather than growing its state by another record, which is also what the
+        // real service answers once an account's feed quota is exhausted.
+        if state.feeds.len() >= crate::state::MAX_FEEDS {
+            return Err(CreateFeedErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "This account already holds the maximum of {} feeds. \
+                         Delete unused feeds or request a quota increase.",
+                        crate::state::MAX_FEEDS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let id = state.mint_feed_id();
+        // 202: the feed is accepted in CREATING and reaches AVAILABLE on the clock.
+        let due = now + crate::state::TRANSITION_SPAN;
+        let feed = crate::state::Feed {
+            arn: crate::state::feed_arn(&region, &id),
+            data_endpoints: crate::state::feed_data_endpoints(&region, &id),
+            name: input.name,
+            id,
+            // Outputs supplied to CreateFeed did not come from AssociateFeed, so
+            // `fromAssociation` is false for every one of them.
+            outputs: input
+                .outputs
+                .into_iter()
+                .map(|output| crate::state::Output {
+                    name: output.name,
+                    output_config: output.output_config,
+                    status: output.status,
+                    description: output.description,
+                    from_association: false,
+                })
+                .collect(),
+            access_role_arn: input.access_role_arn,
+            status: crate::state::FeedStatus::Creating,
+            // "When you create the feed, this property is empty": a resource is
+            // associated later, with AssociateFeed or UpdateFeed.
+            association: None,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            transition_due_at: Some(due),
+        };
+
+        // Built from the record that is about to be stored, so GetFeed answers with
+        // exactly these values.
+        let output = CreateFeedOutput {
+            arn: feed.arn.clone(),
+            name: feed.name.clone(),
+            id: feed.id.clone(),
+            data_endpoints: feed.data_endpoints.clone(),
+            outputs: feed.get_outputs(),
+            access_role_arn: feed.access_role_arn.clone(),
+            status: feed.status.as_wire().to_string(),
+            association: feed.association.clone(),
+            tags: feed.tag_map(),
+        };
+        state.feeds.insert(feed.id.clone(), feed);
+        state.note_due(due);
+        Ok(output)
     }
 }

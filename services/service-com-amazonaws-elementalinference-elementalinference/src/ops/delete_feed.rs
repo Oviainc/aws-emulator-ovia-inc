@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFeed
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFeed`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFeed::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: moves the stored feed into the transient `DELETING` status (HTTP 202
+//! accepts the deletion rather than completing it) and records when the deletion
+//! falls due; once it does, the feed is gone from state, so GetFeed answers
+//! `ResourceNotFoundException` and ListFeeds no longer lists it. An id no live feed
+//! has is a `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -160,17 +156,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFeed` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFeedErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFeed"))
+        // request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteFeedErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the com.amazonaws.elementalinference state store is unavailable"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let now = std::time::Instant::now();
+
+        let mut state = state.lock();
+        state.settle_due_transitions(now);
+
+        let Some(feed) = state.feeds.get_mut(&input.id) else {
+            return Err(DeleteFeedErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("No feed with id {} exists.", input.id),
+                },
+            )
+            .into());
+        };
+
+        // 202: the deletion is accepted, not completed. The feed reports DELETING
+        // until the clock makes the removal due, after which it is gone. Repeating
+        // the call inside that window is idempotent: the removal stays due at the
+        // instant the first call set, so polling DeleteFeed cannot postpone it.
+        let due = match (feed.status, feed.transition_due_at) {
+            (crate::state::FeedStatus::Deleting, Some(due)) => due,
+            _ => feed.enter_transient(crate::state::FeedStatus::Deleting, now),
+        };
+
+        let output = DeleteFeedOutput {
+            arn: feed.arn.clone(),
+            id: feed.id.clone(),
+            status: feed.status.as_wire().to_string(),
+        };
+        state.note_due(due);
+        Ok(output)
     }
 }
