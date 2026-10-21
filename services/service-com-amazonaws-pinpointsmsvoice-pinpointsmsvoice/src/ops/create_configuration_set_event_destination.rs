@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfigurationSetEventDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfigurationSetEventDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfigurationSetEventDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +65,16 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The most event destinations this emulator will hold inside one configuration set.
+///
+/// This is the EMULATOR's own capacity bound, not a published AWS quota. Together with
+/// `create_configuration_set`'s cap on the number of sets it bounds the
+/// sets x destinations product one caller can reach, so a loop over
+/// `CreateConfigurationSetEventDestination` cannot grow the emulator's heap without
+/// limit. It is answered with `LimitExceededException` (HTTP 412), the error this
+/// operation models for "there are too many instances of the specified resource type".
+const MAX_EVENT_DESTINATIONS_PER_CONFIGURATION_SET: usize = 100;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +149,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfigurationSetEventDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConfigurationSetEventDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfigurationSetEventDestination"))
+        let _ = ctx;
+
+        // The destination is filed under `EventDestinationName`, so a blank or absent
+        // one names nothing to create. The name is stored EXACTLY as sent — trimming is
+        // only how blankness is detected, because `Update`/`Delete` resolve the
+        // destination by the raw `{EventDestinationName}` path label.
+        let destination_name = input
+            .event_destination_name
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| {
+                CreateConfigurationSetEventDestinationErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(
+                            "EventDestinationName must be a non-empty event destination name"
+                                .into(),
+                        ),
+                    },
+                )
+            })?;
+
+        // Every member of `EventDestinationDefinition` is optional, so an absent
+        // definition defines a destination with no members rather than a refusal. Its
+        // `MatchingEventTypes` entries were already checked against the model's
+        // `EventType` enum by the boundary validator, before this handler ran.
+        let definition = input.event_destination.unwrap_or_default();
+        let matching_event_types = definition.matching_event_types;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateConfigurationSetEventDestinationErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the service state store is unavailable".into()),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // An event destination lives inside a configuration set, so the set must exist
+        // before one can be attached to it.
+        let set = store
+            .configuration_sets
+            .get_mut(&input.configuration_set_name)
+            .ok_or_else(|| {
+                CreateConfigurationSetEventDestinationErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(format!(
+                            "configuration set {} does not exist",
+                            input.configuration_set_name
+                        )),
+                    },
+                )
+            })?;
+
+        // The name identifies the destination within its set, so a second create under
+        // the same name is a conflict; changing one is `Update...`, not `Create...`.
+        if set.event_destinations.contains_key(&destination_name) {
+            return Err(
+                CreateConfigurationSetEventDestinationErrorModeled::AlreadyExistsException(
+                    AlreadyExistsException {
+                        message: Some(format!(
+                            "event destination {destination_name} already exists in configuration set {}",
+                            input.configuration_set_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // CAP (`MAX_EVENT_DESTINATIONS_PER_CONFIGURATION_SET`): refuse past the
+        // emulator's capacity bound BEFORE inserting, so a caller cannot grow this
+        // nested map without limit.
+        if set.event_destinations.len() >= MAX_EVENT_DESTINATIONS_PER_CONFIGURATION_SET {
+            return Err(
+                CreateConfigurationSetEventDestinationErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "configuration set {} already holds the maximum of {MAX_EVENT_DESTINATIONS_PER_CONFIGURATION_SET} event destinations",
+                            input.configuration_set_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Store what the caller sent, member for member: an omitted member stays
+        // omitted so the reader reports the destination as it was defined.
+        set.event_destinations.insert(
+            destination_name.clone(),
+            crate::state::EventDestinationRecord {
+                name: destination_name,
+                enabled: definition.enabled,
+                matching_event_types,
+                cloud_watch_logs: definition.cloud_watch_logs_destination.map(|dest| {
+                    crate::state::CloudWatchLogsDest {
+                        iam_role_arn: dest.iam_role_arn,
+                        log_group_arn: dest.log_group_arn,
+                    }
+                }),
+                kinesis_firehose: definition.kinesis_firehose_destination.map(|dest| {
+                    crate::state::KinesisFirehoseDest {
+                        delivery_stream_arn: dest.delivery_stream_arn,
+                        iam_role_arn: dest.iam_role_arn,
+                    }
+                }),
+                sns: definition.sns_destination.map(|dest| crate::state::SnsDest {
+                    topic_arn: dest.topic_arn,
+                }),
+            },
+        );
+
+        Ok(CreateConfigurationSetEventDestinationOutput {})
     }
 }

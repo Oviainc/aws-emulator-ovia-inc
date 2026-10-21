@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: moves a stored READY application through STARTING to RUNNING and records
+//! the operation. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +143,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartApplication"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartApplicationErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "this service is not mounted on a stateful engine, so no \
+                         application can be started"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.application_name.clone();
+        let now = crate::state::now_timestamp();
+
+        let mut store = state.lock();
+        store.settle_named(&name);
+
+        let Some(application) = store.applications.get(&name) else {
+            return Err(StartApplicationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Application {name} not found")),
+                },
+            )
+            .into());
+        };
+
+        // "After creating an application, you must exclusively call this operation to
+        // start your application" — so an application is startable only from the status a
+        // create (or a completed stop) leaves it in. Anything else, RUNNING and the
+        // transient STARTING included, is already in use for another lifecycle action.
+        if application.status != crate::state::STATUS_READY {
+            return Err(StartApplicationErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "Application {name} cannot be started while it is in the {} state",
+                        application.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Carry the RunConfiguration the caller asked to run with into the stored
+        // configuration description, so DescribeApplication reports what this run uses.
+        if let Some(run) = input.run_configuration.as_ref() {
+            let description = RunConfigurationDescription {
+                application_restore_configuration_description: run
+                    .application_restore_configuration
+                    .clone(),
+                flink_run_configuration_description: run.flink_run_configuration.clone(),
+            };
+            if let Some(application) = store.applications.get_mut(&name) {
+                application
+                    .configuration
+                    .get_or_insert_with(Default::default)
+                    .run_configuration_description = Some(description);
+            }
+        }
+
+        let operation_id = store.record_operation(&name, Self::NAME, now);
+        // Starting is asynchronous: the application is STARTING when this call answers
+        // and RUNNING once the clock makes the transition due.
+        store.begin_transition(
+            &name,
+            crate::state::STATUS_STARTING,
+            crate::state::STATUS_RUNNING,
+            operation_id.clone(),
+            now,
+        );
+
+        Ok(StartApplicationOutput {
+            operation_id: Some(operation_id),
+        })
     }
 }
