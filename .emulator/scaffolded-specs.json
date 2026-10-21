@@ -1599,6 +1599,106 @@
     {
       "shape_id": "com.amazonaws.supplychain#GalaxyPublicAPIGateway",
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/supplychain/service/2024-01-01/supplychain-2024-01-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.support#AWSSupport_20130415",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/support/service/2013-04-15/support-2013-04-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.supportapp#SupportApp",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/support-app/service/2021-08-20/support-app-2021-08-20.json"
+    },
+    {
+      "shape_id": "com.amazonaws.supportauthz#SupportAuthZ",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/supportauthz/service/2026-06-30/supportauthz-2026-06-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.sustainability#AwsSustainabilityApiService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/sustainability/service/2018-05-10/sustainability-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.swf#SimpleWorkflowService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/swf/service/2012-01-25/swf-2012-01-25.json"
+    },
+    {
+      "shape_id": "com.amazonaws.synthetics#Synthetics",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/synthetics/service/2017-10-11/synthetics-2017-10-11.json"
+    },
+    {
+      "shape_id": "com.amazonaws.taxsettings#TaxSettings",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/taxsettings/service/2018-05-10/taxsettings-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.textract#Textract",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/textract/service/2018-06-27/textract-2018-06-27.json"
+    },
+    {
+      "shape_id": "com.amazonaws.timestreaminfluxdb#AmazonTimestreamInfluxDB",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/timestream-influxdb/service/2023-01-27/timestream-influxdb-2023-01-27.json"
+    },
+    {
+      "shape_id": "com.amazonaws.timestreamquery#Timestream_20181101",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/timestream-query/service/2018-11-01/timestream-query-2018-11-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.timestreamwrite#Timestream_20181101",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/timestream-write/service/2018-11-01/timestream-write-2018-11-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.transcribe#Transcribe",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/transcribe/service/2017-10-26/transcribe-2017-10-26.json"
+    },
+    {
+      "shape_id": "com.amazonaws.transcribestreaming#Transcribe",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/transcribe-streaming/service/2017-10-26/transcribe-streaming-2017-10-26.json"
+    },
+    {
+      "shape_id": "com.amazonaws.transfer#TransferService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/transfer/service/2018-11-05/transfer-2018-11-05.json"
+    },
+    {
+      "shape_id": "com.amazonaws.translate#AWSShineFrontendService_20170701",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/translate/service/2017-07-01/translate-2017-07-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.trustedadvisor#TrustedAdvisor",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/trustedadvisor/service/2022-09-15/trustedadvisor-2022-09-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.uxc#AWSAccountUXSetting",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/uxc/service/2024-07-01/uxc-2024-07-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.verifiedpermissions#VerifiedPermissions",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/verifiedpermissions/service/2021-12-01/verifiedpermissions-2021-12-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.voiceid#VoiceID",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/voice-id/service/2021-09-27/voice-id-2021-09-27.json"
+    },
+    {
+      "shape_id": "com.amazonaws.vpclattice#MercuryControlPlane",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/vpc-lattice/service/2022-11-30/vpc-lattice-2022-11-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.waf#AWSWAF_20150824",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/waf/service/2015-08-24/waf-2015-08-24.json"
+    },
+    {
+      "shape_id": "com.amazonaws.wafregional#AWSWAF_Regional_20161128",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/waf-regional/service/2016-11-28/waf-regional-2016-11-28.json"
+    },
+    {
+      "shape_id": "com.amazonaws.wafv2#AWSWAF_20190729",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/wafv2/service/2019-07-29/wafv2-2019-07-29.json"
+    },
+    {
+      "shape_id": "com.amazonaws.wellarchitected#WellArchitectedApiServiceLambda",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/wellarchitected/service/2020-03-31/wellarchitected-2020-03-31.json"
+    },
+    {
+      "shape_id": "com.amazonaws.wickr#WickrAdminApi",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/wickr/service/2024-02-01/wickr-2024-02-01.json"
     }
   ]
 }
