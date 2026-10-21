@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a domain and persists it, so every later read of that domain answers from
+//! the record this operation wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -211,18 +204,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDomain"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // Both timestamps are generated ONCE, here, from one reading of the clock, so
+        // `CreatedAt` and `LastUpdatedAt` of a freshly created domain are equal and
+        // every later read reports exactly these values.
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        if store.domains.contains_key(&input.domain_name) {
+            // The domain name is the domain's identity, so a second create of the same
+            // name is not a create. `BadRequestException` ("The input you provided is
+            // invalid") is the only client error this operation models for it.
+            return Err(CreateDomainErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "Domain {} already exists; use UpdateDomain to change it",
+                    input.domain_name
+                )),
+            })
+            .into());
+        }
+        // One domain per request, and at most this many in the store: however many
+        // requests arrive, the store cannot grow past the service's domain quota.
+        if store.domains.len() >= crate::state::MAX_DOMAINS {
+            return Err(CreateDomainErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "The maximum number of domains for this account has been reached: {}",
+                    crate::state::MAX_DOMAINS
+                )),
+            })
+            .into());
+        }
+
+        let mut domain =
+            crate::state::Domain::new(input.domain_name, input.default_expiration_days, now);
+        domain.default_encryption_key = input.default_encryption_key;
+        domain.dead_letter_queue_url = input.dead_letter_queue_url;
+        domain.matching = input.matching.map(|matching| MatchingResponse {
+            enabled: Some(matching.enabled),
+            job_schedule: matching.job_schedule,
+            auto_merging: matching.auto_merging,
+            exporting_config: matching.exporting_config,
+        });
+        domain.rule_based_matching =
+            input.rule_based_matching.map(|rule_based| RuleBasedMatchingResponse {
+                enabled: Some(rule_based.enabled),
+                matching_rules: rule_based.matching_rules,
+                // Resolved from the clock on every read, never stored.
+                status: None,
+                max_allowed_rule_level_for_merging: rule_based.max_allowed_rule_level_for_merging,
+                max_allowed_rule_level_for_matching: rule_based
+                    .max_allowed_rule_level_for_matching,
+                attribute_types_selector: rule_based.attribute_types_selector,
+                conflict_resolution: rule_based.conflict_resolution,
+                exporting_config: rule_based.exporting_config,
+            });
+        domain.data_store_enabled = input.data_store.and_then(|data_store| data_store.enabled);
+        domain.tags = input.tags;
+
+        // Answer from the stored record, so the response cannot differ from what a
+        // later `GetDomain` reads.
+        let output = CreateDomainOutput {
+            domain_name: domain.name.clone(),
+            default_expiration_days: domain.default_expiration_days,
+            default_encryption_key: domain.default_encryption_key.clone(),
+            dead_letter_queue_url: domain.dead_letter_queue_url.clone(),
+            matching: domain.matching_response(),
+            rule_based_matching: domain.rule_based_matching_response(now),
+            data_store: domain.data_store_response(now),
+            created_at: crate::state::to_date_time(domain.created_at),
+            last_updated_at: crate::state::to_date_time(domain.last_updated_at),
+            tags: domain.tags.clone(),
+        };
+        store.domains.insert(domain.name.clone(), domain);
+        Ok(output)
     }
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> CreateDomainError {
+    CreateDomainErrorModeled::InternalServerException(crate::state::store_unavailable()).into()
 }

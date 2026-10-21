@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchProfiles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchProfiles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchProfiles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Looks profiles up through the domain's search-key index. A pure read: the search
+//! keys select stored profiles and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +170,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchProfiles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchProfilesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchProfiles"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // One search is "a minimum of 1 key-value(s) pair and up to 5": the required
+        // `KeyName`/`Values` pair, then each `AdditionalSearchKeys` entry. The model
+        // bounds the number of keys but not the length of a key's value list, so the
+        // total is capped here and an oversized search is refused BEFORE any lookup
+        // runs — the message names the member and the limit.
+        let additional = input.additional_search_keys.unwrap_or_default();
+        let total_values = input.values.len()
+            + additional
+                .iter()
+                .map(|key| key.values.len())
+                .sum::<usize>();
+        if total_values > crate::state::MAX_SEARCH_VALUES {
+            return Err(SearchProfilesErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "A search may carry at most {} values across Values and \
+                     AdditionalSearchKeys; this request carried {total_values}",
+                    crate::state::MAX_SEARCH_VALUES
+                )),
+            })
+            .into());
+        }
+        let search_keys: Vec<(String, Vec<String>)> =
+            ::std::iter::once((input.key_name, input.values))
+                .chain(
+                    additional
+                        .into_iter()
+                        .map(|additional| (additional.key_name, additional.values)),
+                )
+                .collect();
+
+        // Everything that needs the store happens inside this block, so the shared
+        // state lock is released before the response is built: the only work done
+        // under it is the index lookup, picking the page, and cloning the page's own
+        // profiles.
+        let (page, next_token) = {
+            let store = state.lock();
+            let domain = store.domains.get(&input.domain_name).ok_or_else(|| {
+                SearchProfilesError::from(SearchProfilesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("The domain {} does not exist", input.domain_name)),
+                    },
+                ))
+            })?;
+
+            // A key matches a profile when the profile is indexed under that key for
+            // ANY of the key's values. `AND` keeps the profiles every key matches, `OR`
+            // those at least one matches; "The OR relationship is the default behavior
+            // if this parameter is not included in the request."
+            let mut per_key = search_keys
+                .iter()
+                .map(|(key_name, values)| domain.lookup(key_name, values));
+            let matched: ::std::collections::BTreeSet<String> =
+                if input.logical_operator.as_deref() == Some(LOGICAL_OPERATOR_AND) {
+                    let first = per_key.next().unwrap_or_default();
+                    per_key.fold(first, |kept, ids| kept.intersection(&ids).cloned().collect())
+                } else {
+                    per_key.flatten().collect()
+                };
+
+            // Ascending by profile id, which is the order the index stores them in, so
+            // the `NextToken` cursor resumes exactly where the page stopped. Only the
+            // ids walk through the cursor; a profile a page skipped costs nothing.
+            let (ids, next_token) = crate::state::paginate(
+                matched.into_iter().map(|profile_id| (profile_id.clone(), profile_id)),
+                input.next_token.as_deref(),
+                input.max_results,
+            );
+            let page: Vec<Profile> = ids
+                .iter()
+                .filter_map(|profile_id| {
+                    domain.profiles.get(profile_id).map(|stored| stored.profile.clone())
+                })
+                .collect();
+            (page, next_token)
+        };
+
+        // A search that matches nothing is an empty page, not a failure: the domain
+        // exists, and "no profile carries this key" is an answer.
+        let items = page
+            .into_iter()
+            .map(|profile| Profile {
+                found_by_items: Some(found_by_items(&search_keys, &profile)),
+                ..profile
+            })
+            .collect();
+        Ok(SearchProfilesOutput { items: Some(items), next_token })
     }
+}
+
+/// The `LogicalOperator` that keeps only profiles every search key matches.
+const LOGICAL_OPERATOR_AND: &str = "AND";
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> SearchProfilesError {
+    SearchProfilesErrorModeled::InternalServerException(crate::state::store_unavailable()).into()
+}
+
+/// Which of the search keys found this profile, and under which of their values — the
+/// `FoundByItems` the response carries beside each profile.
+///
+/// A profile is reachable through exactly the standard keys its own attributes populate
+/// (that is what the domain's index is built from), so the keys that found it are the
+/// requested pairs that appear in that set. Computed once per profile ON THE PAGE, and
+/// the page is bounded by `MaxResults` while the requested values are bounded by
+/// [`crate::state::MAX_SEARCH_VALUES`].
+fn found_by_items(search_keys: &[(String, Vec<String>)], profile: &Profile) -> Vec<FoundByKeyValue> {
+    let own_keys = crate::state::standard_search_keys(profile);
+    let own: ::std::collections::HashSet<(&str, &str)> = own_keys
+        .iter()
+        .map(|(key_name, value)| (key_name.as_str(), value.as_str()))
+        .collect();
+    search_keys
+        .iter()
+        .filter_map(|(key_name, values)| {
+            let matched: Vec<String> = values
+                .iter()
+                .filter(|value| own.contains(&(key_name.as_str(), value.as_str())))
+                .cloned()
+                .collect();
+            (!matched.is_empty()).then(|| FoundByKeyValue {
+                key_name: Some(key_name.clone()),
+                values: Some(matched),
+            })
+        })
+        .collect()
 }
