@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InvokeModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InvokeModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Serves one synchronous inference call: it resolves `modelId` against the
+//! registry in [`crate::state`], applies the request rules the model documents
+//! (`application/json` bodies, and the three guardrail combinations that are an
+//! error), counts the prompt tokens the body carries, honours the generation cap
+//! the body carries for the model's family, and answers in the response envelope
+//! of that family so a client can parse it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InvokeModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! No language model runs in this emulator, so the text inside that envelope
+//! says so (see [`crate::state::emulated_completion_text`]); the envelope, the
+//! token accounting and the invocation log are real.
 //!
 //! ## Shape of an operation
 //!
@@ -186,6 +187,34 @@ impl From<InvokeModelErrorModeled> for InvokeModelError {
     }
 }
 
+/// The only body MIME type `InvokeModel` accepts: "The MIME type of the input
+/// data in the request. You must specify application/json."
+const JSON_MIME: &str = "application/json";
+
+/// The body field that carries a guardrail configuration inline. Naming it
+/// without a `guardrailIdentifier` is one of the error situations the model
+/// documents for this operation.
+const INLINE_GUARDRAIL_CONFIG_FIELD: &str = "amazon-bedrock-guardrailConfig";
+
+/// This operation's own modelled 400 `ValidationException`.
+fn validation(message: String) -> InvokeModelError {
+    InvokeModelErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A MIME type with its parameters (`; charset=utf-8`) and casing removed, so
+/// `application/json; charset=utf-8` compares equal to `application/json`.
+fn mime_essence(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
 /// The `InvokeModel` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -222,18 +251,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InvokeModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InvokeModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InvokeModel"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(InvokeModelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Bedrock Runtime emulator has no state store".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let model = {
+            let guard = state.lock();
+            match guard.resolve_model(&input.model_id) {
+                Some(entry) => entry.clone(),
+                None => {
+                    return Err(InvokeModelErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "The provided model identifier is invalid: {}",
+                                input.model_id
+                            )),
+                        },
+                    )
+                    .into())
+                }
+            }
+        };
+
+        // "You must provide the body in JSON format", and the response is in the
+        // format the `accept` header asks for, whose only documented value is
+        // `application/json` (its default).
+        if let Some(content_type) = input.content_type.as_deref() {
+            if mime_essence(content_type) != JSON_MIME {
+                return Err(validation(format!(
+                    "Invalid contentType {content_type}: you must specify {JSON_MIME}."
+                )));
+            }
+        }
+        if let Some(accept) = input.accept.as_deref() {
+            let essence = mime_essence(accept);
+            if essence != JSON_MIME && essence != "*/*" {
+                return Err(validation(format!(
+                    "Invalid accept {accept}: this model returns {JSON_MIME}."
+                )));
+            }
+        }
+
+        let body = input.body.as_deref().unwrap_or_default();
+        if body.is_empty() {
+            return Err(validation(
+                "The request body must contain the prompt and inference parameters.".to_string(),
+            ));
+        }
+
+        // The three guardrail combinations the model documents as errors. The
+        // second one ("you enable the guardrail but the contentType isn't
+        // application/json") is already refused above, for guarded and unguarded
+        // requests alike.
+        let parsed_body = serde_json::from_slice::<serde_json::Value>(body).ok();
+        let guardrail_identifier = input
+            .guardrail_identifier
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        let guardrail_version = input
+            .guardrail_version
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        if guardrail_identifier.is_some() && guardrail_version.is_none() {
+            return Err(validation(
+                "guardrailVersion must be specified when guardrailIdentifier is provided."
+                    .to_string(),
+            ));
+        }
+        if guardrail_identifier.is_none()
+            && parsed_body
+                .as_ref()
+                .is_some_and(|value| value.get(INLINE_GUARDRAIL_CONFIG_FIELD).is_some())
+        {
+            return Err(validation(format!(
+                "guardrailIdentifier must be specified when the request body contains \
+                 {INLINE_GUARDRAIL_CONFIG_FIELD}."
+            )));
+        }
+
+        // The generation cap the body carries for this family, bounded by the
+        // model's own ceiling; reaching it is what makes the family's response
+        // report its length stop reason instead of a completed one.
+        let max_output_tokens = parsed_body
+            .as_ref()
+            .and_then(|value| crate::state::body_max_tokens(model.family, value))
+            .unwrap_or(model.max_output_tokens)
+            .min(model.max_output_tokens);
+
+        let input_tokens = crate::state::body_input_tokens(body);
+        let full_text = crate::state::emulated_completion_text(&model.model_id, 1, input_tokens);
+        let truncated = crate::state::count_text_tokens(&full_text) > max_output_tokens;
+        let text = if truncated {
+            crate::state::truncate_to_tokens(&full_text, max_output_tokens)
+        } else {
+            full_text
+        };
+        let output_tokens = crate::state::count_text_tokens(&text);
+
+        // A completion id is a per-run, server-generated value; deriving it from
+        // the request keeps it stable for an identical call without inventing an
+        // id that looks recorded.
+        let completion_id = {
+            use sha2::{Digest, Sha256};
+            let mut digest = Sha256::new();
+            digest.update(model.model_id.as_bytes());
+            digest.update(body);
+            hex::encode(digest.finalize())[..24].to_string()
+        };
+
+        let response = crate::state::invoke_model_response_body(
+            model.family,
+            &model.model_id,
+            &completion_id,
+            &text,
+            input_tokens,
+            output_tokens,
+            truncated,
+        );
+        let body = serde_json::to_vec(&response).map_err(|error| {
+            InvokeModelError::from(InvokeModelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!("could not render the inference response: {error}")),
+                },
+            ))
+        })?;
+
+        state
+            .lock()
+            .log_invocation(crate::state::InvocationLogEntry {
+                model_id: model.model_id.clone(),
+                kind: crate::state::InvokeKind::Sync,
+                input_tokens,
+                output_tokens,
+                at_millis: crate::state::now_millis(),
+            });
+
+        Ok(InvokeModelOutput {
+            body,
+            content_type: JSON_MIME.to_string(),
+            performance_config_latency: Some(input.performance_config_latency.clone()),
+            service_tier: input.service_tier.clone(),
+        })
     }
 }

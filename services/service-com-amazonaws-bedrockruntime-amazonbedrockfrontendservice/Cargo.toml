@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Mints the 12-character async-invoke id embedded in an `invocationArn`.
+sha2 = { workspace = true }
+# Encodes the opaque `ListAsyncInvokes` page token.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
