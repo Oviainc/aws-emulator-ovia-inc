@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRecord
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRecord`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation deletes one record from the feature group's OnlineStore
+//! held in [`crate::state`] — `HardDelete` removes it, `SoftDelete` (the default)
+//! leaves a tombstone that `GetRecord` and `BatchGetRecord` no longer serve — and
+//! refuses, as the model documents, a `HardDelete` whose `EventTime` is not later than
+//! the stored record's.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRecord::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Authorization is not emulated, so the modelled `AccessForbidden` is unreachable, and
+//! the OfflineStore is not modelled: the deleted-record marker the model says Feature
+//! Store appends there is out of scope for this slice, so only the OnlineStore side is
+//! served.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +194,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRecord` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRecordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRecord"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteRecordErrorModeled::InternalFailure(InternalFailure {
+                message: Some(
+                    "DeleteRecord: this service holds no state on the mounted engine".into(),
+                ),
+            })
+            .into());
+        };
+
+        // A value outside the `TargetStore` / `DeletionMode` enums would be read below
+        // as "not the OnlineStore" or "not a HardDelete" and silently change what the
+        // call does. The boundary validator refuses an undeclared enum value first;
+        // these are the handler's own guards, against the model's own value lists.
+        if let Some(stores) = input.target_stores.as_ref() {
+            if let Some(unknown) = crate::state::undeclared_value(stores, TARGET_STORE_VALUES) {
+                return Err(validation(format!(
+                    "TargetStores: '{unknown}' is not a TargetStore; expected one of {}",
+                    TARGET_STORE_VALUES.join(", ")
+                )));
+            }
+        }
+        if let Some(mode) = input.deletion_mode.as_deref() {
+            if !DELETION_MODE_VALUES.contains(&mode) {
+                return Err(validation(format!(
+                    "DeletionMode: '{mode}' is not a DeletionMode; expected one of {}",
+                    DELETION_MODE_VALUES.join(", ")
+                )));
+            }
+        }
+
+        // "A list of stores from which you're deleting the record. By default, Feature
+        // Store deletes the record from all of the stores that you're using for the
+        // FeatureGroup." Only the OnlineStore is served here.
+        if !crate::state::targets_online_store(input.target_stores.as_ref()) {
+            return Ok(DeleteRecordOutput);
+        }
+
+        // "For SoftDelete (default), feature columns are set to null and the record is
+        // no longer retrievable by GetRecord or BatchGetRecord. For HardDelete, the
+        // complete Record is removed from the OnlineStore."
+        let hard_delete = input.deletion_mode.as_deref() == Some("HardDelete");
+
+        // The deletion is ordered against the stored record's event time, so the
+        // request's own `EventTime` must be a timestamp.
+        let Some(requested_secs) = crate::state::parse_event_time_secs(&input.event_time) else {
+            return Err(validation(format!(
+                "EventTime: expected an ISO-8601 timestamp or seconds since the epoch, \
+                 not '{}'",
+                input.event_time
+            )));
+        };
+
+        let mut store = state.lock();
+        // DeleteRecord models no ResourceNotFound: a delete marker is appended to the
+        // OfflineStore whether or not the OnlineStore holds the group, so an unknown
+        // feature group is a success with nothing to remove online.
+        let Some(group) = store.group_mut(&input.feature_group_name) else {
+            return Ok(DeleteRecordOutput);
+        };
+
+        let identifier = input.record_identifier_value_as_string.clone();
+        let Some(stored) = group.record(&identifier) else {
+            return Ok(DeleteRecordOutput);
+        };
+
+        // "Note that the EventTime specified in DeleteRecord should be set later than
+        // the EventTime of the existing record in the OnlineStore for that
+        // RecordIdentifer. If it is not, the deletion does not occur": SoftDelete
+        // leaves the existing record in the OnlineStore, HardDelete answers 400. A
+        // stored record with no event time at all orders against nothing, so the
+        // deletion proceeds.
+        let out_of_order = stored
+            .event_time_secs()
+            .is_some_and(|existing| requested_secs <= existing);
+        if out_of_order {
+            if hard_delete {
+                let existing = stored.event_time.clone().unwrap_or_default();
+                return Err(validation(format!(
+                    "EventTime: the EventTime of a HardDelete must be later than the \
+                     EventTime of the record it deletes, but '{}' is not later than \
+                     '{existing}'",
+                    input.event_time
+                )));
+            }
+            return Ok(DeleteRecordOutput);
+        }
+
+        if hard_delete {
+            group.remove_record(&identifier);
+        } else {
+            group.soft_delete_record(&identifier, &input.event_time);
+        }
+
+        Ok(DeleteRecordOutput)
     }
+}
+
+/// The modelled `ValidationError` (HTTP 400) for a request this operation refuses.
+fn validation(message: impl Into<String>) -> DeleteRecordError {
+    DeleteRecordErrorModeled::ValidationError(ValidationError {
+        message: Some(message.into()),
+    })
+    .into()
 }
