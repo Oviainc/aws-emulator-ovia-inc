@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteScalingPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteScalingPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes the stored plan: it enters `DeletionInProgress`, and its removal from
+//! state is owed on the clock, so the next describe stops listing it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteScalingPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A plan that already has a pending lifecycle transition cannot be deleted
+//! (`ConcurrentUpdateException`); a name and version that names no plan is
+//! `ObjectNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +141,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteScalingPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteScalingPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteScalingPlan"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal)?;
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle_due(now);
+
+        let plan = state
+            .plan_mut(&input.scaling_plan_name, input.scaling_plan_version)
+            .ok_or_else(|| {
+                not_found(format!(
+                    "No scaling plan found with name '{}' and version {}",
+                    input.scaling_plan_name, input.scaling_plan_version
+                ))
+            })?;
+
+        if plan.is_in_progress() {
+            return Err(concurrent_update(format!(
+                "The scaling plan '{}' is in status {} and cannot be deleted",
+                input.scaling_plan_name, plan.status_code
+            )));
+        }
+
+        plan.begin(
+            crate::state::STATUS_DELETION_IN_PROGRESS,
+            crate::state::PendingOutcome::Removed,
+            now,
+        );
+
+        Ok(DeleteScalingPlanOutput {})
     }
+}
+
+/// The modelled `ObjectNotFoundException` (HTTP 400): no plan with that name and version.
+fn not_found(message: impl Into<String>) -> DeleteScalingPlanError {
+    DeleteScalingPlanErrorModeled::ObjectNotFoundException(ObjectNotFoundException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled `ConcurrentUpdateException` (HTTP 500): the plan already has a
+/// pending lifecycle transition.
+fn concurrent_update(message: impl Into<String>) -> DeleteScalingPlanError {
+    DeleteScalingPlanErrorModeled::ConcurrentUpdateException(ConcurrentUpdateException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The service's state is unreachable: a server fault, never a client error.
+fn internal() -> DeleteScalingPlanError {
+    DeleteScalingPlanErrorModeled::InternalServiceException(InternalServiceException {
+        message: Some("the scaling-plan store is unavailable".to_string()),
+    })
+    .into()
 }
