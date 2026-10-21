@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListVoiceConnectors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListVoiceConnectors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListVoiceConnectors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a page of the stored Voice Connectors, in a stable order, bounded by
+//! `max-results` and resumed by the opaque `next-token` it hands back. Purely
+//! reporting: it writes nothing, so a paged walk cannot change what a later caller
+//! sees.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +146,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListVoiceConnectors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListVoiceConnectorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListVoiceConnectors"))
+        // `ctx` carries request metadata only. The emulator verifies the request
+        // signature centrally before dispatch, and this operation models no principal
+        // to authorize against, so nothing here reads it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListVoiceConnectorsErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    code: Some("ServiceFailure".to_string()),
+                    message: Some("the Voice Connector store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `MaxResults`'s 1..100 range is modelled, so an out-of-range page size is
+        // already refused at the boundary; an absent one pages at the modelled maximum.
+        // A value that survives the boundary and still cannot be a page size is refused
+        // HERE rather than clamped, so a relaxed boundary could never turn a bad page
+        // size into a silent page of one.
+        let requested_page_size = input
+            .max_results
+            .unwrap_or(crate::state::MAX_LIST_PAGE_SIZE);
+        let page_size = match usize::try_from(requested_page_size) {
+            Ok(size) if size >= 1 => size,
+            _ => {
+                return Err(ListVoiceConnectorsErrorModeled::BadRequestException(
+                    BadRequestException {
+                        code: Some("BadRequest".to_string()),
+                        message: Some(format!(
+                            "MaxResults must be at least 1, got {requested_page_size}"
+                        )),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // An absent (or empty) `next-token` starts at the beginning; anything else must
+        // be a token this service issued.
+        let resume_after = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(last_id) => Some(last_id),
+                None => {
+                    return Err(ListVoiceConnectorsErrorModeled::BadRequestException(
+                        BadRequestException {
+                            code: Some("BadRequest".to_string()),
+                            message: Some(
+                                "NextToken is not a token this service issued".to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let store = state.lock();
+        let mut ids = store.voice_connector_ids_in_page_order();
+        if let Some(last_id) = resume_after.as_deref() {
+            ids.retain(|id| id.as_str() > last_id);
+        }
+
+        // A token is handed back only when ids remain BEYOND this page, so a walk ends
+        // on the page that exhausts the store rather than on an extra empty one.
+        let next_token = ids
+            .get(page_size)
+            .is_some()
+            .then(|| crate::state::encode_page_token(&ids[page_size - 1]));
+
+        let voice_connectors = ids
+            .iter()
+            .take(page_size)
+            .filter_map(|id| store.voice_connectors.get(id))
+            .map(crate::state::VoiceConnectorRecord::to_shape)
+            .collect();
+        drop(store);
+
+        Ok(ListVoiceConnectorsOutput {
+            voice_connectors: Some(voice_connectors),
+            next_token,
+        })
     }
 }
