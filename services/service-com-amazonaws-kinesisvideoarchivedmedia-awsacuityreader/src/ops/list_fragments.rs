@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFragments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFragments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the archived fragments of one stream that fall in a timestamp range,
+//! paginated through an opaque `NextToken`. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFragments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## Behaviour
+//!
+//! * The request names exactly one stream, by `StreamName` or `StreamARN`;
+//!   neither or both is `InvalidArgumentException` (400) and a name or ARN no
+//!   stream answers to is `ResourceNotFoundException` (404).
+//! * `FragmentSelector` is required on the first page only — the model
+//!   documents it as "only required when the NextToken isn't passed in the
+//!   API", because a continuation re-uses the selector its token remembers.
+//! * The page is the archived fragments whose selected timestamp
+//!   (`PRODUCER_TIMESTAMP` or `SERVER_TIMESTAMP`) falls inside the inclusive
+//!   `TimestampRange`, read from the persisted archive; `NextToken` is returned
+//!   only while matching fragments remain.
 //!
 //! ## Shape of an operation
 //!
@@ -113,6 +120,18 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    date_time_millis, service_state, to_date_time, FragmentCursor, StreamLookupError,
+    TimestampOrigin,
+};
+
+/// The page size `ListFragments` uses when the request names no `MaxResults`.
+///
+/// The model documents no default for `MaxResults`, only the maximum
+/// (`ListFragmentsMaxResults`, range 1..1000), so an unbounded request is
+/// served at that maximum: one page carries everything a bounded request
+/// could ask for.
+const DEFAULT_MAX_RESULTS: usize = 1000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -185,18 +204,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFragments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFragmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFragments"))
+        let _ = ctx;
+
+        let invalid = |message: String| -> Self::Error {
+            ListFragmentsErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        let Some(state) = service_state(&*self.engine) else {
+            // Reachable only if this service is mounted on an engine that holds
+            // no store, which the constructor seam makes impossible in the
+            // assembled emulator. Reported as the modelled throttle-shaped
+            // error rather than a success, so a client never reads an empty
+            // fragment list as "this stream has no fragments".
+            return Err(ListFragmentsErrorModeled::ClientLimitExceededException(
+                ClientLimitExceededException {
+                    message: Some("the archived-media store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        let stream = match state.resolve_stream(
+            input.stream_name.as_deref(),
+            input.stream_arn.as_deref(),
+        ) {
+            Ok(stream) => stream,
+            Err(StreamLookupError::InvalidArgument(message)) => return Err(invalid(message)),
+            Err(StreamLookupError::NotFound(message)) => {
+                return Err(ListFragmentsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // Where this page starts, and what it selects on: the token when the
+        // request continues a previous page, else the request's own selector.
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = FragmentCursor::decode(token) else {
+                    return Err(invalid("NextToken is not a valid pagination token".to_string()));
+                };
+                if cursor.stream_name != stream.name {
+                    return Err(invalid(
+                        "NextToken was issued for a different stream".to_string(),
+                    ));
+                }
+                cursor
+            }
+            None => {
+                let Some(selector) = input.fragment_selector.as_ref() else {
+                    return Err(invalid(
+                        "FragmentSelector is required when NextToken is not specified".to_string(),
+                    ));
+                };
+                let Some(origin) = TimestampOrigin::parse(&selector.fragment_selector_type) else {
+                    return Err(invalid(format!(
+                        "FragmentSelector.FragmentSelectorType must be one of [{}]",
+                        FRAGMENT_SELECTOR_TYPE_VALUES.join(", ")
+                    )));
+                };
+                let start_millis = date_time_millis(&selector.timestamp_range.start_timestamp);
+                let end_millis = date_time_millis(&selector.timestamp_range.end_timestamp);
+                if end_millis < start_millis {
+                    return Err(invalid(
+                        "FragmentSelector.TimestampRange.EndTimestamp must not be earlier than \
+                         StartTimestamp"
+                            .to_string(),
+                    ));
+                }
+                FragmentCursor {
+                    stream_name: stream.name.clone(),
+                    origin,
+                    start_millis,
+                    end_millis,
+                    offset: 0,
+                }
+            }
+        };
+
+        let matching =
+            stream.fragments_in_range(cursor.origin, cursor.start_millis, cursor.end_millis);
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        let fragments: Vec<Fragment> = matching
+            .iter()
+            .skip(cursor.offset)
+            .take(page_size)
+            .map(|fragment| Fragment {
+                fragment_number: Some(fragment.fragment_number.clone()),
+                fragment_size_in_bytes: i64::try_from(fragment.size_bytes()).unwrap_or(i64::MAX),
+                producer_timestamp: Some(to_date_time(fragment.producer_timestamp)),
+                server_timestamp: Some(to_date_time(fragment.server_timestamp)),
+                fragment_length_in_milliseconds: i64::try_from(fragment.duration_millis)
+                    .unwrap_or(i64::MAX),
+            })
+            .collect();
+
+        // "This value is null when there are no more results to return."
+        let next_offset = cursor.offset.saturating_add(fragments.len());
+        let next_token = (next_offset < matching.len()).then(|| {
+            FragmentCursor {
+                offset: next_offset,
+                ..cursor
+            }
+            .encode()
+        });
+
+        Ok(ListFragmentsOutput {
+            fragments: Some(fragments),
+            next_token,
+        })
     }
 }
