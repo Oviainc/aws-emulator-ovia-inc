@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAutomationRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAutomationRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAutomationRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Applies the supplied members to the stored rule under an
+//! optimistic-concurrency check on `ruleRevision`, bumps the revision, stamps
+//! `lastUpdatedTimestamp`, and answers with the merged rule read back from the store.
 //!
 //! ## Shape of an operation
 //!
@@ -215,18 +210,192 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAutomationRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAutomationRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAutomationRule"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateAutomationRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service is not mounted on a state-bearing engine".into()),
+                },
+            )
+            .into());
+        };
+
+        // `priority` is a plain `String` in the model but documents a decimal
+        // between 0 and 1, so its form is checked here.
+        if let Some(priority) = input.priority.as_deref() {
+            if !crate::state::priority_is_valid(priority) {
+                return Err(invalid_parameter(format!(
+                    "Value '{priority}' at 'priority' failed to satisfy constraint: Member must \
+                     be a decimal number between 0 and 1 with up to 30 digits after the decimal \
+                     point"
+                )));
+            }
+        }
+        // "Must be 1-128 characters long": the `@length` on `RuleName` has
+        // `min: 0`, so the boundary admits an empty name.
+        if input.name.as_deref().is_some_and(str::is_empty) {
+            return Err(invalid_parameter(
+                "Value '' at 'name' failed to satisfy constraint: Member must have length \
+                 greater than or equal to 1"
+                    .to_string(),
+            ));
+        }
+
+        let mut probe = input.clone();
+        probe.client_token = None;
+        let request_fingerprint = crate::state::fingerprint(&probe);
+        let client_token = input.client_token.as_deref();
+
+        let mut guard = state.lock();
+
+        match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
+            crate::state::TokenOutcome::Fresh => {}
+            // A retry of the same update: the revision has already moved on, so
+            // re-applying it would fail the concurrency check. Answer with the
+            // rule as it stands.
+            crate::state::TokenOutcome::Replay(_) => {
+                return match guard.rules.get(&input.rule_arn) {
+                    Some(rule) => Ok(output_for(rule)),
+                    None => Err(not_found(&input.rule_arn)),
+                };
+            }
+            crate::state::TokenOutcome::ParameterMismatch => {
+                return Err(
+                    UpdateAutomationRuleErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(
+                                "The same client token was used with different parameters.".into(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::TokenOutcome::TokenInUse => {
+                return Err(UpdateAutomationRuleErrorModeled::IdempotencyTokenInUseException(
+                    IdempotencyTokenInUseException {
+                        message: Some("The specified client token is already in use.".into()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(rule) = guard.rules.get(&input.rule_arn) else {
+            return Err(not_found(&input.rule_arn));
+        };
+        // `ruleRevision` is the rule's optimistic-concurrency token: an update
+        // carrying a revision other than the stored one is refused rather than
+        // applied over whatever the rule has become.
+        if rule.rule_revision != input.rule_revision {
+            return Err(invalid_parameter(format!(
+                "Value '{}' at 'ruleRevision' failed to satisfy constraint: Member must match the \
+                 current revision of rule '{}'",
+                input.rule_revision, input.rule_arn
+            )));
+        }
+        // The merged rule must still satisfy the rules a create does: an
+        // `OrganizationRule` needs an organization configuration, whether it
+        // arrives in this request or is already stored.
+        let merged_rule_type = input.rule_type.clone().unwrap_or(rule.rule_type.clone());
+        let merged_org_config = input
+            .organization_configuration
+            .clone()
+            .or_else(|| rule.organization_configuration.clone());
+        if merged_rule_type == "OrganizationRule" && merged_org_config.is_none() {
+            return Err(invalid_parameter(
+                "Value null at 'organizationConfiguration' failed to satisfy constraint: Member \
+                 is required for the OrganizationRule rule type"
+                    .to_string(),
+            ));
+        }
+
+        let updated_at = crate::state::now();
+        let Some(rule) = guard.rules.get_mut(&input.rule_arn) else {
+            return Err(not_found(&input.rule_arn));
+        };
+        // Only the members the request carries are applied; an absent member
+        // leaves the stored value alone.
+        if let Some(name) = input.name.clone() {
+            rule.name = name;
+        }
+        if let Some(description) = input.description.clone() {
+            rule.description = Some(description);
+        }
+        if let Some(rule_type) = input.rule_type.clone() {
+            rule.rule_type = rule_type;
+        }
+        if let Some(organization_configuration) = input.organization_configuration.clone() {
+            rule.organization_configuration = Some(organization_configuration);
+        }
+        if let Some(priority) = input.priority.clone() {
+            rule.priority = Some(priority);
+        }
+        if let Some(recommended_action_types) = input.recommended_action_types.clone() {
+            rule.recommended_action_types = recommended_action_types;
+        }
+        if let Some(criteria) = input.criteria.clone() {
+            rule.criteria = Some(criteria);
+        }
+        if let Some(schedule) = input.schedule.clone() {
+            rule.schedule = schedule;
+        }
+        if let Some(status) = input.status.clone() {
+            rule.status = status;
+        }
+        // "The revision number ... is incremented each time the rule is updated."
+        rule.rule_revision += 1;
+        rule.last_updated_timestamp = Some(updated_at);
+
+        guard.record_token(
+            client_token,
+            Self::NAME,
+            &request_fingerprint,
+            Some(input.rule_arn.clone()),
+        );
+
+        // Answer from the store, so the response is the merged rule a later
+        // reader sees.
+        match guard.rules.get(&input.rule_arn) {
+            Some(rule) => Ok(output_for(rule)),
+            None => Err(not_found(&input.rule_arn)),
+        }
     }
+}
+
+/// The response for a stored rule. The ONE place this operation's output is
+/// built. The modelled output carries neither `ruleId`, `accountId` nor `tags`;
+/// `GetAutomationRule` reports those.
+fn output_for(rule: &crate::state::StoredRule) -> UpdateAutomationRuleOutput {
+    UpdateAutomationRuleOutput {
+        rule_arn: Some(rule.rule_arn.clone()),
+        rule_revision: Some(rule.rule_revision),
+        name: Some(rule.name.clone()),
+        description: rule.description.clone(),
+        rule_type: Some(rule.rule_type.clone()),
+        organization_configuration: rule.organization_configuration.clone(),
+        priority: rule.priority.clone(),
+        recommended_action_types: Some(rule.recommended_action_types.clone()),
+        criteria: rule.criteria.clone(),
+        schedule: Some(rule.schedule.clone()),
+        status: Some(rule.status.clone()),
+        created_timestamp: Some(rule.created_timestamp),
+        last_updated_timestamp: rule.last_updated_timestamp,
+    }
+}
+
+fn not_found(rule_arn: &str) -> UpdateAutomationRuleError {
+    UpdateAutomationRuleErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("No automation rule found with ARN '{rule_arn}'.")),
+    })
+    .into()
+}
+
+fn invalid_parameter(message: String) -> UpdateAutomationRuleError {
+    UpdateAutomationRuleErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

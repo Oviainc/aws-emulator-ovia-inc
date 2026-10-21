@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAutomationRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAutomationRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAutomationRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Reports the rules the store holds, in creation order, narrowed by
+//! `filters` and paged by `maxResults` with an opaque `nextToken` that resumes where
+//! the previous page stopped. `@paginated(inputToken: nextToken, outputToken:
+//! nextToken, items: automationRules)`.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +154,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAutomationRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAutomationRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAutomationRules"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAutomationRulesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service is not mounted on a state-bearing engine".into()),
+                },
+            )
+            .into());
+        };
+
+        let filters = input.filters.unwrap_or_default();
+        // `Filter$name` is typed as the `AutomationRuleFilterName` value set, but
+        // a name outside it is refused here too so a filter is never silently
+        // ignored.
+        if let Some(unknown) = crate::state::unknown_filter_name(&filters) {
+            return Err(invalid_parameter(format!(
+                "Value '{unknown}' at 'filters.member.name' failed to satisfy constraint: Member \
+                 must satisfy enum value set: [Name, RecommendedActionType, Status, RuleType, \
+                 OrganizationConfigurationRuleApplyOrder, AccountId]"
+            )));
+        }
+
+        // The page token carries the filters it was taken with, so resuming a
+        // walk with different filters is refused rather than answered with a
+        // page of a different result set.
+        let filter_fingerprint = crate::state::fingerprint(&filters);
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(cursor) = crate::state::decode_page_token(token) else {
+                    return Err(invalid_parameter(format!(
+                        "Value '{token}' at 'nextToken' failed to satisfy constraint: Member must \
+                         be a token returned by a previous ListAutomationRules call"
+                    )));
+                };
+                if cursor.filter_fingerprint != filter_fingerprint {
+                    return Err(invalid_parameter(
+                        "Value at 'nextToken' failed to satisfy constraint: Member must be a \
+                         token returned for the same filters"
+                            .to_string(),
+                    ));
+                }
+                cursor.offset
+            }
+        };
+
+        // The model bounds `maxResults` at 1..=100, so a caller that sends none
+        // gets the largest page it could have asked for. Clamped to at least one
+        // here as well: a zero page would return nothing while still carrying a
+        // token whose offset never advances, so a walk would never terminate.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::DEFAULT_MAX_RESULTS),
+        )
+        .unwrap_or(1)
+        .max(1);
+
+        let guard = state.lock();
+        let matching: Vec<AutomationRule> = guard
+            .rules
+            .iter_in_order()
+            .filter(|rule| crate::state::rule_matches_filters(rule, &filters))
+            .skip(offset)
+            .take(page_size.saturating_add(1))
+            .map(crate::state::StoredRule::to_automation_rule)
+            .collect();
+
+        // One extra rule was taken: its presence is what says another page
+        // exists, and the token resumes exactly where this page stopped.
+        let has_more = matching.len() > page_size;
+        let page: Vec<AutomationRule> = matching.into_iter().take(page_size).collect();
+        let next_token = has_more.then(|| {
+            crate::state::encode_page_token(&crate::state::PageCursor {
+                offset: offset + page.len(),
+                filter_fingerprint,
+            })
+        });
+
+        Ok(ListAutomationRulesOutput {
+            automation_rules: Some(page),
+            next_token,
+        })
     }
+}
+
+fn invalid_parameter(message: String) -> ListAutomationRulesError {
+    ListAutomationRulesErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAutomationRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAutomationRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAutomationRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Mints a `ruleId`/`ruleArn`, stores the rule, and answers from what
+//! was stored.
 //!
 //! ## Shape of an operation
 //!
@@ -218,18 +212,190 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAutomationRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAutomationRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAutomationRule"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAutomationRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service is not mounted on a state-bearing engine".into()),
+                },
+            )
+            .into());
+        };
+
+        // Rules the model cannot express, so the boundary validator let them
+        // through. Each is refused with the only client-input error this
+        // operation declares.
+        if let Some(message) = invalid_parameter(&input) {
+            return Err(
+                CreateAutomationRuleErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut probe = input.clone();
+        probe.client_token = None;
+        let request_fingerprint = crate::state::fingerprint(&probe);
+        let client_token = input.client_token.as_deref();
+
+        let mut guard = state.lock();
+
+        match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
+            crate::state::TokenOutcome::Fresh => {}
+            // A retry of the same create: answer with the rule the first call
+            // minted, recomputed from the store, instead of minting a second.
+            crate::state::TokenOutcome::Replay(record) => {
+                if let Some(rule) = record
+                    .rule_arn
+                    .as_deref()
+                    .and_then(|arn| guard.rules.get(arn))
+                {
+                    return Ok(output_for(rule));
+                }
+                // The rule the token minted has since been deleted, so there is
+                // nothing to replay.
+                return Err(CreateAutomationRuleErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            "The rule created with this client token no longer exists.".into(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            crate::state::TokenOutcome::ParameterMismatch => {
+                return Err(
+                    CreateAutomationRuleErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(
+                                "The same client token was used with different parameters.".into(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::TokenOutcome::TokenInUse => {
+                return Err(
+                    CreateAutomationRuleErrorModeled::IdempotencyTokenInUseException(
+                        IdempotencyTokenInUseException {
+                            message: Some("The specified client token is already in use.".into()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let account_id = crate::state::caller_account_id();
+        // The store is in memory and a create is the only operation that grows
+        // it, so the per-account rule count is capped and the modelled quota
+        // error is what a caller past the cap sees.
+        if guard.rules.count_for_account(&account_id) >= crate::state::MAX_RULES_PER_ACCOUNT {
+            return Err(
+                CreateAutomationRuleErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "The request would exceed the quota of {} automation rules for \
+                             account {account_id}.",
+                            crate::state::MAX_RULES_PER_ACCOUNT
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let rule_id = guard.mint_rule_id();
+        let rule_arn = crate::state::rule_arn(&rule_id);
+        let stored = crate::state::StoredRule {
+            rule_arn: rule_arn.clone(),
+            rule_id,
+            account_id,
+            name: input.name,
+            description: input.description,
+            rule_type: input.rule_type,
+            rule_revision: crate::state::INITIAL_RULE_REVISION,
+            organization_configuration: input.organization_configuration,
+            priority: input.priority,
+            recommended_action_types: input.recommended_action_types,
+            criteria: input.criteria,
+            schedule: input.schedule,
+            status: input.status,
+            tags: input.tags.unwrap_or_default(),
+            created_timestamp: crate::state::now(),
+            last_updated_timestamp: None,
+        };
+        guard.rules.insert(stored);
+        guard.record_token(
+            client_token,
+            Self::NAME,
+            &request_fingerprint,
+            Some(rule_arn.clone()),
+        );
+
+        // Answer from the store, not from the request struct.
+        let rule = guard.rules.get(&rule_arn).ok_or_else(|| {
+            CreateAutomationRuleError::from(
+                CreateAutomationRuleErrorModeled::InternalServerException(InternalServerException {
+                    message: Some("the rule that was just stored could not be read back".into()),
+                }),
+            )
+        })?;
+        Ok(output_for(rule))
+    }
+}
+
+/// The response for a stored rule. The ONE place this operation's output is
+/// built, so every path (fresh create and idempotent replay) answers from the
+/// same stored fields.
+fn output_for(rule: &crate::state::StoredRule) -> CreateAutomationRuleOutput {
+    CreateAutomationRuleOutput {
+        rule_arn: Some(rule.rule_arn.clone()),
+        rule_id: Some(rule.rule_id.clone()),
+        name: Some(rule.name.clone()),
+        description: rule.description.clone(),
+        rule_type: Some(rule.rule_type.clone()),
+        rule_revision: Some(rule.rule_revision),
+        organization_configuration: rule.organization_configuration.clone(),
+        priority: rule.priority.clone(),
+        recommended_action_types: Some(rule.recommended_action_types.clone()),
+        criteria: rule.criteria.clone(),
+        schedule: Some(rule.schedule.clone()),
+        status: Some(rule.status.clone()),
+        tags: Some(rule.tags.clone()),
+        created_timestamp: Some(rule.created_timestamp),
+    }
+}
+
+/// Why this request's parameter values are not valid, if they are not.
+///
+/// Each clause is a documented rule the Smithy constraints cannot carry:
+///
+/// * `name` — "Must be 1-128 characters long" (the `@length` on `RuleName` has
+///   `min: 0`, so the boundary admits an empty name).
+/// * `organizationConfiguration` — "Required for OrganizationRule type."
+/// * `priority` — "a decimal number between 0 and 1 (having up to 30 digits
+///   after the decimal point)"; the member is a plain `String`.
+fn invalid_parameter(input: &CreateAutomationRuleInput) -> Option<String> {
+    if input.name.is_empty() {
+        return Some("Value '' at 'name' failed to satisfy constraint: Member must have length greater than or equal to 1".to_string());
+    }
+    if input.rule_type == "OrganizationRule" && input.organization_configuration.is_none() {
+        return Some(
+            "Value null at 'organizationConfiguration' failed to satisfy constraint: Member is \
+             required for the OrganizationRule rule type"
+                .to_string(),
+        );
+    }
+    match input.priority.as_deref() {
+        Some(priority) if !crate::state::priority_is_valid(priority) => Some(format!(
+            "Value '{priority}' at 'priority' failed to satisfy constraint: Member must be a \
+             decimal number between 0 and 1 with up to 30 digits after the decimal point"
+        )),
+        _ => None,
     }
 }

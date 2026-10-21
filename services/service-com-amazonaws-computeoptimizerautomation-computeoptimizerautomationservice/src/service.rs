@@ -97,16 +97,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound). This service's
+        // model declares NO `ValidationException`: the one client-input error it
+        // declares — on every operation, as a service-common error — is
+        // `InvalidParameterValueException` (HTTP 400), "One or more parameter
+        // values are not valid". So a value that failed a modeled rule is worded
+        // with that code, which is what a client of this service branches on;
+        // the framework's default `ValidationException` names a shape this
+        // service never declares. The status stays 400, which the protocol owns.
+        //
+        // Both the code and the message are replaced together. Authentication
+        // refusals keep the framework's wording (`None`).
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "InvalidParameterValueException".to_string(),
+                message: violations
+                    .iter()
+                    .map(smithy_server_runtime::Violation::message)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(
