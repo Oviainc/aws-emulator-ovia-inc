@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLogEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLogEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: reads the events persisted for the named stream, filters them to the
+//! requested time window, pages through them in either direction and hands back the
+//! tokens that resume the scan. This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`GetLogEvents::handle`] with real behaviour and
@@ -156,6 +156,57 @@ impl From<GetLogEventsErrorModeled> for GetLogEventsError {
     }
 }
 
+/// The kind tag this operation's pagination cursors carry, so a token minted by
+/// another paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "GetLogEvents";
+
+/// Where a page resumes from: a position in the stream's event order plus the
+/// direction to walk, and the time window the scan was started with.
+#[derive(Debug, Clone)]
+struct Cursor {
+    log_group_name: String,
+    log_stream_name: String,
+    forward: bool,
+    at: crate::state::EventKey,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+}
+
+impl Cursor {
+    /// Render this cursor as the opaque `nextForwardToken` / `nextBackwardToken`.
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "logGroupName": self.log_group_name,
+            "logStreamName": self.log_stream_name,
+            "forward": self.forward,
+            "timestamp": self.at.timestamp,
+            "seq": self.at.seq,
+            "startTime": self.start_time,
+            "endTime": self.end_time,
+        }))
+    }
+
+    /// Read back a cursor this operation minted. `None` for anything else.
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        Some(Self {
+            log_group_name: value.get("logGroupName")?.as_str()?.to_string(),
+            log_stream_name: value.get("logStreamName")?.as_str()?.to_string(),
+            forward: value.get("forward")?.as_bool()?,
+            at: crate::state::EventKey {
+                timestamp: value.get("timestamp")?.as_i64()?,
+                seq: value.get("seq")?.as_u64()?,
+            },
+            start_time: value.get("startTime").and_then(::serde_json::Value::as_i64),
+            end_time: value.get("endTime").and_then(::serde_json::Value::as_i64),
+        })
+    }
+}
+
 /// The `GetLogEvents` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -192,18 +243,184 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLogEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLogEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLogEvents"))
+        // `ctx` carries only request metadata, and `unmask` concerns data-protection
+        // masking, which no policy in this store applies.
+        let _ = (ctx, input.unmask);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetLogEventsError::from(GetLogEventsErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let store = state.lock();
+
+        let log_group_name = crate::state::resolve_log_group_target(
+            input.log_group_name.as_deref(),
+            input.log_group_identifier.as_deref(),
+        )
+        .map_err(|message| {
+            GetLogEventsError::from(GetLogEventsErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            ))
+        })?;
+
+        let Some(group) = store.log_groups.get(&log_group_name) else {
+            return Err(GetLogEventsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some("The specified log group does not exist".to_string()),
+                },
+            )
+            .into());
+        };
+        let Some(stream) = group.streams.get(&input.log_stream_name) else {
+            return Err(GetLogEventsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some("The specified log stream does not exist".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A `nextToken` carries the scan it belongs to: the stream and the time
+        // window. A continuation that names a different stream, or contradicts the
+        // window, is refused rather than answered over a different set of events.
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(GetLogEventsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some("nextToken is not a valid token".to_string()),
+                        },
+                    )
+                    .into());
+                };
+                if cursor.log_group_name != log_group_name
+                    || cursor.log_stream_name != input.log_stream_name
+                {
+                    return Err(GetLogEventsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                "nextToken was issued for a different log stream".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                // An omitted time member keeps the scan's own window; one that is
+                // present must agree with it.
+                if input
+                    .start_time
+                    .is_some_and(|start| Some(start) != cursor.start_time)
+                    || input.end_time.is_some_and(|end| Some(end) != cursor.end_time)
+                {
+                    return Err(GetLogEventsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                "startTime and endTime must match the scan the nextToken was issued for"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+        let (start_time, end_time) = match &cursor {
+            Some(cursor) => (cursor.start_time, cursor.end_time),
+            None => (input.start_time, input.end_time),
+        };
+
+        // `startTime` is inclusive and `endTime` exclusive. The stored events are kept
+        // in timestamp order, so the window is one contiguous run: it is found by two
+        // binary searches rather than by walking everything the stream accumulated.
+        let lo = match start_time {
+            Some(start) => stream
+                .events
+                .partition_point(|event| event.timestamp < start),
+            None => 0,
+        };
+        let hi = match end_time {
+            Some(end) => stream.events.partition_point(|event| event.timestamp < end),
+            None => stream.events.len(),
+        };
+        let matching = &stream.events[lo..hi.max(lo)];
+        let total = matching.len();
+        // `limit` is modelled `range 1..10000`, so the boundary validator has already
+        // refused a value outside it; `max(1)` only keeps the page bounds sane.
+        let limit = usize::try_from(input.limit.unwrap_or(crate::state::DEFAULT_EVENTS_LIMIT))
+            .unwrap_or(0)
+            .max(1);
+
+        // Events are always returned oldest-first within a page; `startFromHead`
+        // chooses which end of the stream the first page is taken from ("If the value
+        // is true, the earliest log events are returned first. If the value is false,
+        // the latest log events are returned first. The default value is false.").
+        let (first, last) = match &cursor {
+            Some(cursor) if cursor.forward => {
+                let from = matching.partition_point(|event| event.key() <= cursor.at);
+                (from, from.saturating_add(limit).min(total))
+            }
+            Some(cursor) => {
+                let until = matching.partition_point(|event| event.key() < cursor.at);
+                (until.saturating_sub(limit), until)
+            }
+            None if input.start_from_head.unwrap_or(false) => (0, limit.min(total)),
+            None => (total.saturating_sub(limit), total),
+        };
+        let page = &matching[first..last];
+
+        // "The returned tokens are never null": a page that exhausted the scan hands
+        // back the token it was called with, which is how a client sees it is done.
+        let forward_at = if let Some(event) = page.last() {
+            event.key()
+        } else {
+            match &cursor {
+                Some(cursor) if cursor.forward => cursor.at,
+                _ => crate::state::EventKey::BEFORE_ALL,
+            }
+        };
+        let backward_at = if let Some(event) = page.first() {
+            event.key()
+        } else {
+            match &cursor {
+                Some(cursor) if !cursor.forward => cursor.at,
+                _ => crate::state::EventKey::AFTER_ALL,
+            }
+        };
+        let template = Cursor {
+            log_group_name,
+            log_stream_name: input.log_stream_name.clone(),
+            forward: true,
+            at: forward_at,
+            start_time,
+            end_time,
+        };
+        let next_forward_token = template.encode();
+        let next_backward_token = Cursor {
+            forward: false,
+            at: backward_at,
+            ..template
+        }
+        .encode();
+
+        Ok(GetLogEventsOutput {
+            events: Some(
+                page.iter()
+                    .map(|event| OutputLogEvent {
+                        timestamp: Some(event.timestamp),
+                        message: Some(event.message.clone()),
+                        ingestion_time: Some(event.ingestion_time),
+                    })
+                    .collect(),
+            ),
+            next_forward_token: Some(next_forward_token),
+            next_backward_token: Some(next_backward_token),
+        })
     }
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAudienceModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAudienceModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAudienceModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the audience model an ARN names, entirely from the record
+//! `CreateAudienceModel` persisted in [`crate::state`]. An ARN that names no persisted
+//! model answers the modelled `ResourceNotFoundException` (404). The only write is the
+//! one the clock already owed: a model whose training span has passed is materialised
+//! `ACTIVE` here, which is the status it would have carried had nobody called.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +167,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAudienceModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAudienceModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAudienceModel"))
+        // This operation reports on the store; the region the request was signed for is
+        // the endpoint it reached, and a Clean Rooms ML endpoint is regional.
+        let region = crate::state::request_region(ctx.parts());
+        // See `CreateTrainingDataset` for why an engine with no store for this service
+        // answers the scaffold's 501.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(model) = store.settled_audience_model_mut(&input.audience_model_arn, &region, now)
+        else {
+            return Err(GetAudienceModelErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(&input.audience_model_arn),
+            )
+            .into());
+        };
+
+        Ok(GetAudienceModelOutput {
+            create_time: ::aws_smithy_types::DateTime::from(model.create_time),
+            update_time: ::aws_smithy_types::DateTime::from(model.update_time),
+            training_data_start_time: model.training_data_start_time,
+            training_data_end_time: model.training_data_end_time,
+            audience_model_arn: model.arn.clone(),
+            name: model.name.clone(),
+            training_dataset_arn: model.training_dataset_arn.clone(),
+            status: model.status.clone(),
+            // `StatusDetails` carries "details about the status of a resource" — the
+            // status code and message of a FAILED one. No status this emulator moves an
+            // audience model into is a failure, so there are no details to report.
+            status_details: None,
+            kms_key_arn: model.kms_key_arn.clone(),
+            tags: Some(crate::state::tag_map(&model.tags)),
+            description: model.description.clone(),
+        })
     }
 }

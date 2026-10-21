@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutTraceSegments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutTraceSegments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutTraceSegments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores each submitted segment document VERBATIM under its trace, so
+//! `BatchGetTraces` can return it byte-for-byte and `GetTraceSummaries` can
+//! recompute a summary from it. A document this handler cannot read is reported
+//! as one `UnprocessedTraceSegment` instead of failing the whole call; a batch
+//! larger than `crate::state::MAX_SEGMENT_DOCUMENTS_PER_CALL`, and a segment
+//! past a trace's segment cap, are refused.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +165,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutTraceSegments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutTraceSegmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutTraceSegments"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutTraceSegmentsErrorModeled::ThrottledException(ThrottledException {
+                message: Some(
+                    "the X-Ray trace store is unavailable on this emulator engine".to_string(),
+                ),
+            })
+            .into());
+        };
+
+        // `TraceSegmentDocuments` carries no modelled length bound, so the batch
+        // is bounded here: an over-long one is refused outright rather than
+        // answered with one `UnprocessedTraceSegment` per document, which would
+        // amplify the request into an equally unbounded response.
+        let submitted = input.trace_segment_documents.len();
+        if submitted > crate::state::MAX_SEGMENT_DOCUMENTS_PER_CALL {
+            return Err(PutTraceSegmentsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "TraceSegmentDocuments carries {submitted} documents; at most {} are accepted per call",
+                        crate::state::MAX_SEGMENT_DOCUMENTS_PER_CALL
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Parse OUTSIDE the lock, yielding between chunks, so a large batch
+        // neither holds the shared store for the whole walk nor denies the
+        // runtime a point at which a timeout or a shutdown can land.
+        let mut parsed = Vec::new();
+        let mut unprocessed = Vec::new();
+        for (position, document) in input.trace_segment_documents.iter().enumerate() {
+            if position > 0 && position % PARSE_YIELD_EVERY == 0 {
+                ::tokio::task::yield_now().await;
+            }
+            match crate::state::parse_segment_document(document) {
+                Ok(segment) => parsed.push(segment),
+                Err(rejection) => unprocessed.push(rejection),
+            }
+        }
+
+        {
+            let mut store = state.lock();
+            for (trace_id, segment) in parsed {
+                if let Err(rejection) = store.ingest_segment(&trace_id, segment) {
+                    unprocessed.push(rejection);
+                }
+            }
+        }
+
+        Ok(PutTraceSegmentsOutput {
+            unprocessed_trace_segments: Some(
+                unprocessed
+                    .into_iter()
+                    .map(|rejection| UnprocessedTraceSegment {
+                        id: rejection.id,
+                        error_code: Some(rejection.error_code.to_string()),
+                        message: Some(rejection.message),
+                    })
+                    .collect(),
+            ),
+        })
     }
 }
+
+/// How many documents are parsed between yields to the runtime.
+const PARSE_YIELD_EVERY: usize = 64;
+

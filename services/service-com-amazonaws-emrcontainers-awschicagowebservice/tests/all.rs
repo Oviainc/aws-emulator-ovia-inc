@@ -13,3 +13,5 @@
 // points it into `tests/all/`.
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/virtual_cluster_job_run_loop.rs"]
+mod virtual_cluster_job_run_loop;

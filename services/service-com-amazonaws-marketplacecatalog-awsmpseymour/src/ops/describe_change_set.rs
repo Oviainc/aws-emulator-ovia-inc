@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeChangeSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeChangeSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeChangeSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored change set: its ids, name, intent, times, status and the changes
+//! `StartChangeSet` stored, plus a failure only when it has one.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +168,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeChangeSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeChangeSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeChangeSet"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeChangeSetErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the marketplace catalog store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        if input.catalog != crate::state::AWS_MARKETPLACE_CATALOG {
+            return Err(DescribeChangeSetErrorModeled::ValidationException(
+                crate::state::wrong_catalog(&input.catalog),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Reporting a change set materialises only what the clock already owed
+        // it: a change set whose span has elapsed has moved on whether or not
+        // anybody asked. Every instant reported is the instant the change fell
+        // due, so repeating this call reports the same record.
+        store.settle(now);
+
+        let Some(record) = store.change_sets.get(&input.change_set_id) else {
+            return Err(DescribeChangeSetErrorModeled::ResourceNotFoundException(
+                crate::state::change_set_not_found(&input.change_set_id),
+            )
+            .into());
+        };
+
+        Ok(DescribeChangeSetOutput {
+            change_set_id: Some(record.id.clone()),
+            change_set_arn: Some(record.arn.clone()),
+            change_set_name: record.name.clone(),
+            intent: Some(record.intent.clone()),
+            start_time: Some(record.start_time.clone()),
+            end_time: record.end_time.clone(),
+            status: Some(record.status.clone()),
+            // "Returned if the change set is in FAILED status": a failure is
+            // reported only by a change set that has one.
+            failure_code: record.failure_code.clone(),
+            failure_description: record.failure_description.clone(),
+            change_set: Some(record.changes.iter().map(|c| c.to_summary()).collect()),
+        })
     }
 }

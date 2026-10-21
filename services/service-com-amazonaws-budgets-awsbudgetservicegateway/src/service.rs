@@ -96,17 +96,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        match refusal {
+            // Budgets names every bad or absent input value `InvalidParameterException`
+            // ("An error on the client occurred. Typically, the cause is an invalid input
+            // value."), the error its model declares on all 26 operations — so that is
+            // the code a Budgets client branches on. The framework's default,
+            // `ValidationException`, is not a shape this service models at all, so a
+            // client could not resolve it. The status stays with the protocol (400), which
+            // is the status the modelled `InvalidParameterException` carries too.
+            //
+            // The message keeps the framework's structural account of what failed
+            // (member path, constraint); AWS documents no wording for it.
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "InvalidParameterException".to_string(),
+                message: violations
+                    .iter()
+                    .map(smithy_server_runtime::Violation::message)
+                    .collect::<Vec<String>>()
+                    .join("; "),
+            }),
+            // An unauthenticated caller is not an input problem: keep the framework's
+            // 403 wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

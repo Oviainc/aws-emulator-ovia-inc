@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBudget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBudget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBudget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the stored budget named by `NewBudget.BudgetName` in place and refreshes
+//! its `LastUpdatedTime`. The notifications, subscribers and tags attached to the
+//! budget are untouched — they have their own operations.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +154,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBudget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBudgetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBudget"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateBudgetErrorModeled::InternalErrorException(InternalErrorException {
+                message: Some(
+                    "budgets is mounted on an engine that holds no state for it".to_string(),
+                ),
+            })
+        })?;
+
+        crate::state::validate_budget(&input.new_budget).map_err(|message| {
+            UpdateBudgetErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+        })?;
+
+        let key = (
+            input.account_id.clone(),
+            input.new_budget.budget_name.clone(),
+        );
+        let mut store = state.lock();
+        let stored = store.budgets.get_mut(&key).ok_or_else(|| {
+            UpdateBudgetErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "Unable to update budget: {} - the budget doesn't exist.",
+                    input.new_budget.budget_name
+                )),
+            })
+        })?;
+
+        let mut budget = input.new_budget;
+        budget.last_updated_time = Some(::aws_smithy_types::DateTime::from(
+            ::std::time::SystemTime::now(),
+        ));
+        stored.budget = budget;
+
+        Ok(UpdateBudgetOutput {})
     }
 }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -200,18 +191,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplication"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateApplicationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the EMR Serverless application store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // `clientToken` is `@idempotencyToken` on an `@idempotent` operation: the same
+        // token names the same application, so a retried create reports the first one
+        // rather than minting a second.
+        let replayed = store
+            .create_application_tokens
+            .get(&input.client_token)
+            .cloned();
+        if let Some(application_id) = replayed {
+            if let Some(record) = store.settled_mut(&application_id, now) {
+                return Ok(CreateApplicationOutput {
+                    application_id: record.application.application_id.clone(),
+                    name: record.application.name.clone(),
+                    arn: record.application.arn.clone(),
+                });
+            }
+        }
+
+        // The store is bounded: past its bound a create is refused rather than adding
+        // another record. This operation models no quota error, so the refusal is its
+        // modelled `ValidationException`.
+        if store.applications.len() >= crate::state::MAX_APPLICATIONS {
+            return Err(CreateApplicationErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "This account already holds the maximum of {} applications",
+                        crate::state::MAX_APPLICATIONS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let application_id = store.mint_application_id();
+        let arn = crate::state::application_arn(&region, &application_id);
+        let created_at = crate::state::now_timestamp(now);
+        let application = Application {
+            application_id: application_id.clone(),
+            name: input.name,
+            arn: arn.clone(),
+            release_label: input.release_label,
+            r#type: input.r#type,
+            // A new application is not usable the instant the create returns; the clock
+            // owes it `CREATED` once the transition span has passed.
+            state: "CREATING".to_string(),
+            state_details: None,
+            initial_capacity: input.initial_capacity,
+            maximum_capacity: input.maximum_capacity,
+            created_at,
+            updated_at: created_at,
+            tags: input.tags,
+            // `AutoStartConfig` and `AutoStopConfig` document their defaults, so the
+            // stored record carries them and every reader reports the same values.
+            auto_start_configuration: crate::state::adopt_auto_start(
+                input.auto_start_configuration,
+            ),
+            auto_stop_configuration: crate::state::adopt_auto_stop(input.auto_stop_configuration),
+            network_configuration: input.network_configuration,
+            architecture: input.architecture,
+            image_configuration: crate::state::adopt_image_configuration(input.image_configuration),
+            worker_type_specifications: crate::state::adopt_worker_type_specifications(
+                input.worker_type_specifications,
+            ),
+            runtime_configuration: input.runtime_configuration,
+            monitoring_configuration: input.monitoring_configuration,
+            disk_encryption_configuration: input.disk_encryption_configuration,
+            interactive_configuration: input.interactive_configuration,
+            scheduler_configuration: input.scheduler_configuration,
+            identity_center_configuration: crate::state::adopt_identity_center_configuration(
+                input.identity_center_configuration,
+            ),
+            job_level_cost_allocation_configuration: input.job_level_cost_allocation_configuration,
+        };
+        let name = application.name.clone();
+
+        store.applications.insert(
+            application_id.clone(),
+            crate::state::ApplicationRecord {
+                application,
+                pending: Some(crate::state::PendingState {
+                    due: now + crate::state::LIFECYCLE_TRANSITION,
+                    state: "CREATED".to_string(),
+                    state_details: None,
+                }),
+                job_runs: ::std::collections::BTreeMap::new(),
+                job_run_tokens: ::std::collections::HashMap::new(),
+                next_job_run_seq: 0,
+            },
+        );
+        store
+            .create_application_tokens
+            .insert(input.client_token, application_id.clone());
+
+        Ok(CreateApplicationOutput {
+            application_id,
+            name,
+            arn,
+        })
     }
 }

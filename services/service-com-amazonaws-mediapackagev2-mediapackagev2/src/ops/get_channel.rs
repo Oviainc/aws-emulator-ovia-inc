@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Reads one persisted channel out of [`crate::state`] and reports it
+//! exactly as `CreateChannel` stored it, ingest URLs included. Purely reporting: it
+//! writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `handle` below is the implementation; `crate::state` holds the store it reads.
 //!
 //! ## Shape of an operation
 //!
@@ -200,18 +196,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetChannel"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetChannelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        let Some(group) = store.channel_groups.get(&input.channel_group_name) else {
+            return Err(GetChannelErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Channel group {} not found",
+                        input.channel_group_name
+                    )),
+                    resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
+                },
+            )
+            .into());
+        };
+        let Some(channel) = group.channels.get(&input.channel_name) else {
+            return Err(GetChannelErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Channel {} not found in channel group {}",
+                        input.channel_name, input.channel_group_name
+                    )),
+                    resource_type_not_found: Some("CHANNEL".to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetChannelOutput {
+            multiview_configuration: channel.multiview_configuration.clone(),
+            attached_multiview_channels: None,
+            arn: channel.arn.clone(),
+            channel_name: channel.name.clone(),
+            channel_group_name: channel.group_name.clone(),
+            created_at: channel.created_at,
+            modified_at: channel.modified_at,
+            reset_at: channel.reset_at,
+            description: channel.description.clone(),
+            ingest_endpoints: Some(channel.ingest_endpoints.clone()),
+            input_type: channel.input_type.clone(),
+            e_tag: Some(channel.etag.clone()),
+            tags: Some(channel.tags.clone()),
+            input_switch_configuration: channel.input_switch_configuration.clone(),
+            output_header_configuration: channel.output_header_configuration.clone(),
+            output_locking_mode: channel.output_locking_mode.clone(),
+        })
     }
 }

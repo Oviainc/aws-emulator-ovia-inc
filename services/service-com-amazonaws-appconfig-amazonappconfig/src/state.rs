@@ -1,11 +1,772 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-appconfig-amazonappconfig service.
+//!
+//! AppConfig's control plane is a tree, and this module holds all of it: an
+//! application owns environments and configuration profiles, a profile owns the
+//! hosted configuration versions written into it, and an environment owns the
+//! deployments started into it. Every value an operation answers is read back out of
+//! this tree rather than computed from the request that asked for it.
+//!
+//! A deployment is the one resource here with a lifetime of its own: AppConfig rolls
+//! a configuration out over the strategy's deployment duration, then monitors it for
+//! the strategy's final bake time, and only then is the deployment `COMPLETE`. That
+//! progression is owed by the CLOCK, not by anybody calling — so it is stored as the
+//! instant it started plus the strategy's documented durations, and
+//! [`Deployment::materialize`] brings the record up to whatever the clock already
+//! made due. Reporting it never invents a transition that was not owed.
+
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, SystemTime};
+
+use crate::ops::types::{DeploymentEvent, Monitor, Validator};
+
+/// `DeploymentState` values this service moves a deployment through. Each is a member
+/// of `DEPLOYMENT_STATE_VALUES` in `crate::ops::types` (the model's `DeploymentState`
+/// enum).
+pub const DEPLOYMENT_DEPLOYING: &str = "DEPLOYING";
+/// See [`DEPLOYMENT_DEPLOYING`].
+pub const DEPLOYMENT_BAKING: &str = "BAKING";
+/// See [`DEPLOYMENT_DEPLOYING`].
+pub const DEPLOYMENT_COMPLETE: &str = "COMPLETE";
+
+/// `EnvironmentState` values this service moves an environment through, from
+/// `ENVIRONMENT_STATE_VALUES` in `crate::ops::types`.
+pub const ENVIRONMENT_READY_FOR_DEPLOYMENT: &str = "READY_FOR_DEPLOYMENT";
+/// See [`ENVIRONMENT_READY_FOR_DEPLOYMENT`].
+pub const ENVIRONMENT_DEPLOYING: &str = "DEPLOYING";
+
+/// `GrowthType` values, from `GROWTH_TYPE_VALUES` in `crate::ops::types`.
+pub const GROWTH_LINEAR: &str = "LINEAR";
+/// See [`GROWTH_LINEAR`].
+pub const GROWTH_EXPONENTIAL: &str = "EXPONENTIAL";
+
+/// `DeploymentEventType` values this service records, from
+/// `DEPLOYMENT_EVENT_TYPE_VALUES` in `crate::ops::types`.
+pub const EVENT_DEPLOYMENT_STARTED: &str = "DEPLOYMENT_STARTED";
+/// See [`EVENT_DEPLOYMENT_STARTED`].
+pub const EVENT_PERCENTAGE_UPDATED: &str = "PERCENTAGE_UPDATED";
+/// See [`EVENT_DEPLOYMENT_STARTED`].
+pub const EVENT_BAKE_TIME_STARTED: &str = "BAKE_TIME_STARTED";
+/// See [`EVENT_DEPLOYMENT_STARTED`].
+pub const EVENT_DEPLOYMENT_COMPLETED: &str = "DEPLOYMENT_COMPLETED";
+
+/// `TriggeredBy` values, from `TRIGGERED_BY_VALUES` in `crate::ops::types`.
+pub const TRIGGERED_BY_USER: &str = "USER";
+/// See [`TRIGGERED_BY_USER`].
+pub const TRIGGERED_BY_APPCONFIG: &str = "APPCONFIG";
+
+/// The documented application quota: `ServiceQuotaExceededException`'s own
+/// documentation lists "Applications: 100 max".
+pub const MAX_APPLICATIONS: usize = 100;
+
+/// Bounds on the stores this service grows one request at a time, so a loop of create
+/// calls cannot grow the emulator's heap without limit. AppConfig's own per-account
+/// quotas for these resources are adjustable and are not carried in the model, so these
+/// numbers are the EMULATOR's bounds; a write past one is refused with the quota error
+/// the operation already declares (`ServiceQuotaExceededException`, HTTP 402) rather
+/// than accepted silently.
+pub const MAX_ENVIRONMENTS_PER_APPLICATION: usize = 100;
+/// See [`MAX_ENVIRONMENTS_PER_APPLICATION`].
+pub const MAX_CONFIGURATION_PROFILES_PER_APPLICATION: usize = 100;
+/// See [`MAX_ENVIRONMENTS_PER_APPLICATION`].
+pub const MAX_HOSTED_CONFIGURATION_VERSIONS_PER_PROFILE: usize = 100;
+/// See [`MAX_ENVIRONMENTS_PER_APPLICATION`]. Enforced by
+/// [`ComAmazonawsAppconfigAmazonappconfigState::try_insert_strategy`], which is the only
+/// way into the created-strategy map.
+pub const MAX_DEPLOYMENT_STRATEGIES: usize = 100;
+
+/// The largest single hosted configuration this emulator stores, and the total it holds
+/// across every configuration profile.
+///
+/// A hosted configuration version is the one place this service stores caller-supplied
+/// bytes, so both the per-write size and the cumulative total are bounded here. AppConfig's
+/// own configuration-size quota is not in the model, so these are the emulator's
+/// bounds: an over-sized write is refused with the modelled `PayloadTooLargeException`
+/// (HTTP 413), which reports the limit and the size in [`BYTES_MEASURE_KILOBYTES`] so a
+/// client can read both, and a write that would exceed the total budget is refused with
+/// `ServiceQuotaExceededException` (HTTP 402).
+pub const MAX_HOSTED_CONFIGURATION_BYTES: usize = 2 * 1024 * 1024;
+/// See [`MAX_HOSTED_CONFIGURATION_BYTES`].
+pub const MAX_TOTAL_HOSTED_CONFIGURATION_BYTES: usize = 64 * 1024 * 1024;
+/// Bytes per kilobyte, the unit `PayloadTooLargeException` reports its limit in.
+pub const BYTES_PER_KILOBYTE: f32 = 1024.0;
+/// The `BytesMeasure` value `PayloadTooLargeException` reports, from
+/// `BYTES_MEASURE_VALUES` in `crate::ops::types`.
+pub const BYTES_MEASURE_KILOBYTES: &str = "KILOBYTES";
+
+/// How many deployment records an environment keeps.
+///
+/// AppConfig retains an environment's deployment history; this emulator retains the most
+/// recent of it and drops the oldest, already-terminal records beyond this bound, so an
+/// environment deployed into in a loop cannot grow without limit. The bound is the
+/// emulator's, not an AppConfig quota.
+pub const MAX_RETAINED_DEPLOYMENTS_PER_ENVIRONMENT: usize = 200;
+
+/// The `LocationUri` that selects AppConfig's own hosted configuration store: "For the
+/// AppConfig hosted configuration store and for feature flags, specify `hosted`", as the
+/// model documents on `CreateConfigurationProfile`'s `LocationUri` member.
+pub const HOSTED_LOCATION_URI: &str = "hosted";
+
+/// The `Type` values a configuration profile accepts. The model's own
+/// `CreateConfigurationProfile` `Type` documentation says: "When calling this API, enter
+/// one of the following values for `Type`: `AWS.AppConfig.FeatureFlags`,
+/// `AWS.Freeform`."
+pub const CONFIGURATION_PROFILE_TYPES: &[&str] = &["AWS.AppConfig.FeatureFlags", "AWS.Freeform"];
+
+/// The floor on a deployment's rollout window.
+///
+/// `AppConfig.AllAtOnce` has a deployment duration of 0 minutes, so its rollout would
+/// otherwise be owed at the very instant the deployment started and `StartDeployment`
+/// would answer a deployment that had already left `DEPLOYING`. The window is floored
+/// here instead, so a caller reading straight after the start call still observes the
+/// deployment rolling out. The length is chosen (AWS documents no floor); every
+/// strategy whose deployment duration is at least a minute is unaffected by it.
+const MINIMUM_ROLLOUT: Duration = Duration::from_millis(500);
+
+/// The most growth steps a rollout is split into.
+///
+/// The smallest growth factor the model's `Percentage` shape allows is 1%, which needs
+/// 100 linear steps (and 7 exponential ones) to reach every target, so no strategy the
+/// model can express is cut short by this bound — and the schedule's loop is bounded by
+/// it rather than by a float comparison, so it terminates for any stored value.
+const MAX_ROLLOUT_STEPS: usize = 100;
+
+/// Lowercase alphanumerics, the alphabet the model's `Id` shape allows
+/// (`^[a-z0-9]{4,7}$`).
+const ID_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+/// Length of a minted id. Within `Id`'s `{4,7}` bound, and the width AppConfig's own
+/// ids use.
+const ID_LENGTH: usize = 7;
+
+/// One row of AppConfig's predefined deployment-strategy catalog: a strategy every
+/// account can deploy with, without first calling `CreateDeploymentStrategy`.
+#[derive(Debug, Clone, Copy)]
+pub struct PredefinedStrategy {
+    /// The strategy id, which for a predefined strategy is also its name.
+    pub id: &'static str,
+    /// Total time the rollout lasts.
+    pub deployment_duration_in_minutes: i32,
+    /// How the percentage of targets grows over that time.
+    pub growth_type: &'static str,
+    /// The percentage of targets each growth step adds.
+    pub growth_factor: f32,
+    /// Time AppConfig monitors the deployment after the rollout before completing it.
+    pub final_bake_time_in_minutes: i32,
+}
+
+/// AppConfig's predefined deployment strategies, from the AWS AppConfig User Guide's
+/// "Predefined deployment strategies" table. Each row's deployment duration and
+/// growth factor are the ones the strategy's own name states — `Linear20Percent`
+/// `Every6Minutes` adds 20% of targets every 6 minutes, i.e. five steps across a
+/// 30-minute deployment — and `AppConfig.AllAtOnce` reaches every target at once with
+/// a 10-minute bake time.
+pub const PREDEFINED_DEPLOYMENT_STRATEGIES: &[PredefinedStrategy] = &[
+    PredefinedStrategy {
+        id: "AppConfig.AllAtOnce",
+        deployment_duration_in_minutes: 0,
+        growth_type: GROWTH_LINEAR,
+        growth_factor: 100.0,
+        final_bake_time_in_minutes: 10,
+    },
+    PredefinedStrategy {
+        id: "AppConfig.Linear50PercentEvery30Seconds",
+        deployment_duration_in_minutes: 1,
+        growth_type: GROWTH_LINEAR,
+        growth_factor: 50.0,
+        final_bake_time_in_minutes: 1,
+    },
+    PredefinedStrategy {
+        id: "AppConfig.Canary10Percent20Minutes",
+        deployment_duration_in_minutes: 20,
+        growth_type: GROWTH_EXPONENTIAL,
+        growth_factor: 10.0,
+        final_bake_time_in_minutes: 10,
+    },
+    PredefinedStrategy {
+        id: "AppConfig.Linear20PercentEvery6Minutes",
+        deployment_duration_in_minutes: 30,
+        growth_type: GROWTH_LINEAR,
+        growth_factor: 20.0,
+        final_bake_time_in_minutes: 10,
+    },
+];
+
+/// A deployment strategy: the rollout schedule a deployment follows.
+#[derive(Debug, Clone)]
+pub struct DeploymentStrategy {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub deployment_duration_in_minutes: i32,
+    pub growth_type: String,
+    pub growth_factor: f32,
+    pub final_bake_time_in_minutes: i32,
+    pub replicate_to: String,
+}
+
+impl From<&PredefinedStrategy> for DeploymentStrategy {
+    fn from(predefined: &PredefinedStrategy) -> Self {
+        Self {
+            id: predefined.id.to_string(),
+            // A predefined strategy's name is its id; it is not replicated anywhere.
+            name: predefined.id.to_string(),
+            description: None,
+            deployment_duration_in_minutes: predefined.deployment_duration_in_minutes,
+            growth_type: predefined.growth_type.to_string(),
+            growth_factor: predefined.growth_factor,
+            final_bake_time_in_minutes: predefined.final_bake_time_in_minutes,
+            replicate_to: "NONE".to_string(),
+        }
+    }
+}
+
+/// An AppConfig application: the organisational root that owns environments and
+/// configuration profiles.
+#[derive(Debug, Clone)]
+pub struct Application {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub tags: HashMap<String, String>,
+    pub environments: HashMap<String, Environment>,
+    pub profiles: HashMap<String, ConfigurationProfile>,
+}
+
+impl Application {
+    pub fn new(
+        id: String,
+        name: String,
+        description: Option<String>,
+        tags: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            description,
+            tags,
+            environments: HashMap::new(),
+            profiles: HashMap::new(),
+        }
+    }
+}
+
+/// A deployment group within an application, and the deployments made into it.
+#[derive(Debug, Clone)]
+pub struct Environment {
+    pub id: String,
+    pub application_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub state: String,
+    pub monitors: Vec<Monitor>,
+    pub tags: HashMap<String, String>,
+    pub deployments: HashMap<i32, Deployment>,
+    pub next_deployment_number: i32,
+}
+
+impl Environment {
+    pub fn new(
+        id: String,
+        application_id: String,
+        name: String,
+        description: Option<String>,
+        monitors: Vec<Monitor>,
+        tags: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            id,
+            application_id,
+            name,
+            description,
+            // A new environment has nothing deploying into it yet.
+            state: ENVIRONMENT_READY_FOR_DEPLOYMENT.to_string(),
+            monitors,
+            tags,
+            deployments: HashMap::new(),
+            // AppConfig numbers an environment's deployments from 1.
+            next_deployment_number: 1,
+        }
+    }
+
+    /// Bring this environment, and every deployment in it, up to the state the clock
+    /// already owes at `now`: an environment is `DEPLOYING` exactly while one of its
+    /// deployments is still rolling out or baking, and `READY_FOR_DEPLOYMENT` once
+    /// none is.
+    pub fn materialize(&mut self, now: SystemTime) {
+        for deployment in self.deployments.values_mut() {
+            deployment.materialize(now);
+        }
+        self.state = if self.deployments.values().any(Deployment::is_in_flight) {
+            ENVIRONMENT_DEPLOYING.to_string()
+        } else {
+            ENVIRONMENT_READY_FOR_DEPLOYMENT.to_string()
+        };
+    }
+
+    /// The deployment still rolling out or baking in this environment, if any. A
+    /// second deployment into the same environment conflicts with it.
+    pub fn deployment_in_flight(&self) -> Option<&Deployment> {
+        self.deployments.values().find(|d| d.is_in_flight())
+    }
+
+    /// Store a new deployment and answer the stored record.
+    ///
+    /// Only [`MAX_RETAINED_DEPLOYMENTS_PER_ENVIRONMENT`] records are kept: the oldest
+    /// beyond that bound are dropped first, and only ones the deployment has already
+    /// finished with — a deployment still rolling out or baking is the one a caller is
+    /// watching, so it is never evicted, and an environment holding nothing but
+    /// in-flight deployments keeps them all (at most one, since `StartDeployment`
+    /// refuses a second). The record being stored is never dropped either: pruning
+    /// drops lower deployment numbers and this is the highest, so the entry it is
+    /// written into is always vacant.
+    pub fn record_deployment(&mut self, deployment: Deployment) -> &Deployment {
+        let number = deployment.deployment_number;
+        while self.deployments.len() >= MAX_RETAINED_DEPLOYMENTS_PER_ENVIRONMENT {
+            let Some(oldest_finished) = self
+                .deployments
+                .values()
+                .filter(|held| !held.is_in_flight())
+                .map(|held| held.deployment_number)
+                .min()
+            else {
+                break;
+            };
+            self.deployments.remove(&oldest_finished);
+        }
+        self.deployments.entry(number).or_insert(deployment)
+    }
+
+    /// The highest deployment number this environment has issued; `0` before the
+    /// first deployment.
+    pub fn latest_deployment_number(&self) -> i32 {
+        self.next_deployment_number - 1
+    }
+}
+
+/// A configuration profile: where a configuration lives, and the versions of it this
+/// service hosts when that location is AppConfig's own hosted store.
+#[derive(Debug, Clone)]
+pub struct ConfigurationProfile {
+    pub id: String,
+    pub application_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub location_uri: String,
+    pub retrieval_role_arn: Option<String>,
+    pub validators: Vec<Validator>,
+    /// The `Type` the caller declared (`AWS.Freeform`, `AWS.AppConfig.FeatureFlags`),
+    /// or `None` when it declared none: the model lists the values it accepts but
+    /// states no default, so none is substituted.
+    pub profile_type: Option<String>,
+    pub kms_key_identifier: Option<String>,
+    pub tags: HashMap<String, String>,
+    pub hosted_versions: BTreeMap<i32, HostedConfigurationVersion>,
+    pub next_version_number: i32,
+}
+
+impl ConfigurationProfile {
+    /// The highest hosted version number written to this profile; `0` before the
+    /// first write.
+    pub fn latest_version_number(&self) -> i32 {
+        self.next_version_number - 1
+    }
+}
+
+/// One version of a configuration held in AppConfig's hosted store, byte for byte as
+/// the caller wrote it.
+#[derive(Debug, Clone)]
+pub struct HostedConfigurationVersion {
+    pub version_number: i32,
+    pub description: Option<String>,
+    pub content: Vec<u8>,
+    pub content_type: String,
+    pub version_label: Option<String>,
+}
+
+/// A deployment of one configuration version into one environment.
+#[derive(Debug, Clone)]
+pub struct Deployment {
+    pub deployment_number: i32,
+    pub application_id: String,
+    pub environment_id: String,
+    pub deployment_strategy_id: String,
+    pub configuration_profile_id: String,
+    pub configuration_name: String,
+    pub configuration_location_uri: String,
+    pub configuration_version: String,
+    pub description: Option<String>,
+    pub deployment_duration_in_minutes: i32,
+    pub growth_type: String,
+    pub growth_factor: f32,
+    pub final_bake_time_in_minutes: i32,
+    pub state: String,
+    pub percentage_complete: f32,
+    pub started_at: SystemTime,
+    pub completed_at: Option<SystemTime>,
+    pub event_log: Vec<DeploymentEvent>,
+    pub kms_key_identifier: Option<String>,
+    pub version_label: Option<String>,
+    pub tags: HashMap<String, String>,
+}
+
+/// What `StartDeployment` persists about a new deployment, beside the strategy that
+/// paces it. Grouped so [`Deployment::start`] takes one argument per concern instead
+/// of a dozen positional strings.
+#[derive(Debug, Clone)]
+pub struct NewDeployment {
+    pub deployment_number: i32,
+    pub application_id: String,
+    pub environment_id: String,
+    pub configuration_profile_id: String,
+    pub configuration_name: String,
+    pub configuration_location_uri: String,
+    pub configuration_version: String,
+    pub description: Option<String>,
+    pub kms_key_identifier: Option<String>,
+    pub version_label: Option<String>,
+    pub tags: HashMap<String, String>,
+}
+
+impl Deployment {
+    /// Start a deployment at `started_at`, paced by `strategy`.
+    ///
+    /// The deployment begins `DEPLOYING` with its first growth step applied and one
+    /// `DEPLOYMENT_STARTED` event; every later state, percentage and event is owed by
+    /// the clock and materialised by [`Deployment::materialize`].
+    pub fn start(new: NewDeployment, strategy: &DeploymentStrategy, started_at: SystemTime) -> Self {
+        let mut deployment = Self {
+            deployment_number: new.deployment_number,
+            application_id: new.application_id,
+            environment_id: new.environment_id,
+            deployment_strategy_id: strategy.id.clone(),
+            configuration_profile_id: new.configuration_profile_id,
+            configuration_name: new.configuration_name,
+            configuration_location_uri: new.configuration_location_uri,
+            configuration_version: new.configuration_version,
+            description: new.description,
+            deployment_duration_in_minutes: strategy.deployment_duration_in_minutes,
+            growth_type: strategy.growth_type.clone(),
+            growth_factor: strategy.growth_factor,
+            final_bake_time_in_minutes: strategy.final_bake_time_in_minutes,
+            state: DEPLOYMENT_DEPLOYING.to_string(),
+            percentage_complete: 0.0,
+            started_at,
+            completed_at: None,
+            event_log: vec![deployment_event(
+                EVENT_DEPLOYMENT_STARTED,
+                TRIGGERED_BY_USER,
+                "Deployment started.".to_string(),
+                started_at,
+            )],
+            kms_key_identifier: new.kms_key_identifier,
+            version_label: new.version_label,
+            tags: new.tags,
+        };
+        // The first growth step is due at the start instant, so the deployment is
+        // never reported as having reached 0% of its targets.
+        deployment.materialize(started_at);
+        deployment
+    }
+
+    /// Whether the deployment is still rolling out or baking, i.e. is in one of the
+    /// `DeploymentState` values it can still leave on its own.
+    pub fn is_in_flight(&self) -> bool {
+        matches!(
+            self.state.as_str(),
+            DEPLOYMENT_DEPLOYING | DEPLOYMENT_BAKING
+        )
+    }
+
+    /// How long the rollout itself lasts: the strategy's deployment duration, floored
+    /// at [`MINIMUM_ROLLOUT`].
+    fn rollout_duration(&self) -> Duration {
+        let duration = Duration::from_secs(60 * self.deployment_duration_in_minutes.max(0) as u64);
+        duration.max(MINIMUM_ROLLOUT)
+    }
+
+    /// How long AppConfig monitors the deployment after the rollout before completing
+    /// it: the strategy's final bake time.
+    fn bake_duration(&self) -> Duration {
+        Duration::from_secs(60 * self.final_bake_time_in_minutes.max(0) as u64)
+    }
+
+    /// The instant the rollout finishes and the final bake begins.
+    fn rollout_end(&self) -> SystemTime {
+        self.started_at + self.rollout_duration()
+    }
+
+    /// The instant the deployment becomes `COMPLETE`.
+    fn completion_due(&self) -> SystemTime {
+        self.rollout_end() + self.bake_duration()
+    }
+
+    /// The rollout schedule: for each growth step the strategy performs, the instant
+    /// it falls due and the cumulative percentage of targets it reaches.
+    ///
+    /// `LINEAR` adds `GrowthFactor` percent of targets per step; `EXPONENTIAL` reaches
+    /// `GrowthFactor * 2^N` percent at step `N`, the formula the model's `GrowthType`
+    /// documentation gives. The steps are spread evenly across the rollout window with
+    /// the first one due at the start instant, so `AppConfig.Linear50PercentEvery30`
+    /// `Seconds` reaches 50% at the start and 100% thirty seconds in.
+    ///
+    /// The step count is bounded by [`MAX_ROLLOUT_STEPS`] and the loop runs over a
+    /// fixed range, so this terminates whatever the stored growth factor is — a growth
+    /// factor is request-derived for a caller-created strategy, and a non-finite one
+    /// survives `f32::clamp`, which propagates NaN instead of mapping it into range.
+    fn rollout_schedule(&self) -> Vec<(SystemTime, f32)> {
+        // A growth factor that is not a finite percentage cannot pace anything, so it
+        // is normalised to a single-step rollout before it reaches the loop below.
+        let growth_factor = if self.growth_factor.is_finite() {
+            self.growth_factor.clamp(1.0, 100.0)
+        } else {
+            100.0
+        };
+
+        let mut percentages: Vec<f32> = Vec::with_capacity(MAX_ROLLOUT_STEPS);
+        for step in 0..MAX_ROLLOUT_STEPS {
+            let multiplier = if self.growth_type == GROWTH_EXPONENTIAL {
+                // `2^step`, saturating at infinity, which `min(100.0)` then clamps.
+                2f32.powi(i32::try_from(step).unwrap_or(i32::MAX))
+            } else {
+                // Step `n` has added the growth factor `n + 1` times.
+                step as f32 + 1.0
+            };
+            let reached = (growth_factor * multiplier).min(100.0);
+            percentages.push(reached);
+            if reached >= 100.0 {
+                break;
+            }
+        }
+
+        let rollout = self.rollout_duration();
+        let steps = percentages.len() as f64;
+        percentages
+            .into_iter()
+            .enumerate()
+            .map(|(index, reached)| {
+                let due = self.started_at + rollout.mul_f64(index as f64 / steps);
+                (due, reached)
+            })
+            .collect()
+    }
+
+    /// Bring the deployment up to the state the clock already owes it at `now`.
+    ///
+    /// Every transition this applies was due at an instant that has passed, whether or
+    /// not anybody asked, so a reporting operation may call it: it cannot make a later
+    /// caller see anything other than what the clock had already made true.
+    pub fn materialize(&mut self, now: SystemTime) {
+        if !self.is_in_flight() {
+            return;
+        }
+
+        for (due, reached) in self.rollout_schedule() {
+            if due <= now && reached > self.percentage_complete {
+                self.percentage_complete = reached;
+                self.event_log.push(deployment_event(
+                    EVENT_PERCENTAGE_UPDATED,
+                    TRIGGERED_BY_APPCONFIG,
+                    format!("The configuration reached {reached}% of deployment targets."),
+                    due,
+                ));
+            }
+        }
+
+        let rollout_end = self.rollout_end();
+        if self.state == DEPLOYMENT_DEPLOYING
+            && now >= rollout_end
+            && !self.bake_duration().is_zero()
+        {
+            self.state = DEPLOYMENT_BAKING.to_string();
+            self.event_log.push(deployment_event(
+                EVENT_BAKE_TIME_STARTED,
+                TRIGGERED_BY_APPCONFIG,
+                format!(
+                    "The deployment is baking for {} minute(s).",
+                    self.final_bake_time_in_minutes
+                ),
+                rollout_end,
+            ));
+        }
+
+        let completion_due = self.completion_due();
+        if now >= completion_due {
+            self.state = DEPLOYMENT_COMPLETE.to_string();
+            self.completed_at = Some(completion_due);
+            self.event_log.push(deployment_event(
+                EVENT_DEPLOYMENT_COMPLETED,
+                TRIGGERED_BY_APPCONFIG,
+                "Deployment completed.".to_string(),
+                completion_due,
+            ));
+        }
+    }
+
+    /// This deployment's events as the model describes `EventLog`: "The most recent
+    /// events are displayed first."
+    pub fn event_log_newest_first(&self) -> Vec<DeploymentEvent> {
+        self.event_log.iter().rev().cloned().collect()
+    }
+}
+
+/// One deployment event, as the model's `DeploymentEvent` shape.
+fn deployment_event(
+    event_type: &str,
+    triggered_by: &str,
+    description: String,
+    occurred_at: SystemTime,
+) -> DeploymentEvent {
+    DeploymentEvent {
+        event_type: Some(event_type.to_string()),
+        triggered_by: Some(triggered_by.to_string()),
+        description: Some(description),
+        action_invocations: None,
+        occurred_at: Some(to_date_time(occurred_at)),
+    }
+}
+
+/// An instant as the `Iso8601DateTime` the model binds these timestamps to.
+pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    let since_epoch = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
+}
 
 /// Per-service state for com-amazonaws-appconfig-amazonappconfig. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAppconfigAmazonappconfigState {
-    // TODO: add service-specific state fields
+    /// Every application, by application id.
+    pub applications: HashMap<String, Application>,
+    /// Deployment strategies this account created, by strategy id.
+    ///
+    /// PRIVATE on purpose: [`Self::try_insert_strategy`] is the only way in, so the
+    /// [`MAX_DEPLOYMENT_STRATEGIES`] bound cannot be bypassed by a handler mutating the
+    /// map directly. AppConfig's predefined `AppConfig.*` strategies are not in here;
+    /// [`Self::resolve_strategy`] answers for those too.
+    deployment_strategies: HashMap<String, DeploymentStrategy>,
+    /// Counter behind [`Self::mint_id`]; never answered to a caller.
+    id_sequence: u64,
+    /// Bytes of hosted configuration content this service is holding, across every
+    /// configuration profile. Maintained by
+    /// [`Self::reserve_hosted_configuration_bytes`] and bounded by
+    /// [`MAX_TOTAL_HOSTED_CONFIGURATION_BYTES`].
+    hosted_configuration_bytes: usize,
+}
+
+impl ComAmazonawsAppconfigAmazonappconfigState {
+    /// Mint a fresh resource id matching the model's `Id` shape (`^[a-z0-9]{4,7}$`),
+    /// unique across every resource this service holds.
+    pub fn mint_id(&mut self) -> String {
+        loop {
+            self.id_sequence = self.id_sequence.wrapping_add(1);
+            let candidate = encode_id(self.id_sequence);
+            if !self.id_taken(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Whether any resource already answers to `id`.
+    fn id_taken(&self, id: &str) -> bool {
+        self.deployment_strategies.contains_key(id)
+            || self.applications.contains_key(id)
+            || self.applications.values().any(|application| {
+                application.environments.contains_key(id) || application.profiles.contains_key(id)
+            })
+    }
+
+    /// Resolve a deployment strategy id to the strategy it names: one this account
+    /// created, or one of AppConfig's predefined `AppConfig.*` strategies, which are
+    /// deployable without a `CreateDeploymentStrategy` call.
+    pub fn resolve_strategy(&self, id: &str) -> Option<DeploymentStrategy> {
+        if let Some(created) = self.deployment_strategies.get(id) {
+            return Some(created.clone());
+        }
+        PREDEFINED_DEPLOYMENT_STRATEGIES
+            .iter()
+            .find(|predefined| predefined.id == id)
+            .map(DeploymentStrategy::from)
+    }
+
+    /// Store a deployment strategy this account created.
+    ///
+    /// Answers `false`, having stored nothing, when this service already holds
+    /// [`MAX_DEPLOYMENT_STRATEGIES`] of them — the bound that keeps a loop of create
+    /// calls from growing the emulator's heap without limit. `CreateDeploymentStrategy`
+    /// (still a 501 of its own) is the caller this exists for; replacing a strategy that
+    /// already exists under the same id is not growth and is always allowed.
+    pub fn try_insert_strategy(&mut self, strategy: DeploymentStrategy) -> bool {
+        let replacing = self.deployment_strategies.contains_key(&strategy.id);
+        if !replacing && self.deployment_strategies.len() >= MAX_DEPLOYMENT_STRATEGIES {
+            return false;
+        }
+        self.deployment_strategies
+            .insert(strategy.id.clone(), strategy);
+        true
+    }
+
+    /// Forget a deployment strategy this account created. Nothing calls this yet —
+    /// `DeleteDeploymentStrategy` is still a stub, and this is the hook it needs so
+    /// deleting a strategy frees its slot.
+    pub fn remove_strategy(&mut self, id: &str) -> Option<DeploymentStrategy> {
+        self.deployment_strategies.remove(id)
+    }
+
+    /// The deployment strategies this account created, for a reader that must report
+    /// them without reaching into the map.
+    pub fn created_strategies(&self) -> impl Iterator<Item = &DeploymentStrategy> {
+        self.deployment_strategies.values()
+    }
+
+    /// Account for `bytes` about to be stored as a hosted configuration version.
+    /// Answers `false`, having changed nothing, when storing them would take this
+    /// service past [`MAX_TOTAL_HOSTED_CONFIGURATION_BYTES`]; the caller then refuses
+    /// the write rather than growing the heap.
+    pub fn reserve_hosted_configuration_bytes(&mut self, bytes: usize) -> bool {
+        let total = self.hosted_configuration_bytes.saturating_add(bytes);
+        if total > MAX_TOTAL_HOSTED_CONFIGURATION_BYTES {
+            return false;
+        }
+        self.hosted_configuration_bytes = total;
+        true
+    }
+
+    /// Give back the accounting for a hosted configuration version that is no longer
+    /// stored. Nothing calls this yet — `DeleteHostedConfigurationVersion` is still a
+    /// stub, and this is the hook it needs so deleting a version frees its budget.
+    pub fn release_hosted_configuration_bytes(&mut self, bytes: usize) {
+        self.hosted_configuration_bytes = self.hosted_configuration_bytes.saturating_sub(bytes);
+    }
+
+    /// Bytes of hosted configuration content this service is currently holding.
+    pub fn hosted_configuration_bytes(&self) -> usize {
+        self.hosted_configuration_bytes
+    }
+}
+
+/// Render a counter value as an id over [`ID_ALPHABET`].
+///
+/// The counter is run through SplitMix64's finalizer first, a bijection on `u64`, so
+/// consecutive resources do not get adjacent ids — AppConfig's ids carry no ordering
+/// a caller could depend on. Uniqueness is not left to the mixing: [`mint_id`] rejects
+/// a candidate any resource already holds.
+///
+/// [`mint_id`]: ComAmazonawsAppconfigAmazonappconfigState::mint_id
+fn encode_id(sequence: u64) -> String {
+    let mut mixed = sequence.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^= mixed >> 31;
+
+    let mut id = String::with_capacity(ID_LENGTH);
+    for slot in 0..ID_LENGTH {
+        let index = (mixed >> (slot * 6)) % ID_ALPHABET.len() as u64;
+        id.push(char::from(ID_ALPHABET[index as usize]));
+    }
+    id
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

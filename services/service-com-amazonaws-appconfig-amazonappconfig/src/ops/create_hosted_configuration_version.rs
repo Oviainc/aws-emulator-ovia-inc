@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHostedConfigurationVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateHostedConfigurationVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateHostedConfigurationVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes a new version of a profile's hosted configuration and persists
+//! its bytes.
 //!
 //! ## Shape of an operation
 //!
@@ -185,20 +178,209 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateHostedConfigurationVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateHostedConfigurationVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateHostedConfigurationVersion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateHostedConfigurationVersionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The one member of this service's API that stores caller-supplied bytes, so the
+        // write is bounded before anything is kept: see
+        // `state::MAX_HOSTED_CONFIGURATION_BYTES`. `PayloadTooLargeException` reports
+        // the limit and the size in KILOBYTES, the unit the model's `BytesMeasure` enum
+        // offers, so a client can read both.
+        let content_length = input.content.len();
+        if content_length > crate::state::MAX_HOSTED_CONFIGURATION_BYTES {
+            return Err(CreateHostedConfigurationVersionErrorModeled::PayloadTooLargeException(
+                PayloadTooLargeException {
+                    message: Some(format!(
+                        "The configuration content is larger than the maximum of {} bytes this \
+                         emulator stores for a hosted configuration version.",
+                        crate::state::MAX_HOSTED_CONFIGURATION_BYTES
+                    )),
+                    measure: Some(crate::state::BYTES_MEASURE_KILOBYTES.to_string()),
+                    limit: crate::state::MAX_HOSTED_CONFIGURATION_BYTES as f32
+                        / crate::state::BYTES_PER_KILOBYTE,
+                    size: content_length as f32 / crate::state::BYTES_PER_KILOBYTE,
+                },
+            )
+            .into());
+        }
+
+        let Some(application) = store.applications.get(&input.application_id) else {
+            return Err(CreateHostedConfigurationVersionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No application with id {} exists.",
+                        input.application_id
+                    )),
+                    resource_name: Some(input.application_id),
+                },
+            )
+            .into());
+        };
+        let Some(profile) = application.profiles.get(&input.configuration_profile_id) else {
+            return Err(CreateHostedConfigurationVersionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No configuration profile with id {} exists in application {}.",
+                        input.configuration_profile_id, input.application_id
+                    )),
+                    resource_name: Some(input.configuration_profile_id),
+                },
+            )
+            .into());
+        };
+
+        // A hosted configuration version only exists in AppConfig's own hosted store,
+        // which a profile selects with the `LocationUri` the model documents as
+        // `hosted`; a profile pointing at S3, Parameter Store or Secrets Manager holds
+        // its configuration there instead, so there is no hosted version to write.
+        if profile.location_uri != crate::state::HOSTED_LOCATION_URI {
+            return Err(CreateHostedConfigurationVersionErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "Configuration profile {} has LocationUri {}, not {}, so it does not use \
+                         the AppConfig hosted configuration store.",
+                        input.configuration_profile_id,
+                        profile.location_uri,
+                        crate::state::HOSTED_LOCATION_URI
+                    )),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
+
+        // `LatestVersionNumber` is the model's optimistic lock: "an optional locking
+        // token used to prevent race conditions from overwriting configuration updates
+        // when creating a new version". A caller that names a version other than the
+        // one currently latest lost that race.
+        if let Some(expected) = input.latest_version_number {
+            let latest = profile.latest_version_number();
+            if expected != latest {
+                return Err(CreateHostedConfigurationVersionErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "LatestVersionNumber {expected} does not match the latest hosted \
+                             configuration version {latest} of this configuration profile."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Both the number of versions a profile keeps and the total content this
+        // service holds are bounded, so a loop of writes cannot grow the emulator's
+        // heap without limit.
+        if profile.hosted_versions.len()
+            >= crate::state::MAX_HOSTED_CONFIGURATION_VERSIONS_PER_PROFILE
+        {
+            return Err(
+                CreateHostedConfigurationVersionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "Cannot create another hosted configuration version: configuration \
+                             profile {} already holds the maximum of {}.",
+                            input.configuration_profile_id,
+                            crate::state::MAX_HOSTED_CONFIGURATION_VERSIONS_PER_PROFILE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if !store.reserve_hosted_configuration_bytes(content_length) {
+            return Err(
+                CreateHostedConfigurationVersionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "Cannot store another hosted configuration version: this emulator \
+                             already holds its maximum of {} bytes of hosted configuration \
+                             content.",
+                            crate::state::MAX_TOTAL_HOSTED_CONFIGURATION_BYTES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(profile) = store
+            .applications
+            .get_mut(&input.application_id)
+            .and_then(|application| {
+                application
+                    .profiles
+                    .get_mut(&input.configuration_profile_id)
+            })
+        else {
+            return Err(CreateHostedConfigurationVersionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The configuration profile could not be re-read while writing the hosted \
+                         configuration version"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let version_number = profile.next_version_number;
+        profile.next_version_number += 1;
+        // Read off the stored profile before it is borrowed for the insert, so the
+        // response names the persisted parents rather than echoing the URI labels.
+        let application_id = profile.application_id.clone();
+        let configuration_profile_id = profile.id.clone();
+        let version = crate::state::HostedConfigurationVersion {
+            version_number,
+            description: input.description,
+            // The exact bytes the caller wrote, so a later read returns the
+            // configuration byte for byte.
+            content: input.content,
+            content_type: input.content_type,
+            version_label: input.version_label,
+        };
+        // `next_version_number` only ever increases, so the slot is vacant. An occupied
+        // one is refused rather than answered from: reporting 201 with another version's
+        // content would describe a write this call never made.
+        let stored = match profile.hosted_versions.entry(version_number) {
+            std::collections::btree_map::Entry::Vacant(slot) => slot.insert(version),
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(
+                    CreateHostedConfigurationVersionErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: Some(format!(
+                                "Hosted configuration version {version_number} already exists"
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        // Answered from the stored version. `KmsKeyArn` is deliberately left unset, not
+        // overlooked: it names the key AppConfig encrypted the version with, and this
+        // emulator encrypts with no KMS key, so any ARN here would be fabricated.
+        Ok(CreateHostedConfigurationVersionOutput {
+            application_id: Some(application_id),
+            configuration_profile_id: Some(configuration_profile_id),
+            version_number: stored.version_number,
+            description: stored.description.clone(),
+            content: Some(stored.content.clone()),
+            content_type: Some(stored.content_type.clone()),
+            version_label: stored.version_label.clone(),
+            kms_key_arn: None,
+        })
     }
 }

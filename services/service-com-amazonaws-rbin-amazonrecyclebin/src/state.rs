@@ -1,11 +1,240 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-rbin-amazonrecyclebin service.
+//!
+//! Recycle Bin's control plane is a flat collection of retention rules addressed
+//! by an 11-character identifier, so the store is one ordered map of rules plus an
+//! ARN index. The ordering is load-bearing: `ListRules` pages through the map in
+//! key order, and its `NextToken` is the last identifier it returned, so a page
+//! boundary stays stable while rules are added or removed.
+
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
+use std::time::SystemTime;
+
+use crate::ops::types::{LockConfiguration, ResourceTag, RetentionPeriod, RuleSummary, Tag};
+
+/// The region an ARN carries when the request is unsigned, so no SigV4 credential
+/// scope names one. Every emulator defaults to `us-east-1`.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// `RuleIdentifier` is `^[0-9a-zA-Z]{11}$` — exactly 11 characters from the base62
+/// alphabet, per the Smithy model.
+pub const IDENTIFIER_LEN: usize = 11;
+
+/// The alphabet `^[0-9a-zA-Z]{11}$` allows, in the digit order used to render a
+/// minted identifier. 62^11 exceeds `u64::MAX`, so every seed renders in 11 digits.
+const BASE62_DIGITS: &[u8; 62] =
+    b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/// `ListRules` page size when the caller names none. The model bounds `MaxResults`
+/// at 1000, so an unbounded page can never be larger than this.
+pub const MAX_PAGE_SIZE: usize = 1000;
+
+/// The number of retention rules this Region holds, after which `CreateRule` is
+/// refused with the modelled `ServiceQuotaExceededException`.
+///
+/// Recycle Bin's published Service Quotas entry "Retention rules per Region" is 1000
+/// (Amazon EBS User Guide, "Recycle Bin quotas"), so the store is bounded by the same
+/// number the real service bounds an account's Region by, rather than by an invented
+/// cap. It also keeps the store from growing for the process's whole lifetime on
+/// nothing but repeated `CreateRule` calls.
+pub const MAX_RULES: usize = 1000;
+
+/// One persisted Recycle Bin retention rule — the single record every operation of
+/// this service reads its response out of.
+#[derive(Debug, Clone)]
+pub struct Rule {
+    /// The rule's unique id, `^[0-9a-zA-Z]{11}$`, and this map's key.
+    pub identifier: String,
+    /// `arn:aws:rbin:{region}:{account}:rule/{identifier}`.
+    pub rule_arn: String,
+    pub description: Option<String>,
+    /// `EBS_SNAPSHOT` | `EBS_VOLUME` | `EC2_IMAGE`. Fixed at creation: the model
+    /// says a rule's resource type cannot be updated.
+    pub resource_type: String,
+    pub retention_period: RetentionPeriod,
+    /// Tag-level rules: the resource tags that select what the rule retains.
+    pub resource_tags: Vec<ResourceTag>,
+    /// Region-level rules: the tags that exclude a resource from the rule.
+    pub exclude_resource_tags: Vec<ResourceTag>,
+    /// The rule's own AWS tags (`TagResource`/`ListTagsForResource`).
+    pub tags: Vec<Tag>,
+    /// `available` | `pending`.
+    pub status: String,
+    pub lock_configuration: Option<LockConfiguration>,
+    /// `locked` | `pending_unlock` | `unlocked`; `None` means never locked, a state
+    /// a rule can never return to once locked.
+    pub lock_state: Option<String>,
+    /// When a `pending_unlock` rule's unlock delay expires.
+    pub lock_end_time: Option<SystemTime>,
+    pub created_at: SystemTime,
+}
+
+impl Rule {
+    /// The `RuleSummary` projection `ListRules` reports: identifier, description,
+    /// retention period, lock state and ARN.
+    pub fn to_summary(&self) -> RuleSummary {
+        RuleSummary {
+            identifier: Some(self.identifier.clone()),
+            description: self.description.clone(),
+            retention_period: Some(self.retention_period.clone()),
+            lock_state: self.lock_state.clone(),
+            rule_arn: Some(self.rule_arn.clone()),
+        }
+    }
+
+    /// Whether the rule's lock still forbids modifying or deleting it.
+    ///
+    /// Per the model: `locked` cannot be modified or deleted; `pending_unlock` has
+    /// been unlocked but is still inside the unlock delay, so it can be modified or
+    /// deleted "only after the unlock delay period has expired" — which the clock,
+    /// not a caller, makes due.
+    pub fn is_lock_protected(&self, now: SystemTime) -> bool {
+        match self.lock_state.as_deref() {
+            Some("locked") => true,
+            Some("pending_unlock") => self.lock_end_time.is_none_or(|end| now < end),
+            _ => false,
+        }
+    }
+
+    /// Whether every tag in `filter` appears among the rule's resource tags. An
+    /// empty filter selects every rule.
+    pub fn has_resource_tags(&self, filter: &[ResourceTag]) -> bool {
+        filter
+            .iter()
+            .all(|wanted| contains_resource_tag(&self.resource_tags, wanted))
+    }
+
+    /// Whether every tag in `filter` appears among the rule's exclusion tags. An
+    /// empty filter selects every rule.
+    pub fn has_exclude_resource_tags(&self, filter: &[ResourceTag]) -> bool {
+        filter
+            .iter()
+            .all(|wanted| contains_resource_tag(&self.exclude_resource_tags, wanted))
+    }
+}
+
+/// A tag matches when the keys are equal and, where the filter names a value, the
+/// values are equal too; a filter that names no value matches any value for the key.
+fn contains_resource_tag(tags: &[ResourceTag], wanted: &ResourceTag) -> bool {
+    tags.iter().any(|tag| {
+        tag.resource_tag_key == wanted.resource_tag_key
+            && wanted
+                .resource_tag_value
+                .as_ref()
+                .is_none_or(|value| tag.resource_tag_value.as_ref() == Some(value))
+    })
+}
 
 /// Per-service state for com-amazonaws-rbin-amazonrecyclebin. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsRbinAmazonrecyclebinState {
-    // TODO: add service-specific state fields
+    /// Every retention rule, keyed by `Identifier` and ordered so paging is stable.
+    pub rules: BTreeMap<String, Rule>,
+    /// `RuleArn` -> `Identifier`, so the ARN-addressed tag operations resolve a rule
+    /// without scanning the map.
+    pub arn_index: HashMap<String, String>,
+    /// Monotonic counter behind [`Self::mint_identifier`].
+    pub next_identifier_seed: u64,
+}
+
+impl ComAmazonawsRbinAmazonrecyclebinState {
+    /// Mint an identifier no stored rule holds, as 11 base62 digits.
+    ///
+    /// Monotonic, so the map's key order is also creation order; the loop skips a
+    /// candidate that is somehow already taken rather than overwriting a rule.
+    pub fn mint_identifier(&mut self) -> String {
+        loop {
+            self.next_identifier_seed = self.next_identifier_seed.wrapping_add(1);
+            let candidate = base62_identifier(self.next_identifier_seed);
+            if !self.rules.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Insert a rule and index it by ARN.
+    pub fn insert_rule(&mut self, rule: Rule) {
+        self.arn_index
+            .insert(rule.rule_arn.clone(), rule.identifier.clone());
+        self.rules.insert(rule.identifier.clone(), rule);
+    }
+
+    /// Remove a rule and drop its ARN index entry. `None` when no such rule exists.
+    pub fn remove_rule(&mut self, identifier: &str) -> Option<Rule> {
+        let removed = self.rules.remove(identifier)?;
+        self.arn_index.remove(&removed.rule_arn);
+        Some(removed)
+    }
+
+    /// The rule an ARN addresses, resolved through [`Self::arn_index`].
+    pub fn rule_by_arn(&self, rule_arn: &str) -> Option<&Rule> {
+        let identifier = self.arn_index.get(rule_arn)?;
+        self.rules.get(identifier)
+    }
+
+    /// The rules to walk for a page, starting after `after` when a `NextToken`
+    /// named one.
+    pub fn page_from<'a>(
+        &'a self,
+        after: Option<&str>,
+    ) -> impl Iterator<Item = (&'a String, &'a Rule)> + 'a {
+        let lower = match after {
+            Some(identifier) => Bound::Excluded(identifier.to_string()),
+            None => Bound::Unbounded,
+        };
+        self.rules.range((lower, Bound::Unbounded))
+    }
+}
+
+/// Render `seed` as exactly [`IDENTIFIER_LEN`] base62 digits, most significant
+/// first and left-padded with `0`, so the result satisfies `^[0-9a-zA-Z]{11}$` and
+/// sorts in the same order as the seed.
+fn base62_identifier(seed: u64) -> String {
+    // Built as `char`s so the result needs no UTF-8 validation step — and so a future
+    // change to the alphabet cannot turn into replacement characters.
+    let mut digits = ['0'; IDENTIFIER_LEN];
+    let mut remaining = seed;
+    let mut index = IDENTIFIER_LEN;
+    while remaining > 0 && index > 0 {
+        index -= 1;
+        digits[index] = BASE62_DIGITS[(remaining % 62) as usize] as char;
+        remaining /= 62;
+    }
+    digits.iter().collect()
+}
+
+/// Whether `candidate` is shaped like a `RuleIdentifier` (`^[0-9a-zA-Z]{11}$`).
+pub fn is_rule_identifier(candidate: &str) -> bool {
+    candidate.len() == IDENTIFIER_LEN && candidate.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// The region this request is for: the SigV4 credential scope's region, which is
+/// what the SDK signs an endpoint's region into, else [`DEFAULT_REGION`].
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Encode a page cursor: the base64 of the last identifier the page returned.
+///
+/// Base64 is what makes the token opaque to a client, and its alphabet is exactly
+/// the `NextToken` pattern `^[A-Za-z0-9+/=]{1,2048}$`.
+pub fn encode_page_token(identifier: &str) -> String {
+    ::aws_smithy_types::base64::encode(identifier)
+}
+
+/// Decode a page cursor back to the identifier the previous page stopped at.
+///
+/// `None` for any token this service did not emit — it is base64 of something that
+/// is not a rule identifier — so the caller can refuse it as an invalid page token
+/// rather than silently returning the first page.
+pub fn decode_page_token(token: &str) -> Option<String> {
+    let bytes = ::aws_smithy_types::base64::decode(token).ok()?;
+    let identifier = String::from_utf8(bytes).ok()?;
+    is_rule_identifier(&identifier).then_some(identifier)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

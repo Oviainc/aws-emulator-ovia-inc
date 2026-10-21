@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartChangeSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartChangeSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartChangeSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a change set: it stores the submitted changes, reserves the entity each one
+//! acts on, and hands back the id and ARN of the record it stored. The change set then
+//! runs on the clock — `crate::state` carries it to `APPLYING` and `SUCCEEDED`, and an
+//! `APPLY` change set that succeeds is what makes its entities exist.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +173,277 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartChangeSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartChangeSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartChangeSet"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartChangeSetErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the marketplace catalog store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Every operation's `Catalog` member documents "Fixed value:
+        // AWSMarketplace", so any other catalog names nothing this service has.
+        if input.catalog != crate::state::AWS_MARKETPLACE_CATALOG {
+            return Err(StartChangeSetErrorModeled::ValidationException(
+                crate::state::wrong_catalog(&input.catalog),
+            )
+            .into());
+        }
+
+        // "The intent related to the request. The default is APPLY." `Intent`
+        // is a modelled enum, so the boundary validator has already refused
+        // any value outside it.
+        let intent = input
+            .intent
+            .clone()
+            .unwrap_or_else(|| crate::state::INTENT_APPLY.to_string());
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // Whatever the clock already owes the change sets in flight has to be
+        // settled before this request reads their statuses: a change set that
+        // finished is no longer holding its entities locked.
+        store.settle(now);
+
+        // `@idempotencyToken`: the same token names the same change set, so a
+        // retried start reports the first one rather than starting a second.
+        let replayed = input
+            .client_request_token
+            .as_deref()
+            .and_then(|token| store.idempotency_tokens.get(token).cloned())
+            .and_then(|id| store.change_sets.get(&id));
+        if let Some(record) = replayed {
+            return Ok(StartChangeSetOutput {
+                change_set_id: Some(record.id.clone()),
+                change_set_arn: Some(record.arn.clone()),
+            });
+        }
+
+        if store.change_sets.len() >= crate::state::CHANGE_SET_QUOTA {
+            return Err(StartChangeSetErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} change sets",
+                        crate::state::CHANGE_SET_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut changes: Vec<crate::state::ChangeRecord> =
+            Vec::with_capacity(input.change_set.len());
+        for change in &input.change_set {
+            // "You can use either Details or DetailsDocument, but not both."
+            // A document nested deeper than the emulator stores is refused
+            // here, before it is converted or persisted.
+            let document = match change.details_document.as_ref() {
+                None => None,
+                Some(document) => match crate::state::document_to_json(document) {
+                    Some(value) => Some(value),
+                    None => {
+                        return Err(StartChangeSetErrorModeled::ValidationException(
+                            crate::state::cannot_parse(
+                                "ChangeSet.DetailsDocument",
+                                format!(
+                                    "DetailsDocument nests deeper than {} levels",
+                                    crate::state::MAX_DETAILS_DEPTH
+                                ),
+                            ),
+                        )
+                        .into())
+                    }
+                },
+            };
+            if change.details.is_some() && document.is_some() {
+                return Err(StartChangeSetErrorModeled::ValidationException(
+                    crate::state::validation(
+                        "ChangeSet.Details",
+                        "a change carries either Details or DetailsDocument, but not both",
+                    ),
+                )
+                .into());
+            }
+
+            // Both members carry the same thing — the details of this change as
+            // a JSON object — so both are read into one value, and a value that
+            // is not an object is refused rather than stored.
+            let details = match (change.details.as_deref(), document) {
+                (Some(text), _) => match ::serde_json::from_str::<::serde_json::Value>(text) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        return Err(StartChangeSetErrorModeled::ValidationException(
+                            crate::state::cannot_parse(
+                                "ChangeSet.Details",
+                                format!("Details is not valid JSON: {error}"),
+                            ),
+                        )
+                        .into())
+                    }
+                },
+                (None, document) => document,
+            };
+            if let Some(value) = details.as_ref() {
+                if !value.is_object() {
+                    return Err(StartChangeSetErrorModeled::ValidationException(
+                        crate::state::validation(
+                            "ChangeSet.Details",
+                            "the details of a change are a JSON object",
+                        ),
+                    )
+                    .into());
+                }
+                // A details value nested without limit would be walked once per
+                // level by every later conversion and report, so the depth this
+                // service stores is bounded.
+                if crate::state::exceeds_details_depth(value) {
+                    return Err(StartChangeSetErrorModeled::ValidationException(
+                        crate::state::cannot_parse(
+                            "ChangeSet.Details",
+                            format!(
+                                "the details of a change nest no deeper than {} levels",
+                                crate::state::MAX_DETAILS_DEPTH
+                            ),
+                        ),
+                    )
+                    .into());
+                }
+                if let Some(visibility) = crate::state::invalid_visibility(value) {
+                    return Err(StartChangeSetErrorModeled::ValidationException(
+                        crate::state::validation(
+                            "ChangeSet.Details.Visibility",
+                            format!(
+                                "Visibility must be one of {:?}, not {visibility:?}",
+                                crate::state::ENTITY_VISIBILITY_VALUES
+                            ),
+                        ),
+                    )
+                    .into());
+                }
+            }
+
+            // A change naming an entity acts on that entity; a change naming
+            // none creates one, and the id it will carry is reserved now so
+            // `EntityIdList` can report it while the change set runs. A
+            // `VALIDATE` change set never creates an entity, so it reserves
+            // nothing.
+            let entity_id = match change.entity.identifier.as_deref() {
+                Some(identifier) => {
+                    let Some(entity) = store.resolve_identifier(identifier) else {
+                        return Err(StartChangeSetErrorModeled::ResourceNotFoundException(
+                            crate::state::entity_not_found(identifier),
+                        )
+                        .into());
+                    };
+                    if entity.entity_type != change.entity.r#type {
+                        let held = entity.entity_type.clone();
+                        return Err(StartChangeSetErrorModeled::ValidationException(
+                            crate::state::validation(
+                                "ChangeSet.Entity.Type",
+                                format!(
+                                    "entity {identifier} is a {held}, not a {}",
+                                    change.entity.r#type
+                                ),
+                            ),
+                        )
+                        .into());
+                    }
+                    Some(entity.id.clone())
+                }
+                None if intent == crate::state::INTENT_APPLY => Some(store.mint_entity_id()),
+                None => None,
+            };
+
+            if let Some(entity_id) = entity_id.as_deref() {
+                // "when a ChangeSet is running, all the entities targeted by
+                // the different changes are locked until the change set has
+                // completed … If you try to start a change set containing a
+                // change against an entity that is already locked, you will
+                // receive a ResourceInUseException error."
+                if let Some(holder) = store.locking_change_set(entity_id) {
+                    return Err(StartChangeSetErrorModeled::ResourceInUseException(
+                        crate::state::in_use(format!(
+                            "entity {entity_id} is locked by the running change set {holder}"
+                        )),
+                    )
+                    .into());
+                }
+                // "Within a single ChangeSet, you can't start the same change
+                // type against the same entity multiple times."
+                if changes.iter().any(|held| {
+                    held.entity_id.as_deref() == Some(entity_id)
+                        && held.change_type == change.change_type
+                }) {
+                    return Err(StartChangeSetErrorModeled::ResourceInUseException(
+                        crate::state::in_use(format!(
+                            "this change set runs {} against entity {entity_id} more than once",
+                            change.change_type
+                        )),
+                    )
+                    .into());
+                }
+            }
+
+            changes.push(crate::state::ChangeRecord {
+                change_type: change.change_type.clone(),
+                entity_type: change.entity.r#type.clone(),
+                entity_identifier: change.entity.identifier.clone(),
+                details: change.details.clone(),
+                details_document: details.filter(|_| change.details.is_none()),
+                change_name: change.change_name.clone(),
+                entity_tags: change.entity_tags.clone().unwrap_or_default(),
+                entity_id,
+            });
+        }
+
+        let id = store.mint_change_set_id();
+        let record = crate::state::ChangeSetRecord {
+            arn: crate::state::change_set_arn(&region, &id),
+            id: id.clone(),
+            name: input.change_set_name,
+            intent,
+            // A change set is asynchronous: it starts out running, and the
+            // clock owes it `APPLYING` and then `SUCCEEDED`.
+            status: crate::state::STATUS_PREPARING.to_string(),
+            start_time: crate::state::iso8601(now),
+            end_time: None,
+            // Nothing this emulator applies fails, so no change set reaches
+            // `FAILED` and none reports a failure.
+            failure_code: None,
+            failure_description: None,
+            changes,
+            tags: input.change_set_tags.unwrap_or_default(),
+            region,
+            schedule: vec![
+                crate::state::PendingTransition {
+                    due: now + crate::state::CHANGE_SET_PREPARING,
+                    status: crate::state::STATUS_APPLYING.to_string(),
+                },
+                crate::state::PendingTransition {
+                    due: now
+                        + crate::state::CHANGE_SET_PREPARING
+                        + crate::state::CHANGE_SET_APPLYING,
+                    status: crate::state::STATUS_SUCCEEDED.to_string(),
+                },
+            ],
+        };
+
+        store.change_sets.insert(id.clone(), record);
+        if let Some(token) = input.client_request_token {
+            store.idempotency_tokens.insert(token, id.clone());
+        }
+
+        // Read back out of the record this call stored, so the ids the caller
+        // gets are the ones the store holds.
+        let stored = store
+            .change_sets
+            .get(&id)
+            .expect("the change set this call just inserted is in the store");
+        Ok(StartChangeSetOutput {
+            change_set_id: Some(stored.id.clone()),
+            change_set_arn: Some(stored.arn.clone()),
+        })
     }
 }

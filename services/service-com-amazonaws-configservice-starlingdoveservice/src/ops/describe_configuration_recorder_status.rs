@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConfigurationRecorderStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConfigurationRecorderStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConfigurationRecorderStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the status of each configuration recorder from the status record
+//! [`crate::state`] holds: `recording` is false until `StartConfigurationRecorder`
+//! and true after it, with the start and stop times that call stamped.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +157,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConfigurationRecorderStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConfigurationRecorderStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConfigurationRecorderStatus"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let names = input.configuration_recorder_names.unwrap_or_default();
+        // Config serves at most one configuration recorder per request.
+        if names.len() > 1 {
+            return Err(
+                DescribeConfigurationRecorderStatusErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "you have specified more than one configuration recorder: \
+                             ConfigurationRecorderNames carries {} names",
+                            names.len(),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+
+        // Materialise the `Pending` -> `Success` recording-event change the clock has
+        // already made due. It was owed at that instant whether or not anybody asked
+        // for the status, so reporting it does not change what a later caller sees.
+        let now = ::std::time::SystemTime::now();
+        for status in store.recorder_status.values_mut() {
+            status.settle(now);
+        }
+
+        let mut selected: Vec<ConfigurationRecorderStatus> = if names.is_empty() {
+            let mut all: Vec<&crate::state::RecorderStatusEntry> =
+                store.recorder_status.values().collect();
+            all.sort_by(|left, right| left.name.cmp(&right.name));
+            all.into_iter()
+                .map(crate::state::RecorderStatusEntry::to_shape)
+                .collect()
+        } else {
+            let mut found = Vec::with_capacity(names.len());
+            for name in &names {
+                let Some(status) = store.recorder_status.get(name) else {
+                    return Err(
+                        DescribeConfigurationRecorderStatusErrorModeled::NoSuchConfigurationRecorderException(
+                            NoSuchConfigurationRecorderException {
+                                message: Some(format!(
+                                    "there is no configuration recorder named '{name}'"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                found.push(status.to_shape());
+            }
+            found
+        };
+
+        // `Arn` names one recorder, so an ARN that matches none is the same failure as
+        // a name that matches none.
+        if let Some(arn) = input.arn.as_deref() {
+            selected.retain(|status| status.arn.as_deref() == Some(arn));
+            if selected.is_empty() {
+                return Err(
+                    DescribeConfigurationRecorderStatusErrorModeled::NoSuchConfigurationRecorderException(
+                        NoSuchConfigurationRecorderException {
+                            message: Some(format!(
+                                "there is no configuration recorder with the ARN '{arn}'"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `ServicePrincipal` selects service-linked recorders, a class this emulator's
+        // `PutConfigurationRecorder` does not create; it narrows the list rather than
+        // naming one recorder, so while `PutServiceLinkedConfigurationRecorder` is
+        // unimplemented the answer is an empty list — "no recorder is linked to that
+        // service", not "no such recorder".
+        if let Some(service_principal) = input.service_principal.as_deref() {
+            let linked: Vec<&str> = store
+                .recorders
+                .values()
+                .filter(|recorder| {
+                    recorder.service_principal.as_deref() == Some(service_principal)
+                })
+                .map(|recorder| recorder.name.as_str())
+                .collect();
+            selected.retain(|status| {
+                status
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| linked.contains(&name))
+            });
+        }
+
+        Ok(DescribeConfigurationRecorderStatusOutput {
+            configuration_recorders_status: Some(selected),
+        })
     }
 }

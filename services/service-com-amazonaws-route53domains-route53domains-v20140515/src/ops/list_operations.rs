@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOperations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOperations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Enumerates the operation store, applying the request's `SubmittedSince`, `Status` and
+//! `Type` filters and its sort, and pages with `Marker` / `NextPageMarker`: the marker is
+//! the id of the last operation on the page just returned, and the last page omits it so
+//! a paginating client terminates.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOperations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The one write this reporting operation performs is materialising the completions the
+//! clock already made due — see [`crate::state::ComAmazonawsRoute53domainsRoute53domainsV20140515State::settle_operations`].
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +118,18 @@ impl From<ListOperationsErrorModeled> for ListOperationsError {
     }
 }
 
+/// `MaxItems`'s documented default: "Default: 20". The model's `@range(max: 100)` caps
+/// it, and the boundary validator enforces that cap.
+const DEFAULT_MAX_ITEMS: usize = 20;
+
+/// This operation's only modelled error.
+fn invalid_input(message: impl Into<String>) -> ListOperationsError {
+    ListOperationsErrorModeled::InvalidInput(InvalidInput {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
 /// The `ListOperations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +166,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOperations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOperationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOperations"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+
+        // `SortBy` is modelled as `ListOperationsSortAttributeName`, whose only member is
+        // `SubmittedDate`, so the sort attribute is fixed and only the order varies.
+        if let Some(sort_by) = input.sort_by.as_deref() {
+            if sort_by != "SubmittedDate" {
+                return Err(invalid_input(format!(
+                    "Value '{sort_by}' at 'sortBy' failed to satisfy constraint: Member must \
+                     satisfy enum value set: [SubmittedDate]"
+                )));
+            }
+        }
+        let descending = match input.sort_order.as_deref() {
+            None | Some("ASC") => false,
+            Some("DESC") => true,
+            Some(other) => {
+                return Err(invalid_input(format!(
+                    "Value '{other}' at 'sortOrder' failed to satisfy constraint: Member must \
+                     satisfy enum value set: [ASC, DESC]"
+                )))
+            }
+        };
+
+        // The model bounds `MaxItems` ABOVE only (`@range(max: 100)`, enforced by the
+        // boundary validator) and says nothing below, so the lower bound is this
+        // handler's: a page of zero operations could never make progress through the
+        // collection, so a caller that asks for one is refused rather than left
+        // paginating forever.
+        if input.max_items.is_some_and(|requested| requested < 1) {
+            return Err(invalid_input(format!(
+                "Value '{}' at 'maxItems' failed to satisfy constraint: Member must have value \
+                 greater than or equal to 1",
+                input.max_items.unwrap_or_default()
+            )));
+        }
+        let max_items = input
+            .max_items
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(DEFAULT_MAX_ITEMS);
+
+        // `SubmittedSince` selects "all the operations that you submitted after a
+        // specified date and time" — strictly after, as the documentation words it.
+        let submitted_since = input.submitted_since.map(crate::state::millis_of);
+        let statuses = input.status.unwrap_or_default();
+        let types = input.r#type.unwrap_or_default();
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::state::state_unavailable(Self::NAME))?;
+        let mut state = state.lock();
+
+        // Materialise any completion the clock already owes, so the reported statuses —
+        // and therefore the `Status` filter — reflect the time that has passed.
+        state.settle_operations(crate::state::now_millis());
+
+        let mut selected: Vec<&crate::state::OperationRecord> = state
+            .operations
+            .iter()
+            .filter(|record| {
+                submitted_since.is_none_or(|since| record.submitted_millis > since)
+                    && (statuses.is_empty() || statuses.iter().any(|s| s == record.status))
+                    && (types.is_empty() || types.iter().any(|t| t == record.op_type))
+            })
+            .collect();
+        // The store is already in submission order, which is `SubmittedDate` ascending.
+        if descending {
+            selected.reverse();
+        }
+
+        // The marker is the id of the last operation on the page just returned, so the
+        // next page starts immediately after it.
+        let marker = input.marker.as_deref().filter(|value| !value.is_empty());
+        let start = match marker {
+            None => 0,
+            Some(marker) => {
+                let position = selected
+                    .iter()
+                    .position(|record| record.operation_id == marker)
+                    .ok_or_else(|| {
+                        invalid_input(format!(
+                            "Value '{marker}' at 'marker' failed to satisfy constraint: Member \
+                             must be the NextPageMarker of a previous ListOperations response"
+                        ))
+                    })?;
+                position + 1
+            }
+        };
+
+        let page: Vec<OperationSummary> = selected[start..]
+            .iter()
+            .take(max_items)
+            .map(|record| OperationSummary {
+                operation_id: Some(record.operation_id.clone()),
+                status: Some(record.status.to_string()),
+                r#type: Some(record.op_type.to_string()),
+                submitted_date: Some(crate::state::date_time(record.submitted_millis)),
+                domain_name: Some(record.domain_name.clone()),
+                // Nothing in this slice fails or waits on a customer action, so there is
+                // no failure detail and no status flag to report.
+                message: None,
+                status_flag: None,
+                last_updated_date: Some(crate::state::date_time(record.last_updated_millis)),
+            })
+            .collect();
+        let next_page_marker = if start + page.len() < selected.len() {
+            page.last().and_then(|summary| summary.operation_id.clone())
+        } else {
+            None
+        };
+
+        Ok(ListOperationsOutput {
+            operations: Some(page),
+            next_page_marker,
+        })
     }
 }

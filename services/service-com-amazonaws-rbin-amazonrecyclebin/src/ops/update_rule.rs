@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: merges the supplied members into the PERSISTED retention rule and
+//! answers with the stored, merged record (HTTP 200). This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -199,18 +193,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the rbin retention-rule store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(rule) = store.rules.get_mut(&input.identifier) else {
+            return Err(UpdateRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Retention rule with ID {} not found",
+                        input.identifier
+                    )),
+                    reason: Some("RULE_NOT_FOUND".to_string()),
+                },
+            )
+            .into());
+        };
+        // A locked rule "can't be modified or deleted", and an unlocked one still
+        // inside its unlock delay can be modified "only after the unlock delay period
+        // has expired".
+        if rule.is_lock_protected(now) {
+            return Err(UpdateRuleErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Retention rule with ID {} can't be modified while its lock state is {}",
+                    rule.identifier,
+                    rule.lock_state.as_deref().unwrap_or("locked")
+                )),
+                reason: Some("INVALID_RULE_STATE".to_string()),
+            })
+            .into());
+        }
+
+        // Only the members the request carried are applied; an absent member leaves the
+        // stored value alone. `ResourceType` is deliberately NOT applied: the model says
+        // "This parameter is currently not supported. You can't update a retention
+        // rule's resource type after creation."
+        let merged_resource_tags = input
+            .resource_tags
+            .unwrap_or_else(|| rule.resource_tags.clone());
+        let merged_exclude_resource_tags = input
+            .exclude_resource_tags
+            .unwrap_or_else(|| rule.exclude_resource_tags.clone());
+        if !merged_resource_tags.is_empty() && !merged_exclude_resource_tags.is_empty() {
+            return Err(UpdateRuleErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "ExcludeResourceTags can't be specified together with ResourceTags: \
+                     exclusion tags apply to Region-level retention rules only"
+                        .to_string(),
+                ),
+                reason: Some("INVALID_PARAMETER_VALUE".to_string()),
+            })
+            .into());
+        }
+        if let Some(retention_period) = input.retention_period {
+            rule.retention_period = retention_period;
+        }
+        if let Some(description) = input.description {
+            rule.description = Some(description);
+        }
+        rule.resource_tags = merged_resource_tags;
+        rule.exclude_resource_tags = merged_exclude_resource_tags;
+
+        Ok(UpdateRuleOutput {
+            identifier: Some(rule.identifier.clone()),
+            retention_period: Some(rule.retention_period.clone()),
+            description: rule.description.clone(),
+            resource_type: Some(rule.resource_type.clone()),
+            resource_tags: Some(rule.resource_tags.clone()),
+            status: Some(rule.status.clone()),
+            lock_state: rule.lock_state.clone(),
+            lock_end_time: rule.lock_end_time.map(::aws_smithy_types::DateTime::from),
+            rule_arn: Some(rule.rule_arn.clone()),
+            exclude_resource_tags: Some(rule.exclude_resource_tags.clone()),
+        })
     }
 }
