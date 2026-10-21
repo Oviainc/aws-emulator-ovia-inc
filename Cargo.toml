@@ -125,6 +125,31 @@ members = [
     "services/service-com-amazonaws-deadline-deadline",
     "services/service-com-amazonaws-detective-amazondetective",
     "services/service-com-amazonaws-devicefarm-devicefarm-20150623",
+    "services/service-com-amazonaws-devopsagent-devopsagent",
+    "services/service-com-amazonaws-devopsguru-capstonecontrolplaneservice",
+    "services/service-com-amazonaws-directconnect-overtureservice",
+    "services/service-com-amazonaws-directoryservice-directoryservice-20150416",
+    "services/service-com-amazonaws-directoryservicedata-directoryservicedata",
+    "services/service-com-amazonaws-dlm-dlm-20180112",
+    "services/service-com-amazonaws-docdb-amazonrdsv19",
+    "services/service-com-amazonaws-docdbelastic-chimeradblionfishservicelambda",
+    "services/service-com-amazonaws-drs-elasticdisasterrecoveryservice",
+    "services/service-com-amazonaws-dsql-dsql",
+    "services/service-com-amazonaws-dynamodb-dynamodb-20120810",
+    "services/service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810",
+    "services/service-com-amazonaws-ebs-ebs",
+    "services/service-com-amazonaws-ec2-amazonec2",
+    "services/service-com-amazonaws-ec2instanceconnect-awsec2instanceconnectservice",
+    "services/service-com-amazonaws-ecr-amazonec2containerregistry-v20150921",
+    "services/service-com-amazonaws-ecrpublic-spencerfrontendservice",
+    "services/service-com-amazonaws-ecs-amazonec2containerservicev20141113",
+    "services/service-com-amazonaws-efs-magnolioapiservice-v20150201",
+    "services/service-com-amazonaws-eks-awswesleyfrontend",
+    "services/service-com-amazonaws-eksauth-eksauthfrontend",
+    "services/service-com-amazonaws-elasticache-amazonelasticachev9",
+    "services/service-com-amazonaws-elasticbeanstalk-awselasticbeanstalkservice",
+    "services/service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7",
+    "services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10",
     "core/router",
     "core/embedded",
 ]
@@ -285,6 +310,31 @@ service-com-amazonaws-dax-amazondaxv3 = { path = "services/service-com-amazonaws
 service-com-amazonaws-deadline-deadline = { path = "services/service-com-amazonaws-deadline-deadline" }
 service-com-amazonaws-detective-amazondetective = { path = "services/service-com-amazonaws-detective-amazondetective" }
 service-com-amazonaws-devicefarm-devicefarm-20150623 = { path = "services/service-com-amazonaws-devicefarm-devicefarm-20150623" }
+service-com-amazonaws-devopsagent-devopsagent = { path = "services/service-com-amazonaws-devopsagent-devopsagent" }
+service-com-amazonaws-devopsguru-capstonecontrolplaneservice = { path = "services/service-com-amazonaws-devopsguru-capstonecontrolplaneservice" }
+service-com-amazonaws-directconnect-overtureservice = { path = "services/service-com-amazonaws-directconnect-overtureservice" }
+service-com-amazonaws-directoryservice-directoryservice-20150416 = { path = "services/service-com-amazonaws-directoryservice-directoryservice-20150416" }
+service-com-amazonaws-directoryservicedata-directoryservicedata = { path = "services/service-com-amazonaws-directoryservicedata-directoryservicedata" }
+service-com-amazonaws-dlm-dlm-20180112 = { path = "services/service-com-amazonaws-dlm-dlm-20180112" }
+service-com-amazonaws-docdb-amazonrdsv19 = { path = "services/service-com-amazonaws-docdb-amazonrdsv19" }
+service-com-amazonaws-docdbelastic-chimeradblionfishservicelambda = { path = "services/service-com-amazonaws-docdbelastic-chimeradblionfishservicelambda" }
+service-com-amazonaws-drs-elasticdisasterrecoveryservice = { path = "services/service-com-amazonaws-drs-elasticdisasterrecoveryservice" }
+service-com-amazonaws-dsql-dsql = { path = "services/service-com-amazonaws-dsql-dsql" }
+service-com-amazonaws-dynamodb-dynamodb-20120810 = { path = "services/service-com-amazonaws-dynamodb-dynamodb-20120810" }
+service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810 = { path = "services/service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810" }
+service-com-amazonaws-ebs-ebs = { path = "services/service-com-amazonaws-ebs-ebs" }
+service-com-amazonaws-ec2-amazonec2 = { path = "services/service-com-amazonaws-ec2-amazonec2" }
+service-com-amazonaws-ec2instanceconnect-awsec2instanceconnectservice = { path = "services/service-com-amazonaws-ec2instanceconnect-awsec2instanceconnectservice" }
+service-com-amazonaws-ecr-amazonec2containerregistry-v20150921 = { path = "services/service-com-amazonaws-ecr-amazonec2containerregistry-v20150921" }
+service-com-amazonaws-ecrpublic-spencerfrontendservice = { path = "services/service-com-amazonaws-ecrpublic-spencerfrontendservice" }
+service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { path = "services/service-com-amazonaws-ecs-amazonec2containerservicev20141113" }
+service-com-amazonaws-efs-magnolioapiservice-v20150201 = { path = "services/service-com-amazonaws-efs-magnolioapiservice-v20150201" }
+service-com-amazonaws-eks-awswesleyfrontend = { path = "services/service-com-amazonaws-eks-awswesleyfrontend" }
+service-com-amazonaws-eksauth-eksauthfrontend = { path = "services/service-com-amazonaws-eksauth-eksauthfrontend" }
+service-com-amazonaws-elasticache-amazonelasticachev9 = { path = "services/service-com-amazonaws-elasticache-amazonelasticachev9" }
+service-com-amazonaws-elasticbeanstalk-awselasticbeanstalkservice = { path = "services/service-com-amazonaws-elasticbeanstalk-awselasticbeanstalkservice" }
+service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7 = { path = "services/service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7" }
+service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { path = "services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10" }
 
 # The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
 #

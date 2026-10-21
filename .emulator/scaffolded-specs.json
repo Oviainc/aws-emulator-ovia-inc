@@ -499,6 +499,106 @@
     {
       "shape_id": "com.amazonaws.devicefarm#DeviceFarm_20150623",
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/device-farm/service/2015-06-23/device-farm-2015-06-23.json"
+    },
+    {
+      "shape_id": "com.amazonaws.devopsagent#DevOpsAgent",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/devops-agent/service/2026-01-01/devops-agent-2026-01-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.devopsguru#CapstoneControlPlaneService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/devops-guru/service/2020-12-01/devops-guru-2020-12-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.directconnect#OvertureService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/direct-connect/service/2012-10-25/direct-connect-2012-10-25.json"
+    },
+    {
+      "shape_id": "com.amazonaws.directoryservice#DirectoryService_20150416",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/directory-service/service/2015-04-16/directory-service-2015-04-16.json"
+    },
+    {
+      "shape_id": "com.amazonaws.directoryservicedata#DirectoryServiceData",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/directory-service-data/service/2023-05-31/directory-service-data-2023-05-31.json"
+    },
+    {
+      "shape_id": "com.amazonaws.dlm#dlm_20180112",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/dlm/service/2018-01-12/dlm-2018-01-12.json"
+    },
+    {
+      "shape_id": "com.amazonaws.docdb#AmazonRDSv19",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/docdb/service/2014-10-31/docdb-2014-10-31.json"
+    },
+    {
+      "shape_id": "com.amazonaws.docdbelastic#ChimeraDbLionfishServiceLambda",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/docdb-elastic/service/2022-11-28/docdb-elastic-2022-11-28.json"
+    },
+    {
+      "shape_id": "com.amazonaws.drs#ElasticDisasterRecoveryService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/drs/service/2020-02-26/drs-2020-02-26.json"
+    },
+    {
+      "shape_id": "com.amazonaws.dsql#DSQL",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/dsql/service/2018-05-10/dsql-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.dynamodb#DynamoDB_20120810",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/dynamodb/service/2012-08-10/dynamodb-2012-08-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.dynamodbstreams#DynamoDBStreams_20120810",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/dynamodb-streams/service/2012-08-10/dynamodb-streams-2012-08-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ebs#Ebs",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/ebs/service/2019-11-02/ebs-2019-11-02.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ec2#AmazonEC2",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/ec2/service/2016-11-15/ec2-2016-11-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ec2instanceconnect#AWSEC2InstanceConnectService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/ec2-instance-connect/service/2018-04-02/ec2-instance-connect-2018-04-02.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ecr#AmazonEC2ContainerRegistry_V20150921",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/ecr/service/2015-09-21/ecr-2015-09-21.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ecrpublic#SpencerFrontendService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/ecr-public/service/2020-10-30/ecr-public-2020-10-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ecs#AmazonEC2ContainerServiceV20141113",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/ecs/service/2014-11-13/ecs-2014-11-13.json"
+    },
+    {
+      "shape_id": "com.amazonaws.efs#MagnolioAPIService_v20150201",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/efs/service/2015-02-01/efs-2015-02-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.eks#AWSWesleyFrontend",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/eks/service/2017-11-01/eks-2017-11-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.eksauth#EKSAuthFrontend",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/eks-auth/service/2023-11-26/eks-auth-2023-11-26.json"
+    },
+    {
+      "shape_id": "com.amazonaws.elasticache#AmazonElastiCacheV9",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/elasticache/service/2015-02-02/elasticache-2015-02-02.json"
+    },
+    {
+      "shape_id": "com.amazonaws.elasticbeanstalk#AWSElasticBeanstalkService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/elastic-beanstalk/service/2010-12-01/elastic-beanstalk-2010-12-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.elasticloadbalancing#ElasticLoadBalancing_v7",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/elastic-load-balancing/service/2012-06-01/elastic-load-balancing-2012-06-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.elasticloadbalancingv2#ElasticLoadBalancing_v10",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/elastic-load-balancing-v2/service/2015-12-01/elastic-load-balancing-v2-2015-12-01.json"
     }
   ]
 }
