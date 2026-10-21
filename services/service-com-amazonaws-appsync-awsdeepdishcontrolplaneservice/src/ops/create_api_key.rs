@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApiKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApiKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApiKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints an API key under a stored `GraphqlApi` and persists it in
+//! [`crate::state`]. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +151,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApiKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApiKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApiKey"))
+        // The key is minted from stored state and the clock; no request metadata
+        // beyond the deserialized input takes part, so `ctx` is unused.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateApiKeyErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = unix_seconds();
+        // "From the creation time, the time after which the API key expires. [...] The
+        // default value for this parameter is 7 days from creation time." An unset
+        // `expires` arrives as the modelled default, 0.
+        let requested = if input.expires == 0 {
+            now.saturating_add(DEFAULT_VALIDITY_SECONDS)
+        } else {
+            input.expires
+        };
+        // "The API key expiration must be set to a value between 1 and 365 days from
+        // creation" — checked on the submitted instant, before it is floored.
+        let validity = requested.saturating_sub(now);
+        if !(MIN_VALIDITY_SECONDS..=MAX_VALIDITY_SECONDS).contains(&validity) {
+            return Err(CreateApiKeyErrorModeled::ApiKeyValidityOutOfBoundsException(
+                ApiKeyValidityOutOfBoundsException {
+                    message: Some(format!(
+                        "expires must be between 1 and 365 days from creation, got {validity} \
+                         seconds"
+                    )),
+                },
+            )
+            .into());
+        }
+        // Both `expires` and `deletes` are documented as "seconds since the epoch,
+        // rounded down to the nearest hour". The model documents no grace period
+        // between the two, so the key is due for deletion when it expires.
+        let expires = floor_to_hour(requested);
+
+        let mut guard = state.lock();
+        // The key's parent API must exist, and must have room for another key.
+        {
+            let Some(api) = guard.graphql_apis.get(&input.api_id) else {
+                return Err(CreateApiKeyErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!("No GraphQL API found with ID {}", input.api_id)),
+                })
+                .into());
+            };
+            if api.api_keys.len() >= API_KEYS_PER_API {
+                return Err(CreateApiKeyErrorModeled::ApiKeyLimitExceededException(
+                    ApiKeyLimitExceededException {
+                        message: Some(format!(
+                            "an API may hold at most {API_KEYS_PER_API} API keys"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Mint the key id and its creation order from the state's own counters, then
+        // store it under its parent API.
+        let mut key_id = format!("{KEY_VERSION_PREFIX}{}", guard.mint_id());
+        while guard
+            .graphql_apis
+            .get(&input.api_id)
+            .is_some_and(|api| api.api_keys.contains_key(&key_id))
+        {
+            key_id = format!("{KEY_VERSION_PREFIX}{}", guard.mint_id());
+        }
+        let seq = guard.next_seq();
+        let record = crate::state::ApiKeyRecord {
+            seq,
+            id: key_id.clone(),
+            description: input.description,
+            expires,
+            deletes: expires,
+        };
+
+        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
+            return Err(CreateApiKeyErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("No GraphQL API found with ID {}", input.api_id)),
+            })
+            .into());
+        };
+        api.api_keys.insert(key_id.clone(), record);
+
+        // Answer from the STORED key, so `ListApiKeys` reports the same one.
+        Ok(CreateApiKeyOutput {
+            api_key: api
+                .api_keys
+                .get(&key_id)
+                .map(crate::state::ApiKeyRecord::to_api_key),
+        })
     }
+}
+
+/// The key version this service mints, as the `ApiKey` shape's own documentation
+/// describes it: `da2` keys report `expires`/`deletes` in seconds and accept a
+/// caller-provided expiration. (`da1` keys ceased to be valid in February 2018.)
+const KEY_VERSION_PREFIX: &str = "da2-";
+
+/// One hour in seconds: the granularity `expires` and `deletes` are documented with.
+const SECONDS_PER_HOUR: i64 = 3_600;
+
+/// One day in seconds, the unit the documented validity window is stated in.
+const SECONDS_PER_DAY: i64 = 86_400;
+
+/// `CreateApiKey`'s documented default: "The default value for this parameter is 7
+/// days from creation time."
+const DEFAULT_VALIDITY_SECONDS: i64 = 7 * SECONDS_PER_DAY;
+
+/// `ApiKeyValidityOutOfBoundsException`'s documented lower bound: "between 1 and 365
+/// days from creation".
+const MIN_VALIDITY_SECONDS: i64 = SECONDS_PER_DAY;
+
+/// `ApiKeyValidityOutOfBoundsException`'s documented upper bound.
+const MAX_VALIDITY_SECONDS: i64 = 365 * SECONDS_PER_DAY;
+
+/// The AppSync service quota for API keys on one GraphQL API, which
+/// `ApiKeyLimitExceededException` reports.
+const API_KEYS_PER_API: usize = 50;
+
+/// Now, as whole seconds since the Unix epoch.
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64)
+}
+
+/// `seconds` rounded DOWN to the nearest hour, the form both `ApiKey$expires` and
+/// `ApiKey$deletes` are documented to take.
+fn floor_to_hour(seconds: i64) -> i64 {
+    seconds - seconds.rem_euclid(SECONDS_PER_HOUR)
 }
