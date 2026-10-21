@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSpace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSpace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSpace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a private re:Post and PERSISTS it in [`crate::state`]: the response carries
+//! only the generated `spaceId`, so every other value a later `GetSpace` /
+//! `ListSpaces` returns must be derived and stored here.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +162,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSpace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSpaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSpace"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateSpaceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the repostspace emulator is mounted on an engine that holds \
+                              no state"
+                        .to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // `tier` drives the storage limit, so an unmodelled value cannot be stored.
+        // The framework already refuses every modelled constraint before `handle`
+        // runs; this keeps the derivation total rather than assuming it did.
+        let Some(storage_limit) = crate::state::storage_limit_for_tier(&input.tier) else {
+            return Err(field_validation(
+                "tier",
+                &format!(
+                    "Value '{}' is not a member of TierLevel: {}",
+                    input.tier,
+                    TIER_LEVEL_VALUES.join(" | ")
+                ),
+            ));
+        };
+        if let Some(parameters) = input.supported_email_domains.as_ref() {
+            if let Some(enabled) = parameters.enabled.as_ref() {
+                if !FEATURE_ENABLE_PARAMETER_VALUES.contains(&enabled.as_str()) {
+                    return Err(field_validation(
+                        "supportedEmailDomains.enabled",
+                        &format!(
+                            "Value '{}' is not a member of FeatureEnableParameter: {}",
+                            enabled,
+                            FEATURE_ENABLE_PARAMETER_VALUES.join(" | ")
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let mut guard = state.lock();
+
+        // A space's name and its subdomain each identify it, so neither can be reused
+        // by a second live space.
+        if let Some(existing) = guard.space_id_with_subdomain(&input.subdomain) {
+            let resource_id = existing.to_string();
+            return Err(CreateSpaceErrorModeled::ConflictException(ConflictException {
+                message: format!("Subdomain {} is already in use", input.subdomain),
+                resource_id,
+                resource_type: crate::state::SPACE_RESOURCE_TYPE.to_string(),
+            })
+            .into());
+        }
+        if let Some(existing) = guard.space_id_with_name(&input.name) {
+            let resource_id = existing.to_string();
+            return Err(CreateSpaceErrorModeled::ConflictException(ConflictException {
+                message: format!("Space name {} is already in use", input.name),
+                resource_id,
+                resource_type: crate::state::SPACE_RESOURCE_TYPE.to_string(),
+            })
+            .into());
+        }
+
+        // The account's space quota: a create beyond it is refused, which is also what
+        // keeps the store finite — a record is released only by `DeleteSpace`.
+        if guard.spaces.len() >= crate::state::MAX_SPACES_PER_ACCOUNT {
+            return Err(CreateSpaceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The account already holds the maximum of {} private re:Posts",
+                        crate::state::MAX_SPACES_PER_ACCOUNT
+                    ),
+                    resource_id: ::engine::emulator_account_id().to_string(),
+                    resource_type: crate::state::SPACE_RESOURCE_TYPE.to_string(),
+                    service_code: crate::state::SERVICE_CODE.to_string(),
+                    quota_code: crate::state::SPACES_QUOTA_CODE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let Some(space_id) = guard.mint_space_id() else {
+            return Err(CreateSpaceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "could not mint a unique space id".to_string(),
+                    retry_after_seconds: Some(1),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let now = ::std::time::Instant::now();
+        let space = crate::state::Space {
+            arn: crate::state::space_arn(&region, &space_id),
+            name: input.name.clone(),
+            description: input.description.clone(),
+            subdomain: input.subdomain.clone(),
+            vanity_domain: format!(
+                "{}.{}",
+                input.subdomain,
+                crate::state::SPACE_DOMAIN_SUFFIX
+            ),
+            vanity_domain_status: crate::state::VANITY_DOMAIN_STATUS_PENDING.to_string(),
+            random_domain: format!(
+                "{}.{}",
+                crate::state::random_subdomain(),
+                crate::state::SPACE_DOMAIN_SUFFIX
+            ),
+            status: crate::state::SPACE_STATUS_CREATING.to_string(),
+            configuration_status: crate::state::CONFIGURATION_STATUS_UNCONFIGURED.to_string(),
+            client_id: crate::state::new_client_id(),
+            identity_store_id: None,
+            application_arn: None,
+            customer_role_arn: input.role_arn.clone(),
+            tier: input.tier.clone(),
+            storage_limit,
+            user_kms_key: input.user_kms_key.clone(),
+            create_date_time: ::aws_smithy_types::DateTime::from(
+                ::std::time::SystemTime::now(),
+            ),
+            delete_date_time: None,
+            user_count: 0,
+            content_size: 0,
+            supported_email_domains: input
+                .supported_email_domains
+                .as_ref()
+                .map(crate::state::email_domains_status),
+            user_admins: Vec::new(),
+            group_admins: Vec::new(),
+            roles: ::std::collections::HashMap::new(),
+            tags: input.tags.clone().unwrap_or_default(),
+            channels: ::std::collections::HashMap::new(),
+            provisioning_due_at: now + crate::state::PROVISIONING_SPAN,
+            space_id: space_id.clone(),
+        };
+        guard.insert_space(space);
+
+        Ok(CreateSpaceOutput { space_id })
     }
+}
+
+/// A modelled `ValidationException` (HTTP 400) naming the member that failed and the
+/// constraint it failed, the way the service's own boundary validator words one.
+fn field_validation(member: &str, message: &str) -> CreateSpaceError {
+    CreateSpaceErrorModeled::ValidationException(ValidationException {
+        message: format!("{member}: {message}"),
+        reason: "fieldValidationFailed".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: message.to_string(),
+        }]),
+    })
+    .into()
 }

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChatToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChatToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: verifies the room exists in [`crate::state`], then mints an opaque token
+//! recorded there against (room, user, capabilities, attributes) with its expiry
+//! timestamps. Two calls never return the same token. An unknown room answers
+//! `ResourceNotFoundException` (404); a capability the modelled enum does not carry
+//! answers `ValidationException` (400).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChatToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A 501 from this operation would mean "nobody has written it yet"; it no longer
+//! answers one.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +165,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChatToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChatTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChatToken"))
+        let _ = ctx;
+        // Modeled constraints are already refused BEFORE this handler runs, so reaching
+        // here means `roomIdentifier`, `userId` and `sessionDurationInMinutes` satisfy
+        // their modelled bounds. The capability VALUES are checked below: the generated
+        // input carries them as plain strings.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service. An engine this service cannot read its state
+            // from means the operation cannot be served at all, which is what 501 says.
+            crate::scaffolded::Scaffolded::not_implemented("CreateChatToken")
+        })?;
+
+        let capabilities = input.capabilities.unwrap_or_default();
+        if let Some(unknown) = capabilities
+            .iter()
+            .find(|value| !CHAT_TOKEN_CAPABILITY_VALUES.contains(&value.as_str()))
+        {
+            return Err(CreateChatTokenErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    "capabilities",
+                    format!(
+                        "capability {unknown} is not one of [{}].",
+                        CHAT_TOKEN_CAPABILITY_VALUES.join(", ")
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let session_minutes = input
+            .session_duration_in_minutes
+            .unwrap_or(crate::state::DEFAULT_SESSION_DURATION_IN_MINUTES);
+        let now = ::std::time::SystemTime::now();
+        let token_expiration_time = now + crate::state::CHAT_TOKEN_LIFETIME;
+        // The session runs for the minutes the request asked for, from the mint.
+        let session_expiration_time = now
+            + ::std::time::Duration::from_secs(
+                u64::try_from(session_minutes).unwrap_or(0).saturating_mul(60),
+            );
+
+        let mut store = state.lock();
+        let Some(room_id) = store.room(&input.room_identifier).map(|room| room.id.clone()) else {
+            return Err(CreateChatTokenErrorModeled::ResourceNotFoundException(
+                crate::state::room_not_found(&input.room_identifier),
+            )
+            .into());
+        };
+
+        // Keep the token store bounded: drop the records whose sessions the clock has
+        // already ended, and the oldest-expiring ones if the set is at its cap.
+        store.prune_chat_tokens(now);
+
+        let token = store.mint_chat_token();
+        let record = crate::state::ChatToken {
+            token: token.clone(),
+            room_id,
+            user_id: input.user_id,
+            capabilities,
+            attributes: input.attributes.unwrap_or_default().into_iter().collect(),
+            token_expiration_time,
+            session_expiration_time,
+        };
+        // A plain insert, so the record this call persists is the one it describes.
+        store.chat_tokens.insert(token.clone(), record);
+        let Some(stored) = store.chat_tokens.get(&token) else {
+            // Unreachable: the insert above put this token in the map while the lock is held.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateChatToken",
+            ));
+        };
+
+        Ok(CreateChatTokenOutput {
+            token: Some(stored.token.clone()),
+            token_expiration_time: Some(crate::state::as_date_time(stored.token_expiration_time)),
+            session_expiration_time: Some(crate::state::as_date_time(
+                stored.session_expiration_time,
+            )),
+        })
     }
 }
