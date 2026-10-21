@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAsyncInvokes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAsyncInvokes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the invocations `StartAsyncInvoke` created: it applies the time and
+//! status filters, sorts by submit time in the requested order, truncates at
+//! `maxResults` and emits an opaque `nextToken` that resumes exactly where the
+//! page just returned ended (absent on the last page).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAsyncInvokes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting only: the one write it makes is to materialise the transitions out
+//! of `InProgress` the clock had already made due, exactly as `GetAsyncInvoke`
+//! does, so the two never disagree about a record's status.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +123,14 @@ impl From<ListAsyncInvokesErrorModeled> for ListAsyncInvokesError {
     }
 }
 
+/// This operation's own modelled 400 `ValidationException`.
+fn validation(message: String) -> ListAsyncInvokesError {
+    ListAsyncInvokesErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `ListAsyncInvokes` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -160,18 +167,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAsyncInvokes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAsyncInvokesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAsyncInvokes"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAsyncInvokesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Bedrock Runtime emulator has no state store".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut guard = state.lock();
+        guard.settle_async_invokes(crate::state::now_millis());
+
+        let submitted_after = input
+            .submit_time_after
+            .as_ref()
+            .map(crate::state::millis_of_datetime);
+        let submitted_before = input
+            .submit_time_before
+            .as_ref()
+            .map(crate::state::millis_of_datetime);
+        let status = match input.status_equals.as_deref() {
+            None => None,
+            Some(value) => match crate::state::AsyncInvokeStatus::parse(value) {
+                Some(status) => Some(status),
+                None => {
+                    return Err(validation(format!(
+                        "statusEquals must be one of InProgress, Completed or Failed, got {value}."
+                    )))
+                }
+            },
+        };
+
+        let mut matching: Vec<&crate::state::AsyncInvokeRecord> = guard
+            .async_invokes
+            .values()
+            .filter(|record| submitted_after.is_none_or(|after| record.submit_time >= after))
+            .filter(|record| submitted_before.is_none_or(|before| record.submit_time <= before))
+            .filter(|record| status.is_none_or(|status| record.status == status))
+            .collect();
+        // `sortBy` models exactly one value, SubmissionTime; the ARN breaks a tie
+        // so the order (and therefore a page token) is total.
+        matching.sort_by(|left, right| {
+            (left.submit_time, left.invocation_arn.as_str())
+                .cmp(&(right.submit_time, right.invocation_arn.as_str()))
+        });
+        if input.sort_order != "Ascending" {
+            matching.reverse();
+        }
+
+        // A page token names the last item of the page it was handed out with, so
+        // the next page starts at the item after it.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some((submit_time, invocation_arn)) = crate::state::decode_page_token(token)
+                else {
+                    return Err(validation(format!("The nextToken {token} is not valid.")));
+                };
+                let found = matching.iter().position(|record| {
+                    record.submit_time == submit_time && record.invocation_arn == invocation_arn
+                });
+                match found {
+                    Some(position) => position + 1,
+                    None => {
+                        return Err(validation(format!("The nextToken {token} is not valid.")))
+                    }
+                }
+            }
+        };
+
+        let remaining = &matching[start.min(matching.len())..];
+        // With no `maxResults` the page is the modelled ceiling, not everything
+        // stored, so one request cannot render an unbounded response.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .min(crate::state::MAX_PAGE_SIZE);
+        let page = &remaining[..page_size.min(remaining.len())];
+        let next_token = page
+            .last()
+            .filter(|_| page.len() < remaining.len())
+            .map(|last| crate::state::encode_page_token(last.submit_time, &last.invocation_arn));
+
+        let async_invoke_summaries = page
+            .iter()
+            .map(|record| AsyncInvokeSummary {
+                invocation_arn: record.invocation_arn.clone(),
+                model_arn: record.model_arn.clone(),
+                client_request_token: record.client_request_token.clone(),
+                status: Some(record.status.as_str().to_string()),
+                failure_message: record.failure_message.clone(),
+                submit_time: crate::state::datetime_of_millis(record.submit_time),
+                last_modified_time: record
+                    .last_modified_time
+                    .map(crate::state::datetime_of_millis),
+                end_time: record.end_time.map(crate::state::datetime_of_millis),
+                output_data_config: record.output_data_config.clone(),
+            })
+            .collect();
+
+        Ok(ListAsyncInvokesOutput {
+            next_token,
+            async_invoke_summaries: Some(async_invoke_summaries),
+        })
     }
 }
