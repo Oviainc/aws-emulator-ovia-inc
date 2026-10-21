@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchUpdateDevicePosition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchUpdateDevicePosition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: appends each accepted update to that device's position history
+//! under the named tracker in
+//! [`crate::state::ComAmazonawsLocationLocationserviceState::trackers`], stamping a
+//! server-side `ReceivedTime`. An update whose position is not a WGS 84 coordinate
+//! is reported per-entry in `Errors`; an unknown tracker is a
+//! `ResourceNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchUpdateDevicePosition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! NOT enforced here, and scoped to its own gap issue: the tracker's
+//! `PositionFiltering` mode (`TimeBased` 30 s / `DistanceBased` 30 m /
+//! `AccuracyBased`) is stored and reported by `DescribeTracker` but is not applied
+//! to writes, so every in-domain update is stored where the real service would
+//! drop some of them.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +169,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchUpdateDevicePosition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchUpdateDevicePositionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchUpdateDevicePosition"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchUpdateDevicePositionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Amazon Location state store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // The batch size caps the work one request can ask for. The model bounds
+        // `Updates` at `len 1..10` and the request boundary refuses a violation,
+        // but the bound is re-checked here so the iteration below is never
+        // caller-sized even if the boundary check changes.
+        if input.updates.len() > crate::state::MAX_BATCH_UPDATES {
+            return Err(BatchUpdateDevicePositionErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Updates must hold at most {} entries; got {}",
+                        crate::state::MAX_BATCH_UPDATES,
+                        input.updates.len()
+                    ),
+                    reason: "FieldValidationFailed".to_string(),
+                    field_list: vec![ValidationExceptionField {
+                        name: "Updates".to_string(),
+                        message: format!(
+                            "at most {} entries are accepted in one batch",
+                            crate::state::MAX_BATCH_UPDATES
+                        ),
+                    }],
+                },
+            )
+            .into());
+        }
+
+        // `ReceivedTime` is when the SERVICE accepted the update, so it is read
+        // from the clock once per request and never taken from the payload.
+        let received_time = crate::state::now_millis();
+
+        // Validate every entry BEFORE taking the state lock, so the lock is held
+        // only for the (at most `MAX_BATCH_UPDATES`) inserts and one request never
+        // holds it while doing caller-sized work. `errors` is built only from
+        // entries that actually failed, so an all-valid batch leaves it empty.
+        let mut accepted = Vec::with_capacity(input.updates.len());
+        let mut errors = Vec::new();
+        for update in input.updates {
+            // Bound first, then move out of `update`: matching the call directly
+            // would hold the borrow of `update.position` across the arm that moves
+            // `update.device_id`.
+            let checked = crate::state::wgs84_position(&update.position);
+            match checked {
+                Ok(position) => accepted.push(crate::state::StoredPosition {
+                    device_id: update.device_id,
+                    sample_time: crate::state::from_date_time(&update.sample_time),
+                    received_time,
+                    position,
+                    accuracy: update.accuracy.map(|accuracy| accuracy.horizontal),
+                    position_properties: update
+                        .position_properties
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect(),
+                }),
+                Err(why) => errors.push(BatchUpdateDevicePositionError2 {
+                    device_id: update.device_id,
+                    sample_time: update.sample_time,
+                    error: BatchItemError {
+                        code: Some(crate::state::BATCH_VALIDATION_ERROR.to_string()),
+                        message: Some(why),
+                    },
+                }),
+            }
+        }
+
+        let mut store = state.lock();
+        let tracker = store.trackers.get_mut(&input.tracker_name).ok_or_else(|| {
+            BatchUpdateDevicePositionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Resource of type \"Tracker\" with name \"{}\" cannot be found.",
+                        input.tracker_name
+                    ),
+                },
+            )
+        })?;
+        for sample in accepted {
+            // `record_position` applies the retention window and the per-device
+            // and per-tracker bounds, so the stored history cannot grow without
+            // limit however many updates arrive.
+            tracker.record_position(sample);
+        }
+
+        // `UpdateTime` tracks when the tracker RESOURCE was last updated (the
+        // `DescribeTrackerResponse$UpdateTime` doc), which a device position write
+        // is not, so it is left alone here.
+        Ok(BatchUpdateDevicePositionOutput { errors })
     }
 }
