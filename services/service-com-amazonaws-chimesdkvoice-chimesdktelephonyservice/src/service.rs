@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation,
 };
 use std::sync::Arc;
 
@@ -96,17 +96,38 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Amazon Chime SDK Voice states a request that breaks a declared input rule
+        // as `BadRequestException` ("The input parameters don't match the service's
+        // restrictions.", HTTP 400) — the error EVERY operation in this service's
+        // model declares for exactly that case. The framework's default code here is
+        // the generic `ValidationException`, which no operation of this service
+        // declares, so a client branching on the modelled code would never match it.
+        // The message keeps the framework's per-violation clause, which names the
+        // member and the constraint it failed, so the caller can fix the request.
+        //
+        // The status stays with the protocol (400 for a declared-rule violation),
+        // which is `BadRequestException`'s own `httpError`, so code and status agree.
+        match refusal {
+            Refusal::Invalid(violations) => {
+                let message = if violations.is_empty() {
+                    "The input parameters don't match the service's restrictions.".to_string()
+                } else {
+                    violations
+                        .iter()
+                        .map(Violation::message)
+                        .collect::<Vec<String>>()
+                        .join("; ")
+                };
+                Some(Refused {
+                    code: "BadRequestException".to_string(),
+                    message,
+                })
+            }
+            // An authentication refusal is a 403 the framework already words; this
+            // service's modelled `UnauthorizedClientException` is a 401, so renaming
+            // it here would answer a 401 code with a 403 status.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
