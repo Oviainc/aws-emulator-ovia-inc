@@ -45,11 +45,36 @@ members = [
     "services/service-com-amazonaws-bcmdataexports-awsbillingandcostmanagementdataexports",
     "services/service-com-amazonaws-bcmpricingcalculator-awsbcmpricingcalculator",
     "services/service-com-amazonaws-bcmrecommendedactions-awsbillingandcostmanagementrecommendedactions",
+    "services/service-com-amazonaws-bedrock-amazonbedrockcontrolplaneservice",
     "services/service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda",
     "services/service-com-amazonaws-bedrockagentcore-amazonbedrockagentcore",
     "services/service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol",
     "services/service-com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice",
+    "services/service-com-amazonaws-bedrockdataautomation-amazonbedrockkeystonebuildtimeservice",
     "services/service-com-amazonaws-bedrockdataautomationruntime-amazonbedrockkeystoneruntimeservice",
+    "services/service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice",
+    "services/service-com-amazonaws-billing-awsbilling",
+    "services/service-com-amazonaws-billingconductor-awsbillingconductor",
+    "services/service-com-amazonaws-braket-braket",
+    "services/service-com-amazonaws-budgets-awsbudgetservicegateway",
+    "services/service-com-amazonaws-chatbot-wheatleyorchestration-20171011",
+    "services/service-com-amazonaws-chime-ucbuzzconsoleservice",
+    "services/service-com-amazonaws-chimesdkidentity-chimeidentityservice",
+    "services/service-com-amazonaws-chimesdkmediapipelines-chimesdkmediapipelinesservice",
+    "services/service-com-amazonaws-chimesdkmeetings-chimemeetingssdkservice",
+    "services/service-com-amazonaws-chimesdkmessaging-chimemessagingservice",
+    "services/service-com-amazonaws-chimesdkvoice-chimesdktelephonyservice",
+    "services/service-com-amazonaws-cleanrooms-awsbastioncontrolplaneservicelambda",
+    "services/service-com-amazonaws-cleanroomsml-awsstarkcontrolservice",
+    "services/service-com-amazonaws-cloud9-awscloud9workspacemanagementservice",
+    "services/service-com-amazonaws-cloudcontrol-cloudapiservice",
+    "services/service-com-amazonaws-clouddirectory-amazonclouddirectory-20170111",
+    "services/service-com-amazonaws-cloudformation-cloudformation",
+    "services/service-com-amazonaws-cloudfront-cloudfront2020-05-31",
+    "services/service-com-amazonaws-cloudfrontkeyvaluestore-cloudfrontkeyvaluestore",
+    "services/service-com-amazonaws-cloudhsm-cloudhsmfrontendservice",
+    "services/service-com-amazonaws-cloudhsmv2-baldrapiservice",
+    "services/service-com-amazonaws-cloudsearchdomain-amazoncloudsearch2013",
     "core/router",
     "core/embedded",
 ]
@@ -130,11 +155,36 @@ service-com-amazonaws-bcmdashboards-awsbcmdashboardsservice = { path = "services
 service-com-amazonaws-bcmdataexports-awsbillingandcostmanagementdataexports = { path = "services/service-com-amazonaws-bcmdataexports-awsbillingandcostmanagementdataexports" }
 service-com-amazonaws-bcmpricingcalculator-awsbcmpricingcalculator = { path = "services/service-com-amazonaws-bcmpricingcalculator-awsbcmpricingcalculator" }
 service-com-amazonaws-bcmrecommendedactions-awsbillingandcostmanagementrecommendedactions = { path = "services/service-com-amazonaws-bcmrecommendedactions-awsbillingandcostmanagementrecommendedactions" }
+service-com-amazonaws-bedrock-amazonbedrockcontrolplaneservice = { path = "services/service-com-amazonaws-bedrock-amazonbedrockcontrolplaneservice" }
 service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda = { path = "services/service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda" }
 service-com-amazonaws-bedrockagentcore-amazonbedrockagentcore = { path = "services/service-com-amazonaws-bedrockagentcore-amazonbedrockagentcore" }
 service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol = { path = "services/service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol" }
 service-com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice = { path = "services/service-com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice" }
+service-com-amazonaws-bedrockdataautomation-amazonbedrockkeystonebuildtimeservice = { path = "services/service-com-amazonaws-bedrockdataautomation-amazonbedrockkeystonebuildtimeservice" }
 service-com-amazonaws-bedrockdataautomationruntime-amazonbedrockkeystoneruntimeservice = { path = "services/service-com-amazonaws-bedrockdataautomationruntime-amazonbedrockkeystoneruntimeservice" }
+service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice = { path = "services/service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice" }
+service-com-amazonaws-billing-awsbilling = { path = "services/service-com-amazonaws-billing-awsbilling" }
+service-com-amazonaws-billingconductor-awsbillingconductor = { path = "services/service-com-amazonaws-billingconductor-awsbillingconductor" }
+service-com-amazonaws-braket-braket = { path = "services/service-com-amazonaws-braket-braket" }
+service-com-amazonaws-budgets-awsbudgetservicegateway = { path = "services/service-com-amazonaws-budgets-awsbudgetservicegateway" }
+service-com-amazonaws-chatbot-wheatleyorchestration-20171011 = { path = "services/service-com-amazonaws-chatbot-wheatleyorchestration-20171011" }
+service-com-amazonaws-chime-ucbuzzconsoleservice = { path = "services/service-com-amazonaws-chime-ucbuzzconsoleservice" }
+service-com-amazonaws-chimesdkidentity-chimeidentityservice = { path = "services/service-com-amazonaws-chimesdkidentity-chimeidentityservice" }
+service-com-amazonaws-chimesdkmediapipelines-chimesdkmediapipelinesservice = { path = "services/service-com-amazonaws-chimesdkmediapipelines-chimesdkmediapipelinesservice" }
+service-com-amazonaws-chimesdkmeetings-chimemeetingssdkservice = { path = "services/service-com-amazonaws-chimesdkmeetings-chimemeetingssdkservice" }
+service-com-amazonaws-chimesdkmessaging-chimemessagingservice = { path = "services/service-com-amazonaws-chimesdkmessaging-chimemessagingservice" }
+service-com-amazonaws-chimesdkvoice-chimesdktelephonyservice = { path = "services/service-com-amazonaws-chimesdkvoice-chimesdktelephonyservice" }
+service-com-amazonaws-cleanrooms-awsbastioncontrolplaneservicelambda = { path = "services/service-com-amazonaws-cleanrooms-awsbastioncontrolplaneservicelambda" }
+service-com-amazonaws-cleanroomsml-awsstarkcontrolservice = { path = "services/service-com-amazonaws-cleanroomsml-awsstarkcontrolservice" }
+service-com-amazonaws-cloud9-awscloud9workspacemanagementservice = { path = "services/service-com-amazonaws-cloud9-awscloud9workspacemanagementservice" }
+service-com-amazonaws-cloudcontrol-cloudapiservice = { path = "services/service-com-amazonaws-cloudcontrol-cloudapiservice" }
+service-com-amazonaws-clouddirectory-amazonclouddirectory-20170111 = { path = "services/service-com-amazonaws-clouddirectory-amazonclouddirectory-20170111" }
+service-com-amazonaws-cloudformation-cloudformation = { path = "services/service-com-amazonaws-cloudformation-cloudformation" }
+service-com-amazonaws-cloudfront-cloudfront2020-05-31 = { path = "services/service-com-amazonaws-cloudfront-cloudfront2020-05-31" }
+service-com-amazonaws-cloudfrontkeyvaluestore-cloudfrontkeyvaluestore = { path = "services/service-com-amazonaws-cloudfrontkeyvaluestore-cloudfrontkeyvaluestore" }
+service-com-amazonaws-cloudhsm-cloudhsmfrontendservice = { path = "services/service-com-amazonaws-cloudhsm-cloudhsmfrontendservice" }
+service-com-amazonaws-cloudhsmv2-baldrapiservice = { path = "services/service-com-amazonaws-cloudhsmv2-baldrapiservice" }
+service-com-amazonaws-cloudsearchdomain-amazoncloudsearch2013 = { path = "services/service-com-amazonaws-cloudsearchdomain-amazoncloudsearch2013" }
 
 # The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
 #

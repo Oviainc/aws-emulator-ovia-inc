@@ -181,6 +181,10 @@
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/bcm-recommended-actions/service/2024-11-14/bcm-recommended-actions-2024-11-14.json"
     },
     {
+      "shape_id": "com.amazonaws.bedrock#AmazonBedrockControlPlaneService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/bedrock/service/2023-04-20/bedrock-2023-04-20.json"
+    },
+    {
       "shape_id": "com.amazonaws.bedrockagent#AmazonBedrockAgentBuildTimeLambda",
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/bedrock-agent/service/2023-06-05/bedrock-agent-2023-06-05.json"
     },
@@ -197,8 +201,104 @@
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/bedrock-agent-runtime/service/2023-07-26/bedrock-agent-runtime-2023-07-26.json"
     },
     {
+      "shape_id": "com.amazonaws.bedrockdataautomation#AmazonBedrockKeystoneBuildTimeService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/bedrock-data-automation/service/2023-07-26/bedrock-data-automation-2023-07-26.json"
+    },
+    {
       "shape_id": "com.amazonaws.bedrockdataautomationruntime#AmazonBedrockKeystoneRuntimeService",
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/bedrock-data-automation-runtime/service/2024-06-13/bedrock-data-automation-runtime-2024-06-13.json"
+    },
+    {
+      "shape_id": "com.amazonaws.bedrockruntime#AmazonBedrockFrontendService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/bedrock-runtime/service/2023-09-30/bedrock-runtime-2023-09-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.billing#AWSBilling",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/billing/service/2023-09-07/billing-2023-09-07.json"
+    },
+    {
+      "shape_id": "com.amazonaws.billingconductor#AWSBillingConductor",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/billingconductor/service/2021-07-30/billingconductor-2021-07-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.braket#Braket",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/braket/service/2019-09-01/braket-2019-09-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.budgets#AWSBudgetServiceGateway",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/budgets/service/2016-10-20/budgets-2016-10-20.json"
+    },
+    {
+      "shape_id": "com.amazonaws.chatbot#WheatleyOrchestration_20171011",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/chatbot/service/2017-10-11/chatbot-2017-10-11.json"
+    },
+    {
+      "shape_id": "com.amazonaws.chime#UCBuzzConsoleService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/chime/service/2018-05-01/chime-2018-05-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.chimesdkidentity#ChimeIdentityService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/chime-sdk-identity/service/2021-04-20/chime-sdk-identity-2021-04-20.json"
+    },
+    {
+      "shape_id": "com.amazonaws.chimesdkmediapipelines#ChimeSDKMediaPipelinesService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/chime-sdk-media-pipelines/service/2021-07-15/chime-sdk-media-pipelines-2021-07-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.chimesdkmeetings#ChimeMeetingsSDKService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/chime-sdk-meetings/service/2021-07-15/chime-sdk-meetings-2021-07-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.chimesdkmessaging#ChimeMessagingService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/chime-sdk-messaging/service/2021-05-15/chime-sdk-messaging-2021-05-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.chimesdkvoice#ChimeSDKTelephonyService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/chime-sdk-voice/service/2022-08-03/chime-sdk-voice-2022-08-03.json"
+    },
+    {
+      "shape_id": "com.amazonaws.cleanrooms#AWSBastionControlPlaneServiceLambda",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/cleanrooms/service/2022-02-17/cleanrooms-2022-02-17.json"
+    },
+    {
+      "shape_id": "com.amazonaws.cleanroomsml#AWSStarkControlService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/cleanroomsml/service/2023-09-06/cleanroomsml-2023-09-06.json"
+    },
+    {
+      "shape_id": "com.amazonaws.cloud9#AWSCloud9WorkspaceManagementService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/cloud9/service/2017-09-23/cloud9-2017-09-23.json"
+    },
+    {
+      "shape_id": "com.amazonaws.cloudcontrol#CloudApiService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/cloudcontrol/service/2021-09-30/cloudcontrol-2021-09-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.clouddirectory#AmazonCloudDirectory_20170111",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/clouddirectory/service/2017-01-11/clouddirectory-2017-01-11.json"
+    },
+    {
+      "shape_id": "com.amazonaws.cloudformation#CloudFormation",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/cloudformation/service/2010-05-15/cloudformation-2010-05-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.cloudfront#Cloudfront2020_05_31",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/cloudfront/service/2020-05-31/cloudfront-2020-05-31.json"
+    },
+    {
+      "shape_id": "com.amazonaws.cloudfrontkeyvaluestore#CloudFrontKeyValueStore",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/cloudfront-keyvaluestore/service/2022-07-26/cloudfront-keyvaluestore-2022-07-26.json"
+    },
+    {
+      "shape_id": "com.amazonaws.cloudhsm#CloudHsmFrontendService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/cloudhsm/service/2014-05-30/cloudhsm-2014-05-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.cloudhsmv2#BaldrApiService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/cloudhsm-v2/service/2017-04-28/cloudhsm-v2-2017-04-28.json"
+    },
+    {
+      "shape_id": "com.amazonaws.cloudsearchdomain#AmazonCloudSearch2013",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/cloudsearch-domain/service/2013-01-01/cloudsearch-domain-2013-01-01.json"
     }
   ]
 }
