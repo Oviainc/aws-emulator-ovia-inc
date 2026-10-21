@@ -1,0 +1,1426 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The enrollment + recommendation-preference workflow, end to end over the wire.
+//!
+//! Every call here goes through the same `MultiServiceRouter::dispatch` the emulator's
+//! front door uses: `POST /` with `X-Amz-Target: ComputeOptimizerService.<Operation>` and
+//! an `awsJson1_0` body. Nothing reaches into the state struct, so what these tests prove
+//! is what a client sees.
+
+use std::sync::Arc;
+
+use bytes::Bytes;
+use serde_json::{json, Value};
+use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
+    DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MAX_PREFERENCE_RECORDS,
+};
+use service_com_amazonaws_computeoptimizer_computeoptimizerservice::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// The account that owns every resource named below. A `Scope` of `AccountId` must be a
+/// 12-digit account id (the model's `Scope$value` doc), and an account-level preference
+/// applies to the resources of that account.
+const ACCOUNT: &str = "111122223333";
+
+/// An EC2 instance ARN — one of the two ARN forms the preference API accepts.
+fn instance_arn(instance_id: &str) -> String {
+    format!("arn:aws:ec2:us-east-1:{ACCOUNT}:instance/{instance_id}")
+}
+
+/// An Auto Scaling group ARN — the other accepted form.
+fn auto_scaling_group_arn(name: &str) -> String {
+    format!(
+        "arn:aws:autoscaling:us-east-1:{ACCOUNT}:autoScalingGroup:\
+         12345678-1234-1234-1234-123456789012:autoScalingGroupName/{name}"
+    )
+}
+
+/// One emulator: one engine, one shared store, reached only over HTTP.
+fn emulator() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(engine));
+    router
+}
+
+/// Call one operation and return the HTTP status and the parsed JSON body.
+async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("content-type", "application/x-amz-json-1.0")
+        .header("x-amz-target", format!("ComputeOptimizerService.{operation}"))
+        // The SigV4 credential scope is what routes a request to its service.
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 \
+             Credential=AKIDEXAMPLE/20260101/us-east-1/compute-optimizer/aws4_request, \
+             SignedHeaders=host;x-amz-target, Signature=not-verified",
+        )
+        .body(Bytes::from(body.to_string()))
+        .expect("build the request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let parsed = if response.body().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+    };
+    (status, parsed)
+}
+
+/// The wire error code (`__type`) of an error response.
+fn error_code(body: &Value) -> String {
+    body["__type"].as_str().unwrap_or_default().to_string()
+}
+
+/// Opt the account in, which every preference operation requires.
+async fn opt_in(router: &MultiServiceRouter) {
+    let (status, body) = call(
+        router,
+        "UpdateEnrollmentStatus",
+        json!({"status": "Active", "includeMemberAccounts": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "opting in: expected 200, got {status}: {body}");
+}
+
+/// Write one preference, asserting it was accepted.
+async fn put_preference(router: &MultiServiceRouter, request: &Value) {
+    let (status, body) = call(router, "PutRecommendationPreferences", request.clone()).await;
+    assert_eq!(
+        status, 200,
+        "put {request}: expected 200, got {status}: {body}"
+    );
+    assert_eq!(
+        body,
+        json!({}),
+        "put {request}: PutRecommendationPreferences has an empty output, got {body}"
+    );
+}
+
+/// Read the preference records stored for `resource_type`, optionally at one scope.
+async fn get_preferences(
+    router: &MultiServiceRouter,
+    resource_type: &str,
+    scope: Option<&Value>,
+) -> Value {
+    let mut request = json!({"resourceType": resource_type});
+    if let Some(scope) = scope {
+        request["scope"] = scope.clone();
+    }
+    let (status, body) = call(router, "GetRecommendationPreferences", request.clone()).await;
+    assert_eq!(
+        status, 200,
+        "get {request}: expected 200, got {status}: {body}"
+    );
+    body
+}
+
+/// `GetEnrollmentStatus` reports the documented default before any write, and afterwards
+/// exactly what the last accepted `UpdateEnrollmentStatus` stored — while `Pending` and
+/// `Failed`, which the model says are server-assigned, are refused.
+#[tokio::test]
+async fn enrollment_defaults_to_inactive_and_round_trips_every_settable_status() {
+    let router = emulator();
+
+    let (status, body) = call(&router, "GetEnrollmentStatus", json!({})).await;
+    assert_eq!(
+        status, 200,
+        "untouched enrollment: expected 200, got {status}: {body}"
+    );
+    assert_eq!(
+        body["status"], "Inactive",
+        "untouched enrollment: expected status Inactive, got {body}"
+    );
+    assert_eq!(
+        body["memberAccountsEnrolled"], false,
+        "untouched enrollment: expected memberAccountsEnrolled false, got {body}"
+    );
+    assert!(
+        body["lastUpdatedTimestamp"].is_null(),
+        "untouched enrollment: nothing has been written, so there is no \
+         lastUpdatedTimestamp, got {body}"
+    );
+
+    // The rows span the model's `Status` enum (Active | Failed | Inactive | Pending —
+    // `crate::ops::types::STATUS_VALUES`) crossed with `includeMemberAccounts`. Per the
+    // `status` member's documentation only Active and Inactive may be supplied by a
+    // client; Pending and Failed "cannot be used to update the enrollment status".
+    let cases = [
+        ("Active", true, true),
+        ("Active", false, true),
+        ("Pending", false, false),
+        ("Inactive", true, true),
+        ("Failed", true, false),
+        ("Inactive", false, true),
+    ];
+    for (wanted, include_member_accounts, settable) in cases {
+        let case = format!("status={wanted} includeMemberAccounts={include_member_accounts}");
+        let (status, updated) = call(
+            &router,
+            "UpdateEnrollmentStatus",
+            json!({"status": wanted, "includeMemberAccounts": include_member_accounts}),
+        )
+        .await;
+
+        if !settable {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: a server-assigned status must be refused, got {status}: {updated}"
+            );
+            assert!(
+                error_code(&updated).contains("InvalidParameterValueException"),
+                "case {case:?}: expected InvalidParameterValueException, got {updated}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status}: {updated}"
+        );
+        assert_eq!(
+            updated["status"], wanted,
+            "case {case:?}: the response must carry the stored status, got {updated}"
+        );
+        assert!(
+            updated["statusReason"].is_string(),
+            "case {case:?}: expected a statusReason, got {updated}"
+        );
+
+        let (status, got) = call(&router, "GetEnrollmentStatus", json!({})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from the read-back, got {status}: {got}"
+        );
+        assert_eq!(
+            got["status"], wanted,
+            "case {case:?}: the read-back must report the stored status, got {got}"
+        );
+        assert_eq!(
+            got["memberAccountsEnrolled"], include_member_accounts,
+            "case {case:?}: the read-back must report the stored memberAccountsEnrolled, got {got}"
+        );
+        assert_eq!(
+            got["statusReason"], updated["statusReason"],
+            "case {case:?}: both operations report one stored statusReason, got {got}"
+        );
+        assert!(
+            got["lastUpdatedTimestamp"].as_f64().unwrap_or_default() > 0.0,
+            "case {case:?}: a write sets lastUpdatedTimestamp, got {got}"
+        );
+        if include_member_accounts && wanted == "Active" {
+            assert_eq!(
+                got["numberOfMemberAccountsOptedIn"],
+                json!(0),
+                "case {case:?}: this organization holds no member accounts, so zero of them \
+                 are opted in, got {got}"
+            );
+        } else {
+            assert!(
+                got["numberOfMemberAccountsOptedIn"].is_null(),
+                "case {case:?}: member accounts are not enrolled, so there is no count, got {got}"
+            );
+        }
+    }
+
+    // The two refusals above changed nothing: the last accepted row is still in force.
+    let (_, body) = call(&router, "GetEnrollmentStatus", json!({})).await;
+    assert_eq!(
+        body["status"], "Inactive",
+        "a refused update must not move the stored status, got {body}"
+    );
+    assert_eq!(
+        body["memberAccountsEnrolled"], false,
+        "a refused update must not move the stored memberAccountsEnrolled, got {body}"
+    );
+}
+
+/// Every preference a `PutRecommendationPreferences` call stores comes back from
+/// `GetRecommendationPreferences` at its own resource type and scope, and a second put
+/// merges into the record rather than replacing it.
+#[tokio::test]
+async fn a_written_preference_is_read_back_at_its_own_resource_type_and_scope() {
+    let router = emulator();
+    opt_in(&router).await;
+
+    let instance = instance_arn("i-1234567890abcdef0");
+    let group = auto_scaling_group_arn("web-tier");
+
+    // Rows differ along resource type, scope level, and which preference fields are set.
+    // Every value is from the model's own enums; `Idle`/`NotApplicable` resource types
+    // carry no settable preference of their own and are left out.
+    let cases: Vec<(&str, &str, Option<Value>, Value)> = vec![
+        (
+            "ec2 account default, no scope",
+            "Ec2Instance",
+            None,
+            json!({"enhancedInfrastructureMetrics": "Active"}),
+        ),
+        (
+            "ec2 at the account scope",
+            "Ec2Instance",
+            Some(json!({"name": "AccountId", "value": ACCOUNT})),
+            json!({"lookBackPeriod": "DAYS_32", "inferredWorkloadTypes": "Inactive"}),
+        ),
+        (
+            "ec2 at the resource scope",
+            "Ec2Instance",
+            Some(json!({"name": "ResourceArn", "value": instance})),
+            json!({
+                "enhancedInfrastructureMetrics": "Inactive",
+                "externalMetricsPreference": {"source": "Datadog"},
+            }),
+        ),
+        (
+            "ec2 at the organization scope",
+            "Ec2Instance",
+            Some(json!({"name": "Organization", "value": "ALL_ACCOUNTS"})),
+            json!({
+                "utilizationPreferences": [{
+                    "metricName": "CpuUtilization",
+                    "metricParameters": {"threshold": "P95", "headroom": "PERCENT_10"},
+                }],
+                "savingsEstimationMode": "AfterDiscounts",
+            }),
+        ),
+        (
+            "ebs volume at the account scope",
+            "EbsVolume",
+            Some(json!({"name": "AccountId", "value": ACCOUNT})),
+            json!({"lookBackPeriod": "DAYS_93"}),
+        ),
+        (
+            "auto scaling group at the resource scope",
+            "AutoScalingGroup",
+            Some(json!({"name": "ResourceArn", "value": group})),
+            json!({
+                "preferredResources": [{
+                    "name": "Ec2InstanceTypes",
+                    "includeList": ["m5.large", "m5.xlarge"],
+                }],
+            }),
+        ),
+        (
+            "lambda function account default",
+            "LambdaFunction",
+            None,
+            json!({"inferredWorkloadTypes": "Active"}),
+        ),
+    ];
+
+    for (name, resource_type, scope, preferences) in &cases {
+        let mut request = json!({"resourceType": resource_type});
+        for (field, value) in preferences.as_object().expect("an object of preferences") {
+            request[field] = value.clone();
+        }
+        if let Some(scope) = scope {
+            request["scope"] = scope.clone();
+        }
+        put_preference(&router, &request).await;
+
+        let body = get_preferences(&router, resource_type, scope.as_ref()).await;
+        let details = body["recommendationPreferencesDetails"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {name:?}: expected a detail list, got {body}"));
+        assert_eq!(
+            details.len(),
+            1,
+            "case {name:?}: expected exactly the record just written, got {body}"
+        );
+        let detail = &details[0];
+        assert_eq!(
+            detail["resourceType"], *resource_type,
+            "case {name:?}: expected resourceType {resource_type}, got {detail}"
+        );
+        match scope {
+            Some(scope) => assert_eq!(
+                detail["scope"], *scope,
+                "case {name:?}: expected the stored scope {scope}, got {detail}"
+            ),
+            None => assert!(
+                detail["scope"].is_null(),
+                "case {name:?}: nothing was written at a scope, got {detail}"
+            ),
+        }
+        for (field, written) in preferences.as_object().expect("an object of preferences") {
+            if field == "preferredResources" {
+                // Reported as `EffectivePreferredResource`: the stored lists plus
+                // `effectiveIncludeList`, which resolves wildcards — the identity here,
+                // since these include lists carry none.
+                for (index, want) in written.as_array().expect("a list").iter().enumerate() {
+                    let got = &detail[field][index];
+                    assert_eq!(
+                        got["name"], want["name"],
+                        "case {name:?}: expected preferred-resource name {want}, got {got}"
+                    );
+                    assert_eq!(
+                        got["includeList"], want["includeList"],
+                        "case {name:?}: expected includeList {want}, got {got}"
+                    );
+                    assert_eq!(
+                        got["effectiveIncludeList"], want["includeList"],
+                        "case {name:?}: a wildcard-free includeList resolves to itself, got {got}"
+                    );
+                }
+                continue;
+            }
+            assert_eq!(
+                detail[field], *written,
+                "case {name:?}: expected {field} = {written}, got {detail}"
+            );
+        }
+    }
+
+    // Reading by resource type alone returns every record of that type and nothing else.
+    for (resource_type, expected) in [
+        ("Ec2Instance", 4),
+        ("EbsVolume", 1),
+        ("AutoScalingGroup", 1),
+        ("LambdaFunction", 1),
+        ("EcsService", 0),
+    ] {
+        let body = get_preferences(&router, resource_type, None).await;
+        let details = body["recommendationPreferencesDetails"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default();
+        assert_eq!(
+            details, expected,
+            "resourceType {resource_type}: expected {expected} record(s), got {body}"
+        );
+    }
+
+    // A second put UPDATES the record for that key: the field it names changes, the
+    // fields it does not are left where they were.
+    let account_scope = json!({"name": "AccountId", "value": ACCOUNT});
+    put_preference(
+        &router,
+        &json!({
+            "resourceType": "Ec2Instance",
+            "scope": account_scope,
+            "lookBackPeriod": "DAYS_93",
+        }),
+    )
+    .await;
+    let body = get_preferences(&router, "Ec2Instance", Some(&account_scope)).await;
+    let detail = &body["recommendationPreferencesDetails"][0];
+    assert_eq!(
+        detail["lookBackPeriod"], "DAYS_93",
+        "an upsert must store the new value, got {detail}"
+    );
+    assert_eq!(
+        detail["inferredWorkloadTypes"], "Inactive",
+        "an upsert must leave a field it does not name alone, got {detail}"
+    );
+}
+
+/// `maxResults` caps a page and the opaque `nextToken` resumes exactly where the previous
+/// page stopped, whatever the page size: paging always yields the unpaged sequence.
+#[tokio::test]
+async fn preferences_page_through_an_opaque_next_token() {
+    let router = emulator();
+    opt_in(&router).await;
+
+    let scopes = [
+        None,
+        Some(json!({"name": "AccountId", "value": ACCOUNT})),
+        Some(json!({"name": "Organization", "value": "ALL_ACCOUNTS"})),
+        Some(json!({"name": "ResourceArn", "value": instance_arn("i-0abc")})),
+        Some(json!({"name": "ResourceArn", "value": instance_arn("i-0def")})),
+    ];
+    for (index, scope) in scopes.iter().enumerate() {
+        let mut request = json!({
+            "resourceType": "Ec2Instance",
+            "enhancedInfrastructureMetrics": if index % 2 == 0 { "Active" } else { "Inactive" },
+        });
+        if let Some(scope) = scope {
+            request["scope"] = scope.clone();
+        }
+        put_preference(&router, &request).await;
+    }
+
+    let unpaged = get_preferences(&router, "Ec2Instance", None).await;
+    let expected = unpaged["recommendationPreferencesDetails"]
+        .as_array()
+        .expect("a detail list")
+        .clone();
+    assert_eq!(
+        expected.len(),
+        scopes.len(),
+        "the unpaged read must return every record written, got {unpaged}"
+    );
+    assert!(
+        unpaged["nextToken"].is_null(),
+        "an unpaged read has no further page, got {unpaged}"
+    );
+
+    // One row per page size: every size must walk the same sequence, and only the final
+    // page may omit the token. 1 is the smallest page, 5 is exactly the record count, and
+    // 6 is one past it.
+    for page_size in [1_u64, 2, 3, 5, 6] {
+        let case = format!("maxResults={page_size}");
+        let mut collected: Vec<Value> = Vec::new();
+        let mut next_token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let mut request = json!({"resourceType": "Ec2Instance", "maxResults": page_size});
+            if let Some(token) = &next_token {
+                request["nextToken"] = json!(token);
+            }
+            let (status, body) = call(&router, "GetRecommendationPreferences", request).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected 200, got {status}: {body}"
+            );
+            let page = body["recommendationPreferencesDetails"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: expected a detail list, got {body}"));
+            assert!(
+                page.len() as u64 <= page_size,
+                "case {case:?}: a page must not exceed maxResults, got {} entries",
+                page.len()
+            );
+            collected.extend(page.iter().cloned());
+            pages += 1;
+            assert!(
+                pages <= scopes.len() + 1,
+                "case {case:?}: paging did not terminate after {pages} pages"
+            );
+            match body["nextToken"].as_str() {
+                Some(token) => next_token = Some(token.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(
+            collected, expected,
+            "case {case:?}: paging must yield the unpaged sequence"
+        );
+    }
+
+    // A token this service did not issue names no page boundary.
+    let (status, body) = call(
+        &router,
+        "GetRecommendationPreferences",
+        json!({"resourceType": "Ec2Instance", "nextToken": "not-a-token"}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a forged nextToken must be refused, got {status}: {body}"
+    );
+    assert!(
+        error_code(&body).contains("InvalidParameterValueException"),
+        "a forged nextToken: expected InvalidParameterValueException, got {body}"
+    );
+
+    // `maxResults` is modelled 0..1000. Zero is the published lower bound and carries no
+    // documented meaning; a cap of zero could never advance through the pages, so it is
+    // read as "no size asked for" — the same answer as leaving maxResults out, which is
+    // the emulator's own DEFAULT_PAGE_SIZE and so holds all five records here.
+    let (status, body) = call(
+        &router,
+        "GetRecommendationPreferences",
+        json!({"resourceType": "Ec2Instance", "maxResults": 0}),
+    )
+    .await;
+    assert_eq!(status, 200, "maxResults=0: expected 200, got {status}: {body}");
+    assert_eq!(
+        body["recommendationPreferencesDetails"],
+        Value::Array(expected.clone()),
+        "maxResults=0: expected the unpaged sequence, got {body}"
+    );
+    assert!(
+        body["nextToken"].is_null(),
+        "maxResults=0: expected no further page, got {body}"
+    );
+
+    // Each published bound is accepted, and one past the top is refused by the modelled
+    // range before the handler runs.
+    for (page_size, accepted) in [(1000_u64, true), (1001, false)] {
+        let (status, body) = call(
+            &router,
+            "GetRecommendationPreferences",
+            json!({"resourceType": "Ec2Instance", "maxResults": page_size}),
+        )
+        .await;
+        if accepted {
+            assert_eq!(
+                status, 200,
+                "maxResults={page_size}: inside the modelled range, got {status}: {body}"
+            );
+            assert_eq!(
+                body["recommendationPreferencesDetails"],
+                Value::Array(expected.clone()),
+                "maxResults={page_size}: expected every record on one page, got {body}"
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "maxResults={page_size}: outside the modelled range 0..1000, got {status}: {body}"
+            );
+        }
+    }
+}
+
+/// Each effective preference is the value set by the most specific scope that sets it, so
+/// a resource-level record wins field by field and inherits the rest; with nothing set,
+/// the look-back period is the documented default.
+#[tokio::test]
+async fn effective_preferences_resolve_by_scope_precedence() {
+    let router = emulator();
+    opt_in(&router).await;
+
+    let instance = instance_arn("i-1234567890abcdef0");
+    let other_instance = instance_arn("i-00000000000000000");
+    let group = auto_scaling_group_arn("web-tier");
+
+    // Nothing stored: only the documented default applies ("When this preference isn't
+    // specified, we use the default value DAYS_14").
+    let (status, body) = call(
+        &router,
+        "GetEffectiveRecommendationPreferences",
+        json!({"resourceArn": instance}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "no preferences stored: expected 200, got {status}: {body}"
+    );
+    assert_eq!(
+        body["lookBackPeriod"], "DAYS_14",
+        "no preferences stored: expected the default look-back period, got {body}"
+    );
+    assert!(
+        body["enhancedInfrastructureMetrics"].is_null(),
+        "no preferences stored: nothing else is in effect, got {body}"
+    );
+
+    // Each row adds a more specific record and states what must then be in effect.
+    let organization_scope = json!({"name": "Organization", "value": "ALL_ACCOUNTS"});
+    let account_scope = json!({"name": "AccountId", "value": ACCOUNT});
+    let resource_scope = json!({"name": "ResourceArn", "value": instance});
+
+    put_preference(
+        &router,
+        &json!({
+            "resourceType": "Ec2Instance",
+            "scope": organization_scope,
+            "enhancedInfrastructureMetrics": "Active",
+            "lookBackPeriod": "DAYS_93",
+        }),
+    )
+    .await;
+    let effective = effective_for(&router, &instance).await;
+    assert_eq!(
+        effective["enhancedInfrastructureMetrics"], "Active",
+        "organization level only: expected it to apply, got {effective}"
+    );
+    assert_eq!(
+        effective["lookBackPeriod"], "DAYS_93",
+        "organization level only: expected it to apply, got {effective}"
+    );
+
+    put_preference(
+        &router,
+        &json!({
+            "resourceType": "Ec2Instance",
+            "scope": account_scope,
+            "lookBackPeriod": "DAYS_32",
+        }),
+    )
+    .await;
+    let effective = effective_for(&router, &instance).await;
+    assert_eq!(
+        effective["lookBackPeriod"], "DAYS_32",
+        "account over organization: the account level wins, got {effective}"
+    );
+    assert_eq!(
+        effective["enhancedInfrastructureMetrics"], "Active",
+        "account over organization: a field the account level does not set is inherited, \
+         got {effective}"
+    );
+
+    put_preference(
+        &router,
+        &json!({
+            "resourceType": "Ec2Instance",
+            "scope": resource_scope,
+            "enhancedInfrastructureMetrics": "Inactive",
+            "externalMetricsPreference": {"source": "Dynatrace"},
+        }),
+    )
+    .await;
+    let effective = effective_for(&router, &instance).await;
+    assert_eq!(
+        effective["enhancedInfrastructureMetrics"], "Inactive",
+        "resource over account: the resource level wins, got {effective}"
+    );
+    assert_eq!(
+        effective["externalMetricsPreference"]["source"], "Dynatrace",
+        "resource over account: the resource level value is reported, got {effective}"
+    );
+    assert_eq!(
+        effective["lookBackPeriod"], "DAYS_32",
+        "resource over account: the look-back period is inherited from the account scope, \
+         got {effective}"
+    );
+
+    // The resource-level record applies to ITS resource only; another instance of the
+    // same account still resolves to the account and organization levels.
+    let effective = effective_for(&router, &other_instance).await;
+    assert_eq!(
+        effective["enhancedInfrastructureMetrics"], "Active",
+        "another instance: a resource-level record must not leak to it, got {effective}"
+    );
+    assert!(
+        effective["externalMetricsPreference"].is_null(),
+        "another instance: a resource-level record must not leak to it, got {effective}"
+    );
+
+    // An Auto Scaling group resolves against AutoScalingGroup records, not EC2 ones.
+    put_preference(
+        &router,
+        &json!({
+            "resourceType": "AutoScalingGroup",
+            "scope": {"name": "ResourceArn", "value": group},
+            "preferredResources": [{"name": "Ec2InstanceTypes", "excludeList": ["t2"]}],
+        }),
+    )
+    .await;
+    let effective = effective_for(&router, &group).await;
+    assert_eq!(
+        effective["preferredResources"][0]["excludeList"][0], "t2",
+        "auto scaling group: expected its own resource-level record, got {effective}"
+    );
+    assert!(
+        effective["enhancedInfrastructureMetrics"].is_null(),
+        "auto scaling group: an Ec2Instance record must not apply to it, got {effective}"
+    );
+    assert_eq!(
+        effective["lookBackPeriod"], "DAYS_14",
+        "auto scaling group: no AutoScalingGroup record sets one, so the default applies, \
+         got {effective}"
+    );
+
+    // Only EC2 instance and Auto Scaling group ARNs are supported.
+    for unsupported in [
+        "arn:aws:s3:::my-bucket",
+        "arn:aws:ec2:us-east-1:111122223333:volume/vol-123",
+        "not-an-arn",
+    ] {
+        let (status, body) = call(
+            &router,
+            "GetEffectiveRecommendationPreferences",
+            json!({"resourceArn": unsupported}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "resourceArn {unsupported:?}: expected 400, got {status}: {body}"
+        );
+        assert!(
+            error_code(&body).contains("InvalidParameterValueException"),
+            "resourceArn {unsupported:?}: expected InvalidParameterValueException, got {body}"
+        );
+    }
+}
+
+/// The effective preferences in force for one resource.
+async fn effective_for(router: &MultiServiceRouter, resource_arn: &str) -> Value {
+    let (status, body) = call(
+        router,
+        "GetEffectiveRecommendationPreferences",
+        json!({"resourceArn": resource_arn}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "effective preferences for {resource_arn}: expected 200, got {status}: {body}"
+    );
+    body
+}
+
+/// `DeleteRecommendationPreferences` removes exactly the preferences it names, from
+/// exactly the record it addresses; a record with nothing left is gone, and a later read
+/// falls back to the next scope or to the default.
+#[tokio::test]
+async fn delete_removes_only_the_named_preferences() {
+    let router = emulator();
+    opt_in(&router).await;
+
+    let instance = instance_arn("i-1234567890abcdef0");
+    let account_scope = json!({"name": "AccountId", "value": ACCOUNT});
+    let resource_scope = json!({"name": "ResourceArn", "value": instance});
+
+    put_preference(
+        &router,
+        &json!({
+            "resourceType": "Ec2Instance",
+            "scope": account_scope,
+            "enhancedInfrastructureMetrics": "Active",
+            "lookBackPeriod": "DAYS_32",
+        }),
+    )
+    .await;
+
+    // Every name is a `RecommendationPreferenceName` (the model's enum:
+    // EnhancedInfrastructureMetrics | InferredWorkloadTypes | ExternalMetricsPreference |
+    // LookBackPeriodPreference | PreferredResources | UtilizationPreferences), each
+    // written at the resource scope and then deleted one at a time.
+    put_preference(
+        &router,
+        &json!({
+            "resourceType": "Ec2Instance",
+            "scope": resource_scope,
+            "enhancedInfrastructureMetrics": "Inactive",
+            "inferredWorkloadTypes": "Inactive",
+            "externalMetricsPreference": {"source": "Instana"},
+            "lookBackPeriod": "DAYS_93",
+            "preferredResources": [{"name": "Ec2InstanceTypes", "includeList": ["m5.large"]}],
+            "utilizationPreferences": [{
+                "metricName": "MemoryUtilization",
+                "metricParameters": {"headroom": "PERCENT_0"},
+            }],
+        }),
+    )
+    .await;
+
+    // An unrecognised preference name is refused, and nothing is cleared: a refused
+    // request must not have deleted the names that came before the bad one.
+    let (status, body) = call(
+        &router,
+        "DeleteRecommendationPreferences",
+        json!({
+            "resourceType": "Ec2Instance",
+            "scope": resource_scope,
+            "recommendationPreferenceNames": ["EnhancedInfrastructureMetrics", "NotAPreference"],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "an unrecognised preference name must be refused, got {status}: {body}"
+    );
+    let read = get_preferences(&router, "Ec2Instance", Some(&resource_scope)).await;
+    assert_eq!(
+        read["recommendationPreferencesDetails"][0]["enhancedInfrastructureMetrics"], "Inactive",
+        "a refused delete must leave every preference where it was, got {read}"
+    );
+
+    let deletions = [
+        ("EnhancedInfrastructureMetrics", "enhancedInfrastructureMetrics"),
+        ("InferredWorkloadTypes", "inferredWorkloadTypes"),
+        ("ExternalMetricsPreference", "externalMetricsPreference"),
+        ("LookBackPeriodPreference", "lookBackPeriod"),
+        ("PreferredResources", "preferredResources"),
+        ("UtilizationPreferences", "utilizationPreferences"),
+    ];
+    let mut remaining: Vec<&str> = deletions.iter().map(|(_, field)| *field).collect();
+    for (name, field) in deletions {
+        let (status, body) = call(
+            &router,
+            "DeleteRecommendationPreferences",
+            json!({
+                "resourceType": "Ec2Instance",
+                "scope": resource_scope,
+                "recommendationPreferenceNames": [name],
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "deleting {name}: expected 200, got {status}: {body}"
+        );
+        assert_eq!(
+            body,
+            json!({}),
+            "deleting {name}: DeleteRecommendationPreferences has an empty output, got {body}"
+        );
+
+        remaining.retain(|candidate| *candidate != field);
+        let read = get_preferences(&router, "Ec2Instance", Some(&resource_scope)).await;
+        let details = read["recommendationPreferencesDetails"]
+            .as_array()
+            .unwrap_or_else(|| panic!("deleting {name}: expected a detail list, got {read}"));
+        if remaining.is_empty() {
+            assert!(
+                details.is_empty(),
+                "deleting {name}: the record holds no preference any more, so it is gone, \
+                 got {read}"
+            );
+            continue;
+        }
+        assert_eq!(
+            details.len(),
+            1,
+            "deleting {name}: the record still holds {remaining:?}, got {read}"
+        );
+        assert!(
+            details[0][field].is_null(),
+            "deleting {name}: expected {field} to be gone, got {}",
+            details[0]
+        );
+        for survivor in &remaining {
+            assert!(
+                !details[0][survivor].is_null(),
+                "deleting {name}: {survivor} was not named, so it must survive, got {}",
+                details[0]
+            );
+        }
+    }
+
+    // The account-scoped record was never addressed, so it is untouched — and with the
+    // resource-level record gone the effective value falls back to it.
+    let read = get_preferences(&router, "Ec2Instance", Some(&account_scope)).await;
+    let detail = &read["recommendationPreferencesDetails"][0];
+    assert_eq!(
+        detail["enhancedInfrastructureMetrics"], "Active",
+        "a delete at one scope must not touch another scope's record, got {read}"
+    );
+    let effective = effective_for(&router, &instance).await;
+    assert_eq!(
+        effective["enhancedInfrastructureMetrics"], "Active",
+        "with the resource-level record gone, the account level applies, got {effective}"
+    );
+    assert_eq!(
+        effective["lookBackPeriod"], "DAYS_32",
+        "with the resource-level record gone, the account level applies, got {effective}"
+    );
+
+    // Deleting the account-scoped record's last preferences drops it too, so the
+    // documented default applies again.
+    let (status, body) = call(
+        &router,
+        "DeleteRecommendationPreferences",
+        json!({
+            "resourceType": "Ec2Instance",
+            "scope": account_scope,
+            "recommendationPreferenceNames": [
+                "EnhancedInfrastructureMetrics", "LookBackPeriodPreference",
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "deleting both names: got {status}: {body}");
+    let effective = effective_for(&router, &instance).await;
+    assert_eq!(
+        effective["lookBackPeriod"], "DAYS_14",
+        "with every record gone, the default look-back period applies, got {effective}"
+    );
+    assert!(
+        effective["enhancedInfrastructureMetrics"].is_null(),
+        "with every record gone, nothing else is in effect, got {effective}"
+    );
+}
+
+/// A request that breaks a documented preference rule is refused with
+/// `InvalidParameterValueException`, and one that keeps every rule is stored.
+#[tokio::test]
+async fn preference_requests_are_checked_against_the_documented_rules() {
+    let router = emulator();
+    opt_in(&router).await;
+
+    let instance = instance_arn("i-1234567890abcdef0");
+    let group = auto_scaling_group_arn("web-tier");
+
+    // `accepted` says whether the request keeps every rule the model documents for these
+    // members. The refusals cover each rule in turn; the acceptances pin that the rule is
+    // no wider than documented.
+    let cases: Vec<(&str, bool, Value)> = vec![
+        // `externalMetricsPreference` "can only be set for the Ec2Instance resource type".
+        (
+            "external metrics on Ec2Instance",
+            true,
+            json!({
+                "resourceType": "Ec2Instance",
+                "externalMetricsPreference": {"source": "NewRelic"},
+            }),
+        ),
+        (
+            "external metrics on EbsVolume",
+            false,
+            json!({
+                "resourceType": "EbsVolume",
+                "externalMetricsPreference": {"source": "NewRelic"},
+            }),
+        ),
+        (
+            "external metrics on RdsDBInstance",
+            false,
+            json!({
+                "resourceType": "RdsDBInstance",
+                "externalMetricsPreference": {"source": "Datadog"},
+            }),
+        ),
+        // `preferredResources`: "You must specify either an includeList or excludeList.
+        // If the preference is an empty set of resource type values, an error occurs."
+        (
+            "preferred resources with an include list",
+            true,
+            json!({
+                "resourceType": "Ec2Instance",
+                "preferredResources": [{"name": "Ec2InstanceTypes", "includeList": ["m5"]}],
+            }),
+        ),
+        (
+            "preferred resources with an exclude list",
+            true,
+            json!({
+                "resourceType": "Ec2Instance",
+                "preferredResources": [{"name": "Ec2InstanceTypes", "excludeList": ["t2"]}],
+            }),
+        ),
+        (
+            "preferred resources with neither list",
+            false,
+            json!({
+                "resourceType": "Ec2Instance",
+                "preferredResources": [{"name": "Ec2InstanceTypes"}],
+            }),
+        ),
+        (
+            "preferred resources with two empty lists",
+            false,
+            json!({
+                "resourceType": "Ec2Instance",
+                "preferredResources": [{
+                    "name": "Ec2InstanceTypes", "includeList": [], "excludeList": [],
+                }],
+            }),
+        ),
+        // `utilizationPreferences`: "You can only set CPU and memory utilization
+        // preferences for the Amazon EC2 instance resource type" and "The threshold
+        // setting isn't available for memory utilization."
+        (
+            "cpu utilization with a threshold",
+            true,
+            json!({
+                "resourceType": "Ec2Instance",
+                "utilizationPreferences": [{
+                    "metricName": "CpuUtilization",
+                    "metricParameters": {"threshold": "P90", "headroom": "PERCENT_30"},
+                }],
+            }),
+        ),
+        (
+            "memory utilization with a headroom only",
+            true,
+            json!({
+                "resourceType": "Ec2Instance",
+                "utilizationPreferences": [{
+                    "metricName": "MemoryUtilization",
+                    "metricParameters": {"headroom": "PERCENT_20"},
+                }],
+            }),
+        ),
+        (
+            "memory utilization with a threshold",
+            false,
+            json!({
+                "resourceType": "Ec2Instance",
+                "utilizationPreferences": [{
+                    "metricName": "MemoryUtilization",
+                    "metricParameters": {"threshold": "P99_5"},
+                }],
+            }),
+        ),
+        (
+            "utilization preferences on EcsService",
+            false,
+            json!({
+                "resourceType": "EcsService",
+                "utilizationPreferences": [{
+                    "metricName": "CpuUtilization",
+                    "metricParameters": {"headroom": "PERCENT_20"},
+                }],
+            }),
+        ),
+        // `lookBackPeriod` "can only be set for the Amazon EC2 instance, Auto Scaling
+        // group, Amazon EBS volume, Amazon ECS service on Fargate, Amazon RDS DB
+        // instance, and Aurora DB cluster storage resource types" — every one of them,
+        // and nothing else.
+        (
+            "look-back period on Ec2Instance",
+            true,
+            json!({"resourceType": "Ec2Instance", "lookBackPeriod": "DAYS_14"}),
+        ),
+        (
+            "look-back period on EbsVolume",
+            true,
+            json!({"resourceType": "EbsVolume", "lookBackPeriod": "DAYS_32"}),
+        ),
+        (
+            "look-back period on EcsService",
+            true,
+            json!({"resourceType": "EcsService", "lookBackPeriod": "DAYS_93"}),
+        ),
+        (
+            "look-back period on RdsDBInstance",
+            true,
+            json!({"resourceType": "RdsDBInstance", "lookBackPeriod": "DAYS_32"}),
+        ),
+        (
+            "look-back period on AuroraDBClusterStorage",
+            true,
+            json!({"resourceType": "AuroraDBClusterStorage", "lookBackPeriod": "DAYS_32"}),
+        ),
+        (
+            "look-back period on AutoScalingGroup at the resource scope",
+            true,
+            json!({
+                "resourceType": "AutoScalingGroup",
+                "scope": {"name": "ResourceArn", "value": group},
+                "lookBackPeriod": "DAYS_32",
+            }),
+        ),
+        (
+            "look-back period on LambdaFunction",
+            false,
+            json!({"resourceType": "LambdaFunction", "lookBackPeriod": "DAYS_32"}),
+        ),
+        (
+            "look-back period on License",
+            false,
+            json!({"resourceType": "License", "lookBackPeriod": "DAYS_32"}),
+        ),
+        // `scope`: an Auto Scaling group preference can be created "only at the resource
+        // level by specifying a scope name of ResourceArn".
+        (
+            "auto scaling group at the account scope",
+            false,
+            json!({
+                "resourceType": "AutoScalingGroup",
+                "scope": {"name": "AccountId", "value": ACCOUNT},
+                "inferredWorkloadTypes": "Active",
+            }),
+        ),
+        (
+            "auto scaling group with no scope",
+            false,
+            json!({"resourceType": "AutoScalingGroup", "inferredWorkloadTypes": "Active"}),
+        ),
+        // `Scope$value`: Organization -> ALL_ACCOUNTS, AccountId -> a 12-digit account id,
+        // ResourceArn -> an EC2 instance or Auto Scaling group ARN.
+        (
+            "organization scope with ALL_ACCOUNTS",
+            true,
+            json!({
+                "resourceType": "Ec2Instance",
+                "scope": {"name": "Organization", "value": "ALL_ACCOUNTS"},
+                "inferredWorkloadTypes": "Active",
+            }),
+        ),
+        (
+            "organization scope with an account id",
+            false,
+            json!({
+                "resourceType": "Ec2Instance",
+                "scope": {"name": "Organization", "value": ACCOUNT},
+                "inferredWorkloadTypes": "Active",
+            }),
+        ),
+        (
+            "account scope with an 11-digit account id",
+            false,
+            json!({
+                "resourceType": "Ec2Instance",
+                "scope": {"name": "AccountId", "value": "11112222333"},
+                "inferredWorkloadTypes": "Active",
+            }),
+        ),
+        (
+            "account scope with a non-numeric account id",
+            false,
+            json!({
+                "resourceType": "Ec2Instance",
+                "scope": {"name": "AccountId", "value": "1111-2222-333"},
+                "inferredWorkloadTypes": "Active",
+            }),
+        ),
+        (
+            "resource scope with an instance ARN",
+            true,
+            json!({
+                "resourceType": "Ec2Instance",
+                "scope": {"name": "ResourceArn", "value": instance},
+                "inferredWorkloadTypes": "Active",
+            }),
+        ),
+        (
+            "resource scope with a bucket ARN",
+            false,
+            json!({
+                "resourceType": "Ec2Instance",
+                "scope": {"name": "ResourceArn", "value": "arn:aws:s3:::my-bucket"},
+                "inferredWorkloadTypes": "Active",
+            }),
+        ),
+        (
+            "a scope name with no value",
+            false,
+            json!({
+                "resourceType": "Ec2Instance",
+                "scope": {"name": "AccountId"},
+                "inferredWorkloadTypes": "Active",
+            }),
+        ),
+        (
+            "a scope value with no name",
+            false,
+            json!({
+                "resourceType": "Ec2Instance",
+                "scope": {"value": ACCOUNT},
+                "inferredWorkloadTypes": "Active",
+            }),
+        ),
+    ];
+
+    for (name, accepted, request) in &cases {
+        let (status, body) = call(&router, "PutRecommendationPreferences", request.clone()).await;
+        if *accepted {
+            assert_eq!(
+                status, 200,
+                "case {name:?}: this request keeps every documented rule, got {status}: {body}"
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 400,
+            "case {name:?}: expected 400, got {status}: {body}"
+        );
+        assert!(
+            error_code(&body).contains("InvalidParameterValueException"),
+            "case {name:?}: expected InvalidParameterValueException, got {body}"
+        );
+    }
+
+    // A refused request stores nothing: the refused Lambda look-back period above left no
+    // LambdaFunction record behind.
+    let body = get_preferences(&router, "LambdaFunction", None).await;
+    assert_eq!(
+        body["recommendationPreferencesDetails"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default(),
+        0,
+        "a refused request must store nothing, got {body}"
+    );
+}
+
+/// Every preference operation that models `OptInRequiredException` answers it while the
+/// account is not opted in, and the enrollment operations keep working so the caller can
+/// opt in. Opting back in finds the records still there: the store is shared, not
+/// per-request.
+#[tokio::test]
+async fn preference_operations_require_the_account_to_be_opted_in() {
+    let router = emulator();
+
+    let instance = instance_arn("i-1234567890abcdef0");
+    let put = json!({
+        "resourceType": "Ec2Instance",
+        "scope": {"name": "AccountId", "value": ACCOUNT},
+        "enhancedInfrastructureMetrics": "Active",
+    });
+    let requests: Vec<(&str, Value)> = vec![
+        ("PutRecommendationPreferences", put.clone()),
+        (
+            "GetRecommendationPreferences",
+            json!({"resourceType": "Ec2Instance"}),
+        ),
+        (
+            "GetEffectiveRecommendationPreferences",
+            json!({"resourceArn": instance}),
+        ),
+        (
+            "DeleteRecommendationPreferences",
+            json!({
+                "resourceType": "Ec2Instance",
+                "recommendationPreferenceNames": ["EnhancedInfrastructureMetrics"],
+            }),
+        ),
+    ];
+
+    // The default enrollment is Inactive, so every one of them is refused.
+    for (operation, request) in &requests {
+        let (status, body) = call(&router, operation, request.clone()).await;
+        assert_eq!(
+            status, 403,
+            "{operation} while not opted in: expected 403, got {status}: {body}"
+        );
+        assert!(
+            error_code(&body).contains("OptInRequiredException"),
+            "{operation} while not opted in: expected OptInRequiredException, got {body}"
+        );
+    }
+
+    // Opt in; the same calls now work.
+    opt_in(&router).await;
+    put_preference(&router, &put).await;
+    let body = get_preferences(&router, "Ec2Instance", None).await;
+    assert_eq!(
+        body["recommendationPreferencesDetails"][0]["enhancedInfrastructureMetrics"], "Active",
+        "after opting in the write must be stored, got {body}"
+    );
+
+    // Opt out again: the preference operations go back to refusing.
+    let (status, body) = call(
+        &router,
+        "UpdateEnrollmentStatus",
+        json!({"status": "Inactive", "includeMemberAccounts": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "opting out: got {status}: {body}");
+    for (operation, request) in &requests {
+        let (status, body) = call(&router, operation, request.clone()).await;
+        assert_eq!(
+            status, 403,
+            "{operation} after opting out: expected 403, got {status}: {body}"
+        );
+    }
+
+    // And the record written earlier is still in the shared store when the account opts
+    // back in — no request got a private copy of it.
+    opt_in(&router).await;
+    let body = get_preferences(&router, "Ec2Instance", None).await;
+    assert_eq!(
+        body["recommendationPreferencesDetails"][0]["enhancedInfrastructureMetrics"], "Active",
+        "the store is shared across requests, got {body}"
+    );
+}
+
+/// The store and the page it can produce are BOUNDED: the store holds at most
+/// `MAX_PREFERENCE_RECORDS` records, so a request for one more NEW key is refused (while
+/// an update to a key already held still works), and a read that names no page size gets
+/// `DEFAULT_PAGE_SIZE` records plus a token rather than the whole store in one response.
+#[tokio::test]
+async fn the_preference_store_and_its_pages_are_bounded() {
+    let router = emulator();
+    opt_in(&router).await;
+
+    // Fill the store through the public API: each distinct ResourceArn scope is a distinct
+    // key, which is exactly how a caller could grow it without limit.
+    for index in 0..MAX_PREFERENCE_RECORDS {
+        let request = json!({
+            "resourceType": "Ec2Instance",
+            "scope": {"name": "ResourceArn", "value": instance_arn(&format!("i-{index:016x}"))},
+            "enhancedInfrastructureMetrics": "Active",
+        });
+        let (status, body) = call(&router, "PutRecommendationPreferences", request).await;
+        assert_eq!(
+            status, 200,
+            "record {index} of {MAX_PREFERENCE_RECORDS}: must be accepted, got {status}: {body}"
+        );
+    }
+
+    // One past the bound: a NEW key is refused with the modelled server-capacity error,
+    // and nothing is stored for it.
+    let past_bound = instance_arn("i-ffffffffffffffff");
+    let (status, body) = call(
+        &router,
+        "PutRecommendationPreferences",
+        json!({
+            "resourceType": "Ec2Instance",
+            "scope": {"name": "ResourceArn", "value": past_bound},
+            "enhancedInfrastructureMetrics": "Active",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 503,
+        "a new key past {MAX_PREFERENCE_RECORDS} records: expected 503, got {status}: {body}"
+    );
+    assert!(
+        error_code(&body).contains("ServiceUnavailableException"),
+        "a new key past the bound: expected ServiceUnavailableException, got {body}"
+    );
+    let at_bound = json!({"name": "ResourceArn", "value": past_bound});
+    let body = get_preferences(&router, "Ec2Instance", Some(&at_bound)).await;
+    assert_eq!(
+        body["recommendationPreferencesDetails"]
+            .as_array()
+            .map_or(0, Vec::len),
+        0,
+        "the refused key must not have been stored, got {body}"
+    );
+
+    // An UPDATE to a key the full store already holds allocates no record, so it is still
+    // accepted — and it is really stored.
+    let existing = json!({"name": "ResourceArn", "value": instance_arn("i-0000000000000007")});
+    put_preference(
+        &router,
+        &json!({
+            "resourceType": "Ec2Instance",
+            "scope": existing.clone(),
+            "enhancedInfrastructureMetrics": "Inactive",
+        }),
+    )
+    .await;
+    let body = get_preferences(&router, "Ec2Instance", Some(&existing)).await;
+    assert_eq!(
+        body["recommendationPreferencesDetails"][0]["enhancedInfrastructureMetrics"], "Inactive",
+        "an update to an existing key in a full store must be stored, got {body}"
+    );
+
+    // A read that names no page size is bounded by the emulator's default page, not by the
+    // store's size, and hands back a token for the rest.
+    let body = get_preferences(&router, "Ec2Instance", None).await;
+    assert_eq!(
+        body["recommendationPreferencesDetails"]
+            .as_array()
+            .map_or(0, Vec::len),
+        DEFAULT_PAGE_SIZE,
+        "a read naming no maxResults must return one default-sized page, got {body}"
+    );
+    assert!(
+        body["nextToken"].is_string(),
+        "a bounded page over a larger store must carry a nextToken, got {body}"
+    );
+
+    // Walking those pages still visits every stored record exactly once.
+    let mut seen = 0_usize;
+    let mut next_token = body["nextToken"].as_str().map(str::to_string);
+    while let Some(token) = next_token {
+        seen += DEFAULT_PAGE_SIZE;
+        let (status, body) = call(
+            &router,
+            "GetRecommendationPreferences",
+            json!({"resourceType": "Ec2Instance", "nextToken": token}),
+        )
+        .await;
+        assert_eq!(status, 200, "paging a full store: got {status}: {body}");
+        let page = body["recommendationPreferencesDetails"]
+            .as_array()
+            .map_or(0, Vec::len);
+        assert!(
+            page <= DEFAULT_PAGE_SIZE,
+            "paging a full store: a page must not exceed {DEFAULT_PAGE_SIZE}, got {page}"
+        );
+        next_token = body["nextToken"].as_str().map(str::to_string);
+        if next_token.is_none() {
+            seen += page;
+        }
+    }
+    assert_eq!(
+        seen, MAX_PREFERENCE_RECORDS,
+        "paging must visit every one of the {MAX_PREFERENCE_RECORDS} stored records, saw {seen}"
+    );
+
+    // And no `maxResults` a request may carry can exceed the page ceiling.
+    let (status, body) = call(
+        &router,
+        "GetRecommendationPreferences",
+        json!({"resourceType": "Ec2Instance", "maxResults": 1000}),
+    )
+    .await;
+    assert_eq!(status, 200, "maxResults=1000: got {status}: {body}");
+    let page = body["recommendationPreferencesDetails"]
+        .as_array()
+        .map_or(0, Vec::len);
+    assert!(
+        page <= MAX_PAGE_SIZE,
+        "maxResults=1000: a page must not exceed the {MAX_PAGE_SIZE} ceiling, got {page}"
+    );
+}

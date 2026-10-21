@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRecommendationPreferences
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRecommendationPreferences`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRecommendationPreferences::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: clears exactly the preference fields `recommendationPreferenceNames`
+//! names from the record stored for the requested (resourceType, scope) key, and drops
+//! the record once it holds no preference at all.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +159,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRecommendationPreferences` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRecommendationPreferencesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRecommendationPreferences"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteRecommendationPreferencesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The Compute Optimizer preference store is unavailable.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every refusal is decided BEFORE the store is touched, so a refused request
+        // never half-deletes: a bad scope or an unrecognised preference name leaves the
+        // record exactly as it was. InvalidParameterValueException therefore also takes
+        // precedence over the opt-in gate below, as it does in the other three preference
+        // operations.
+        if let Some(reason) = crate::state::scope_rejection(input.scope.as_ref()) {
+            return Err(
+                DeleteRecommendationPreferencesErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(reason),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Some(unknown) = input
+            .recommendation_preference_names
+            .iter()
+            .find(|name| !crate::state::is_recommendation_preference_name(name))
+        {
+            return Err(
+                DeleteRecommendationPreferencesErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "The value supplied for parameter recommendationPreferenceNames is \
+                             not valid: {unknown} is not a recommendation preference name.",
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut guard = state.lock();
+        if !guard.enrollment.is_opted_in() {
+            return Err(
+                DeleteRecommendationPreferencesErrorModeled::OptInRequiredException(
+                    OptInRequiredException {
+                        message: Some(
+                            "The account is not opted in to Compute Optimizer.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Per-name deletion: only the named preferences leave the record addressed by
+        // (resourceType, scope); every other preference on it survives, and so does any
+        // record at another scope.
+        let key = crate::state::PreferenceKey::new(&input.resource_type, input.scope.as_ref());
+        if let Some(record) = guard.preferences.get_mut(&key) {
+            for name in &input.recommendation_preference_names {
+                record.clear_preference(name);
+            }
+            // A record with nothing left on it is no longer a preference: dropping it is
+            // what makes a later read fall back to the next scope, or to the default.
+            if !record.holds_any_preference() {
+                guard.preferences.remove(&key);
+            }
+        }
+
+        Ok(DeleteRecommendationPreferencesOutput {})
     }
 }

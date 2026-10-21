@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEffectiveRecommendationPreferences
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEffectiveRecommendationPreferences`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEffectiveRecommendationPreferences::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves each preference field for one resource from the stored records,
+//! taking it from the most specific scope that sets it — resource, then account, then the
+//! account default, then organization — and falling back to the service default.
 //!
 //! ## Shape of an operation
 //!
@@ -201,18 +196,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEffectiveRecommendationPreferences` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEffectiveRecommendationPreferencesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEffectiveRecommendationPreferences"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetEffectiveRecommendationPreferencesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The Compute Optimizer preference store is unavailable.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `resourceArn`: "Only EC2 instance and Auto Scaling group ARNs are currently
+        // supported." The ARN also names the resource type whose preferences apply and
+        // the account whose account-level preferences apply. Refused before the store is
+        // read, so InvalidParameterValueException takes precedence over the opt-in gate,
+        // as it does in the other preference operations.
+        let Some(resource) = crate::state::parse_resource_arn(&input.resource_arn) else {
+            return Err(
+                GetEffectiveRecommendationPreferencesErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "The value supplied for parameter resourceArn is not valid: {} is not \
+                             the Amazon Resource Name (ARN) of an EC2 instance or an Auto Scaling \
+                             group.",
+                            input.resource_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let guard = state.lock();
+        if !guard.enrollment.is_opted_in() {
+            return Err(
+                GetEffectiveRecommendationPreferencesErrorModeled::OptInRequiredException(
+                    OptInRequiredException {
+                        message: Some(
+                            "The account is not opted in to Compute Optimizer.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Considers all applicable preferences that you might have set at the resource,
+        // account, and organization level": each field independently takes the value from
+        // the most specific scope that sets it, so a resource-level record that sets one
+        // preference still inherits the rest.
+        let applicable = guard.records_applying_to(&input.resource_arn, resource);
+        let effective = |field: fn(&crate::state::PreferenceRecord) -> bool| {
+            applicable.iter().copied().find(|record| field(record))
+        };
+
+        Ok(GetEffectiveRecommendationPreferencesOutput {
+            enhanced_infrastructure_metrics: effective(|record| {
+                record.enhanced_infrastructure_metrics.is_some()
+            })
+            .and_then(|record| record.enhanced_infrastructure_metrics.clone()),
+            external_metrics_preference: effective(|record| {
+                record.external_metrics_preference.is_some()
+            })
+            .and_then(|record| record.external_metrics_preference.clone()),
+            // "When this preference isn't specified, we use the default value DAYS_14."
+            look_back_period: Some(
+                effective(|record| record.look_back_period.is_some())
+                    .and_then(|record| record.look_back_period.clone())
+                    .unwrap_or_else(|| crate::state::DEFAULT_LOOK_BACK_PERIOD.to_string()),
+            ),
+            utilization_preferences: effective(|record| {
+                !record.utilization_preferences.is_empty()
+            })
+            .map(|record| record.utilization_preferences.clone()),
+            preferred_resources: effective(|record| !record.preferred_resources.is_empty()).map(
+                |record| {
+                    record
+                        .preferred_resources
+                        .iter()
+                        .map(crate::state::effective_preferred_resource)
+                        .collect()
+                },
+            ),
+        })
     }
 }

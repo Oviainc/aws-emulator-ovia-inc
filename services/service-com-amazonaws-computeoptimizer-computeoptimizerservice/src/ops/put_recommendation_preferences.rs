@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRecommendationPreferences
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRecommendationPreferences`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRecommendationPreferences::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: creates or updates (upserts) the one stored preference record for the
+//! requested (resourceType, scope) key, merging the supplied preference fields into it,
+//! and refuses a request that breaks a documented preference rule with
+//! `InvalidParameterValueException`.
 //!
 //! ## Shape of an operation
 //!
@@ -211,18 +207,197 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRecommendationPreferences` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRecommendationPreferencesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRecommendationPreferences"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutRecommendationPreferencesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The Compute Optimizer preference store is unavailable.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A malformed request is refused before the store is read or written, so
+        // InvalidParameterValueException takes precedence over the opt-in gate below and a
+        // refused request stores nothing. The other three preference operations order
+        // their refusals the same way.
+        if let Some(reason) = request_rejection(&input) {
+            return Err(
+                PutRecommendationPreferencesErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(reason),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut guard = state.lock();
+        if !guard.enrollment.is_opted_in() {
+            return Err(
+                PutRecommendationPreferencesErrorModeled::OptInRequiredException(
+                    OptInRequiredException {
+                        message: Some(
+                            "The account is not opted in to Compute Optimizer.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Creates a new recommendation preference or updates an existing recommendation
+        // preference": one record per (resourceType, scope) key, with the supplied fields
+        // merged into whatever that key already holds.
+        let key = crate::state::PreferenceKey::new(&input.resource_type, input.scope.as_ref());
+        // The key comes from caller-supplied `resourceType` + `scope`, so a NEW key is a
+        // new allocation this request asked for: refuse once the store is full rather than
+        // growing without limit. An update to a key already held allocates nothing and is
+        // still accepted.
+        if !guard.can_hold(&key) {
+            return Err(store_full());
+        }
+        guard
+            .preferences
+            .entry(key)
+            .or_insert_with(|| {
+                crate::state::PreferenceRecord::for_key(&input.resource_type, input.scope.as_ref())
+            })
+            .apply(&input);
+
+        Ok(PutRecommendationPreferencesOutput {})
     }
 }
+
+/// The modelled refusal for a store already holding
+/// [`crate::state::MAX_PREFERENCE_RECORDS`] records: this emulator will not grow its
+/// preference store further, so a request for one more record is refused rather than
+/// served by allocating it. `ServiceUnavailableException` (HTTP 503, "The request has
+/// failed due to a temporary failure of the server") is the server-side-capacity refusal
+/// this operation models; the message names the bound that was actually reached.
+fn store_full() -> PutRecommendationPreferencesError {
+    PutRecommendationPreferencesErrorModeled::ServiceUnavailableException(
+        ServiceUnavailableException {
+            message: Some(format!(
+                "this emulator stores at most {} recommendation preference records",
+                crate::state::MAX_PREFERENCE_RECORDS
+            )),
+        },
+    )
+    .into()
+}
+
+/// Why this request is not a valid preference, or `None` when it is.
+///
+/// Every rule below is one the model documents for this operation's own members; they are
+/// checked here rather than per-member at the boundary because each is a relation between
+/// `resourceType`/`scope` and another member, which no single member constraint can state.
+fn request_rejection(input: &PutRecommendationPreferencesInput) -> Option<String> {
+    if let Some(reason) = crate::state::scope_rejection(input.scope.as_ref()) {
+        return Some(reason);
+    }
+    let scope_name = input.scope.as_ref().and_then(|scope| scope.name.as_deref());
+
+    // `scope`: "You cannot create recommendation preferences for Auto Scaling groups at
+    // the organization and account levels. You can create recommendation preferences for
+    // Auto Scaling groups only at the resource level by specifying a scope name of
+    // ResourceArn and a scope value of the Auto Scaling group Amazon Resource Name (ARN)."
+    if input.resource_type == crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP
+        && scope_name != Some(crate::state::SCOPE_RESOURCE_ARN)
+    {
+        return Some(format!(
+            "The value supplied for parameter scope is not valid: a {} recommendation \
+             preference can only be created at the resource level, with a scope name of {}.",
+            crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP,
+            crate::state::SCOPE_RESOURCE_ARN,
+        ));
+    }
+
+    // `externalMetricsPreference`: "This preference can only be set for the Ec2Instance
+    // resource type."
+    if input.external_metrics_preference.is_some()
+        && input.resource_type != crate::state::RESOURCE_TYPE_EC2_INSTANCE
+    {
+        return Some(format!(
+            "The value supplied for parameter externalMetricsPreference is not valid: it can \
+             only be set for the {} resource type, not {}.",
+            crate::state::RESOURCE_TYPE_EC2_INSTANCE, input.resource_type,
+        ));
+    }
+
+    // `utilizationPreferences`: "You can only set CPU and memory utilization preferences
+    // for the Amazon EC2 instance resource type" and "The threshold setting isn't
+    // available for memory utilization."
+    if let Some(preferences) = input
+        .utilization_preferences
+        .as_ref()
+        .filter(|preferences| !preferences.is_empty())
+    {
+        if input.resource_type != crate::state::RESOURCE_TYPE_EC2_INSTANCE {
+            return Some(format!(
+                "The value supplied for parameter utilizationPreferences is not valid: it can \
+                 only be set for the {} resource type, not {}.",
+                crate::state::RESOURCE_TYPE_EC2_INSTANCE, input.resource_type,
+            ));
+        }
+        for preference in preferences {
+            let carries_threshold = preference
+                .metric_parameters
+                .as_ref()
+                .is_some_and(|parameters| parameters.threshold.is_some());
+            if preference.metric_name.as_deref() == Some(MEMORY_UTILIZATION) && carries_threshold {
+                return Some(format!(
+                    "The value supplied for parameter utilizationPreferences is not valid: the \
+                     threshold setting is not available for {MEMORY_UTILIZATION}.",
+                ));
+            }
+        }
+    }
+
+    // `preferredResources`: "You must specify either an includeList or excludeList. If the
+    // preference is an empty set of resource type values, an error occurs."
+    for resource in input.preferred_resources.iter().flatten() {
+        let included = resource.include_list.iter().flatten().count();
+        let excluded = resource.exclude_list.iter().flatten().count();
+        if included + excluded == 0 {
+            return Some(
+                "The value supplied for parameter preferredResources is not valid: each entry \
+                 must specify either an includeList or an excludeList."
+                    .to_string(),
+            );
+        }
+    }
+
+    // `lookBackPeriod`: "You can only set this preference for the Amazon EC2 instance,
+    // Auto Scaling group, Amazon EBS volume, Amazon ECS service on Fargate, Amazon RDS DB
+    // instance, and Aurora DB cluster storage resource types."
+    if input.look_back_period.is_some()
+        && !LOOK_BACK_PERIOD_RESOURCE_TYPES.contains(&input.resource_type.as_str())
+    {
+        return Some(format!(
+            "The value supplied for parameter lookBackPeriod is not valid: it cannot be set for \
+             the {} resource type.",
+            input.resource_type,
+        ));
+    }
+
+    None
+}
+
+/// The `CustomizableMetricName` value whose headroom, but not threshold, is settable.
+const MEMORY_UTILIZATION: &str = "MemoryUtilization";
+
+/// The `ResourceType` values a `lookBackPeriod` preference may be set for, from this
+/// operation's `lookBackPeriod` documentation.
+const LOOK_BACK_PERIOD_RESOURCE_TYPES: &[&str] = &[
+    "Ec2Instance",
+    "AutoScalingGroup",
+    "EbsVolume",
+    "EcsService",
+    "RdsDBInstance",
+    "AuroraDBClusterStorage",
+];

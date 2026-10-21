@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRecommendationPreferences
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRecommendationPreferences`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRecommendationPreferences::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: returns the stored preference records for the requested `resourceType`,
+//! filtered by `scope` when one is supplied, one page at a time: at most `maxResults`
+//! records, plus an opaque `nextToken` when records remain and none on the final page.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +172,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRecommendationPreferences` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRecommendationPreferencesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRecommendationPreferences"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetRecommendationPreferencesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The Compute Optimizer preference store is unavailable.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A malformed request — a bad scope or a forged token — is refused before the
+        // store is read, so InvalidParameterValueException takes precedence over the
+        // opt-in gate below, as it does in the other preference operations.
+        if let Some(reason) = crate::state::scope_rejection(input.scope.as_ref()) {
+            return Err(
+                GetRecommendationPreferencesErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(reason),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A `nextToken` this service did not issue cannot name a page boundary.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(
+                        GetRecommendationPreferencesErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(
+                                    "The value supplied for parameter nextToken is not valid."
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+        };
+
+        // `maxResults` is modelled 0..1000 (the boundary refuses anything outside that).
+        // Whatever it asks for, the page is capped at `MAX_PAGE_SIZE` so no number a
+        // request carries can size the response or the allocation that builds it; and a
+        // request naming no size (or naming the range's lower bound `0`, which the service
+        // documents no meaning for) gets `DEFAULT_PAGE_SIZE` plus a `nextToken` to walk the
+        // rest, rather than the whole store serialised into one response.
+        // `tests/all/enrollment_and_preferences.rs` pins both.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .filter(|requested| *requested > 0)
+            .unwrap_or(crate::state::DEFAULT_PAGE_SIZE)
+            .min(crate::state::MAX_PAGE_SIZE);
+        // A scope, when supplied, selects exactly the record written at that scope.
+        let only_scope = input
+            .scope
+            .as_ref()
+            .map(|scope| crate::state::PreferenceKey::new(&input.resource_type, Some(scope)));
+
+        let guard = state.lock();
+        if !guard.enrollment.is_opted_in() {
+            return Err(
+                GetRecommendationPreferencesErrorModeled::OptInRequiredException(
+                    OptInRequiredException {
+                        message: Some(
+                            "The account is not opted in to Compute Optimizer.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        let mut details: Vec<RecommendationPreferencesDetail> = Vec::new();
+        let mut next_token = None;
+        for (key, record) in &guard.preferences {
+            if key.resource_type != input.resource_type {
+                continue;
+            }
+            if only_scope.as_ref().is_some_and(|wanted| key != wanted) {
+                continue;
+            }
+            if resume_at.as_ref().is_some_and(|start| key < start) {
+                continue;
+            }
+            if details.len() >= page_size {
+                // The page is full and this record is the next page's first.
+                next_token = Some(crate::state::encode_page_token(key));
+                break;
+            }
+            details.push(record.to_detail());
+        }
+
+        Ok(GetRecommendationPreferencesOutput {
+            next_token,
+            recommendation_preferences_details: Some(details),
+        })
     }
 }
