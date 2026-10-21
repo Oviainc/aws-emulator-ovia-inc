@@ -893,12 +893,112 @@
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/lakeformation/service/2017-03-31/lakeformation-2017-03-31.json"
     },
     {
+      "shape_id": "com.amazonaws.lambda#AWSGirApiService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/lambda/service/2015-03-31/lambda-2015-03-31.json"
+    },
+    {
       "shape_id": "com.amazonaws.lambdacore#LambdaCoreApiService",
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/lambda-core/service/2026-04-30/lambda-core-2026-04-30.json"
     },
     {
       "shape_id": "com.amazonaws.lambdamicrovms#LambdaMicrovms",
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/lambda-microvms/service/2025-09-09/lambda-microvms-2025-09-09.json"
+    },
+    {
+      "shape_id": "com.amazonaws.lambdaweb#LambdaWeb",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/lambda-web/service/2025-03-07/lambda-web-2025-03-07.json"
+    },
+    {
+      "shape_id": "com.amazonaws.launchwizard#LaunchWizard",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/launch-wizard/service/2018-05-10/launch-wizard-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.lexmodelbuildingservice#AWSDeepSenseModelBuildingService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/lex-model-building-service/service/2017-04-19/lex-model-building-service-2017-04-19.json"
+    },
+    {
+      "shape_id": "com.amazonaws.lexmodelsv2#LexModelBuildingServiceV2",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/lex-models-v2/service/2020-08-07/lex-models-v2-2020-08-07.json"
+    },
+    {
+      "shape_id": "com.amazonaws.lexruntimeservice#AWSDeepSenseRunTimeService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/lex-runtime-service/service/2016-11-28/lex-runtime-service-2016-11-28.json"
+    },
+    {
+      "shape_id": "com.amazonaws.lexruntimev2#AWSDeepSenseRunTimeServiceApi2_0",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/lex-runtime-v2/service/2020-08-07/lex-runtime-v2-2020-08-07.json"
+    },
+    {
+      "shape_id": "com.amazonaws.licensemanager#AWSLicenseManager",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/license-manager/service/2018-08-01/license-manager-2018-08-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.licensemanagerlinuxsubscriptions#LicenseManagerLinuxSubscriptions",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/license-manager-linux-subscriptions/service/2018-05-10/license-manager-linux-subscriptions-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.licensemanagerusersubscriptions#LicenseManagerUserSubscriptions",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/license-manager-user-subscriptions/service/2018-05-10/license-manager-user-subscriptions-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.lightsail#Lightsail_20161128",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/lightsail/service/2016-11-28/lightsail-2016-11-28.json"
+    },
+    {
+      "shape_id": "com.amazonaws.location#LocationService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/location/service/2020-11-19/location-2020-11-19.json"
+    },
+    {
+      "shape_id": "com.amazonaws.lookoutequipment#AWSLookoutEquipmentFrontendService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/lookoutequipment/service/2020-12-15/lookoutequipment-2020-12-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.m2#AwsSupernovaControlPlaneService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/m2/service/2021-04-28/m2-2021-04-28.json"
+    },
+    {
+      "shape_id": "com.amazonaws.machinelearning#AmazonML_20141212",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/machine-learning/service/2014-12-12/machine-learning-2014-12-12.json"
+    },
+    {
+      "shape_id": "com.amazonaws.macie2#Macie2",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/macie2/service/2020-01-01/macie2-2020-01-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.mailmanager#MailManagerSvc",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/mailmanager/service/2023-10-17/mailmanager-2023-10-17.json"
+    },
+    {
+      "shape_id": "com.amazonaws.managedblockchain#TaigaWebService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/managedblockchain/service/2018-09-24/managedblockchain-2018-09-24.json"
+    },
+    {
+      "shape_id": "com.amazonaws.managedblockchainquery#TietonChainQueryService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/managedblockchain-query/service/2023-05-04/managedblockchain-query-2023-05-04.json"
+    },
+    {
+      "shape_id": "com.amazonaws.marketplaceagreement#AWSMPCommerceService_v20200301",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/marketplace-agreement/service/2020-03-01/marketplace-agreement-2020-03-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.marketplacecatalog#AWSMPSeymour",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/marketplace-catalog/service/2018-09-17/marketplace-catalog-2018-09-17.json"
+    },
+    {
+      "shape_id": "com.amazonaws.marketplacecommerceanalytics#MarketplaceCommerceAnalytics20150701",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/marketplace-commerce-analytics/service/2015-07-01/marketplace-commerce-analytics-2015-07-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.marketplacedeployment#AWSMPDeploymentParametersService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/marketplace-deployment/service/2023-01-25/marketplace-deployment-2023-01-25.json"
+    },
+    {
+      "shape_id": "com.amazonaws.marketplacediscovery#AWSMarketplaceDiscovery",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/marketplace-discovery/service/2026-02-05/marketplace-discovery-2026-02-05.json"
+    },
+    {
+      "shape_id": "com.amazonaws.marketplaceentitlementservice#AWSMPEntitlementService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/marketplace-entitlement-service/service/2017-01-11/marketplace-entitlement-service-2017-01-11.json"
     }
   ]
 }

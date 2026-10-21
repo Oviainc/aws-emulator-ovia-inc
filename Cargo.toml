@@ -223,8 +223,33 @@ members = [
     "services/service-com-amazonaws-kinesisvideowebrtcstorage-awsacuityroutingservicelambda",
     "services/service-com-amazonaws-kms-trentservice",
     "services/service-com-amazonaws-lakeformation-awslakeformation",
+    "services/service-com-amazonaws-lambda-awsgirapiservice",
     "services/service-com-amazonaws-lambdacore-lambdacoreapiservice",
     "services/service-com-amazonaws-lambdamicrovms-lambdamicrovms",
+    "services/service-com-amazonaws-lambdaweb-lambdaweb",
+    "services/service-com-amazonaws-launchwizard-launchwizard",
+    "services/service-com-amazonaws-lexmodelbuildingservice-awsdeepsensemodelbuildingservice",
+    "services/service-com-amazonaws-lexmodelsv2-lexmodelbuildingservicev2",
+    "services/service-com-amazonaws-lexruntimeservice-awsdeepsenseruntimeservice",
+    "services/service-com-amazonaws-lexruntimev2-awsdeepsenseruntimeserviceapi2-0",
+    "services/service-com-amazonaws-licensemanager-awslicensemanager",
+    "services/service-com-amazonaws-licensemanagerlinuxsubscriptions-licensemanagerlinuxsubscriptions",
+    "services/service-com-amazonaws-licensemanagerusersubscriptions-licensemanagerusersubscriptions",
+    "services/service-com-amazonaws-lightsail-lightsail-20161128",
+    "services/service-com-amazonaws-location-locationservice",
+    "services/service-com-amazonaws-lookoutequipment-awslookoutequipmentfrontendservice",
+    "services/service-com-amazonaws-m2-awssupernovacontrolplaneservice",
+    "services/service-com-amazonaws-machinelearning-amazonml-20141212",
+    "services/service-com-amazonaws-macie2-macie2",
+    "services/service-com-amazonaws-mailmanager-mailmanagersvc",
+    "services/service-com-amazonaws-managedblockchain-taigawebservice",
+    "services/service-com-amazonaws-managedblockchainquery-tietonchainqueryservice",
+    "services/service-com-amazonaws-marketplaceagreement-awsmpcommerceservice-v20200301",
+    "services/service-com-amazonaws-marketplacecatalog-awsmpseymour",
+    "services/service-com-amazonaws-marketplacecommerceanalytics-marketplacecommerceanalytics20150701",
+    "services/service-com-amazonaws-marketplacedeployment-awsmpdeploymentparametersservice",
+    "services/service-com-amazonaws-marketplacediscovery-awsmarketplacediscovery",
+    "services/service-com-amazonaws-marketplaceentitlementservice-awsmpentitlementservice",
     "core/router",
     "core/embedded",
 ]
@@ -483,8 +508,33 @@ service-com-amazonaws-kinesisvideosignaling-awsacuitysignalingservice = { path =
 service-com-amazonaws-kinesisvideowebrtcstorage-awsacuityroutingservicelambda = { path = "services/service-com-amazonaws-kinesisvideowebrtcstorage-awsacuityroutingservicelambda" }
 service-com-amazonaws-kms-trentservice = { path = "services/service-com-amazonaws-kms-trentservice" }
 service-com-amazonaws-lakeformation-awslakeformation = { path = "services/service-com-amazonaws-lakeformation-awslakeformation" }
+service-com-amazonaws-lambda-awsgirapiservice = { path = "services/service-com-amazonaws-lambda-awsgirapiservice" }
 service-com-amazonaws-lambdacore-lambdacoreapiservice = { path = "services/service-com-amazonaws-lambdacore-lambdacoreapiservice" }
 service-com-amazonaws-lambdamicrovms-lambdamicrovms = { path = "services/service-com-amazonaws-lambdamicrovms-lambdamicrovms" }
+service-com-amazonaws-lambdaweb-lambdaweb = { path = "services/service-com-amazonaws-lambdaweb-lambdaweb" }
+service-com-amazonaws-launchwizard-launchwizard = { path = "services/service-com-amazonaws-launchwizard-launchwizard" }
+service-com-amazonaws-lexmodelbuildingservice-awsdeepsensemodelbuildingservice = { path = "services/service-com-amazonaws-lexmodelbuildingservice-awsdeepsensemodelbuildingservice" }
+service-com-amazonaws-lexmodelsv2-lexmodelbuildingservicev2 = { path = "services/service-com-amazonaws-lexmodelsv2-lexmodelbuildingservicev2" }
+service-com-amazonaws-lexruntimeservice-awsdeepsenseruntimeservice = { path = "services/service-com-amazonaws-lexruntimeservice-awsdeepsenseruntimeservice" }
+service-com-amazonaws-lexruntimev2-awsdeepsenseruntimeserviceapi2-0 = { path = "services/service-com-amazonaws-lexruntimev2-awsdeepsenseruntimeserviceapi2-0" }
+service-com-amazonaws-licensemanager-awslicensemanager = { path = "services/service-com-amazonaws-licensemanager-awslicensemanager" }
+service-com-amazonaws-licensemanagerlinuxsubscriptions-licensemanagerlinuxsubscriptions = { path = "services/service-com-amazonaws-licensemanagerlinuxsubscriptions-licensemanagerlinuxsubscriptions" }
+service-com-amazonaws-licensemanagerusersubscriptions-licensemanagerusersubscriptions = { path = "services/service-com-amazonaws-licensemanagerusersubscriptions-licensemanagerusersubscriptions" }
+service-com-amazonaws-lightsail-lightsail-20161128 = { path = "services/service-com-amazonaws-lightsail-lightsail-20161128" }
+service-com-amazonaws-location-locationservice = { path = "services/service-com-amazonaws-location-locationservice" }
+service-com-amazonaws-lookoutequipment-awslookoutequipmentfrontendservice = { path = "services/service-com-amazonaws-lookoutequipment-awslookoutequipmentfrontendservice" }
+service-com-amazonaws-m2-awssupernovacontrolplaneservice = { path = "services/service-com-amazonaws-m2-awssupernovacontrolplaneservice" }
+service-com-amazonaws-machinelearning-amazonml-20141212 = { path = "services/service-com-amazonaws-machinelearning-amazonml-20141212" }
+service-com-amazonaws-macie2-macie2 = { path = "services/service-com-amazonaws-macie2-macie2" }
+service-com-amazonaws-mailmanager-mailmanagersvc = { path = "services/service-com-amazonaws-mailmanager-mailmanagersvc" }
+service-com-amazonaws-managedblockchain-taigawebservice = { path = "services/service-com-amazonaws-managedblockchain-taigawebservice" }
+service-com-amazonaws-managedblockchainquery-tietonchainqueryservice = { path = "services/service-com-amazonaws-managedblockchainquery-tietonchainqueryservice" }
+service-com-amazonaws-marketplaceagreement-awsmpcommerceservice-v20200301 = { path = "services/service-com-amazonaws-marketplaceagreement-awsmpcommerceservice-v20200301" }
+service-com-amazonaws-marketplacecatalog-awsmpseymour = { path = "services/service-com-amazonaws-marketplacecatalog-awsmpseymour" }
+service-com-amazonaws-marketplacecommerceanalytics-marketplacecommerceanalytics20150701 = { path = "services/service-com-amazonaws-marketplacecommerceanalytics-marketplacecommerceanalytics20150701" }
+service-com-amazonaws-marketplacedeployment-awsmpdeploymentparametersservice = { path = "services/service-com-amazonaws-marketplacedeployment-awsmpdeploymentparametersservice" }
+service-com-amazonaws-marketplacediscovery-awsmarketplacediscovery = { path = "services/service-com-amazonaws-marketplacediscovery-awsmarketplacediscovery" }
+service-com-amazonaws-marketplaceentitlementservice-awsmpentitlementservice = { path = "services/service-com-amazonaws-marketplaceentitlementservice-awsmpentitlementservice" }
 
 # The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
 #

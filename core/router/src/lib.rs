@@ -96,7 +96,9 @@ pub fn build_router(engine: Arc<InMemoryEngine>) -> MultiServiceRouter {
     let router = mount_chunk_17(router, &engine);
     let router = mount_chunk_18(router, &engine);
     let router = mount_chunk_19(router, &engine);
-    mount_chunk_20(router, &engine)
+    let router = mount_chunk_20(router, &engine);
+    let router = mount_chunk_21(router, &engine);
+    mount_chunk_22(router, &engine)
 }
 
 /// Register services 00 of this workspace on `router`.
@@ -571,8 +573,57 @@ fn mount_chunk_20(
     router.register_service(service_com_amazonaws_kinesisvideowebrtcstorage_awsacuityroutingservicelambda::EmulatedService::new(engine.clone()));
     router.register_service(service_com_amazonaws_kms_trentservice::EmulatedService::new(engine.clone()));
     router.register_service(service_com_amazonaws_lakeformation_awslakeformation::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(engine.clone()));
     router.register_service(service_com_amazonaws_lambdacore_lambdacoreapiservice::EmulatedService::new(engine.clone()));
     router.register_service(service_com_amazonaws_lambdamicrovms_lambdamicrovms::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_lambdaweb_lambdaweb::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_launchwizard_launchwizard::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_lexmodelbuildingservice_awsdeepsensemodelbuildingservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_lexmodelsv2_lexmodelbuildingservicev2::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_lexruntimeservice_awsdeepsenseruntimeservice::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 21 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_21(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_lexruntimev2_awsdeepsenseruntimeserviceapi2_0::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_licensemanager_awslicensemanager::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_licensemanagerusersubscriptions_licensemanagerusersubscriptions::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_lightsail_lightsail_20161128::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_location_locationservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_lookoutequipment_awslookoutequipmentfrontendservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_m2_awssupernovacontrolplaneservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_machinelearning_amazonml_20141212::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_macie2_macie2::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_mailmanager_mailmanagersvc::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 22 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_22(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_managedblockchain_taigawebservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_managedblockchainquery_tietonchainqueryservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_marketplaceagreement_awsmpcommerceservice_v20200301::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_marketplacecatalog_awsmpseymour::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_marketplacecommerceanalytics_marketplacecommerceanalytics20150701::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_marketplacediscovery_awsmarketplacediscovery::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_marketplaceentitlementservice_awsmpentitlementservice::EmulatedService::new(engine.clone()));
     router
 }
 
