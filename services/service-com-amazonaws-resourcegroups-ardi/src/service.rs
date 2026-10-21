@@ -96,17 +96,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Resource Groups words a request that violates the model's own rules — an
+        // absent required member, a value outside a declared length, pattern or
+        // range — as `BadRequestException`: "The request includes one or more
+        // parameters that violate validation rules." (the model's own documentation
+        // of that error). The framework's default code here is
+        // `ValidationException`, which this service never returns, so BOTH the code
+        // and the message are replaced. The message keeps the framework's own
+        // envelope, which names the member and the constraint it failed, so a caller
+        // can fix the request from it.
+        //
+        // An authentication refusal keeps the framework's wording: the emulator, not
+        // this service, decides how a caller is refused.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "BadRequestException".to_string(),
+                message: aws_smithy_schema_server::envelope(violations).unwrap_or_else(|| {
+                    "The request includes one or more parameters that violate validation rules."
+                        .to_string()
+                }),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

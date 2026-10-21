@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `GroupIdentifier` per persisted group, in group-name order, computed from
+//! [`crate::state`]. A page carries at most `MaxResults` identifiers and, when more
+//! remain, a `NextToken` the next call resumes after.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +172,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGroups"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` is deliberately unreachable here and a success says
+        // nothing about the caller's permissions.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListGroupsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the resource-groups store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let filters = input.filters.unwrap_or_default();
+        for filter in &filters {
+            match filter.name.as_str() {
+                "criticality" | "display-name" | "owner" => {}
+                // Both read data this slice does not hold: a group's service
+                // configuration (`GetGroupConfiguration` and
+                // `PutGroupConfiguration` are still scaffolded) and the resource
+                // types a group's query selects.
+                "configuration-type" | "resource-type" => {
+                    return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                        "ListGroups filtered by {}",
+                        filter.name,
+                    )));
+                }
+                other => {
+                    return Err(bad_request(format!(
+                        "Filters contains the filter name {}, which is not valid: expected one of {}",
+                        other,
+                        GROUP_FILTER_NAME_VALUES.join(", "),
+                    )));
+                }
+            }
+        }
+
+        // The token is this service's own opaque encoding of the name the previous
+        // page stopped at; anything else cannot name a resume point.
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => match crate::state::decode_page_token(LISTING, token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(bad_request(
+                        "NextToken is not valid: it was not issued by a previous ListGroups call",
+                    ))
+                }
+            },
+        };
+
+        let store = state.lock();
+        let mut remaining: Vec<&crate::state::GroupRecord> = store
+            .groups
+            .values()
+            .filter(|group| filters.iter().all(|filter| matches_filter(group, filter)))
+            .collect();
+        // The listing order is group-name order, which is what the resume key below
+        // is compared against. The store is keyed in that order, and sorting here as
+        // well keeps this page correct whatever order it is handed.
+        remaining.sort_by(|left, right| left.name.cmp(&right.name));
+        if let Some(resume) = resume_after.as_deref() {
+            remaining.retain(|group| group.name.as_str() > resume);
+        }
+        let page_size = page_size(input.max_results)?.min(remaining.len());
+        let page = &remaining[..page_size];
+        let next_token = (page.len() < remaining.len())
+            .then(|| page.last().map(|group| crate::state::encode_page_token(LISTING, &group.name)))
+            .flatten();
+
+        Ok(ListGroupsOutput {
+            group_identifiers: Some(page.iter().map(|group| group.to_identifier()).collect()),
+            // Deprecated in favour of `GroupIdentifiers`, and reported from the same
+            // page so the two cannot disagree.
+            groups: Some(page.iter().map(|group| group.to_group()).collect()),
+            next_token,
+        })
     }
+}
+
+/// The listing this operation's pagination tokens belong to: a token issued here
+/// resumes THIS listing and no other.
+const LISTING: &str = "groups";
+
+/// The largest page the modelled `MaxResults` can ask for (`range 1..50`), and the
+/// page size used when the caller asks for none: the model documents the absent
+/// case as "defaults to a value that is specific to the operation", and answering
+/// at the modelled maximum bounds the response and keeps the `NextToken` loop
+/// working the same way whether or not `MaxResults` was sent.
+const MAX_RESULTS: usize = 50;
+
+/// How many identifiers one page carries, from the caller's `MaxResults`.
+///
+/// The framework refuses a value outside the modelled range before this handler
+/// runs; checking it again here keeps the conversion lossless rather than letting
+/// a negative value wrap into "every group".
+fn page_size(max_results: Option<i32>) -> Result<usize, ListGroupsError> {
+    match max_results {
+        None => Ok(MAX_RESULTS),
+        Some(max) => usize::try_from(max)
+            .ok()
+            .filter(|size| (1..=MAX_RESULTS).contains(size))
+            .ok_or_else(|| {
+                bad_request(format!(
+                    "MaxResults {max} is not valid: it must be between 1 and {MAX_RESULTS}"
+                ))
+            }),
+    }
+}
+
+/// Whether `group` satisfies one `GroupFilter`: the attribute the filter names
+/// equals one of its values. A group whose attribute is unset matches no value.
+/// The caller has already refused every filter name this slice cannot answer.
+fn matches_filter(group: &crate::state::GroupRecord, filter: &GroupFilter) -> bool {
+    let attribute = match filter.name.as_str() {
+        "criticality" => group.criticality.map(|rank| rank.to_string()),
+        "display-name" => group.display_name.clone(),
+        "owner" => group.owner.clone(),
+        _ => None,
+    };
+    attribute.is_some_and(|value| filter.values.contains(&value))
+}
+
+/// A `BadRequestException` (HTTP 400) — the modelled refusal for a request whose
+/// parameters violate this operation's validation rules.
+fn bad_request(message: impl Into<String>) -> ListGroupsError {
+    ListGroupsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

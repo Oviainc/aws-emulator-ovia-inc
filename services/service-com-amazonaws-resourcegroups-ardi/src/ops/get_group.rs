@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored group that `Group` (a name or a group ARN) or the deprecated
+//! `GroupName` names, exactly as [`crate::state`] holds it. Reporting only — it never
+//! writes.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +152,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGroup"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` is deliberately unreachable here and a success says
+        // nothing about the caller's permissions.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetGroupErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the resource-groups store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // Neither member is `@required`, but the operation addresses exactly one
+        // group, so a request naming none cannot be served. `Group` wins over the
+        // deprecated `GroupName`, and the one identifier resolved here is the one
+        // every answer below names.
+        let Some(identifier) = input.group.as_deref().or(input.group_name.as_deref()) else {
+            return Err(GetGroupErrorModeled::BadRequestException(BadRequestException {
+                message: Some(
+                    "the request must name the group to get, in Group or GroupName".to_string(),
+                ),
+            })
+            .into());
+        };
+        let not_found = || {
+            GetGroupError::from(GetGroupErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("no group found with the identifier {identifier}")),
+            }))
+        };
+        let store = state.lock();
+        let name = store.lookup(identifier).ok_or_else(not_found)?;
+        let group = store.groups.get(&name).ok_or_else(not_found)?;
+        Ok(GetGroupOutput {
+            group: Some(group.to_group()),
+        })
     }
 }
