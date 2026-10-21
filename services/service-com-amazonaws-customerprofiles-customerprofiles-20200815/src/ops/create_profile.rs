@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a profile id, stores the profile under its domain and indexes it under the
+//! predefined search keys its own attributes populate, so `SearchProfiles` finds it.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +182,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProfile"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let domain = store.domains.get_mut(&input.domain_name).ok_or_else(|| {
+            CreateProfileError::from(CreateProfileErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("The domain {} does not exist", input.domain_name)),
+                },
+            ))
+        })?;
+        // One profile per request, and at most this many per domain: however many
+        // requests arrive, the domain cannot grow past the cap.
+        if domain.profiles.len() >= crate::state::MAX_PROFILES_PER_DOMAIN {
+            return Err(CreateProfileErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "The maximum number of profiles for domain {} has been reached: {}",
+                    input.domain_name,
+                    crate::state::MAX_PROFILES_PER_DOMAIN
+                )),
+            })
+            .into());
+        }
+
+        let profile_id = new_profile_id();
+        let profile = Profile {
+            profile_id: Some(profile_id.clone()),
+            account_number: input.account_number,
+            additional_information: input.additional_information,
+            party_type: input.party_type,
+            business_name: input.business_name,
+            first_name: input.first_name,
+            middle_name: input.middle_name,
+            last_name: input.last_name,
+            birth_date: input.birth_date,
+            gender: input.gender,
+            phone_number: input.phone_number,
+            mobile_phone_number: input.mobile_phone_number,
+            home_phone_number: input.home_phone_number,
+            business_phone_number: input.business_phone_number,
+            email_address: input.email_address,
+            personal_email_address: input.personal_email_address,
+            business_email_address: input.business_email_address,
+            address: input.address,
+            shipping_address: input.shipping_address,
+            mailing_address: input.mailing_address,
+            billing_address: input.billing_address,
+            attributes: input.attributes,
+            // `FoundByItems` reports which search keys matched one search, so it
+            // belongs to a `SearchProfiles` response, not to the stored profile.
+            found_by_items: None,
+            party_type_string: input.party_type_string,
+            gender_string: input.gender_string,
+            profile_type: input.profile_type,
+            engagement_preferences: input.engagement_preferences,
+        };
+
+        // Writing a profile is not an edit of the DOMAIN, so the domain's
+        // `LastUpdatedAt` ("the timestamp of when the domain was most recently edited")
+        // deliberately does not move here.
+        domain.put_profile(crate::state::StoredProfile {
+            profile,
+            created_at: now,
+            last_updated_at: now,
+        });
+
+        Ok(CreateProfileOutput { profile_id })
     }
+}
+
+/// A fresh `ProfileId`: the 32 lowercase hex characters the modelled pattern
+/// `^[a-f0-9]{32}$` requires, taken from a v4 UUID's simple (undashed) form.
+fn new_profile_id() -> String {
+    ::uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> CreateProfileError {
+    CreateProfileErrorModeled::InternalServerException(crate::state::store_unavailable()).into()
 }

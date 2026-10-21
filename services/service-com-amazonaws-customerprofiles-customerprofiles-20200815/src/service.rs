@@ -96,17 +96,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Customer Profiles states an input it will not accept as `BadRequestException`
+        // ("The input you provided is invalid.") — the one client-input error every
+        // operation in this model declares; the model declares no `ValidationException`
+        // at all. So a request the framework refuses before a handler runs (a required
+        // member absent, a `DomainName` outside `^[a-zA-Z0-9_-]+$` or 1..64, a
+        // `DefaultExpirationDays` outside 1..1098, a `MaxResults` outside 1..100) is
+        // reworded to that code, keeping the framework's description of WHAT was
+        // refused as the message. The status stays with the protocol: restJson1 renders
+        // a refusal as HTTP 400, which is `BadRequestException`'s modelled status.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "BadRequestException".to_string(),
+                message: aws_smithy_schema_server::envelope(violations)
+                    .unwrap_or_else(|| "The input you provided is invalid.".to_string()),
+            }),
+            // Authentication is not this service's concern; the framework's 403 wording
+            // is already what a caller needs.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

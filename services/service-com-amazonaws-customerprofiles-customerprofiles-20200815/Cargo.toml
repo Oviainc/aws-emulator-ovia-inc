@@ -21,6 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `ProfileId` is minted as a v4 UUID's 32-hex simple form, which is exactly the
+# `^[a-f0-9]{32}$` the model requires.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -28,6 +31,8 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `time` for a test that waits out a clock-owed transition without blocking the runtime.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true
