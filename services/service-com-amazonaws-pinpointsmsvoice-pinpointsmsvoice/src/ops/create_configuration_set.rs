@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfigurationSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfigurationSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfigurationSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +63,17 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The most configuration sets this emulator will hold for the account.
+///
+/// This is the EMULATOR's own capacity bound, not a published AWS quota: AWS does not
+/// document a configuration-set limit for this API, but a caller looping
+/// `CreateConfigurationSet` with distinct names would otherwise grow the emulator's
+/// heap until the host runs out of memory. It is answered with `LimitExceededException`
+/// (HTTP 412), the error this operation models for "there are too many instances of the
+/// specified resource type", and is set far above any realistic client script so normal
+/// use never reaches it.
+const MAX_CONFIGURATION_SETS: usize = 10_000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -145,18 +147,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfigurationSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConfigurationSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfigurationSet"))
+        let _ = ctx;
+
+        // `ConfigurationSetName` is the only input and it is what the set is keyed by,
+        // so an absent or blank name names no resource to create: the modelled
+        // "input you provided is invalid" refusal, HTTP 400. The name is stored EXACTLY
+        // as sent — trimming is only how blankness is detected, because every other
+        // operation resolves the set by the raw `{ConfigurationSetName}` path label, so
+        // a stored key that differs from what the caller sent would not resolve there.
+        let name = input
+            .configuration_set_name
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| {
+                CreateConfigurationSetErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(
+                        "ConfigurationSetName must be a non-empty configuration set name".into(),
+                    ),
+                })
+            })?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateConfigurationSetErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the service state store is unavailable".into()),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // A configuration set name is unique within an account and region, so a second
+        // create of the same name is a conflict, not an idempotent no-op.
+        if store.configuration_sets.contains_key(&name) {
+            return Err(CreateConfigurationSetErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(format!("configuration set {name} already exists")),
+                },
+            )
+            .into());
+        }
+
+        // CAP (`MAX_CONFIGURATION_SETS`): refuse past the emulator's capacity bound
+        // BEFORE inserting, so a caller cannot grow this map without limit.
+        if store.configuration_sets.len() >= MAX_CONFIGURATION_SETS {
+            return Err(CreateConfigurationSetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {MAX_CONFIGURATION_SETS} configuration sets"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store
+            .configuration_sets
+            .insert(name.clone(), crate::state::ConfigurationSet::new(name));
+
+        Ok(CreateConfigurationSetOutput {})
     }
 }
