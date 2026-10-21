@@ -1,4 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Operation handlers for com-amazonaws-mediaconnect-mediaconnect. One file per operation.
+//!
+//! This model names an OPERATION after another operation's output shape (`UpdateBridge`
+//! has an output shape `UpdateBridgeOutput` and `UpdateBridgeOutput` is also an operation
+//! of its own, and the same holds for several `...Output` operations here), so the
+//! generated module's `pub use types::*` and `pub use <operation>::*` both re-export that
+//! name. Both re-exports are wanted (the shape and the operation struct are reached
+//! through this module), and the collision comes from the model, not from this crate, so
+//! the ambiguity is allowed here rather than resolved by dropping one.
+#![allow(ambiguous_glob_reexports)]
 include!(concat!(env!("OUT_DIR"), "/com_amazonaws_mediaconnect_mediaconnect_ops_generated.rs"));

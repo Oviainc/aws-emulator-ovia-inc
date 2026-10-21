@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWorkspace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWorkspace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWorkspace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the workspace from [`crate::state`] and reports the record it removed, with
+//! the `DELETING` status the accepted deletion leaves it in. The id names nothing
+//! afterwards: a following describe, update or delete answers
+//! `ResourceNotFoundException`, and `ListWorkspaces` no longer carries it.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +147,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWorkspace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWorkspaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWorkspace"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteWorkspaceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the grafana workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(mut workspace) = store.workspaces.remove(&input.workspace_id) else {
+            return Err(DeleteWorkspaceErrorModeled::ResourceNotFoundException(
+                crate::state::workspace_not_found(&input.workspace_id),
+            )
+            .into());
+        };
+
+        // Forget the client tokens that named it, so a replayed CreateWorkspace
+        // mints a new workspace instead of reporting one that no longer exists.
+        store
+            .idempotency_tokens
+            .retain(|_, id| id != &workspace.id);
+
+        // The deletion is accepted and the record is gone; the response reports
+        // the status the workspace was left in, and nothing is owed on it.
+        workspace.status = "DELETING".to_string();
+        workspace.pending = None;
+        workspace.modified = now;
+
+        Ok(DeleteWorkspaceOutput {
+            workspace: workspace.to_description(),
+        })
     }
 }

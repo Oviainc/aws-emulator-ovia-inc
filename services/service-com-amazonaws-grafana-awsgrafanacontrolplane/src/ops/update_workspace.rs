@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWorkspace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWorkspace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWorkspace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates only the members the request carries, bumps `modified`, and leaves the
+//! workspace reporting `UPDATING` until the clock owes it `ACTIVE` again. The change is
+//! persisted in [`crate::state`], so the next `DescribeWorkspace` reports it.
 //!
 //! ## Shape of an operation
 //!
@@ -212,18 +206,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWorkspace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWorkspaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        /// A `ValidationException` for a request that both sets and removes the
+        /// same member: the two instructions cannot both be applied.
+        fn conflicting_members(set: &str, remove: &str) -> UpdateWorkspaceError {
+            UpdateWorkspaceErrorModeled::ValidationException(ValidationException {
+                message: format!("{set} and {remove} cannot both be specified"),
+                reason: "OTHER".to_string(),
+                field_list: Some(vec![
+                    ValidationExceptionField {
+                        name: set.to_string(),
+                        message: format!("conflicts with {remove}"),
+                    },
+                    ValidationExceptionField {
+                        name: remove.to_string(),
+                        message: format!("conflicts with {set}"),
+                    },
+                ]),
+            })
+            .into()
+        }
+
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateWorkspaceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the grafana workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        if input.vpc_configuration.is_some() && input.remove_vpc_configuration == Some(true) {
+            return Err(conflicting_members(
+                "vpcConfiguration",
+                "removeVpcConfiguration",
+            ));
+        }
+        if input.network_access_control.is_some()
+            && input.remove_network_access_configuration == Some(true)
+        {
+            return Err(conflicting_members(
+                "networkAccessControl",
+                "removeNetworkAccessConfiguration",
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(workspace) = store.settled_mut(&input.workspace_id, now) else {
+            return Err(UpdateWorkspaceErrorModeled::ResourceNotFoundException(
+                crate::state::workspace_not_found(&input.workspace_id),
+            )
+            .into());
+        };
+
+        // Only the members the request carries move; every other one keeps what
+        // the create, or an earlier update, stored.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWorkspace"))
+        // The documented rule `CreateWorkspace` enforces holds for the record an
+        // update leaves behind too: ORGANIZATION account access "must specify
+        // which organizational units the workspace can access in the
+        // workspaceOrganizationalUnits parameter". It is judged on the POST-patch
+        // values, so an update may supply either member, or both, and may rely on
+        // what the create already stored — and nothing is mutated when it fails.
+        let access_after = input
+            .account_access_type
+            .as_deref()
+            .unwrap_or(&workspace.account_access_type);
+        let units_after = input
+            .workspace_organizational_units
+            .as_ref()
+            .unwrap_or(&workspace.organizational_units);
+        if access_after == "ORGANIZATION" && units_after.is_empty() {
+            return Err(UpdateWorkspaceErrorModeled::ValidationException(
+                ValidationException {
+                    message: "workspaceOrganizationalUnits must name at least one \
+                              organizational unit when accountAccessType is ORGANIZATION"
+                        .to_string(),
+                    reason: "FIELD_VALIDATION_FAILED".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "workspaceOrganizationalUnits".to_string(),
+                        message: "required when accountAccessType is ORGANIZATION".to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        if let Some(value) = input.workspace_name {
+            workspace.name = Some(value);
+        }
+        if let Some(value) = input.workspace_description {
+            workspace.description = Some(value);
+        }
+        if let Some(value) = input.account_access_type {
+            workspace.account_access_type = value;
+        }
+        if let Some(value) = input.permission_type {
+            workspace.permission_type = value;
+        }
+        if let Some(value) = input.workspace_role_arn {
+            workspace.workspace_role_arn = Some(value);
+        }
+        if let Some(value) = input.organization_role_name {
+            workspace.organization_role_name = Some(value);
+        }
+        if let Some(value) = input.stack_set_name {
+            workspace.stack_set_name = Some(value);
+        }
+        if let Some(value) = input.workspace_data_sources {
+            workspace.data_sources = value;
+        }
+        if let Some(value) = input.workspace_notification_destinations {
+            workspace.notification_destinations = value;
+        }
+        if let Some(value) = input.workspace_organizational_units {
+            workspace.organizational_units = value;
+        }
+        if let Some(value) = input.ip_address_type {
+            workspace.ip_address_type = Some(value);
+        }
+        if let Some(value) = input.vpc_configuration {
+            workspace.vpc_configuration = Some(value);
+        }
+        if input.remove_vpc_configuration == Some(true) {
+            workspace.vpc_configuration = None;
+        }
+        if let Some(value) = input.network_access_control {
+            workspace.network_access_control = Some(value);
+        }
+        if input.remove_network_access_configuration == Some(true) {
+            workspace.network_access_control = None;
+        }
+
+        workspace.modified = now;
+        // The update is accepted, not finished: the workspace reports `UPDATING`
+        // until the clock owes it `ACTIVE` again.
+        workspace.status = "UPDATING".to_string();
+        workspace.pending = Some(crate::state::PendingTransition {
+            due: now + crate::state::LIFECYCLE_TRANSITION,
+            status: "ACTIVE".to_string(),
+        });
+
+        Ok(UpdateWorkspaceOutput {
+            workspace: workspace.to_description(),
+        })
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkspace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkspace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkspace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a workspace: the record is persisted in [`crate::state`] and every member of
+//! the returned `WorkspaceDescription` is computed from it. A repeated call carrying the
+//! same `clientToken` answers with the workspace that token already created.
 //!
 //! ## Shape of an operation
 //!
@@ -219,18 +213,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkspace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkspaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkspace"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateWorkspaceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the grafana workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // `accountAccessType` documents the one cross-member rule the model
+        // cannot express: "If you specify ORGANIZATION, you must specify which
+        // organizational units the workspace can access in the
+        // workspaceOrganizationalUnits parameter."
+        if input.account_access_type == "ORGANIZATION"
+            && input
+                .workspace_organizational_units
+                .as_ref()
+                .is_none_or(Vec::is_empty)
+        {
+            return Err(CreateWorkspaceErrorModeled::ValidationException(
+                ValidationException {
+                    message: "workspaceOrganizationalUnits must name at least one \
+                              organizational unit when accountAccessType is ORGANIZATION"
+                        .to_string(),
+                    reason: "FIELD_VALIDATION_FAILED".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "workspaceOrganizationalUnits".to_string(),
+                        message: "required when accountAccessType is ORGANIZATION".to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // `@idempotencyToken`: the same token names the same workspace, so a
+        // retried create reports the first one rather than minting a second.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.idempotency_tokens.get(token).cloned());
+        if let Some(id) = replayed {
+            if let Some(workspace) = store.settled_mut(&id, now) {
+                return Ok(CreateWorkspaceOutput {
+                    workspace: workspace.to_description(),
+                });
+            }
+        }
+
+        // The store is bounded: past its quota a create is refused rather than
+        // adding another record. `ServiceQuotaExceededException` is the modelled
+        // refusal for exactly this.
+        if store.workspaces.len() >= crate::state::WORKSPACE_QUOTA {
+            return Err(CreateWorkspaceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} workspaces",
+                        crate::state::WORKSPACE_QUOTA
+                    ),
+                    // The quota is per account, so the account is the resource
+                    // that reached it.
+                    resource_id: ::engine::emulator_account_id().to_string(),
+                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                    service_code: "grafana".to_string(),
+                    // Named for what it bounds: an AWS quota code is an
+                    // identifier Service Quotas issues, which this emulator does
+                    // not model and so must not invent one of.
+                    quota_code: "WorkspacesPerAccount".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_workspace_id();
+        let workspace = crate::state::Workspace {
+            endpoint: crate::state::workspace_endpoint(&id, &region),
+            id: id.clone(),
+            name: input.workspace_name,
+            description: input.workspace_description,
+            account_access_type: input.account_access_type,
+            permission_type: input.permission_type,
+            authentication_providers: input.authentication_providers,
+            // A workspace is not usable the instant the create returns; the
+            // clock owes it `ACTIVE` once the transition span has passed.
+            status: "CREATING".to_string(),
+            pending: Some(crate::state::PendingTransition {
+                due: now + crate::state::LIFECYCLE_TRANSITION,
+                status: "ACTIVE".to_string(),
+            }),
+            grafana_version: input
+                .grafana_version
+                .unwrap_or_else(|| crate::state::DEFAULT_GRAFANA_VERSION.to_string()),
+            data_sources: input.workspace_data_sources.unwrap_or_default(),
+            notification_destinations: input
+                .workspace_notification_destinations
+                .unwrap_or_default(),
+            organizational_units: input.workspace_organizational_units.unwrap_or_default(),
+            organization_role_name: input.organization_role_name,
+            stack_set_name: input.stack_set_name,
+            workspace_role_arn: input.workspace_role_arn,
+            vpc_configuration: input.vpc_configuration,
+            network_access_control: input.network_access_control,
+            ip_address_type: input.ip_address_type,
+            kms_key_id: input.kms_key_id,
+            configuration: input
+                .configuration
+                .unwrap_or_else(|| crate::state::DEFAULT_WORKSPACE_CONFIGURATION.to_string()),
+            // A licence is associated by `AssociateLicense`, never at create.
+            license_type: None,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created: now,
+            modified: now,
+        };
+
+        let description = workspace.to_description();
+        store.workspaces.insert(id.clone(), workspace);
+        if let Some(token) = input.client_token {
+            store.idempotency_tokens.insert(token, id);
+        }
+
+        Ok(CreateWorkspaceOutput {
+            workspace: description,
+        })
     }
 }
