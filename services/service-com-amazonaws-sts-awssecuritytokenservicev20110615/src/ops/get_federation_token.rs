@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFederationToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFederationToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFederationToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a session credential for a federated user: a NEW credential from the
+//! emulator's credential store, recorded in this service's session registry against
+//! the federated user it names, so `GetCallerIdentity` signed with it reports
+//! `<account>:<Name>` and the federated-user ARN. The account is the calling
+//! identity's.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -187,9 +185,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-sts-awssecuritytokenser
 // here — hence the `GetFederationTokenError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.sts#GetFederationToken")]
+// `GetFederationToken` does not list `ExpiredTokenException`, so that shape — which
+// this SERVICE models, with its own 400 status and awsQuery code — is widened in: a
+// request that presents an expired session credential is refused with the service's
+// own expired-token error, the same way every other operation here refuses one.
+#[smithy_macros::operation_error(
+    "com.amazonaws.sts#GetFederationToken",
+    extra_errors = ["ExpiredTokenException"]
+)]
 #[derive(Debug)]
 pub enum GetFederationTokenErrorModeled {
+    ExpiredTokenException(ExpiredTokenException),
     MalformedPolicyDocumentException(MalformedPolicyDocumentException),
     PackedPolicyTooLargeException(PackedPolicyTooLargeException),
     RegionDisabledException(RegionDisabledException),
@@ -246,18 +252,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFederationToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFederationTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFederationToken"))
+        use crate::state::{
+            duplicate_tag_key, is_policy_document, packed_policy_size, sts_arn, Identity,
+            NewSession, SessionKind, VENDED_SESSION_DEFAULT_DURATION_SECONDS,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This service has no store on the engine it was mounted on, so it cannot
+            // serve anything. The router builds the one engine that does, so this is
+            // unreachable there.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetFederationToken",
+            ));
+        };
+        let store = ctx.credential_store();
+        let now = ::std::time::SystemTime::now();
+
+        // A session policy must be a JSON policy document.
+        if let Some(policy) = input.policy.as_deref() {
+            if !is_policy_document(policy) {
+                return Err(GetFederationTokenErrorModeled::MalformedPolicyDocumentException(
+                    MalformedPolicyDocumentException {
+                        message: Some(
+                            "The inline session policy must be a JSON policy document".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        if let Some(duplicate) = duplicate_tag_key(input.tags.as_deref()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Tags carries the session tag key '{duplicate}' more than once"
+            )));
+        }
+
+        let packed_policy = packed_policy_size(
+            input.policy.as_deref(),
+            &crate::state::policy_arns(input.policy_arns.as_deref()),
+            input.tags.as_deref().unwrap_or(&[]),
+        );
+        if let Some(percent) = packed_policy.filter(|percent| *percent > 100) {
+            return Err(GetFederationTokenErrorModeled::PackedPolicyTooLargeException(
+                PackedPolicyTooLargeException {
+                    message: Some(format!(
+                        "Serialized token too large for session: the session policies and session \
+                         tags pack to {percent} percent of the allowed size"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+        let mut registry = state.lock();
+        let caller = crate::state::resolve_caller(&mut registry, &access_key_id, now, store)
+            .map_err(|expired| {
+                GetFederationTokenErrorModeled::ExpiredTokenException(ExpiredTokenException {
+                    message: Some(expired.message()),
+                })
+            })?;
+
+        // The federated user lives in the calling identity's account, and is named by
+        // the request: `<account>:<Name>` and `arn:aws:sts::<account>:federated-user/<Name>`.
+        let federated_user_id = format!("{}:{}", caller.account, input.name);
+        let federated_user_arn = sts_arn(
+            &caller.account,
+            &format!("federated-user/{}", input.name),
+        );
+        let identity = Identity {
+            user_id: federated_user_id.clone(),
+            account: caller.account,
+            arn: federated_user_arn.clone(),
+        };
+
+        let duration_seconds = input
+            .duration_seconds
+            .unwrap_or(VENDED_SESSION_DEFAULT_DURATION_SECONDS);
+        let minted = crate::state::mint_session(
+            store,
+            &mut registry,
+            now,
+            NewSession {
+                tags: crate::state::tag_pairs(input.tags.as_deref()),
+                packed_policy_size: packed_policy,
+                ..NewSession::new(identity, SessionKind::FederationToken, duration_seconds)
+            },
+        );
+        let minted = match minted {
+            Ok(minted) => minted,
+            // The bounded session registry is full of sessions that have not expired,
+            // so this one cannot be recorded — and a credential that is not recorded
+            // must not be handed out.
+            Err(why) => return Err(crate::scaffolded::Scaffolded::validation(why.message())),
+        };
+        if let Err(why) = crate::state::honour_minimum_token_size(
+            &mut registry,
+            store,
+            &minted,
+            input.minimum_session_token_size,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
+        let (session_token_utilization, session_token_size) =
+            crate::state::session_token_metrics(&minted.credentials);
+        Ok(GetFederationTokenOutput {
+            credentials: Some(minted.credentials),
+            federated_user: Some(FederatedUser {
+                federated_user_id,
+                arn: federated_user_arn,
+            }),
+            packed_policy_size: packed_policy,
+            session_token_utilization: Some(session_token_utilization),
+            session_token_size: Some(session_token_size),
+        })
     }
 }
