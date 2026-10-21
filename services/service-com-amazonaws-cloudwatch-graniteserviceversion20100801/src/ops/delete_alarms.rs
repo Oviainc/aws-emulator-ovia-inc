@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAlarms
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAlarms`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAlarms::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes stored alarms by name. Implemented here — this is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -111,11 +104,19 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteAlarmsOutput {
 // here — hence the `DeleteAlarmsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#DeleteAlarms")]
+//
+// `InternalServiceFault` is widened in: it is THIS service's own server fault (every
+// metric operation declares it), and it is the only honest answer when the shared store
+// cannot be reached. Reporting that as a 4xx would tell the caller to fix its request.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#DeleteAlarms",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum DeleteAlarmsErrorModeled {
     ResourceConflict(ResourceConflict),
     ResourceNotFound(ResourceNotFound),
+    InternalServiceFault(InternalServiceFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -169,18 +170,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAlarms` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAlarmsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAlarmsErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch alarm store is unavailable".into()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // The composite-alarm constraints this operation documents (at most one composite
+        // alarm per call, no batched log alarms, and no deleting a composite alarm another
+        // alarm's `AlarmRule` depends on) all concern alarms only `PutCompositeAlarm` and
+        // `PutLogAlarm` can create, and both are still scaffolded — so the store holds
+        // nothing those rules can apply to and `ResourceConflict` has nothing to report yet.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAlarms"))
+        // "If you specify any incorrect alarm names, the alarms you specify with correct
+        // names are still deleted." (DeleteAlarms documentation) — so the names that do
+        // exist are removed, and the call still reports the ones that did not with the
+        // modelled `ResourceNotFound`.
+        let mut missing: Vec<&str> = Vec::new();
+        for name in &input.alarm_names {
+            if store.alarms.remove(name).is_none() {
+                missing.push(name.as_str());
+            } else {
+                store.alarm_history.remove(name);
+            }
+        }
+        missing.sort_unstable();
+        missing.dedup();
+        if !missing.is_empty() {
+            return Err(DeleteAlarmsErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("no alarm named {}", missing.join(", "))),
+            })
+            .into());
+        }
+
+        Ok(DeleteAlarmsOutput)
     }
 }
