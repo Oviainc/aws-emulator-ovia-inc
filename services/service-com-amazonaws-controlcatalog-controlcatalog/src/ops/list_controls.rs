@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListControls
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListControls`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListControls::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the catalog's controls, a page at a time, out of this service's state
+//! (`crate::state`) — each summary projected from the same stored record `GetControl`
+//! answers with — optionally narrowed by implementation type, implementation
+//! identifier and governed provider.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +78,102 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page `ListControls` returns, and the page size a request that sends no
+/// `MaxResults` gets: the maximum of the modeled `MaxListControlsResults` range (1..100).
+const MAX_LIST_CONTROLS_RESULTS: i32 = 100;
+
+/// Project a stored control into the modeled `ControlSummary`.
+fn control_summary(control: &crate::state::Control) -> ControlSummary {
+    ControlSummary {
+        arn: control.arn.clone(),
+        aliases: Some(control.aliases.clone()),
+        name: control.name.clone(),
+        description: control.description.clone(),
+        behavior: Some(control.behavior.clone()),
+        severity: control.severity.clone(),
+        parameter_requirement_summary: control.parameter_requirement_summary.clone(),
+        implementation: control
+            .implementation
+            .as_ref()
+            .map(|implementation| ImplementationSummary {
+                r#type: implementation.implementation_type.clone(),
+                identifier: implementation.identifier.clone(),
+            }),
+        create_time: Some(::aws_smithy_types::DateTime::from_secs(control.create_time)),
+        governed_resources: Some(control.governed_resources.clone()),
+        governed_providers: Some(control.governed_providers.clone()),
+    }
+}
+
+/// Does `control` satisfy every dimension the caller's filter sets?
+///
+/// A dimension the filter omits constrains nothing; a dimension it sets admits only a
+/// control whose own stored value is among the values listed, and a control that has
+/// no implementation at all cannot satisfy an implementation dimension.
+fn matches_filter(control: &crate::state::Control, filter: Option<&ControlFilter>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    if let Some(implementations) = filter.implementations.as_ref() {
+        if let Some(types) = implementations.types.as_ref() {
+            let matched = control.implementation.as_ref().is_some_and(|implementation| {
+                types.contains(&implementation.implementation_type)
+            });
+            if !matched {
+                return false;
+            }
+        }
+        if let Some(identifiers) = implementations.identifiers.as_ref() {
+            let matched = control.implementation.as_ref().is_some_and(|implementation| {
+                implementation
+                    .identifier
+                    .as_ref()
+                    .is_some_and(|identifier| identifiers.contains(identifier))
+            });
+            if !matched {
+                return false;
+            }
+        }
+    }
+    if let Some(providers) = filter.governed_providers.as_ref() {
+        let matched = providers
+            .iter()
+            .any(|provider| control.governed_providers.contains(provider));
+        if !matched {
+            return false;
+        }
+    }
+    true
+}
+
+/// The filter's dimensions, as the `(dimension, values)` pairs
+/// `state::filter_fingerprint` hashes: the model declares `Implementations.Types`,
+/// `Implementations.Identifiers` and `GovernedProviders`, and a dimension the caller
+/// omitted contributes no values.
+fn filter_dimensions(filter: Option<&ControlFilter>) -> Vec<(&'static str, Vec<String>)> {
+    let implementations = filter.and_then(|filter| filter.implementations.as_ref());
+    vec![
+        (
+            "types",
+            implementations
+                .and_then(|i| i.types.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "identifiers",
+            implementations
+                .and_then(|i| i.identifiers.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "governedProviders",
+            filter
+                .and_then(|filter| filter.governed_providers.clone())
+                .unwrap_or_default(),
+        ),
+    ]
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -154,18 +245,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListControls` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListControlsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListControls"))
+        // `ctx` carries request metadata only; this operation reads none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListControlsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Control Catalog store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        let filter = input.filter.as_ref();
+        let fingerprint = crate::state::filter_fingerprint(&filter_dimensions(filter));
+        let page = crate::state::page(
+            "controls",
+            &fingerprint,
+            state
+                .controls
+                .iter()
+                .filter(|(_, control)| matches_filter(control, filter))
+                .map(|(arn, control)| (arn.clone(), control_summary(control))),
+            input.next_token.as_deref(),
+            input.max_results,
+            MAX_LIST_CONTROLS_RESULTS,
+        )
+        .map_err(|error| {
+            ListControlsErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::page_refusal("ListControls", error)),
+            })
+        })?;
+
+        Ok(ListControlsOutput {
+            controls: page.items,
+            next_token: page.next_token,
+        })
     }
 }
