@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: persists the cluster in [`crate::state`] keyed by `ClusterName` —
+//! every member the request supplied, plus the ARN, configuration endpoint and shard
+//! layout the service derives — and answers from that stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -248,18 +242,166 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCluster"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); this operation models no server fault, so
+            // the request is refused rather than answered with a fabricated cluster.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        let number_of_shards = input.num_shards.unwrap_or(crate::state::DEFAULT_NUM_SHARDS);
+        let num_replicas_per_shard = input
+            .num_replicas_per_shard
+            .unwrap_or(crate::state::DEFAULT_NUM_REPLICAS_PER_SHARD);
+        // BOUND THE LAYOUT BEFORE ANYTHING IS BUILT OR LOCKED. Both members arrive as
+        // a bare `i32` the model puts no `@range` on, and both size the stored shard
+        // and node lists, so an out-of-range value is refused here rather than
+        // allocated: a cluster has between 1 and `MAX_SHARDS_PER_CLUSTER` shards, and a
+        // shard between 0 and `MAX_REPLICAS_PER_SHARD` replicas. The two ceilings make
+        // the node total (`shards * (replicas + 1)`) bounded too, so neither factor
+        // nor their product can be driven by the request.
+        if number_of_shards < 1 {
+            return Err(CreateClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some("NumShards must be at least 1.".to_string()),
+                },
+            )
+            .into());
+        }
+        if number_of_shards > crate::state::MAX_SHARDS_PER_CLUSTER {
+            return Err(
+                CreateClusterErrorModeled::ShardsPerClusterQuotaExceededFault(
+                    ShardsPerClusterQuotaExceededFault {
+                        message: Some(format!(
+                            "NumShards must not exceed {} shards per cluster.",
+                            crate::state::MAX_SHARDS_PER_CLUSTER
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if !(0..=crate::state::MAX_REPLICAS_PER_SHARD).contains(&num_replicas_per_shard) {
+            return Err(CreateClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "NumReplicasPerShard must be between 0 and {}.",
+                        crate::state::MAX_REPLICAS_PER_SHARD
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let port = input.port.unwrap_or(crate::state::DEFAULT_PORT);
+        let created_at = std::time::SystemTime::now();
+        let arn = crate::state::cluster_arn(&region, &input.cluster_name);
+        // The layout is laid out BEFORE the store is locked, so no other caller waits
+        // on this request's bounded-but-not-free work.
+        let shards = crate::state::build_shards(
+            &region,
+            &input.cluster_name,
+            number_of_shards,
+            num_replicas_per_shard,
+            port,
+            created_at,
+        );
+
+        let now = std::time::Instant::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        if state.clusters.contains_key(&input.cluster_name) {
+            return Err(CreateClusterErrorModeled::ClusterAlreadyExistsFault(
+                ClusterAlreadyExistsFault {
+                    message: Some(format!(
+                        "Cluster with name {} already exists.",
+                        input.cluster_name
+                    )),
+                },
+            )
+            .into());
+        }
+        // The store itself is bounded: one caller cannot grow it without end.
+        if state.clusters.len() >= crate::state::MAX_RESOURCES_PER_KIND {
+            return Err(
+                CreateClusterErrorModeled::ClusterQuotaForCustomerExceededFault(
+                    ClusterQuotaForCustomerExceededFault {
+                        message: Some(format!(
+                            "The maximum number of clusters ({}) has been reached.",
+                            crate::state::MAX_RESOURCES_PER_KIND
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The cluster's access control list must already exist: `ACLName` names a
+        // resource, so an unknown one is resolved against state, not accepted.
+        if !state.acls.contains_key(&input.acl_name) {
+            return Err(CreateClusterErrorModeled::ACLNotFoundFault(ACLNotFoundFault {
+                message: Some(format!("ACL {} not found.", input.acl_name)),
+            })
+            .into());
+        }
+
+        let cluster = crate::state::StoredCluster {
+            name: input.cluster_name.clone(),
+            region: region.clone(),
+            description: input.description,
+            // A cluster AWS has only just accepted is not serving yet: it reports
+            // `creating`, and the clock owes it `available` once `SETTLE_AFTER` has
+            // passed, so a caller polling straight away still sees `creating`.
+            status: crate::state::cluster_status::CREATING.to_string(),
+            settles_at: Some(now + crate::state::SETTLE_AFTER),
+            node_type: input.node_type,
+            number_of_shards,
+            num_replicas_per_shard,
+            acl_name: input.acl_name,
+            multi_region_cluster_name: input.multi_region_cluster_name,
+            parameter_group_name: input.parameter_group_name,
+            subnet_group_name: input.subnet_group_name,
+            security_group_ids: input.security_group_ids.unwrap_or_default(),
+            maintenance_window: input.maintenance_window,
+            snapshot_window: input.snapshot_window,
+            snapshot_retention_limit: input.snapshot_retention_limit,
+            sns_topic_arn: input.sns_topic_arn.clone(),
+            // A cluster given a notification topic starts notifying through it; one
+            // without a topic has no notification status to report.
+            sns_topic_status: input
+                .sns_topic_arn
+                .as_ref()
+                .map(|_| crate::state::SNS_TOPIC_ACTIVE.to_string()),
+            tls_enabled: input.tls_enabled,
+            kms_key_id: input.kms_key_id,
+            engine: input.engine,
+            engine_version: input.engine_version,
+            auto_minor_version_upgrade: input.auto_minor_version_upgrade,
+            data_tiering: input.data_tiering,
+            network_type: input.network_type,
+            ip_discovery: input.ip_discovery,
+            port,
+            endpoint_address: crate::state::cluster_endpoint_address(
+                &region,
+                &input.cluster_name,
+            ),
+            arn: arn.clone(),
+            shards,
+            created_at,
+        };
+
+        let tags = crate::state::tag_pairs(input.tags.as_ref());
+        if !tags.is_empty() {
+            state.tags.insert(arn, tags);
+        }
+        // `CreateCluster` has no `ShowShardDetails` member, so the shards it just laid
+        // out are reported here; `DescribeClusters` gates them on that flag.
+        let response = cluster.to_api(true);
+        state.clusters.insert(input.cluster_name, cluster);
+        Ok(CreateClusterOutput {
+            cluster: Some(response),
+        })
     }
 }
