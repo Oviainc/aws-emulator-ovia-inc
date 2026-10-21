@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds or replaces tags on the resource an ARN names, in the same store the
+//! create wrote, so `ListTagsForResource` and the resource's own read report them.
+//! An ARN this service holds no resource for is a `ResourceNotFoundException`
+//! (404).
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +139,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceError::from(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the sagemaker-geospatial store is unavailable".to_string(),
+                    resource_id: None,
+                },
+            ))
+        })?;
+        let _ = ctx;
+
+        let mut store = state.lock();
+        let Some(tags) = store.tags_of_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "No sagemaker-geospatial resource exists with the ARN {}",
+                        input.resource_arn
+                    ),
+                    resource_id: Some(input.resource_arn.clone()),
+                },
+            )
+            .into());
+        };
+
+        // Tagging is additive: a key the request carries takes the request's
+        // value, and a key it does not carry keeps the one the resource has.
+        // Bounded, so repeated calls cannot grow one record's tag map without
+        // limit.
+        let merged = tags
+            .keys()
+            .filter(|key| !input.tags.contains_key(*key))
+            .count()
+            + input.tags.len();
+        if merged > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "A resource carries at most {} tags; this request would leave it with {merged}",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    ),
+                    resource_id: Some(input.resource_arn.clone()),
+                },
+            )
+            .into());
+        }
+        for (key, value) in input.tags {
+            tags.insert(key, value);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }
