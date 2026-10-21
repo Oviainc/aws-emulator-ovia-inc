@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Serves the report document for one report version, but ONLY under a term grant this
+//! service issued for that same report and version: the `termToken` is checked against
+//! the grants [`crate::state`] holds, so a token nobody was ever given is refused and a
+//! token accepted for another report version is a conflict. The grant is not consumed —
+//! this handler only READS.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The grant is the ONLY authorisation this handler applies. The emulator verifies every
+//! request signature before a handler runs, but it models no IAM, so the modelled
+//! `AccessDeniedException` is never raised here: a call the real service would refuse for
+//! lack of `artifact:GetReport` succeeds against this emulator, and a pass here is not a
+//! statement about an AWS-side authorisation decision.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +157,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetReport"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetReportErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the artifact report catalog is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+
+        let Some(report) = store.reports.get(&input.report_id) else {
+            return Err(GetReportErrorModeled::ResourceNotFoundException(
+                crate::state::report_not_found(&input.report_id),
+            )
+            .into());
+        };
+        let Some(version) = report.resolve(input.report_version) else {
+            // Total in both shapes: the request either named a version this report never
+            // published, or named none and the report publishes none at all. Nothing a
+            // request carries may abort the handler, so neither arm unwraps.
+            let missing = match input.report_version {
+                Some(requested) => {
+                    crate::state::report_version_not_found(&input.report_id, requested)
+                }
+                None => crate::state::report_not_found(&input.report_id),
+            };
+            return Err(GetReportErrorModeled::ResourceNotFoundException(missing).into());
+        };
+
+        // The term token is the acceptance receipt: a token that was never issued is not
+        // a token at all, and one issued for another report version does not authorise
+        // THIS download. Either way no URL is served.
+        let Some(grant) = store.term_tokens.get(&input.term_token) else {
+            ::tracing::info!(
+                operation = "GetReport",
+                report_id = %input.report_id,
+                report_version = version.version,
+                outcome = "denied",
+                reason = "term token not issued",
+                "refused a report download"
+            );
+            return Err(GetReportErrorModeled::ValidationException(
+                // The caller's token is NOT echoed back: a 400 body need not repeat what
+                // the request already carried, and the modelled `resourceId` on the
+                // conflict below is the member that identifies a grant.
+                crate::state::invalid_token("termToken was not issued by GetTermForReport"),
+            )
+            .into());
+        };
+        if grant.report_id != report.id || grant.report_version != version.version {
+            ::tracing::info!(
+                operation = "GetReport",
+                report_id = %input.report_id,
+                report_version = version.version,
+                outcome = "denied",
+                reason = "term token accepted for another report version",
+                "refused a report download"
+            );
+            return Err(GetReportErrorModeled::ConflictException(
+                crate::state::grant_does_not_cover(&input.term_token, grant),
+            )
+            .into());
+        }
+
+        ::tracing::info!(
+            operation = "GetReport",
+            report_id = %input.report_id,
+            report_version = version.version,
+            outcome = "served",
+            "served a report document"
+        );
+
+        Ok(GetReportOutput {
+            document_presigned_url: Some(crate::state::report_document_url(
+                &region,
+                report,
+                version.version,
+                &input.term_token,
+            )),
+        })
     }
 }

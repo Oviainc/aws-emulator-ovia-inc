@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSite
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSite`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSite::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a `SiteId` / `SiteArn`, persists the site in this service's
+//! store and answers the stored record. `GetSite`, `ListSites`, `CreateOutpost` and
+//! `DeleteSite` all read that same store.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +153,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSite` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSiteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSite"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateSiteErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // The store grows by one site per call and lives for the life of the
+        // process, so the growth is capped; past the cap the service answers the
+        // quota error it models rather than accepting another entry.
+        if store.sites.len() >= crate::state::MAX_RESOURCES {
+            return Err(CreateSiteErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the number of sites would exceed the limit of {}",
+                        crate::state::MAX_RESOURCES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let (site_id, sequence) = store.mint_id("os");
+        let site_arn = crate::state::site_arn(&region, &site_id);
+        let (country_code, state_or_region, city) =
+            crate::state::operating_address_projection(input.operating_address.as_ref());
+        let site = Site {
+            site_id: Some(site_id.clone()),
+            account_id: Some(::engine::emulator_account_id().to_string()),
+            name: Some(input.name),
+            description: crate::state::non_empty(input.description),
+            tags: crate::state::tags_member(&input.tags.unwrap_or_default()),
+            site_arn: Some(site_arn),
+            notes: crate::state::non_empty(input.notes),
+            operating_address_country_code: country_code,
+            operating_address_state_or_region: state_or_region,
+            operating_address_city: city,
+            rack_physical_properties: input.rack_physical_properties,
+        };
+        store.sites.insert(
+            site_id,
+            crate::state::SiteRecord {
+                sequence,
+                site: site.clone(),
+                operating_address: input.operating_address,
+                shipping_address: input.shipping_address,
+            },
+        );
+
+        Ok(CreateSiteOutput { site: Some(site) })
     }
 }

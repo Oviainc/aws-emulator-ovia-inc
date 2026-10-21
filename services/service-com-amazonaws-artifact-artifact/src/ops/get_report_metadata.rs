@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetReportMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetReportMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the metadata of one report version, exactly as [`crate::state`] holds it:
+//! the version `reportVersion` names, or the latest published version when the request
+//! names none. Every member it returns takes the same value `ListReports` reported for
+//! that report, because both project the one stored record. This handler only READS.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetReportMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The emulator models no IAM, so the modelled `AccessDeniedException` is never raised
+//! here: a pass is not a statement about an AWS-side authorisation decision.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +148,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetReportMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetReportMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetReportMetadata"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetReportMetadataErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the artifact report catalog is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        let Some(report) = store.reports.get(&input.report_id) else {
+            return Err(GetReportMetadataErrorModeled::ResourceNotFoundException(
+                crate::state::report_not_found(&input.report_id),
+            )
+            .into());
+        };
+        let Some(version) = report.resolve(input.report_version) else {
+            // Total in both shapes: the request either named a version this report never
+            // published, or named none and the report publishes none at all. Nothing a
+            // request carries may abort the handler, so neither arm unwraps.
+            let missing = match input.report_version {
+                Some(requested) => {
+                    crate::state::report_version_not_found(&input.report_id, requested)
+                }
+                None => crate::state::report_not_found(&input.report_id),
+            };
+            return Err(GetReportMetadataErrorModeled::ResourceNotFoundException(missing).into());
+        };
+
+        Ok(GetReportMetadataOutput {
+            report_details: Some(report.to_detail(version, &region)),
+        })
     }
 }
