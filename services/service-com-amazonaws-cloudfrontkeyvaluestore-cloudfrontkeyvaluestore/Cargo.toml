@@ -21,13 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The store's opaque ETag is a digest of (store ARN, version), so one store's
+# versions never collide and the value carries no readable structure.
+sha2 = { workspace = true }
+# Hex is the encoding for both the ETag digest and the opaque ListKeys page token.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
