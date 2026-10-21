@@ -1,0 +1,154 @@
+{
+  "_vendoredFrom": "hand-synced mirror of the telemetry backend's ingest validator and its limits, patterns and allowlists; the backend is the source of truth — edit this document only to mirror a change there",
+  "contractVersion": 1,
+  "maxSafeInteger": 9007199254740991,
+  "identifiers": {
+    "maxIdentifierLength": 36,
+    "projectIdPattern": "^proj-[0-9a-f]{32}$",
+    "uuidPattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    "productVersionPattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:\\.(0|[1-9]\\d*))?(?:[-+][0-9A-Za-z.-]+)?$",
+    "maxProductVersionLength": 32,
+    "maxVersionComponent": 99,
+    "regionPattern": "^(?:unknown|[a-z]{2}(?:-gov|-iso[a-z]?)?-[a-z]+-\\d)$",
+    "dottedVersionPattern": "^\\d+(?:\\.\\d+)*$",
+    "maxSdkOrLanguageVersionLength": 64,
+    "wholeSecondRfc3339Pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+  },
+  "namespace": {
+    "maxLength": 64,
+    "knownValues": [
+      "s3",
+      "dynamodb",
+      "sqs",
+      "sns",
+      "lambda",
+      "kms",
+      "iam",
+      "sts",
+      "cloudwatch",
+      "logs",
+      "bedrock",
+      "stepfunctions"
+    ],
+    "foldToOther": true,
+    "foldedValue": "other",
+    "canonicalization": "trimmed, matched case-insensitively against knownValues"
+  },
+  "operation": {
+    "maxLength": 64,
+    "pattern": "^(?=.*[a-z])[A-Z][A-Za-z0-9]{0,63}$",
+    "foldedValue": "unknown"
+  },
+  "errorType": {
+    "maxLength": 64,
+    "knownValues": [
+      "ValidationError",
+      "ResourceNotFound",
+      "ResourceConflict",
+      "AccessDenied",
+      "AuthFailure",
+      "Throttling",
+      "LimitExceeded",
+      "UnsupportedOperation",
+      "SerializationError",
+      "Timeout",
+      "ServiceUnavailable",
+      "InternalError"
+    ],
+    "foldToOther": true,
+    "foldedValue": "Other",
+    "canonicalization": "matched case-insensitively, ignoring '_' and '-'"
+  },
+  "featureFlags": {
+    "keys": [
+      "persistence",
+      "multiRegion",
+      "authEmulation",
+      "strictMode",
+      "requestLogging",
+      "fidelityGating"
+    ]
+  },
+  "enums": {
+    "recordType": ["batch", "metric"],
+    "metricType": ["operation", "coverage_gap", "error"],
+    "outcome": ["success", "client_error", "server_error", "not_emulated", "error", "crashed"],
+    "os": ["linux", "macos", "windows", "other", "unknown"],
+    "arch": ["x86_64", "aarch64", "other", "unknown"],
+    "sdkName": ["aws-sdk-rust", "aws-sdk-java", "boto3", "aws-sdk-js-v3", "aws-cli", "mixed", "other", "unknown"],
+    "agentClient": ["amazon-q", "claude-code", "kiro", "cursor", "other", "unknown"],
+    "installChannel": ["cargo", "npm", "pip", "docker", "binary", "source", "other", "unknown"],
+    "containerRuntime": ["docker", "kubernetes", "ecs", "other", "none", "unknown"],
+    "memoryUsageBucket": ["less_than_256_mib", "256_to_512_mib", "512_mib_to_1_gib", "1_to_2_gib", "2_to_4_gib", "greater_than_4_gib", "unknown"],
+    "startupOutcome": ["success", "failure", "unknown"],
+    "runMode": ["standalone", "embedded", "unknown"],
+    "crashType": ["panic", "oom", "sigkill", "unknown"]
+  },
+  "envelope": {
+    "schemaVersion": "1",
+    "requiredFields": [
+      "recordType",
+      "schemaVersion",
+      "installationId",
+      "sessionId",
+      "projectId",
+      "batchId",
+      "flushSequence",
+      "sentAt"
+    ],
+    "optionalFields": [
+      "productVersion",
+      "isFinal",
+      "sessionDurationMs",
+      "previousVersion",
+      "firstRun",
+      "environment",
+      "performance",
+      "crash"
+    ],
+    "maxSessionDurationMs": 2592000000,
+    "environment": {
+      "optionalFields": [
+        "os",
+        "arch",
+        "sdkName",
+        "sdkVersion",
+        "languageVersion",
+        "runMode",
+        "isCi",
+        "containerRuntime",
+        "agentClient",
+        "region",
+        "installChannel",
+        "featureFlags"
+      ]
+    },
+    "performance": {
+      "optionalFields": ["memoryUsage", "throughput", "peakConcurrency", "startupOutcome", "coldStartTime"],
+      "maxThroughput": 1000000000,
+      "maxPeakConcurrency": 1000000,
+      "maxColdStartTimeMillis": 86400000
+    },
+    "crash": {
+      "optionalFields": ["crashType"]
+    }
+  },
+  "metricRow": {
+    "requiredFields": ["recordType", "type", "namespace", "operation", "count", "outcome"],
+    "optionalFields": ["errorType", "latency"],
+    "latency": {
+      "fields": ["min", "max", "sumMillis"],
+      "boundTolerance": 1e-9
+    }
+  },
+  "transport": {
+    "maxBodyBytes": 262144
+  },
+  "clientConfigLimits": {
+    "flushIntervalSeconds": { "min": 30, "max": 3600 },
+    "maxRowsPerBatch": { "min": 1, "max": 5000 },
+    "maxBodyBytes": { "min": 1024, "max": 262144 },
+    "samplingRate": { "min": 0, "max": 1 },
+    "configTtlSeconds": { "min": 300, "max": 86400 }
+  }
+}

@@ -1,0 +1,16 @@
+[package]
+name = "aws-emulator-embedded"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+engine = { workspace = true }
+aws-emulator-router = { path = "../router" }
+aws-smithy-runtime-api = { workspace = true }
+emulator-server = { workspace = true }
+emulator-telemetry = { workspace = true }
+smithy-server-runtime = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,454 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+//! SigV4 request authentication, switched by [`authentication_enabled`].
+//! A request is verified by signing it again with `aws-sigv4`, the SDK's own signer.
+//! `MultiServiceRouter::new` decides once whether to enforce it; the serve path then
+//! publishes the keys of [`SigV4Authenticator::minted_credentials`].
+
+use aws_sigv4::http_request::{PercentEncodingMode, SignableBody, SignableRequest, sign};
+use aws_sigv4::http_request::{SignatureLocation, SigningSettings, UriPathNormalizationMode};
+use crate::aws_credentials::{SECRET_ACCESS_KEY, SIGV4_SCHEME};
+use crate::credential_store::{CredentialStore, random_from, same_secret};
+use std::time::{Duration, SystemTime};
+
+type Parts = http::request::Parts;
+
+const X_AMZ_DATE: &str = "x-amz-date";
+const X_AMZ_CONTENT_SHA256: &str = "x-amz-content-sha256";
+const HEX_ALPHABET: &[u8] = b"0123456789ABCDEF";
+const SIGV4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
+
+/// The query fields of a presigned URL that the signer adds back itself.
+/// Seven days, the longest validity AWS accepts for a presigned URL.
+const MAX_PRESIGNED_EXPIRES_SECS: u64 = 604_800;
+
+const PRESIGNED_FIELDS: &str = "Algorithm Credential Date Expires SignedHeaders Signature";
+
+/// Decides whether a request may reach the operation served by `serving_signing_name`, the signing
+/// name as the router keys it: trimmed and lowercased, so `IoTSecuredTunneling` arrives as
+/// `iotsecuredtunneling`. Any S3-family name serves any other, since S3 and S3 Control requests
+/// are signed under `s3`, `s3express`, `s3-outposts` and `s3-object-lambda`.
+pub trait RequestAuthenticator: Send + Sync {
+    /// The Smithy auth scheme shape id this verifies, as operations list it (`aws.auth#sigv4`).
+    fn scheme_id(&self) -> &'static str;
+    /// Whether the request carries this scheme's credentials at all.
+    fn recognizes(&self, parts: &Parts) -> bool;
+    /// Whether `credentials` hold the credential the request is signed with, and the signature
+    /// is right.
+    fn verify(
+        &self,
+        parts: &Parts,
+        body: &[u8],
+        serving_signing_name: &str,
+        credentials: &CredentialStore,
+    ) -> Result<(), Denied>;
+    /// What a caller must present to pass this authenticator, when it can be handed out.
+    fn vended_credentials(&self) -> Option<VendedCredentials> {
+        None
+    }
+}
+
+/// Credentials an authenticator hands to an in-process caller, one variant per kind of secret.
+#[non_exhaustive]
+#[derive(Clone, PartialEq, Eq)]
+pub enum VendedCredentials {
+    /// An AWS access key pair, for SigV4 signing.
+    AwsAccessKey {
+        access_key_id: String,
+        secret_access_key: String,
+    },
+}
+
+/// Prints the key id but never the secret, so a logged value leaks nothing.
+impl std::fmt::Debug for VendedCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AwsAccessKey { access_key_id, .. } => f
+                .debug_struct("AwsAccessKey")
+                .field("access_key_id", access_key_id)
+                .field("secret_access_key", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+/// The AWS error code and message a refused caller sees.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Denied {
+    pub code: &'static str,
+    pub message: &'static str,
+}
+
+pub const ACCESS_DENIED: Denied = Denied {
+    code: "AccessDenied",
+    message: "Sign the request with the emulator credentials",
+};
+const SIGNATURE_MISMATCH: Denied = Denied {
+    code: "SignatureDoesNotMatch",
+    message: "The request signature does not match",
+};
+
+static AUTHENTICATION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Sets the process-wide switch (`--auth on|off`); call before any router is built.
+pub fn set_authentication(enabled: bool) {
+    AUTHENTICATION.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The one switch for request authentication, off unless [`set_authentication`] turned it on.
+pub fn authentication_enabled() -> bool {
+    AUTHENTICATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The key pair this emulator process publishes, minted on first use. Requests signed with it
+/// verify beside those signed with credentials the router's operations created.
+pub struct SigV4Authenticator {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+static MINTED: std::sync::OnceLock<SigV4Authenticator> = std::sync::OnceLock::new();
+
+impl SigV4Authenticator {
+    pub fn for_this_process() -> &'static Self {
+        MINTED.get_or_init(|| Self {
+            access_key_id: format!("EMULATOR{}", random_from(HEX_ALPHABET, 12)),
+            secret_access_key: random_from(HEX_ALPHABET, 40),
+        })
+    }
+
+    /// The keys, once something in this process registered the authenticator.
+    pub fn minted_credentials() -> Option<&'static Self> {
+        MINTED.get()
+    }
+
+    /// The secret of `key_id`: this key pair's own, else a created credential's.
+    fn secret_for(&self, key_id: &str, credentials: &CredentialStore) -> Result<String, Denied> {
+        if key_id == self.access_key_id {
+            return Ok(self.secret_access_key.clone());
+        }
+        credentials.secret_for(key_id, SIGV4_SCHEME, SECRET_ACCESS_KEY)
+    }
+
+    fn signature_for(
+        &self,
+        parts: &Parts,
+        body: &[u8],
+        signed: &Signature,
+        secret: &str,
+    ) -> Option<String> {
+        let [key, _, region, service, _] = &signed.scope[..] else {
+            return None;
+        };
+        let credentials = aws_credential_types::Credentials::builder().provider_name("emulator");
+        let credentials = credentials.access_key_id(key).secret_access_key(secret);
+        let identity = credentials.build().into();
+        let settings = signing_settings(service, signed.expires_secs);
+        let params = aws_sigv4::sign::v4::SigningParams::builder().identity(&identity);
+        let params = params.region(region).name(service).settings(settings);
+        let params = params
+            .time(parse_amz_date(&signed.amz_date)?)
+            .build()
+            .ok()?;
+        let headers = signed.headers.iter().filter(|name| *name != X_AMZ_DATE);
+        let headers = headers.flat_map(|name| header_values(parts, name));
+        let (method, uri) = (parts.method.as_str(), signable_uri_with_signed_host(parts, signed)?);
+        let request = SignableRequest::new(method, uri, headers, payload(parts, body, signed));
+        Some(
+            sign(request.ok()?, &params.into())
+                .ok()?
+                .signature()
+                .to_string(),
+        )
+    }
+}
+
+impl RequestAuthenticator for SigV4Authenticator {
+    fn scheme_id(&self) -> &'static str {
+        SIGV4_SCHEME
+    }
+
+    fn vended_credentials(&self) -> Option<VendedCredentials> {
+        Some(VendedCredentials::AwsAccessKey {
+            access_key_id: self.access_key_id.clone(),
+            secret_access_key: self.secret_access_key.clone(),
+        })
+    }
+
+    fn recognizes(&self, parts: &Parts) -> bool {
+        let header = parts
+            .headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok());
+        header.map_or_else(
+            || presigned_field(parts, "X-Amz-Algorithm").is_some_and(|a| a == SIGV4_ALGORITHM),
+            |header| header.starts_with(&format!("{SIGV4_ALGORITHM} ")),
+        )
+    }
+
+    fn verify(
+        &self,
+        parts: &Parts,
+        body: &[u8],
+        serving_signing_name: &str,
+        credentials: &CredentialStore,
+    ) -> Result<(), Denied> {
+        let signed = Signature::of(parts).ok_or(ACCESS_DENIED)?;
+        let signed_for_serving = |service: &str| {
+            crate::normalize_service_key(service) == serving_signing_name
+                || (signs_like_s3(service) && signs_like_s3(serving_signing_name))
+        };
+        let scoped_key_id = match &signed.scope[..] {
+            [key_id, _, _, service, terminator]
+                if signed_for_serving(service) && terminator == "aws4_request" =>
+            {
+                Some(key_id)
+            }
+            _ => None,
+        };
+        let expired = signed.expires_secs.is_some_and(|secs| {
+            if secs > MAX_PRESIGNED_EXPIRES_SECS {
+                return true;
+            }
+            let at = parse_amz_date(&signed.amz_date);
+            let valid_until = at.and_then(|at| at.checked_add(Duration::from_secs(secs)));
+            valid_until.is_none_or(|valid_until| valid_until < SystemTime::now())
+        });
+        let (Some(key_id), false) = (scoped_key_id, expired) else {
+            return Err(ACCESS_DENIED);
+        };
+        let secret = self.secret_for(key_id, credentials)?;
+        let expected = self.signature_for(parts, body, &signed, &secret);
+        let matches = expected.is_some_and(|expected| same_secret(&expected, &signed.value));
+        matches.then_some(()).ok_or(SIGNATURE_MISMATCH)
+    }
+}
+
+/// The SigV4 fields of a request, from its `Authorization` header or else its presigned query.
+struct Signature {
+    scope: Vec<String>,
+    headers: Vec<String>,
+    value: String,
+    amz_date: String,
+    expires_secs: Option<u64>,
+}
+
+impl Signature {
+    fn of(parts: &Parts) -> Option<Self> {
+        let header = parts.headers.get(http::header::AUTHORIZATION);
+        let field = |name: &str| match header {
+            Some(header) => authorization_field(header.to_str().ok()?, name),
+            None => presigned_field(parts, &format!("X-Amz-{name}")),
+        };
+        let (amz_date, expires_secs) = match header {
+            Some(_) => (
+                parts.headers.get(X_AMZ_DATE)?.to_str().ok()?.to_string(),
+                None,
+            ),
+            None if field("Algorithm")? == SIGV4_ALGORITHM => {
+                (field("Date")?, Some(field("Expires")?.parse().ok()?))
+            }
+            None => return None,
+        };
+        let split = |text: String, separator| text.split(separator).map(str::to_string).collect();
+        let scope = split(field("Credential")?, '/');
+        let headers = split(field("SignedHeaders")?, ';');
+        let value = field("Signature")?;
+        Some(Self {
+            scope,
+            headers,
+            value,
+            amz_date,
+            expires_secs,
+        })
+    }
+
+    /// The signing name the request's credential scope names (`key/date/region/name/aws4_request`).
+    fn signing_name(&self) -> &str {
+        self.scope.get(3).map_or("", String::as_str)
+    }
+}
+
+fn authorization_field(header: &str, name: &str) -> Option<String> {
+    let fields = header.strip_prefix(SIGV4_ALGORITHM)?.strip_prefix(' ')?;
+    let mut fields = fields.split(',');
+    let value = fields.find_map(|field| field.trim().strip_prefix(name)?.strip_prefix('='));
+    value.map(str::to_string)
+}
+
+/// A field of a presigned request's query, such as the `X-Amz-Credential` that names the
+/// service the URL was signed for.
+fn presigned_field(parts: &Parts, name: &str) -> Option<String> {
+    let decode = |text| {
+        percent_encoding::percent_decode_str(text)
+            .decode_utf8_lossy()
+            .into()
+    };
+    let mut pairs = parts
+        .uri
+        .query()?
+        .split('&')
+        .filter_map(|item| item.split_once('='));
+    let value = pairs.find(|(key, _)| decode(key) == *name)?.1;
+    Some(decode(value))
+}
+
+fn header_values<'p>(parts: &'p Parts, name: &'p str) -> impl Iterator<Item = (&'p str, &'p str)> {
+    let values = parts.headers.get_all(name).iter();
+    values.filter_map(move |value| Some((name, value.to_str().ok()?)))
+}
+
+/// The signing names whose endpoint rules set `disableDoubleEncoding` (the S3 and S3 Control
+/// models): their paths are encoded once, never normalized, and presigned with an unsigned payload.
+fn signs_like_s3(signing_name: &str) -> bool {
+    matches!(
+        signing_name,
+        "s3" | "s3-outposts" | "s3-object-lambda" | "s3express"
+    )
+}
+
+fn signing_settings(service: &str, presigned_expires_secs: Option<u64>) -> SigningSettings {
+    let mut settings = SigningSettings::default();
+    settings.payload_checksum_kind = aws_sigv4::http_request::PayloadChecksumKind::NoHeader;
+    settings.excluded_headers = None;
+    if signs_like_s3(service) {
+        settings.percent_encoding_mode = PercentEncodingMode::Single;
+        settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    }
+    if let Some(secs) = presigned_expires_secs {
+        settings.signature_location = SignatureLocation::QueryParams;
+        settings.expires_in = Some(Duration::from_secs(secs));
+    }
+    settings
+}
+
+/// The URI the signer reads: a presigned query loses the fields the signer adds back, a
+/// request without a `Host` header (in-process, HTTP/2) signs its URI authority as the host, and
+/// an S3 path is signed decoded and then encoded once, so `/a/%2Fb` signs as `/a//b`. `None` when
+/// the host is not signed or not known: the signer always signs one, and panics without one.
+fn signable_uri_with_signed_host(parts: &Parts, signed: &Signature) -> Option<String> {
+    let added_by_signer = |name: &str| {
+        let field = name.strip_prefix("X-Amz-").unwrap_or("-");
+        signed.expires_secs.is_some() && PRESIGNED_FIELDS.split(' ').any(|added| added == field)
+    };
+    let items = parts
+        .uri
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter(|item| !item.is_empty());
+    let items = items.filter(|item| !added_by_signer(item.split('=').next().unwrap_or("")));
+    let (path, query) = (
+        signable_path(parts, signed),
+        items.collect::<Vec<_>>().join("&"),
+    );
+    let path_and_query = if query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{query}")
+    };
+    if !signed.headers.iter().any(|name| name == "host") {
+        return None;
+    }
+    if parts.headers.contains_key(http::header::HOST) {
+        return Some(path_and_query);
+    }
+    let (scheme, authority) = (parts.uri.scheme_str()?, parts.uri.authority()?);
+    Some(format!("{scheme}://{authority}{path_and_query}"))
+}
+
+/// SigV4's `UriEncode` keeps only the unreserved characters, plus `/` in a path.
+const S3_PATH_ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'/')
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+fn signable_path<'p>(parts: &'p Parts, signed: &Signature) -> std::borrow::Cow<'p, str> {
+    let wire_path = parts.uri.path();
+    if !signs_like_s3(signed.signing_name()) {
+        return wire_path.into();
+    }
+    let decoded: Vec<u8> = percent_encoding::percent_decode_str(wire_path).collect();
+    percent_encoding::percent_encode(&decoded, S3_PATH_ENCODE_SET)
+        .to_string()
+        .into()
+}
+
+/// A declared marker (`UNSIGNED-PAYLOAD`, `STREAMING-...`) is signed as written; a declared hash
+/// is not trusted, the body is hashed instead.
+fn payload<'b>(parts: &Parts, body: &'b [u8], signed: &Signature) -> SignableBody<'b> {
+    let declared = parts
+        .headers
+        .get(X_AMZ_CONTENT_SHA256)
+        .map(|value| value.to_str());
+    match declared {
+        Some(Ok(marker)) if marker.contains('-') => SignableBody::Precomputed(marker.to_string()),
+        _ if signed.expires_secs.is_some() && signs_like_s3(signed.signing_name()) => {
+            SignableBody::UnsignedPayload
+        }
+        _ => SignableBody::Bytes(body),
+    }
+}
+
+/// `YYYYMMDDTHHMMSSZ`, as SigV4 writes dates.
+fn parse_amz_date(raw: &str) -> Option<SystemTime> {
+    let format =
+        time::format_description::parse_borrowed::<2>("[year][month][day]T[hour][minute][second]Z");
+    Some(
+        time::PrimitiveDateTime::parse(raw, &format.ok()?)
+            .ok()?
+            .assume_utc()
+            .into(),
+    )
+}
+
+/// Writes `keys` to `<emulator home>/<port>/emulator_credentials` (AWS shared credentials format,
+/// owner-only); the file is removed when the returned guard drops. Refused where the file cannot be
+/// made owner-only (non-Unix), rather than leaving the secret readable by other users.
+pub fn write_credentials_file(
+    keys: &SigV4Authenticator,
+    port: u16,
+) -> std::io::Result<EmulatorFile> {
+    if cfg!(not(unix)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the credentials file cannot be made owner-only on this platform",
+        ));
+    }
+    let (key, secret) = (&keys.access_key_id, &keys.secret_access_key);
+    let text = format!("[default]\naws_access_key_id = {key}\naws_secret_access_key = {secret}\n");
+    write_emulator_file(port, "emulator_credentials", &text)
+}
+
+/// Writes `text` to `<emulator home>/<port>/<name>`, owner-only on Unix, replacing (never
+/// following) whatever is already there; the file is removed when the returned guard drops.
+pub fn write_emulator_file(port: u16, name: &str, text: &str) -> std::io::Result<EmulatorFile> {
+    let home = emulator_paths::emulator_home().ok_or(std::io::ErrorKind::NotFound)?;
+    let folder = home.join(port.to_string());
+    std::fs::create_dir_all(&folder)?;
+    let path = folder.join(name);
+    match std::fs::remove_file(&path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    std::io::Write::write_all(&mut options.open(&path)?, text.as_bytes())?;
+    Ok(EmulatorFile(path))
+}
+
+pub struct EmulatorFile(pub std::path::PathBuf);
+
+impl Drop for EmulatorFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(test)]
+#[path = "request_authentication_tests.rs"]
+mod tests;

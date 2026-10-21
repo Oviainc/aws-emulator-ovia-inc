@@ -1,0 +1,130 @@
+// SPDX-License-Identifier: CC0-1.0
+
+#![forbid(unsafe_code)]
+//! In-process entry point for the aws-emulator emulator.
+//!
+//! A host that wants to exercise this emulator inside its own test process —
+//! without binding a socket or running the standalone binary — links this crate
+//! and builds an emulator with [`AwsEmulatorEmbedded::new`]. Its
+//! [`AwsEmulatorEmbedded::http_client`] is an
+//! `aws_smithy_runtime_api::client::http::HttpClient`, so it drops straight into an AWS
+//! SDK config's `http_client(..)` in place of a network connector, and
+//! [`AwsEmulatorEmbedded::aws_credentials_provider`] signs for it: SDK calls are
+//! served from the in-memory engine with no I/O.
+//!
+//! Each emulator owns a FRESH engine: clients from one emulator share state, and two
+//! emulators never do.
+
+pub use emulator_server::embedded::{Authentication, EmbeddedOptions, Telemetry};
+pub use emulator_server::VendedCredentials;
+use emulator_telemetry::{TelemetryClient, TelemetryOptions};
+use smithy_server_runtime::EmbeddedEmulator;
+use std::sync::Once;
+
+/// The project id this emulator reports to telemetry.
+const TELEMETRY_PROJECT_ID: &str = "proj-a85d506b35244f71850223e92be29acb";
+
+/// The telemetry configuration endpoint. `None` leaves telemetry off.
+const TELEMETRY_CONFIG_ENDPOINT: Option<&str> = Some("https://e871klluo0.execute-api.us-west-2.amazonaws.com/prod/v1/config");
+
+/// The emulator's folder in the user's home (config file, telemetry state).
+const EMULATOR_HOME_DIR: &str = ".aws/emulator";
+
+/// One in-process emulator: a fresh in-memory engine with its options. Every
+/// [`Self::http_client`] serves the same engine, so SDK clients built from one emulator
+/// share state and two emulators never do.
+#[derive(Debug, Clone)]
+pub struct AwsEmulatorEmbedded {
+    emulator: EmbeddedEmulator,
+}
+
+impl AwsEmulatorEmbedded {
+    /// An emulator with `options`. Authentication applies to this emulator; telemetry, once
+    /// on, records for the whole process.
+    pub fn new(options: EmbeddedOptions) -> Self {
+        if let Err(error) = emulator_server::set_emulator_home_dir(EMULATOR_HOME_DIR) {
+            eprintln!("{error}");
+        }
+        start_telemetry(options.telemetry);
+        let engine = std::sync::Arc::new(engine::InMemoryEngine::new());
+        let mut router = aws_emulator_router::build_router(engine);
+        router.set_request_authentication(options.authentication == Authentication::On);
+        // The emulator is the one in-process surface: it serves both the SDK
+        // `HttpClient` a host hands to a config's `.http_client(..)` (the router
+        // is itself the client) and the credential accessors, all reading this
+        // one router.
+        Self {
+            emulator: EmbeddedEmulator::from_router(router),
+        }
+    }
+
+    /// The SDK `HttpClient` for this emulator, to pass to a config's `.http_client(..)`.
+    pub fn http_client(
+        &self,
+    ) -> emulator_server::aws_smithy_runtime_api::client::http::SharedHttpClient {
+        self.emulator.http_client()
+    }
+
+    /// The SDK `HttpConnector` for this emulator, for driving it in-process
+    /// directly (`connector.call(request)`) without building a full SDK client.
+    pub fn http_connector(
+        &self,
+    ) -> emulator_server::aws_smithy_runtime_api::client::http::SharedHttpConnector {
+        self.emulator.http_connector()
+    }
+
+    /// What a request must carry to pass this emulator's authentication; empty when it is off.
+    /// The key pair is minted once per process, so every emulator with authentication on
+    /// accepts the same keys.
+    pub fn credentials(&self) -> Vec<VendedCredentials> {
+        self.emulator.credentials()
+    }
+
+    /// An AWS SDK credentials provider signing with [`Self::credentials`], or with
+    /// placeholders when authentication is off.
+    pub fn aws_credentials_provider(
+        &self,
+    ) -> emulator_server::embedded::SharedCredentialsProvider {
+        self.emulator.aws_credentials_provider()
+    }
+}
+
+impl Default for AwsEmulatorEmbedded {
+    /// [`EmbeddedOptions::default`]: authentication off, usage telemetry on.
+    fn default() -> Self {
+        Self::new(EmbeddedOptions::default())
+    }
+}
+
+/// Starts the process's telemetry client once, unless this call says [`Telemetry::Off`] or no
+/// endpoint is compiled in — then nothing starts and nothing on disk is touched. The client
+/// records for the whole process and installs no panic hook; its final flush runs when the
+/// process exits.
+fn start_telemetry(telemetry: Telemetry) {
+    static START: Once = Once::new();
+    if telemetry == Telemetry::Off {
+        return;
+    }
+    START.call_once(|| {
+        if let Some(options) = telemetry_options() {
+            emulator_telemetry::init_global(TelemetryClient::start(options));
+            emulator_telemetry::flush_at_process_exit();
+        }
+    });
+}
+
+/// The version embedded telemetry reports: the release version the release build stamps
+/// as `EMULATOR_VERSION`, and the package version with `-dev` appended for any other build.
+const EMBEDDED_VERSION: &str = match option_env!("EMULATOR_VERSION") {
+    Some(version) => version,
+    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
+};
+
+fn telemetry_options() -> Option<TelemetryOptions> {
+    let project_id = emulator_telemetry::ProjectId::new(TELEMETRY_PROJECT_ID).ok()?;
+    let version = emulator_telemetry::ProductVersion::new(EMBEDDED_VERSION).ok()?;
+    let endpoint = emulator_telemetry::Endpoint::parse(TELEMETRY_CONFIG_ENDPOINT?).ok()?;
+    let mut options = TelemetryOptions::new(project_id, version, endpoint);
+    options.run_mode = emulator_telemetry::RunMode::Embedded;
+    Some(options)
+}

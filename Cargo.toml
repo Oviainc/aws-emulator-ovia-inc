@@ -1,0 +1,68 @@
+[workspace]
+members = [
+    "core/router",
+    "core/embedded",
+]
+exclude = [
+    "vendor/smithy-macros",
+    "vendor/smithy-schema-server",
+    "vendor/smithy-server-runtime",
+    "vendor/server",
+    "vendor/engine",
+    "vendor/build-support",
+    "vendor/emulator-telemetry",
+    "vendor/emulator-paths",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+
+# Debuginfo is the largest term in this workspace's build time and disk, and
+# nothing reads it — the emulator is exercised over HTTP, not in a debugger.
+# Line tables keep panic backtraces. `profile.test` inherits `dev`.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+# Workspace-local crates
+
+# The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
+#
+# `engine` is deliberately ONE crate shared by every service crate and the
+# router: the router builds a single `Arc<InMemoryEngine>` and hands it to each
+# service's operations through their constructor (`new(engine)`), so a
+# second `engine` crate anywhere in the tree would be a second, incompatible
+# `InMemoryEngine` type that the shared engine could not be handed to.
+smithy-macros = { path = "vendor/smithy-macros", package = "aws-emulator-smithy-macros" }
+aws-smithy-schema-server = { path = "vendor/smithy-schema-server", package = "aws-emulator-smithy-schema-server" }
+smithy-server-runtime = { path = "vendor/smithy-server-runtime", package = "aws-emulator-smithy-server-runtime" }
+emulator-server = { path = "vendor/server", package = "aws-emulator-server" }
+engine = { path = "vendor/engine", package = "aws-emulator-engine" }
+emulator-core-build-support = { path = "vendor/build-support", package = "aws-emulator-build-support" }
+emulator-telemetry = { path = "vendor/emulator-telemetry", package = "aws-emulator-emulator-telemetry" }
+emulator-paths = { path = "vendor/emulator-paths", package = "aws-emulator-emulator-paths" }
+
+# Public crates.io deps
+aws-smithy-schema = "0.2.1"
+aws-smithy-runtime-api = { version = "1", features = ["client", "http-1x"] }
+aws-smithy-types = "1"
+# Generated crates use tokio only for `#[tokio::main]` / `#[tokio::test]`.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+bytes = "1"
+http = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+sha2 = "0.10"
+hex = "0.4"

@@ -1,0 +1,21 @@
+[package]
+name = "aws-emulator-smithy-macros"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
+# `preserve_order` is load-bearing, not a preference: the codegen reads a shape's
+# members straight out of the parsed model, so without it they arrive sorted by
+# name and the wire order of every structure is alphabetical instead of the order
+# the model declares.
+serde_json = { version = "1", features = ["preserve_order"] }
+darling = "0.20"
+proc-macro-crate = "3"

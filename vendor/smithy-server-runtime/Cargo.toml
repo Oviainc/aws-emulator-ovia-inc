@@ -1,0 +1,20 @@
+[package]
+name = "aws-emulator-smithy-server-runtime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[dependencies]
+smithy-macros = { path = "../smithy-macros", package = "aws-emulator-smithy-macros", version = "*" }
+aws-smithy-schema-server = { path = "../smithy-schema-server", package = "aws-emulator-smithy-schema-server", version = "*" }
+aws-smithy-schema = "0.2.1"
+axum = "0.7"
+http = "1"
+http-body-util = "0.1"
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
+bytes = "1"
+emulator-server = { path = "../server", package = "aws-emulator-server", version = "*" }
+emulator-telemetry = { path = "../emulator-telemetry", package = "aws-emulator-emulator-telemetry", version = "*" }
+uuid = { version = "1", features = ["v4"] }

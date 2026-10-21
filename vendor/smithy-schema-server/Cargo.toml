@@ -1,0 +1,21 @@
+[package]
+name = "aws-emulator-smithy-schema-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[dependencies]
+aws-smithy-schema = "0.2.1"
+aws-smithy-json = "0.63.1"
+aws-smithy-cbor = "0.62.2"
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
+aws-smithy-eventstream = "0.60"
+flate2 = "1"
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+quick-xml = "0.41"
+regex = "1.12.3"
+uuid = { version = "1", features = ["v4"] }

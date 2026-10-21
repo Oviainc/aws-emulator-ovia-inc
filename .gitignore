@@ -1,0 +1,29 @@
+# Rust build output
+/target
+**/target/
+
+# Backup / patch / temporary artifacts — never commit these
+*.bak
+*.bk
+**/*.rs.bk
+*.orig
+*.rej
+*.tmp
+*~
+
+# Editor swap files
+*.swp
+*.swo
+
+# OS metadata
+.DS_Store
+
+# Node / Python tooling artifacts
+node_modules/
+__pycache__/
+*.pyc
+
+# EmulatorCore local runtime scratch written INTO the checkout (emulator boot logs).
+# Only the transient artifacts are ignored, never the whole `.emulator/` dir:
+# `.emulator/scaffolded-specs.json` is a TRACKED record that must stay committed.
+.emulator/*.log

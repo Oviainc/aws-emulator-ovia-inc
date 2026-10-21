@@ -1,0 +1,34 @@
+[package]
+name = "aws-emulator-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "aws-emulator"
+path = "src/main.rs"
+
+[dependencies]
+engine = { workspace = true }
+emulator-server = { workspace = true }
+emulator-telemetry = { workspace = true }
+smithy-server-runtime = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
+aws-smithy-types = { workspace = true }
+tokio = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+sha2 = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

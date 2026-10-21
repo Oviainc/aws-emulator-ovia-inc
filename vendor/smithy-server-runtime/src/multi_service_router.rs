@@ -1,0 +1,839 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+//! The multi-service router: the emulator core that mounts N services in one
+//! process and dispatches each request to the one service that claims it.
+
+use crate::service::{ErasedOperation, Service};
+use crate::OperationContext;
+use emulator_server::{aws_json_error_response, AwsJsonProtocol, EmulatorService};
+use emulator_server::{
+    CredentialStore, Denied, RequestAuthenticator, SigV4Authenticator, VendedCredentials,
+};
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+
+/// A front-router that mounts N emulated services in one process and dispatches
+/// each inbound request to the one service that claims it.
+///
+/// Routing is a fixed two-step sequence: find the single service whose
+/// [`can_handle`](Service::can_handle) returns true, then ask that service for
+/// the operation and run it. Zero claimants is a 404 `UnknownService`; two or
+/// more is a 500 `AmbiguousService`. Ambiguity is rejected rather than resolved
+/// by registration order, because several AWS services share one SigV4 signing
+/// name and serving an arbitrary one would answer the wrong service.
+///
+/// `MultiServiceRouter` implements [`EmulatorService`], so it composes with the
+/// transport layer's `serve_*` paths, and it is exposed as an SDK `HttpConnector`
+/// (via `impl_emulator_http_traits!`), so the embedded front door drives it
+/// in-process through exactly the same `dispatch`. The two front doors cannot
+/// diverge in routing behaviour because they share this one path.
+#[derive(Default, Clone)]
+pub struct MultiServiceRouter {
+    // `Arc` so the router is `Clone` (required by `EmulatorService`, which the
+    // in-process `HttpConnector` bridge clones per call) even though a
+    // `Box<dyn Service>` is not: the service set is built once, before the
+    // router is ever cloned or served.
+    services: std::sync::Arc<Vec<Box<dyn Service>>>,
+    authenticators: Vec<&'static dyn RequestAuthenticator>,
+    /// Shared by every clone, so a handler's callback sees the credentials its emulator created.
+    pub(crate) credential_store: std::sync::Arc<CredentialStore>,
+}
+
+impl MultiServiceRouter {
+    /// An empty router. Register services with [`register_service`](Self::register_service).
+    ///
+    /// Every front door builds its router here, in vendored code an author does not edit, so this
+    /// is the one place request authentication is switched on: with `--auth on` (`set_authentication`)
+    /// requests are verified with this process's SigV4 keys.
+    pub fn new() -> Self {
+        let mut router = Self::default();
+        if emulator_server::authentication_enabled() {
+            router.register_authenticator(SigV4Authenticator::for_this_process());
+        }
+        router
+    }
+
+    /// Mount a service. Each service carries its own identity, protocol,
+    /// `can_handle`, and operation map, so the router needs no separate name.
+    ///
+    /// Called only during assembly, before the router is cloned or served, so
+    /// the `Arc` is uniquely held and `get_mut` always succeeds.
+    pub fn register_service(&mut self, svc: impl Service) -> &mut Self {
+        std::sync::Arc::get_mut(&mut self.services)
+            .expect("register_service called after the router was shared")
+            .push(Box::new(svc));
+        self
+    }
+
+    /// Refuse requests no registered authenticator verifies, except to operations the model serves unsigned.
+    /// An operation is checked by the authenticators of the auth schemes its model lists.
+    pub fn register_authenticator(
+        &mut self,
+        authenticator: &'static dyn RequestAuthenticator,
+    ) -> &mut Self {
+        self.authenticators.push(authenticator);
+        self
+    }
+
+    /// Turns request authentication on or off for this router only, overriding the process-wide
+    /// `set_authentication`: off removes every registered authenticator, on registers the ones
+    /// this emulator supports. When on, requests must carry [`Self::vended_credentials`].
+    pub fn set_request_authentication(&mut self, enabled: bool) -> &mut Self {
+        self.authenticators.clear();
+        if enabled {
+            self.register_authenticator(SigV4Authenticator::for_this_process());
+        }
+        self
+    }
+
+    /// The credentials each registered authenticator hands out; empty when none is registered.
+    pub fn vended_credentials(&self) -> Vec<VendedCredentials> {
+        self.authenticators
+            .iter()
+            .filter_map(|authenticator| authenticator.vended_credentials())
+            .collect()
+    }
+
+    /// Shape ids of all registered services (sorted). For diagnostics.
+    ///
+    /// Reports each service by its Smithy shape id, the precise per-service
+    /// identity, rather than its signing name: signing names collide across
+    /// services (rds, docdb, and neptune share one), so a signing-name list
+    /// cannot distinguish them.
+    pub fn service_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .services
+            .iter()
+            .map(|s| s.definition().identity().shape_id().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Dispatch a buffered request to the one service that claims it.
+    ///
+    /// STEP 1 — filter by `can_handle`, require exactly one claimant.
+    /// STEP 2 — name the operation: the service's `override_operation` first,
+    /// else the model-derived `routing_table` keyed by the protocol's routing key;
+    /// then refuse it unless a registered authenticator its model lists verifies it.
+    /// STEPS 3–11 — the operation's `run` drives the full deserialize → handle →
+    /// telemetry → serialize sequence, converting the request to the runtime-API
+    /// shape the protocol speaks and back.
+    pub async fn dispatch(
+        &self,
+        request: http::Request<bytes::Bytes>,
+    ) -> http::Response<bytes::Bytes> {
+        let (parts, _body) = {
+            let (parts, body) = request.into_parts();
+            (parts, body)
+        };
+
+        // RE-ENTRANCY GUARD — read the chain depth from the
+        // [`crate::CallbackRecursionDepth`] request extension and refuse here,
+        // before any service is selected, once it passes
+        // [`crate::CALLBACK_RECURSION_LIMIT`]. The refusal is a throttle-shaped
+        // 5xx an SDK maps to a retryable service error, returned to whichever
+        // caller made the over-limit call.
+        let recursion_depth = parts
+            .extensions
+            .get::<crate::CallbackRecursionDepth>()
+            .map_or(0, |depth| depth.0);
+        if recursion_depth > crate::CALLBACK_RECURSION_LIMIT {
+            return callback_recursion_limit_response(recursion_depth);
+        }
+
+        // STEP 1 — exactly one service must claim the request.
+        let claimants: Vec<&dyn Service> = self
+            .services
+            .iter()
+            .map(|s| s.as_ref())
+            .filter(|s| s.can_handle(&parts))
+            .collect();
+
+        let svc: &dyn Service = match claimants.as_slice() {
+            [one] => *one,
+            [] => {
+                let key = emulator_server::resolve_route_key(&parts);
+                return unknown_service_response(key.as_deref());
+            }
+            ambiguous => {
+                let names: Vec<&str> = ambiguous
+                    .iter()
+                    .map(|s| s.definition().identity().signing_name())
+                    .collect();
+                let key = emulator_server::resolve_route_key(&parts);
+                return ambiguous_service_response(key.as_deref(), &names);
+            }
+        };
+
+        // Build the runtime-API request (parts + body) ONCE, up front: the
+        // operation lookup needs the body (a `query` service routes by the
+        // `Action` form field, not the headers), and so does the matched
+        // operation's `run`. Reusing one request for both guarantees routing and
+        // deserialization see identical bytes.
+        let mut rt_req = runtime_api_request_from_parts(&parts, _body.to_vec());
+
+        // `aws-chunked` is a transfer encoding, not a payload, so it is stripped
+        // once here — before any protocol or the operation lookup reads the body
+        // — exactly as an HTTP server strips `Transfer-Encoding: chunked`, and
+        // exactly where the legacy per-service `dispatch` stripped it. It is a
+        // pure header-gated no-op for every request that is not `aws-chunked`
+        // (the overwhelmingly common case), so a non-chunked service is
+        // unaffected. Left in place, S3 object writes would store the framing
+        // bytes as the object: wrong length, wrong ETag, and no error raised.
+        // A body that DECLARES the framing and cannot be decoded is a client
+        // error, rendered in the claiming service's OWN protocol envelope (a
+        // `restXml` S3 service answers `400 InvalidRequest` as `application/xml`),
+        // never a pass-through that would silently store the framing bytes.
+        if let Err(e) = aws_smithy_schema_server::aws_chunked::decode_request(&mut rt_req) {
+            // The author's `override_framework_error` gets first refusal; on
+            // `None` the entry renders the protocol-correct default. The error is
+            // borrowed by the override and, if it declines, moved into the default
+            // renderer — consumed exactly once, so no `Clone` of the non-`Clone`
+            // `ProtocolError` is needed.
+            let err = aws_smithy_schema_server::ProtocolError::Malformed(e.to_string());
+            let rt_resp = svc
+                .override_framework_error(&err)
+                .unwrap_or_else(|| svc.definition().framework_error_response(err));
+            return http_response_from_runtime_api(rt_resp);
+        }
+
+        // STEP 2 — the service names the operation. The author's
+        // `override_operation` gets first refusal (it serves what the model's
+        // routing key cannot name); on `None` the model-derived routing table
+        // resolves it from the protocol's routing key. Both read the same
+        // runtime-API request, so a body-routed protocol (awsQuery / ec2Query,
+        // keyed on the `Action` form field) resolves exactly as the matched
+        // operation's `run` later deserializes it.
+        let op = match svc.override_operation(&rt_req) {
+            Some(op) => Some(op),
+            None => match svc.definition().protocol().routing_key(&rt_req) {
+                Ok(key) => svc.definition().routing_table().get(key),
+                Err(_) => None,
+            },
+        };
+        let Some(op) = op else {
+            // The request reached its service but named no modeled operation.
+            // The service renders the refusal in ITS OWN protocol envelope
+            // (query -> 400 InvalidAction text/xml, awsJson -> 404, …), rather
+            // than the router stamping one awsJson shape on every protocol. The
+            // author's `override_routing_error` gets first refusal; on `None` the
+            // entry renders the protocol-correct default.
+            let rt_resp = svc
+                .override_routing_error(&rt_req)
+                .unwrap_or_else(|| svc.definition().routing_error_response(&rt_req));
+            return http_response_from_runtime_api(rt_resp);
+        };
+        if let Err(denied) = self.authenticate(svc, op, &rt_req, &parts, &_body) {
+            let (code, message) = (denied.code, denied.message);
+            let err = aws_smithy_schema_server::ProtocolError::Unauthenticated { code, message };
+            let chosen = crate::refusal_of(&err).and_then(|r| svc.override_refusal(&r));
+            return http_response_from_runtime_api(svc.definition().refusal_response(err, chosen));
+        }
+
+        // STEPS 3–11 — run the op against the same request, convert the response
+        // back to the buffered `http` shape. The service is passed back into
+        // `run` (it was looked up FROM `svc`), so the centralized sequence can read
+        // this service's wire protocol via `svc.definition().protocol()` and
+        // reach its own refusal wording via `Service::override_refusal`.
+        //
+        // The handler is handed a callback into this same, live emulator: an
+        // `EmbeddedEmulator` over `self` (which is already an SDK transport via
+        // `impl_emulator_http_traits!`, cheap to clone behind its `Arc`). A
+        // callback therefore hits the same engine and state. The callback's
+        // transport stamps the next recursion depth, so a re-entrant chain is
+        // bounded at the limit by the guard above.
+        let callback = crate::EmbeddedEmulator::from_router(self.clone())
+            .with_recursion_depth(recursion_depth.saturating_add(1));
+        let ctx = OperationContext::new(&parts, svc.definition().identity(), callback);
+        emulator_server::cli::record_api_call();
+        let rt_resp = op.run(svc, &rt_req, &ctx).await;
+        http_response_from_runtime_api(rt_resp)
+    }
+}
+
+impl MultiServiceRouter {
+    /// `Ok` when no authenticator is registered or `op` is served unsigned. The modeled operation
+    /// the routing key names decides, so an author-written operation cannot weaken its schemes;
+    /// an operation's own schemes count only when the model names none for the request.
+    fn authenticate(
+        &self,
+        svc: &dyn Service,
+        op: &dyn ErasedOperation,
+        rt_req: &RtRequest,
+        parts: &http::request::Parts,
+        body: &[u8],
+    ) -> Result<(), Denied> {
+        if self.authenticators.is_empty() {
+            return Ok(());
+        }
+        let schemes = modeled_operation(svc, rt_req)
+            .and_then(|modeled| modeled.auth_schemes())
+            .or_else(|| op.auth_schemes());
+        if schemes.is_some_and(<[_]>::is_empty) {
+            return Ok(());
+        }
+        let authenticator = authenticator_for(&self.authenticators, schemes.unwrap_or(&[]), parts)?;
+        let serving = svc.definition().identity().signing_name();
+        authenticator.verify(parts, body, serving, &self.credential_store)
+    }
+}
+
+/// The operation the model's routing table names for the request's routing key.
+fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dyn ErasedOperation> {
+    let key = svc.definition().protocol().routing_key(req).ok()?;
+    svc.definition().routing_table().get(key)
+}
+
+/// The first registered authenticator, in the operation's scheme order, that recognizes the request; with no
+/// schemes known, any registered one. None means the request is refused: its scheme cannot be verified here.
+fn authenticator_for(
+    authenticators: &[&'static dyn RequestAuthenticator],
+    schemes: &[&str],
+    parts: &http::request::Parts,
+) -> Result<&'static dyn RequestAuthenticator, Denied> {
+    let rank = |a: &dyn RequestAuthenticator| match schemes {
+        [] => Some(0),
+        _ => schemes.iter().position(|s| *s == a.scheme_id()),
+    };
+    let recognizing = authenticators.iter().filter(|a| a.recognizes(parts));
+    let ranked = recognizing.filter_map(|a| Some((rank(*a)?, *a)));
+    let first = ranked.min_by_key(|(rank, _)| *rank).map(|(_, a)| a);
+    first.ok_or(emulator_server::request_authentication::ACCESS_DENIED)
+}
+
+impl EmulatorService for MultiServiceRouter {
+    async fn handle_request(
+        &self,
+        req: http::Request<bytes::Bytes>,
+    ) -> http::Response<bytes::Bytes> {
+        self.dispatch(req).await
+    }
+}
+
+// Expose the router as an SDK `HttpConnector`/`HttpClient`, so a caller can drive
+// it in-process (the embedded front door) through exactly the same `dispatch` as
+// a socket-served request — the two modes cannot diverge in routing behaviour.
+emulator_server::impl_emulator_http_traits!(MultiServiceRouter);
+
+impl std::fmt::Debug for MultiServiceRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiServiceRouter")
+            .field("services", &self.service_names())
+            .finish()
+    }
+}
+
+/// Build the throttle-shaped `503 CallbackRecursionLimitExceeded` envelope
+/// returned when an in-process callback chain passes
+/// [`crate::CALLBACK_RECURSION_LIMIT`].
+///
+/// A `503` is a Receiver fault an AWS SDK maps to a retryable service error,
+/// which is what an over-limit callback is to its caller: the request was
+/// refused by the emulator, not malformed. The message names the depth reached
+/// and the limit, so a cycle is diagnosable from the response alone.
+fn callback_recursion_limit_response(depth_reached: u8) -> http::Response<bytes::Bytes> {
+    let message = format!(
+        "in-process callback chain reached depth {} past the limit of {}; \
+         the request is refused to bound re-entrant callbacks",
+        depth_reached,
+        crate::CALLBACK_RECURSION_LIMIT,
+    );
+    aws_json_error_response(
+        503,
+        "CallbackRecursionLimitExceeded",
+        &message,
+        AwsJsonProtocol::V1_1,
+    )
+}
+
+/// Build the `404 UnknownService` envelope returned when no registered service
+/// claims a request.
+fn unknown_service_response(key: Option<&str>) -> http::Response<bytes::Bytes> {
+    let message = match key {
+        Some(k) => format!("no emulated service is registered for '{k}'"),
+        None => "could not resolve a target service from the request \
+                 (no SigV4 credential scope, X-Amz-Target, or Host header)"
+            .to_string(),
+    };
+    aws_json_error_response(404, "UnknownService", &message, AwsJsonProtocol::V1_1)
+}
+
+/// Build the `500 AmbiguousService` envelope returned when more than one
+/// registered service claims a request. The message names every claimant so the
+/// collision is diagnosable from the response alone.
+fn ambiguous_service_response(
+    key: Option<&str>,
+    claimants: &[&str],
+) -> http::Response<bytes::Bytes> {
+    let resolved = key.unwrap_or("<unresolved>");
+    let message = format!(
+        "{} emulated services all claim requests for '{}': {}; \
+         the request is rejected rather than served by an arbitrary one",
+        claimants.len(),
+        resolved,
+        claimants.join(", "),
+    );
+    aws_json_error_response(500, "AmbiguousService", &message, AwsJsonProtocol::V1_1)
+}
+
+/// Build a runtime-API request from buffered parts + body, preserving URI,
+/// method, and headers (so URI-routed protocols and `@httpHeader` bindings see
+/// what the client sent).
+fn runtime_api_request_from_parts(parts: &http::request::Parts, body: Vec<u8>) -> RtRequest {
+    let mut req = RtRequest::new(aws_smithy_types::body::SdkBody::from(body));
+    let uri_str = parts.uri.to_string();
+    req.set_uri(uri_str.as_str()).expect("valid URI");
+    req.set_method(parts.method.as_str()).expect("valid method");
+    for (name, value) in parts.headers.iter() {
+        if let Ok(v) = value.to_str() {
+            // `append`, not `insert`: `HeaderMap::iter` yields one entry per
+            // value, so a repeated or multi-valued header must keep every value
+            // (e.g. `@httpHeader` list / `@httpPrefixHeaders` bindings) rather
+            // than collapsing to the last one.
+            req.headers_mut()
+                .append(name.as_str().to_string(), v.to_string());
+        }
+    }
+    req
+}
+
+/// Convert a runtime-API response back to the buffered `http::Response<Bytes>`
+/// the `EmulatorService` contract uses, dropping hop-by-hop and transfer-framing
+/// headers that describe a transfer this buffered body no longer has.
+///
+/// `content-length` is a handler decision, not transfer framing: an operation
+/// may set it to advertise a size that is not this message's body length (a
+/// `HEAD` carries the resource's length with an empty body), so a value the
+/// handler set is preserved verbatim. Only when the handler sets no
+/// `content-length` is the header omitted, leaving the transport to frame it
+/// from the body length. Stripping a handler-set value would report the wrong
+/// size on exactly the responses that set it deliberately.
+fn http_response_from_runtime_api(resp: RtResponse) -> http::Response<bytes::Bytes> {
+    let status = resp.status().as_u16();
+    let mut builder = http::Response::builder().status(status);
+    for (name, value) in resp.headers().iter() {
+        if [
+            "transfer-encoding",
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "upgrade",
+            "te",
+            "trailer",
+        ]
+        .iter()
+        .any(|banned| name.eq_ignore_ascii_case(banned))
+        {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    let body_bytes = resp
+        .into_body()
+        .bytes()
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
+    builder
+        .body(bytes::Bytes::from(body_bytes))
+        .expect("valid status and headers")
+}
+
+#[cfg(test)]
+mod tests {
+    //! The multi-service SELECTION verdicts, pinned against the real
+    //! [`MultiServiceRouter`]: zero claimants is a `404 UnknownService` naming
+    //! the resolved key, two or more is a `500 AmbiguousService` naming every
+    //! claimant, that ambiguity verdict does not depend on registration order,
+    //! and a request no service claims is never silently absorbed. These pins
+    //! drive the router's own `dispatch` through `register_service`, so they
+    //! guard the production selection path itself rather than a reimplementation
+    //! of it.
+    //!
+    //! The single-claimant SERVE path is deliberately NOT pinned here: serving
+    //! needs a real operation map and protocol, which the generated service
+    //! crates supply, so it is covered end to end in the `*-service-test` crates
+    //! (e.g. `aws-query-compat-service-test`) that register a real generated
+    //! service and drive `dispatch`. The predicate RULE each service's
+    //! `can_handle` applies is pinned separately, as a pure function, in
+    //! `emulator-server`.
+
+    use super::*;
+    use crate::service::{ErasedOperation, ServiceIdentity};
+    use aws_smithy_runtime_api::http::Request as RtRequest;
+
+    /// How a test double decides whether it claims a request.
+    #[derive(Clone, Copy)]
+    enum Claim {
+        /// Claim only when the request resolves to this service's own signing
+        /// name — the framework-default predicate a generated service seeds.
+        WhenKeyMatches,
+        /// Claim every request, so two such services registered together
+        /// contend for one request and make it ambiguous.
+        Always,
+        /// Claim nothing, so a request that resolves to this service's key is
+        /// still declined and must not be absorbed.
+        Never,
+    }
+
+    /// The minimal [`ErasedServiceDefinition`] a [`SelectingService`] exposes. Only
+    /// [`identity`](ErasedServiceDefinition::identity) is real — selection reads it to
+    /// resolve and report a service's key; the protocol, routing table, and
+    /// error renderers are never reached on the selection path (a request with
+    /// zero or two-plus claimants is answered before the router looks an
+    /// operation up), so they are left `unreachable!()` rather than given stub
+    /// behaviour that could mislead.
+    struct SelectingEntry {
+        identity: ServiceIdentity,
+    }
+
+    impl crate::service::ErasedServiceDefinition for SelectingEntry {
+        fn identity(&self) -> &ServiceIdentity {
+            &self.identity
+        }
+
+        fn protocol(&self) -> &dyn crate::service::ServerHttpProtocol {
+            unreachable!("selection answers before the protocol is read")
+        }
+
+        fn routing_table(&self) -> &crate::service::OperationRoutingTable {
+            unreachable!("selection answers before the routing table is read")
+        }
+
+        fn routing_error_response(
+            &self,
+            _req: &RtRequest,
+        ) -> aws_smithy_runtime_api::http::Response {
+            unreachable!("selection answers before a routing error is rendered")
+        }
+
+        fn framework_error_response(
+            &self,
+            _error: aws_smithy_schema_server::ProtocolError,
+        ) -> aws_smithy_runtime_api::http::Response {
+            unreachable!("selection answers before a framework error is rendered")
+        }
+    }
+
+    /// A minimal [`Service`] that participates in routing by identity and
+    /// predicate alone. Selection reaches only `can_handle` and the entry's
+    /// `identity`: a request with zero or two-plus claimants is answered before
+    /// the router looks an operation up, so the remaining seams are never called
+    /// on this path and are left unreachable rather than given stub behaviour
+    /// that could mislead.
+    struct SelectingService {
+        entry: SelectingEntry,
+        claim: Claim,
+    }
+
+    impl SelectingService {
+        /// A service keyed on `signing_name`, claiming a request only when it
+        /// resolves to that name.
+        fn by_signing_name(signing_name: &'static str) -> Self {
+            Self {
+                entry: SelectingEntry {
+                    identity: ServiceIdentity::new(signing_name, signing_name),
+                },
+                claim: Claim::WhenKeyMatches,
+            }
+        }
+
+        /// A service named `signing_name` that claims every request, for forcing
+        /// an ambiguous collision.
+        fn always_claiming(signing_name: &'static str) -> Self {
+            Self {
+                entry: SelectingEntry {
+                    identity: ServiceIdentity::new(signing_name, signing_name),
+                },
+                claim: Claim::Always,
+            }
+        }
+
+        /// A service named `signing_name` that claims nothing, for proving a
+        /// declined request is never absorbed.
+        fn never_claiming(signing_name: &'static str) -> Self {
+            Self {
+                entry: SelectingEntry {
+                    identity: ServiceIdentity::new(signing_name, signing_name),
+                },
+                claim: Claim::Never,
+            }
+        }
+    }
+
+    impl Service for SelectingService {
+        fn definition(&self) -> &dyn crate::service::ErasedServiceDefinition {
+            &self.entry
+        }
+
+        fn can_handle(&self, parts: &http::request::Parts) -> bool {
+            match self.claim {
+                Claim::Always => true,
+                Claim::Never => false,
+                Claim::WhenKeyMatches => {
+                    emulator_server::resolve_route_key(parts).as_deref()
+                        == Some(self.entry.identity.signing_name())
+                }
+            }
+        }
+
+        fn override_operation(&self, _req: &RtRequest) -> Option<&dyn ErasedOperation> {
+            unreachable!("selection answers before an operation is looked up")
+        }
+
+        fn override_routing_error(&self, _req: &RtRequest) -> Option<RtResponse> {
+            unreachable!("selection answers before a routing error is rendered")
+        }
+
+        fn override_framework_error(
+            &self,
+            _error: &aws_smithy_schema_server::ProtocolError,
+        ) -> Option<RtResponse> {
+            unreachable!("selection answers before a framework error is rendered")
+        }
+
+        fn override_refusal(&self, _refusal: &crate::Refusal) -> Option<crate::Refused> {
+            unreachable!("selection answers before a refusal is rendered")
+        }
+    }
+
+    /// A buffered POST whose SigV4 credential scope names `signing_name`, so the
+    /// router resolves that routing key and a `by_signing_name` service claims
+    /// it.
+    fn signed_request(signing_name: &str) -> http::Request<bytes::Bytes> {
+        http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 \
+                     Credential=AKIDEXAMPLE/20240101/us-east-1/{signing_name}/aws4_request, \
+                     SignedHeaders=host, Signature=deadbeef"
+                ),
+            )
+            .body(bytes::Bytes::from_static(b"{}"))
+            .unwrap()
+    }
+
+    fn body_json(resp: &http::Response<bytes::Bytes>) -> serde_json::Value {
+        serde_json::from_slice(resp.body()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn zero_claimants_is_404_unknown_service_naming_the_resolved_key() {
+        // A request that resolves to a service no one registered has zero
+        // claimants, so the router answers 404 UnknownService rather than
+        // serving an arbitrary service, and the message names the key it could
+        // not place.
+        let mut router = MultiServiceRouter::new();
+        router.register_service(SelectingService::by_signing_name("iam"));
+
+        let resp = router.dispatch(signed_request("ec2")).await;
+        assert_eq!(resp.status(), 404);
+        let body = body_json(&resp);
+        assert_eq!(body["__type"], "UnknownService");
+        assert!(
+            body["message"].as_str().unwrap().contains("ec2"),
+            "the unresolved key is named: {}",
+            body["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn two_or_more_claimants_is_500_ambiguous_service_naming_every_claimant() {
+        // rds, docdb and neptune all sign as `rds`; registering three services
+        // that each claim the `rds` key makes one request ambiguous. The router
+        // refuses it 500 AmbiguousService and names every claimant so the
+        // collision is diagnosable from the response alone.
+        let mut router = MultiServiceRouter::new();
+        for name in ["rds", "docdb", "neptune"] {
+            // Each claims unconditionally so all three contend for the request.
+            router.register_service(SelectingService::always_claiming(name));
+        }
+
+        let resp = router.dispatch(signed_request("rds")).await;
+        assert_eq!(resp.status(), 500);
+        let body = body_json(&resp);
+        assert_eq!(body["__type"], "AmbiguousService");
+        let message = body["message"].as_str().unwrap();
+        for name in ["rds", "docdb", "neptune"] {
+            assert!(message.contains(name), "{name} is named: {message}");
+        }
+        assert!(
+            message.contains('3'),
+            "the claimant count is named: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguity_is_refused_regardless_of_registration_order() {
+        // Reversing the order two colliding services are registered in must not
+        // change the verdict: an ambiguous request is refused either way, never
+        // served by whichever registered first.
+        let build = |order: [&'static str; 2]| {
+            let mut router = MultiServiceRouter::new();
+            for name in order {
+                router.register_service(SelectingService::always_claiming(name));
+            }
+            router
+        };
+
+        let forward = build(["rds", "docdb"]);
+        let reverse = build(["docdb", "rds"]);
+        assert_eq!(forward.dispatch(signed_request("rds")).await.status(), 500);
+        assert_eq!(reverse.dispatch(signed_request("rds")).await.status(), 500);
+    }
+
+    #[tokio::test]
+    async fn a_declining_service_never_absorbs_a_request_it_does_not_claim() {
+        // There is no catch-all: a registered service whose predicate declines a
+        // request does not make the router serve it. A request that resolves to
+        // that service's key but is declined, and a request that resolves to no
+        // registered key at all, both answer 404 UnknownService.
+        let mut router = MultiServiceRouter::new();
+        router.register_service(SelectingService::never_claiming("iam"));
+
+        let declined = router.dispatch(signed_request("iam")).await;
+        assert_eq!(declined.status(), 404);
+        assert_eq!(body_json(&declined)["__type"], "UnknownService");
+
+        let unregistered = router.dispatch(signed_request("ec2")).await;
+        assert_eq!(unregistered.status(), 404);
+        assert_eq!(body_json(&unregistered)["__type"], "UnknownService");
+    }
+
+    #[test]
+    fn request_authentication_switches_and_vends_for_one_router() {
+        let mut router = MultiServiceRouter::default();
+        router.set_request_authentication(false);
+        assert!(
+            router.authenticators.is_empty(),
+            "off on a router without one is a no-op"
+        );
+        router
+            .set_request_authentication(true)
+            .set_request_authentication(true);
+        assert_eq!(
+            router.authenticators.len(),
+            1,
+            "on twice registers one authenticator"
+        );
+        let keys = SigV4Authenticator::minted_credentials().expect("on mints the process keys");
+        assert!(std::ptr::addr_eq(router.authenticators[0], keys));
+        assert_eq!(
+            router.vended_credentials(),
+            vec![keys.vended_credentials().expect("SigV4 vends its key pair")],
+            "an authenticating router hands out the keys it checks"
+        );
+        router.register_authenticator(Box::leak(Box::new(SigV4Authenticator {
+            access_key_id: "OTHER".into(),
+            secret_access_key: "other".into(),
+        })));
+        router.set_request_authentication(false);
+        assert!(
+            router.authenticators.is_empty(),
+            "off removes every authenticator"
+        );
+        assert!(router.vended_credentials().is_empty(), "off vends nothing");
+    }
+
+    #[test]
+    fn a_request_is_checked_only_by_an_authenticator_its_operation_lists() {
+        let sigv4: &'static dyn RequestAuthenticator = Box::leak(Box::new(SigV4Authenticator {
+            access_key_id: "EMULATORAAAAAAAAAAAA".into(),
+            secret_access_key: "s".into(),
+        }));
+        let bearer = http::Request::builder()
+            .header("authorization", "Bearer token")
+            .body(())
+            .unwrap();
+        let (signed, bearer) = (signed_request("sqs").into_parts().0, bearer.into_parts().0);
+        #[rustfmt::skip]
+        let cases: [(&str, &[&str], &http::request::Parts, bool); 4] = [
+            ("sigv4 operation, sigv4 request", &["aws.auth#sigv4"], &signed, true),
+            ("no schemes modeled, sigv4 request", &[], &signed, true),
+            ("bearer-only operation (CodeCatalyst), no bearer authenticator", &["smithy.api#httpBearerAuth"], &signed, false),
+            ("sigv4 operation, unsupported Authorization scheme", &["aws.auth#sigv4"], &bearer, false),
+        ];
+        for (name, schemes, parts, checked) in cases {
+            assert_eq!(
+                authenticator_for(&[sigv4], schemes, parts).is_ok(),
+                checked,
+                "{name}"
+            );
+        }
+    }
+
+    use aws_smithy_runtime_api::http::StatusCode;
+    use aws_smithy_types::body::SdkBody;
+
+    /// A handler-set `content-length` survives the conversion to the buffered
+    /// response unchanged. A `HEAD` reply carries the resource's size with an
+    /// empty body, so the advertised length is not the message body length;
+    /// recomputing it from the body would report `0` and misstate the size.
+    #[test]
+    fn handler_set_content_length_survives_conversion_unchanged() {
+        let mut rt = RtResponse::new(StatusCode::try_from(200).unwrap(), SdkBody::from(&b""[..]));
+        rt.headers_mut().insert("content-length", "4096");
+
+        let resp = http_response_from_runtime_api(rt);
+
+        assert_eq!(
+            resp.headers()
+                .get("content-length")
+                .map(|v| v.to_str().unwrap()),
+            Some("4096"),
+            "the handler's advertised length is preserved, not recomputed from the empty body"
+        );
+        assert!(resp.body().is_empty(), "the empty body is left empty");
+    }
+
+    /// With no handler-set `content-length`, the converted response carries
+    /// none, leaving the transport to frame it from the body length rather than
+    /// inheriting a stale or forced value.
+    #[test]
+    fn absent_content_length_is_left_for_the_transport_to_compute() {
+        let rt = RtResponse::new(
+            StatusCode::try_from(200).unwrap(),
+            SdkBody::from(&b"hello"[..]),
+        );
+
+        let resp = http_response_from_runtime_api(rt);
+
+        assert!(
+            resp.headers().get("content-length").is_none(),
+            "no header is forced when the handler set none; the transport frames the body"
+        );
+        assert_eq!(
+            resp.body().as_ref(),
+            b"hello",
+            "the body is carried through"
+        );
+    }
+
+    /// Transfer-framing and hop-by-hop headers that describe a transfer the
+    /// buffered body no longer has are still dropped, so preserving
+    /// `content-length` does not reopen the strip for the framing headers.
+    #[test]
+    fn transfer_framing_headers_are_still_dropped() {
+        let mut rt = RtResponse::new(
+            StatusCode::try_from(200).unwrap(),
+            SdkBody::from(&b"{}"[..]),
+        );
+        rt.headers_mut().insert("transfer-encoding", "chunked");
+        rt.headers_mut().insert("connection", "keep-alive");
+        rt.headers_mut().insert("content-type", "application/json");
+
+        let resp = http_response_from_runtime_api(rt);
+
+        assert!(resp.headers().get("transfer-encoding").is_none());
+        assert!(resp.headers().get("connection").is_none());
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .map(|v| v.to_str().unwrap()),
+            Some("application/json"),
+            "a non-framing header the handler set is carried through"
+        );
+    }
+}
