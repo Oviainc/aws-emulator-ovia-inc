@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartAsyncInvoke
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartAsyncInvoke`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Submits an asynchronous invocation: it resolves `modelId` against the
+//! registry in [`crate::state`], mints an `invocationArn`, and persists the
+//! record `GetAsyncInvoke` and `ListAsyncInvokes` then report.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartAsyncInvoke::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `@idempotent` with an `@idempotencyToken` `clientRequestToken`: a repeat of
+//! the same payload under the same token returns the invocation already
+//! minted, and the same token with a different payload is a `ConflictException`.
+//!
+//! The submitted record starts in `InProgress` and leaves it only when the clock
+//! makes that transition due; since no model runs in this emulator and nothing is
+//! written to the caller's S3 location, it settles into the modelled `Failed`
+//! state carrying the reason — see `settle_async_invokes` on the state struct
+//! and [`crate::state::ASYNC_INVOKE_FAILURE_MESSAGE`].
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +179,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartAsyncInvoke` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartAsyncInvokeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartAsyncInvoke"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartAsyncInvokeErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Bedrock Runtime emulator has no state store".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut guard = state.lock();
+
+        let model = match guard.resolve_model(&input.model_id) {
+            Some(entry) => entry.clone(),
+            None => {
+                return Err(StartAsyncInvokeErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "The provided model identifier is invalid: {}",
+                            input.model_id
+                        )),
+                    },
+                )
+                .into())
+            }
+        };
+
+        let fingerprint = crate::state::async_invoke_fingerprint(
+            &model.model_id,
+            &input.model_input,
+            &input.output_data_config,
+            input.tags.as_deref().unwrap_or_default(),
+        );
+
+        // `@idempotent`: the same token with the same payload names the
+        // invocation already minted; with a different payload it is a conflict.
+        let token = input
+            .client_request_token
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        if let Some(token) = token {
+            if let Some(existing) = guard
+                .idempotency_index
+                .get(token)
+                .and_then(|arn| guard.async_invokes.get(arn))
+            {
+                if existing.request_fingerprint == fingerprint {
+                    return Ok(StartAsyncInvokeOutput {
+                        invocation_arn: existing.invocation_arn.clone(),
+                    });
+                }
+                return Err(StartAsyncInvokeErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "The clientRequestToken {token} was already used for a different \
+                             request."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let submit_time = crate::state::now_millis();
+        let invocation_id = guard.mint_invocation_id(&model.model_id, submit_time);
+        let invocation_arn = ::engine::emulator_arn(
+            "bedrock",
+            &region,
+            &format!("async-invoke/{invocation_id}"),
+        );
+        let record = crate::state::AsyncInvokeRecord {
+            invocation_arn: invocation_arn.clone(),
+            model_id: model.model_id.clone(),
+            model_arn: crate::state::foundation_model_arn(&region, &model.model_id),
+            client_request_token: token.map(str::to_string),
+            status: crate::state::AsyncInvokeStatus::InProgress,
+            submit_time,
+            last_modified_time: Some(submit_time),
+            end_time: None,
+            failure_message: None,
+            output_data_config: input.output_data_config.clone(),
+            model_input: input.model_input.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+            settles_at: submit_time + crate::state::ASYNC_INVOKE_SETTLE_MILLIS,
+            request_fingerprint: fingerprint,
+        };
+        // `insert_async_invoke` also indexes the idempotency token and evicts the
+        // oldest records once the store passes its retention bound.
+        guard.insert_async_invoke(record);
+        guard.log_invocation(crate::state::InvocationLogEntry {
+            model_id: model.model_id,
+            kind: crate::state::InvokeKind::Async,
+            input_tokens: crate::state::body_input_tokens(
+                crate::state::document_to_json(&input.model_input)
+                    .to_string()
+                    .as_bytes(),
+            ),
+            output_tokens: 0,
+            at_millis: submit_time,
+        });
+
+        Ok(StartAsyncInvokeOutput { invocation_arn })
     }
 }
