@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetService
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetService`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetService::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reads one persisted service, by id or by ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -135,6 +128,16 @@ impl From<GetServiceErrorModeled> for GetServiceError {
     }
 }
 
+/// HTTP 404 for an identifier that names no persisted service.
+fn not_found(identifier: &str) -> GetServiceError {
+    GetServiceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("service {identifier} not found"),
+        resource_id: identifier.to_string(),
+        resource_type: crate::state::KIND_SERVICE.to_string(),
+    })
+    .into()
+}
+
 /// The `GetService` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -171,18 +174,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetService` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetServiceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetService"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetServiceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        // `serviceIdentifier` is modelled as either the bare id or the ARN.
+        let Some(id) = crate::state::id_from_identifier(
+            &input.service_identifier,
+            crate::state::PREFIX_SERVICE,
+        ) else {
+            return Err(not_found(&input.service_identifier));
+        };
+        let now = std::time::SystemTime::now();
+        let store = state.lock();
+        let Some(service) = store.services.get(&id) else {
+            return Err(not_found(&input.service_identifier));
+        };
+        let (domain_name, hosted_zone_id) = service.dns_entry();
+        Ok(GetServiceOutput {
+            id: Some(service.id.clone()),
+            name: Some(service.name.clone()),
+            arn: Some(service.arn.clone()),
+            created_at: Some(crate::state::timestamp(service.created_at)),
+            last_updated_at: Some(crate::state::timestamp(service.last_updated_at)),
+            dns_entry: Some(DnsEntry {
+                domain_name: Some(domain_name),
+                hosted_zone_id: Some(hosted_zone_id),
+            }),
+            custom_domain_name: service.custom_domain_name.clone(),
+            certificate_arn: service.certificate_arn.clone(),
+            status: Some(service.status(now).to_string()),
+            auth_type: Some(service.auth_type.clone()),
+            idle_timeout_seconds: Some(service.idle_timeout_seconds),
+            // `failureCode`/`failureMessage` describe a CREATE_FAILED service; nothing
+            // persisted here has failed, so neither member is set.
+            failure_code: None,
+            failure_message: None,
+        })
     }
 }

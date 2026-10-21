@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeClusters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeClusters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeClusters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads the stored clusters back, in one stable order (by name), filtered by
+//! `ClusterNames` when given and paged by `MaxResults`/`NextToken`. A name that was
+//! never created, or whose cluster has been removed, is answered with
+//! `ClusterNotFoundFault`.
+//!
+//! It reports; the only thing it writes is the cluster status move the CLOCK has
+//! already made due (`crate::state::ComAmazonawsDaxAmazondaxv3State::settle_due`), which
+//! was owed at the same instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +160,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeClusters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeClustersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeClusters"))
+        let _ = ctx;
+        let state = crate::state::store(&*self.engine, Self::NAME)?;
+        let now = ::std::time::SystemTime::now();
+
+        // "The value for MaxResults must be between 20 and 100" (`MaxResults`).
+        if let Some(max_results) = input.max_results {
+            if !(crate::state::MIN_MAX_RESULTS..=crate::state::MAX_MAX_RESULTS)
+                .contains(&max_results)
+            {
+                return Err(DescribeClustersErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "MaxResults must be between {} and {}, got {max_results}",
+                            crate::state::MIN_MAX_RESULTS,
+                            crate::state::MAX_MAX_RESULTS
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A continuation token this service did not issue is refused, rather than
+        // answering an arbitrary page with a 200.
+        let start_from = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_token(token) {
+                Some(from) => Some(from),
+                None => {
+                    return Err(DescribeClustersErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(
+                                "NextToken is not a continuation token from a prior \
+                                 DescribeClusters response"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        let mut store = state.lock();
+        store.settle_due(now);
+
+        let requested = input.cluster_names.unwrap_or_default();
+        let names: Vec<String> = if requested.is_empty() {
+            store.clusters.keys().cloned().collect()
+        } else {
+            let mut named: Vec<String> = Vec::with_capacity(requested.len());
+            for name in &requested {
+                let name = name.to_lowercase();
+                if !store.clusters.contains_key(&name) {
+                    return Err(DescribeClustersErrorModeled::ClusterNotFoundFault(
+                        ClusterNotFoundFault {
+                            message: Some(format!("Cluster {name} does not exist")),
+                        },
+                    )
+                    .into());
+                }
+                named.push(name);
+            }
+            named.sort_unstable();
+            named.dedup();
+            named
+        };
+
+        let all: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (page, next_token) =
+            crate::state::page(&all, input.max_results, start_from.as_deref());
+        let clusters = page
+            .iter()
+            .filter_map(|name| store.clusters.get(*name))
+            .map(crate::state::ClusterRecord::describe_view)
+            .collect();
+
+        Ok(DescribeClustersOutput {
+            next_token,
+            clusters: Some(clusters),
+        })
     }
 }

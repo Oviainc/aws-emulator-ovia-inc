@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints and persists an application in this service's store.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `@idempotent`: the identity source IS the application's identity, so repeating the
+//! same request answers the stored ARN instead of minting a second application.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +153,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplication"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateApplicationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the account-access store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let IdentitySource::identityCenter(identity_center) = &input.identity_source;
+        let instance_arn = identity_center.instance_arn.clone();
+        let Some(instance_id) = crate::state::identity_center_instance_id(&instance_arn) else {
+            return Err(CreateApplicationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "identitySource.identityCenter.instanceArn must name an IAM Identity \
+                         Center instance: {instance_arn}"
+                    )),
+                },
+            )
+            .into());
+        };
+        let tags: std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
+
+        let now = crate::state::now_millis();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        store.settle(now);
+
+        // `@idempotent`: one application per identity source. An identical request
+        // answers the application already stored for it; a DIFFERENT request for the
+        // same identity source is the `AlreadyCreatedException` the model declares
+        // ("To retrieve the existing resource, use the corresponding Get operation").
+        if let Some(existing) = store.application_for_instance(&instance_arn) {
+            if existing.tags == tags {
+                return Ok(CreateApplicationOutput {
+                    application_arn: existing.application_arn.clone(),
+                });
+            }
+            return Err(CreateApplicationErrorModeled::AlreadyCreatedException(
+                AlreadyCreatedException {
+                    message: Some(format!(
+                        "an application already exists for identity source {instance_arn}; \
+                         use GetApplication to retrieve it"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: the emulator holds no IAM Identity Center state, so
+        // nothing limits how many distinct identity sources a caller can name.
+        if store.applications.len() >= crate::state::MAX_APPLICATIONS {
+            return Err(CreateApplicationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} account access \
+                         applications; delete one before creating another",
+                        crate::state::MAX_APPLICATIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let sequence = store.next_sequence();
+        let application_arn = ::engine::emulator_arn(
+            "account-access",
+            &region,
+            &format!("application/aam-{sequence:016x}"),
+        );
+        // `IdentityCenterDetails$applicationArn` is
+        // `arn:<partition>:sso::<account>:application/<instance id>/apl-<16 alphanumerics>`;
+        // an IAM Identity Center application ARN carries no region.
+        let identity_center_application_arn = ::engine::emulator_arn(
+            "sso",
+            "",
+            &format!("application/{instance_id}/apl-{sequence:016x}"),
+        );
+
+        store.insert_application(crate::state::Application {
+            application_arn: application_arn.clone(),
+            identity_center_instance_arn: instance_arn,
+            identity_center_application_arn,
+            status: crate::state::STATUS_CREATE_IN_PROGRESS.to_string(),
+            created_at_millis: now,
+            updated_at_millis: now,
+            active_at_millis: now + crate::state::APPLICATION_ACTIVATION_MILLIS,
+            tags,
+            error: None,
+        });
+
+        Ok(CreateApplicationOutput { application_arn })
     }
 }

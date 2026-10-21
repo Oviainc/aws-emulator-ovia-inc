@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGraphs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGraphs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGraphs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages over the stored graphs in the shared store.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +143,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGraphs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGraphsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGraphs"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListGraphsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A token this service did not issue cannot name a page. `ListGraphs` models no
+        // client-input error, so the refusal goes through the scaffold channel, which
+        // renders the same 400 `ValidationException` the boundary validator does.
+        let start_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(format!(
+                    "nextToken '{token}' is not a pagination token this service issued"
+                ))
+            })?),
+            None => None,
+        };
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(DEFAULT_PAGE_SIZE);
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+        // Reporting only: the sole write is materialising the CREATING/UPDATING ->
+        // AVAILABLE transitions the clock already made due.
+        store.settle_all(now);
+
+        // `graphs` is a BTreeMap, so one stable total order underlies every page and a
+        // token can name a position in it.
+        let lower = match start_after.as_deref() {
+            Some(id) => ::std::ops::Bound::Excluded(id),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut remaining = store
+            .graphs
+            .range::<str, _>((lower, ::std::ops::Bound::Unbounded));
+        let graphs: Vec<GraphSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(_, graph)| GraphSummary::from(graph))
+            .collect();
+        // A token only when graphs remain, and it resumes after the last one reported,
+        // so a resumed page returns the remainder without repeats.
+        let next_token = if remaining.next().is_some() {
+            graphs.last().map(|summary| encode_page_token(&summary.id))
+        } else {
+            None
+        };
+
+        Ok(Self::Output { graphs, next_token })
     }
 }
+
+/// The page size when `maxResults` is absent: the largest the member allows
+/// (`smithy_query(query="operation",operation="ListGraphs")` -> `maxResults` range
+/// 1..100), so an unpaginated caller sees as much as one page can carry.
+const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// A pagination token naming the last graph id of the page just returned. Hex keeps the
+/// token opaque to a client and within `PaginationToken`'s 1..8192 length.
+fn encode_page_token(last_returned_id: &str) -> String {
+    hex::encode(last_returned_id)
+}
+
+/// The graph id a token resumes after, or `None` when the token is not one
+/// [`encode_page_token`] produced.
+///
+/// A decoded value that does not name a position in the graph-id space (the modelled
+/// `GraphId` pattern) is rejected rather than treated as the start of the list.
+/// Membership in the store is deliberately NOT required: a graph deleted between two
+/// pages must still leave its successors reachable, which is what resuming from a
+/// position — rather than from a row — gives.
+fn decode_page_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    crate::state::is_graph_id(&decoded).then_some(decoded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_page_token, encode_page_token};
+
+    /// A token round-trips to the id it was minted from, and a token this service
+    /// never issued is rejected rather than silently treated as the first page.
+    #[test]
+    fn page_tokens_round_trip_and_reject_foreign_tokens() {
+        for id in ["g-0000000000", "g-abcdefghij", "g-zz99zz99zz"] {
+            let token = encode_page_token(id);
+            let decoded = decode_page_token(&token);
+            assert_eq!(
+                decoded.as_deref(),
+                Some(id),
+                "case {id:?}: token {token:?} did not round-trip, got {decoded:?}"
+            );
+        }
+        for foreign in [
+            "not-a-token",
+            "zz",
+            "abc",
+            // Decodes cleanly, but names no position in the graph-id space.
+            &hex::encode("not-a-graph-id"),
+            &hex::encode("g-short"),
+            &hex::encode("gs-0123456789"),
+        ] {
+            let decoded = decode_page_token(foreign);
+            assert!(
+                decoded.is_none(),
+                "case {foreign:?}: expected rejection, got {decoded:?}"
+            );
+        }
+    }
+}
+

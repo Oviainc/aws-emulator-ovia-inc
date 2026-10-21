@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListImages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListImages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListImages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the identifiers of the images a repository holds, derived from the store: one
+//! entry per (digest, tag) pair and one tagless entry for a digest nothing points at,
+//! filtered by `filter` and served one page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -135,6 +129,22 @@ impl From<ListImagesErrorModeled> for ListImagesError {
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors.
+fn fault_error(fault: crate::state::Fault) -> ListImagesErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            ListImagesErrorModeled::RepositoryNotFoundException(RepositoryNotFoundException {
+                message,
+            })
+        }
+        // `ImageNotFound` cannot arise here: a listing resolves no image identifier.
+        _ => {
+            ListImagesErrorModeled::InvalidParameterException(InvalidParameterException { message })
+        }
+    }
+}
+
 /// The `ListImages` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -171,18 +181,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListImages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListImagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListImages"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListImagesErrorModeled::ServerException(ServerException {
+                message: Some("the ecr repository store is unavailable".to_string()),
+            })
+            .into());
+        };
+        let _ = ctx;
+
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        let filter = input.filter.unwrap_or_default();
+        // A value outside `TagStatus` / `ImageStatusFilter` was already refused at the
+        // boundary, so what arrives here is one of the modelled values.
+        let tag_status = filter.tag_status.unwrap_or_else(|| "ANY".to_string());
+        // "If not specified, only images with ACTIVE status are returned" — which every
+        // image in standard storage is.
+        let image_status = filter
+            .image_status
+            .unwrap_or_else(|| crate::state::ACTIVE_IMAGE_STATUS.to_string());
+        let status_matches =
+            image_status == "ANY" || image_status == crate::state::ACTIVE_IMAGE_STATUS;
+
+        let store = state.lock();
+        let repo = store
+            .repository(&input.repository_name)
+            .map_err(fault_error)?;
+
+        // Keyed by digest and then tag, so a page boundary is a point in one total
+        // order the next call resolves against the live store.
+        let candidates: Vec<(String, ImageIdentifier)> = if status_matches {
+            repo.images
+                .values()
+                .flat_map(crate::state::ImageRecord::identifiers)
+                .filter(|id| match tag_status.as_str() {
+                    "TAGGED" => id.image_tag.is_some(),
+                    "UNTAGGED" => id.image_tag.is_none(),
+                    _ => true,
+                })
+                .map(|id| {
+                    let key = format!(
+                        "{}\u{1}{}",
+                        id.image_digest.clone().unwrap_or_default(),
+                        id.image_tag.clone().unwrap_or_default()
+                    );
+                    (key, id)
+                })
+                .collect()
+        } else {
+            // Nothing stored here is archived or activating, so no stored image
+            // matches a filter asking for one.
+            Vec::new()
+        };
+
+        let (image_ids, next_token) =
+            crate::state::paginate(candidates, input.next_token.as_ref(), input.max_results)
+                .map_err(fault_error)?;
+
+        Ok(ListImagesOutput {
+            image_ids: Some(image_ids),
+            next_token,
+        })
     }
 }

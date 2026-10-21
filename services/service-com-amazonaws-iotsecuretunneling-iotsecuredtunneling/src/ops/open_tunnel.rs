@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op OpenTunnel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `OpenTunnel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`OpenTunnel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints and persists a tunnel: a fresh `tunnelId`, its ARN, and two distinct
+//! client access tokens, all stored in [`crate::state`] so `DescribeTunnel`,
+//! `ListTunnels`, `RotateTunnelAccessToken` and `CloseTunnel` read the same record.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +142,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `OpenTunnel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(OpenTunnelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("OpenTunnel"))
+        // The shared store. `None` means this service was mounted on an engine it
+        // cannot reach, so the operation cannot be served at all — never a fresh
+        // engine, whose writes would be dropped when this request returns.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("OpenTunnel"))?;
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+
+        // An absent `timeoutConfig`, or an absent member within it, takes the
+        // modelled default of 720 minutes.
+        let max_lifetime_timeout_minutes = input
+            .timeout_config
+            .as_ref()
+            .and_then(|config| config.max_lifetime_timeout_minutes)
+            .unwrap_or(crate::state::DEFAULT_MAX_LIFETIME_TIMEOUT_MINUTES);
+
+        let destination_config =
+            input
+                .destination_config
+                .as_ref()
+                .map(|config| crate::state::StoredDestinationConfig {
+                    thing_name: config.thing_name.clone(),
+                    services: config.services.clone(),
+                });
+
+        let mut store = state.lock();
+        // The store holds at most `MAX_TUNNELS` records, which is the limit the
+        // modelled `LimitExceededException` ("Thrown when a tunnel limit is
+        // exceeded", HTTP 403) exists to report. Refused before anything is minted,
+        // so a refused open neither stores a record nor hands out a token.
+        if store.is_at_tunnel_limit() {
+            return Err(OpenTunnelErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Tunnel limit of {} exceeded; close a tunnel with delete set before \
+                         opening another",
+                        crate::state::MAX_TUNNELS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A tunnel carries at most `MAX_TAGS_PER_TUNNEL` tags, and the two tagging
+        // entry points agree: refused here as well as in `TagResource`, before
+        // anything is minted or stored. The modelled `TagList` length bounds one
+        // request's list; this bounds what one tunnel accumulates.
+        let tag_count = input.tags.as_deref().map_or(0, |tags| {
+            tags.iter()
+                .map(|tag| tag.key.as_str())
+                .collect::<::std::collections::BTreeSet<&str>>()
+                .len()
+        });
+        if tag_count > crate::state::MAX_TAGS_PER_TUNNEL {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "tags carries {tag_count} tags; a tunnel carries at most {}",
+                crate::state::MAX_TAGS_PER_TUNNEL
+            )));
+        }
+
+        let tunnel_id = crate::state::mint_tunnel_id();
+        let tunnel_arn = crate::state::tunnel_arn(&region, &tunnel_id);
+        // Two independently minted tokens: the source and destination proxies each
+        // authenticate with their own.
+        let source_access_token = crate::state::mint_access_token();
+        let destination_access_token = crate::state::mint_access_token();
+        let expires_at = now + crate::state::max_lifetime(max_lifetime_timeout_minutes);
+
+        let creation_seq = store.next_creation_seq();
+        let tunnel = crate::state::StoredTunnel {
+            tunnel_id: tunnel_id.clone(),
+            tunnel_arn: tunnel_arn.clone(),
+            status: crate::state::TunnelStatus::Open,
+            description: input.description.clone(),
+            destination_config,
+            max_lifetime_timeout_minutes,
+            // No local proxy has connected at either end yet.
+            source_connection_state: crate::state::StoredConnectionState::disconnected(now),
+            destination_connection_state: crate::state::StoredConnectionState::disconnected(now),
+            source_access_token: source_access_token.clone(),
+            destination_access_token: destination_access_token.clone(),
+            created_at: now,
+            last_updated_at: now,
+            expires_at,
+            creation_seq,
+        };
+
+        // Tags supplied at open time go into the one authoritative tag store, so
+        // `ListTagsForResource` and `DescribeTunnel` report exactly what was set here.
+        if let Some(tags) = input.tags.as_ref() {
+            let stored = store.tags.entry(tunnel_arn.clone()).or_default();
+            for tag in tags {
+                stored.insert(tag.key.clone(), tag.value.clone());
+            }
+        }
+        store.arn_index.insert(tunnel_arn.clone(), tunnel_id.clone());
+        store.tunnels.insert(tunnel_id.clone(), tunnel);
+        // Tell the expiry sweep when this tunnel's lifetime runs out, so it can
+        // skip the store entirely until something is due.
+        store.note_open_expiry(expires_at);
+        drop(store);
+
+        Ok(OpenTunnelOutput {
+            tunnel_id: Some(tunnel_id),
+            tunnel_arn: Some(tunnel_arn),
+            source_access_token: Some(source_access_token),
+            destination_access_token: Some(destination_access_token),
+        })
     }
 }

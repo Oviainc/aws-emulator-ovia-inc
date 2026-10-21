@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRepository
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRepository`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRepository::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a repository in this emulator's registry: the record is persisted in
+//! [`crate::state`] and every member of the returned `Repository` — its ARN, its URI,
+//! its creation instant and its settings — is computed once here and read back by
+//! every later operation. A second create of the same name is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -148,6 +143,15 @@ impl From<CreateRepositoryErrorModeled> for CreateRepositoryError {
     }
 }
 
+/// The `Repository` this operation reports comes from [`crate::state::Repo`], so the
+/// shared failures those helpers raise are mapped onto this operation's own modelled
+/// error here.
+fn invalid_parameter(fault: crate::state::Fault) -> CreateRepositoryErrorModeled {
+    CreateRepositoryErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(fault.message().to_string()),
+    })
+}
+
 /// The `CreateRepository` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -184,18 +188,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRepository` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRepositoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRepository"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRepositoryErrorModeled::ServerException(ServerException {
+                message: Some("the ecr repository store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        // `registryId` names the registry to create the repository in; this emulator
+        // serves exactly one registry — its own account's.
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(invalid_parameter)?;
+
+        // "If this parameter is omitted, the default setting of MUTABLE will be used."
+        // A value outside `ImageTagMutability` was already refused at the boundary.
+        let mutability = input
+            .image_tag_mutability
+            .unwrap_or_else(|| crate::state::DEFAULT_IMAGE_TAG_MUTABILITY.to_string());
+
+        // The repository is encrypted at rest either way; `AES256` is what ECR uses when
+        // the request names no encryption configuration.
+        let encryption = input
+            .encryption_configuration
+            .unwrap_or_else(|| EncryptionConfiguration {
+                encryption_type: crate::state::DEFAULT_ENCRYPTION_TYPE.to_string(),
+                kms_key: None,
+            });
+        // Only the KMS encryption types take a key: AES256 encrypts the repository with
+        // an Amazon S3-managed key, so a `kmsKey` beside it cannot be honoured. The
+        // model cannot express the pairing, so it is checked here.
+        if encryption.kms_key.is_some()
+            && encryption.encryption_type == crate::state::S3_MANAGED_ENCRYPTION_TYPE
+        {
+            return Err(invalid_parameter(crate::state::Fault::InvalidParameter(
+                "encryptionConfiguration.kmsKey cannot be specified with the AES256 \
+                 encryption type"
+                    .to_string(),
+            ))
+            .into());
+        }
+
+        // "The maximum number of tags that can be applied to a repository is 50"; a tag
+        // key is at most 128 and a tag value at most 256 characters.
+        let tags = input.tags.unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(
+                CreateRepositoryErrorModeled::TooManyTagsException(TooManyTagsException {
+                    message: Some(format!(
+                        "{} tags were supplied; the maximum number of tags that can be \
+                         applied to a repository is {}",
+                        tags.len(),
+                        crate::state::MAX_TAGS
+                    )),
+                })
+                .into(),
+            );
+        }
+        for tag in &tags {
+            let key_len = tag.key.chars().count();
+            let value_len = tag.value.chars().count();
+            if key_len > crate::state::MAX_TAG_KEY_LEN {
+                return Err(CreateRepositoryErrorModeled::InvalidTagParameterException(
+                    InvalidTagParameterException {
+                        message: Some(format!(
+                            "tag key '{}' is {key_len} characters; a tag key can have a \
+                             maximum character length of {}",
+                            tag.key,
+                            crate::state::MAX_TAG_KEY_LEN
+                        )),
+                    },
+                )
+                .into());
+            }
+            if value_len > crate::state::MAX_TAG_VALUE_LEN {
+                return Err(CreateRepositoryErrorModeled::InvalidTagParameterException(
+                    InvalidTagParameterException {
+                        message: Some(format!(
+                            "the value of tag key '{}' is {value_len} characters; a tag \
+                             value can have a maximum length of {}",
+                            tag.key,
+                            crate::state::MAX_TAG_VALUE_LEN
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        // ECR is regional: the ARN and the repository URI name the region the request
+        // was signed for.
+        let region = crate::state::request_region(ctx.parts());
+        let name = input.repository_name;
+        let mut store = state.lock();
+
+        if store.repositories.contains_key(&name) {
+            return Err(
+                CreateRepositoryErrorModeled::RepositoryAlreadyExistsException(
+                    RepositoryAlreadyExistsException {
+                        message: Some(format!(
+                            "The repository with name '{name}' already exists in the \
+                             registry with id '{}'",
+                            crate::state::registry_id()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is bounded: past its cap a create is refused rather than adding
+        // another record. See [`crate::state::MAX_REPOSITORIES`].
+        if store.repositories.len() >= crate::state::MAX_REPOSITORIES {
+            return Err(
+                CreateRepositoryErrorModeled::LimitExceededException(LimitExceededException {
+                    message: Some(format!(
+                        "this registry already holds the maximum of {} repositories",
+                        crate::state::MAX_REPOSITORIES
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        let repo = crate::state::Repo {
+            arn: crate::state::repository_arn(&region, &name),
+            uri: crate::state::repository_uri(&region, &name),
+            registry_id: crate::state::registry_id().to_string(),
+            name: name.clone(),
+            created_at: now,
+            image_tag_mutability: mutability,
+            image_tag_mutability_exclusion_filters: input
+                .image_tag_mutability_exclusion_filters
+                .unwrap_or_default(),
+            image_scanning_config: input.image_scanning_configuration,
+            encryption_config: encryption,
+            tags,
+            images: ::std::collections::BTreeMap::new(),
+            tag_index: ::std::collections::BTreeMap::new(),
+        };
+
+        let repository = repo.to_repository();
+        store.repositories.insert(name, repo);
+
+        Ok(CreateRepositoryOutput {
+            repository: Some(repository),
+        })
     }
 }

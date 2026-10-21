@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOutpostsWithS3
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOutpostsWithS3`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOutpostsWithS3::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +144,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOutpostsWithS3` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOutpostsWithS3ErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOutpostsWithS3"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListOutpostsWithS3ErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the S3 on Outposts endpoint store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The cursor is the Outpost id the next page starts at.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_outpost_id(token) {
+                return Err(ListOutpostsWithS3ErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "NextToken {token:?} is not a token returned by ListOutpostsWithS3"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let page_size = crate::state::page_size(input.max_results);
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+
+        let mut outposts = Vec::with_capacity(page_size);
+        let mut next_token = None;
+        for (outpost_id, outpost) in &store.outposts {
+            // Resume at the first id at or after the cursor.
+            if input
+                .next_token
+                .as_deref()
+                .is_some_and(|token| outpost_id.as_str() < token)
+            {
+                continue;
+            }
+            if outposts.len() == page_size {
+                next_token = Some(outpost_id.clone());
+                break;
+            }
+            // Every Outpost in the store has S3 capacity provisioned and is
+            // either owned by this caller or shared with it, which is what this
+            // operation reports.
+            outposts.push(outpost.to_outpost(&region));
+        }
+
+        Ok(ListOutpostsWithS3Output {
+            outposts: Some(outposts),
+            next_token,
+        })
     }
 }

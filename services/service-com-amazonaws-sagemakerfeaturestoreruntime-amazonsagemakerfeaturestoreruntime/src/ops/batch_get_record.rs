@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetRecord
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetRecord`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation fans out over the same OnlineStore `GetRecord` reads
+//! ([`crate::state`]): every identifier present in its feature group comes back in
+//! `Records`, an identifier in a feature group the store does not hold comes back in
+//! `Errors` with the `ResourceNotFound` error code, and an identifier absent from a
+//! known group is simply omitted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetRecord::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Authorization is not emulated, so the modelled `AccessForbidden` is unreachable.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +151,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetRecord` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetRecordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetRecord"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchGetRecordErrorModeled::InternalFailure(InternalFailure {
+                message: Some(
+                    "BatchGetRecord: this service holds no state on the mounted engine".into(),
+                ),
+            })
+            .into());
+        };
+
+        // The boundary validator refuses an undeclared enum value first; this is the
+        // handler's own guard, shared with GetRecord so the two cannot drift.
+        let expiration_enabled = crate::state::expiration_time_enabled(
+            input.expiration_time_response.as_deref(),
+        )
+        .map_err(|message| {
+            BatchGetRecordError::from(BatchGetRecordErrorModeled::ValidationError(
+                ValidationError {
+                    message: Some(message),
+                },
+            ))
+        })?;
+
+        let mut records: Vec<BatchGetRecordResultDetail> = Vec::new();
+        let mut errors: Vec<BatchGetRecordError2> = Vec::new();
+
+        let mut store = state.lock();
+        // The fan-out is bounded by the request: `Identifiers` is modelled
+        // `len 1..100` and each entry's `RecordIdentifiersValueAsString`
+        // `len 1..100`, both refused at the boundary before this handler runs, so no
+        // cardinality check is repeated here.
+        for wanted in &input.identifiers {
+            // The response names the feature group the way the CALLER named it (an ARN
+            // stays an ARN), while the store is keyed by `group_key`, so both modelled
+            // spellings reach one store and the reply pairs with the request.
+            let group_name = wanted.feature_group_name.clone();
+            let Some(group) = store.group_mut(&wanted.feature_group_name) else {
+                // `ErrorCode` is documented as one of GetRecord's own error codes, so
+                // a feature group with no OnlineStore is reported per identifier as
+                // the `ResourceNotFound` GetRecord would have answered.
+                errors.extend(wanted.record_identifiers_value_as_string.iter().map(
+                    |identifier| BatchGetRecordError2 {
+                        feature_group_name: group_name.clone(),
+                        record_identifier_value_as_string: identifier.clone(),
+                        error_code: "ResourceNotFound".to_owned(),
+                        error_message: format!("Feature group '{group_name}' has no OnlineStore"),
+                    },
+                ));
+                continue;
+            };
+
+            for identifier in &wanted.record_identifiers_value_as_string {
+                // An identifier the group does not hold is omitted, exactly as
+                // GetRecord answers an empty result for it.
+                let Some(record) = group.live_record(identifier) else {
+                    continue;
+                };
+                let projected = record.project(wanted.feature_names.as_deref());
+                if projected.is_empty() {
+                    // `Record` is modelled `len 1..`, so a projection that matched
+                    // nothing contributes no detail. A `FeatureNames` entry the record
+                    // does not carry is not an error here: the runtime API carries no
+                    // feature-group definition, so a feature the group declares but
+                    // this record never set cannot be told apart from a name the group
+                    // does not declare.
+                    continue;
+                }
+                records.push(BatchGetRecordResultDetail {
+                    feature_group_name: group_name.clone(),
+                    record_identifier_value_as_string: record.identifier.clone(),
+                    record: projected,
+                    expires_at: expiration_enabled
+                        .then(|| record.expires_at.clone())
+                        .flatten(),
+                });
+            }
+        }
+
+        Ok(BatchGetRecordOutput {
+            records,
+            errors,
+            // Every identifier of the batch is read from the store before the response
+            // is built, so none is ever left unprocessed.
+            unprocessed_identifiers: Vec::new(),
+        })
     }
 }
