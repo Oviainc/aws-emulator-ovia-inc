@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a task, persists it `IN_PROGRESS` with the targets, command, description and
+//! tags the request carried, and queues one execution per target device, so a later
+//! `DescribeTask` / `ListExecutions` reports what this call stored. A target naming no
+//! managed device is answered with the modelled `ResourceNotFoundException`, and
+//! `@idempotencyToken` means a repeated `clientToken` reports the first task rather
+//! than minting a second.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +155,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTask"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateTaskErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the snow-device-management task store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // "The task to be performed." The modelled union carries two empty
+        // structures, so the variant IS the whole command.
+        let command = match input.command {
+            Command::Unlock(_) => crate::state::TaskCommand::Unlock,
+            Command::Reboot(_) => crate::state::TaskCommand::Reboot,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        store.ensure_seeded(&region, now);
+        store.settle(now);
+
+        // `@idempotencyToken`: the same token names the same task.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.idempotency.get(token).cloned());
+        if let Some(task_id) = replayed {
+            if let Some(task) = store.tasks.get(&task_id) {
+                return Ok(CreateTaskOutput {
+                    task_id: Some(task.task_id.clone()),
+                    task_arn: Some(task.task_arn.clone()),
+                });
+            }
+        }
+
+        // "A list of managed device IDs" — every one of them has to name a device
+        // this account manages, or there is nothing to run the command on.
+        for target in &input.targets {
+            if !store.devices.contains_key(target) {
+                return Err(CreateTaskErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::DEVICE_RESOURCE_TYPE, target),
+                )
+                .into());
+            }
+        }
+
+        // The store is bounded: past its quota a create is refused rather than
+        // adding another record.
+        if store.tasks.len() >= crate::state::TASK_QUOTA {
+            return Err(CreateTaskErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} tasks",
+                        crate::state::TASK_QUOTA
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let task_id = store.mint_task_id();
+        let task = crate::state::Task {
+            task_arn: crate::state::task_arn(&task_id, &region),
+            task_id: task_id.clone(),
+            targets: input.targets.clone(),
+            command,
+            description: input.description,
+            // "Only one task is executed on a device at a time": the task is
+            // running from the instant it is created, and finishes when every
+            // execution it created has.
+            state: "IN_PROGRESS".to_string(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at: now,
+            last_updated_at: now,
+            completed_at: None,
+        };
+        let task_arn = task.task_arn.clone();
+        store.tasks.insert(task_id.clone(), task);
+
+        // One execution per target device. A repeated target names the same
+        // device, and a device runs one execution of a task, so the key pair is
+        // what de-duplicates it.
+        for target in input.targets {
+            let key = (task_id.clone(), target.clone());
+            if store.executions.contains_key(&key) {
+                continue;
+            }
+            let execution_id = store.mint_execution_id();
+            store.executions.insert(
+                key,
+                crate::state::Execution {
+                    task_id: task_id.clone(),
+                    execution_id,
+                    managed_device_id: target,
+                    // The command has not reached the device yet; the clock owes
+                    // it `IN_PROGRESS` once the dispatch span has passed.
+                    state: "QUEUED".to_string(),
+                    started_at: None,
+                    last_updated_at: now,
+                    due: Some(now + crate::state::EXECUTION_START_SPAN),
+                },
+            );
+        }
+
+        if let Some(token) = input.client_token {
+            store.idempotency.insert(token, task_id.clone());
+        }
+
+        Ok(CreateTaskOutput {
+            task_id: Some(task_id),
+            task_arn: Some(task_arn),
+        })
     }
 }

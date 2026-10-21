@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDevices
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDevices`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDevices::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the managed-device inventory held in state as `DeviceSummary`, in
+//! `managedDeviceId` order, narrowed to one `jobId` when the request names one:
+//! `@paginated(items: devices)`, so a page is cut at `maxResults` and `nextToken`
+//! carries the device id the next page resumes at.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +147,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDevices` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDevicesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDevices"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDevicesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the snow-device-management device store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The token carries the device id the next page resumes at; a value this
+        // service never issued is refused rather than silently serving page one.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_token(token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListDevicesErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "nextToken {token:?} is not a token returned by ListDevices"
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        let page_size = crate::state::page_size(input.max_results);
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        store.ensure_seeded(&region, now);
+        store.settle(now);
+
+        let mut devices = Vec::with_capacity(page_size);
+        let mut next_token = None;
+        for (managed_device_id, device) in &store.devices {
+            // Resume at the first id at or after the token, so a page is still
+            // served when the device the token named is gone.
+            if resume_at
+                .as_deref()
+                .is_some_and(|key| managed_device_id.as_str() < key)
+            {
+                continue;
+            }
+            // "The ID of the job used to order the device."
+            if input
+                .job_id
+                .as_deref()
+                .is_some_and(|job_id| device.associated_with_job != job_id)
+            {
+                continue;
+            }
+            if devices.len() == page_size {
+                next_token = Some(crate::state::encode_token(managed_device_id));
+                break;
+            }
+            devices.push(device.to_summary());
+        }
+
+        Ok(ListDevicesOutput {
+            devices: Some(devices),
+            next_token,
+        })
     }
 }
