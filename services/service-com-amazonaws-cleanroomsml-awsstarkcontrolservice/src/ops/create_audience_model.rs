@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAudienceModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAudienceModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAudienceModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an audience model from a persisted training dataset: the referenced
+//! `trainingDatasetArn` must name a training dataset in [`crate::state`], and the model
+//! record this operation persists is what `GetAudienceModel` reports. Clean Rooms ML
+//! trains the model asynchronously, so the model is persisted in the transient status
+//! `AudienceModelStatus` carries before `ACTIVE`, with the instant the clock owes it
+//! `ACTIVE` stored on the record.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +173,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAudienceModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAudienceModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAudienceModel"))
+        // See `CreateTrainingDataset` for why an engine with no store for this service
+        // answers the scaffold's 501.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // The training dataset is what the model is trained from, so one this endpoint
+        // does not serve cannot be trained from: the modelled
+        // `ResourceNotFoundException` (404) is the refusal, not a model whose
+        // `trainingDatasetArn` names nothing visible here.
+        if store
+            .training_dataset(&input.training_dataset_arn, &region)
+            .is_none()
+        {
+            return Err(CreateAudienceModelErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(&input.training_dataset_arn),
+            )
+            .into());
+        }
+
+        // The store is bounded: past its quota a create is refused rather than adding
+        // another record. `ServiceQuotaExceededException` is the modelled refusal for
+        // exactly this, and it reports what the bound is.
+        if store.audience_models.len() >= crate::state::RESOURCE_QUOTA {
+            return Err(CreateAudienceModelErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} audience models; \
+                         delete one before creating another",
+                        crate::state::RESOURCE_QUOTA
+                    ),
+                    // Named for what it bounds: an AWS quota code or name is an
+                    // identifier Service Quotas issues, which this emulator does not
+                    // model, so the bound reported here is the emulator's own.
+                    quota_name: Some("AudienceModelsPerAccount".to_string()),
+                    quota_value: Some(crate::state::RESOURCE_QUOTA as f64),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_resource_id();
+        let arn = crate::state::audience_model_arn(&id, &region);
+        store.audience_models.insert(
+            arn.clone(),
+            crate::state::AudienceModel {
+                arn: arn.clone(),
+                region,
+                name: input.name,
+                training_dataset_arn: input.training_dataset_arn,
+                training_data_start_time: input.training_data_start_time,
+                training_data_end_time: input.training_data_end_time,
+                kms_key_arn: input.kms_key_arn,
+                description: input.description,
+                tags: input.tags.unwrap_or_default().into_iter().collect(),
+                // Training has been accepted, not finished: the model is not usable the
+                // instant the create returns, and the clock owes it `ACTIVE` once the
+                // training span has passed.
+                status: crate::state::AUDIENCE_MODEL_CREATING.to_string(),
+                pending: Some(crate::state::PendingTransition {
+                    due: now + crate::state::AUDIENCE_MODEL_TRAINING,
+                    status: crate::state::STATUS_ACTIVE.to_string(),
+                }),
+                create_time: now,
+                update_time: now,
+            },
+        );
+
+        Ok(CreateAudienceModelOutput {
+            audience_model_arn: arn,
+        })
     }
 }

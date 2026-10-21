@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetApps
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetApps`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetApps::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the applications currently stored by this service, newest state and all:
+//! `page-size` truncates the page and `NextToken` resumes the next one.
 //!
 //! ## Shape of an operation
 //!
@@ -155,20 +148,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetApps` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAppsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetApps"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetAppsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the pinpoint state store is unavailable".to_string()),
+                    request_id: None,
+                },
+            )
+            .into());
+        };
+
+        // `page-size` arrives as a free-form string on the wire (the model declares
+        // no `@range` for the boundary validator to enforce): anything that is not a
+        // positive count is a client error, not a silently ignored parameter.
+        let requested = match input.page_size.as_deref().map(str::trim) {
+            None => None,
+            Some(raw) => match raw.parse::<usize>() {
+                Ok(size) if size > 0 => Some(size),
+                _ => {
+                    return Err(GetAppsErrorModeled::BadRequestException(BadRequestException {
+                        message: Some(format!(
+                            "page-size must be a positive integer, received: {raw}"
+                        )),
+                        request_id: None,
+                    })
+                    .into())
+                }
+            },
+        };
+        // Clamped to this service's own page limit, so neither the loop below nor the
+        // response it builds grows with the number of stored applications — a caller
+        // asking for more is served `APP_PAGE_LIMIT` plus a `NextToken` for the rest,
+        // and so is a caller asking for no particular size.
+        let page_size = requested
+            .unwrap_or(crate::state::APP_PAGE_LIMIT)
+            .min(crate::state::APP_PAGE_LIMIT);
+
+        // The token is opaque to the caller: it is this service's own encoding of the
+        // application id the next page starts at, so a string that does not decode to
+        // an id this service could have minted is a client error rather than a
+        // silently ignored parameter.
+        let resume_from = match input.token.as_deref().filter(|t| !t.is_empty()) {
+            None => None,
+            Some(token) => match decode_page_token(token) {
+                Some(position) => Some(position),
+                None => {
+                    return Err(GetAppsErrorModeled::BadRequestException(BadRequestException {
+                        message: Some("token is not a NextToken GetApps issued".to_string()),
+                        request_id: None,
+                    })
+                    .into())
+                }
+            },
+        };
+
+        let store = state.lock();
+        // The store keeps applications in one deterministic id order, so a page and
+        // the token that resumes it agree even across inserts and deletes. The range
+        // starts at the first id at or after the token — so a page is still served
+        // when the application the token named was deleted meanwhile — and it is a
+        // seek, not a scan: the work is bounded by the page, not by the store.
+        let resume = resume_from
+            .as_deref()
+            .map_or(::std::ops::Bound::Unbounded, ::std::ops::Bound::Included);
+        let mut item = Vec::with_capacity(page_size);
+        let mut next_token = None;
+        for (id, app) in store
+            .apps
+            .range::<str, _>((resume, ::std::ops::Bound::Unbounded))
+        {
+            if item.len() == page_size {
+                // Present only when applications remain: a caller loops until the
+                // NextToken is gone.
+                next_token = Some(encode_page_token(id));
+                break;
+            }
+            item.push(app.to_response());
+        }
+        // Nothing below reads the store, so the shared lock is released here.
+        drop(store);
+
+        Ok(GetAppsOutput {
+            applications_response: ApplicationsResponse {
+                item: Some(item),
+                next_token,
+            },
+        })
     }
+}
+
+/// Encode the resume position (the id of the first application of the NEXT page)
+/// into the opaque `NextToken` this service hands back.
+fn encode_page_token(application_id: &str) -> String {
+    hex::encode(application_id.as_bytes())
+}
+
+/// The inverse of [`encode_page_token`]; `None` unless the token decodes to an
+/// identifier this service could have minted.
+fn decode_page_token(token: &str) -> Option<String> {
+    let bytes = hex::decode(token).ok()?;
+    String::from_utf8(bytes)
+        .ok()
+        .filter(|id| crate::state::is_application_id(id))
 }

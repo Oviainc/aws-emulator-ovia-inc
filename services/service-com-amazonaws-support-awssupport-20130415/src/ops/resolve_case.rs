@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResolveCase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResolveCase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResolveCase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads the stored case's status, moves it to `resolved`, and reports the status it
+//! had before the call alongside the one it has after — both from state.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +152,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResolveCase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResolveCaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResolveCase"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ResolveCaseErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the support case store is unavailable".to_string()),
+            })
+        })?;
+
+        // `caseId` is not modelled `@required`, but there is no case to resolve
+        // without one: refuse rather than pick a case.
+        let Some(case_id) = input.case_id else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "caseId must name the case to resolve",
+            ));
+        };
+
+        let mut store = state.lock();
+        let Some(case) = store.cases.get_mut(&case_id) else {
+            return Err(ResolveCaseErrorModeled::CaseIdNotFound(CaseIdNotFound {
+                message: Some("The requested CaseId could not be located.".to_string()),
+            })
+            .into());
+        };
+
+        // `dryRun`: the request is validated — including that the case exists —
+        // but "the case isn't resolved, and the operation returns a
+        // DryRunOperationException".
+        if input.dry_run == Some(true) {
+            return Err(ResolveCaseErrorModeled::DryRunOperationException(
+                DryRunOperationException {
+                    message: Some(
+                        "The request was valid, but the operation wasn't performed because \
+                         dryRun was set to true."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let initial_case_status = case.status.clone();
+        case.status = crate::state::STATUS_RESOLVED.to_string();
+
+        Ok(ResolveCaseOutput {
+            initial_case_status: Some(initial_case_status),
+            final_case_status: Some(case.status.clone()),
+        })
     }
 }

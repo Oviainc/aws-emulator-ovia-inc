@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListJobRuns
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListJobRuns`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListJobRuns::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the job runs stored for one virtual cluster, newest first, after applying the
+//! `name` / `states` / `createdBefore` / `createdAfter` query filters and the
+//! `@paginated` page of `maxResults` + `nextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +72,67 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The opaque `nextToken` for the run the next page starts at: the virtual cluster it
+/// pages, plus that run's place in the newest-first order (the pair the order is built
+/// from). A client must not read it; the service only has to be able to resume from it.
+fn encode_cursor(virtual_cluster_id: &str, record: &crate::state::JobRunRecord) -> String {
+    format!(
+        "{virtual_cluster_id}-{}-{}",
+        record.created_at_millis, record.sequence
+    )
+}
+
+/// The place in this cluster's newest-first order a `nextToken` names.
+///
+/// `None` — refused as an invalid request — when the token is not one of this service's
+/// cursors or belongs to another virtual cluster's listing, so a token cannot be carried
+/// from one cluster's pagination to another's.
+fn decode_cursor(virtual_cluster_id: &str, token: &str) -> Option<(i64, u64)> {
+    let mut parts = token.split('-');
+    let (Some(cluster), Some(created_at_millis), Some(sequence), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    if cluster != virtual_cluster_id {
+        return None;
+    }
+    Some((created_at_millis.parse().ok()?, sequence.parse().ok()?))
+}
+
+/// Whether one stored job run satisfies every filter the request carried. A filter the
+/// request omitted constrains nothing.
+fn matches_filters(record: &crate::state::JobRunRecord, input: &ListJobRunsInput) -> bool {
+    // `name` is an exact match: it is a `ResourceNameString`, not a pattern.
+    if input.name.is_some() && record.name != input.name {
+        return false;
+    }
+    // `states` keeps the runs in any listed state. An empty list names no state to keep
+    // out, so it constrains nothing.
+    if let Some(states) = input.states.as_ref().filter(|states| !states.is_empty()) {
+        if !states.contains(&record.state) {
+            return false;
+        }
+    }
+    // `createdBefore` / `createdAfter` bound `createdAt` strictly, so the two together
+    // name an open interval and neither ever returns the run created exactly at a bound.
+    if input
+        .created_before
+        .as_ref()
+        .is_some_and(|bound| record.created_at_millis >= crate::state::millis_of(bound))
+    {
+        return false;
+    }
+    if input
+        .created_after
+        .as_ref()
+        .is_some_and(|bound| record.created_at_millis <= crate::state::millis_of(bound))
+    {
+        return false;
+    }
+    true
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +203,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListJobRuns` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListJobRunsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListJobRuns"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListJobRunsError::Modeled(ListJobRunsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the job run store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let _ = ctx;
+        let mut state = store.lock();
+        state.settle();
+
+        // This operation models no not-found error, so an unknown virtual cluster is
+        // refused as an invalid request. A cluster that exists in any state still lists
+        // its job runs, including a terminated one.
+        if !state.virtual_clusters.contains_key(&input.virtual_cluster_id) {
+            return Err(ListJobRunsErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "Virtual cluster {} was not found",
+                    input.virtual_cluster_id
+                )),
+            })
+            .into());
+        }
+
+        // `maxResults` is the page size. The model declares no range for it, but a page
+        // of fewer than one item is not a page, so it is refused rather than silently
+        // read as "no limit".
+        let page_size = match input.max_results {
+            Some(limit) if limit < 1 => {
+                return Err(ListJobRunsErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "maxResults must be at least 1, but {limit} was requested"
+                    )),
+                })
+                .into());
+            }
+            Some(limit) => Some(usize::try_from(limit).unwrap_or(usize::MAX)),
+            None => None,
+        };
+
+        // Newest first, over the runs this cluster actually holds. The creation sequence
+        // breaks a tie between two runs created in the same millisecond, so the order is
+        // total and a page boundary never depends on hash order.
+        let mut matching: Vec<&crate::state::JobRunRecord> = state
+            .cluster_job_runs(&input.virtual_cluster_id)
+            .filter(|record| matches_filters(record, &input))
+            .collect();
+        matching.sort_by(|left, right| {
+            (right.created_at_millis, right.sequence).cmp(&(left.created_at_millis, left.sequence))
+        });
+
+        // `nextToken` is the cursor the previous page ended on: the POSITION in the
+        // newest-first order of the next run to report, not the identity of a row. So a
+        // run whose state changed between pages (a PENDING one that reached RUNNING, say,
+        // under a `states` filter) cannot invalidate a token the client already holds:
+        // resuming reports everything ordered after the cursor, with no repeats and no
+        // gaps.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(cursor) = decode_cursor(&input.virtual_cluster_id, token) else {
+                    return Err(ListJobRunsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some("nextToken is not a valid pagination token".to_string()),
+                        },
+                    )
+                    .into());
+                };
+                matching
+                    .iter()
+                    .position(|record| (record.created_at_millis, record.sequence) <= cursor)
+                    .unwrap_or(matching.len())
+            }
+        };
+
+        let end = page_size.map_or(matching.len(), |size| {
+            start.saturating_add(size).min(matching.len())
+        });
+        let job_runs: Vec<JobRun> = matching[start..end]
+            .iter()
+            .map(|record| record.to_job_run())
+            .collect();
+        // A `nextToken` only when runs remain after this page.
+        let next_token = matching
+            .get(end)
+            .map(|record| encode_cursor(&input.virtual_cluster_id, record));
+
+        Ok(ListJobRunsOutput {
+            job_runs: Some(job_runs),
+            next_token,
+        })
     }
 }

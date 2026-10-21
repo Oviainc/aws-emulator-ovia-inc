@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddGroupMember
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddGroupMember`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddGroupMember::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Puts an existing object of the directory into one of its groups: the membership is
+//! recorded on the group's record in [`crate::state`], which is what
+//! `ListGroupMembers` then reports. An unknown group or member is
+//! `ResourceNotFoundException`; a member the group already holds is
+//! `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +170,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddGroupMember` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddGroupMemberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddGroupMember"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AddGroupMemberErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the directory object store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let group_key = crate::state::fold(&input.group_name);
+        let member_key = crate::state::fold(&input.member_name);
+        // What this call IS, for the `@idempotencyToken` ledger: the same token with
+        // these inputs replays, the same token with different ones conflicts.
+        let fingerprint = crate::state::fingerprint(&[
+            Self::NAME,
+            &input.directory_id,
+            &group_key,
+            &member_key,
+            &input
+                .member_realm
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+        ]);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        match store.claim_token(input.client_token.as_deref(), &fingerprint, now) {
+            // The first call already added this member, so the replay answers as it
+            // did rather than as the duplicate it would otherwise be.
+            crate::state::TokenClaim::Replayed(_) => return Ok(AddGroupMemberOutput {}),
+            crate::state::TokenClaim::Conflict => {
+                return Err(AddGroupMemberErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(
+                            "ClientToken was already used for a request with different parameters"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            crate::state::TokenClaim::Fresh => {}
+        }
+
+        // Both objects must already exist, so this writes no directory record of its
+        // own: a `DirectoryId` nothing has written to holds no group to add to.
+        let Some(directory) = store.directories.get_mut(&input.directory_id) else {
+            return Err(AddGroupMemberErrorModeled::ResourceNotFoundException(
+                crate::state::group_not_found(&input.directory_id, &input.group_name),
+            )
+            .into());
+        };
+
+        if !directory.groups.contains_key(&group_key) {
+            return Err(AddGroupMemberErrorModeled::ResourceNotFoundException(
+                crate::state::group_not_found(&input.directory_id, &input.group_name),
+            )
+            .into());
+        }
+
+        // `MemberRealm` names the domain the member comes from; this directory holds
+        // objects only in its own realm, so a member from another one is not found.
+        let member_in_realm =
+            crate::state::realm_matches(input.member_realm.as_deref(), &directory.realm);
+        // The member's `MemberType` is what the member IS: a user object or a group
+        // object. A computer object cannot be created through this API, so no
+        // membership is ever recorded as one.
+        let member_type = if !member_in_realm {
+            None
+        } else if directory.users.contains_key(&member_key) {
+            Some(crate::state::USER_MEMBER_TYPE)
+        } else if directory.groups.contains_key(&member_key) {
+            Some(crate::state::GROUP_MEMBER_TYPE)
+        } else {
+            None
+        };
+        let Some(member_type) = member_type else {
+            return Err(AddGroupMemberErrorModeled::ResourceNotFoundException(
+                crate::state::member_not_found(&input.directory_id, &input.member_name),
+            )
+            .into());
+        };
+
+        // "It can also occur when adding a member to a group that the member is
+        // already in."
+        if directory.holds_member(&group_key, &member_key) {
+            return Err(AddGroupMemberErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "{} is already a member of group {}",
+                        input.member_name, input.group_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let added = directory.add_member(
+            &group_key,
+            crate::state::Membership {
+                member_name: input.member_name,
+                member_type: member_type.to_string(),
+            },
+        );
+        debug_assert!(added, "the group was found above, so the member is recorded");
+
+        store.record_token(input.client_token, fingerprint, None, now);
+
+        Ok(AddGroupMemberOutput {})
     }
 }

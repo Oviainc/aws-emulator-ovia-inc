@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAudienceModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAudienceModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAudienceModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Releases the audience model an ARN names: the record is removed from
+//! [`crate::state`], so a later `GetAudienceModel` answers the modelled
+//! `ResourceNotFoundException` (404). An ARN that names no persisted model answers that
+//! same 404.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +164,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAudienceModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAudienceModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAudienceModel"))
+        // The ARN of the model to release is the whole request; the region it was signed
+        // for is the endpoint it reached, and a Clean Rooms ML endpoint only serves its
+        // own region's resources.
+        let region = crate::state::request_region(ctx.parts());
+        // See `CreateTrainingDataset` for why an engine with no store for this service
+        // answers the scaffold's 501.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        let mut store = state.lock();
+        // The dependency this operation's `ConflictException` documents is a configured
+        // audience model ("You can't delete an audience model if there are any
+        // configured audience models that depend on the audience model"). Those are
+        // served by `CreateConfiguredAudienceModel`, still a scaffold answering 501, so
+        // no such dependent can be persisted yet and the conflict is unreachable; when
+        // that operation is implemented, the check belongs here.
+        if store
+            .audience_models
+            .get(&input.audience_model_arn)
+            .is_none_or(|model| model.region != region)
+        {
+            return Err(DeleteAudienceModelErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(&input.audience_model_arn),
+            )
+            .into());
+        }
+        store.audience_models.remove(&input.audience_model_arn);
+
+        Ok(DeleteAudienceModelOutput)
     }
 }

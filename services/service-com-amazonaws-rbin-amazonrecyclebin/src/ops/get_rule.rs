@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reads the PERSISTED retention rule out of [`crate::state`] (HTTP 200),
+//! or answers `ResourceNotFoundException` (HTTP 404) when no rule has that identifier.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +166,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the rbin retention-rule store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        let store = state.lock();
+        let Some(rule) = store.rules.get(&input.identifier) else {
+            return Err(GetRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Retention rule with ID {} not found",
+                        input.identifier
+                    )),
+                    reason: Some("RULE_NOT_FOUND".to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(GetRuleOutput {
+            identifier: Some(rule.identifier.clone()),
+            description: rule.description.clone(),
+            resource_type: Some(rule.resource_type.clone()),
+            retention_period: Some(rule.retention_period.clone()),
+            resource_tags: Some(rule.resource_tags.clone()),
+            status: Some(rule.status.clone()),
+            lock_configuration: rule.lock_configuration.clone(),
+            lock_state: rule.lock_state.clone(),
+            lock_end_time: rule.lock_end_time.map(::aws_smithy_types::DateTime::from),
+            rule_arn: Some(rule.rule_arn.clone()),
+            exclude_resource_tags: Some(rule.exclude_resource_tags.clone()),
+        })
     }
 }

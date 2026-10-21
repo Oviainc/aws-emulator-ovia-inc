@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTraceSummaries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTraceSummaries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTraceSummaries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Selects the stored traces whose earliest segment `start_time` falls in
+//! [`StartTime`, `EndTime`) and builds each `TraceSummary` from the persisted
+//! segment documents, so a trace just written by `PutTraceSegments` appears
+//! here. A request asking for behaviour this slice does not implement — a
+//! `FilterExpression`, another `TimeRangeType`, sampling — is REFUSED with
+//! `InvalidRequestException` naming what is unsupported, rather than answered
+//! with an unfiltered 200.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +166,237 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTraceSummaries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTraceSummariesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTraceSummaries"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetTraceSummariesErrorModeled::ThrottledException(ThrottledException {
+                message: Some(
+                    "the X-Ray trace store is unavailable on this emulator engine".to_string(),
+                ),
+            })
+            .into());
+        };
+
+        let start = epoch_seconds(&input.start_time);
+        let end = epoch_seconds(&input.end_time);
+
+        // A request asking for behaviour this slice does not implement is
+        // REFUSED, never answered with a success that quietly ignored it: a
+        // caller that asks for a filtered, differently-ranged or sampled
+        // selection would otherwise get the full unfiltered window under HTTP
+        // 200. The selection below is on the trace's own start time, which is
+        // the `TraceId` time range; `Event` and `Service` range over a different
+        // clock this slice does not keep. A reversed or zero-width window is NOT
+        // refused — it is a well-formed request whose half-open interval simply
+        // contains nothing, so it selects nothing.
+        if input
+            .filter_expression
+            .as_deref()
+            .is_some_and(|filter| !filter.trim().is_empty())
+        {
+            return Err(unsupported(
+                "FilterExpression is not evaluated by this emulator yet; omit it to select every trace in [StartTime, EndTime)",
+            ));
+        }
+        if let Some(range) = input.time_range_type.as_deref() {
+            if range != SUPPORTED_TIME_RANGE_TYPE {
+                return Err(unsupported(format!(
+                    "TimeRangeType `{range}` is not supported by this emulator yet; only `{SUPPORTED_TIME_RANGE_TYPE}` is"
+                )));
+            }
+        }
+        if input.sampling == Some(true) || input.sampling_strategy.is_some() {
+            return Err(unsupported(
+                "sampling is not supported by this emulator yet; omit Sampling and SamplingStrategy to select every matching trace",
+            ));
+        }
+
+        let resume = input.next_token.as_deref();
+        let store = state.lock();
+
+        // A token this service issued names the trace the next page starts at.
+        // One still inside the keyspace being walked is honoured even if that
+        // exact trace has since been evicted, so an eviction between pages does
+        // not fail an in-flight paginator; one beyond it never came from here.
+        if let Some(token) = resume {
+            let within_keyspace = store
+                .traces
+                .keys()
+                .next_back()
+                .is_some_and(|last| token <= last.as_str());
+            if !within_keyspace {
+                return Err(unsupported(format!(
+                    "NextToken `{token}` was not issued by this service"
+                )));
+            }
+        }
+
+        // `traces` is a `BTreeMap`, so the walk is in trace-id order and the
+        // token resumes at the first id at or after it, in O(log n).
+        let scan: Box<dyn Iterator<Item = &crate::state::TraceRecord>> = match resume {
+            Some(token) => Box::new(
+                store
+                    .traces
+                    .range(token.to_string()..)
+                    .map(|(_, trace)| trace),
+            ),
+            None => Box::new(store.traces.values()),
+        };
+        let mut traces_scanned: i64 = 0;
+        let mut selected: Vec<&crate::state::TraceRecord> = Vec::new();
+        for trace in scan {
+            traces_scanned += 1;
+            if trace.first_start >= start && trace.first_start < end {
+                selected.push(trace);
+            }
+        }
+
+        // A token only when the selection was truncated.
+        let next_token = selected
+            .get(TRACE_SUMMARIES_PAGE_SIZE)
+            .map(|trace| trace.id.clone());
+        let trace_summaries = selected
+            .iter()
+            .take(TRACE_SUMMARIES_PAGE_SIZE)
+            .copied()
+            .map(summary_of)
+            .collect();
+
+        Ok(GetTraceSummariesOutput {
+            trace_summaries: Some(trace_summaries),
+            approximate_time: Some(now()),
+            traces_processed_count: Some(traces_scanned),
+            next_token,
+        })
+    }
+}
+
+/// How many `TraceSummary` values one page carries.
+///
+/// The model declares no page size for `GetTraceSummaries`, so this is the
+/// emulator's: a `NextToken` is emitted only when the selection exceeded it, and
+/// resuming from that token returns the remainder.
+pub const TRACE_SUMMARIES_PAGE_SIZE: usize = 5;
+
+/// The one `TimeRangeType` this slice serves. The selection is on each trace's
+/// own earliest segment `start_time`, which is the trace-id range; `Event` and
+/// `Service` range over times this slice does not keep.
+pub const SUPPORTED_TIME_RANGE_TYPE: &str = "TraceId";
+
+/// Refuse a request asking for behaviour this slice does not implement, with the
+/// error this operation models for an invalid request.
+fn unsupported(message: impl Into<String>) -> GetTraceSummariesError {
+    GetTraceSummariesErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A modelled timestamp as floating point seconds of epoch time, the unit a
+/// segment document's `start_time` / `end_time` use.
+fn epoch_seconds(timestamp: &::aws_smithy_types::DateTime) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let seconds = timestamp.secs() as f64;
+    seconds + f64::from(timestamp.subsec_nanos()) / 1_000_000_000.0
+}
+
+/// `ApproximateTime`: when this response was built.
+fn now() -> ::aws_smithy_types::DateTime {
+    let seconds = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0.0, |since| since.as_secs_f64());
+    ::aws_smithy_types::DateTime::from_secs_f64(seconds)
+}
+
+/// Build one `TraceSummary` from a stored trace's segments.
+fn summary_of(trace: &crate::state::TraceRecord) -> TraceSummary {
+    let root = trace.root();
+    TraceSummary {
+        id: Some(trace.id.clone()),
+        start_time: Some(::aws_smithy_types::DateTime::from_secs_f64(
+            trace.first_start,
+        )),
+        duration: trace.duration(),
+        response_time: trace.response_time(),
+        has_fault: Some(trace.has_fault()),
+        has_error: Some(trace.has_error()),
+        has_throttle: Some(trace.has_throttle()),
+        is_partial: Some(trace.is_partial()),
+        http: root.and_then(http_of),
+        annotations: annotations_of(trace),
+        service_ids: Some(service_ids_of(trace)),
+        entry_point: root.map(service_id_of),
+        ..TraceSummary::default()
+    }
+}
+
+/// The root segment's `http` block, as the modelled `Http`.
+fn http_of(root: &crate::state::SegmentRecord) -> Option<Http> {
+    let http = root.http.as_ref()?;
+    Some(Http {
+        http_url: http.url.clone(),
+        http_status: http.response_status,
+        http_method: http.http_method.clone(),
+        user_agent: http.user_agent.clone(),
+        client_ip: http.client_ip.clone(),
+    })
+}
+
+/// One segment's service identity: its `name`, plus its `origin` as the type.
+fn service_id_of(segment: &crate::state::SegmentRecord) -> ServiceId {
+    ServiceId {
+        name: Some(segment.name.clone()),
+        names: Some(vec![segment.name.clone()]),
+        account_id: segment.account_id.clone(),
+        r#type: segment.origin.clone(),
+    }
+}
+
+/// "Service IDs from the trace's segment documents" — one per distinct segment
+/// name, in first-submission order.
+fn service_ids_of(trace: &crate::state::TraceRecord) -> Vec<ServiceId> {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut ids = Vec::new();
+    for segment in &trace.segments {
+        if seen.contains(&segment.name.as_str()) {
+            continue;
+        }
+        seen.push(segment.name.as_str());
+        ids.push(service_id_of(segment));
+    }
+    ids
+}
+
+/// "Annotations from the trace's segment documents", each value carrying the
+/// services that annotated it. `None` when no segment carries any.
+fn annotations_of(
+    trace: &crate::state::TraceRecord,
+) -> Option<std::collections::HashMap<String, Vec<ValueWithServiceIds>>> {
+    let mut annotations: std::collections::HashMap<String, Vec<ValueWithServiceIds>> =
+        std::collections::HashMap::new();
+    for segment in &trace.segments {
+        for (key, value) in &segment.annotations {
+            let Some(annotation_value) = annotation_value_of(value) else {
+                continue;
+            };
+            annotations
+                .entry(key.clone())
+                .or_default()
+                .push(ValueWithServiceIds {
+                    annotation_value: Some(annotation_value),
+                    service_ids: Some(vec![service_id_of(segment)]),
+                });
+        }
+    }
+    (!annotations.is_empty()).then_some(annotations)
+}
+
+/// A submitted annotation as the modelled union. `AnnotationValue` has exactly
+/// three value types — Number, Boolean and String — so anything else is dropped.
+fn annotation_value_of(value: &serde_json::Value) -> Option<AnnotationValue> {
+    match value {
+        serde_json::Value::Bool(flag) => Some(AnnotationValue::BooleanValue(*flag)),
+        serde_json::Value::Number(number) => number.as_f64().map(AnnotationValue::NumberValue),
+        serde_json::Value::String(text) => Some(AnnotationValue::StringValue(text.clone())),
+        _ => None,
     }
 }

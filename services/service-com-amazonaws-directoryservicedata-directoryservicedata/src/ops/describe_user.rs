@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored user object: every member of the answer is read from the record
+//! [`crate::state`] holds under the case-folded `SAMAccountName`, and only the
+//! `OtherAttributes` the request asks for are projected. A name no object in the
+//! directory answers to is `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +174,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeUser"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeUserErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the directory object store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A read NEVER materialises a directory: a `DirectoryId` nothing has written
+        // to holds no objects, so the user it asks about is not found.
+        let store = state.lock();
+        let not_found = || {
+            DescribeUserErrorModeled::ResourceNotFoundException(crate::state::user_not_found(
+                &input.directory_id,
+                &input.sam_account_name,
+            ))
+        };
+        let Some(directory) = store.directories.get(&input.directory_id) else {
+            return Err(not_found().into());
+        };
+
+        // `Realm` names the domain to read from; this directory holds objects only in
+        // its own realm, so a user asked for in another realm is not found here.
+        if !crate::state::realm_matches(input.realm.as_deref(), &directory.realm) {
+            return Err(not_found().into());
+        }
+
+        let Some(user) = directory
+            .users
+            .get(&crate::state::fold(&input.sam_account_name))
+        else {
+            return Err(not_found().into());
+        };
+
+        Ok(DescribeUserOutput {
+            directory_id: Some(input.directory_id.clone()),
+            realm: Some(directory.realm.clone()),
+            sid: Some(user.sid.clone()),
+            sam_account_name: Some(user.sam_account_name.clone()),
+            distinguished_name: Some(user.distinguished_name.clone()),
+            user_principal_name: Some(user.user_principal_name.clone()),
+            email_address: user.email_address.clone(),
+            given_name: user.given_name.clone(),
+            surname: user.surname.clone(),
+            enabled: Some(user.enabled),
+            // "The attribute values that you want returned": only what was asked for.
+            other_attributes: user.projected_attributes(input.other_attributes.as_deref()),
+        })
     }
 }

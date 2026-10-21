@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelJobRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelJobRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelJobRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels the stored job run: it moves to CANCEL_PENDING, and the clock owes it
+//! CANCELLED ([`crate::state::TRANSITION_SPAN`]), at which point its `finishedAt` is the
+//! instant the cancellation came due. A following `DescribeJobRun` observes both steps.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +137,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelJobRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelJobRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelJobRun"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CancelJobRunError::Modeled(CancelJobRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the job run store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let _ = ctx;
+        let mut state = store.lock();
+        state.settle();
+
+        // This operation models no not-found error, so a job run that is not stored
+        // under this virtual cluster is refused as an invalid request rather than
+        // answered with a silent success.
+        let Some(record) = state.job_run(&input.virtual_cluster_id, &input.id) else {
+            return Err(CancelJobRunErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Job run {} was not found in virtual cluster {}",
+                        input.id, input.virtual_cluster_id
+                    )),
+                },
+            )
+            .into());
+        };
+        let current_state = record.state.clone();
+
+        // A run that has already finished cannot be cancelled; one whose cancellation is
+        // already pending is left exactly as it is, so a retried cancel is idempotent.
+        if crate::state::job_state_is_terminal(&current_state) {
+            return Err(CancelJobRunErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Job run {} is in state {current_state} and cannot be cancelled",
+                        input.id
+                    )),
+                },
+            )
+            .into());
+        }
+        if current_state != crate::state::JOB_CANCEL_PENDING {
+            state.move_job_run(
+                &input.id,
+                crate::state::JOB_CANCEL_PENDING,
+                crate::state::JOB_CANCELLED,
+            );
+        }
+
+        Ok(CancelJobRunOutput {
+            id: Some(input.id),
+            virtual_cluster_id: Some(input.virtual_cluster_id),
+        })
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the cases the store holds, filtered by `caseIdList` / `displayId` and the
+//! date window, hiding resolved cases unless `includeResolvedCases` asks for them,
+//! each with its five most recent communications. A pure read: it never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +181,175 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCases"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeCasesErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the support case store is unavailable".to_string()),
+            })
+        })?;
+
+        let window = crate::state::parse_date_window(
+            input.after_time.as_deref(),
+            input.before_time.as_deref(),
+        )
+        .map_err(|member| {
+            crate::scaffolded::Scaffolded::validation(format!(
+                "{member} must be an ISO 8601 instant"
+            ))
+        })?;
+        // A cursor is the order key (creation instant, `caseId`) of the next case
+        // to report, so a resumed page starts at the same place in the
+        // deterministic order even when cases have been created since.
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_cursor(token).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(
+                    "nextToken is not a resumption point this service issued",
+                )
+            })?),
+        };
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE);
+        // "By default, communications are included."
+        let include_communications = input.include_communications.unwrap_or(true);
+
+        let store = state.lock();
+
+        // An id the store does not hold is a bad case id, not an empty page.
+        let requested: Vec<&crate::state::Case> = match input.case_id_list.as_deref() {
+            None | Some([]) => store.cases.values().collect(),
+            Some(ids) => {
+                let mut cases = Vec::with_capacity(ids.len());
+                for id in ids {
+                    let Some(case) = store.cases.get(id) else {
+                        return Err(DescribeCasesErrorModeled::CaseIdNotFound(CaseIdNotFound {
+                            message: Some(
+                                "The requested CaseId could not be located.".to_string(),
+                            ),
+                        })
+                        .into());
+                    };
+                    cases.push(case);
+                }
+                cases
+            }
+        };
+
+        // `dryRun`: validated — including every requested case id — but "no cases
+        // are returned, and the operation returns a DryRunOperationException".
+        if input.dry_run == Some(true) {
+            return Err(DescribeCasesErrorModeled::DryRunOperationException(
+                DryRunOperationException {
+                    message: Some(
+                        "The request was valid, but the operation wasn't performed because \
+                         dryRun was set to true."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let mut selected: Vec<&crate::state::Case> = requested
+            .into_iter()
+            .filter(|case| {
+                // "By default, resolved cases aren't included."
+                (input.include_resolved_cases || !case.is_resolved())
+                    && input
+                        .display_id
+                        .as_deref()
+                        .is_none_or(|display_id| case.display_id == display_id)
+                    && window.contains(case.time_created_instant)
+            })
+            .collect();
+        selected.sort_by_key(|case| case.order_key());
+
+        let start = match resume_from {
+            None => 0,
+            Some(cursor) => selected
+                .iter()
+                .position(|case| case.order_key() >= cursor)
+                .unwrap_or(selected.len()),
+        };
+        let page = &selected[start..];
+
+        let cases: Vec<CaseDetails> = page
+            .iter()
+            .take(page_size)
+            .map(|case| case_details(case, include_communications))
+            .collect();
+        let next_token = page
+            .get(page_size)
+            .map(|case| encode_cursor(&case.order_key()));
+
+        Ok(DescribeCasesOutput {
+            cases: Some(cases),
+            next_token,
+        })
     }
+}
+
+/// The separator between the two halves of a pagination cursor. A unit separator
+/// cannot occur in a decimal instant or in a case id, so the split is exact.
+const CURSOR_SEPARATOR: char = '\u{1f}';
+
+/// The modelled `CaseDetails` for a stored case. `recentCommunications` carries
+/// the five most recent communications plus a resumption point when the case has
+/// more, exactly as `DescribeCommunications` would hand them back.
+fn case_details(case: &crate::state::Case, include_communications: bool) -> CaseDetails {
+    let recent_communications = include_communications.then(|| {
+        let newest: Vec<Communication> = case
+            .communications
+            .iter()
+            .rev()
+            .take(crate::state::RECENT_COMMUNICATIONS)
+            .map(crate::state::CommunicationRecord::to_modeled)
+            .collect();
+        // The resumption point is the next (older) communication's sequence
+        // number, the same cursor `DescribeCommunications` pages on.
+        let next_token = case
+            .communications
+            .iter()
+            .rev()
+            .nth(crate::state::RECENT_COMMUNICATIONS)
+            .map(|record| crate::state::encode_token(&record.sequence.to_string()));
+        RecentCaseCommunications {
+            communications: Some(newest),
+            next_token,
+        }
+    });
+
+    CaseDetails {
+        case_id: Some(case.case_id.clone()),
+        display_id: Some(case.display_id.clone()),
+        subject: Some(case.subject.clone()),
+        status: Some(case.status.clone()),
+        service_code: case.service_code.clone(),
+        category_code: case.category_code.clone(),
+        severity_code: case.severity_code.clone(),
+        submitted_by: Some(case.submitted_by.clone()),
+        time_created: Some(case.time_created.clone()),
+        recent_communications,
+        cc_email_addresses: Some(case.cc_email_addresses.clone()),
+        language: case.language.clone(),
+    }
+}
+
+/// Wrap a case order key as the opaque `nextToken` a caller hands back.
+fn encode_cursor(key: &(std::cmp::Reverse<i128>, String)) -> String {
+    let (std::cmp::Reverse(instant), case_id) = key;
+    crate::state::encode_token(&format!("{instant}{CURSOR_SEPARATOR}{case_id}"))
+}
+
+/// Recover a case order key from a `nextToken`. `None` for a token this service
+/// did not mint.
+fn decode_cursor(token: &str) -> Option<(std::cmp::Reverse<i128>, String)> {
+    let cursor = crate::state::decode_token(token)?;
+    let (instant, case_id) = cursor.split_once(CURSOR_SEPARATOR)?;
+    Some((
+        std::cmp::Reverse(instant.parse::<i128>().ok()?),
+        case_id.to_string(),
+    ))
 }

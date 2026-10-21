@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages the PERSISTED retention rules out of [`crate::state`] (HTTP 200),
+//! filtered by `ResourceType` and by the optional `LockState` / tag filters. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +153,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRules"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRulesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the rbin retention-rule store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        // A `NextToken` this service did not mint resolves to no cursor at all;
+        // answering the first page instead would silently restart the walk.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(identifier) => Some(identifier),
+                None => {
+                    return Err(ListRulesErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some("NextToken is not a valid page token".to_string()),
+                            reason: Some("INVALID_PAGE_TOKEN".to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+        // No `MaxResults` means "as many as the page can hold"; the model bounds that
+        // member at 1000, so an unnamed page size can never exceed it either.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_PAGE_SIZE, |requested| {
+                (requested as usize).clamp(1, crate::state::MAX_PAGE_SIZE)
+            });
+        let resource_tag_filter = input.resource_tags.unwrap_or_default();
+        let exclude_resource_tag_filter = input.exclude_resource_tags.unwrap_or_default();
+
+        let store = state.lock();
+        let mut rules = Vec::new();
+        let mut last_reported: Option<&String> = None;
+        let mut next_token = None;
+        for (identifier, rule) in store.page_from(resume_after.as_deref()) {
+            // Only rules of the requested type, with the requested lock state (when
+            // one was named), carrying every resource/exclusion tag named as a filter.
+            if rule.resource_type != input.resource_type {
+                continue;
+            }
+            if input
+                .lock_state
+                .as_deref()
+                .is_some_and(|wanted| rule.lock_state.as_deref() != Some(wanted))
+            {
+                continue;
+            }
+            if !rule.has_resource_tags(&resource_tag_filter)
+                || !rule.has_exclude_resource_tags(&exclude_resource_tag_filter)
+            {
+                continue;
+            }
+            if rules.len() >= page_size {
+                // One more rule matches than fits: hand back a cursor at the last rule
+                // this page reported, so the next call resumes right after it.
+                next_token = last_reported.map(|id| crate::state::encode_page_token(id));
+                break;
+            }
+            rules.push(rule.to_summary());
+            last_reported = Some(identifier);
+        }
+
+        Ok(ListRulesOutput {
+            rules: Some(rules),
+            next_token,
+        })
     }
 }

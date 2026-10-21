@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDeploymentGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDeploymentGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Registers a deployment group under an existing application and answers the
+//! `deploymentGroupId` it minted and stored.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDeploymentGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -309,18 +304,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDeploymentGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDeploymentGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDeploymentGroup"))
+        let _ = ctx;
+        // `applicationName` and `deploymentGroupName` carry modelled length and
+        // pattern constraints the boundary has already enforced. `serviceRoleArn` is
+        // @required but carries none, so an empty one reaches the handler and is what
+        // `RoleRequiredException` is for.
+        if input.service_role_arn.trim().is_empty() {
+            return Err(CreateDeploymentGroupErrorModeled::RoleRequiredException(
+                RoleRequiredException {
+                    message: Some("The service role ARN was not specified".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let application_name = input.application_name;
+        let deployment_group_name = input.deployment_group_name;
+        let requested_config = input.deployment_config_name;
+
+        let outcome = crate::state::with_state(&*self.engine, |state| {
+            // Resolving a NAMED configuration is a read of the configuration
+            // store, so it happens before the application is borrowed mutably;
+            // an omitted one is resolved from the application's compute platform
+            // below.
+            let named_config = match requested_config {
+                Some(name) => {
+                    if !state.deployment_configs.contains_key(&name) {
+                        return Err(
+                            CreateDeploymentGroupErrorModeled::DeploymentConfigDoesNotExistException(
+                                DeploymentConfigDoesNotExistException {
+                                    message: Some(format!(
+                                        "No deployment configuration found for name {name}"
+                                    )),
+                                },
+                            ),
+                        );
+                    }
+                    Some(name)
+                }
+                None => None,
+            };
+            // The application record OWNS its deployment groups, so everything
+            // from here on goes through the one lookup of it. NOTE on precedence:
+            // a request naming BOTH an unknown configuration and an unknown
+            // application is answered for the configuration, because resolving
+            // it is a read of a different part of the store and happens first.
+            let Some(application) = state.applications.get_mut(&application_name) else {
+                return Err(
+                    CreateDeploymentGroupErrorModeled::ApplicationDoesNotExistException(
+                        ApplicationDoesNotExistException {
+                            message: Some(format!(
+                                "No application found for name {application_name}"
+                            )),
+                        },
+                    ),
+                );
+            };
+            if application
+                .deployment_groups
+                .contains_key(&deployment_group_name)
+            {
+                return Err(
+                    CreateDeploymentGroupErrorModeled::DeploymentGroupAlreadyExistsException(
+                        DeploymentGroupAlreadyExistsException {
+                            message: Some(format!(
+                                "A deployment group named {deployment_group_name} already exists \
+                                 for application {application_name}"
+                            )),
+                        },
+                    ),
+                );
+            }
+            // The per-application deployment group quota, which also bounds the
+            // store.
+            if application.deployment_groups.len()
+                >= crate::state::MAX_DEPLOYMENT_GROUPS_PER_APPLICATION
+            {
+                return Err(
+                    CreateDeploymentGroupErrorModeled::DeploymentGroupLimitExceededException(
+                        DeploymentGroupLimitExceededException {
+                            message: Some(format!(
+                                "The maximum number of deployment groups was exceeded: {} are \
+                                 allowed per application",
+                                crate::state::MAX_DEPLOYMENT_GROUPS_PER_APPLICATION
+                            )),
+                        },
+                    ),
+                );
+            }
+
+            let deployment_group_id =
+                crate::state::mint_uuid_from(&mut state.next_id, "deployment-group");
+
+            let compute_platform = application.compute_platform.clone();
+            let deployment_config_name = named_config.unwrap_or_else(|| {
+                crate::state::default_deployment_config_for(&compute_platform).to_string()
+            });
+            let group = crate::state::DeploymentGroup {
+                deployment_group_id: deployment_group_id.clone(),
+                deployment_group_name: deployment_group_name.clone(),
+                application_name: application_name.clone(),
+                service_role_arn: input.service_role_arn,
+                deployment_config_name,
+                compute_platform,
+                ec2_tag_filters: input.ec2_tag_filters.unwrap_or_default(),
+                on_premises_instance_tag_filters: input
+                    .on_premises_instance_tag_filters
+                    .unwrap_or_default(),
+                auto_scaling_groups: input.auto_scaling_groups.unwrap_or_default(),
+                trigger_configurations: input.trigger_configurations.unwrap_or_default(),
+                alarm_configuration: input.alarm_configuration,
+                auto_rollback_configuration: input.auto_rollback_configuration,
+                outdated_instances_strategy: input.outdated_instances_strategy,
+                deployment_style: input.deployment_style,
+                blue_green_deployment_configuration: input.blue_green_deployment_configuration,
+                load_balancer_info: input.load_balancer_info,
+                ec2_tag_set: input.ec2_tag_set,
+                on_premises_tag_set: input.on_premises_tag_set,
+                ecs_services: input.ecs_services.unwrap_or_default(),
+                ec2_deployment_options: input.ec2_deployment_options,
+                termination_hook_enabled: input.termination_hook_enabled.unwrap_or(false),
+                tags: input.tags.unwrap_or_default(),
+                create_time_ms: crate::state::now_ms(),
+            };
+            application
+                .deployment_groups
+                .insert(deployment_group_name.clone(), group);
+            application
+                .deployment_group_order
+                .push(deployment_group_name);
+            Ok(deployment_group_id)
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        Ok(CreateDeploymentGroupOutput {
+            deployment_group_id: Some(outcome?),
+        })
     }
 }

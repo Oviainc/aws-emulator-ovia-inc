@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListJobRuns
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListJobRuns`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListJobRuns::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +145,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListJobRuns` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListJobRunsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListJobRuns"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListJobRunsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the EMR Serverless application store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Where this page starts. An absent token starts at the first job run; a token
+        // this service minted names the id to resume at.
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(id) => Some(id),
+                None => {
+                    return Err(ListJobRunsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "Member must be a nextToken returned by a previous \
+                                      ListJobRuns call: nextToken"
+                                .to_string(),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        let page_size = crate::state::page_size(input.max_results);
+        let created_after = input.created_at_after.map(|at| at.as_secs_f64());
+        let created_before = input.created_at_before.map(|at| at.as_secs_f64());
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A report: it walks this application's stored job runs. The only write it
+        // performs is materialising the state changes the clock already owed them.
+        // This operation declares no `ResourceNotFoundException`
+        // (`smithy_query(query="operation",operation="ListJobRuns")` lists only
+        // `InternalServerException` and `ValidationException`), so an application id
+        // that names nothing is refused with the modelled `ValidationException`.
+        let record = store
+            .settled_mut(&input.application_id, now)
+            .ok_or_else(|| {
+                ListJobRunsErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "Member must name an existing application: applicationId {}",
+                        input.application_id
+                    ),
+                })
+            })?;
+
+        let start = match resume_from.as_deref() {
+            Some(id) => ::std::ops::Bound::Included(id),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let states = input.states.unwrap_or_default();
+        let mode = input.mode;
+        let mut matching = record
+            .job_runs
+            .range::<str, _>((start, ::std::ops::Bound::Unbounded))
+            .filter(|(_, run)| {
+                let job_run = &run.job_run;
+                let state_matches = states.is_empty() || states.contains(&job_run.state);
+                let mode_matches = mode
+                    .as_ref()
+                    .is_none_or(|wanted| job_run.mode.as_ref() == Some(wanted));
+                // `createdAtAfter` / `createdAtBefore` bound the creation instant
+                // inclusively on each side.
+                let created = job_run.created_at.as_secs_f64();
+                let after_matches = created_after.is_none_or(|bound| created >= bound);
+                let before_matches = created_before.is_none_or(|bound| created <= bound);
+                state_matches && mode_matches && after_matches && before_matches
+            });
+
+        let mut job_runs = Vec::new();
+        for (_, run) in matching.by_ref().take(page_size) {
+            job_runs.push(run.summary());
+        }
+        // The cursor names the first job run AFTER this page, so `nextToken` is present
+        // exactly when one remains.
+        let next_token = matching
+            .next()
+            .map(|(id, _)| crate::state::encode_page_token(id));
+
+        Ok(ListJobRunsOutput {
+            job_runs,
+            next_token,
+        })
     }
 }
