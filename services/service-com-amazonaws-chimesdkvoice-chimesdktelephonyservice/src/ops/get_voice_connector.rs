@@ -153,10 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetVoiceConnectorErrorModeled::ServiceFailureException(
-                ServiceFailureException {
-                    code: Some("ServiceFailure".to_string()),
-                    message: Some("the Voice Connector store is unavailable".to_string()),
-                },
+                crate::state::store_unavailable(),
             )
             .into());
         };
@@ -165,13 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // well-formed id that names no stored record is the 404.
         let store = state.lock();
         let Some(record) = store.voice_connectors.get(&input.voice_connector_id) else {
-            return Err(GetVoiceConnectorErrorModeled::NotFoundException(NotFoundException {
-                code: Some("NotFound".to_string()),
-                message: Some(format!(
-                    "no Voice Connector with id {}",
-                    input.voice_connector_id
-                )),
-            })
+            return Err(GetVoiceConnectorErrorModeled::NotFoundException(
+                crate::state::voice_connector_not_found(&input.voice_connector_id),
+            )
             .into());
         };
 

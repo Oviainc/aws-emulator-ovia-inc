@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteArchive
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteArchive`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: marks the stored archive `PENDING_DELETION` rather than erasing it. The
+//! model states "This changes the archive state to pending deletion" and that the archive
+//! "will be permanently deleted 30 days after entering the pending deletion state", so a
+//! following `GetArchive` still resolves and reports the new state.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteArchive::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `DeleteArchive` models no `ResourceNotFoundException` (unlike `GetArchive` and
+//! `UpdateArchive`), so an unknown `ArchiveId` is refused with the modelled
+//! `ValidationException` (HTTP 400) — never a 501 and never a hollow 200.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +144,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteArchive` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteArchiveErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteArchive"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteArchiveErrorModeled::ThrottlingException(ThrottlingException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+            .into());
+        };
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        store.purge_permanently_deleted(now);
+
+        let Some(record) = store.archives.get_mut(&input.archive_id) else {
+            return Err(DeleteArchiveErrorModeled::ValidationException(ValidationException {
+                message: Some(format!("Archive {} not found.", input.archive_id)),
+            })
+            .into());
+        };
+
+        if record.archive_state == crate::state::ARCHIVE_STATE_PENDING_DELETION {
+            return Err(DeleteArchiveErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Archive {} is already pending deletion.",
+                    record.archive_id
+                )),
+            })
+            .into());
+        }
+
+        record.archive_state = crate::state::ARCHIVE_STATE_PENDING_DELETION.to_string();
+        record.pending_deletion_at_millis =
+            Some(now.saturating_add(crate::state::PENDING_DELETION_WINDOW_MILLIS));
+        record.last_updated_at_millis = crate::state::bump_millis(record.last_updated_at_millis, now);
+
+        Ok(DeleteArchiveOutput {})
     }
 }

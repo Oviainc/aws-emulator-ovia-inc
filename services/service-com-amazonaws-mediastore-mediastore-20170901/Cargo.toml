@@ -21,13 +21,13 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The container endpoint's host label is a SHA-256 digest, hex-encoded; `hex` also
+# encodes the opaque ListContainers pagination token.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRecords::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the records of one dataset out of [`crate::state`], and mints
+//! the sync session `UpdateRecords` spends. A dataset that was never written is not an
+//! error here — the model declares no `ResourceNotFoundException` for this operation —
+//! it is reported as `DatasetExists=false` with an empty record list, which is what the
+//! recorded AWS response in this file's contract below shows.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +183,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRecords"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(state_unavailable());
+        };
+
+        // `MaxResults` carries no modelled range, but a page of fewer than one record is
+        // not a page: refuse it as a parameter that does not comply with its constraint.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(ListRecordsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: format!("MaxResults must be at least 1, got {max_results}"),
+                    },
+                )
+                .into());
+            }
+            Some(max_results) => usize::try_from(max_results)
+                .unwrap_or(usize::MAX)
+                // The caller may ask for a smaller page than the server's, never a
+                // larger one; `NextToken` carries whatever did not fit.
+                .min(crate::state::MAX_PAGE_SIZE),
+            // No `MaxResults`: the server's own page size.
+            None => crate::state::MAX_PAGE_SIZE,
+        };
+        // "LastSyncCount — The last server sync count for this record": the caller asks
+        // for what changed after it, so absent means "everything".
+        let last_sync_count = input.last_sync_count.unwrap_or(0);
+        let key = crate::state::dataset_key(
+            &input.identity_pool_id,
+            &input.identity_id,
+            &input.dataset_name,
+        );
+        let minted_at = crate::state::now();
+
+        let mut store = state.lock();
+
+        let dataset_exists = store.datasets.contains_key(&key);
+        // `DatasetDeletedAfterRequestedSyncCount` — "whether to delete the dataset
+        // locally": true exactly when the dataset is gone from the server and the
+        // caller's copy predates that deletion, so its local copy is the stale one.
+        let dataset_deleted_after_requested_sync_count = !dataset_exists
+            && store
+                .deletion_sync_count(&key)
+                .is_some_and(|deleted_at_sync_count| last_sync_count <= deleted_at_sync_count);
+
+        let (records, next_token, dataset_sync_count, last_modified_by) =
+            match store.datasets.get(&key) {
+                Some(dataset) => {
+                    let mut matching = dataset
+                        .records
+                        .iter()
+                        .filter(|(record_key, _)| {
+                            input
+                                .next_token
+                                .as_deref()
+                                .is_none_or(|resume_from| record_key.as_str() >= resume_from)
+                        })
+                        .filter(|(_, record)| record.sync_count > last_sync_count)
+                        .map(|(record_key, record)| record.to_shape(record_key));
+                    let page: Vec<Record> = matching.by_ref().take(page_size).collect();
+                    // The next page resumes at the first record this one left out.
+                    let next_token = matching.next().and_then(|record| record.key);
+                    (
+                        page,
+                        next_token,
+                        Some(dataset.sync_count),
+                        dataset.last_modified_by.clone(),
+                    )
+                }
+                // Never written: no records, and a server sync count of zero.
+                None => (Vec::new(), None, Some(0), None),
+            };
+
+        // This operation reports; the single thing it writes is the sync session the
+        // model says it hands back (`SyncSessionToken`), which `UpdateRecords` spends.
+        let sync_session_token = store.mint_sync_session(&key, minted_at);
+        drop(store);
+
+        Ok(ListRecordsOutput {
+            // "Count — Total number of records" in this answer.
+            count: i32::try_from(records.len()).unwrap_or(i32::MAX),
+            records: Some(records),
+            next_token,
+            dataset_sync_count,
+            last_modified_by,
+            // This API has no merge operation, so no dataset here has merged peers.
+            merged_dataset_names: None,
+            dataset_exists,
+            dataset_deleted_after_requested_sync_count,
+            sync_session_token: Some(sync_session_token),
+        })
     }
+}
+
+/// This service's store is not mounted on the engine the operation was built from — a
+/// server fault, answered with the modelled server error rather than a panic.
+fn state_unavailable() -> ListRecordsError {
+    ListRecordsErrorModeled::InternalErrorException(InternalErrorException {
+        message: crate::state::STORE_UNAVAILABLE.to_string(),
+    })
+    .into()
 }

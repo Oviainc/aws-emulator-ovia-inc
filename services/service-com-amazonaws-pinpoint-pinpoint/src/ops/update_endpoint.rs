@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or merges one endpoint under an application and persists every supplied
+//! member; an unknown `ApplicationId` is a `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -159,20 +152,203 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateEndpointErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the pinpoint state store is unavailable".to_string()),
+                    request_id: None,
+                },
+            )
+            .into());
+        };
+
+        let UpdateEndpointInput {
+            application_id,
+            endpoint_id,
+            endpoint_request: request,
+        } = input;
+
+        if endpoint_id.trim().is_empty() {
+            return Err(UpdateEndpointErrorModeled::BadRequestException(BadRequestException {
+                message: Some("EndpointId must be a non-empty endpoint identifier".to_string()),
+                request_id: None,
+            })
+            .into());
+        }
+
+        // `ChannelType` is an enum shape, so the boundary validator has already
+        // refused any value the model does not list before this handler runs.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEndpoint"))
+        // `CreationDate` is the server's own clock; `EffectiveDate` is "when the
+        // endpoint is updated", which the caller may state itself.
+        let now = crate::state::now_iso8601();
+        let effective_date = request.effective_date.clone().unwrap_or_else(|| now.clone());
+
+        let mut store = state.lock();
+        // Every refusal below happens BEFORE anything is minted or written, so a
+        // rejected request leaves the store exactly as it was.
+        {
+            let Some(app) = store.apps.get(&application_id) else {
+                return Err(UpdateEndpointErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!("Application not found: {application_id}")),
+                    request_id: None,
+                })
+                .into());
+            };
+            let existing = app.endpoints.get(&endpoint_id);
+
+            // This write would add an endpoint: refuse it at the per-application
+            // ceiling rather than growing the application without limit.
+            if existing.is_none() && app.endpoints.len() >= crate::state::MAX_ENDPOINTS_PER_APP {
+                return Err(UpdateEndpointErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!(
+                            "an application holds at most {} endpoints in this emulator",
+                            crate::state::MAX_ENDPOINTS_PER_APP
+                        )),
+                        request_id: None,
+                    },
+                )
+                .into());
+            }
+
+            // The maps MERGE, so each ceiling is checked against what the write would
+            // leave STORED, not against what this one request carries.
+            let attributes = merged_key_count(
+                existing.and_then(|e| e.attributes.as_ref()),
+                request.attributes.as_ref(),
+            );
+            let metrics = merged_key_count(
+                existing.and_then(|e| e.metrics.as_ref()),
+                request.metrics.as_ref(),
+            );
+            for (member, merged, ceiling) in [
+                (
+                    "Attributes",
+                    attributes,
+                    crate::state::MAX_ENDPOINT_ATTRIBUTES,
+                ),
+                ("Metrics", metrics, crate::state::MAX_ENDPOINT_METRICS),
+            ] {
+                if merged > ceiling {
+                    return Err(UpdateEndpointErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(format!(
+                                "an endpoint holds at most {ceiling} {member} keys in this emulator; this request would store {merged}"
+                            )),
+                            request_id: None,
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let request_id = request
+            .request_id
+            .clone()
+            .unwrap_or_else(|| store.mint_id());
+
+        let Some(app) = store.apps.get_mut(&application_id) else {
+            return Err(UpdateEndpointErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the pinpoint state store is unavailable".to_string()),
+                    request_id: None,
+                },
+            )
+            .into());
+        };
+
+        let endpoint = app
+            .endpoints
+            .entry(endpoint_id.clone())
+            .or_insert_with(|| crate::state::Endpoint {
+                id: endpoint_id.clone(),
+                application_id: application_id.clone(),
+                cohort_id: crate::state::cohort_id(&application_id, &endpoint_id),
+                creation_date: now,
+                ..crate::state::Endpoint::default()
+            });
+
+        // A merge: a member the request carries replaces the stored one, a member it
+        // omits keeps the value an earlier write stored. The two maps merge key by
+        // key, so one write does not drop attributes or metrics another recorded.
+        if request.address.is_some() {
+            endpoint.address = request.address;
+        }
+        if request.channel_type.is_some() {
+            endpoint.channel_type = request.channel_type;
+        }
+        if let Some(attributes) = request.attributes {
+            endpoint.attributes.get_or_insert_with(Default::default).extend(attributes);
+        }
+        if let Some(metrics) = request.metrics {
+            endpoint.metrics.get_or_insert_with(Default::default).extend(metrics);
+        }
+        if request.user.is_some() {
+            endpoint.user = request.user;
+        }
+        if request.location.is_some() {
+            endpoint.location = request.location;
+        }
+        if request.demographic.is_some() {
+            endpoint.demographic = request.demographic;
+        }
+        if request.opt_out.is_some() {
+            endpoint.opt_out = request.opt_out;
+        }
+        // `EndpointRequest$EndpointStatus`: "Amazon Pinpoint automatically sets this
+        // value to ACTIVE when you create an endpoint or update an existing endpoint",
+        // so a write with no status asked for lands as ACTIVE.
+        endpoint.endpoint_status = Some(
+            request
+                .endpoint_status
+                .unwrap_or_else(|| ENDPOINT_STATUS_ACTIVE.to_string()),
+        );
+        endpoint.effective_date = effective_date;
+        endpoint.request_id = Some(request_id.clone());
+        let address = endpoint.address.clone();
+
+        // ... and "automatically sets this value to INACTIVE if you update another
+        // endpoint that has the same address": one address is reachable through one
+        // endpoint, the one most recently written.
+        if let Some(address) = address.filter(|a| !a.is_empty()) {
+            for other in app.endpoints.values_mut() {
+                if other.id != endpoint_id && other.address.as_deref() == Some(address.as_str()) {
+                    other.endpoint_status = Some(ENDPOINT_STATUS_INACTIVE.to_string());
+                }
+            }
+        }
+
+        Ok(UpdateEndpointOutput {
+            message_body: MessageBody {
+                message: Some("Accepted".to_string()),
+                request_id: Some(request_id),
+            },
+        })
     }
+}
+
+/// The endpoint status a write lands on, per `EndpointRequest$EndpointStatus`.
+const ENDPOINT_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The status the endpoints an address was taken away from land on, per the same member.
+const ENDPOINT_STATUS_INACTIVE: &str = "INACTIVE";
+
+/// How many keys a map would hold after `incoming` is merged into `stored`: the keys
+/// already stored, plus the incoming ones that are not among them.
+fn merged_key_count<V>(
+    stored: Option<&::std::collections::HashMap<String, V>>,
+    incoming: Option<&::std::collections::HashMap<String, V>>,
+) -> usize {
+    let stored_keys = stored.map_or(0, ::std::collections::HashMap::len);
+    let added = incoming.map_or(0, |incoming| {
+        incoming
+            .keys()
+            .filter(|key| stored.is_none_or(|stored| !stored.contains_key(key.as_str())))
+            .count()
+    });
+    stored_keys + added
 }

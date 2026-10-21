@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDomains
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDomains`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Enumerates the domain store, applying the request's `FilterConditions` and
+//! `SortCondition`, and pages with `Marker` / `NextPageMarker`: the marker is the name of
+//! the last domain on the page just returned, and the last page omits it so a paginating
+//! client terminates.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDomains::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This operation is a pure read: it never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +114,131 @@ impl From<ListDomainsErrorModeled> for ListDomainsError {
     }
 }
 
+/// `MaxItems`'s documented default: "Number of domains to be returned. Default: 20".
+/// The model's `@range(max: 100)` caps it, and the boundary validator enforces that cap.
+const DEFAULT_MAX_ITEMS: usize = 20;
+
+/// This operation's only modelled error.
+fn invalid_input(message: impl Into<String>) -> ListDomainsError {
+    ListDomainsErrorModeled::InvalidInput(InvalidInput {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The attribute a filter or a sort names, from the model's `ListDomainsAttributeName`
+/// enum (`DomainName | Expiry`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attribute {
+    DomainName,
+    Expiry,
+}
+
+impl Attribute {
+    fn parse(name: &str) -> Result<Self, ListDomainsError> {
+        match name {
+            "DomainName" => Ok(Self::DomainName),
+            "Expiry" => Ok(Self::Expiry),
+            other => Err(invalid_input(format!(
+                "Value '{other}' at 'name' failed to satisfy constraint: Member must satisfy \
+                 enum value set: [DomainName, Expiry]"
+            ))),
+        }
+    }
+}
+
+/// One parsed `FilterCondition`: which attribute to compare, how, and against what.
+///
+/// The operators are the model's `Operator` enum, with the meanings its documentation
+/// gives: `LE` "Less than, or equal to", `GE` "Greater than, or equal to",
+/// `BEGINS_WITH` "Begins with".
+#[derive(Debug)]
+enum Filter {
+    NameBeginsWith(String),
+    NameAtMost(String),
+    NameAtLeast(String),
+    ExpiryAtMost(i64),
+    ExpiryAtLeast(i64),
+}
+
+/// An `Expiry` comparison value.
+///
+/// `FilterCondition$Values` is modelled as a list of plain strings, and the only
+/// timestamp form this protocol states is the one awsJson1_1 gives a modelled
+/// `Timestamp` — epoch seconds (`ListOperations$SubmittedSince`'s own documentation:
+/// "Specify the date and time in Unix time format"). Anything else is refused rather
+/// than guessed at.
+fn parse_expiry(raw: &str) -> Option<i64> {
+    raw.parse::<i64>().ok().map(|seconds| seconds.saturating_mul(1000))
+}
+
+impl Filter {
+    fn parse(condition: &FilterCondition) -> Result<Self, ListDomainsError> {
+        // `Values` is modelled `@length(min: 1, max: 1)` — "Only 1 item in the list is
+        // currently supported" — so the boundary validator has already refused any other
+        // count. Refuse an absent value explicitly all the same rather than letting it
+        // degrade into a filter that matches everything.
+        let Some(value) = condition.values.first().map(String::as_str) else {
+            return Err(invalid_input(
+                "Value null at 'values' failed to satisfy constraint: Member must hold \
+                 exactly one value to compare",
+            ));
+        };
+        let attribute = Attribute::parse(&condition.name)?;
+        match (attribute, condition.operator.as_str()) {
+            (Attribute::DomainName, "BEGINS_WITH") => {
+                Ok(Self::NameBeginsWith(value.to_ascii_lowercase()))
+            }
+            (Attribute::DomainName, "LE") => Ok(Self::NameAtMost(value.to_ascii_lowercase())),
+            (Attribute::DomainName, "GE") => Ok(Self::NameAtLeast(value.to_ascii_lowercase())),
+            (Attribute::Expiry, operator @ ("LE" | "GE")) => {
+                let millis = parse_expiry(value).ok_or_else(|| {
+                    invalid_input(format!(
+                        "Value '{value}' at 'values.1.member' failed to satisfy constraint: \
+                         Member must be a date and time in Unix time format when 'name' is \
+                         Expiry"
+                    ))
+                })?;
+                if operator == "LE" {
+                    Ok(Self::ExpiryAtMost(millis))
+                } else {
+                    Ok(Self::ExpiryAtLeast(millis))
+                }
+            }
+            // `BEGINS_WITH` compares string prefixes, so it cannot be applied to the
+            // `Expiry` timestamp.
+            (Attribute::Expiry, "BEGINS_WITH") => Err(invalid_input(
+                "Value 'BEGINS_WITH' at 'operator' failed to satisfy constraint: Member must be \
+                 LE or GE when 'name' is Expiry",
+            )),
+            (_, other) => Err(invalid_input(format!(
+                "Value '{other}' at 'operator' failed to satisfy constraint: Member must satisfy \
+                 enum value set: [LE, GE, BEGINS_WITH]"
+            ))),
+        }
+    }
+
+    /// The attribute this filter compares, which `SortCondition` has to agree with.
+    fn attribute(&self) -> Attribute {
+        match self {
+            Self::NameBeginsWith(_) | Self::NameAtMost(_) | Self::NameAtLeast(_) => {
+                Attribute::DomainName
+            }
+            Self::ExpiryAtMost(_) | Self::ExpiryAtLeast(_) => Attribute::Expiry,
+        }
+    }
+
+    fn keeps(&self, domain: &crate::state::Domain) -> bool {
+        match self {
+            Self::NameBeginsWith(prefix) => domain.name.starts_with(prefix.as_str()),
+            Self::NameAtMost(bound) => domain.name.as_str() <= bound.as_str(),
+            Self::NameAtLeast(bound) => domain.name.as_str() >= bound.as_str(),
+            Self::ExpiryAtMost(bound) => domain.expiration_millis <= *bound,
+            Self::ExpiryAtLeast(bound) => domain.expiration_millis >= *bound,
+        }
+    }
+}
+
 /// The `ListDomains` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,18 +275,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDomains` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDomainsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDomains"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+
+        let filters: Vec<Filter> = input
+            .filter_conditions
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(Filter::parse)
+            .collect::<Result<Vec<Filter>, Self::Error>>()?;
+
+        // `SortCondition$Name`: "Note that if filterCondition is used in the same
+        // ListDomains call, the field used for sorting has to be the same as the field
+        // used for filtering."
+        let sort = match input.sort_condition.as_ref() {
+            None => None,
+            Some(condition) => {
+                let attribute = Attribute::parse(&condition.name)?;
+                if let Some(filter) = filters.iter().find(|f| f.attribute() != attribute) {
+                    return Err(invalid_input(format!(
+                        "Value '{}' at 'sortCondition.name' failed to satisfy constraint: Member \
+                         must name the same field as every filter condition, which names {:?}",
+                        condition.name,
+                        filter.attribute()
+                    )));
+                }
+                let descending = match condition.sort_order.as_str() {
+                    "ASC" => false,
+                    "DESC" => true,
+                    other => {
+                        return Err(invalid_input(format!(
+                            "Value '{other}' at 'sortCondition.sortOrder' failed to satisfy \
+                             constraint: Member must satisfy enum value set: [ASC, DESC]"
+                        )))
+                    }
+                };
+                Some((attribute, descending))
+            }
+        };
+
+        // The model bounds `MaxItems` ABOVE only (`@range(max: 100)`, enforced by the
+        // boundary validator) and says nothing below, so the lower bound is this
+        // handler's: a page of zero domains could never make progress through the
+        // collection, so a caller that asks for one is refused rather than left
+        // paginating forever.
+        if input.max_items.is_some_and(|requested| requested < 1) {
+            return Err(invalid_input(format!(
+                "Value '{}' at 'maxItems' failed to satisfy constraint: Member must have value \
+                 greater than or equal to 1",
+                input.max_items.unwrap_or_default()
+            )));
+        }
+        let max_items = input
+            .max_items
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(DEFAULT_MAX_ITEMS);
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::state::state_unavailable(Self::NAME))?;
+        let state = state.lock();
+
+        let mut selected: Vec<&crate::state::Domain> = state
+            .domains
+            .values()
+            .filter(|domain| filters.iter().all(|filter| filter.keeps(domain)))
+            .collect();
+        // Unsorted, the store is already in domain-name order, which is what an
+        // unqualified request gets.
+        if let Some((attribute, descending)) = sort {
+            selected.sort_by(|left, right| {
+                let primary = match attribute {
+                    Attribute::DomainName => left.name.cmp(&right.name),
+                    Attribute::Expiry => left.expiration_millis.cmp(&right.expiration_millis),
+                };
+                let primary = if descending { primary.reverse() } else { primary };
+                // Ties break on the domain name, always ascending, so the order is total
+                // and a paginating client's marker walk cannot shift between pages.
+                primary.then_with(|| left.name.cmp(&right.name))
+            });
+        }
+
+        // The marker is the name of the last domain on the page just returned, so the
+        // next page starts immediately after it.
+        let marker = input.marker.as_deref().filter(|value| !value.is_empty());
+        let start = match marker {
+            None => 0,
+            Some(marker) => {
+                let lowered = marker.to_ascii_lowercase();
+                let position = selected
+                    .iter()
+                    .position(|domain| domain.name == lowered)
+                    .ok_or_else(|| {
+                        invalid_input(format!(
+                            "Value '{marker}' at 'marker' failed to satisfy constraint: Member \
+                             must be the NextPageMarker of a previous ListDomains response"
+                        ))
+                    })?;
+                position + 1
+            }
+        };
+
+        let page: Vec<DomainSummary> = selected[start..]
+            .iter()
+            .take(max_items)
+            .map(|domain| DomainSummary {
+                domain_name: Some(domain.name.clone()),
+                auto_renew: Some(domain.auto_renew),
+                transfer_lock: Some(domain.transfer_lock),
+                expiry: Some(crate::state::date_time(domain.expiration_millis)),
+            })
+            .collect();
+        // Omitted on the last page: "If there are more domains than you specified for
+        // MaxItems in the request, submit another request and include the value of
+        // NextPageMarker in the value of Marker."
+        let next_page_marker = if start + page.len() < selected.len() {
+            page.last().and_then(|summary| summary.domain_name.clone())
+        } else {
+            None
+        };
+
+        Ok(ListDomainsOutput {
+            domains: Some(page),
+            next_page_marker,
+        })
     }
 }

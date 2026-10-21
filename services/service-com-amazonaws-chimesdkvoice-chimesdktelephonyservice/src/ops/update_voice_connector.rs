@@ -157,10 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateVoiceConnectorErrorModeled::ServiceFailureException(
-                ServiceFailureException {
-                    code: Some("ServiceFailure".to_string()),
-                    message: Some("the Voice Connector store is unavailable".to_string()),
-                },
+                crate::state::store_unavailable(),
             )
             .into());
         };
@@ -168,13 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let updated = crate::state::current_timestamp();
         let mut store = state.lock();
         let Some(record) = store.voice_connectors.get_mut(&input.voice_connector_id) else {
-            return Err(UpdateVoiceConnectorErrorModeled::NotFoundException(NotFoundException {
-                code: Some("NotFound".to_string()),
-                message: Some(format!(
-                    "no Voice Connector with id {}",
-                    input.voice_connector_id
-                )),
-            })
+            return Err(UpdateVoiceConnectorErrorModeled::NotFoundException(
+                crate::state::voice_connector_not_found(&input.voice_connector_id),
+            )
             .into());
         };
 

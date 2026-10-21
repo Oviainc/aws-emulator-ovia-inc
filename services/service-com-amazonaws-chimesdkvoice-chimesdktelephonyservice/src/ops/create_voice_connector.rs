@@ -176,10 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateVoiceConnectorErrorModeled::ServiceFailureException(
-                ServiceFailureException {
-                    code: Some("ServiceFailure".to_string()),
-                    message: Some("the Voice Connector store is unavailable".to_string()),
-                },
+                crate::state::store_unavailable(),
             )
             .into());
         };
@@ -198,13 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.voice_connectors.len() >= crate::state::MAX_VOICE_CONNECTORS {
             return Err(
                 CreateVoiceConnectorErrorModeled::ResourceLimitExceededException(
-                    ResourceLimitExceededException {
-                        code: Some("ResourceLimitExceeded".to_string()),
-                        message: Some(format!(
-                            "this account already holds the maximum of {} Voice Connectors",
-                            crate::state::MAX_VOICE_CONNECTORS
-                        )),
-                    },
+                    crate::state::voice_connector_limit_reached(),
                 )
                 .into(),
             );

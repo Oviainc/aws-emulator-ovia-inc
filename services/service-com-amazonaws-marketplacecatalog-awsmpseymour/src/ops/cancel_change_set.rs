@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelChangeSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelChangeSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelChangeSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops a change set that is still running: it moves to `CANCELLED`, takes an end time,
+//! and the changes it carried are never applied.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +148,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelChangeSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelChangeSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelChangeSet"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CancelChangeSetErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the marketplace catalog store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        if input.catalog != crate::state::AWS_MARKETPLACE_CATALOG {
+            return Err(CancelChangeSetErrorModeled::ValidationException(
+                crate::state::wrong_catalog(&input.catalog),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A change set the clock has already carried to `SUCCEEDED` is past
+        // cancelling, so settle before deciding.
+        store.settle(now);
+
+        let Some(record) = store.change_sets.get_mut(&input.change_set_id) else {
+            return Err(CancelChangeSetErrorModeled::ResourceNotFoundException(
+                crate::state::change_set_not_found(&input.change_set_id),
+            )
+            .into());
+        };
+
+        // Only a change set that is still running can be stopped: one that has
+        // completed is in use by nobody, and its result stands.
+        if !record.is_running() {
+            let status = record.status.clone();
+            return Err(CancelChangeSetErrorModeled::ResourceInUseException(
+                crate::state::in_use(format!(
+                    "change set {} already reached {status} and cannot be cancelled",
+                    input.change_set_id
+                )),
+            )
+            .into());
+        }
+
+        record.status = crate::state::STATUS_CANCELLED.to_string();
+        record.end_time = Some(crate::state::iso8601(now));
+        // Cancelling is what the clock no longer owes anything after: the
+        // changes this change set carried are never applied.
+        record.schedule.clear();
+
+        Ok(CancelChangeSetOutput {
+            change_set_id: Some(record.id.clone()),
+            change_set_arn: Some(record.arn.clone()),
+        })
     }
 }

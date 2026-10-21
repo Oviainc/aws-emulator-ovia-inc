@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListUsers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListUsers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListUsers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the stored users of one server in `BTreeMap` (user-name) order. `MaxResults`
+//! is a real page bound and `NextToken` is an opaque token encoding the exclusive
+//! start key of the next page, so a listing resumes deterministically; a token that
+//! does not decode is an `InvalidNextTokenException` (400). `SshPublicKeyCount` is
+//! derived from each user's stored keys.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +157,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListUsers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListUsersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListUsers"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            ListUsersErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(st::decode_page_token(token).ok_or_else(|| {
+                ListUsersErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+                    message: "The NextToken is not valid".to_string(),
+                })
+            })?),
+            None => None,
+        };
+
+        let guard = state.lock();
+
+        if !guard.servers.contains_key(&input.server_id) {
+            return Err(ListUsersErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Unknown server {}", input.server_id),
+                    resource: input.server_id.clone(),
+                    resource_type: "server".to_string(),
+                },
+            )
+            .into());
+        }
+
+        // ONE range scan over this server's run of the user map: the records to render
+        // come straight out of it, so no row is looked up a second time and no key is
+        // cloned to do it.
+        let stored: Vec<&st::User> = guard.users_of(&input.server_id).collect();
+        let names: Vec<&str> = stored
+            .iter()
+            .map(|user| user.user_name.as_str())
+            .collect();
+        let (page, next_key) =
+            st::page_bounds(&names, after.as_deref(), st::page_limit(input.max_results));
+
+        let users = stored
+            .get(page)
+            .unwrap_or_default()
+            .iter()
+            .map(|stored| ListedUser {
+                arn: stored.arn.clone(),
+                home_directory: stored.home_directory.clone(),
+                home_directory_type: stored.home_directory_type.clone(),
+                role: Some(stored.role.clone()),
+                ssh_public_key_count: Some(stored.ssh_public_key_count()),
+                user_name: Some(stored.user_name.clone()),
+            })
+            .collect();
+
+        Ok(ListUsersOutput {
+            // A token only when a further page remains.
+            next_token: next_key.as_deref().map(st::encode_page_token),
+            server_id: input.server_id,
+            users,
+        })
     }
 }

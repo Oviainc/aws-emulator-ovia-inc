@@ -41,9 +41,133 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, ViolationKind,
 };
 use std::sync::Arc;
+
+/// Which modelled error CodeDeploy answers for a refused input member: the code
+/// for an ABSENT (or empty) value, and the code for a value that is present but
+/// not one the service accepts. `None` in either position means this service
+/// models no such code for that member, so the framework's default wording
+/// stands for that case.
+///
+/// Every code here is a shape this service's model declares for the operations
+/// carrying that member — see the crate root's `OPERATIONS.md`, which lists each
+/// operation's errors.
+const REFUSAL_CODES: &[(&str, Option<&str>, Option<&str>)] = &[
+    (
+        "applicationName",
+        Some("ApplicationNameRequiredException"),
+        Some("InvalidApplicationNameException"),
+    ),
+    (
+        "applicationNames",
+        Some("ApplicationNameRequiredException"),
+        Some("InvalidApplicationNameException"),
+    ),
+    (
+        "deploymentGroupName",
+        Some("DeploymentGroupNameRequiredException"),
+        Some("InvalidDeploymentGroupNameException"),
+    ),
+    (
+        "deploymentGroupNames",
+        Some("DeploymentGroupNameRequiredException"),
+        Some("InvalidDeploymentGroupNameException"),
+    ),
+    (
+        "deploymentConfigName",
+        Some("DeploymentConfigNameRequiredException"),
+        Some("InvalidDeploymentConfigNameException"),
+    ),
+    (
+        "deploymentId",
+        Some("DeploymentIdRequiredException"),
+        Some("InvalidDeploymentIdException"),
+    ),
+    (
+        "deploymentIds",
+        Some("DeploymentIdRequiredException"),
+        Some("InvalidDeploymentIdException"),
+    ),
+    (
+        "instanceName",
+        Some("InstanceNameRequiredException"),
+        Some("InvalidInstanceNameException"),
+    ),
+    (
+        "instanceNames",
+        Some("InstanceNameRequiredException"),
+        Some("InvalidInstanceNameException"),
+    ),
+    ("instanceId", Some("InstanceIdRequiredException"), None),
+    ("instanceIds", Some("InstanceIdRequiredException"), None),
+    (
+        "targetId",
+        Some("DeploymentTargetIdRequiredException"),
+        Some("InvalidDeploymentTargetIdException"),
+    ),
+    (
+        "targetIds",
+        Some("DeploymentTargetIdRequiredException"),
+        Some("InvalidDeploymentTargetIdException"),
+    ),
+    (
+        "serviceRoleArn",
+        Some("RoleRequiredException"),
+        Some("InvalidRoleException"),
+    ),
+    (
+        "resourceArn",
+        Some("ResourceArnRequiredException"),
+        Some("InvalidArnException"),
+    ),
+    (
+        "revision",
+        Some("RevisionRequiredException"),
+        Some("InvalidRevisionException"),
+    ),
+    (
+        "revisions",
+        Some("RevisionRequiredException"),
+        Some("InvalidRevisionException"),
+    ),
+    // Value-set members: a refusal can only ever be "not one of the values".
+    ("computePlatform", None, Some("InvalidComputePlatformException")),
+    (
+        "fileExistsBehavior",
+        None,
+        Some("InvalidFileExistsBehaviorException"),
+    ),
+    (
+        "includeOnlyStatuses",
+        None,
+        Some("InvalidDeploymentStatusException"),
+    ),
+];
+
+/// The code [`EmulatedService::override_refusal`] answers for `member` failing
+/// `kind`.
+///
+/// A member absent from the request and one sent empty are the SAME refusal to
+/// CodeDeploy — both mean "you did not give me this name" — so a `@length`
+/// minimum failure maps to the member's `…RequiredException` alongside an absent
+/// one; every other constraint failure means the value itself is not one the
+/// service accepts.
+fn refusal_code(member: &str, kind: &ViolationKind) -> Option<&'static str> {
+    let absent = matches!(
+        kind,
+        ViolationKind::MissingRequiredMember | ViolationKind::MinLength(_)
+    );
+    let (_, for_absent, for_invalid) = REFUSAL_CODES
+        .iter()
+        .find(|(name, _, _)| *name == member)?;
+    if absent {
+        *for_absent
+    } else {
+        *for_invalid
+    }
+}
 
 /// The `com-amazonaws-codedeploy-codedeploy-20141006` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -96,17 +220,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // CodeDeploy does NOT answer a generic `ValidationException` for an input it
+        // will not accept: every name and id member has its own pair of modelled
+        // error shapes — one for "you did not give me this", one for "what you gave
+        // me is not a valid one" — and a client branches on those codes. The
+        // framework refuses a modelled constraint before any handler runs, so this
+        // seam is the only place those codes can be chosen. A member the table does
+        // not name keeps the framework's default wording.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        // The first refused member, which is the one the service names.
+        let violation = violations.first()?;
+        // The path is rooted at the top-level input member and descends from there
+        // (`includeOnlyStatuses.1.member`), so the root segment is the member the
+        // caller sent.
+        let member = violation.path.split('.').next()?;
+        let code = refusal_code(member, &violation.kind)?;
+        Some(Refused {
+            code: code.to_string(),
+            // The clause the framework built from the request: it names the member
+            // and the constraint it failed, which is what a caller has to fix.
+            message: violation.message(),
+        })
     }
 
     fn override_routing_error(

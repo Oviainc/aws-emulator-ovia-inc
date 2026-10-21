@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the PERSISTED domain from [`crate::state`]. It is a reporting operation: the
+//! only write it makes is materialising a lifecycle step the clock already owed
+//! (`CREATING` -> `AVAILABLE`, a finished `DELETING` -> gone), which was due at this
+//! instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +176,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDomain"))
+        let _ = ctx;
+        use crate::state::{date_time, now_ms};
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetDomainErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_clock(now_ms());
+
+        let domain = store.domains.get(&input.identifier).ok_or_else(|| {
+            GetDomainErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("Domain {} was not found", input.identifier),
+            })
+        })?;
+
+        Ok(GetDomainOutput {
+            id: domain.id.clone(),
+            root_domain_unit_id: Some(domain.root_domain_unit_id.clone()),
+            name: Some(domain.name.clone()),
+            description: domain.description.clone(),
+            single_sign_on: domain.single_sign_on.as_ref().map(|sso| SingleSignOn {
+                r#type: sso.sso_type.clone(),
+                user_assignment: sso.user_assignment.clone(),
+                idc_instance_arn: sso.idc_instance_arn.clone(),
+            }),
+            domain_execution_role: domain.domain_execution_role.clone(),
+            arn: Some(domain.arn.clone()),
+            kms_key_identifier: domain.kms_key_identifier.clone(),
+            status: domain.status.clone(),
+            portal_url: domain.portal_url.clone(),
+            created_at: Some(date_time(domain.created_at_ms)),
+            last_updated_at: Some(date_time(domain.last_updated_at_ms)),
+            tags: Some(domain.tags.clone().into_iter().collect()),
+            domain_version: Some(domain.domain_version.clone()),
+            service_role: domain.service_role.clone(),
+            // Nothing has failed: the emulator reports no failure reason, and the
+            // delete progress of a domain that is not being deleted is absent.
+            failure_reasons: None,
+            delete_progress: None,
+        })
     }
 }

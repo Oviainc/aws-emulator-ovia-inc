@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Registers an application in this service's store under its name, and answers the
+//! `applicationId` it minted and stored.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +153,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplication"))
+        let _ = ctx;
+        // `applicationName`'s length and pattern and `computePlatform`'s value set are
+        // MODELLED constraints: the boundary already refused anything outside them, in
+        // the words `crate::service` picks for CodeDeploy. What is left for the handler
+        // is the part that depends on stored state: the name must be unused.
+        let name = input.application_name;
+        let compute_platform = input
+            .compute_platform
+            .unwrap_or_else(|| crate::state::DEFAULT_COMPUTE_PLATFORM.to_string());
+        let tags = input.tags.unwrap_or_default();
+
+        let minted = crate::state::with_state(&*self.engine, |state| {
+            if state.applications.contains_key(&name) {
+                return Err(CreateApplicationErrorModeled::ApplicationAlreadyExistsException(
+                    ApplicationAlreadyExistsException {
+                        message: Some(format!(
+                            "An application named {name} already exists with this account"
+                        )),
+                    },
+                ));
+            }
+            // The account's application quota, which also bounds the store.
+            if state.applications.len() >= crate::state::MAX_APPLICATIONS {
+                return Err(CreateApplicationErrorModeled::ApplicationLimitExceededException(
+                    ApplicationLimitExceededException {
+                        message: Some(format!(
+                            "The maximum number of applications was exceeded: {} are allowed per \
+                             account in this Region",
+                            crate::state::MAX_APPLICATIONS
+                        )),
+                    },
+                ));
+            }
+            let application_id = state.mint_uuid("application");
+            state.applications.insert(
+                name.clone(),
+                crate::state::Application {
+                    application_id: application_id.clone(),
+                    application_name: name.clone(),
+                    compute_platform,
+                    create_time_ms: crate::state::now_ms(),
+                    linked_to_git_hub: false,
+                    git_hub_account_name: None,
+                    tags,
+                    deployment_groups: ::std::collections::HashMap::new(),
+                    deployment_group_order: Vec::new(),
+                },
+            );
+            state.application_order.push(name.clone());
+            Ok(application_id)
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        Ok(CreateApplicationOutput {
+            application_id: Some(minted?),
+        })
     }
 }

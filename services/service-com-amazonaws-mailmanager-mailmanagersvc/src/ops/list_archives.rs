@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListArchives
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListArchives`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListArchives::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: pages the stored archive records in `ArchiveId` order. Reporting only —
+//! the single write it makes (dropping archives whose 30-day pending-deletion window has
+//! elapsed) is one the clock already owed at this instant.
 //!
 //! ## Shape of an operation
 //!
@@ -111,6 +105,11 @@ impl From<ListArchivesErrorModeled> for ListArchivesError {
     }
 }
 
+/// The page size `ListArchives` uses when the caller names none: the maximum the model's
+/// `PageSize` range allows (`smithy_query(query="operation",operation="ListArchives")`
+/// reports `range {min: 1, max: 50}`).
+const MAX_PAGE_SIZE: i32 = 50;
+
 /// The `ListArchives` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -147,18 +146,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListArchives` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListArchivesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListArchives"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListArchivesErrorModeled::ThrottlingException(ThrottlingException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+            .into());
+        };
+
+        // `PageSize` is modelled `range(1..50)`, so the boundary validator is the
+        // enforcement point and has already refused anything outside it; the modelled
+        // maximum stands in when the caller names none. The clamp is belt-and-braces for
+        // that unreachable case, so a page can never be zero-sized (an empty page
+        // carrying a `NextToken` would make a paging caller loop forever).
+        let requested = input
+            .page_size
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        let page_size = usize::try_from(requested).unwrap_or(1);
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        store.purge_permanently_deleted(now);
+
+        // A `NextToken` is this operation's own output, so it names an `ArchiveId` this
+        // service minted. Anything else is a token from another emulator run, a token
+        // whose archive has since been permanently deleted, or a value the caller
+        // invented: refused with the modelled `ValidationException` rather than answered
+        // with a plausible page the caller never asked for. That deliberately includes the
+        // rare case where the token's own archive was purged mid-pagination (its 30-day
+        // pending-deletion window elapsed between two pages): the caller is told its
+        // token is stale instead of silently resuming at a different record.
+        if let Some(token) = input.next_token.as_deref() {
+            if !store.archives.contains_key(token) {
+                return Err(ListArchivesErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!("NextToken {token} is not a valid pagination token.")),
+                })
+                .into());
+            }
+        }
+
+        // The archives are keyed by `ArchiveId` in a `BTreeMap`, so this walk is in one
+        // stable order and `NextToken` is simply the id to resume at — the range starts
+        // directly at that key rather than rescanning from the front. One extra record is
+        // taken to decide whether a further page exists, and is not reported.
+        let resume_from = input.next_token.clone().unwrap_or_default();
+        let mut page: Vec<&crate::state::ArchiveRecord> = store
+            .archives
+            .range(resume_from..)
+            .map(|(_, record)| record)
+            .take(page_size.saturating_add(1))
+            .collect();
+
+        let next_token = page.get(page_size).map(|record| record.archive_id.clone());
+        page.truncate(page_size);
+
+        Ok(ListArchivesOutput {
+            archives: page
+                .into_iter()
+                .map(|record| Archive {
+                    archive_id: record.archive_id.clone(),
+                    archive_name: Some(record.archive_name.clone()),
+                    archive_state: Some(record.archive_state.clone()),
+                    last_updated_timestamp: Some(crate::state::timestamp(
+                        record.last_updated_at_millis,
+                    )),
+                })
+                .collect(),
+            next_token,
+        })
     }
 }

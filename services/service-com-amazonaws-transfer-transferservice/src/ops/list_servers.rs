@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the stored servers in `BTreeMap` (`ServerId`) order, with the same page bound
+//! and opaque-token contract as `ListUsers`. `UserCount` is derived from the live user
+//! map per server. Like `DescribeServer`, this materialises the `STARTING` -> `ONLINE`
+//! transition the clock already made due, and writes nothing else.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +148,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServers"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            ListServersErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(st::decode_page_token(token).ok_or_else(|| {
+                ListServersErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+                    message: "The NextToken is not valid".to_string(),
+                })
+            })?),
+            None => None,
+        };
+
+        let now = ::std::time::Instant::now();
+        let mut guard = state.lock();
+        // Materialise only what the clock already owed at `now`.
+        guard.settle_servers(now);
+
+        // ONE walk of the server map for the page's records, and ONE pass over the user
+        // map for every `UserCount` on it — so the per-request work is `servers + users
+        // + page`, never the product `page x users`.
+        let stored: Vec<&st::Server> = guard.servers.values().collect();
+        let ids: Vec<&str> = stored
+            .iter()
+            .map(|server| server.server_id.as_str())
+            .collect();
+        let (page, next_key) =
+            st::page_bounds(&ids, after.as_deref(), st::page_limit(input.max_results));
+        let user_counts = guard.user_counts();
+
+        let servers = stored
+            .get(page)
+            .unwrap_or_default()
+            .iter()
+            .map(|stored| ListedServer {
+                arn: stored.arn.clone(),
+                domain: Some(stored.domain.clone()),
+                identity_provider_type: Some(stored.identity_provider_type.clone()),
+                endpoint_type: Some(stored.endpoint_type.clone()),
+                // `ListedServer.LoggingRole` targets `Role` (`len 20..2048`, pattern
+                // `^arn:.*role/\S+$`), not the nullable `NullableRole` that
+                // `DescribedServer` uses, so a server whose logging role was cleared to
+                // the empty string reports it absent here rather than as `""`.
+                logging_role: stored
+                    .logging_role
+                    .clone()
+                    .filter(|role| !role.is_empty()),
+                server_id: Some(stored.server_id.clone()),
+                state: Some(stored.state.clone()),
+                user_count: Some(
+                    user_counts
+                        .get(stored.server_id.as_str())
+                        .copied()
+                        .unwrap_or(0),
+                ),
+            })
+            .collect();
+
+        Ok(ListServersOutput {
+            // A token only when a further page remains.
+            next_token: next_key.as_deref().map(st::encode_page_token),
+            servers,
+        })
     }
 }

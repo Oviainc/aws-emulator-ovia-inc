@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutConfigurationRecorder
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutConfigurationRecorder`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutConfigurationRecorder::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates THE customer managed configuration recorder of this account and
+//! Region, persisting it in [`crate::state`] so `DescribeConfigurationRecorders` reads
+//! back exactly what was stored, including the ARN this operation mints.
 //!
 //! ## Shape of an operation
 //!
@@ -208,18 +202,198 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutConfigurationRecorder` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutConfigurationRecorderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutConfigurationRecorder"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let requested = &input.configuration_recorder;
+
+        // This operation cannot create a service-linked configuration recorder:
+        // `PutServiceLinkedConfigurationRecorder` does. A request that names a service
+        // principal or a connector is asking for one.
+        if requested.service_principal.is_some() || requested.connector_arn.is_some() {
+            return Err(
+                PutConfigurationRecorderErrorModeled::UnmodifiableEntityException(
+                    UnmodifiableEntityException {
+                        message: Some(
+                            "PutConfigurationRecorder cannot create a service-linked \
+                             configuration recorder; use \
+                             PutServiceLinkedConfigurationRecorder instead"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Config assigns the name "default" when the request does not carry one; a name
+        // that is present but blank is not a valid configuration recorder name.
+        let name = match requested.name.as_deref() {
+            None => crate::state::DEFAULT_NAME.to_string(),
+            Some(name) if name.trim().is_empty() => {
+                return Err(
+                    PutConfigurationRecorderErrorModeled::InvalidConfigurationRecorderNameException(
+                        InvalidConfigurationRecorderNameException {
+                            message: Some(
+                                "ConfigurationRecorder.name must not be blank".to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            Some(name) => name.to_string(),
+        };
+
+        if name.starts_with(crate::state::SERVICE_LINKED_RECORDER_NAME_PREFIX) {
+            return Err(
+                PutConfigurationRecorderErrorModeled::InvalidConfigurationRecorderNameException(
+                    InvalidConfigurationRecorderNameException {
+                        message: Some(format!(
+                            "the prefix '{}' is reserved for service-linked configuration \
+                             recorders, so '{name}' is not a valid configuration recorder name",
+                            crate::state::SERVICE_LINKED_RECORDER_NAME_PREFIX,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The server rejects a request without a defined `roleARN`, even though the
+        // model does not mark it required.
+        let Some(role_arn) = requested
+            .role_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|role| !role.is_empty())
+        else {
+            return Err(PutConfigurationRecorderErrorModeled::InvalidRoleException(
+                InvalidRoleException {
+                    message: Some(
+                        "ConfigurationRecorder.roleARN must be a non-empty IAM role ARN"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        if let Some(violation) = recording_group_violation(requested.recording_group.as_ref()) {
+            return Err(
+                PutConfigurationRecorderErrorModeled::InvalidRecordingGroupException(
+                    InvalidRecordingGroupException {
+                        message: Some(violation),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An absent recording group means "record all supported resource types,
+        // excluding the global IAM resource types".
+        let recording_group = Some(
+            requested
+                .recording_group
+                .clone()
+                .unwrap_or_else(crate::state::default_recording_group),
+        );
+
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // One customer managed configuration recorder per account per Region.
+        if !store.recorders.contains_key(&name) && !store.recorders.is_empty() {
+            return Err(
+                PutConfigurationRecorderErrorModeled::MaxNumberOfConfigurationRecordersExceededException(
+                    MaxNumberOfConfigurationRecordersExceededException {
+                        message: Some(format!(
+                            "this account already has a customer managed configuration recorder \
+                             in {region}; only one can exist for each account for each Region"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        if let Some(existing) = store.recorders.get_mut(&name) {
+            // An update replaces the recorder's configuration but keeps the ARN it was
+            // created with; tags are added at creation and are not updated here.
+            existing.role_arn = role_arn.to_string();
+            existing.recording_group = recording_group;
+            existing.recording_mode = requested.recording_mode.clone();
+            existing.recording_scope = requested.recording_scope.clone();
+        } else {
+            let arn = crate::state::recorder_arn(&region, &name);
+            store.recorders.insert(
+                name.clone(),
+                crate::state::RecorderEntry {
+                    name: name.clone(),
+                    arn: arn.clone(),
+                    role_arn: role_arn.to_string(),
+                    recording_group,
+                    recording_mode: requested.recording_mode.clone(),
+                    recording_scope: requested.recording_scope.clone(),
+                    service_principal: None,
+                    tags: input.tags.clone().unwrap_or_default(),
+                },
+            );
+            // A recorder that has just been created is not recording: it begins
+            // recording on `StartConfigurationRecorder`.
+            store.recorder_status.insert(
+                name.clone(),
+                crate::state::RecorderStatusEntry::new(&name, &arn),
+            );
+        }
+
+        Ok(PutConfigurationRecorderOutput)
     }
+}
+
+/// Why `group` is not a valid `RecordingGroup`, or `None` when it is.
+///
+/// The combinations refused here are the ones `InvalidRecordingGroupException`
+/// documents: `allSupported` together with an explicit resource-type list,
+/// `allSupported` together with the exclusion recording strategy, and a group in
+/// which every parameter is null, false or empty.
+fn recording_group_violation(group: Option<&RecordingGroup>) -> Option<String> {
+    let group = group?;
+    let resource_types = group.resource_types.as_deref().unwrap_or(&[]);
+    let excluded = group
+        .exclusion_by_resource_types
+        .as_ref()
+        .and_then(|exclusion| exclusion.resource_types.as_deref())
+        .unwrap_or(&[]);
+    let strategy = group
+        .recording_strategy
+        .as_ref()
+        .and_then(|strategy| strategy.use_only.as_deref());
+
+    if group.all_supported && !resource_types.is_empty() {
+        return Some(
+            "RecordingGroup.allSupported is true, so RecordingGroup.resourceTypes must be empty"
+                .to_string(),
+        );
+    }
+    if group.all_supported && strategy == Some(crate::state::RECORDING_STRATEGY_EXCLUSION) {
+        return Some(format!(
+            "RecordingGroup.allSupported is true, so RecordingStrategy.useOnly must not be {}",
+            crate::state::RECORDING_STRATEGY_EXCLUSION,
+        ));
+    }
+    if !group.all_supported
+        && !group.include_global_resource_types
+        && resource_types.is_empty()
+        && excluded.is_empty()
+        && strategy.is_none()
+    {
+        return Some(
+            "every RecordingGroup parameter is null, false or empty; specify allSupported, \
+             resourceTypes, exclusionByResourceTypes or recordingStrategy"
+                .to_string(),
+        );
+    }
+    None
 }

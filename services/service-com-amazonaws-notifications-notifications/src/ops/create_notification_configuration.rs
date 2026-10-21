@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNotificationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNotificationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNotificationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a configuration arn, persists the record the request describes, and
+//! answers `{arn, status}` read back out of that record.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +157,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNotificationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNotificationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNotificationConfiguration"))
+        let _ = ctx;
+
+        // The store is the only place a configuration exists; without it there is
+        // nothing to create in, which is a server fault, not a client error.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateNotificationConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the notifications store is unavailable".to_string(),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // The store is bounded: past its ceiling a create is refused with the
+        // error the model declares for a quota, not served by growing the store
+        // further.
+        if !store.has_configuration_capacity() {
+            return Err(
+                CreateNotificationConfigurationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this account already holds the maximum of {} NotificationConfigurations",
+                            crate::state::MAX_NOTIFICATION_CONFIGURATIONS
+                        ),
+                        resource_type: "NotificationConfiguration".to_string(),
+                        resource_id: None,
+                        service_code: Some("notifications".to_string()),
+                        quota_code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `name`, `description`, `tags` and `aggregationDuration` already satisfy
+        // every modelled constraint: the boundary validator refused the request
+        // before this handler ran otherwise.
+        let (arn, sequence) = store.mint_configuration_arn();
+        let record = crate::state::NotificationConfigurationRecord {
+            arn: arn.clone(),
+            name: input.name,
+            description: input.description,
+            aggregation_duration: input.aggregation_duration,
+            status: crate::state::CONFIGURATION_STATUS_ACTIVE.to_string(),
+            // A configuration an account creates for itself is `ACCOUNT`;
+            // `ADMIN_MANAGED` belongs to one an organization's management
+            // account owns, which this call is not.
+            subtype: Some(crate::state::CONFIGURATION_SUBTYPE_ACCOUNT.to_string()),
+            creation_time: crate::state::now(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // A configuration is created with no EventRule and no channel
+            // association; `CreateEventRule` and `AssociateChannel` are the
+            // operations that add them, and both are still 501 stubs.
+            event_rule_sources: std::collections::BTreeSet::new(),
+            channel_arns: std::collections::BTreeSet::new(),
+            sequence,
+        };
+        store.configurations.insert(arn.clone(), record);
+
+        // Read the response back out of the stored record rather than echoing the
+        // value just built, so this response can only report what a later Get does.
+        let stored = store.configurations.get(&arn).ok_or_else(|| {
+            CreateNotificationConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the created configuration could not be read back".to_string(),
+                },
+            )
+        })?;
+        Ok(CreateNotificationConfigurationOutput {
+            arn: stored.arn.clone(),
+            status: stored.status.clone(),
+        })
     }
 }

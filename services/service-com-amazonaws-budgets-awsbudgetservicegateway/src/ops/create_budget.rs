@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBudget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBudget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBudget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a new budget under `(AccountId, Budget.BudgetName)` together with the
+//! notifications, subscribers and tags supplied with it, stamping
+//! `Budget.LastUpdatedTime` with the time of the call. The name is unique within an
+//! account, so a second create for the same pair is a `DuplicateRecordException`.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +168,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBudget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBudgetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBudget"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBudgetErrorModeled::InternalErrorException(InternalErrorException {
+                message: Some(
+                    "budgets is mounted on an engine that holds no state for it".to_string(),
+                ),
+            })
+        })?;
+
+        // The rules the model documents but no constraint trait can express; every
+        // modelled constraint (the 12-digit AccountId, the BudgetName pattern, the
+        // TimeUnit/BudgetType enums, the list bounds) was already refused upstream.
+        crate::state::validate_budget(&input.budget).map_err(|message| {
+            CreateBudgetErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+        })?;
+
+        let key = (input.account_id.clone(), input.budget.budget_name.clone());
+        let mut store = state.lock();
+        if store.budgets.contains_key(&key) {
+            return Err(CreateBudgetErrorModeled::DuplicateRecordException(
+                DuplicateRecordException {
+                    message: Some(format!(
+                        "Error creating budget: {} - the budget already exists.",
+                        input.budget.budget_name
+                    )),
+                },
+            )
+            .into());
+        }
+        // The store is bounded: both halves of the key come from the request, so without
+        // a ceiling a caller could grow this process without limit. The account's own
+        // quota is AWS's documented one; the total is the emulator's memory bound.
+        if crate::state::budget_count_for_account(&store, &input.account_id)
+            >= crate::state::MAX_BUDGETS_PER_ACCOUNT
+        {
+            return Err(CreateBudgetErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "Error creating budget: {} - the account has reached its quota of {} \
+                         budgets.",
+                        input.budget.budget_name,
+                        crate::state::MAX_BUDGETS_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+        if store.budgets.len() >= crate::state::MAX_BUDGETS_TOTAL {
+            return Err(CreateBudgetErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "Error creating budget: {} - this emulator holds its maximum of {} \
+                         budgets.",
+                        input.budget.budget_name,
+                        crate::state::MAX_BUDGETS_TOTAL
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut budget = input.budget;
+        // "The last time that you updated this budget" — stamped by the service, so a
+        // value the caller sent is replaced rather than echoed.
+        budget.last_updated_time = Some(::aws_smithy_types::DateTime::from(
+            ::std::time::SystemTime::now(),
+        ));
+        let notifications = input
+            .notifications_with_subscribers
+            .unwrap_or_default()
+            .into_iter()
+            .map(|supplied| crate::state::StoredNotification {
+                notification: supplied.notification,
+                subscribers: supplied.subscribers,
+            })
+            .collect();
+        store.budgets.insert(
+            key,
+            crate::state::StoredBudget {
+                budget,
+                notifications,
+                tags: input.resource_tags.unwrap_or_default(),
+            },
+        );
+
+        Ok(CreateBudgetOutput {})
     }
 }

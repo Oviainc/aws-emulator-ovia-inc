@@ -28,6 +28,8 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `time` lets a test await the clock-owed recorder status transition.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

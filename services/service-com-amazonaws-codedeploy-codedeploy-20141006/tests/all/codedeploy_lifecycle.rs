@@ -1,0 +1,1425 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The CodeDeploy application / deployment-group / deployment lifecycle, driven
+//! over the wire.
+//!
+//! Every case here goes through the same front door a client uses: a signed-shape
+//! `POST /` with `X-Amz-Target: CodeDeploy_20141006.<Operation>` dispatched by the
+//! multi-service router, so the boundary validator, this service's refusal
+//! wording and the awsJson1_1 envelope are all exercised, not bypassed.
+
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
+use std::sync::Arc;
+
+/// One emulator with one CodeDeploy service mounted on one shared engine.
+struct Emulator {
+    router: MultiServiceRouter,
+}
+
+impl Emulator {
+    fn new() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        // The suite signs nothing; routing is by `X-Amz-Target`.
+        router.set_request_authentication(false);
+        router.register_service(
+            service_com_amazonaws_codedeploy_codedeploy_20141006::EmulatedService::new(engine),
+        );
+        Self { router }
+    }
+
+    /// Call `operation` with `body`, answering its HTTP status and parsed body.
+    async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
+        let request = ::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("x-amz-target", format!("CodeDeploy_20141006.{operation}"))
+            .header("content-type", "application/x-amz-json-1.1")
+            .body(bytes::Bytes::from(body.to_string()))
+            .expect("the request is well formed");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let parsed = if response.body().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+        };
+        (status, parsed)
+    }
+
+    /// Call `operation` and require success, answering the response body.
+    async fn ok(&self, operation: &str, body: Value) -> Value {
+        let (status, parsed) = self.call(operation, body).await;
+        assert_eq!(status, 200, "{operation} must succeed, got {parsed:?}");
+        parsed
+    }
+}
+
+/// The wire error code of a failure body: awsJson carries it in `__type`, either
+/// bare or namespaced.
+fn error_code(body: &Value) -> String {
+    body["__type"]
+        .as_str()
+        .unwrap_or("<no __type>")
+        .rsplit('#')
+        .next()
+        .unwrap_or("<no __type>")
+        .to_string()
+}
+
+/// An `s3Location` revision, the form the AWS CLI's `--s3-location` sends.
+fn s3_revision(bucket: &str, key: &str) -> Value {
+    json!({"revisionType": "S3", "s3Location": {"bucket": bucket, "key": key, "bundleType": "zip"}})
+}
+
+/// Create an application and a deployment group on it, answering the group name.
+async fn seeded_group(emulator: &Emulator, application: &str, platform: &str) -> String {
+    emulator
+        .ok(
+            "CreateApplication",
+            json!({"applicationName": application, "computePlatform": platform}),
+        )
+        .await;
+    let group = format!("{application}-dg");
+    emulator
+        .ok(
+            "CreateDeploymentGroup",
+            json!({
+                "applicationName": application,
+                "deploymentGroupName": group,
+                "serviceRoleArn": "arn:aws:iam::123456789012:role/CodeDeployRole",
+            }),
+        )
+        .await;
+    group
+}
+
+// ---------------------------------------------------------------------------
+// Applications
+// ---------------------------------------------------------------------------
+
+/// RULE: a created resource is answered from the stored record — the id
+/// `CreateApplication` minted comes back from `GetApplication`, with the
+/// compute platform the request asked for, or CodeDeploy's `Server` default
+/// when the request named none.
+#[tokio::test]
+async fn an_application_reads_back_as_it_was_created() {
+    let emulator = Emulator::new();
+    // Rows differ along `computePlatform`: every value the model's enum carries,
+    // plus its absence.
+    let cases: &[(&str, Option<&str>, &str)] = &[
+        ("app-server", Some("Server"), "Server"),
+        ("app-lambda", Some("Lambda"), "Lambda"),
+        ("app-ecs", Some("ECS"), "ECS"),
+        ("app-defaulted", None, "Server"),
+    ];
+
+    let mut seen_ids: Vec<String> = Vec::new();
+    for (name, requested, expected) in cases {
+        let mut request = json!({"applicationName": name});
+        if let Some(platform) = requested {
+            request["computePlatform"] = json!(platform);
+        }
+        let created = emulator.ok("CreateApplication", request).await;
+        let application_id = created["applicationId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !application_id.is_empty(),
+            "case {name:?}: expected a minted applicationId, got {created:?}"
+        );
+
+        let fetched = emulator
+            .ok("GetApplication", json!({"applicationName": name}))
+            .await;
+        let application = &fetched["application"];
+        assert_eq!(
+            application["applicationId"].as_str(),
+            Some(application_id.as_str()),
+            "case {name:?}: expected the stored applicationId {application_id}, got {application:?}"
+        );
+        assert_eq!(
+            application["applicationName"].as_str(),
+            Some(*name),
+            "case {name:?}: expected the stored name, got {application:?}"
+        );
+        assert_eq!(
+            application["computePlatform"].as_str(),
+            Some(*expected),
+            "case {name:?}: expected computePlatform {expected}, got {application:?}"
+        );
+        assert_eq!(
+            application["linkedToGitHub"].as_bool(),
+            Some(false),
+            "case {name:?}: expected linkedToGitHub false, got {application:?}"
+        );
+        assert!(
+            application["createTime"].as_f64().unwrap_or_default() > 0.0,
+            "case {name:?}: expected a createTime, got {application:?}"
+        );
+
+        // A second read answers the same record: reporting changes nothing.
+        let again = emulator
+            .ok("GetApplication", json!({"applicationName": name}))
+            .await;
+        assert_eq!(
+            again, fetched,
+            "case {name:?}: expected a read to be repeatable, got {again:?}"
+        );
+
+        assert!(
+            !seen_ids.contains(&application_id),
+            "case {name:?}: expected a distinct applicationId, {application_id} was minted twice"
+        );
+        seen_ids.push(application_id);
+    }
+
+    let listed = emulator.ok("ListApplications", json!({})).await;
+    let applications = listed["applications"].as_array().cloned().unwrap_or_default();
+    for (name, _, _) in cases {
+        assert!(
+            applications.iter().any(|listed| listed.as_str() == Some(*name)),
+            "case {name:?}: expected ListApplications to carry it, got {applications:?}"
+        );
+    }
+}
+
+/// RULE: an application name is unique per account, so re-creating one is
+/// refused with `ApplicationAlreadyExistsException` whatever the name looks like.
+#[tokio::test]
+async fn re_creating_an_application_is_refused() {
+    let emulator = Emulator::new();
+    // Rows differ along the FORM of an accepted name: plain, every punctuation
+    // character the modelled pattern allows, and the modelled maximum length.
+    let cases: &[&str] = &["demo-app", "a+b=c,d.e@f_g-h", &"n".repeat(100)];
+
+    for name in cases {
+        emulator
+            .ok("CreateApplication", json!({"applicationName": name}))
+            .await;
+        let (status, body) = emulator
+            .call("CreateApplication", json!({"applicationName": name}))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {name:?}: expected HTTP 400 on the second create, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ApplicationAlreadyExistsException",
+            "case {name:?}: expected ApplicationAlreadyExistsException, got {body:?}"
+        );
+    }
+}
+
+/// RULE: a refused input member is answered with CodeDeploy's OWN code for that
+/// member — the `…RequiredException` when it was not given (absent or empty), the
+/// `Invalid…Exception` when the value is not one the service accepts — on every
+/// operation that carries the member, not a generic `ValidationException`.
+#[tokio::test]
+async fn a_refused_member_is_answered_with_codedeploys_code_for_it() {
+    let emulator = Emulator::new();
+    seeded_group(&emulator, "refusals", "Server").await;
+
+    // Rows span the members and the two refusal kinds: absent, empty, too long,
+    // outside the pattern, and outside an enum's value set.
+    let long_name = "n".repeat(101);
+    let cases: &[(&str, Value, &str)] = &[
+        (
+            "CreateApplication",
+            json!({}),
+            "ApplicationNameRequiredException",
+        ),
+        (
+            "CreateApplication",
+            json!({"applicationName": ""}),
+            "ApplicationNameRequiredException",
+        ),
+        (
+            "CreateApplication",
+            json!({"applicationName": long_name}),
+            "InvalidApplicationNameException",
+        ),
+        (
+            "CreateApplication",
+            json!({"applicationName": "has spaces"}),
+            "InvalidApplicationNameException",
+        ),
+        (
+            "CreateApplication",
+            json!({"applicationName": "ok-name", "computePlatform": "Windows"}),
+            "InvalidComputePlatformException",
+        ),
+        (
+            "GetApplication",
+            json!({"applicationName": ""}),
+            "ApplicationNameRequiredException",
+        ),
+        (
+            "GetApplication",
+            json!({"applicationName": "has spaces"}),
+            "InvalidApplicationNameException",
+        ),
+        (
+            "DeleteApplication",
+            json!({"applicationName": ""}),
+            "ApplicationNameRequiredException",
+        ),
+        (
+            "ListDeployments",
+            json!({"applicationName": "refusals", "deploymentGroupName": ""}),
+            "DeploymentGroupNameRequiredException",
+        ),
+        (
+            "GetDeploymentGroup",
+            json!({"applicationName": "refusals", "deploymentGroupName": "has spaces"}),
+            "InvalidDeploymentGroupNameException",
+        ),
+        (
+            "GetDeployment",
+            json!({}),
+            "DeploymentIdRequiredException",
+        ),
+        (
+            "GetDeploymentConfig",
+            json!({"deploymentConfigName": ""}),
+            "DeploymentConfigNameRequiredException",
+        ),
+        (
+            "CreateDeploymentGroup",
+            json!({
+                "applicationName": "refusals",
+                "deploymentGroupName": "ok-group",
+                "serviceRoleArn": ""
+            }),
+            "RoleRequiredException",
+        ),
+    ];
+
+    for (operation, request, expected) in cases {
+        let (status, body) = emulator.call(operation, request.clone()).await;
+        assert_eq!(
+            status, 400,
+            "case {operation}/{request}: expected HTTP 400, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            *expected,
+            "case {operation}/{request}: expected {expected}, got {body:?}"
+        );
+    }
+}
+
+/// RULE: `ListApplications` is `@paginated` on `nextToken` alone, so a token
+/// CONTINUES the listing — every stored name is reported exactly once across the
+/// pages — and a token this service did not issue is refused.
+#[tokio::test]
+async fn listing_applications_pages_without_repeating_or_restarting() {
+    let emulator = Emulator::new();
+    let total = 150;
+    for index in 0..total {
+        emulator
+            .ok(
+                "CreateApplication",
+                json!({"applicationName": format!("paged-{index:03}")}),
+            )
+            .await;
+    }
+
+    let mut collected: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let request = match &token {
+            Some(token) => json!({"nextToken": token}),
+            None => json!({}),
+        };
+        let page = emulator.ok("ListApplications", request).await;
+        let names: Vec<String> = page["applications"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|name| name.as_str().map(str::to_string))
+            .collect();
+        assert!(
+            !names.is_empty(),
+            "case page {pages}: expected a non-empty page, got {page:?}"
+        );
+        collected.extend(names);
+        pages += 1;
+        assert!(pages <= 5, "case page {pages}: paging did not terminate");
+        token = page["nextToken"].as_str().map(str::to_string);
+        if token.is_none() {
+            break;
+        }
+    }
+
+    assert!(
+        pages > 1,
+        "case 150 applications: expected more than one page, got {pages}"
+    );
+    assert_eq!(
+        collected.len(),
+        total,
+        "case 150 applications: expected every name exactly once, got {} names",
+        collected.len()
+    );
+    let mut sorted = collected.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        total,
+        "case 150 applications: expected no repeats across pages, got {} distinct of {}",
+        sorted.len(),
+        collected.len()
+    );
+
+    for bogus in ["not-a-token", "p", "pzzz-", ""] {
+        let (status, body) = emulator
+            .call("ListApplications", json!({"nextToken": bogus}))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case token {bogus:?}: expected HTTP 400, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidNextTokenException",
+            "case token {bogus:?}: expected InvalidNextTokenException, got {body:?}"
+        );
+    }
+}
+
+/// RULE: deleting an application removes it and the deployment groups it owns,
+/// and deleting one that is not there is a success.
+#[tokio::test]
+async fn deleting_an_application_removes_it_and_its_groups() {
+    let emulator = Emulator::new();
+    let group = seeded_group(&emulator, "doomed", "Server").await;
+    emulator
+        .ok("CreateApplication", json!({"applicationName": "survivor"}))
+        .await;
+
+    emulator
+        .ok("DeleteApplication", json!({"applicationName": "doomed"}))
+        .await;
+
+    let (status, body) = emulator
+        .call("GetApplication", json!({"applicationName": "doomed"}))
+        .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "ApplicationDoesNotExistException"),
+        "case deleted application: expected ApplicationDoesNotExistException, got {status} {body:?}"
+    );
+
+    let (status, body) = emulator
+        .call(
+            "GetDeploymentGroup",
+            json!({"applicationName": "doomed", "deploymentGroupName": group}),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "ApplicationDoesNotExistException"),
+        "case group of a deleted application: expected ApplicationDoesNotExistException, got {status} {body:?}"
+    );
+
+    let listed = emulator.ok("ListApplications", json!({})).await;
+    let applications = listed["applications"].as_array().cloned().unwrap_or_default();
+    assert!(
+        applications.iter().all(|name| name.as_str() != Some("doomed")),
+        "case deleted application: expected it gone from ListApplications, got {applications:?}"
+    );
+    assert!(
+        applications.iter().any(|name| name.as_str() == Some("survivor")),
+        "case surviving application: expected it still listed, got {applications:?}"
+    );
+
+    // Deleting what is not there is a no-op success, twice over: the name just
+    // deleted, and one never created.
+    for name in ["doomed", "never-existed"] {
+        let (status, body) = emulator
+            .call("DeleteApplication", json!({"applicationName": name}))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case delete {name:?}: expected a no-op success, got {status} {body:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deployment configurations
+// ---------------------------------------------------------------------------
+
+/// RULE: the `CodeDeployDefault.*` configurations CodeDeploy ships resolve
+/// without anyone creating them, each with the healthy-hosts or traffic-routing
+/// setting documented for it; anything else does not resolve.
+#[tokio::test]
+async fn the_builtin_deployment_configurations_resolve() {
+    let emulator = Emulator::new();
+    // Catalog source: the AWS CodeDeploy User Guide's deployment-configuration
+    // tables (EC2/on-premises, and AWS Lambda / Amazon ECS).
+    struct Builtin {
+        name: &'static str,
+        platform: &'static str,
+        /// `minimumHealthyHosts` as (type, value).
+        healthy: Option<(&'static str, i64)>,
+        /// `trafficRoutingConfig.type`.
+        routing: Option<&'static str>,
+    }
+    let cases = &[
+        Builtin {
+            name: "CodeDeployDefault.OneAtATime",
+            platform: "Server",
+            healthy: Some(("FLEET_PERCENT", 99)),
+            routing: None,
+        },
+        Builtin {
+            name: "CodeDeployDefault.HalfAtATime",
+            platform: "Server",
+            healthy: Some(("FLEET_PERCENT", 50)),
+            routing: None,
+        },
+        Builtin {
+            name: "CodeDeployDefault.AllAtOnce",
+            platform: "Server",
+            healthy: Some(("HOST_COUNT", 0)),
+            routing: None,
+        },
+        Builtin {
+            name: "CodeDeployDefault.LambdaAllAtOnce",
+            platform: "Lambda",
+            healthy: None,
+            routing: Some("AllAtOnce"),
+        },
+        Builtin {
+            name: "CodeDeployDefault.ECSAllAtOnce",
+            platform: "ECS",
+            healthy: None,
+            routing: Some("AllAtOnce"),
+        },
+    ];
+
+    for Builtin {
+        name,
+        platform,
+        healthy,
+        routing,
+    } in cases
+    {
+        let fetched = emulator
+            .ok("GetDeploymentConfig", json!({"deploymentConfigName": name}))
+            .await;
+        let info = &fetched["deploymentConfigInfo"];
+        assert_eq!(
+            info["deploymentConfigName"].as_str(),
+            Some(*name),
+            "case {name}: expected the configuration's own name, got {info:?}"
+        );
+        assert!(
+            !info["deploymentConfigId"].as_str().unwrap_or_default().is_empty(),
+            "case {name}: expected a deploymentConfigId, got {info:?}"
+        );
+        assert_eq!(
+            info["computePlatform"].as_str(),
+            Some(*platform),
+            "case {name}: expected computePlatform {platform}, got {info:?}"
+        );
+        match healthy {
+            Some((kind, value)) => assert_eq!(
+                (
+                    info["minimumHealthyHosts"]["type"].as_str(),
+                    info["minimumHealthyHosts"]["value"].as_i64()
+                ),
+                (Some(*kind), Some(*value)),
+                "case {name}: expected minimumHealthyHosts {kind}/{value}, got {info:?}"
+            ),
+            None => assert!(
+                info["minimumHealthyHosts"].is_null(),
+                "case {name}: expected no minimumHealthyHosts, got {info:?}"
+            ),
+        }
+        match routing {
+            Some(kind) => assert_eq!(
+                info["trafficRoutingConfig"]["type"].as_str(),
+                Some(*kind),
+                "case {name}: expected trafficRoutingConfig {kind}, got {info:?}"
+            ),
+            None => assert!(
+                info["trafficRoutingConfig"].is_null(),
+                "case {name}: expected no trafficRoutingConfig, got {info:?}"
+            ),
+        }
+    }
+
+    for unknown in ["CodeDeployDefault.Nope", "my-own-config"] {
+        let (status, body) = emulator
+            .call(
+                "GetDeploymentConfig",
+                json!({"deploymentConfigName": unknown}),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "DeploymentConfigDoesNotExistException"),
+            "case {unknown}: expected DeploymentConfigDoesNotExistException, got {status} {body:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deployment groups
+// ---------------------------------------------------------------------------
+
+/// RULE: a deployment group is stored under its application with everything the
+/// request gave it, and an omitted `deploymentConfigName` resolves to the
+/// default built-in for the application's compute platform.
+#[tokio::test]
+async fn a_deployment_group_reads_back_as_it_was_created() {
+    let emulator = Emulator::new();
+    // Rows differ along compute platform (which default applies) and along how
+    // much optional configuration the request carried.
+    let cases: &[(&str, &str, Option<&str>, &str, Value)] = &[
+        (
+            "grp-server",
+            "Server",
+            None,
+            "CodeDeployDefault.OneAtATime",
+            json!({}),
+        ),
+        (
+            "grp-lambda",
+            "Lambda",
+            None,
+            "CodeDeployDefault.LambdaAllAtOnce",
+            json!({}),
+        ),
+        (
+            "grp-ecs",
+            "ECS",
+            None,
+            "CodeDeployDefault.ECSAllAtOnce",
+            json!({}),
+        ),
+        (
+            "grp-explicit",
+            "Server",
+            Some("CodeDeployDefault.HalfAtATime"),
+            "CodeDeployDefault.HalfAtATime",
+            json!({
+                "ec2TagFilters": [{"Key": "Name", "Value": "web", "Type": "KEY_AND_VALUE"}],
+                "autoRollbackConfiguration": {"enabled": true, "events": ["DEPLOYMENT_FAILURE"]},
+                "deploymentStyle": {"deploymentType": "IN_PLACE", "deploymentOption": "WITHOUT_TRAFFIC_CONTROL"},
+                "terminationHookEnabled": true,
+            }),
+        ),
+    ];
+
+    for (application, platform, config, expected_config, extras) in cases {
+        emulator
+            .ok(
+                "CreateApplication",
+                json!({"applicationName": application, "computePlatform": platform}),
+            )
+            .await;
+        let mut request = json!({
+            "applicationName": application,
+            "deploymentGroupName": "dg",
+            "serviceRoleArn": "arn:aws:iam::123456789012:role/CodeDeployRole",
+        });
+        if let Some(config) = config {
+            request["deploymentConfigName"] = json!(config);
+        }
+        for (member, value) in extras.as_object().cloned().unwrap_or_default() {
+            request[member] = value;
+        }
+
+        let created = emulator.ok("CreateDeploymentGroup", request.clone()).await;
+        let group_id = created["deploymentGroupId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !group_id.is_empty(),
+            "case {application}: expected a minted deploymentGroupId, got {created:?}"
+        );
+
+        let fetched = emulator
+            .ok(
+                "GetDeploymentGroup",
+                json!({"applicationName": application, "deploymentGroupName": "dg"}),
+            )
+            .await;
+        let info = &fetched["deploymentGroupInfo"];
+        assert_eq!(
+            info["deploymentGroupId"].as_str(),
+            Some(group_id.as_str()),
+            "case {application}: expected the stored deploymentGroupId, got {info:?}"
+        );
+        assert_eq!(
+            info["applicationName"].as_str(),
+            Some(*application),
+            "case {application}: expected the owning application, got {info:?}"
+        );
+        assert_eq!(
+            info["deploymentConfigName"].as_str(),
+            Some(*expected_config),
+            "case {application}: expected deploymentConfigName {expected_config}, got {info:?}"
+        );
+        assert_eq!(
+            info["serviceRoleArn"].as_str(),
+            Some("arn:aws:iam::123456789012:role/CodeDeployRole"),
+            "case {application}: expected the stored serviceRoleArn, got {info:?}"
+        );
+        assert_eq!(
+            info["computePlatform"].as_str(),
+            Some(*platform),
+            "case {application}: expected the application's computePlatform, got {info:?}"
+        );
+        // Whatever optional configuration the request carried comes back; what it
+        // did not carry is absent rather than invented.
+        if extras.get("autoRollbackConfiguration").is_some() {
+            assert_eq!(
+                info["autoRollbackConfiguration"]["events"][0].as_str(),
+                Some("DEPLOYMENT_FAILURE"),
+                "case {application}: expected the stored autoRollbackConfiguration, got {info:?}"
+            );
+            assert_eq!(
+                info["ec2TagFilters"][0]["Key"].as_str(),
+                Some("Name"),
+                "case {application}: expected the stored ec2TagFilters, got {info:?}"
+            );
+            assert_eq!(
+                info["terminationHookEnabled"].as_bool(),
+                Some(true),
+                "case {application}: expected terminationHookEnabled true, got {info:?}"
+            );
+        } else {
+            assert!(
+                info["ec2TagFilters"].is_null(),
+                "case {application}: expected no ec2TagFilters, got {info:?}"
+            );
+            assert!(
+                info["autoRollbackConfiguration"].is_null(),
+                "case {application}: expected no autoRollbackConfiguration, got {info:?}"
+            );
+        }
+
+        // The same group name is taken now.
+        let (status, body) = emulator.call("CreateDeploymentGroup", request).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "DeploymentGroupAlreadyExistsException"),
+            "case {application}: expected DeploymentGroupAlreadyExistsException, got {status} {body:?}"
+        );
+    }
+}
+
+/// RULE: a deployment group can only be created on an application that exists,
+/// with a deployment configuration that exists.
+#[tokio::test]
+async fn a_deployment_group_needs_an_application_and_a_configuration() {
+    let emulator = Emulator::new();
+    emulator
+        .ok("CreateApplication", json!({"applicationName": "real-app"}))
+        .await;
+
+    let cases: &[(&str, &str, Option<&str>, &str)] = &[
+        (
+            "missing-app",
+            "dg",
+            None,
+            "ApplicationDoesNotExistException",
+        ),
+        (
+            "real-app",
+            "dg",
+            Some("CodeDeployDefault.NotAThing"),
+            "DeploymentConfigDoesNotExistException",
+        ),
+    ];
+
+    for (application, group, config, expected) in cases {
+        let mut request = json!({
+            "applicationName": application,
+            "deploymentGroupName": group,
+            "serviceRoleArn": "arn:aws:iam::123456789012:role/CodeDeployRole",
+        });
+        if let Some(config) = config {
+            request["deploymentConfigName"] = json!(config);
+        }
+        let (status, body) = emulator.call("CreateDeploymentGroup", request).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, *expected),
+            "case {application}/{group}: expected {expected}, got {status} {body:?}"
+        );
+    }
+
+    let (status, body) = emulator
+        .call(
+            "GetDeploymentGroup",
+            json!({"applicationName": "real-app", "deploymentGroupName": "nope"}),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "DeploymentGroupDoesNotExistException"),
+        "case unknown group: expected DeploymentGroupDoesNotExistException, got {status} {body:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Deployments
+// ---------------------------------------------------------------------------
+
+/// RULE: `GetDeployment` reconstructs the deployment from the stored record —
+/// the revision exactly as supplied, the effective configuration, the creator,
+/// and the application's compute platform — for every form a revision takes.
+#[tokio::test]
+async fn a_deployment_reads_back_as_it_was_created() {
+    let emulator = Emulator::new();
+    let group = seeded_group(&emulator, "deployed", "Server").await;
+
+    // Rows differ along the revision's own form: each member the model's
+    // `RevisionLocation` carries.
+    let cases: &[(&str, Value)] = &[
+        ("s3", s3_revision("my-bucket", "app.zip")),
+        (
+            "github",
+            json!({"revisionType": "GitHub", "gitHubLocation": {"repository": "octo/app", "commitId": "0f1e2d3"}}),
+        ),
+        (
+            "string",
+            json!({"revisionType": "String", "string": {"content": "version: 0.0", "sha256": "abc"}}),
+        ),
+        (
+            "appspec",
+            json!({"revisionType": "AppSpecContent", "appSpecContent": {"content": "version: 0.0", "sha256": "def"}}),
+        ),
+    ];
+
+    let mut seen_ids: Vec<String> = Vec::new();
+    for (case, revision) in cases {
+        let created = emulator
+            .ok(
+                "CreateDeployment",
+                json!({
+                    "applicationName": "deployed",
+                    "deploymentGroupName": group,
+                    "revision": revision,
+                    "description": format!("deploy {case}"),
+                }),
+            )
+            .await;
+        let deployment_id = created["deploymentId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            deployment_id.starts_with("d-") && deployment_id.len() == 11,
+            "case {case}: expected a d-XXXXXXXXX deployment id, got {created:?}"
+        );
+        assert!(
+            !seen_ids.contains(&deployment_id),
+            "case {case}: expected a distinct deploymentId, {deployment_id} was minted twice"
+        );
+        seen_ids.push(deployment_id.clone());
+
+        let fetched = emulator
+            .ok("GetDeployment", json!({"deploymentId": deployment_id}))
+            .await;
+        let info = &fetched["deploymentInfo"];
+        assert_eq!(
+            info["deploymentId"].as_str(),
+            Some(deployment_id.as_str()),
+            "case {case}: expected the stored deploymentId, got {info:?}"
+        );
+        assert_eq!(
+            info["applicationName"].as_str(),
+            Some("deployed"),
+            "case {case}: expected the stored applicationName, got {info:?}"
+        );
+        assert_eq!(
+            info["deploymentGroupName"].as_str(),
+            Some(group.as_str()),
+            "case {case}: expected the stored deploymentGroupName, got {info:?}"
+        );
+        assert_eq!(
+            info["deploymentConfigName"].as_str(),
+            Some("CodeDeployDefault.OneAtATime"),
+            "case {case}: expected the group's effective configuration, got {info:?}"
+        );
+        assert_eq!(
+            info["revision"], *revision,
+            "case {case}: expected the revision as supplied, got {:?}",
+            info["revision"]
+        );
+        assert_eq!(
+            info["creator"].as_str(),
+            Some("user"),
+            "case {case}: expected creator user, got {info:?}"
+        );
+        assert_eq!(
+            info["computePlatform"].as_str(),
+            Some("Server"),
+            "case {case}: expected the application's computePlatform, got {info:?}"
+        );
+        assert_eq!(
+            info["description"].as_str(),
+            Some(format!("deploy {case}").as_str()),
+            "case {case}: expected the stored description, got {info:?}"
+        );
+        assert_eq!(
+            info["ignoreApplicationStopFailures"].as_bool(),
+            Some(false),
+            "case {case}: expected the modelled default false, got {info:?}"
+        );
+        assert!(
+            info["createTime"].as_f64().unwrap_or_default() > 0.0,
+            "case {case}: expected a createTime, got {info:?}"
+        );
+    }
+
+    // The second deployment onwards reports the one before it as its previous
+    // revision.
+    let latest = seen_ids.last().expect("a deployment was created");
+    let info = emulator
+        .ok("GetDeployment", json!({"deploymentId": latest}))
+        .await;
+    assert_eq!(
+        info["deploymentInfo"]["previousRevision"], cases[cases.len() - 2].1,
+        "case previousRevision: expected the revision of the deployment before it, got {:?}",
+        info["deploymentInfo"]["previousRevision"]
+    );
+}
+
+/// RULE: a deployment the emulator created starts non-terminal and the clock
+/// owes it its terminal `Succeeded` status, with a start and a completion time,
+/// after which reading it reports the same record every time.
+#[tokio::test]
+async fn a_deployment_reaches_a_terminal_status() {
+    let emulator = Emulator::new();
+    let group = seeded_group(&emulator, "waited-on", "Server").await;
+    let created = emulator
+        .ok(
+            "CreateDeployment",
+            json!({
+                "applicationName": "waited-on",
+                "deploymentGroupName": group,
+                "revision": s3_revision("my-bucket", "app.zip"),
+            }),
+        )
+        .await;
+    let deployment_id = created["deploymentId"].as_str().expect("a deployment id");
+
+    let first = emulator
+        .ok("GetDeployment", json!({"deploymentId": deployment_id}))
+        .await;
+    let status = first["deploymentInfo"]["status"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        matches!(status.as_str(), "Created" | "InProgress"),
+        "case straight after create: expected a non-terminal status, got {status:?}"
+    );
+    assert!(
+        first["deploymentInfo"]["completeTime"].is_null(),
+        "case straight after create: expected no completeTime, got {:?}",
+        first["deploymentInfo"]
+    );
+
+    // The transition is owed by the clock, not by the poll: it arrives without
+    // anyone asking more than once.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let terminal = loop {
+        let polled = emulator
+            .ok("GetDeployment", json!({"deploymentId": deployment_id}))
+            .await;
+        if polled["deploymentInfo"]["status"].as_str() == Some("Succeeded") {
+            break polled;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case waiting for completion: expected Succeeded within 5s, got {:?}",
+            polled["deploymentInfo"]["status"]
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    let info = &terminal["deploymentInfo"];
+    let create_time = info["createTime"].as_f64().unwrap_or_default();
+    let start_time = info["startTime"].as_f64().unwrap_or_default();
+    let complete_time = info["completeTime"].as_f64().unwrap_or_default();
+    assert!(
+        create_time <= start_time && start_time <= complete_time,
+        "case terminal deployment: expected createTime <= startTime <= completeTime, got {info:?}"
+    );
+
+    // Terminal is terminal: reading it again changes nothing.
+    let again = emulator
+        .ok("GetDeployment", json!({"deploymentId": deployment_id}))
+        .await;
+    assert_eq!(
+        again, terminal,
+        "case terminal deployment: expected a repeatable read, got {again:?}"
+    );
+}
+
+/// RULE: a deployment names an application, a deployment group of it and a
+/// revision; each one missing or unknown is refused with its own modelled code.
+#[tokio::test]
+async fn a_deployment_needs_an_application_a_group_and_a_revision() {
+    let emulator = Emulator::new();
+    let group = seeded_group(&emulator, "checked", "Server").await;
+    let revision = s3_revision("my-bucket", "app.zip");
+
+    let cases: &[(&str, Value, &str)] = &[
+        (
+            "unknown application",
+            json!({"applicationName": "ghost", "deploymentGroupName": group, "revision": revision}),
+            "ApplicationDoesNotExistException",
+        ),
+        (
+            "unknown group",
+            json!({"applicationName": "checked", "deploymentGroupName": "ghost-dg", "revision": revision}),
+            "DeploymentGroupDoesNotExistException",
+        ),
+        (
+            "no group",
+            json!({"applicationName": "checked", "revision": revision}),
+            "DeploymentGroupNameRequiredException",
+        ),
+        (
+            "no revision",
+            json!({"applicationName": "checked", "deploymentGroupName": group}),
+            "RevisionRequiredException",
+        ),
+        (
+            "empty revision",
+            json!({"applicationName": "checked", "deploymentGroupName": group, "revision": {}}),
+            "InvalidRevisionException",
+        ),
+        (
+            "revision naming only a type",
+            json!({"applicationName": "checked", "deploymentGroupName": group, "revision": {"revisionType": "S3"}}),
+            "InvalidRevisionException",
+        ),
+        (
+            "unknown configuration",
+            json!({
+                "applicationName": "checked",
+                "deploymentGroupName": group,
+                "revision": revision,
+                "deploymentConfigName": "CodeDeployDefault.NotAThing",
+            }),
+            "DeploymentConfigDoesNotExistException",
+        ),
+    ];
+
+    for (case, request, expected) in cases {
+        let (status, body) = emulator.call("CreateDeployment", request.clone()).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, *expected),
+            "case {case}: expected {expected}, got {status} {body:?}"
+        );
+    }
+
+    for unknown in ["d-NOTREAL1", "d-ZZZZZZZZZ"] {
+        let (status, body) = emulator
+            .call("GetDeployment", json!({"deploymentId": unknown}))
+            .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "DeploymentDoesNotExistException"),
+            "case {unknown}: expected DeploymentDoesNotExistException, got {status} {body:?}"
+        );
+    }
+}
+
+/// RULE: `ListDeployments` answers the stored deployment ids newest first,
+/// narrowed by each filter the request carries, and refuses a filter it cannot
+/// resolve.
+#[tokio::test]
+async fn listing_deployments_orders_and_filters_by_the_stored_records() {
+    let emulator = Emulator::new();
+    let first_group = seeded_group(&emulator, "alpha", "Server").await;
+    let second_group = seeded_group(&emulator, "beta", "Server").await;
+    // A second group on `alpha`, so the group filter has something to exclude.
+    emulator
+        .ok(
+            "CreateDeploymentGroup",
+            json!({
+                "applicationName": "alpha",
+                "deploymentGroupName": "alpha-other",
+                "serviceRoleArn": "arn:aws:iam::123456789012:role/CodeDeployRole",
+            }),
+        )
+        .await;
+
+    let mut created: Vec<(String, String, String)> = Vec::new();
+    for (application, group) in [
+        ("alpha", first_group.as_str()),
+        ("alpha", "alpha-other"),
+        ("beta", second_group.as_str()),
+        ("alpha", first_group.as_str()),
+    ] {
+        let response = emulator
+            .ok(
+                "CreateDeployment",
+                json!({
+                    "applicationName": application,
+                    "deploymentGroupName": group,
+                    "revision": s3_revision("my-bucket", "app.zip"),
+                }),
+            )
+            .await;
+        created.push((
+            application.to_string(),
+            group.to_string(),
+            response["deploymentId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        ));
+    }
+
+    let ids = |body: &Value| -> Vec<String> {
+        body["deployments"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|id| id.as_str().map(str::to_string))
+            .collect()
+    };
+
+    // Newest first, across every application.
+    let all = ids(&emulator.ok("ListDeployments", json!({})).await);
+    let newest_first: Vec<String> = created
+        .iter()
+        .rev()
+        .map(|(_, _, id)| id.clone())
+        .collect();
+    assert_eq!(
+        all, newest_first,
+        "case no filter: expected the stored ids newest first, got {all:?}"
+    );
+
+    // Rows differ along which filter is applied.
+    let cases: &[(&str, Value, Vec<String>)] = &[
+        (
+            "by application",
+            json!({"applicationName": "alpha"}),
+            created
+                .iter()
+                .rev()
+                .filter(|(application, _, _)| application == "alpha")
+                .map(|(_, _, id)| id.clone())
+                .collect(),
+        ),
+        (
+            "by application and group",
+            json!({"applicationName": "alpha", "deploymentGroupName": first_group}),
+            created
+                .iter()
+                .rev()
+                .filter(|(application, group, _)| application == "alpha" && group == &first_group)
+                .map(|(_, _, id)| id.clone())
+                .collect(),
+        ),
+        (
+            "by a status nothing holds",
+            json!({"includeOnlyStatuses": ["Stopped"]}),
+            Vec::new(),
+        ),
+        (
+            "by an external id nothing holds",
+            json!({"externalId": "arn:aws:cloudformation:us-west-2:123456789012:stack/x"}),
+            Vec::new(),
+        ),
+        (
+            "by a creation window in the past",
+            json!({"createTimeRange": {"start": 1.0, "end": 2.0}}),
+            Vec::new(),
+        ),
+    ];
+
+    for (case, request, expected) in cases {
+        let got = ids(&emulator.ok("ListDeployments", request.clone()).await);
+        assert_eq!(
+            &got, expected,
+            "case {case}: expected {expected:?}, got {got:?}"
+        );
+    }
+
+    // A status every deployment eventually holds selects them all.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let succeeded = ids(&emulator
+            .ok("ListDeployments", json!({"includeOnlyStatuses": ["Succeeded"]}))
+            .await);
+        if succeeded == newest_first {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case by status Succeeded: expected every deployment within 5s, got {succeeded:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let refusals: &[(&str, Value, &str)] = &[
+        (
+            "a group without an application",
+            json!({"deploymentGroupName": "alpha-other"}),
+            "ApplicationNameRequiredException",
+        ),
+        (
+            "an unknown application",
+            json!({"applicationName": "ghost"}),
+            "ApplicationDoesNotExistException",
+        ),
+        (
+            "an unknown group",
+            json!({"applicationName": "alpha", "deploymentGroupName": "ghost-dg"}),
+            "DeploymentGroupDoesNotExistException",
+        ),
+        (
+            "a backwards creation window",
+            json!({"createTimeRange": {"start": 2.0, "end": 1.0}}),
+            "InvalidTimeRangeException",
+        ),
+        (
+            "a token this service did not issue",
+            json!({"nextToken": "not-a-token"}),
+            "InvalidNextTokenException",
+        ),
+        (
+            "a status outside the modelled set",
+            json!({"includeOnlyStatuses": ["Exploded"]}),
+            "InvalidDeploymentStatusException",
+        ),
+    ];
+
+    for (case, request, expected) in refusals {
+        let (status, body) = emulator.call("ListDeployments", request.clone()).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, *expected),
+            "case {case}: expected {expected}, got {status} {body:?}"
+        );
+    }
+}
+
+/// RULE: a deployment group reports its last attempted and last successful
+/// deployment, derived from the deployments actually stored for it.
+#[tokio::test]
+async fn a_deployment_group_reports_its_last_deployment() {
+    let emulator = Emulator::new();
+    let group = seeded_group(&emulator, "tracked", "Server").await;
+
+    let before = emulator
+        .ok(
+            "GetDeploymentGroup",
+            json!({"applicationName": "tracked", "deploymentGroupName": group}),
+        )
+        .await;
+    assert!(
+        before["deploymentGroupInfo"]["lastAttemptedDeployment"].is_null(),
+        "case no deployments yet: expected no lastAttemptedDeployment, got {:?}",
+        before["deploymentGroupInfo"]
+    );
+
+    let revision = s3_revision("my-bucket", "app.zip");
+    let created = emulator
+        .ok(
+            "CreateDeployment",
+            json!({
+                "applicationName": "tracked",
+                "deploymentGroupName": group,
+                "revision": revision,
+            }),
+        )
+        .await;
+    let deployment_id = created["deploymentId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let after = emulator
+        .ok(
+            "GetDeploymentGroup",
+            json!({"applicationName": "tracked", "deploymentGroupName": group}),
+        )
+        .await;
+    let info = &after["deploymentGroupInfo"];
+    assert_eq!(
+        info["lastAttemptedDeployment"]["deploymentId"].as_str(),
+        Some(deployment_id.as_str()),
+        "case one deployment: expected it as lastAttemptedDeployment, got {info:?}"
+    );
+    assert_eq!(
+        info["targetRevision"], revision,
+        "case one deployment: expected its revision as the group's targetRevision, got {info:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let polled = emulator
+            .ok(
+                "GetDeploymentGroup",
+                json!({"applicationName": "tracked", "deploymentGroupName": group}),
+            )
+            .await;
+        let successful = &polled["deploymentGroupInfo"]["lastSuccessfulDeployment"];
+        if successful["deploymentId"].as_str() == Some(deployment_id.as_str()) {
+            assert_eq!(
+                successful["status"].as_str(),
+                Some("Succeeded"),
+                "case succeeded deployment: expected the status with it, got {successful:?}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case succeeded deployment: expected a lastSuccessfulDeployment within 5s, got {successful:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bounds
+// ---------------------------------------------------------------------------
+
+/// RULE: a quota CodeDeploy publishes is enforced, with the modelled
+/// `…LimitExceededException` for it — the account's application quota, and an
+/// application's deployment-group quota — so repeated requests cannot grow the
+/// store without limit.
+#[tokio::test]
+async fn the_published_quotas_are_enforced() {
+    let emulator = Emulator::new();
+    // Quota source: "Quotas in AWS CodeDeploy" — 1,000 applications per account
+    // per Region, mirrored by `state::MAX_APPLICATIONS`.
+    let quota = 1_000;
+    for index in 0..quota {
+        emulator
+            .ok(
+                "CreateApplication",
+                json!({"applicationName": format!("quota-{index:04}")}),
+            )
+            .await;
+    }
+
+    let (status, body) = emulator
+        .call(
+            "CreateApplication",
+            json!({"applicationName": "one-too-many"}),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "ApplicationLimitExceededException"),
+        "case the application after the quota: expected ApplicationLimitExceededException, got {status} {body:?}"
+    );
+
+    // One under the quota accepts a create again, so the refusal is the quota
+    // and not a wedged store.
+    emulator
+        .ok("DeleteApplication", json!({"applicationName": "quota-0000"}))
+        .await;
+    emulator
+        .ok("CreateApplication", json!({"applicationName": "room-again"}))
+        .await;
+}
+
+/// RULE: the deployment history this emulator retains is bounded, so creating
+/// deployments without limit drops the oldest rather than growing the store —
+/// and the newest deployments are always the ones still readable.
+#[tokio::test]
+async fn the_deployment_history_is_bounded() {
+    let emulator = Emulator::new();
+    let group = seeded_group(&emulator, "churn", "Server").await;
+    // Retention bound: `state::MAX_DEPLOYMENT_HISTORY`.
+    let retained = 500;
+    let mut ids: Vec<String> = Vec::new();
+    for _ in 0..(retained + 2) {
+        let created = emulator
+            .ok(
+                "CreateDeployment",
+                json!({
+                    "applicationName": "churn",
+                    "deploymentGroupName": group,
+                    "revision": s3_revision("my-bucket", "app.zip"),
+                }),
+            )
+            .await;
+        ids.push(
+            created["deploymentId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+
+    // The two oldest fell out of the history; the newest is still there.
+    for dropped in &ids[..2] {
+        let (status, body) = emulator
+            .call("GetDeployment", json!({"deploymentId": dropped}))
+            .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "DeploymentDoesNotExistException"),
+            "case evicted {dropped}: expected DeploymentDoesNotExistException, got {status} {body:?}"
+        );
+    }
+    let newest = ids.last().expect("deployments were created");
+    emulator
+        .ok("GetDeployment", json!({"deploymentId": newest}))
+        .await;
+
+    // Walking every page reports exactly the retained window, newest first.
+    let mut listed: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let request = match &token {
+            Some(token) => json!({"nextToken": token}),
+            None => json!({}),
+        };
+        let page = emulator.ok("ListDeployments", request).await;
+        listed.extend(
+            page["deployments"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|id| id.as_str().map(str::to_string)),
+        );
+        token = page["nextToken"].as_str().map(str::to_string);
+        if token.is_none() {
+            break;
+        }
+        assert!(
+            listed.len() <= retained,
+            "case paging the history: expected at most {retained} ids, got {}",
+            listed.len()
+        );
+    }
+    let expected: Vec<String> = ids.iter().skip(2).rev().cloned().collect();
+    assert_eq!(
+        listed, expected,
+        "case paging the history: expected the retained window newest first, got {} ids",
+        listed.len()
+    );
+}

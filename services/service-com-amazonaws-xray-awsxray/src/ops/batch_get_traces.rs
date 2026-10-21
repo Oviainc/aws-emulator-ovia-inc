@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetTraces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetTraces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetTraces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Rebuilds each requested trace from the segment documents
+//! `PutTraceSegments` stored: `Segment$Document` is the exact string that was
+//! submitted. A requested id with no stored segments goes to
+//! `UnprocessedTraceIds`.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +142,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetTraces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetTracesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetTraces"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchGetTracesErrorModeled::ThrottledException(ThrottledException {
+                message: Some(
+                    "the X-Ray trace store is unavailable on this emulator engine".to_string(),
+                ),
+            })
+            .into());
+        };
+
+        // `TraceIds` carries no modelled length bound and each unstored id costs
+        // one `UnprocessedTraceIds` entry, so the request is bounded here.
+        let requested = input.trace_ids.len();
+        if requested > crate::state::MAX_TRACE_IDS_PER_CALL {
+            return Err(BatchGetTracesErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "TraceIds carries {requested} ids; at most {} are accepted per call",
+                        crate::state::MAX_TRACE_IDS_PER_CALL
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The token names how far into `TraceIds` the last page got, so a resumed
+        // call continues through the SAME requested list. One this service never
+        // issued — unparseable, or past the end of the list — is refused.
+        let offset = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => match token.parse::<usize>() {
+                Ok(offset) if offset < input.trace_ids.len() => offset,
+                _ => {
+                    return Err(BatchGetTracesErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(format!(
+                                "NextToken `{token}` was not issued by this service for these TraceIds"
+                            )),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let store = state.lock();
+        let mut traces = Vec::new();
+        let mut unprocessed_trace_ids = Vec::new();
+        // The page caps the number of traces; this budget caps the number of
+        // segment documents they carry, so a short request cannot pull the whole
+        // accumulated store into one response. A trace that does not fit in what
+        // is left is deferred to the next page, not truncated.
+        let mut segment_budget = crate::state::MAX_SEGMENTS_PER_BATCH_RESPONSE;
+        let mut consumed = offset;
+        for trace_id in input.trace_ids.iter().skip(consumed) {
+            if traces.len() == TRACES_PAGE_SIZE {
+                break;
+            }
+            match store.traces.get(trace_id) {
+                Some(trace) => {
+                    if trace.segments.len() > segment_budget && !traces.is_empty() {
+                        break;
+                    }
+                    let (wire, carried) = trace_of(trace, segment_budget);
+                    segment_budget -= carried;
+                    traces.push(wire);
+                }
+                None => unprocessed_trace_ids.push(trace_id.clone()),
+            }
+            consumed += 1;
+        }
+
+        // A token only when requested ids are still unread.
+        let next_token = (consumed < input.trace_ids.len()).then(|| consumed.to_string());
+
+        Ok(BatchGetTracesOutput {
+            traces: Some(traces),
+            unprocessed_trace_ids: Some(unprocessed_trace_ids),
+            next_token,
+        })
     }
+}
+
+/// How many `Trace` values one page carries.
+///
+/// The model declares no page size for `BatchGetTraces`, so this is the
+/// emulator's: a `NextToken` is emitted only when requested ids are still
+/// unread, and resuming from that token returns the remainder.
+pub const TRACES_PAGE_SIZE: usize = 5;
+
+/// Rebuild one `Trace` from its stored segments, carrying at most `budget`
+/// segment documents. Returns the trace and how many it carried.
+///
+/// `LimitExceeded` is true when the trace dropped a segment at ingest because it
+/// was full, or when this response could not carry all of them — never a
+/// hardcoded `false`. The caller defers a trace that does not fit, so the
+/// truncating branch is reached only by a trace larger than a whole page budget.
+fn trace_of(trace: &crate::state::TraceRecord, budget: usize) -> (Trace, usize) {
+    let carried = trace.segments.len().min(budget);
+    let truncated = carried < trace.segments.len();
+    let wire = Trace {
+        id: Some(trace.id.clone()),
+        duration: trace.duration(),
+        limit_exceeded: Some(trace.limit_exceeded || truncated),
+        segments: Some(
+            trace
+                .segments
+                .iter()
+                .take(carried)
+                .map(|segment| Segment {
+                    id: Some(segment.id.clone()),
+                    document: Some(segment.document.clone()),
+                })
+                .collect(),
+        ),
+    };
+    (wire, carried)
 }
