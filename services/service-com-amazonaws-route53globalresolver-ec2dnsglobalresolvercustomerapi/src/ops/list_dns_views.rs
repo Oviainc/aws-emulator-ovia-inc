@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDNSViews
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDNSViews`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDNSViews::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the DNS Views [`crate::state`] holds under one Global Resolver, one
+//! `@paginated` page at a time; an unknown `globalResolverId` is the modelled 404.
+//! `@readonly`: the only change it makes is to materialize the status transitions
+//! the clock has already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +155,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDNSViews` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDNSViewsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDNSViews"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDNSViewsErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // `maxResults` is a plain `Integer` with no `@range`, so the page size is
+        // this service's rule to enforce: a page holds at least one item.
+        if let Some(max_results) = input.max_results {
+            if max_results < 1 {
+                return Err(ListDNSViewsErrorModeled::ValidationException(
+                    crate::state::field_validation(
+                        "maxResults",
+                        format!("must be at least 1, got {max_results}"),
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // `nextToken` is one of this service's own DNS View ids, for the same
+        // reason as in `ListGlobalResolvers`.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_page_token(crate::state::DNS_VIEW_ID_PREFIX, token) {
+                return Err(ListDNSViewsErrorModeled::ValidationException(
+                    crate::state::field_validation(
+                        "nextToken",
+                        "is not a token this service issued",
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let mut state = state.lock();
+        state.settle(::std::time::SystemTime::now());
+
+        if !state.global_resolvers.contains_key(&input.global_resolver_id) {
+            return Err(ListDNSViewsErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(
+                    crate::state::GLOBAL_RESOLVER_RESOURCE,
+                    &input.global_resolver_id,
+                ),
+            )
+            .into());
+        }
+
+        let (page, next_token) = crate::state::page(
+            state
+                .dns_views
+                .iter()
+                .filter(|(_, view)| view.global_resolver_id == input.global_resolver_id),
+            input.next_token.as_deref(),
+            input.max_results,
+        );
+
+        Ok(ListDNSViewsOutput {
+            next_token,
+            dns_views: page
+                .into_iter()
+                .map(|view| DNSViewSummary {
+                    id: view.id.clone(),
+                    arn: view.arn.clone(),
+                    client_token: view.client_token.clone(),
+                    dnssec_validation: view.dnssec_validation.as_wire().to_string(),
+                    edns_client_subnet: view.edns_client_subnet.as_wire().to_string(),
+                    firewall_rules_fail_open: view.firewall_rules_fail_open.as_wire().to_string(),
+                    name: view.name.clone(),
+                    description: view.description.clone(),
+                    global_resolver_id: view.global_resolver_id.clone(),
+                    created_at: ::aws_smithy_types::DateTime::from(view.created_at),
+                    updated_at: ::aws_smithy_types::DateTime::from(view.updated_at),
+                    status: view.status.as_wire().to_string(),
+                })
+                .collect(),
+        })
     }
 }

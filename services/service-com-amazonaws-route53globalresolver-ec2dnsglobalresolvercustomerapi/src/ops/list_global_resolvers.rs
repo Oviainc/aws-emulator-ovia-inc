@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGlobalResolvers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGlobalResolvers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGlobalResolvers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Global Resolvers [`crate::state`] holds, one `@paginated` page at
+//! a time. `@readonly`: the only change it makes is to materialize the status
+//! transitions the clock has already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +149,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGlobalResolvers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGlobalResolversErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGlobalResolvers"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListGlobalResolversErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // `maxResults` is a plain `Integer` with no `@range`, so the page size is
+        // this service's rule to enforce: a page holds at least one item.
+        if let Some(max_results) = input.max_results {
+            if max_results < 1 {
+                return Err(ListGlobalResolversErrorModeled::ValidationException(
+                    crate::state::field_validation(
+                        "maxResults",
+                        format!("must be at least 1, got {max_results}"),
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // `nextToken` is one of this service's own ids: a token of any other shape
+        // was never issued here, so it is refused rather than served as "start
+        // from the beginning".
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_page_token(crate::state::RESOLVER_ID_PREFIX, token) {
+                return Err(ListGlobalResolversErrorModeled::ValidationException(
+                    crate::state::field_validation(
+                        "nextToken",
+                        "is not a token this service issued",
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let mut state = state.lock();
+        state.settle(::std::time::SystemTime::now());
+
+        let (page, next_token) = crate::state::page(
+            state.global_resolvers.iter(),
+            input.next_token.as_deref(),
+            input.max_results,
+        );
+
+        Ok(ListGlobalResolversOutput {
+            next_token,
+            global_resolvers: page
+                .into_iter()
+                .map(|resolver| GlobalResolversItem {
+                    id: resolver.id.clone(),
+                    arn: resolver.arn.clone(),
+                    client_token: resolver.client_token.clone(),
+                    dns_name: resolver.dns_name.clone(),
+                    observability_region: resolver.observability_region.clone(),
+                    name: resolver.name.clone(),
+                    description: resolver.description.clone(),
+                    regions: resolver.regions.clone(),
+                    created_at: ::aws_smithy_types::DateTime::from(resolver.created_at),
+                    updated_at: ::aws_smithy_types::DateTime::from(resolver.updated_at),
+                    status: resolver.status.as_wire().to_string(),
+                    ipv4_addresses: resolver.ipv4_addresses.clone(),
+                    ipv6_addresses: resolver.ipv6_addresses_for_output(),
+                    ip_address_type: Some(resolver.ip_address_type.as_wire().to_string()),
+                })
+                .collect(),
+        })
     }
 }

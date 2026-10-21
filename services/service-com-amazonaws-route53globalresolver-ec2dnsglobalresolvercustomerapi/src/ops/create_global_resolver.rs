@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGlobalResolver
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGlobalResolver`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGlobalResolver::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a Route 53 Global Resolver into this service's store ([`crate::state`])
+//! and answers with the stored record. `@idempotent` with an
+//! `@idempotencyToken`: a replay carrying a `clientToken` this store has already
+//! seen answers with the resolver that token minted, never a second one.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -208,18 +205,191 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGlobalResolver` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGlobalResolverErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGlobalResolver"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateGlobalResolverErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // `regions` is `@required` but declares no `@length`, so an empty list
+        // reaches the handler: a resolver with no Region to run in cannot be
+        // provisioned. The upper bound is this service's own, so one request
+        // cannot grow one record without limit.
+        if input.regions.is_empty() {
+            return Err(CreateGlobalResolverErrorModeled::ValidationException(
+                crate::state::field_validation("regions", "must name at least one Region"),
+            )
+            .into());
+        }
+        if input.regions.len() > crate::state::MAX_REGIONS_PER_RESOLVER {
+            return Err(CreateGlobalResolverErrorModeled::ValidationException(
+                crate::state::field_validation(
+                    "regions",
+                    format!(
+                        "must name at most {} Regions, got {}",
+                        crate::state::MAX_REGIONS_PER_RESOLVER,
+                        input.regions.len()
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // Each entry must be a Region AWS could name: `Regions` is a plain
+        // list<string>, so the grammar is the service's to enforce.
+        for region in &input.regions {
+            if !crate::state::is_region_token(region) {
+                return Err(CreateGlobalResolverErrorModeled::ValidationException(
+                    crate::state::field_validation(
+                        "regions",
+                        format!("{region:?} is not an Amazon Web Services Region"),
+                    ),
+                )
+                .into());
+            }
+        }
+        if let Some(region) = input
+            .observability_region
+            .as_deref()
+            .filter(|region| !region.is_empty())
+        {
+            if !crate::state::is_region_token(region) {
+                return Err(CreateGlobalResolverErrorModeled::ValidationException(
+                    crate::state::field_validation(
+                        "observabilityRegion",
+                        format!("{region:?} is not an Amazon Web Services Region"),
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // `GlobalResolverIpAddressType` is an enum SHAPE, whose membership the
+        // boundary validator does not check, so this handler owns it. An absent
+        // member means the default the model documents, IPV4.
+        let ip_address_type = match input.ip_address_type.as_deref() {
+            None => crate::state::GlobalResolverIpAddressType::Ipv4,
+            Some(value) => match crate::state::GlobalResolverIpAddressType::from_wire(value) {
+                Some(parsed) => parsed,
+                None => {
+                    return Err(CreateGlobalResolverErrorModeled::ValidationException(
+                        crate::state::field_validation(
+                            "ipAddressType",
+                            format!(
+                                "must be one of {}",
+                                GLOBAL_RESOLVER_IP_ADDRESS_TYPE_VALUES.join(", ")
+                            ),
+                        ),
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        // The `@idempotent` replay: the same `clientToken` answers with the
+        // resolver it already minted, and only when this request asks for the same
+        // resolver — a token reused with different parameters is a conflict.
+        if let Some(token) = input.client_token.as_deref() {
+            let minted = state.resolver_idempotency.get(token).cloned();
+            if let Some(resolver) = minted.and_then(|id| state.global_resolvers.get(&id)) {
+                if resolver.matches_create(&input, ip_address_type) {
+                    return Ok(output(resolver));
+                }
+                return Err(CreateGlobalResolverErrorModeled::ConflictException(
+                    crate::state::idempotency_conflict(
+                        crate::state::GLOBAL_RESOLVER_RESOURCE,
+                        &resolver.id,
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // Not a replay, so this request would add a resolver: refuse it when the
+        // store is already at its ceiling, rather than growing without limit.
+        if state.global_resolvers.len() >= crate::state::MAX_GLOBAL_RESOLVERS {
+            return Err(
+                CreateGlobalResolverErrorModeled::ServiceQuotaExceededException(
+                    crate::state::quota_exceeded(
+                        crate::state::GLOBAL_RESOLVER_RESOURCE,
+                        None,
+                        crate::state::MAX_GLOBAL_RESOLVERS,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let sequence = state.next_sequence();
+        let id = crate::state::resolver_id(sequence);
+        let client_token = input
+            .client_token
+            .unwrap_or_else(|| crate::state::minted_client_token(sequence));
+        let resolver = crate::state::GlobalResolver {
+            arn: crate::state::resource_arn(&region, crate::state::GLOBAL_RESOLVER_RESOURCE, &id),
+            dns_name: crate::state::dns_name(&id),
+            id: id.clone(),
+            name: input.name,
+            description: input.description,
+            client_token: client_token.clone(),
+            regions: input.regions,
+            observability_region: input.observability_region,
+            ip_address_type,
+            ipv4_addresses: crate::state::anycast_ipv4_addresses(sequence),
+            ipv6_addresses: match ip_address_type {
+                crate::state::GlobalResolverIpAddressType::DualStack => {
+                    crate::state::anycast_ipv6_addresses(sequence)
+                }
+                // `ipv6Addresses` "is only populated when ipAddressType is
+                // DUAL_STACK".
+                crate::state::GlobalResolverIpAddressType::Ipv4 => Vec::new(),
+            },
+            // A resolver is being provisioned, not ready: it reports CREATING
+            // until the clock owes it OPERATIONAL.
+            status: crate::state::CrResourceStatus::Creating,
+            created_at: now,
+            updated_at: now,
+            operational_at: now + crate::state::PROVISIONING_DELAY,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            dns_view_ids: Vec::new(),
+        };
+
+        state.resolver_idempotency.insert(client_token, id.clone());
+        state.global_resolvers.insert(id.clone(), resolver);
+        // Read the stored record back, so the response is the state rather than
+        // the value that went into it.
+        let stored = state.global_resolvers.get(&id).ok_or_else(|| {
+            CreateGlobalResolverErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        Ok(output(stored))
+    }
+}
+
+/// This operation's output for a stored resolver — every member read off the
+/// record, so a create answers exactly what the following get answers.
+fn output(resolver: &crate::state::GlobalResolver) -> CreateGlobalResolverOutput {
+    CreateGlobalResolverOutput {
+        id: resolver.id.clone(),
+        arn: resolver.arn.clone(),
+        client_token: resolver.client_token.clone(),
+        created_at: ::aws_smithy_types::DateTime::from(resolver.created_at),
+        description: resolver.description.clone(),
+        dns_name: resolver.dns_name.clone(),
+        ip_address_type: Some(resolver.ip_address_type.as_wire().to_string()),
+        ipv4_addresses: resolver.ipv4_addresses.clone(),
+        ipv6_addresses: resolver.ipv6_addresses_for_output(),
+        name: resolver.name.clone(),
+        observability_region: resolver.observability_region.clone(),
+        regions: resolver.regions.clone(),
+        status: resolver.status.as_wire().to_string(),
+        updated_at: ::aws_smithy_types::DateTime::from(resolver.updated_at),
     }
 }

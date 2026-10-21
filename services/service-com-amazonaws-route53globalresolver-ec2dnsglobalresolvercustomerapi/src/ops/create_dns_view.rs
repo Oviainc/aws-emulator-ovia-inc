@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDNSView
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDNSView`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDNSView::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a DNS View under an existing Global Resolver into [`crate::state`] and
+//! answers with the stored record; an unknown `globalResolverId` is the modelled
+//! 404. `@idempotent` with an `@idempotencyToken`, like `CreateGlobalResolver`.
 //!
 //! ## Shape of an operation
 //!
@@ -205,18 +200,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDNSView` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDNSViewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDNSView"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDNSViewErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // `DnsSecValidationType`, `EdnsClientSubnetType` and
+        // `FirewallRulesFailOpenType` are enum SHAPES whose membership the boundary
+        // validator does not check, and whose `@default` ("DISABLED") the
+        // deserializer cannot materialize for an enum member — so an absent member
+        // arrives as the empty string and this handler resolves both cases.
+        let toggle = |member: &str,
+                      value: &str,
+                      values: &[&str]|
+         -> Result<crate::state::Toggle, CreateDNSViewError> {
+            crate::state::Toggle::resolve(value).ok_or_else(|| {
+                CreateDNSViewErrorModeled::ValidationException(crate::state::field_validation(
+                    member,
+                    format!("must be one of {}", values.join(", ")),
+                ))
+                .into()
+            })
+        };
+        let dnssec_validation = toggle(
+            "dnssecValidation",
+            &input.dnssec_validation,
+            DNS_SEC_VALIDATION_TYPE_VALUES,
+        )?;
+        let edns_client_subnet = toggle(
+            "ednsClientSubnet",
+            &input.edns_client_subnet,
+            EDNS_CLIENT_SUBNET_TYPE_VALUES,
+        )?;
+        let firewall_rules_fail_open = toggle(
+            "firewallRulesFailOpen",
+            &input.firewall_rules_fail_open,
+            FIREWALL_RULES_FAIL_OPEN_TYPE_VALUES,
+        )?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        // A view only exists under a resolver, so an unknown parent is a 404.
+        if !state.global_resolvers.contains_key(&input.global_resolver_id) {
+            return Err(CreateDNSViewErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(
+                    crate::state::GLOBAL_RESOLVER_RESOURCE,
+                    &input.global_resolver_id,
+                ),
+            )
+            .into());
+        }
+
+        // The `@idempotent` replay: the same `clientToken` answers with the view it
+        // already minted, and only when this request asks for the same view under
+        // the same parent — a token reused with different parameters is a conflict.
+        if let Some(token) = input.client_token.as_deref() {
+            let minted = state.dns_view_idempotency.get(token).cloned();
+            if let Some(view) = minted.and_then(|id| state.dns_views.get(&id)) {
+                if view.matches_create(
+                    &input,
+                    dnssec_validation,
+                    edns_client_subnet,
+                    firewall_rules_fail_open,
+                ) {
+                    return Ok(output(view));
+                }
+                return Err(CreateDNSViewErrorModeled::ConflictException(
+                    crate::state::idempotency_conflict(crate::state::DNS_VIEW_RESOURCE, &view.id),
+                )
+                .into());
+            }
+        }
+
+        // Not a replay, so this request would add a view: refuse it when the
+        // parent is already at its ceiling, rather than growing without limit.
+        let views_held = state
+            .global_resolvers
+            .get(&input.global_resolver_id)
+            .map_or(0, |parent| parent.dns_view_ids.len());
+        if views_held >= crate::state::MAX_DNS_VIEWS_PER_RESOLVER {
+            return Err(CreateDNSViewErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded(
+                    crate::state::DNS_VIEW_RESOURCE,
+                    Some(&input.global_resolver_id),
+                    crate::state::MAX_DNS_VIEWS_PER_RESOLVER,
+                ),
+            )
+            .into());
+        }
+
+        let sequence = state.next_sequence();
+        let id = crate::state::dns_view_id(sequence);
+        let client_token = input
+            .client_token
+            .unwrap_or_else(|| crate::state::minted_client_token(sequence));
+        let view = crate::state::DnsView {
+            arn: crate::state::resource_arn(&region, crate::state::DNS_VIEW_RESOURCE, &id),
+            id: id.clone(),
+            global_resolver_id: input.global_resolver_id.clone(),
+            name: input.name,
+            description: input.description,
+            client_token: client_token.clone(),
+            dnssec_validation,
+            edns_client_subnet,
+            firewall_rules_fail_open,
+            // A view is being provisioned, not ready: it reports CREATING until
+            // the clock owes it OPERATIONAL.
+            status: crate::state::ProfileResourceStatus::Creating,
+            created_at: now,
+            updated_at: now,
+            operational_at: now + crate::state::PROVISIONING_DELAY,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        state.dns_view_idempotency.insert(client_token, id.clone());
+        state.dns_views.insert(id.clone(), view);
+        if let Some(parent) = state.global_resolvers.get_mut(&input.global_resolver_id) {
+            parent.dns_view_ids.push(id.clone());
+        }
+        // Read the stored record back, so the response is the state rather than
+        // the value that went into it.
+        let stored = state.dns_views.get(&id).ok_or_else(|| {
+            CreateDNSViewErrorModeled::InternalServerException(crate::state::state_unavailable())
+        })?;
+        Ok(output(stored))
+    }
+}
+
+/// This operation's output for a stored view — every member read off the record,
+/// so a create answers exactly what the following get answers.
+fn output(view: &crate::state::DnsView) -> CreateDNSViewOutput {
+    CreateDNSViewOutput {
+        id: view.id.clone(),
+        arn: view.arn.clone(),
+        client_token: Some(view.client_token.clone()),
+        dnssec_validation: view.dnssec_validation.as_wire().to_string(),
+        edns_client_subnet: view.edns_client_subnet.as_wire().to_string(),
+        firewall_rules_fail_open: view.firewall_rules_fail_open.as_wire().to_string(),
+        name: view.name.clone(),
+        description: view.description.clone(),
+        global_resolver_id: view.global_resolver_id.clone(),
+        created_at: ::aws_smithy_types::DateTime::from(view.created_at),
+        updated_at: ::aws_smithy_types::DateTime::from(view.updated_at),
+        status: view.status.as_wire().to_string(),
     }
 }

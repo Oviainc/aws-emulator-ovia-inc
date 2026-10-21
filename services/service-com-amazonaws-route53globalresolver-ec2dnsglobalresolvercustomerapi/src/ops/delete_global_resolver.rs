@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteGlobalResolver
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteGlobalResolver`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteGlobalResolver::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the Global Resolver this id names from [`crate::state`] — with the DNS
+//! Views under it, because the model's own documentation says "All associated DNS
+//! views, access sources, tokens, and firewall rules are also deleted" — and
+//! answers with its final record (`status` `DELETING`). A second delete of the
+//! same id is the modelled 404.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +182,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteGlobalResolver` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteGlobalResolverErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteGlobalResolver"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteGlobalResolverErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        // `@idempotent`, but a delete of what is no longer there is the modelled
+        // 404: the resolver is gone from the store after the first call.
+        let Some(mut resolver) = state.global_resolvers.remove(&input.global_resolver_id) else {
+            return Err(DeleteGlobalResolverErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(
+                    crate::state::GLOBAL_RESOLVER_RESOURCE,
+                    &input.global_resolver_id,
+                ),
+            )
+            .into());
+        };
+
+        // The documented cascade: the views under this resolver go with it, so no
+        // later reader sees a view whose parent is gone. The parent's own
+        // `dns_view_ids` is the one source of that parentage — every
+        // `CreateDNSView` appends to it — so the sweep needs no scan of the view
+        // map. The sentence also names access sources, tokens and firewall rules:
+        // none of those can exist yet, because every operation that creates one is
+        // still a 501, and their cascade belongs here when they are implemented.
+        let orphaned: ::std::collections::BTreeSet<String> =
+            resolver.dns_view_ids.iter().cloned().collect();
+        for view_id in &orphaned {
+            state.dns_views.remove(view_id);
+        }
+        // The idempotency records of the resources that are gone go too, so a
+        // replayed create mints a new resource rather than naming a dead one, and
+        // the store's size stays bounded by the resources that are still live.
+        state
+            .dns_view_idempotency
+            .retain(|_, view_id| !orphaned.contains(view_id));
+        state
+            .resolver_idempotency
+            .retain(|_, id| id != &resolver.id);
+
+        resolver.status = crate::state::CrResourceStatus::Deleting;
+        resolver.updated_at = now;
+
+        Ok(DeleteGlobalResolverOutput {
+            id: resolver.id.clone(),
+            arn: resolver.arn.clone(),
+            client_token: resolver.client_token.clone(),
+            dns_name: resolver.dns_name.clone(),
+            observability_region: resolver.observability_region.clone(),
+            name: resolver.name.clone(),
+            description: resolver.description.clone(),
+            regions: resolver.regions.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(resolver.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(resolver.updated_at),
+            status: resolver.status.as_wire().to_string(),
+            ipv4_addresses: resolver.ipv4_addresses.clone(),
+            ipv6_addresses: resolver.ipv6_addresses_for_output(),
+            ip_address_type: Some(resolver.ip_address_type.as_wire().to_string()),
+        })
     }
 }
