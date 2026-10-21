@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Converse
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Converse`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Serves one conversational turn: it validates the turn sequence, counts the
+//! input tokens with the tokenizer in [`crate::state`] (the same one
+//! `CountTokens` uses), answers with an assistant message derived from the
+//! supplied conversation, and records the call in the inference log.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Converse::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! No language model runs in this emulator, so the assistant message says so
+//! (see [`crate::state::emulated_completion_text`]); the turn semantics, the
+//! token accounting, the stop reason and the metrics are all computed from the
+//! request that was actually served.
 //!
 //! ## Shape of an operation
 //!
@@ -220,6 +220,17 @@ impl From<ConverseErrorModeled> for ConverseError {
     }
 }
 
+/// This operation's own modelled 400 `ValidationException`.
+///
+/// The model declares `ValidationException` for `Converse`, so a refusal uses
+/// that shape rather than the scaffold's synthetic one.
+fn validation(message: String) -> ConverseError {
+    ConverseErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `Converse` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -256,18 +267,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Converse` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ConverseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Converse"))
+        let _ = ctx;
+        let started = ::std::time::Instant::now();
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ConverseErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Bedrock Runtime emulator has no state store".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The model has to be one this emulator recognises, and one the Converse
+        // API serves: "Supported models and model features" lists base models
+        // that only `InvokeModel` serves.
+        let model = {
+            let guard = state.lock();
+            match guard.resolve_model(&input.model_id) {
+                Some(entry) => entry.clone(),
+                None => {
+                    return Err(ConverseErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "The provided model identifier is invalid: {}",
+                                input.model_id
+                            )),
+                        },
+                    )
+                    .into())
+                }
+            }
+        };
+        if !model.supports_converse {
+            return Err(validation(format!(
+                "The model {} does not support the Converse API.",
+                model.model_id
+            )));
+        }
+
+        // A conversation is a non-empty sequence of turns that starts with the
+        // user and alternates user/assistant.
+        let messages = match input.messages.as_ref() {
+            Some(messages) if !messages.is_empty() => messages,
+            _ => {
+                return Err(validation(
+                    "The messages field must contain at least one message.".to_string(),
+                ))
+            }
+        };
+        for (turn, message) in messages.iter().enumerate() {
+            let expected = if turn % 2 == 0 { "user" } else { "assistant" };
+            if message.role != expected {
+                return Err(validation(format!(
+                    "A conversation must start with a user message and then alternate between \
+                     user and assistant roles: expected role {expected} at messages[{turn}], \
+                     got {}.",
+                    message.role
+                )));
+            }
+        }
+
+        let input_tokens = crate::state::converse_input_tokens(
+            input.system.as_ref(),
+            input.messages.as_ref(),
+            input.tool_config.as_ref(),
+        );
+
+        // The model's own ceiling caps `inferenceConfig.maxTokens`, and hitting
+        // the cap is what makes the turn stop on `max_tokens` instead of
+        // `end_turn`.
+        let requested_max = input
+            .inference_config
+            .as_ref()
+            .and_then(|config| config.max_tokens)
+            .and_then(|max| u32::try_from(max).ok())
+            .unwrap_or(model.max_output_tokens);
+        let max_output_tokens = requested_max.min(model.max_output_tokens);
+
+        let full_text = crate::state::emulated_completion_text(
+            &model.model_id,
+            u32::try_from(messages.len()).unwrap_or(u32::MAX),
+            input_tokens,
+        );
+        let truncated = crate::state::count_text_tokens(&full_text) > max_output_tokens;
+        let text = if truncated {
+            crate::state::truncate_to_tokens(&full_text, max_output_tokens)
+        } else {
+            full_text
+        };
+        let output_tokens = crate::state::count_text_tokens(&text);
+
+        state
+            .lock()
+            .log_invocation(crate::state::InvocationLogEntry {
+                model_id: model.model_id.clone(),
+                kind: crate::state::InvokeKind::Converse,
+                input_tokens,
+                output_tokens,
+                at_millis: crate::state::now_millis(),
+            });
+
+        Ok(ConverseOutput {
+            output: ConverseOutput2::Message(Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text(text)],
+            }),
+            stop_reason: if truncated { "max_tokens" } else { "end_turn" }.to_string(),
+            usage: TokenUsage {
+                input_tokens: crate::state::token_count_i32(input_tokens),
+                output_tokens: crate::state::token_count_i32(output_tokens),
+                total_tokens: crate::state::token_count_i32(
+                    input_tokens.saturating_add(output_tokens),
+                ),
+                cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
+                cache_details: None,
+            },
+            metrics: ConverseMetrics {
+                latency_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+            },
+            additional_model_response_fields: None,
+            trace: None,
+            performance_config: input.performance_config.clone(),
+            service_tier: input.service_tier.clone(),
+        })
     }
 }
