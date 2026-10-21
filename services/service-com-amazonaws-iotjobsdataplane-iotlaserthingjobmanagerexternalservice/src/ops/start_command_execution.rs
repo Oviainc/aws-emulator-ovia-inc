@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartCommandExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartCommandExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartCommandExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints and persists a job execution for the thing named by `targetArn`, with
+//! status `QUEUED` and a job document built from `commandArn` + `parameters`, and
+//! returns its id. `clientToken` makes the call idempotent: the same token with the
+//! same parameters returns the same `executionId` and creates nothing, the same
+//! token with different parameters is a 409 `ConflictException` (the token member's
+//! own documented rule).
 //!
 //! ## Shape of an operation
 //!
@@ -94,6 +92,148 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{JobExecutionRecord, STATUS_QUEUED};
+
+/// `JobDocument`'s modeled maximum length (len 0..32768).
+const MAX_JOB_DOCUMENT_LEN: usize = 32_768;
+
+/// `ThingName`'s modeled maximum length (len 1..128).
+const MAX_THING_NAME_LEN: usize = 128;
+
+/// The thing name `target_arn` names, as the device whose queue the execution is
+/// enqueued on. `targetArn` is documented as "the ARN of the device where the
+/// command execution is occurring", i.e. `arn:<partition>:iot:<region>:<account>:thing/<name>`;
+/// anything that is not a well-formed thing ARN is refused with the modeled
+/// `ValidationException`.
+fn thing_name_from_target_arn(target_arn: &str) -> Result<String, StartCommandExecutionError> {
+    let invalid = |why: &str| -> StartCommandExecutionError {
+        StartCommandExecutionErrorModeled::ValidationException(ValidationException {
+            message: Some(format!("targetArn {why}")),
+        })
+        .into()
+    };
+
+    // 6 fields: arn:<partition>:<service>:<region>:<account-id>:<resource>. The
+    // resource keeps any colon of its own, so the split is bounded at 6.
+    let fields: Vec<&str> = target_arn.splitn(6, ':').collect();
+    let ["arn", _partition, service, _region, _account, resource] = fields.as_slice() else {
+        return Err(invalid("is not an Amazon Resource Name"));
+    };
+    if *service != "iot" {
+        return Err(invalid("must name an iot resource"));
+    }
+    let Some(thing_name) = resource.strip_prefix("thing/") else {
+        return Err(invalid("must name a thing, as arn:<partition>:iot:<region>:<account>:thing/<name>"));
+    };
+    // The ARN's resource segment has to satisfy `ThingName` for the execution to
+    // be reachable through the `/things/{thingName}/jobs` operations. Smithy
+    // `length` counts characters, so the check does too.
+    let thing_name_len = thing_name.chars().count();
+    if thing_name_len == 0 || thing_name_len > MAX_THING_NAME_LEN {
+        return Err(invalid("names a thing whose name is not 1..128 characters long"));
+    }
+    if !thing_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-'))
+    {
+        return Err(invalid(
+            "names a thing whose name does not match ^[a-zA-Z0-9:_-]+$",
+        ));
+    }
+    Ok(thing_name.to_string())
+}
+
+/// `commandArn` is documented as `arn:aws:iot:<region>:<accountid>:command/<commandName>`;
+/// refuse anything else with the modeled `ValidationException`.
+fn validate_command_arn(command_arn: &str) -> Result<(), StartCommandExecutionError> {
+    let fields: Vec<&str> = command_arn.splitn(6, ':').collect();
+    let valid = match fields.as_slice() {
+        ["arn", _partition, "iot", _region, _account, resource] => resource
+            .strip_prefix("command/")
+            .is_some_and(|name| !name.is_empty()),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(StartCommandExecutionErrorModeled::ValidationException(ValidationException {
+            message: Some(
+                "commandArn must name a command, as arn:<partition>:iot:<region>:<account>:command/<name>"
+                    .to_string(),
+            ),
+        })
+        .into())
+    }
+}
+
+/// One command parameter as JSON, keyed by the member the model names on the wire
+/// (`S`, `B`, `I`, `L`, `D`, `BIN`, `UL`). A blob is base64, the restJson1 form.
+fn parameter_value_json(value: &CommandParameterValue) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    if let Some(s) = value.s.as_ref() {
+        object.insert("S".to_string(), serde_json::Value::from(s.as_str()));
+    }
+    if let Some(b) = value.b {
+        object.insert("B".to_string(), serde_json::Value::from(b));
+    }
+    if let Some(i) = value.i {
+        object.insert("I".to_string(), serde_json::Value::from(i));
+    }
+    if let Some(l) = value.l {
+        object.insert("L".to_string(), serde_json::Value::from(l));
+    }
+    if let Some(d) = value.d {
+        object.insert("D".to_string(), serde_json::Value::from(d));
+    }
+    if let Some(bin) = value.bin.as_ref() {
+        object.insert(
+            "BIN".to_string(),
+            serde_json::Value::from(aws_smithy_types::base64::encode(bin)),
+        );
+    }
+    if let Some(ul) = value.ul.as_ref() {
+        object.insert("UL".to_string(), serde_json::Value::from(ul.as_str()));
+    }
+    serde_json::Value::Object(object)
+}
+
+/// The parameters as a JSON object, in name order (so one request always yields
+/// one document, whatever order the map arrived in).
+fn parameters_json(
+    parameters: Option<&std::collections::HashMap<String, CommandParameterValue>>,
+) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    for (name, value) in parameters.into_iter().flatten() {
+        object.insert(name.clone(), parameter_value_json(value));
+    }
+    serde_json::Value::Object(object)
+}
+
+/// The job document the device fetches: the command it must run and the
+/// parameters it must run it with.
+fn job_document(command_arn: &str, parameters: &serde_json::Value) -> String {
+    serde_json::json!({
+        "commandArn": command_arn,
+        "parameters": parameters,
+    })
+    .to_string()
+}
+
+/// Digest of the request members a `clientToken` covers, so a replay can be told
+/// apart from a different request reusing the token.
+fn request_fingerprint(input: &StartCommandExecutionInput, parameters: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+
+    let canonical = serde_json::json!({
+        "targetArn": input.target_arn,
+        "commandArn": input.command_arn,
+        "parameters": parameters,
+        "executionTimeoutSeconds": input.execution_timeout_seconds,
+    })
+    .to_string();
+    hex::encode(Sha256::digest(canonical.as_bytes()))
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -167,18 +307,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartCommandExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartCommandExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartCommandExecution"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartCommandExecutionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the job execution store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let thing_name = thing_name_from_target_arn(&input.target_arn)?;
+        validate_command_arn(&input.command_arn)?;
+
+        let parameters = parameters_json(input.parameters.as_ref());
+        let document = job_document(&input.command_arn, &parameters);
+        // Smithy `length` counts characters, so the modeled maximum does too.
+        let document_len = document.chars().count();
+        if document_len > MAX_JOB_DOCUMENT_LEN {
+            return Err(StartCommandExecutionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "parameters produce a job document of {document_len} characters, over the {MAX_JOB_DOCUMENT_LEN} character maximum"
+                    )),
+                },
+            )
+            .into());
+        }
+        let fingerprint = request_fingerprint(&input, &parameters);
+
+        let mut state = state.lock();
+
+        // Idempotency, as `clientToken` documents it: the same token with the same
+        // parameters completes with the execution the first call created; the same
+        // token with different parameters is a conflict.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(started) = state.idempotency.get(token) {
+                if started.request_fingerprint == fingerprint {
+                    return Ok(StartCommandExecutionOutput {
+                        execution_id: Some(started.execution_id.clone()),
+                    });
+                }
+                return Err(StartCommandExecutionErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(
+                            "clientToken was already used for a request with different parameters"
+                                .to_string(),
+                        ),
+                        resource_id: Some(started.execution_id.clone()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let now = crate::state::now_epoch_seconds();
+        let execution_id = state.mint_execution_id();
+        if let Err(quota) = state.try_insert_execution(JobExecutionRecord {
+            job_id: execution_id.clone(),
+            thing_name,
+            status: STATUS_QUEUED.to_string(),
+            status_details: std::collections::BTreeMap::new(),
+            queued_at: now,
+            started_at: None,
+            last_updated_at: now,
+            // A device update has not happened yet, so this is version 1.
+            version_number: 1,
+            // This call mints a new job id, so the device has run no earlier
+            // execution of it: this is that job's first execution on the device.
+            execution_number: 1,
+            step_timeout_expires_at: None,
+            // "A timer is started as soon as the command execution is created" —
+            // `executionTimeoutSeconds`.
+            execution_timeout_expires_at: input
+                .execution_timeout_seconds
+                .map(|seconds| now.saturating_add(seconds)),
+            job_document: document,
+        }) {
+            return Err(
+                StartCommandExecutionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(quota),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        if let Some(token) = input.client_token.clone() {
+            state.remember_client_token(token, execution_id.clone(), fingerprint);
+        }
+
+        Ok(StartCommandExecutionOutput {
+            execution_id: Some(execution_id),
+        })
     }
 }
