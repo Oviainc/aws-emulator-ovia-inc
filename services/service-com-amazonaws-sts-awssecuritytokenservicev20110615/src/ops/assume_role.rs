@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssumeRole
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssumeRole`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssumeRole::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a role session: a NEW credential from the emulator's credential store, kept
+//! in this service's session registry under the access key id it was minted with, so
+//! `GetCallerIdentity` signed with it reports the assumed-role identity and
+//! `GetAccessKeyInfo` reports the role's account. The account and the role name come
+//! from the `RoleArn` the request names; the role id is stable per role ARN.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -316,18 +314,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssumeRole` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssumeRoleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssumeRole"))
+        use crate::state::{
+            duplicate_tag_key, is_policy_document, packed_policy_size, parse_role_arn, sts_arn,
+            Identity, NewSession, SessionKind, ASSUME_ROLE_DEFAULT_DURATION_SECONDS,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This service has no store on the engine it was mounted on, so it cannot
+            // serve anything. The router builds the one engine that does, so this is
+            // unreachable there.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("AssumeRole"));
+        };
+        let store = ctx.credential_store();
+        let now = ::std::time::SystemTime::now();
+
+        // The role ARN decides the account the session belongs to and the role name
+        // the assumed-role ARN carries. Its length and character set are modeled, but
+        // being an IAM role ARN of an account is not, so it is refused here.
+        let Some(role) = parse_role_arn(&input.role_arn) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "RoleArn '{}' is not an IAM role ARN of the form \
+                 arn:<partition>:iam::<account>:role/<name>",
+                input.role_arn
+            )));
+        };
+
+        // A trusted context assertion is "signed and encrypted by Amazon Web Services
+        // STS" (ProvidedContexts, this service's model). This emulator issues none, so
+        // every assertion presented to it is one it cannot verify; it refuses the
+        // request rather than assuming a context it never granted.
+        if input
+            .provided_contexts
+            .as_ref()
+            .is_some_and(|given| !given.is_empty())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "ProvidedContexts carries trusted context assertions signed by STS; this \
+                 emulator issues none, so it cannot verify one",
+            ));
+        }
+
+        // An inline session policy must be a JSON policy document.
+        if let Some(policy) = input.policy.as_deref() {
+            if !is_policy_document(policy) {
+                return Err(AssumeRoleErrorModeled::MalformedPolicyDocumentException(
+                    MalformedPolicyDocumentException {
+                        message: Some(
+                            "The inline session policy must be a JSON policy document".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        if let Some(duplicate) = duplicate_tag_key(input.tags.as_deref()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Tags carries the session tag key '{duplicate}' more than once"
+            )));
+        }
+
+        // The packed size of the session policies and session tags, as the percentage
+        // of the budget AWS reports; over 100 percent the request does not fit.
+        let packed_policy = packed_policy_size(
+            input.policy.as_deref(),
+            &crate::state::policy_arns(input.policy_arns.as_deref()),
+            input.tags.as_deref().unwrap_or(&[]),
+        );
+        if let Some(percent) = packed_policy.filter(|percent| *percent > 100) {
+            return Err(AssumeRoleErrorModeled::PackedPolicyTooLargeException(
+                PackedPolicyTooLargeException {
+                    message: Some(format!(
+                        "Serialized token too large for session: the session policies and session \
+                         tags pack to {percent} percent of the allowed size"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+        let mut registry = state.lock();
+        // A caller presenting an expired session credential is refused, never served
+        // as another identity.
+        if let Err(expired) = crate::state::resolve_caller(&mut registry, &access_key_id, now, store)
+        {
+            return Err(AssumeRoleErrorModeled::ExpiredTokenException(
+                ExpiredTokenException {
+                    message: Some(expired.message()),
+                },
+            )
+            .into());
+        }
+
+        // SerialNumber and TokenCode name the caller's MFA device. They gate the call
+        // only through an MFA condition in the role's trust policy, which this
+        // emulator holds no roles and so no trust policies for; they are recorded
+        // nowhere and change nothing about the session.
+        let duration_seconds = input
+            .duration_seconds
+            .unwrap_or(ASSUME_ROLE_DEFAULT_DURATION_SECONDS);
+        let role_id = crate::state::role_id(&input.role_arn);
+        let assumed_role_id = format!("{role_id}:{}", input.role_session_name);
+        let assumed_role_arn = sts_arn(
+            &role.account,
+            &format!("assumed-role/{}/{}", role.name, input.role_session_name),
+        );
+        let identity = Identity {
+            user_id: assumed_role_id.clone(),
+            account: role.account.clone(),
+            arn: assumed_role_arn.clone(),
+        };
+
+        let minted = crate::state::mint_session(
+            store,
+            &mut registry,
+            now,
+            NewSession {
+                source_identity: input.source_identity.clone(),
+                tags: crate::state::tag_pairs(input.tags.as_deref()),
+                transitive_tag_keys: input.transitive_tag_keys.clone().unwrap_or_default(),
+                packed_policy_size: packed_policy,
+                external_id: input.external_id.clone(),
+                ..NewSession::new(identity, SessionKind::AssumedRole, duration_seconds)
+            },
+        );
+        let minted = match minted {
+            Ok(minted) => minted,
+            // The bounded session registry is full of sessions that have not expired,
+            // so this one cannot be recorded — and a credential that is not recorded
+            // must not be handed out.
+            Err(why) => return Err(crate::scaffolded::Scaffolded::validation(why.message())),
+        };
+        if let Err(why) = crate::state::honour_minimum_token_size(
+            &mut registry,
+            store,
+            &minted,
+            input.minimum_session_token_size,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
+        let (session_token_utilization, session_token_size) =
+            crate::state::session_token_metrics(&minted.credentials);
+        Ok(AssumeRoleOutput {
+            credentials: Some(minted.credentials),
+            assumed_role_user: Some(AssumedRoleUser {
+                assumed_role_id,
+                arn: assumed_role_arn,
+            }),
+            packed_policy_size: packed_policy,
+            source_identity: input.source_identity,
+            session_token_utilization: Some(session_token_utilization),
+            session_token_size: Some(session_token_size),
+        })
     }
 }

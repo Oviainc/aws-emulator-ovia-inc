@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSessionToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSessionToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSessionToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a session credential for the identity that called it: a NEW credential from
+//! the emulator's credential store, recorded in this service's session registry
+//! against the CALLER's own identity, so `GetCallerIdentity` signed with it reports
+//! the original caller rather than an assumed role.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -147,9 +144,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-sts-awssecuritytokenser
 // here — hence the `GetSessionTokenError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.sts#GetSessionToken")]
+// `GetSessionToken` lists only `RegionDisabledException`, so `ExpiredTokenException`
+// — a shape this SERVICE models, with its own 400 status and awsQuery code — is
+// widened in: a request that presents an expired session credential is refused with
+// the service's own expired-token error, the same way every other operation here
+// refuses one.
+#[smithy_macros::operation_error(
+    "com.amazonaws.sts#GetSessionToken",
+    extra_errors = ["ExpiredTokenException"]
+)]
 #[derive(Debug)]
 pub enum GetSessionTokenErrorModeled {
+    ExpiredTokenException(ExpiredTokenException),
     RegionDisabledException(RegionDisabledException),
 }
 
@@ -204,18 +210,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSessionToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSessionTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSessionToken"))
+        use crate::state::{NewSession, SessionKind, VENDED_SESSION_DEFAULT_DURATION_SECONDS};
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This service has no store on the engine it was mounted on, so it cannot
+            // serve anything. The router builds the one engine that does, so this is
+            // unreachable there.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetSessionToken",
+            ));
+        };
+        let store = ctx.credential_store();
+        let now = ::std::time::SystemTime::now();
+        let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+        let mut registry = state.lock();
+
+        // The session speaks for whoever asked for it, so an expired credential cannot
+        // be exchanged for a fresh one: that would renew a session past its end.
+        let identity =
+            crate::state::resolve_caller(&mut registry, &access_key_id, now, store).map_err(
+                |expired| {
+                    GetSessionTokenErrorModeled::ExpiredTokenException(ExpiredTokenException {
+                        message: Some(expired.message()),
+                    })
+                },
+            )?;
+
+        // SerialNumber and TokenCode name the caller's MFA device. They gate the call
+        // only through an MFA condition in a policy, which this emulator holds no
+        // policies for; they are recorded nowhere and change nothing about the session.
+        let duration_seconds = input
+            .duration_seconds
+            .unwrap_or(VENDED_SESSION_DEFAULT_DURATION_SECONDS);
+        let minted = crate::state::mint_session(
+            store,
+            &mut registry,
+            now,
+            NewSession::new(identity, SessionKind::SessionToken, duration_seconds),
+        );
+        let minted = match minted {
+            Ok(minted) => minted,
+            // The bounded session registry is full of sessions that have not expired,
+            // so this one cannot be recorded — and a credential that is not recorded
+            // must not be handed out.
+            Err(why) => return Err(crate::scaffolded::Scaffolded::validation(why.message())),
+        };
+        if let Err(why) = crate::state::honour_minimum_token_size(
+            &mut registry,
+            store,
+            &minted,
+            input.minimum_session_token_size,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
+        let (session_token_utilization, session_token_size) =
+            crate::state::session_token_metrics(&minted.credentials);
+        Ok(GetSessionTokenOutput {
+            credentials: Some(minted.credentials),
+            session_token_utilization: Some(session_token_utilization),
+            session_token_size: Some(session_token_size),
+        })
     }
 }
