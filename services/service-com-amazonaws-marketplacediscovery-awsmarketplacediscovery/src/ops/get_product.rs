@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetProduct
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetProduct`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetProduct::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns the seeded catalog's record for `productId`, including the listing that
+//! associates it, or `ResourceNotFoundException` when no such product exists.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +167,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetProduct` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetProductErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetProduct"))
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| GetProductError::validation("the catalog store is unavailable"))?;
+        let state = store.lock();
+
+        let preferred = crate::state::resolve_requested_locale(input.locale.as_deref())
+            .map_err(GetProductError::validation)?;
+
+        let product = state.products.get(&input.product_id).ok_or_else(|| {
+            GetProductErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "Product '{}' does not exist in catalog '{}'",
+                    input.product_id, state.catalog
+                )),
+            })
+        })?;
+
+        let locale = product.text.content_locale(preferred);
+        let text = product.text.text(locale);
+
+        Ok(GetProductOutput {
+            locale: Some(locale.to_string()),
+            product_id: product.product_id.clone(),
+            catalog: state.catalog.clone(),
+            product_name: text.name.clone(),
+            manufacturer: product.manufacturer.clone(),
+            deployed_on_aws: product.deployed_on_aws.clone(),
+            short_description: text.short_description.clone(),
+            long_description: text.long_description.clone(),
+            logo_thumbnail_url: product.logo_thumbnail_url.clone(),
+            fulfillment_option_summaries: product.fulfillment_option_summaries.clone(),
+            categories: product.categories.clone(),
+            highlights: product.highlights.clone(),
+            promotional_media: product.promotional_media.clone(),
+            resources: product.resources.clone(),
+            seller_engagements: product.seller_engagements.clone(),
+            // The listing whose `associatedEntities` name this product: stored on the
+            // product as the back-pointer to it, so the two directions cannot disagree.
+            listing_id: product.listing_id.clone(),
+        })
     }
 }
