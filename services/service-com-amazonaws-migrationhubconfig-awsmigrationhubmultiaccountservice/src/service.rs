@@ -96,17 +96,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Every operation of this service declares `InvalidInputException` for a
+        // request "the provided input violates a policy constraint or is entered in
+        // the wrong format or data type" (the shape's own documentation), so that is
+        // the code this service answers when the framework refuses a request against
+        // the model's own rules — an absent required member, or a value outside a
+        // declared length, range, pattern or enum. The framework's default code,
+        // `ValidationException`, is not a shape this service models, so a client
+        // branching on the error code would see a code the API never declares.
+        //
+        // The wording is left to the framework's renderer: it states which member
+        // failed which constraint, which is what a caller needs to fix the request.
+        // `Unauthenticated` keeps the default, which is a 403 rather than any shape
+        // this model declares.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "InvalidInputException".to_string(),
+                message: aws_smithy_schema_server::envelope(violations)
+                    .unwrap_or_else(|| "invalid request".to_string()),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeHomeRegionControls
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeHomeRegionControls`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeHomeRegionControls::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the home region controls held in [`crate::state`], filtered by whichever
+//! of `ControlId` / `HomeRegion` / `Target` the caller supplied and paginated with
+//! an opaque `NextToken`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +156,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeHomeRegionControls` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeHomeRegionControlsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeHomeRegionControls"))
+        // This operation only reports: it never writes to the store.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeHomeRegionControlsErrorModeled::InternalServerError(InternalServerError {
+                message: Some(
+                    "the MigrationHub Config store is unavailable in this emulator".to_string(),
+                ),
+            })
+        })?;
+
+        // The model bounds `MaxResults` at 100 and the `HomeRegionControls` list at
+        // 100 entries, so an unspecified page size is that bound: a page can never
+        // carry more than the output shape allows.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(0)
+            .clamp(1, usize::try_from(MAX_PAGE_SIZE).unwrap_or(1));
+
+        let resume_after = decode_next_token(input.next_token.as_deref()).ok_or_else(|| {
+            DescribeHomeRegionControlsErrorModeled::InvalidInputException(InvalidInputException {
+                message: Some(
+                    "The value of 'NextToken' is not a pagination token this service issued"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let resume_after = resume_after.as_deref();
+
+        let (target_type, target_id) = match input.target.as_ref() {
+            Some(target) => (Some(target.r#type.as_str()), target.id.as_deref()),
+            None => (None, None),
+        };
+
+        let store = state.lock();
+        // `home_region_controls` is keyed by control id, and ids are minted in
+        // ascending order, so this walk is the same stable order on every call and a
+        // token can resume it by naming the last id already returned.
+        let mut matching = store
+            .home_region_controls
+            .iter()
+            .filter(|(control_id, _)| {
+                resume_after.is_none_or(|resume| control_id.as_str() > resume)
+            })
+            .filter(|(_, record)| {
+                record.matches(
+                    input.control_id.as_deref(),
+                    input.home_region.as_deref(),
+                    target_type,
+                    target_id,
+                )
+            })
+            .map(|(_, record)| record);
+
+        let page: Vec<crate::state::HomeRegionControlRecord> =
+            matching.by_ref().take(page_size).cloned().collect();
+        // A token is emitted ONLY when a further match remains, so a caller that
+        // reaches the end of the list sees no token at all.
+        let next_token = matching
+            .next()
+            .and(page.last())
+            .map(|last| encode_next_token(&last.control_id));
+
+        Ok(DescribeHomeRegionControlsOutput {
+            home_region_controls: Some(
+                page.iter()
+                    .map(crate::state::HomeRegionControlRecord::to_modeled)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The largest page this operation serves: the model's `MaxResults` maximum, which
+/// is also the maximum length of the `HomeRegionControls` output list.
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// Encode the last control id of a page as an opaque continuation token.
+///
+/// Hex keeps the token inside the model's `Token` pattern
+/// (`^[a-zA-Z0-9\/\+\=]{0,2048}$`) and makes it opaque to a caller, which must
+/// pass it back unchanged rather than construct one. `hex` does the encoding: this
+/// crate writes no codec of its own.
+fn encode_next_token(control_id: &str) -> String {
+    ::hex::encode(control_id)
+}
+
+/// Decode a caller-supplied `NextToken` into the control id a page resumes after.
+///
+/// `Some(None)` for an absent or empty token (start at the beginning), `None` for a
+/// token this service could not have issued — which the caller sees as
+/// `InvalidInputException`. A token naming a control that has since been deleted is
+/// still honoured: it is only a position in the id order, so pagination survives a
+/// delete between two pages.
+fn decode_next_token(next_token: Option<&str>) -> Option<Option<String>> {
+    let token = next_token.unwrap_or_default();
+    if token.is_empty() {
+        return Some(None);
+    }
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    // Every token this service issues encodes a control id, so anything else is a
+    // token it did not issue.
+    let suffix = decoded.strip_prefix("hrc-")?;
+    let well_formed = suffix.len() == 12
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    well_formed.then_some(Some(decoded))
 }
