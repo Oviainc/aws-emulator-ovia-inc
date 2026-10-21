@@ -82,7 +82,10 @@ pub fn build_router(engine: Arc<InMemoryEngine>) -> MultiServiceRouter {
     let router = mount_chunk_03(router, &engine);
     let router = mount_chunk_04(router, &engine);
     let router = mount_chunk_05(router, &engine);
-    mount_chunk_06(router, &engine)
+    let router = mount_chunk_06(router, &engine);
+    let router = mount_chunk_07(router, &engine);
+    let router = mount_chunk_08(router, &engine);
+    mount_chunk_09(router, &engine)
 }
 
 /// Register services 00 of this workspace on `router`.
@@ -240,7 +243,68 @@ fn mount_chunk_06(
     router.register_service(service_com_amazonaws_cloudfrontkeyvaluestore_cloudfrontkeyvaluestore::EmulatedService::new(engine.clone()));
     router.register_service(service_com_amazonaws_cloudhsm_cloudhsmfrontendservice::EmulatedService::new(engine.clone()));
     router.register_service(service_com_amazonaws_cloudhsmv2_baldrapiservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_cloudsearch_a9searchcloudconfigservice2013::EmulatedService::new(engine.clone()));
     router.register_service(service_com_amazonaws_cloudsearchdomain_amazoncloudsearch2013::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_cloudtrail_cloudtrail_20131101::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 07 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_07(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_cloudtraildata_cloudtraildataservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_cloudwatchevents_awsevents::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_cloudwatchomni_cloudwatchomnifrontend::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_codeartifact_codeartifactcontrolplaneservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_codebuild_codebuild_20161006::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_codecatalyst_codecatalyst::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_codecommit_codecommit_20150413::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_codeconnections_codeconnections_20231201::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_codedeploy_codedeploy_20141006::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 08 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_08(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_codeguruprofiler_codeguruprofiler::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_codegurureviewer_awsgurufrontendservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_codegurusecurity_awscodegurusecurity::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_codepipeline_codepipeline_20150709::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_codestarconnections_codestar_connections_20191201::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_codestarnotifications_codestarnotifications_20191015::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_cognitoidentity_awscognitoidentityservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_cognitosync_awscognitosyncservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_comprehend_comprehend_20171127::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_comprehendmedical_comprehendmedical_20181030::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 09 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_09(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::EmulatedService::new(engine.clone()));
     router
 }
 

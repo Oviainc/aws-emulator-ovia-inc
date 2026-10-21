@@ -74,7 +74,32 @@ members = [
     "services/service-com-amazonaws-cloudfrontkeyvaluestore-cloudfrontkeyvaluestore",
     "services/service-com-amazonaws-cloudhsm-cloudhsmfrontendservice",
     "services/service-com-amazonaws-cloudhsmv2-baldrapiservice",
+    "services/service-com-amazonaws-cloudsearch-a9searchcloudconfigservice2013",
     "services/service-com-amazonaws-cloudsearchdomain-amazoncloudsearch2013",
+    "services/service-com-amazonaws-cloudtrail-cloudtrail-20131101",
+    "services/service-com-amazonaws-cloudtraildata-cloudtraildataservice",
+    "services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
+    "services/service-com-amazonaws-cloudwatchevents-awsevents",
+    "services/service-com-amazonaws-cloudwatchlogs-logs-20140328",
+    "services/service-com-amazonaws-cloudwatchomni-cloudwatchomnifrontend",
+    "services/service-com-amazonaws-codeartifact-codeartifactcontrolplaneservice",
+    "services/service-com-amazonaws-codebuild-codebuild-20161006",
+    "services/service-com-amazonaws-codecatalyst-codecatalyst",
+    "services/service-com-amazonaws-codecommit-codecommit-20150413",
+    "services/service-com-amazonaws-codeconnections-codeconnections-20231201",
+    "services/service-com-amazonaws-codedeploy-codedeploy-20141006",
+    "services/service-com-amazonaws-codeguruprofiler-codeguruprofiler",
+    "services/service-com-amazonaws-codegurureviewer-awsgurufrontendservice",
+    "services/service-com-amazonaws-codegurusecurity-awscodegurusecurity",
+    "services/service-com-amazonaws-codepipeline-codepipeline-20150709",
+    "services/service-com-amazonaws-codestarconnections-codestar-connections-20191201",
+    "services/service-com-amazonaws-codestarnotifications-codestarnotifications-20191015",
+    "services/service-com-amazonaws-cognitoidentity-awscognitoidentityservice",
+    "services/service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice",
+    "services/service-com-amazonaws-cognitosync-awscognitosyncservice",
+    "services/service-com-amazonaws-comprehend-comprehend-20171127",
+    "services/service-com-amazonaws-comprehendmedical-comprehendmedical-20181030",
+    "services/service-com-amazonaws-computeoptimizerautomation-computeoptimizerautomationservice",
     "core/router",
     "core/embedded",
 ]
@@ -184,7 +209,32 @@ service-com-amazonaws-cloudfront-cloudfront2020-05-31 = { path = "services/servi
 service-com-amazonaws-cloudfrontkeyvaluestore-cloudfrontkeyvaluestore = { path = "services/service-com-amazonaws-cloudfrontkeyvaluestore-cloudfrontkeyvaluestore" }
 service-com-amazonaws-cloudhsm-cloudhsmfrontendservice = { path = "services/service-com-amazonaws-cloudhsm-cloudhsmfrontendservice" }
 service-com-amazonaws-cloudhsmv2-baldrapiservice = { path = "services/service-com-amazonaws-cloudhsmv2-baldrapiservice" }
+service-com-amazonaws-cloudsearch-a9searchcloudconfigservice2013 = { path = "services/service-com-amazonaws-cloudsearch-a9searchcloudconfigservice2013" }
 service-com-amazonaws-cloudsearchdomain-amazoncloudsearch2013 = { path = "services/service-com-amazonaws-cloudsearchdomain-amazoncloudsearch2013" }
+service-com-amazonaws-cloudtrail-cloudtrail-20131101 = { path = "services/service-com-amazonaws-cloudtrail-cloudtrail-20131101" }
+service-com-amazonaws-cloudtraildata-cloudtraildataservice = { path = "services/service-com-amazonaws-cloudtraildata-cloudtraildataservice" }
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { path = "services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801" }
+service-com-amazonaws-cloudwatchevents-awsevents = { path = "services/service-com-amazonaws-cloudwatchevents-awsevents" }
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { path = "services/service-com-amazonaws-cloudwatchlogs-logs-20140328" }
+service-com-amazonaws-cloudwatchomni-cloudwatchomnifrontend = { path = "services/service-com-amazonaws-cloudwatchomni-cloudwatchomnifrontend" }
+service-com-amazonaws-codeartifact-codeartifactcontrolplaneservice = { path = "services/service-com-amazonaws-codeartifact-codeartifactcontrolplaneservice" }
+service-com-amazonaws-codebuild-codebuild-20161006 = { path = "services/service-com-amazonaws-codebuild-codebuild-20161006" }
+service-com-amazonaws-codecatalyst-codecatalyst = { path = "services/service-com-amazonaws-codecatalyst-codecatalyst" }
+service-com-amazonaws-codecommit-codecommit-20150413 = { path = "services/service-com-amazonaws-codecommit-codecommit-20150413" }
+service-com-amazonaws-codeconnections-codeconnections-20231201 = { path = "services/service-com-amazonaws-codeconnections-codeconnections-20231201" }
+service-com-amazonaws-codedeploy-codedeploy-20141006 = { path = "services/service-com-amazonaws-codedeploy-codedeploy-20141006" }
+service-com-amazonaws-codeguruprofiler-codeguruprofiler = { path = "services/service-com-amazonaws-codeguruprofiler-codeguruprofiler" }
+service-com-amazonaws-codegurureviewer-awsgurufrontendservice = { path = "services/service-com-amazonaws-codegurureviewer-awsgurufrontendservice" }
+service-com-amazonaws-codegurusecurity-awscodegurusecurity = { path = "services/service-com-amazonaws-codegurusecurity-awscodegurusecurity" }
+service-com-amazonaws-codepipeline-codepipeline-20150709 = { path = "services/service-com-amazonaws-codepipeline-codepipeline-20150709" }
+service-com-amazonaws-codestarconnections-codestar-connections-20191201 = { path = "services/service-com-amazonaws-codestarconnections-codestar-connections-20191201" }
+service-com-amazonaws-codestarnotifications-codestarnotifications-20191015 = { path = "services/service-com-amazonaws-codestarnotifications-codestarnotifications-20191015" }
+service-com-amazonaws-cognitoidentity-awscognitoidentityservice = { path = "services/service-com-amazonaws-cognitoidentity-awscognitoidentityservice" }
+service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice = { path = "services/service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice" }
+service-com-amazonaws-cognitosync-awscognitosyncservice = { path = "services/service-com-amazonaws-cognitosync-awscognitosyncservice" }
+service-com-amazonaws-comprehend-comprehend-20171127 = { path = "services/service-com-amazonaws-comprehend-comprehend-20171127" }
+service-com-amazonaws-comprehendmedical-comprehendmedical-20181030 = { path = "services/service-com-amazonaws-comprehendmedical-comprehendmedical-20181030" }
+service-com-amazonaws-computeoptimizerautomation-computeoptimizerautomationservice = { path = "services/service-com-amazonaws-computeoptimizerautomation-computeoptimizerautomationservice" }
 
 # The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
 #
