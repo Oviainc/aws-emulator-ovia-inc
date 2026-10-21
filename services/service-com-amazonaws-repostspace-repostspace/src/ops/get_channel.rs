@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the channel `CreateChannel` persisted under its space, exactly as stored.
+//! The only write this read makes is materialising a channel status the clock already
+//! owed (see [`crate::state::PROVISIONING_SPAN`]).
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +154,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetChannel"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetChannelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the repostspace emulator is mounted on an engine that holds \
+                              no state"
+                        .to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        let Some(space) = guard.space_mut(&input.space_id) else {
+            return Err(GetChannelErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Space {} was not found", input.space_id),
+                    resource_id: input.space_id.clone(),
+                    resource_type: crate::state::SPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+        let Some(channel) = space.channel(&input.channel_id) else {
+            return Err(GetChannelErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Channel {} was not found", input.channel_id),
+                    resource_id: input.channel_id.clone(),
+                    resource_type: crate::state::CHANNEL_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetChannelOutput {
+            space_id: channel.space_id.clone(),
+            channel_id: channel.channel_id.clone(),
+            channel_name: channel.channel_name.clone(),
+            channel_description: channel.channel_description.clone(),
+            create_date_time: channel.create_date_time,
+            delete_date_time: channel.delete_date_time,
+            // Absent until an accessor holds a channel role, as the model's optional
+            // member allows.
+            channel_roles: (!channel.channel_roles.is_empty())
+                .then(|| channel.channel_roles.clone()),
+            channel_status: channel.channel_status.clone(),
+        })
     }
 }
