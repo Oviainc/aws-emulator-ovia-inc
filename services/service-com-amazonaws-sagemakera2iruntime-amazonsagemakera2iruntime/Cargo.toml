@@ -21,13 +21,18 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Hex codec for the opaque `ListHumanLoops` pagination token and the stored input digest.
+hex = { workspace = true }
+# SHA-256: a record keeps the digest of a human loop's input content, never the content.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# `time` for `tokio::time::sleep` in the lifecycle tests: the clock-owed Stopping -> Stopped
+# transition is observed by waiting past its due instant without blocking the test's worker.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true
