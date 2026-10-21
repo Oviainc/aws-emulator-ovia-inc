@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a new resource group in [`crate::state`] and reports it back. The group's
+//! ARN is minted once here, from the request's region and the emulator's account id, and
+//! every later read returns the stored one.
+//!
+//! A service `Configuration` is answered with 501: the operations that report one
+//! (`GetGroupConfiguration`, `PutGroupConfiguration`) are still scaffolded, so this
+//! emulator cannot answer for a configured group faithfully.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +185,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGroup"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` is deliberately unreachable here and a success says
+        // nothing about the caller's permissions. `ctx` is read below for the
+        // request's region.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateGroupErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the resource-groups store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A `Configuration` present but EMPTY carries no configuration item, so the
+        // group contains no configuration and is treated exactly as one that sent
+        // none: the mutual-exclusion rule below is about a group CONTAINING a
+        // configuration, and an empty list contains nothing.
+        let configured = input.configuration.as_ref().is_some_and(|c| !c.is_empty());
+        // Modelled: "A resource group can contain either a ResourceQuery or a
+        // Configuration, but not both."
+        if configured && input.resource_query.is_some() {
+            return Err(bad_request(
+                "a resource group can contain either a ResourceQuery or a Configuration, \
+                 but not both",
+            ));
+        }
+        if configured {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateGroup with a service Configuration",
+            ));
+        }
+        // Modelled on `CreateGroupInput$Name`: "The name cannot start with AWS, aws, or
+        // any other possible capitalization; these are reserved." `get` keeps the
+        // comparison on a char boundary: `Name` is request-supplied, so byte-indexing it
+        // would panic on a name whose third byte is inside a multi-byte character.
+        if input
+            .name
+            .get(..3)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("aws"))
+        {
+            return Err(bad_request(format!(
+                "Name {} is not valid: a group name cannot start with a reserved prefix \
+                 (any capitalization of 'aws')",
+                input.name,
+            )));
+        }
+        if let Some(query) = &input.resource_query {
+            if !QUERY_TYPE_VALUES.contains(&query.r#type.as_str()) {
+                return Err(bad_request(format!(
+                    "ResourceQuery.Type {} is not valid: expected one of {}",
+                    query.r#type,
+                    QUERY_TYPE_VALUES.join(", "),
+                )));
+            }
+            // The model documents `ResourceQuery$Query` as "The query that defines a
+            // group or a search" in JSON — an object: `{"ResourceTypeFilters":[..],
+            // "TagFilters":[..]}` for a tag query, `{"StackIdentifier":".."}` for a
+            // stack query. A body that is not a JSON object defines no query. Which
+            // keys a given `Type` accepts is not refused here: the slice stores the
+            // query without running it.
+            if !serde_json::from_str::<serde_json::Value>(&query.query)
+                .is_ok_and(|parsed| parsed.is_object())
+            {
+                return Err(bad_request(
+                    "ResourceQuery.Query is not valid: it must be a JSON object",
+                ));
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // A group name is unique within an account and region, so a second create
+        // for a stored name is refused rather than overwriting it.
+        if store.groups.contains_key(&input.name) {
+            return Err(bad_request(format!(
+                "a group named {} already exists in this account",
+                input.name,
+            )));
+        }
+        // The emulator's own ceiling on stored state (see `MAX_GROUPS`), so a client
+        // looping on this operation is refused instead of growing the store without
+        // end. Deleting a group makes room again.
+        if store.groups.len() >= crate::state::MAX_GROUPS {
+            return Err(bad_request(format!(
+                "this emulator holds at most {} resource groups; delete one before \
+                 creating another",
+                crate::state::MAX_GROUPS,
+            )));
+        }
+        let record = crate::state::GroupRecord {
+            group_arn: crate::state::group_arn(&region, &input.name),
+            name: input.name.clone(),
+            description: input.description,
+            criticality: input.criticality,
+            owner: input.owner,
+            display_name: input.display_name,
+            resource_query: input
+                .resource_query
+                .map(|query| crate::state::ResourceQueryRecord {
+                    query_type: query.r#type,
+                    query: query.query,
+                }),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            members: Vec::new(),
+        };
+        // Reported from the record that is about to be stored, so the response and
+        // the store cannot disagree.
+        let output = CreateGroupOutput {
+            group: Some(record.to_group()),
+            resource_query: record.to_resource_query(),
+            tags: Some(record.tags_map()),
+            // A group created without a `Configuration` has none.
+            group_configuration: None,
+        };
+        store.groups.insert(record.name.clone(), record);
+        Ok(output)
     }
+}
+
+/// A `BadRequestException` (HTTP 400) — the modelled refusal for a request whose
+/// parameters violate this operation's validation rules.
+fn bad_request(message: impl Into<String>) -> CreateGroupError {
+    CreateGroupErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }
