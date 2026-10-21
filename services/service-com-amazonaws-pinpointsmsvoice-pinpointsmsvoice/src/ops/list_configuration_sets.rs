@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConfigurationSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConfigurationSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConfigurationSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +68,34 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The page bound applied when the caller sends no `PageSize`.
+///
+/// An unbounded default would let one `GET` with no parameters amplify into a response
+/// sized by the whole store, so the server picks a bound and reports a `NextToken` for
+/// the rest. AWS does not document this API's default, so this is the emulator's own:
+/// a paginating client is unaffected (it follows the token), and a client that wants
+/// more asks for it with `PageSize`.
+const DEFAULT_PAGE_SIZE: usize = 50;
+
+/// The largest page the server will serve, whatever `PageSize` asks for.
+///
+/// A caller-chosen page size is clamped to this rather than refused: it bounds how much
+/// one request can amplify into, so the response size is capped no matter what is
+/// stored. AWS does not document a maximum for this API, so this is the emulator's own
+/// bound, set well above any realistic page.
+///
+/// A caller cannot tell a clamped page from an exhausted one by its length alone — only
+/// by `NextToken`, which is reported exactly when entries remain, so a client that
+/// follows the token still walks the whole collection.
+const MAX_PAGE_SIZE: usize = 1_000;
+
+/// The marker every `NextToken` this operation mints carries, inside the encoding.
+///
+/// It is what distinguishes a token this service handed out from a string a caller made
+/// up that merely decodes cleanly; it also names the token's layout version, so a later
+/// change of cursor format can reject the old shape instead of misreading it.
+const TOKEN_MARKER: &str = "pinpointsmsvoice:configuration-sets:1:";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +167,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConfigurationSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConfigurationSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConfigurationSets"))
+        let _ = ctx;
+
+        // `PageSize` is modelled as a string, so a value that is not a positive
+        // decimal count is a client error, not a count to clamp. Absent, the server's
+        // own `DEFAULT_PAGE_SIZE` applies; present, it is clamped to `MAX_PAGE_SIZE`.
+        let page_size = match input.page_size.as_deref().map(str::trim) {
+            None | Some("") => DEFAULT_PAGE_SIZE,
+            Some(raw) => parse_page_size(raw)?,
+        };
+
+        // `NextToken` is opaque to the caller but it is OURS: one this service did not
+        // mint cannot name a position in the listing.
+        let resume_after = match input.next_token.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(raw) => Some(decode_token(raw).ok_or_else(|| {
+                ListConfigurationSetsErrorModeled::BadRequestException(BadRequestException {
+                    message: Some("NextToken is not a token returned by ListConfigurationSets".into()),
+                })
+            })?),
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListConfigurationSetsErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the service state store is unavailable".into()),
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        // The store is a `BTreeMap`, so the listing order is total and stable and a
+        // token naming the last name of a page resumes exactly after it.
+        let mut remaining = store.configuration_sets.keys().filter(|name| {
+            resume_after
+                .as_deref()
+                .is_none_or(|after| name.as_str() > after)
+        });
+
+        // CAP (`DEFAULT_PAGE_SIZE` / `MAX_PAGE_SIZE`): `page_size` is already bounded,
+        // so one response can never carry more than `MAX_PAGE_SIZE` names however many
+        // are stored; the rest is reached through `NextToken`.
+        let page: Vec<String> = remaining.by_ref().take(page_size).cloned().collect();
+        // A `NextToken` is reported only when something is actually left: the last page
+        // must not hand back a token that resumes onto nothing.
+        let more = remaining.next().is_some();
+        let next_token = match (more, page.last()) {
+            (true, Some(last)) => Some(encode_token(last)),
+            _ => None,
+        };
+
+        Ok(ListConfigurationSetsOutput {
+            configuration_sets: Some(page),
+            next_token,
+        })
     }
+}
+
+/// Read `PageSize` as the page bound, refusing anything that is not a positive count
+/// and clamping what is left to [`MAX_PAGE_SIZE`].
+///
+/// A page of zero items would make a paginating client loop forever, so it is refused
+/// alongside a negative, fractional or non-numeric value. A count above the maximum is
+/// clamped rather than refused: the caller asked for at most that many, and it gets a
+/// `NextToken` for the remainder.
+fn parse_page_size(raw: &str) -> Result<usize, ListConfigurationSetsErrorModeled> {
+    match raw.parse::<usize>() {
+        Ok(size) if size > 0 => Ok(size.min(MAX_PAGE_SIZE)),
+        _ => Err(ListConfigurationSetsErrorModeled::BadRequestException(
+            BadRequestException {
+                message: Some(format!(
+                    "PageSize must be a positive whole number of items, got {raw}"
+                )),
+            },
+        )),
+    }
+}
+
+/// Mint the opaque `NextToken` for a page whose last entry was `after`.
+///
+/// The token is the hex of [`TOKEN_MARKER`] followed by the exclusive-start name:
+/// opaque to the caller, and enough to resume the listing because the stored order is
+/// total. The marker is what makes the token THIS service's — see [`decode_token`].
+fn encode_token(after: &str) -> String {
+    hex::encode(format!("{TOKEN_MARKER}{after}").as_bytes())
+}
+
+/// The inverse of [`encode_token`]; `None` for anything this service did not mint.
+///
+/// The marker is checked, not just the encoding: without it any even-length hex string
+/// that happens to decode to UTF-8 would be honoured as a cursor, and a caller that
+/// invented one would silently get a listing starting from a position the service never
+/// handed out.
+fn decode_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    decoded.strip_prefix(TOKEN_MARKER).map(str::to_string)
 }
