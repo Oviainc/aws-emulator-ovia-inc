@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrail
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrail`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrail::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a trail in the shared trail registry (`crate::state`) and reports it back.
 //!
 //! ## Shape of an operation
 //!
@@ -339,18 +331,185 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrail` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTrailErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrail"))
+        let region = crate::state::request_region(ctx.parts());
+
+        // `Name` must satisfy the trail-name rules the model documents; the boundary
+        // validator cannot refuse them because the model carries no pattern for them.
+        crate::state::validate_trail_name(&input.name).map_err(|rejection| {
+            CreateTrailErrorModeled::InvalidTrailNameException(InvalidTrailNameException {
+                message: Some(rejection.message()),
+            })
+        })?;
+
+        if let Some(prefix) = input
+            .s3_key_prefix
+            .as_deref()
+            .filter(|p| p.chars().count() > crate::state::S3_KEY_PREFIX_MAX_LEN)
+        {
+            return Err(CreateTrailErrorModeled::InvalidS3PrefixException(
+                InvalidS3PrefixException {
+                    message: Some(format!(
+                        "S3KeyPrefix is {} characters long; the maximum length is {} characters",
+                        prefix.chars().count(),
+                        crate::state::S3_KEY_PREFIX_MAX_LEN
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if let Some(topic) = input
+            .sns_topic_name
+            .as_deref()
+            .filter(|t| t.chars().count() > crate::state::SNS_TOPIC_NAME_MAX_LEN)
+        {
+            return Err(CreateTrailErrorModeled::InvalidSnsTopicNameException(
+                InvalidSnsTopicNameException {
+                    message: Some(format!(
+                        "SnsTopicName is {} characters long; the maximum length is {} characters",
+                        topic.chars().count(),
+                        crate::state::SNS_TOPIC_NAME_MAX_LEN
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let tags = input.tags_list.unwrap_or_default();
+        if tags.len() > crate::state::TAGS_PER_RESOURCE_LIMIT {
+            return Err(CreateTrailErrorModeled::TagsLimitExceededException(
+                TagsLimitExceededException {
+                    message: Some(format!(
+                        "TagsList carries {} tags; the limit is {} tags per trail",
+                        tags.len(),
+                        crate::state::TAGS_PER_RESOURCE_LIMIT
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(duplicate) = first_duplicate_tag_key(&tags) {
+            return Err(CreateTrailErrorModeled::InvalidTagParameterException(
+                InvalidTagParameterException {
+                    message: Some(format!(
+                        "TagsList carries the tag key '{duplicate}' more than once"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateTrailErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+                message: Some(
+                    "CreateTrail needs the CloudTrail trail registry, which this engine \
+                     does not carry"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // A name already taken IN THIS REGION is a conflict, never an overwrite; a
+        // trail name is scoped to its Region, so the same name in another Region is
+        // a different trail.
+        let key = (input.name.clone(), region.clone());
+        if store.trails.contains_key(&key) {
+            return Err(CreateTrailErrorModeled::TrailAlreadyExistsException(
+                TrailAlreadyExistsException {
+                    message: Some(format!(
+                        "Trail {} already exists in {region}",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The registry is bounded: it holds state for the life of the process and
+        // every request may add to it.
+        if store.trails.len() >= crate::state::TRAIL_QUOTA {
+            return Err(
+                CreateTrailErrorModeled::MaximumNumberOfTrailsExceededException(
+                    MaximumNumberOfTrailsExceededException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} trails; delete a \
+                             trail before creating another",
+                            crate::state::TRAIL_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = crate::state::TrailRecord {
+            trail_arn: crate::state::trail_arn(&region, &input.name),
+            name: input.name,
+            s3_bucket_name: input.s3_bucket_name,
+            s3_key_prefix: input.s3_key_prefix,
+            sns_topic_arn: input
+                .sns_topic_name
+                .as_deref()
+                .map(|topic| crate::state::sns_topic_arn(&region, topic)),
+            sns_topic_name: input.sns_topic_name,
+            // CloudTrail delivers global service events unless the request turns
+            // them off.
+            include_global_service_events: input.include_global_service_events.unwrap_or(true),
+            // "The default is false, which creates a trail only in the Region where
+            // you are signed in."
+            is_multi_region_trail: input.is_multi_region_trail.unwrap_or(false),
+            // `EnableLogFileValidation` is the request's name for the trail's
+            // `LogFileValidationEnabled`; "The default is false."
+            log_file_validation_enabled: input.enable_log_file_validation.unwrap_or(false),
+            cloud_watch_logs_log_group_arn: input.cloud_watch_logs_log_group_arn,
+            cloud_watch_logs_role_arn: input.cloud_watch_logs_role_arn,
+            kms_key_id: input.kms_key_id,
+            // "The default is false, and cannot be true unless the call is made on
+            // behalf of [the] management account".
+            is_organization_trail: input.is_organization_trail.unwrap_or(false),
+            // "The default value is true."
+            recursive_logging: input.recursive_logging.unwrap_or(true),
+            home_region: region,
+            has_custom_event_selectors: false,
+            has_insight_selectors: false,
+            tags,
+            status: crate::state::TrailStatus::default(),
+        };
+
+        // Report the stored record, so the response and every later read of this
+        // trail are the same values.
+        let output = CreateTrailOutput {
+            name: Some(record.name.clone()),
+            s3_bucket_name: Some(record.s3_bucket_name.clone()),
+            s3_key_prefix: record.s3_key_prefix.clone(),
+            // Deprecated in the model ("This field is no longer in use. Use
+            // SnsTopicARN."), so only the ARN is reported.
+            sns_topic_name: None,
+            sns_topic_arn: record.sns_topic_arn.clone(),
+            include_global_service_events: Some(record.include_global_service_events),
+            is_multi_region_trail: Some(record.is_multi_region_trail),
+            trail_arn: Some(record.trail_arn.clone()),
+            log_file_validation_enabled: Some(record.log_file_validation_enabled),
+            cloud_watch_logs_log_group_arn: record.cloud_watch_logs_log_group_arn.clone(),
+            cloud_watch_logs_role_arn: record.cloud_watch_logs_role_arn.clone(),
+            kms_key_id: record.kms_key_id.clone(),
+            is_organization_trail: Some(record.is_organization_trail),
+            recursive_logging: Some(record.recursive_logging),
+        };
+
+        store.trails.insert(key, record);
+        Ok(output)
     }
+}
+
+/// The first tag key that appears more than once in `tags`, if any.
+///
+/// `InvalidTagParameterException` covers duplicate tags, and a tag set is a map on
+/// the wire even though the model carries it as a list.
+fn first_duplicate_tag_key(tags: &[Tag]) -> Option<&str> {
+    let mut seen = ::std::collections::BTreeSet::new();
+    tags.iter()
+        .find(|tag| !seen.insert(tag.key.as_str()))
+        .map(|tag| tag.key.as_str())
 }
