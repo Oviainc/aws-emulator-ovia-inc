@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +175,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChannel"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // `DryRun` carries no documented semantics in this model (its doc text is
+        // the generated placeholder), so what the real service validates — and
+        // what it answers — is not knowable from the contract. Refuse it with the
+        // operation's own modelled client error rather than silently creating a
+        // channel the caller asked NOT to create.
+        if input.dry_run == Some(true) {
+            return Err(CreateChannelErrorModeled::BadRequestException(BadRequestException {
+                message: Some(
+                    "dryRun is not implemented by this emulator; omit dryRun to create the channel"
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
+        // The model gives `ChannelClass` no default, and MediaLive's own default
+        // is STANDARD — the two-pipeline class the `ChannelClass` doc describes.
+        let channel_class = input
+            .channel_class
+            .unwrap_or_else(|| crate::state::channel_class::STANDARD.to_string());
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.settle(now);
+
+        // A retried create (same `@idempotencyToken` `RequestId`) must return the
+        // channel the first one created, not a second channel.
+        if let Some(existing) = input
+            .request_id
+            .as_deref()
+            .and_then(|token| state.channel_for_token(token))
+            .map(str::to_string)
+        {
+            let channel = state.channel_description(&existing).ok_or_else(unavailable)?;
+            return Ok(CreateChannelOutput {
+                channel: Some(channel),
+            });
+        }
+
+        // The store is bounded, so a create loop cannot grow the emulator's heap
+        // without limit: once it is full the operation's own modelled throttle is
+        // the answer, not another channel.
+        if state.is_full() {
+            return Err(CreateChannelErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "This emulator stores at most {} channels; delete one before creating another",
+                        crate::state::MAX_CHANNELS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.mint_channel_id();
+        let arn = ::engine::emulator_arn("medialive", &region, &format!("channel:{id}"));
+        let mut channel = crate::state::new_channel(id.clone(), arn, channel_class, now);
+
+        // Everything the request supplied is stored verbatim; the response is
+        // then read back out of the stored record, never from `input`.
+        channel.name = input.name;
+        channel.cdi_input_specification = input.cdi_input_specification;
+        channel.destinations = input.destinations.unwrap_or_default();
+        channel.encoder_settings = input.encoder_settings;
+        channel.input_attachments = input.input_attachments.unwrap_or_default();
+        channel.input_specification = input.input_specification;
+        channel.log_level = input.log_level;
+        channel.maintenance = input.maintenance.map(|maintenance| MaintenanceStatus {
+            maintenance_day: maintenance.maintenance_day,
+            maintenance_start_time: maintenance.maintenance_start_time,
+            // The deadline and the scheduled date are assigned by the real
+            // service's maintenance scheduler, which this emulator does not run.
+            maintenance_deadline: None,
+            maintenance_scheduled_date: None,
+        });
+        channel.role_arn = input.role_arn;
+        channel.tags = input.tags.unwrap_or_default();
+        channel.channel_security_groups = input.channel_security_groups.unwrap_or_default();
+        channel.anywhere_settings = input.anywhere_settings;
+        channel.linked_channel_settings = input.linked_channel_settings;
+        channel.inference_settings = input.inference_settings;
+        channel.vpc = input.vpc;
+        channel.channel_engine_version =
+            input.channel_engine_version.and_then(|version| version.version);
+
+        state.channels.insert(id.clone(), channel);
+        if let Some(token) = input.request_id {
+            // Bounded, evicting write: a caller-chosen token can neither
+            // accumulate past the cap nor outlive the channel it created.
+            state.record_idempotency_token(token, &id);
+        }
+
+        let channel = state.channel_description(&id).ok_or_else(unavailable)?;
+        Ok(CreateChannelOutput {
+            channel: Some(channel),
+        })
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to create the channel in. A modelled server error, never
+/// a fresh engine (which would drop the write when this request returns).
+fn unavailable() -> CreateChannelError {
+    CreateChannelErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }
