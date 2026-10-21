@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPurchaseOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPurchaseOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPurchaseOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the purchase options (offers and offer sets) in the emulator's seeded
+//! catalog, narrowed by `filters`.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +142,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPurchaseOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPurchaseOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPurchaseOptions"))
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPurchaseOptionsError::validation("the catalog store is unavailable")
+        })?;
+        let state = store.lock();
+
+        let locale = crate::state::resolve_requested_locale(input.locale.as_deref())
+            .map_err(ListPurchaseOptionsError::validation)?;
+
+        let filters = input.filters.clone().unwrap_or_default();
+        let candidates = state.purchase_options(crate::state::now_secs(), locale);
+        let mut matches: Vec<&crate::state::PurchaseOptionEntry> = Vec::new();
+        for candidate in &candidates {
+            if matches_every_filter(candidate, &filters)
+                .map_err(ListPurchaseOptionsError::validation)?
+            {
+                matches.push(candidate);
+            }
+        }
+
+        let identity = query_identity(locale, &filters);
+        let (page, next_token) = crate::state::page(
+            &matches,
+            input.next_token.as_deref(),
+            &identity,
+            input.max_results,
+        )
+        .map_err(ListPurchaseOptionsError::validation)?;
+
+        Ok(ListPurchaseOptionsOutput {
+            // An empty page is an empty list, not an error: the model gives
+            // `purchaseOptions` no error for "nothing matched".
+            purchase_options: Some(page.iter().map(|entry| entry.summary.clone()).collect()),
+            next_token,
+        })
     }
+}
+
+/// The query whose result set a `nextToken` belongs to: everything that changes WHICH
+/// purchase options match, and not `maxResults`, which a client may vary per page.
+fn query_identity(locale: &str, filters: &[PurchaseOptionFilter]) -> String {
+    let filters: Vec<String> = filters
+        .iter()
+        .map(|filter| format!("{}={}", filter.filter_type, filter.filter_values.join("|")))
+        .collect();
+    format!("ListPurchaseOptions/{locale}/{}", filters.join(";"))
+}
+
+/// Whether a purchase option satisfies every filter (AND across filters, OR within one).
+///
+/// The filter types and the values each one accepts are
+/// `PurchaseOptionFilterType`/`PurchaseOptionFilter$filterValues`: `PRODUCT_ID` and
+/// `SELLER_OF_RECORD_PROFILE_ID` take identifiers, `PURCHASE_OPTION_TYPE` takes `OFFER` or
+/// `OFFERSET`, `VISIBILITY_SCOPE` takes `PRIVATE`, and `AVAILABILITY_STATUS` takes
+/// `AVAILABLE` or `EXPIRED`. `Err` is the refusal message for a value outside the
+/// documented set, which the model's enums cover only for the filter TYPE.
+fn matches_every_filter(
+    entry: &crate::state::PurchaseOptionEntry,
+    filters: &[PurchaseOptionFilter],
+) -> Result<bool, String> {
+    for filter in filters {
+        let values = &filter.filter_values;
+        let matched = match filter.filter_type.as_str() {
+            "PRODUCT_ID" => entry
+                .product_ids
+                .iter()
+                .any(|product_id| values.contains(product_id)),
+            "SELLER_OF_RECORD_PROFILE_ID" => values.contains(&entry.seller_profile_id),
+            "PURCHASE_OPTION_TYPE" => {
+                // The model's own enum of purchase option types.
+                check_values(&filter.filter_type, values, PURCHASE_OPTION_TYPE_VALUES)?;
+                values.contains(&entry.summary.purchase_option_type)
+            }
+            "VISIBILITY_SCOPE" => {
+                check_values(
+                    &filter.filter_type,
+                    values,
+                    crate::state::VISIBILITY_SCOPE_FILTER_VALUES,
+                )?;
+                values.contains(&entry.visibility_scope)
+            }
+            "AVAILABILITY_STATUS" => {
+                check_values(
+                    &filter.filter_type,
+                    values,
+                    crate::state::AVAILABILITY_STATUS_VALUES,
+                )?;
+                values.contains(&entry.availability_status)
+            }
+            other => {
+                return Err(format!("filters: '{other}' is not a supported filterType"));
+            }
+        };
+        if !matched {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Refuse a filter value outside the set its filter type documents.
+fn check_values(filter_type: &str, values: &[String], allowed: &[&str]) -> Result<(), String> {
+    for value in values {
+        if !allowed.contains(&value.as_str()) {
+            return Err(format!(
+                "filters: {filter_type} accepts only {}, got '{value}'",
+                allowed.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }

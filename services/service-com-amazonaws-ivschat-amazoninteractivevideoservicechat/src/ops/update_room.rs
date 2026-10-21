@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRoom
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRoom`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mutates the STORED room in place. Only the members the request carries
+//! are applied; `updateTime` is bumped and `arn`, `id`, `createTime` and `tags` are left
+//! as they were, so a following `GetRoom` observes exactly this change.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRoom::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A 501 from this operation would mean "nobody has written it yet"; it no longer
+//! answers one.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +173,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRoom` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRoomErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRoom"))
+        let _ = ctx;
+        // Modeled constraints are already refused BEFORE this handler runs, so reaching
+        // here means every member present satisfies its modelled bounds.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service. An engine this service cannot read its state
+            // from means the operation cannot be served at all, which is what 501 says.
+            crate::scaffolded::Scaffolded::not_implemented("UpdateRoom")
+        })?;
+
+        if crate::state::ComAmazonawsIvschatAmazoninteractivevideoservicechatState::room_id_of(
+            &input.identifier,
+        )
+        .is_none()
+        {
+            return Err(UpdateRoomErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    "identifier",
+                    format!(
+                        "identifier {} does not name a room: it must be a room ARN.",
+                        input.identifier
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(room) = store.room_mut(&input.identifier) else {
+            return Err(UpdateRoomErrorModeled::ResourceNotFoundException(
+                crate::state::room_not_found(&input.identifier),
+            )
+            .into());
+        };
+
+        // Only the members the request carries are applied; an absent member leaves the
+        // stored value alone.
+        if let Some(name) = input.name {
+            room.name = Some(name);
+        }
+        if let Some(rate) = input.maximum_message_rate_per_second {
+            room.maximum_message_rate_per_second = rate;
+        }
+        if let Some(length) = input.maximum_message_length {
+            room.maximum_message_length = length;
+        }
+        if let Some(handler) = input.message_review_handler {
+            room.message_review_handler = Some(handler);
+        }
+        if let Some(identifiers) = input.logging_configuration_identifiers {
+            room.logging_configuration_identifiers = identifiers;
+        }
+        room.update_time = now;
+
+        Ok(UpdateRoomOutput {
+            arn: Some(room.arn.clone()),
+            id: Some(room.id.clone()),
+            name: room.name.clone(),
+            create_time: Some(crate::state::as_date_time(room.create_time)),
+            update_time: Some(crate::state::as_date_time(room.update_time)),
+            maximum_message_rate_per_second: Some(room.maximum_message_rate_per_second),
+            maximum_message_length: Some(room.maximum_message_length),
+            message_review_handler: room.message_review_handler.clone(),
+            tags: Some(room.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            logging_configuration_identifiers: Some(room.logging_configuration_identifiers.clone()),
+        })
     }
 }

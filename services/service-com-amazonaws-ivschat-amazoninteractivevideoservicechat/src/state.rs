@@ -1,11 +1,269 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-ivschat-amazoninteractivevideoservicechat service.
+//!
+//! The chat `Room` is this service's one persisted resource: `CreateRoom` mints it,
+//! `GetRoom`/`ListRooms` report it, `UpdateRoom` mutates it and `DeleteRoom` removes it
+//! together with every chat token issued against it. Every response field an operation
+//! returns is read back out of the record stored here, so a create followed by a get
+//! answers exactly what was created.
+
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
+
+use crate::ops::types::{
+    MessageReviewHandler, ResourceNotFoundException, ValidationException, ValidationExceptionField,
+    RESOURCE_TYPE_VALUES,
+};
+
+/// `CreateRoom`/`UpdateRoom` default for `maximumMessageRatePerSecond`, from the model's
+/// own documentation of that member ("Maximum number of messages per second that can be
+/// sent to the room (by all clients). Default: 10.").
+pub const DEFAULT_MAXIMUM_MESSAGE_RATE_PER_SECOND: i32 = 10;
+
+/// `CreateRoom`/`UpdateRoom` default for `maximumMessageLength`, from the model's own
+/// documentation of that member ("Maximum number of characters in a single message …
+/// Default: 500.").
+pub const DEFAULT_MAXIMUM_MESSAGE_LENGTH: i32 = 500;
+
+/// `CreateChatToken` default for `sessionDurationInMinutes`, from the model's own
+/// documentation of that member ("Session duration (in minutes), after which the session
+/// expires. Default: 60 (1 hour).").
+pub const DEFAULT_SESSION_DURATION_IN_MINUTES: i32 = 60;
+
+/// `ListRooms` default page size, from the model's own documentation of `maxResults`
+/// ("Maximum number of rooms to return. Default: 50.").
+pub const DEFAULT_MAX_ROOM_RESULTS: i32 = 50;
+
+/// The largest page `ListRooms` answers, from the modelled `MaxRoomResults` range 1..50.
+pub const MAX_ROOM_RESULTS: i32 = 50;
+
+/// The number of rooms one account may hold in one Region: Amazon IVS Chat publishes a
+/// rooms-per-account-per-Region service quota (50,000), and `ServiceQuotaExceededException`
+/// (HTTP 402) is `CreateRoom`'s modelled refusal past it. This emulator serves one
+/// Region's worth of state, so the quota applies to the whole store — which is also what
+/// bounds it: a repeated create cannot grow the process without limit.
+pub const ROOMS_PER_REGION: usize = 50_000;
+
+/// The most chat-token records this store keeps.
+///
+/// AWS publishes no token-retention quota and `CreateChatToken` models no quota error, so
+/// this is the emulator's own memory bound rather than a service rule: a mint first drops
+/// every record whose session the clock has already ended, then the oldest-expiring
+/// records until the set fits. No operation reads an ended session, so dropping one
+/// changes no answer this emulator gives.
+pub const MAX_RETAINED_CHAT_TOKENS: usize = 10_000;
+
+/// How long a freshly minted chat token stays usable for opening a connection. AWS does
+/// not state this span in the model — the model only says the token "becomes invalid at
+/// the token-expiration timestamp included in the response" — so the emulator chooses one
+/// minute and reports it in `tokenExpirationTime`, which is the value a client must obey.
+pub const CHAT_TOKEN_LIFETIME: Duration = Duration::from_secs(60);
+
+/// Length of a `RoomID`: the model constrains `RoomID` to `len 12..12`, pattern
+/// `^[a-zA-Z0-9]+$`.
+pub const ROOM_ID_LEN: usize = 12;
+
+/// The alphabet room ids and chat tokens are rendered in — exactly the character set
+/// `RoomID`'s `^[a-zA-Z0-9]+$` pattern admits.
+const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// Domain separators mixed into the mint counter, so a room id and a chat token minted at
+/// the same counter value are different strings.
+const ROOM_ID_DOMAIN: u64 = 0x524f_4f4d_5f49_4400; // "ROOM_ID"
+const CHAT_TOKEN_DOMAIN: u64 = 0x544f_4b45_4e5f_3031; // "TOKEN_01"
+const CHAT_TOKEN_DOMAIN_HI: u64 = 0x544f_4b45_4e5f_3032; // "TOKEN_02"
+
+/// SplitMix64's finalizer: a bijection on `u64`, so distinct mint counters always give
+/// distinct ids while the rendered id carries no readable sequence number.
+fn mix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Render `value` in base62, zero-padded to exactly `len` characters.
+///
+/// 62^12 exceeds `u64::MAX`, so a 12-character rendering of a `u64` loses nothing: the
+/// mapping stays injective and the result matches `^[a-zA-Z0-9]+$`.
+fn base62_fixed(mut value: u64, len: usize) -> String {
+    let mut out = vec![b'0'; len];
+    for slot in out.iter_mut().rev() {
+        *slot = BASE62[(value % 62) as usize];
+        value /= 62;
+    }
+    String::from_utf8(out).expect("the base62 alphabet is ASCII")
+}
+
+/// A chat room, as `CreateRoom` persisted it and the reporting operations render it.
+#[derive(Debug, Clone)]
+pub struct Room {
+    /// System-generated `RoomID`: 12 characters, `^[a-zA-Z0-9]+$`.
+    pub id: String,
+    /// `arn:aws:ivschat:<region>:<account>:room/<id>`, built through `engine::emulator_arn`.
+    pub arn: String,
+    pub name: Option<String>,
+    pub create_time: SystemTime,
+    pub update_time: SystemTime,
+    pub maximum_message_rate_per_second: i32,
+    pub maximum_message_length: i32,
+    pub message_review_handler: Option<MessageReviewHandler>,
+    pub logging_configuration_identifiers: Vec<String>,
+    pub tags: BTreeMap<String, String>,
+}
+
+/// A chat token minted by `CreateChatToken` against a room.
+#[derive(Debug, Clone)]
+pub struct ChatToken {
+    pub token: String,
+    pub room_id: String,
+    pub user_id: String,
+    pub capabilities: Vec<String>,
+    pub attributes: BTreeMap<String, String>,
+    pub token_expiration_time: SystemTime,
+    pub session_expiration_time: SystemTime,
+}
 
 /// Per-service state for com-amazonaws-ivschat-amazoninteractivevideoservicechat. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIvschatAmazoninteractivevideoservicechatState {
-    // TODO: add service-specific state fields
+    /// Rooms keyed by `RoomID`, so a lookup by id or ARN is one map hit. `ListRooms`
+    /// imposes its own documented order on top of this.
+    pub rooms: BTreeMap<String, Room>,
+    /// Chat tokens keyed by the token string itself.
+    pub chat_tokens: BTreeMap<String, ChatToken>,
+    /// Monotonic mint counter. Never decreases, so an id is never reused after a delete.
+    minted: u64,
+}
+
+impl ComAmazonawsIvschatAmazoninteractivevideoservicechatState {
+    /// Mint a fresh `RoomID`: 12 characters from `^[a-zA-Z0-9]+$`, unique within this store.
+    pub fn mint_room_id(&mut self) -> String {
+        self.minted = self.minted.wrapping_add(1);
+        base62_fixed(mix64(self.minted ^ ROOM_ID_DOMAIN), ROOM_ID_LEN)
+    }
+
+    /// Mint a fresh opaque chat token. Unique within this store: two calls never collide,
+    /// so no caller can treat the value as a constant.
+    pub fn mint_chat_token(&mut self) -> String {
+        self.minted = self.minted.wrapping_add(1);
+        let n = self.minted;
+        format!(
+            "{}{}",
+            base62_fixed(mix64(n ^ CHAT_TOKEN_DOMAIN), 24),
+            base62_fixed(mix64(n ^ CHAT_TOKEN_DOMAIN_HI), 24)
+        )
+    }
+
+    /// The `RoomID` a room identifier names: the part after `:room/` of a room ARN, or a
+    /// bare id. Does NOT say whether that room exists.
+    ///
+    /// The modelled `RoomIdentifier` pattern makes the boundary validator refuse anything
+    /// but a room ARN before a handler runs, so the bare-id arm only serves callers
+    /// inside the emulator; an identifier this cannot read at all answers `None`.
+    pub fn room_id_of(identifier: &str) -> Option<&str> {
+        if let Some((_, id)) = identifier.split_once(":room/") {
+            return (!id.is_empty()).then_some(id);
+        }
+        if !identifier.is_empty() && identifier.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Some(identifier);
+        }
+        None
+    }
+
+    /// The stored room a room identifier names, if any.
+    pub fn room(&self, identifier: &str) -> Option<&Room> {
+        self.rooms.get(Self::room_id_of(identifier)?)
+    }
+
+    /// The stored room a room identifier names, for in-place mutation.
+    pub fn room_mut(&mut self, identifier: &str) -> Option<&mut Room> {
+        let id = Self::room_id_of(identifier)?.to_string();
+        self.rooms.get_mut(&id)
+    }
+
+    /// Remove a room and every chat token issued against it.
+    pub fn remove_room(&mut self, identifier: &str) -> Option<Room> {
+        let id = Self::room_id_of(identifier)?.to_string();
+        let room = self.rooms.remove(&id)?;
+        self.chat_tokens.retain(|_, token| token.room_id != id);
+        Some(room)
+    }
+
+    /// Whether the store already holds this Region's quota of rooms, so `CreateRoom` must
+    /// answer the modelled `ServiceQuotaExceededException` instead of minting another.
+    pub fn rooms_at_quota(&self) -> bool {
+        self.rooms.len() >= ROOMS_PER_REGION
+    }
+
+    /// Make room for one more chat-token record, keeping the set bounded.
+    ///
+    /// First drops every record whose session `now` has already ended — a change the clock
+    /// had already made due — then, if the set is still at
+    /// [`MAX_RETAINED_CHAT_TOKENS`], drops the oldest-expiring records in one batch so a
+    /// steady stream of mints cannot grow the store without limit.
+    pub fn prune_chat_tokens(&mut self, now: SystemTime) {
+        self.chat_tokens
+            .retain(|_, token| token.session_expiration_time > now);
+        if self.chat_tokens.len() < MAX_RETAINED_CHAT_TOKENS {
+            return;
+        }
+        // Trim to nine tenths of the cap, so the batch is amortised over many mints
+        // rather than run on every one.
+        let target = MAX_RETAINED_CHAT_TOKENS * 9 / 10;
+        let excess = self.chat_tokens.len().saturating_sub(target);
+        let mut by_expiry: Vec<(SystemTime, String)> = self
+            .chat_tokens
+            .iter()
+            .map(|(token, record)| (record.session_expiration_time, token.clone()))
+            .collect();
+        by_expiry.sort();
+        for (_, token) in by_expiry.into_iter().take(excess) {
+            self.chat_tokens.remove(&token);
+        }
+    }
+}
+
+/// The modelled `ResourceNotFoundException` for a room identifier that names no stored
+/// room.
+///
+/// `resourceType` is the modelled `ResourceType` enum's only value; `resourceId` is the
+/// `RoomID` the identifier named. The message is built from the request, so it names the
+/// identifier the caller has to fix.
+pub fn room_not_found(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("Room not found for identifier {identifier}."),
+        resource_id: ComAmazonawsIvschatAmazoninteractivevideoservicechatState::room_id_of(
+            identifier,
+        )
+        .unwrap_or_default()
+        .to_string(),
+        // `RESOURCE_TYPE_VALUES` is the generated catalog of the modelled `ResourceType`
+        // enum; ROOM is the only member it carries.
+        resource_type: RESOURCE_TYPE_VALUES
+            .first()
+            .copied()
+            .unwrap_or("ROOM")
+            .to_string(),
+    }
+}
+
+/// The modelled `ValidationException` for a request member this service refuses, with the
+/// member named in `fieldList` the way a field-level refusal reports it.
+pub fn field_validation_failed(field: &str, message: impl Into<String>) -> ValidationException {
+    let message = message.into();
+    ValidationException {
+        message: message.clone(),
+        // `VALIDATION_EXCEPTION_REASON_VALUES` is the generated catalog of the modelled
+        // `ValidationExceptionReason` enum; a bad member value is a field validation
+        // failure rather than OTHER.
+        reason: "FIELD_VALIDATION_FAILED".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: field.to_string(),
+            message,
+        }]),
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -17,4 +275,175 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsIvschatAmazoninteractivevideoservicechatState>)
+}
+
+/// A `SystemTime` as the modelled `Time` shape, at the millisecond precision the service's
+/// ISO 8601 timestamps carry.
+pub fn as_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
+    let millis = time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    ::aws_smithy_types::DateTime::from_millis(millis)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minted_room_ids_match_the_modelled_room_id_shape_and_never_repeat() {
+        let mut state = ComAmazonawsIvschatAmazoninteractivevideoservicechatState::default();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..1_000 {
+            let id = state.mint_room_id();
+            assert_eq!(id.len(), ROOM_ID_LEN, "room id {id} must be 12 characters");
+            assert!(
+                id.bytes().all(|b| b.is_ascii_alphanumeric()),
+                "room id {id} must match ^[a-zA-Z0-9]+$"
+            );
+            assert!(seen.insert(id.clone()), "room id {id} was minted twice");
+        }
+    }
+
+    #[test]
+    fn minted_chat_tokens_never_repeat() {
+        let mut state = ComAmazonawsIvschatAmazoninteractivevideoservicechatState::default();
+        let first = state.mint_chat_token();
+        let second = state.mint_chat_token();
+        assert_ne!(first, second, "two mints must not return the same token");
+        assert!(!first.is_empty(), "a chat token must not be empty");
+    }
+
+    #[test]
+    fn a_room_identifier_resolves_from_an_arn_or_a_bare_id() {
+        for (identifier, expected) in [
+            (
+                "arn:aws:ivschat:us-east-1:000000000000:room/abc123ABC456",
+                Some("abc123ABC456"),
+            ),
+            (
+                "arn:aws:ivschat:eu-west-2:000000000000:room/zz",
+                Some("zz"),
+            ),
+            ("abc123ABC456", Some("abc123ABC456")),
+            ("arn:aws:ivschat:us-east-1:000000000000:room/", None),
+            ("not an identifier", None),
+            ("", None),
+        ] {
+            let actual =
+                ComAmazonawsIvschatAmazoninteractivevideoservicechatState::room_id_of(identifier);
+            assert_eq!(
+                actual, expected,
+                "case {identifier:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pruning_drops_ended_sessions_and_keeps_the_token_store_bounded() {
+        let mut state = ComAmazonawsIvschatAmazoninteractivevideoservicechatState::default();
+        let now = SystemTime::now();
+
+        // Rows differ in how far the session expiry sits from `now`: two already ended,
+        // one still live.
+        for (token, ended, offset_secs) in [
+            ("ended-long-ago", true, 3_600_u64),
+            ("ended-just-now", true, 1),
+            ("still-live", false, 600),
+        ] {
+            let expires = if ended {
+                now - Duration::from_secs(offset_secs)
+            } else {
+                now + Duration::from_secs(offset_secs)
+            };
+            state.chat_tokens.insert(
+                token.to_string(),
+                ChatToken {
+                    token: token.to_string(),
+                    room_id: "abc123ABC456".to_string(),
+                    user_id: "alice".to_string(),
+                    capabilities: Vec::new(),
+                    attributes: BTreeMap::new(),
+                    token_expiration_time: expires,
+                    session_expiration_time: expires,
+                },
+            );
+        }
+        state.prune_chat_tokens(now);
+        let kept: Vec<&str> = state.chat_tokens.keys().map(String::as_str).collect();
+        assert_eq!(
+            kept,
+            vec!["still-live"],
+            "case ended sessions: expected only the live token, got {kept:?}"
+        );
+
+        // At the cap, the oldest-expiring records go and the newest-expiring stay.
+        for index in 0..MAX_RETAINED_CHAT_TOKENS {
+            let token = format!("token-{index:06}");
+            let expires = now + Duration::from_secs(60 + index as u64);
+            state.chat_tokens.insert(
+                token.clone(),
+                ChatToken {
+                    token,
+                    room_id: "abc123ABC456".to_string(),
+                    user_id: "alice".to_string(),
+                    capabilities: Vec::new(),
+                    attributes: BTreeMap::new(),
+                    token_expiration_time: expires,
+                    session_expiration_time: expires,
+                },
+            );
+        }
+        let before = state.chat_tokens.len();
+        state.prune_chat_tokens(now);
+        let after = state.chat_tokens.len();
+        assert!(
+            after < MAX_RETAINED_CHAT_TOKENS,
+            "case at the cap: expected fewer than {MAX_RETAINED_CHAT_TOKENS} records after \
+             pruning {before}, got {after}"
+        );
+        assert!(
+            state
+                .chat_tokens
+                .contains_key(&format!("token-{:06}", MAX_RETAINED_CHAT_TOKENS - 1)),
+            "case at the cap: the newest-expiring record must survive, got {after} records"
+        );
+        assert!(
+            !state.chat_tokens.contains_key("token-000000"),
+            "case at the cap: the oldest-expiring record must be the one dropped"
+        );
+    }
+
+    #[test]
+    fn the_room_store_reports_the_region_quota_as_reached() {
+        let mut state = ComAmazonawsIvschatAmazoninteractivevideoservicechatState::default();
+        let now = SystemTime::now();
+        assert!(
+            !state.rooms_at_quota(),
+            "case empty store: the quota is not reached"
+        );
+        for index in 0..ROOMS_PER_REGION {
+            let id = format!("{index:012}");
+            state.rooms.insert(
+                id.clone(),
+                Room {
+                    arn: format!("arn:aws:ivschat:us-east-1:000000000000:room/{id}"),
+                    id,
+                    name: None,
+                    create_time: now,
+                    update_time: now,
+                    maximum_message_rate_per_second: DEFAULT_MAXIMUM_MESSAGE_RATE_PER_SECOND,
+                    maximum_message_length: DEFAULT_MAXIMUM_MESSAGE_LENGTH,
+                    message_review_handler: None,
+                    logging_configuration_identifiers: Vec::new(),
+                    tags: BTreeMap::new(),
+                },
+            );
+        }
+        assert!(
+            state.rooms_at_quota(),
+            "case {ROOMS_PER_REGION} rooms: the quota is reached, so a create must be refused"
+        );
+    }
 }
