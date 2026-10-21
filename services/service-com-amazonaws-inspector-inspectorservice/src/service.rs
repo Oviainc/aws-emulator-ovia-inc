@@ -96,17 +96,40 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Inspector states every bad-input refusal as `InvalidInputException` — "The
+        // request was rejected because an invalid or out-of-range value was supplied for
+        // an input parameter" — which is the client-input error EVERY operation in this
+        // service's model declares, and the only one it has for an absent member or a
+        // value outside a modelled bound (`durationInSeconds` under 180, a
+        // `assessmentRunArns` list longer than 10, ...). So the framework's generic
+        // `ValidationException` code is replaced here, service-wide, with the code a
+        // real Inspector client branches on. The message states which member failed
+        // which constraint, built from the request.
+        //
+        // LIMITATION, stated rather than hidden: this pre-dispatch channel renders only
+        // `__type` + `message`, so the modelled `errorCode` (an `InvalidInputErrorCode`)
+        // and `canRetry` members cannot travel with it — a framework refusal carries the
+        // right error code and status but no `errorCode`, while every refusal a HANDLER
+        // raises (an unknown ARN, a name already taken, a quota) sets both. Carrying them
+        // here would need the framework's `Refused` channel to accept a modelled error
+        // shape, which is vendored and not editable from this service.
+        //
+        // An authentication refusal is left to the framework: it is answered before any
+        // operation is named, so this service has nothing to add to it.
+        match refusal {
+            Refusal::Invalid(violations) => {
+                let message = violations
+                    .iter()
+                    .map(smithy_server_runtime::Violation::message)
+                    .collect::<Vec<String>>()
+                    .join("; ");
+                Some(Refused {
+                    code: "InvalidInputException".to_string(),
+                    message,
+                })
+            }
+            _ => None,
+        }
     }
 
     fn override_routing_error(
