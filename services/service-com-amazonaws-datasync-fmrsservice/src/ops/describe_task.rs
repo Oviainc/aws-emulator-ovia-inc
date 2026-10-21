@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the task `CreateTask` stored under this `TaskArn` — the configuration the
+//! request supplied, plus the status and current execution the clock and
+//! `StartTaskExecution` left it in. An unknown or deleted ARN is
+//! `InvalidRequestException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +188,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTask"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeTaskErrorModeled::InternalException(InternalException {
+                message: Some(
+                    "the DataSync emulator could not reach its state store".to_string(),
+                ),
+                error_code: None,
+            })
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+        let Some(task) = store.tasks.get(&input.task_arn) else {
+            return Err(DescribeTaskErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!("Task {} is not found.", input.task_arn)),
+                    error_code: None,
+                    datasync_error_code: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeTaskOutput {
+            task_arn: Some(task.arn.clone()),
+            status: Some(task.status.as_str().to_string()),
+            name: task.name.clone(),
+            current_task_execution_arn: task.current_task_execution_arn.clone(),
+            source_location_arn: Some(task.source_location_arn.clone()),
+            destination_location_arn: Some(task.destination_location_arn.clone()),
+            cloud_watch_log_group_arn: task.cloud_watch_log_group_arn.clone(),
+            // The network interfaces DataSync reports belong to an agent-backed
+            // transfer; no implemented operation creates an agent yet, so there are
+            // none to report rather than an invented ARN.
+            source_network_interface_arns: None,
+            destination_network_interface_arns: None,
+            options: Some(task.options.clone()),
+            excludes: (!task.excludes.is_empty()).then(|| task.excludes.clone()),
+            schedule: task.schedule.clone(),
+            // `ErrorCode`/`ErrorDetail` describe a task that failed; this task did not.
+            error_code: None,
+            error_detail: None,
+            creation_time: Some(crate::state::as_timestamp(task.creation_time)),
+            includes: (!task.includes.is_empty()).then(|| task.includes.clone()),
+            manifest_config: task.manifest_config.clone(),
+            task_report_config: task.task_report_config.clone(),
+            // `ScheduleDetails` reports when and why a schedule was disabled; no
+            // implemented operation disables one (`UpdateTask` is still scaffolded).
+            schedule_details: None,
+            task_mode: Some(task.task_mode.clone()),
+        })
     }
 }

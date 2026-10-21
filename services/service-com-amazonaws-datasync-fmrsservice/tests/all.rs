@@ -13,3 +13,5 @@
 // points it into `tests/all/`.
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/transfer_task_lifecycle.rs"]
+mod transfer_task_lifecycle;

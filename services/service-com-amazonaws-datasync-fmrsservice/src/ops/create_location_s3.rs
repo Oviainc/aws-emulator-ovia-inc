@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLocationS3
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLocationS3`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLocationS3::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `LocationArn` and stores the whole S3 transfer location in
+//! [`crate::state`], so `DescribeLocationS3` and `CreateTask` can resolve it again.
+//! Nothing is echoed back: the response carries only the newly minted ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +166,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLocationS3` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLocationS3ErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLocationS3"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateLocationS3ErrorModeled::InternalException(InternalException {
+                message: Some(
+                    "the DataSync emulator could not reach its state store".to_string(),
+                ),
+                error_code: None,
+            })
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let bucket = s3_resource_name(&input.s3_bucket_arn);
+        let location_uri = s3_location_uri(&bucket, input.subdirectory.as_deref());
+        let s3_storage_class = input
+            .s3_storage_class
+            .clone()
+            .unwrap_or_else(|| default_storage_class(&input.s3_bucket_arn).to_string());
+
+        let location_arn = {
+            let mut store = state.lock();
+            store.advance_clock(now);
+            let location_arn = store.mint_location_arn(&region);
+            store.locations.insert(
+                location_arn.clone(),
+                crate::state::Location {
+                    arn: location_arn.clone(),
+                    location_uri,
+                    kind: crate::state::LocationKind::S3,
+                    s3_bucket_arn: input.s3_bucket_arn,
+                    s3_config: input.s3_config,
+                    s3_storage_class,
+                    subdirectory: input.subdirectory,
+                    agent_arns: input.agent_arns.unwrap_or_default(),
+                    tags: input.tags.unwrap_or_default(),
+                    creation_time: now,
+                },
+            );
+            location_arn
+        };
+
+        Ok(CreateLocationS3Output {
+            location_arn: Some(location_arn),
+        })
+    }
+}
+
+/// The bucket or access-point name an `S3BucketArn` addresses.
+///
+/// The member's three modelled ARN forms all put the name last in the resource
+/// segment: `arn:<p>:s3:::<bucket>`, `arn:<p>:s3:<region>:<account>:accesspoint/<name>`
+/// and `arn:<p>:s3-outposts:<region>:<account>:outpost/<outpost>/accesspoint/<name>`.
+fn s3_resource_name(bucket_arn: &str) -> String {
+    let resource = bucket_arn.splitn(6, ':').nth(5).unwrap_or(bucket_arn);
+    resource
+        .split(['/', ':'])
+        .next_back()
+        .unwrap_or(resource)
+        .to_string()
+}
+
+/// The `LocationUri` for an S3 location: the `s3` scheme, the bucket, and the
+/// prefix the caller asked DataSync to read from or write to.
+///
+/// The modelled `LocationUri` pattern is `^(efs|nfs|s3|smb|hdfs|fsx[a-z0-9-]+)://…`,
+/// so the scheme comes from [`crate::state::LocationKind::uri_scheme`] rather than a
+/// second literal. A `Subdirectory` is reported as a single slash-delimited prefix,
+/// however many leading or trailing slashes the request spelled it with.
+fn s3_location_uri(bucket: &str, subdirectory: Option<&str>) -> String {
+    let scheme = crate::state::LocationKind::S3.uri_scheme();
+    let prefix = subdirectory.unwrap_or_default().trim_matches('/');
+    if prefix.is_empty() {
+        format!("{scheme}://{bucket}/")
+    } else {
+        format!("{scheme}://{bucket}/{prefix}/")
+    }
+}
+
+/// The storage class a request that declared none ends up with.
+///
+/// From this operation's own documentation: "For buckets in Amazon Web Services
+/// Regions, the storage class defaults to STANDARD. For buckets on Outposts, the
+/// storage class defaults to OUTPOSTS." An Outposts bucket is exactly one addressed
+/// through the `s3-outposts` ARN namespace.
+fn default_storage_class(bucket_arn: &str) -> &'static str {
+    if bucket_arn.contains(":s3-outposts:") {
+        "OUTPOSTS"
+    } else {
+        "STANDARD"
     }
 }

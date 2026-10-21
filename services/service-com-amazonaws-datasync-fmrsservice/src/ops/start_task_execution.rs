@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartTaskExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartTaskExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartTaskExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a transfer for a task this service holds: mints a `TaskExecutionArn` nested
+//! under the task's ARN, stores the execution (with the options actually in effect),
+//! and moves the task to `RUNNING` with the new execution as its
+//! `CurrentTaskExecutionArn`. An unknown `TaskArn`, or a task that is not `AVAILABLE`
+//! yet, is `InvalidRequestException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +174,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartTaskExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartTaskExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartTaskExecution"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartTaskExecutionErrorModeled::InternalException(InternalException {
+                message: Some(
+                    "the DataSync emulator could not reach its state store".to_string(),
+                ),
+                error_code: None,
+            })
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        let Some(task) = store.tasks.get(&input.task_arn) else {
+            return Err(StartTaskExecutionErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!("Task {} is not found.", input.task_arn)),
+                    error_code: None,
+                    datasync_error_code: None,
+                },
+            )
+            .into());
+        };
+
+        // A transfer can only start on a task that finished being created and is not
+        // already running one.
+        if task.status != crate::state::TaskStatus::Available {
+            return Err(StartTaskExecutionErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "Task {} is in status {} and cannot start an execution.",
+                        input.task_arn,
+                        task.status.as_str()
+                    )),
+                    error_code: None,
+                    datasync_error_code: None,
+                },
+            )
+            .into());
+        }
+
+        // The execution's effective configuration: the task's own, with each member
+        // the caller overrode for this run replacing it.
+        let options = crate::state::overlay_options(&task.options, input.override_options.as_ref());
+        let includes = input.includes.unwrap_or_else(|| task.includes.clone());
+        let excludes = input.excludes.unwrap_or_else(|| task.excludes.clone());
+        let manifest_config = input
+            .manifest_config
+            .or_else(|| task.manifest_config.clone());
+        let task_report_config = input
+            .task_report_config
+            .or_else(|| task.task_report_config.clone());
+        let task_mode = task.task_mode.clone();
+
+        let execution_arn = store.mint_execution_arn(&input.task_arn);
+        store.task_executions.insert(
+            execution_arn.clone(),
+            crate::state::TaskExecution {
+                arn: execution_arn.clone(),
+                task_arn: input.task_arn.clone(),
+                status: crate::state::TaskExecutionStatus::Launching,
+                options,
+                includes,
+                excludes,
+                manifest_config,
+                task_report_config,
+                tags: input.tags.unwrap_or_default(),
+                task_mode,
+                start_time: now,
+                launch_time: None,
+                end_time: None,
+                schedule: crate::state::ExecutionSchedule::starting_at(now),
+                counters: crate::state::ExecutionCounters::default(),
+            },
+        );
+
+        if let Some(task) = store.tasks.get_mut(&input.task_arn) {
+            task.status = crate::state::TaskStatus::Running;
+            task.current_task_execution_arn = Some(execution_arn.clone());
+            task.execution_arns.push(execution_arn.clone());
+        }
+        drop(store);
+
+        Ok(StartTaskExecutionOutput {
+            task_execution_arn: Some(execution_arn),
+        })
     }
 }
