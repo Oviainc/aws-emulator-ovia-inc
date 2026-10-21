@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDomainConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDomainConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDomainConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: merges the supplied option containers into the stored
+//! [`crate::state::Domain`] record, bumping the revision of each option it changed,
+//! and answers with the `DomainConfig` projection of the merged record. A `DryRun`
+//! computes the same answer without storing anything.
 //!
 //! ## Shape of an operation
 //!
@@ -152,6 +147,190 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::{
+    stored_advanced_security_options, stored_aiml_options,
+    stored_automated_snapshot_pause_options, stored_identity_center_options, stored_vpc_options,
+    Domain, OPT_ACCESS_POLICIES, OPT_ADVANCED_OPTIONS, OPT_ADVANCED_SECURITY_OPTIONS,
+    OPT_AIML_OPTIONS, OPT_AUTOMATED_SNAPSHOT_PAUSE_OPTIONS, OPT_AUTO_TUNE_OPTIONS,
+    OPT_CLUSTER_CONFIG, OPT_COGNITO_OPTIONS, OPT_DEPLOYMENT_STRATEGY_OPTIONS,
+    OPT_DOMAIN_ENDPOINT_OPTIONS, OPT_EBS_OPTIONS, OPT_ENCRYPTION_AT_REST_OPTIONS, OPT_ENGINE_MODE,
+    OPT_IDENTITY_CENTER_OPTIONS, OPT_IP_ADDRESS_TYPE, OPT_LOG_PUBLISHING_OPTIONS,
+    OPT_NODE_TO_NODE_ENCRYPTION_OPTIONS, OPT_OFF_PEAK_WINDOW_OPTIONS, OPT_SNAPSHOT_OPTIONS,
+    OPT_SOFTWARE_UPDATE_OPTIONS, OPT_USE_CASE, OPT_VPC_OPTIONS, PROCESSING_STATUS_MODIFYING,
+};
+
+/// `DryRunResults$DeploymentType` for "the update requires a blue/green deployment".
+const DEPLOYMENT_BLUE_GREEN: &str = "Blue/Green";
+
+/// `DryRunResults$DeploymentType` for "no blue/green deployment required".
+const DEPLOYMENT_DYNAMIC_UPDATE: &str = "DynamicUpdate";
+
+/// `DryRunResults$DeploymentType` for "the domain is in the middle of an update and
+/// can't predict the deployment type".
+const DEPLOYMENT_UNDETERMINED: &str = "Undetermined";
+
+/// `DryRunResults$DeploymentType` for "the request doesn't include any configuration
+/// changes".
+const DEPLOYMENT_NONE: &str = "None";
+
+/// The options whose change re-provisions the cluster, and so needs a blue/green
+/// deployment rather than an in-place one.
+///
+/// `DryRunResults$DeploymentType` documents the four values and what each MEANS, but
+/// not which option falls in which class; this split is the emulator's own, and it is
+/// the one its update path implements: changing the shape of the provisioned cluster
+/// (its nodes, storage, encryption, network or endpoint) replaces it, while the rest
+/// are settings applied to the running cluster.
+const CLUSTER_SHAPING_OPTIONS: &[&str] = &[
+    OPT_CLUSTER_CONFIG,
+    OPT_EBS_OPTIONS,
+    OPT_ENCRYPTION_AT_REST_OPTIONS,
+    OPT_NODE_TO_NODE_ENCRYPTION_OPTIONS,
+    OPT_DOMAIN_ENDPOINT_OPTIONS,
+    OPT_VPC_OPTIONS,
+    OPT_IP_ADDRESS_TYPE,
+    OPT_ADVANCED_SECURITY_OPTIONS,
+    OPT_IDENTITY_CENTER_OPTIONS,
+    OPT_COGNITO_OPTIONS,
+    OPT_AIML_OPTIONS,
+    OPT_DEPLOYMENT_STRATEGY_OPTIONS,
+    OPT_USE_CASE,
+    OPT_ENGINE_MODE,
+];
+
+/// Merge the option containers `input` carries into `domain`, bumping the revision of
+/// each option it set, and answer with the options that changed.
+///
+/// A supplied container REPLACES that option's stored value; an option the request
+/// does not name keeps the value it had. Nothing else about the record moves — the
+/// name, id, ARN, endpoint and engine version a domain was created with are not
+/// members of this request.
+fn merge(domain: &mut Domain, input: UpdateDomainConfigInput, now: SystemTime) -> Vec<&'static str> {
+    let mut touched: Vec<&'static str> = Vec::new();
+
+    if let Some(cluster_config) = input.cluster_config {
+        domain.cluster_config = cluster_config;
+        touched.push(OPT_CLUSTER_CONFIG);
+    }
+    if let Some(ebs_options) = input.ebs_options {
+        domain.ebs_options = Some(ebs_options);
+        touched.push(OPT_EBS_OPTIONS);
+    }
+    if let Some(snapshot_options) = input.snapshot_options {
+        domain.snapshot_options = Some(snapshot_options);
+        touched.push(OPT_SNAPSHOT_OPTIONS);
+    }
+    if let Some(vpc_options) = input.vpc_options {
+        domain.vpc_options = Some(stored_vpc_options(vpc_options));
+        touched.push(OPT_VPC_OPTIONS);
+    }
+    if let Some(cognito_options) = input.cognito_options {
+        domain.cognito_options = Some(cognito_options);
+        touched.push(OPT_COGNITO_OPTIONS);
+    }
+    if let Some(advanced_options) = input.advanced_options {
+        domain.advanced_options = advanced_options.into_iter().collect();
+        touched.push(OPT_ADVANCED_OPTIONS);
+    }
+    if let Some(access_policies) = input.access_policies {
+        domain.access_policies = Some(access_policies);
+        touched.push(OPT_ACCESS_POLICIES);
+    }
+    if let Some(ip_address_type) = input.ip_address_type {
+        domain.ip_address_type = Some(ip_address_type);
+        touched.push(OPT_IP_ADDRESS_TYPE);
+    }
+    if let Some(log_publishing_options) = input.log_publishing_options {
+        domain.log_publishing_options = log_publishing_options.into_iter().collect();
+        touched.push(OPT_LOG_PUBLISHING_OPTIONS);
+    }
+    if let Some(encryption_at_rest_options) = input.encryption_at_rest_options {
+        domain.encryption_at_rest_options = Some(encryption_at_rest_options);
+        touched.push(OPT_ENCRYPTION_AT_REST_OPTIONS);
+    }
+    if let Some(domain_endpoint_options) = input.domain_endpoint_options {
+        domain.domain_endpoint_options = Some(domain_endpoint_options);
+        touched.push(OPT_DOMAIN_ENDPOINT_OPTIONS);
+    }
+    if let Some(node_to_node_encryption_options) = input.node_to_node_encryption_options {
+        domain.node_to_node_encryption_options = Some(node_to_node_encryption_options);
+        touched.push(OPT_NODE_TO_NODE_ENCRYPTION_OPTIONS);
+    }
+    if let Some(advanced_security_options) = input.advanced_security_options {
+        domain.advanced_security_options =
+            Some(stored_advanced_security_options(advanced_security_options));
+        touched.push(OPT_ADVANCED_SECURITY_OPTIONS);
+    }
+    if let Some(identity_center_options) = input.identity_center_options {
+        domain.identity_center_options =
+            Some(stored_identity_center_options(identity_center_options));
+        touched.push(OPT_IDENTITY_CENTER_OPTIONS);
+    }
+    if let Some(auto_tune_options) = input.auto_tune_options {
+        // This request carries the `AutoTuneOptions` shape the record stores, so there
+        // is nothing to project.
+        domain.auto_tune_options = Some(auto_tune_options);
+        touched.push(OPT_AUTO_TUNE_OPTIONS);
+    }
+    if let Some(off_peak_window_options) = input.off_peak_window_options {
+        domain.off_peak_window_options = Some(off_peak_window_options);
+        touched.push(OPT_OFF_PEAK_WINDOW_OPTIONS);
+    }
+    if let Some(software_update_options) = input.software_update_options {
+        domain.software_update_options = Some(software_update_options);
+        touched.push(OPT_SOFTWARE_UPDATE_OPTIONS);
+    }
+    if let Some(aiml_options) = input.aiml_options {
+        domain.aiml_options = Some(stored_aiml_options(aiml_options));
+        touched.push(OPT_AIML_OPTIONS);
+    }
+    if let Some(deployment_strategy_options) = input.deployment_strategy_options {
+        domain.deployment_strategy_options = Some(deployment_strategy_options);
+        touched.push(OPT_DEPLOYMENT_STRATEGY_OPTIONS);
+    }
+    if let Some(automated_snapshot_pause_options) = input.automated_snapshot_pause_options {
+        domain.automated_snapshot_pause_options = Some(stored_automated_snapshot_pause_options(
+            automated_snapshot_pause_options,
+        ));
+        touched.push(OPT_AUTOMATED_SNAPSHOT_PAUSE_OPTIONS);
+    }
+    if let Some(use_case) = input.use_case {
+        domain.use_case = use_case;
+        touched.push(OPT_USE_CASE);
+    }
+    if let Some(engine_mode) = input.engine_mode {
+        domain.engine_mode = engine_mode;
+        touched.push(OPT_ENGINE_MODE);
+    }
+
+    for option in &touched {
+        domain.touch(option, now);
+    }
+    touched
+}
+
+/// `DryRunResults$DeploymentType` for a change: which of the four documented
+/// deployment kinds applying `touched` to `domain` would be.
+fn deployment_type(domain: &Domain, touched: &[&'static str]) -> &'static str {
+    if touched.is_empty() {
+        // "None - The request doesn't include any configuration changes."
+        DEPLOYMENT_NONE
+    } else if domain.processing {
+        // "Undetermined - The domain is in the middle of an update and can't predict
+        // the deployment type."
+        DEPLOYMENT_UNDETERMINED
+    } else if touched
+        .iter()
+        .any(|option| CLUSTER_SHAPING_OPTIONS.contains(option))
+    {
+        DEPLOYMENT_BLUE_GREEN
+    } else {
+        DEPLOYMENT_DYNAMIC_UPDATE
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -225,18 +404,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDomainConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDomainConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDomainConfig"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let name = input.domain_name.clone();
+        let dry_run = input.dry_run.unwrap_or(false);
+
+        let mut store = state.lock();
+
+        // The merge runs on a COPY of the stored record, which is what makes a dry run
+        // honest: it computes the same answer from the same code and then throws the
+        // copy away instead of storing it.
+        let mut merged = store
+            .settled_mut(&name, now)
+            .ok_or_else(|| {
+                UpdateDomainConfigErrorModeled::ResourceNotFoundException(
+                    crate::state::domain_not_found(&name),
+                )
+            })?
+            .clone();
+
+        let touched = merge(&mut merged, input, now);
+        let deployment = deployment_type(&merged, &touched);
+
+        if dry_run {
+            // "This flag, when set to True, specifies whether the UpdateDomain request
+            // should return the results of a dry run analysis without actually
+            // applying the change." Nothing is written: the store still holds the
+            // record the settle above left, so a later read sees the old values.
+            return Ok(UpdateDomainConfigOutput {
+                domain_config: merged.to_config(),
+                dry_run_results: Some(DryRunResults {
+                    deployment_type: Some(deployment.to_string()),
+                    message: None,
+                }),
+                // A `DryRunProgressStatus` belongs to the asynchronous, verbose dry
+                // run `DescribeDryRunProgress` reports on; that operation is still a
+                // stub, so no dry run is tracked and none is reported.
+                dry_run_progress_status: None,
+            });
+        }
+
+        if !touched.is_empty() {
+            // The change is not live the instant the update returns: the clock owes
+            // the domain a settled configuration once the provisioning span has
+            // passed, and until then the options this call set report
+            // `OptionState::Processing`.
+            merged.begin_processing(PROCESSING_STATUS_MODIFYING, now);
+        }
+
+        let domain_config = merged.to_config();
+        store.domains.insert(name, merged);
+        Ok(UpdateDomainConfigOutput {
+            domain_config,
+            // A dry run was not asked for, so there are no dry-run results to report.
+            dry_run_results: None,
+            dry_run_progress_status: None,
+        })
     }
 }
