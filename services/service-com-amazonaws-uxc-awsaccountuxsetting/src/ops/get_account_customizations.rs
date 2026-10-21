@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAccountCustomizations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAccountCustomizations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAccountCustomizations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the customization record persisted for the calling
+//! account, and writes nothing (`@readonly`).
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +151,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAccountCustomizations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAccountCustomizationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAccountCustomizations"))
+        // The input shape has no members, and this read needs no request metadata.
+        let _ = (&input, ctx);
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetAccountCustomizationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A pure read: `customization` clones the stored record and never inserts
+        // a key, so polling this operation cannot change what a later caller sees.
+        let stored = state
+            .lock()
+            .customization(crate::state::calling_account_id());
+
+        Ok(GetAccountCustomizationsOutput {
+            // "A value of none indicates that you have not set a color": an
+            // account that never configured one reports `none`, not an absent
+            // member.
+            account_color: Some(
+                stored
+                    .account_color
+                    .unwrap_or_else(|| crate::state::ACCOUNT_COLOR_NONE.to_string()),
+            ),
+            // "A value of null indicates that you have not configured this
+            // feature": an unconfigured list stays absent rather than empty.
+            visible_services: stored.visible_services,
+            visible_regions: stored.visible_regions,
+        })
     }
 }
