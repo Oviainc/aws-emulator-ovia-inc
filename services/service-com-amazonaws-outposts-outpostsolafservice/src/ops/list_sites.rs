@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSites
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSites`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSites::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports every persisted site that satisfies the caller's operating-address
+//! filters, in creation order, cut into pages of at most `MaxResults` with the modelled
+//! `NextToken` the next page resumes from. A read: it never changes what a later caller
+//! sees.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +145,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSites` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSitesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSites"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSitesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+
+        // The resume point the caller's token names. A token this service did not
+        // issue for THIS list is a bad request, not an empty page.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::SITE_PAGE, token).ok_or_else(
+                    || {
+                        ListSitesErrorModeled::ValidationException(ValidationException {
+                            message: Some(
+                                "NextToken is not a pagination token this service issued for \
+                                 ListSites"
+                                    .to_string(),
+                            ),
+                        })
+                    },
+                )?,
+            ),
+            None => None,
+        };
+        let size = crate::state::page_size(input.max_results);
+
+        let store = state.lock();
+        let (sites, next_token) = crate::state::page(
+            crate::state::SITE_PAGE,
+            store
+                .sites
+                .values()
+                .filter(|record| matches_filters(&record.site, &input))
+                .map(|record| (record.sequence, record.site.clone())),
+            after,
+            size,
+        );
+
+        Ok(ListSitesOutput {
+            sites: Some(sites),
+            next_token,
+        })
     }
+}
+
+/// Whether a site satisfies every `OperatingAddress*Filter` member the caller sent.
+///
+/// Each filter is a LIST of accepted values for the `Site` member it names, so a
+/// site matches when its value is one of them; an absent (or empty) filter matches
+/// everything, so several filters together narrow rather than widen.
+fn matches_filters(site: &Site, input: &ListSitesInput) -> bool {
+    let matches = |filter: Option<&Vec<String>>, value: Option<&String>| match filter {
+        Some(accepted) if !accepted.is_empty() => {
+            value.is_some_and(|value| accepted.contains(value))
+        }
+        _ => true,
+    };
+    matches(
+        input.operating_address_country_code_filter.as_ref(),
+        site.operating_address_country_code.as_ref(),
+    ) && matches(
+        input.operating_address_state_or_region_filter.as_ref(),
+        site.operating_address_state_or_region.as_ref(),
+    ) && matches(
+        input.operating_address_city_filter.as_ref(),
+        site.operating_address_city.as_ref(),
+    )
 }
