@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSchedules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSchedules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSchedules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates persisted schedules as `ScheduleSummary`, in the `(group, name)`
+//! order the state's ordered map keeps, honouring the `ScheduleGroup`,
+//! `NamePrefix` and `State` filters and paging with an opaque `NextToken` that
+//! encodes the last key returned.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +152,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSchedules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSchedulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSchedules"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListSchedulesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the scheduler state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        // A page token is only ever one this service minted; anything else is a
+        // bad request, not an empty page.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListSchedulesErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "NextToken is not a token this service issued".to_string(),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let store = state.lock();
+
+        // `ScheduleGroup` names a group, so a name no group has is a missing
+        // resource rather than a filter that matches nothing — which is why this
+        // operation declares ResourceNotFoundException and ListScheduleGroups
+        // does not.
+        if let Some(group_name) = input.group_name.as_deref() {
+            if !store.group_exists(group_name) {
+                return Err(ListSchedulesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Schedule group {group_name} does not exist."),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Filter in the `(group, name)` order the ordered map keeps. A page token
+        // is a POSITION in that same order, so resuming means "every key strictly
+        // after it" — not an index into a list that may have changed since the
+        // previous page.
+        let mut matched: Vec<&crate::state::ScheduleRecord> = Vec::new();
+        for ((group, name), record) in &store.schedules {
+            let filtered_out = input
+                .group_name
+                .as_deref()
+                .is_some_and(|wanted| wanted != group.as_str())
+                || input
+                    .name_prefix
+                    .as_deref()
+                    .is_some_and(|prefix| !name.starts_with(prefix))
+                || input
+                    .state
+                    .as_deref()
+                    .is_some_and(|wanted| wanted != record.state.as_str());
+            let already_returned = resume_after
+                .as_ref()
+                .is_some_and(|after| (group, name) <= (&after.0, &after.1));
+            if filtered_out || already_returned {
+                continue;
+            }
+            matched.push(record);
+        }
+
+        let limit = input
+            .max_results
+            .map_or(crate::state::MAX_LIST_SCHEDULES_PAGE, |max| {
+                (max as usize).min(crate::state::MAX_LIST_SCHEDULES_PAGE)
+            });
+        let page_len = matched.len().min(limit);
+        let has_more = matched.len() > page_len;
+        let page = &matched[..page_len];
+
+        let schedules: Vec<ScheduleSummary> = page
+            .iter()
+            .map(|record| ScheduleSummary {
+                arn: Some(record.arn.clone()),
+                name: Some(record.name.clone()),
+                group_name: Some(record.group_name.clone()),
+                state: Some(record.state.clone()),
+                creation_date: Some(crate::state::to_wire_timestamp(record.creation_date)),
+                last_modification_date: Some(crate::state::to_wire_timestamp(
+                    record.last_modification_date,
+                )),
+                target: Some(TargetSummary {
+                    arn: record.target.arn.clone(),
+                }),
+            })
+            .collect();
+
+        // A NextToken only when something is actually left to read, so a client
+        // that follows tokens terminates.
+        let next_token = page
+            .last()
+            .filter(|_| has_more)
+            .map(|record| crate::state::encode_page_token(&record.group_name, &record.name));
+
+        Ok(ListSchedulesOutput {
+            next_token,
+            schedules,
+        })
     }
 }
