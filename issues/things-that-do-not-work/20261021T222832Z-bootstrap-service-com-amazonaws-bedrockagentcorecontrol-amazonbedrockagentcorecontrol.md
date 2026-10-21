@@ -1,0 +1,49 @@
+Issue-Severity: CRITICAL
+Issue-Gap-Class: missing
+Issue-Commit: 85378260976efce74d968b045ae62c2fe2a03011
+
+# Bootstrap the Bedrock AgentCore Control emulator
+
+_Filed: 2026-10-21T22:28:32Z_
+_Operation: service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol | Class: missing_
+
+> _Note: this issue was identified against the code base at commit `85378260976efce74d968b045ae62c2fe2a03011`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Description
+
+Every one of the 171 operations in this crate is an unmodified scaffold: each `src/ops/*.rs` carries the `//! SCAFFOLDED, NOT IMPLEMENTED:` header and returns `Err(crate::scaffolded::Scaffolded::not_implemented(..))`, i.e. HTTP 501, and the service holds no state. Nothing works end-to-end.
+
+This issue scopes the FIRST, SMALL slice: the agent-runtime lifecycle, which is the service's primary resource (`/runtimes/`). Implement exactly these five operations statefully, in this order (wire protocol: `restJson1`, endpoint prefix `bedrock-agentcore-control`, sigv4 name `bedrock-agentcore`):
+
+1. **CreateAgentRuntime** — `PUT /runtimes/` -> 202. Required input: `agentRuntimeName` (pattern `^[a-zA-Z][a-zA-Z0-9_]{0,47}$`), `agentRuntimeArtifact`, `roleArn`; optional `description`, `networkConfiguration`, `protocolConfiguration`, `authorizerConfiguration`, `requestHeaderConfiguration`, `lifecycleConfiguration`, `environmentVariables`, `filesystemConfigurations`, `capacityProviderConfiguration`, `platformVersion`, `tags`, `clientToken` (@idempotencyToken). Must mint and PERSIST a runtime: generate `agentRuntimeId` matching `^[a-zA-Z][a-zA-Z0-9_]{0,99}-[a-zA-Z0-9]{10}$` (name + "-" + 10 random alphanumerics), `agentRuntimeArn` = `arn:aws:bedrock-agentcore:{region}:{account}:runtime/{agentRuntimeId}`, `agentRuntimeVersion` = `"1"`, `createdAt`/`lastUpdatedAt` = now, `status` = `READY` (a one-shot `CREATING`→`READY` is acceptable but the stored value must drive later reads). Required output: `agentRuntimeArn`, `agentRuntimeId`, `agentRuntimeVersion`, `createdAt`, `status`; plus `workloadIdentityDetails`. Duplicate `agentRuntimeName` -> `ConflictException` (409); malformed name/roleArn -> `ValidationException` (400).
+2. **GetAgentRuntime** — `GET /runtimes/{agentRuntimeId}/?version=` -> 200, @readonly. Must look the runtime up in state and echo back WHAT WAS STORED, not the request: `agentRuntimeArn`, `agentRuntimeName`, `agentRuntimeId`, `agentRuntimeVersion`, `createdAt`, `lastUpdatedAt`, `roleArn`, `status`, `lifecycleConfiguration` (all @required) plus the optional config members that were supplied at create/update time (`description`, `agentRuntimeArtifact`, `networkConfiguration`, `protocolConfiguration`, `environmentVariables`, `authorizerConfiguration`, `requestHeaderConfiguration`, `filesystemConfigurations`, `capacityProviderConfiguration`, `platformVersion`). Unknown id, or a `version` query that no stored version matches -> `ResourceNotFoundException` (404).
+3. **ListAgentRuntimes** — `POST /runtimes/` -> 200, @paginated(inputToken=nextToken, outputToken=nextToken, items=agentRuntimes). Must return one `AgentRuntime` summary per persisted runtime (latest version), each with the @required `agentRuntimeArn`, `agentRuntimeId`, `agentRuntimeVersion`, `agentRuntimeName`, `description`, `lastUpdatedAt`, `status`. Honour `maxResults` (1..100) by truncating and returning an opaque `nextToken` that resumes exactly where the page ended; omit `nextToken` on the last page. An empty store returns an empty list, not 501.
+4. **UpdateAgentRuntime** — `PUT /runtimes/{agentRuntimeId}/` -> 202. Required `agentRuntimeArtifact`, `roleArn` plus the optional config members. Must mutate the stored runtime, bump `agentRuntimeVersion` to the next integer ("1" -> "2"), retain the previous version so `ListAgentRuntimeVersions`/`GetAgentRuntime?version=1` can still find it, refresh `lastUpdatedAt`, and return `agentRuntimeArn`, `agentRuntimeId`, `agentRuntimeVersion`, `createdAt`, `lastUpdatedAt`, `status`. A subsequent GetAgentRuntime must observe the NEW values. Unknown id -> `ResourceNotFoundException` (404).
+5. **DeleteAgentRuntime** — `DELETE /runtimes/{agentRuntimeId}/` -> 202. Must remove the runtime (all versions, or just `version` when the query param is given) from state and return `status` (@required, e.g. `DELETING`), `agentRuntimeId`, `agentRuntimeVersion`. After this, GetAgentRuntime -> `ResourceNotFoundException` (404) and the runtime must be absent from ListAgentRuntimes. Deleting an unknown id -> `ResourceNotFoundException` (404).
+
+NEVER STUBS: each of the five must compute its response from the persisted store reached via `crate::state::service_state(&*self.engine)` — no canned bodies, no echoing the input back without storing it, no random id without a corresponding stored record. Delete the `SCAFFOLDED, NOT IMPLEMENTED` marker line from each implemented file so the census reflects the work.
+
+## State Model
+
+In `src/state.rs`, extend the service state with:
+
+- `agent_runtimes: BTreeMap<String /* agentRuntimeId */, AgentRuntimeRecord>` — insertion/key order gives the deterministic list order needed for stable pagination.
+- `runtime_names: BTreeMap<String /* agentRuntimeName */, String /* agentRuntimeId */>` — enforces the create-time `ConflictException` on duplicate names.
+- `AgentRuntimeRecord { agent_runtime_id: String, agent_runtime_arn: String, agent_runtime_name: String, created_at: DateTime, latest_version: u32, versions: BTreeMap<u32, AgentRuntimeVersionRecord>, tags: BTreeMap<String,String>, workload_identity_details: Option<WorkloadIdentityDetails> }`.
+- `AgentRuntimeVersionRecord { version: u32, status: AgentRuntimeStatus, last_updated_at: DateTime, role_arn: String, description: Option<String>, agent_runtime_artifact: AgentRuntimeArtifact, network_configuration: Option<NetworkConfiguration>, protocol_configuration: Option<ProtocolConfiguration>, authorizer_configuration: Option<AuthorizerConfiguration>, request_header_configuration: Option<RequestHeaderConfiguration>, lifecycle_configuration: LifecycleConfiguration, environment_variables: BTreeMap<String,String>, filesystem_configurations: Vec<FilesystemConfiguration>, capacity_provider_configuration: Option<CapacityProviderConfiguration>, platform_version: Option<String>, failure_reason: Option<String> }`.
+- `idempotency: BTreeMap<String /* clientToken */, String /* agentRuntimeId */>` — so a replayed Create/Update with the same `clientToken` returns the first result instead of creating a second runtime.
+
+Done = a client script can create a runtime, get it back with the fields it supplied, see it in a (paginated) list, update it and observe a bumped version plus the new artifact/role, delete it, and then get a 404 — all against one running emulator process. The other 166 operations (gateways, memories, browsers, code interpreters, credential providers, policies, registries, datasets, evaluators, payments, tagging, resource policies, token vault) stay 501 and will be filed as individual gap issues later.
+
+## Evidence
+
+OPERATIONS.md (crate root) header: "171 operations", protocol `restJson1`, SDK id `Bedrock AgentCore Control`. The agent-runtime contracts cited above are OPERATIONS.md lines 128-174: CreateAgentRuntime (`PUT /runtimes/ -> 202`, required `agentRuntimeName`/`agentRuntimeArtifact`/`roleArn`, required outputs `agentRuntimeArn`/`agentRuntimeId`/`agentRuntimeVersion`/`createdAt`/`status`, errors incl. ConflictException 409 + ValidationException 400); GetAgentRuntime (`GET /runtimes/{agentRuntimeId}/ -> 200`, @readonly, `version` @httpQuery, ResourceNotFoundException 404); ListAgentRuntimes (`POST /runtimes/ -> 200`, @paginated items=agentRuntimes, `maxResults` range 1..100, `nextToken`); UpdateAgentRuntime (`PUT /runtimes/{agentRuntimeId}/ -> 202`, returns `agentRuntimeVersion` + `lastUpdatedAt`); DeleteAgentRuntime (`DELETE /runtimes/{agentRuntimeId}/ -> 202`, required output `status`). The `AgentRuntime` summary members come from `smithy_query shape=AgentRuntime` (agentRuntimeArn, agentRuntimeId, agentRuntimeVersion, agentRuntimeName, description, lastUpdatedAt, status — all @required). All-stub status confirmed: `src/ops/create_agent_runtime.rs:4` carries `//! SCAFFOLDED, NOT IMPLEMENTED:` and line 211 returns `Err(crate::scaffolded::Scaffolded::not_implemented("CreateAgentRuntime"))`; every other file in `src/ops/` is the same generated shape. README.md documents the engine-backed state API the handlers must use and warns against constructing a private `InMemoryEngine`.
+
+## Steps to Reproduce
+
+1. Start the emulator and point a client at the `bedrock-agentcore-control` endpoint.
+2. CreateAgentRuntime with agentRuntimeName="my_agent", roleArn="arn:aws:iam::123456789012:role/AgentRole", an agentRuntimeArtifact and description="demo" — expect 202 with agentRuntimeId matching ^[a-zA-Z][a-zA-Z0-9_]{0,99}-[a-zA-Z0-9]{10}$, an ARN containing that id, agentRuntimeVersion="1" and a status; today: HTTP 501 NotImplemented.
+3. GetAgentRuntime with the returned agentRuntimeId — expect 200 echoing the STORED agentRuntimeName, roleArn, description, agentRuntimeArtifact, createdAt/lastUpdatedAt and status; today: 501.
+4. ListAgentRuntimes with maxResults=1 after creating two runtimes — expect one AgentRuntime summary plus a nextToken, and the second runtime on the follow-up call with that token; today: 501.
+5. UpdateAgentRuntime on the id with a changed artifact and roleArn — expect 202 with agentRuntimeVersion="2"; then GetAgentRuntime must return the new roleArn/artifact and a later lastUpdatedAt, and GetAgentRuntime?version=1 must still return the original.
+6. DeleteAgentRuntime on the id — expect 202 with a status; then GetAgentRuntime -> 404 ResourceNotFoundException and ListAgentRuntimes no longer contains it.
