@@ -599,6 +599,106 @@
     {
       "shape_id": "com.amazonaws.elasticloadbalancingv2#ElasticLoadBalancing_v10",
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/elastic-load-balancing-v2/service/2015-12-01/elastic-load-balancing-v2-2015-12-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.elasticsearchservice#AmazonElasticsearchService2015",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/elasticsearch-service/service/2015-01-01/elasticsearch-service-2015-01-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.elementalinference#ElementalInference",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/elementalinference/service/2018-11-14/elementalinference-2018-11-14.json"
+    },
+    {
+      "shape_id": "com.amazonaws.emr#ElasticMapReduce",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/emr/service/2009-03-31/emr-2009-03-31.json"
+    },
+    {
+      "shape_id": "com.amazonaws.emrcontainers#AwsChicagoWebService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/emr-containers/service/2020-10-01/emr-containers-2020-10-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.emrserverless#AwsToledoWebService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/emr-serverless/service/2021-07-13/emr-serverless-2021-07-13.json"
+    },
+    {
+      "shape_id": "com.amazonaws.endusermessaging#EndUserMessaging",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/endusermessaging/service/2026-09-21/endusermessaging-2026-09-21.json"
+    },
+    {
+      "shape_id": "com.amazonaws.entityresolution#AWSVeniceService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/entityresolution/service/2018-05-10/entityresolution-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.eventbridge#AWSEvents",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/eventbridge/service/2015-10-07/eventbridge-2015-10-07.json"
+    },
+    {
+      "shape_id": "com.amazonaws.eventbridgev2#AWSEventsV2",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/eventbridgev2/service/2025-05-15/eventbridgev2-2025-05-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.evs#AmazonElasticVMwareService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/evs/service/2023-07-27/evs-2023-07-27.json"
+    },
+    {
+      "shape_id": "com.amazonaws.firehose#Firehose_20150804",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/firehose/service/2015-08-04/firehose-2015-08-04.json"
+    },
+    {
+      "shape_id": "com.amazonaws.fis#FaultInjectionSimulator",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/fis/service/2020-12-01/fis-2020-12-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.fms#AWSFMS_20180101",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/fms/service/2018-01-01/fms-2018-01-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.forecast#AmazonForecast",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/forecast/service/2018-06-26/forecast-2018-06-26.json"
+    },
+    {
+      "shape_id": "com.amazonaws.forecastquery#AmazonForecastRuntime",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/forecastquery/service/2018-06-26/forecastquery-2018-06-26.json"
+    },
+    {
+      "shape_id": "com.amazonaws.frauddetector#AWSHawksNestServiceFacade",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/frauddetector/service/2019-11-15/frauddetector-2019-11-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.freetier#AWSFreeTierService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/freetier/service/2023-09-07/freetier-2023-09-07.json"
+    },
+    {
+      "shape_id": "com.amazonaws.fsx#AWSSimbaAPIService_v20180301",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/fsx/service/2018-03-01/fsx-2018-03-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.gamelift#GameLift",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/gamelift/service/2015-10-01/gamelift-2015-10-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.gameliftstreams#GameLiftStreams",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/gameliftstreams/service/2018-05-10/gameliftstreams-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.geomaps#MapsService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/geo-maps/service/2020-11-19/geo-maps-2020-11-19.json"
+    },
+    {
+      "shape_id": "com.amazonaws.geoplaces#PlacesService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/geo-places/service/2020-11-19/geo-places-2020-11-19.json"
+    },
+    {
+      "shape_id": "com.amazonaws.georoutes#RoutesService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/geo-routes/service/2020-11-19/geo-routes-2020-11-19.json"
+    },
+    {
+      "shape_id": "com.amazonaws.glacier#Glacier",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/glacier/service/2012-06-01/glacier-2012-06-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.globalaccelerator#GlobalAccelerator_V20180706",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/global-accelerator/service/2018-08-08/global-accelerator-2018-08-08.json"
     }
   ]
 }

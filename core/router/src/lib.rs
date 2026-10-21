@@ -89,7 +89,9 @@ pub fn build_router(engine: Arc<InMemoryEngine>) -> MultiServiceRouter {
     let router = mount_chunk_10(router, &engine);
     let router = mount_chunk_11(router, &engine);
     let router = mount_chunk_12(router, &engine);
-    mount_chunk_13(router, &engine)
+    let router = mount_chunk_13(router, &engine);
+    let router = mount_chunk_14(router, &engine);
+    mount_chunk_15(router, &engine)
 }
 
 /// Register services 00 of this workspace on `router`.
@@ -407,6 +409,55 @@ fn mount_chunk_13(
     router.register_service(service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice::EmulatedService::new(engine.clone()));
     router.register_service(service_com_amazonaws_elasticloadbalancing_elasticloadbalancing_v7::EmulatedService::new(engine.clone()));
     router.register_service(service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_elasticsearchservice_amazonelasticsearchservice2015::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_elementalinference_elementalinference::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_emr_elasticmapreduce::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_emrcontainers_awschicagowebservice::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 14 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_14(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_emrserverless_awstoledowebservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_endusermessaging_endusermessaging::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_entityresolution_awsveniceservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_eventbridge_awsevents::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_eventbridgev2_awseventsv2::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_evs_amazonelasticvmwareservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_firehose_firehose_20150804::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_fis_faultinjectionsimulator::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_fms_awsfms_20180101::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_forecast_amazonforecast::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_forecastquery_amazonforecastruntime::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 15 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_15(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_frauddetector_awshawksnestservicefacade::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_freetier_awsfreetierservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_fsx_awssimbaapiservice_v20180301::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_gamelift_gamelift::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_gameliftstreams_gameliftstreams::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_geomaps_mapsservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_geoplaces_placesservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_georoutes_routesservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_glacier_glacier::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_globalaccelerator_globalaccelerator_v20180706::EmulatedService::new(engine.clone()));
     router
 }
 

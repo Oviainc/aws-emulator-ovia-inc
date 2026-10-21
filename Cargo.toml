@@ -150,6 +150,31 @@ members = [
     "services/service-com-amazonaws-elasticbeanstalk-awselasticbeanstalkservice",
     "services/service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7",
     "services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10",
+    "services/service-com-amazonaws-elasticsearchservice-amazonelasticsearchservice2015",
+    "services/service-com-amazonaws-elementalinference-elementalinference",
+    "services/service-com-amazonaws-emr-elasticmapreduce",
+    "services/service-com-amazonaws-emrcontainers-awschicagowebservice",
+    "services/service-com-amazonaws-emrserverless-awstoledowebservice",
+    "services/service-com-amazonaws-endusermessaging-endusermessaging",
+    "services/service-com-amazonaws-entityresolution-awsveniceservice",
+    "services/service-com-amazonaws-eventbridge-awsevents",
+    "services/service-com-amazonaws-eventbridgev2-awseventsv2",
+    "services/service-com-amazonaws-evs-amazonelasticvmwareservice",
+    "services/service-com-amazonaws-firehose-firehose-20150804",
+    "services/service-com-amazonaws-fis-faultinjectionsimulator",
+    "services/service-com-amazonaws-fms-awsfms-20180101",
+    "services/service-com-amazonaws-forecast-amazonforecast",
+    "services/service-com-amazonaws-forecastquery-amazonforecastruntime",
+    "services/service-com-amazonaws-frauddetector-awshawksnestservicefacade",
+    "services/service-com-amazonaws-freetier-awsfreetierservice",
+    "services/service-com-amazonaws-fsx-awssimbaapiservice-v20180301",
+    "services/service-com-amazonaws-gamelift-gamelift",
+    "services/service-com-amazonaws-gameliftstreams-gameliftstreams",
+    "services/service-com-amazonaws-geomaps-mapsservice",
+    "services/service-com-amazonaws-geoplaces-placesservice",
+    "services/service-com-amazonaws-georoutes-routesservice",
+    "services/service-com-amazonaws-glacier-glacier",
+    "services/service-com-amazonaws-globalaccelerator-globalaccelerator-v20180706",
     "core/router",
     "core/embedded",
 ]
@@ -335,6 +360,31 @@ service-com-amazonaws-elasticache-amazonelasticachev9 = { path = "services/servi
 service-com-amazonaws-elasticbeanstalk-awselasticbeanstalkservice = { path = "services/service-com-amazonaws-elasticbeanstalk-awselasticbeanstalkservice" }
 service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7 = { path = "services/service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7" }
 service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { path = "services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10" }
+service-com-amazonaws-elasticsearchservice-amazonelasticsearchservice2015 = { path = "services/service-com-amazonaws-elasticsearchservice-amazonelasticsearchservice2015" }
+service-com-amazonaws-elementalinference-elementalinference = { path = "services/service-com-amazonaws-elementalinference-elementalinference" }
+service-com-amazonaws-emr-elasticmapreduce = { path = "services/service-com-amazonaws-emr-elasticmapreduce" }
+service-com-amazonaws-emrcontainers-awschicagowebservice = { path = "services/service-com-amazonaws-emrcontainers-awschicagowebservice" }
+service-com-amazonaws-emrserverless-awstoledowebservice = { path = "services/service-com-amazonaws-emrserverless-awstoledowebservice" }
+service-com-amazonaws-endusermessaging-endusermessaging = { path = "services/service-com-amazonaws-endusermessaging-endusermessaging" }
+service-com-amazonaws-entityresolution-awsveniceservice = { path = "services/service-com-amazonaws-entityresolution-awsveniceservice" }
+service-com-amazonaws-eventbridge-awsevents = { path = "services/service-com-amazonaws-eventbridge-awsevents" }
+service-com-amazonaws-eventbridgev2-awseventsv2 = { path = "services/service-com-amazonaws-eventbridgev2-awseventsv2" }
+service-com-amazonaws-evs-amazonelasticvmwareservice = { path = "services/service-com-amazonaws-evs-amazonelasticvmwareservice" }
+service-com-amazonaws-firehose-firehose-20150804 = { path = "services/service-com-amazonaws-firehose-firehose-20150804" }
+service-com-amazonaws-fis-faultinjectionsimulator = { path = "services/service-com-amazonaws-fis-faultinjectionsimulator" }
+service-com-amazonaws-fms-awsfms-20180101 = { path = "services/service-com-amazonaws-fms-awsfms-20180101" }
+service-com-amazonaws-forecast-amazonforecast = { path = "services/service-com-amazonaws-forecast-amazonforecast" }
+service-com-amazonaws-forecastquery-amazonforecastruntime = { path = "services/service-com-amazonaws-forecastquery-amazonforecastruntime" }
+service-com-amazonaws-frauddetector-awshawksnestservicefacade = { path = "services/service-com-amazonaws-frauddetector-awshawksnestservicefacade" }
+service-com-amazonaws-freetier-awsfreetierservice = { path = "services/service-com-amazonaws-freetier-awsfreetierservice" }
+service-com-amazonaws-fsx-awssimbaapiservice-v20180301 = { path = "services/service-com-amazonaws-fsx-awssimbaapiservice-v20180301" }
+service-com-amazonaws-gamelift-gamelift = { path = "services/service-com-amazonaws-gamelift-gamelift" }
+service-com-amazonaws-gameliftstreams-gameliftstreams = { path = "services/service-com-amazonaws-gameliftstreams-gameliftstreams" }
+service-com-amazonaws-geomaps-mapsservice = { path = "services/service-com-amazonaws-geomaps-mapsservice" }
+service-com-amazonaws-geoplaces-placesservice = { path = "services/service-com-amazonaws-geoplaces-placesservice" }
+service-com-amazonaws-georoutes-routesservice = { path = "services/service-com-amazonaws-georoutes-routesservice" }
+service-com-amazonaws-glacier-glacier = { path = "services/service-com-amazonaws-glacier-glacier" }
+service-com-amazonaws-globalaccelerator-globalaccelerator-v20180706 = { path = "services/service-com-amazonaws-globalaccelerator-globalaccelerator-v20180706" }
 
 # The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
 #
