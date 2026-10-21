@@ -175,6 +175,31 @@ members = [
     "services/service-com-amazonaws-georoutes-routesservice",
     "services/service-com-amazonaws-glacier-glacier",
     "services/service-com-amazonaws-globalaccelerator-globalaccelerator-v20180706",
+    "services/service-com-amazonaws-glue-awsglue",
+    "services/service-com-amazonaws-grafana-awsgrafanacontrolplane",
+    "services/service-com-amazonaws-greengrass-greengrass",
+    "services/service-com-amazonaws-greengrassv2-greengrassv2",
+    "services/service-com-amazonaws-groundstation-groundstation",
+    "services/service-com-amazonaws-guardduty-guarddutyapiservice",
+    "services/service-com-amazonaws-health-awshealth-20160804",
+    "services/service-com-amazonaws-healthlake-healthlake",
+    "services/service-com-amazonaws-iam-awsidentitymanagementv20100508",
+    "services/service-com-amazonaws-iamtoolbox-authrequestservice",
+    "services/service-com-amazonaws-identitystore-awsidentitystore",
+    "services/service-com-amazonaws-imagebuilder-imagebuilder",
+    "services/service-com-amazonaws-inspector-inspectorservice",
+    "services/service-com-amazonaws-inspector2-inspector2",
+    "services/service-com-amazonaws-inspectorscan-inspectorscan",
+    "services/service-com-amazonaws-interconnect-interconnect",
+    "services/service-com-amazonaws-internetmonitor-internetmonitor20210603",
+    "services/service-com-amazonaws-invoicing-invoicing",
+    "services/service-com-amazonaws-iot-awsiotservice",
+    "services/service-com-amazonaws-iotdataplane-iotmoonrakerservice",
+    "services/service-com-amazonaws-iotdeviceadvisor-iotsenateservice",
+    "services/service-com-amazonaws-iotfleetwise-iotautobahncontrolplane",
+    "services/service-com-amazonaws-iotjobsdataplane-iotlaserthingjobmanagerexternalservice",
+    "services/service-com-amazonaws-iotmanagedintegrations-iotmanagedintegrations",
+    "services/service-com-amazonaws-iotsecuretunneling-iotsecuredtunneling",
     "core/router",
     "core/embedded",
 ]
@@ -385,6 +410,31 @@ service-com-amazonaws-geoplaces-placesservice = { path = "services/service-com-a
 service-com-amazonaws-georoutes-routesservice = { path = "services/service-com-amazonaws-georoutes-routesservice" }
 service-com-amazonaws-glacier-glacier = { path = "services/service-com-amazonaws-glacier-glacier" }
 service-com-amazonaws-globalaccelerator-globalaccelerator-v20180706 = { path = "services/service-com-amazonaws-globalaccelerator-globalaccelerator-v20180706" }
+service-com-amazonaws-glue-awsglue = { path = "services/service-com-amazonaws-glue-awsglue" }
+service-com-amazonaws-grafana-awsgrafanacontrolplane = { path = "services/service-com-amazonaws-grafana-awsgrafanacontrolplane" }
+service-com-amazonaws-greengrass-greengrass = { path = "services/service-com-amazonaws-greengrass-greengrass" }
+service-com-amazonaws-greengrassv2-greengrassv2 = { path = "services/service-com-amazonaws-greengrassv2-greengrassv2" }
+service-com-amazonaws-groundstation-groundstation = { path = "services/service-com-amazonaws-groundstation-groundstation" }
+service-com-amazonaws-guardduty-guarddutyapiservice = { path = "services/service-com-amazonaws-guardduty-guarddutyapiservice" }
+service-com-amazonaws-health-awshealth-20160804 = { path = "services/service-com-amazonaws-health-awshealth-20160804" }
+service-com-amazonaws-healthlake-healthlake = { path = "services/service-com-amazonaws-healthlake-healthlake" }
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { path = "services/service-com-amazonaws-iam-awsidentitymanagementv20100508" }
+service-com-amazonaws-iamtoolbox-authrequestservice = { path = "services/service-com-amazonaws-iamtoolbox-authrequestservice" }
+service-com-amazonaws-identitystore-awsidentitystore = { path = "services/service-com-amazonaws-identitystore-awsidentitystore" }
+service-com-amazonaws-imagebuilder-imagebuilder = { path = "services/service-com-amazonaws-imagebuilder-imagebuilder" }
+service-com-amazonaws-inspector-inspectorservice = { path = "services/service-com-amazonaws-inspector-inspectorservice" }
+service-com-amazonaws-inspector2-inspector2 = { path = "services/service-com-amazonaws-inspector2-inspector2" }
+service-com-amazonaws-inspectorscan-inspectorscan = { path = "services/service-com-amazonaws-inspectorscan-inspectorscan" }
+service-com-amazonaws-interconnect-interconnect = { path = "services/service-com-amazonaws-interconnect-interconnect" }
+service-com-amazonaws-internetmonitor-internetmonitor20210603 = { path = "services/service-com-amazonaws-internetmonitor-internetmonitor20210603" }
+service-com-amazonaws-invoicing-invoicing = { path = "services/service-com-amazonaws-invoicing-invoicing" }
+service-com-amazonaws-iot-awsiotservice = { path = "services/service-com-amazonaws-iot-awsiotservice" }
+service-com-amazonaws-iotdataplane-iotmoonrakerservice = { path = "services/service-com-amazonaws-iotdataplane-iotmoonrakerservice" }
+service-com-amazonaws-iotdeviceadvisor-iotsenateservice = { path = "services/service-com-amazonaws-iotdeviceadvisor-iotsenateservice" }
+service-com-amazonaws-iotfleetwise-iotautobahncontrolplane = { path = "services/service-com-amazonaws-iotfleetwise-iotautobahncontrolplane" }
+service-com-amazonaws-iotjobsdataplane-iotlaserthingjobmanagerexternalservice = { path = "services/service-com-amazonaws-iotjobsdataplane-iotlaserthingjobmanagerexternalservice" }
+service-com-amazonaws-iotmanagedintegrations-iotmanagedintegrations = { path = "services/service-com-amazonaws-iotmanagedintegrations-iotmanagedintegrations" }
+service-com-amazonaws-iotsecuretunneling-iotsecuredtunneling = { path = "services/service-com-amazonaws-iotsecuretunneling-iotsecuredtunneling" }
 
 # The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
 #

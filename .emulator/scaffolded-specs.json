@@ -699,6 +699,106 @@
     {
       "shape_id": "com.amazonaws.globalaccelerator#GlobalAccelerator_V20180706",
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/global-accelerator/service/2018-08-08/global-accelerator-2018-08-08.json"
+    },
+    {
+      "shape_id": "com.amazonaws.glue#AWSGlue",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/glue/service/2017-03-31/glue-2017-03-31.json"
+    },
+    {
+      "shape_id": "com.amazonaws.grafana#AWSGrafanaControlPlane",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/grafana/service/2020-08-18/grafana-2020-08-18.json"
+    },
+    {
+      "shape_id": "com.amazonaws.greengrass#Greengrass",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/greengrass/service/2017-06-07/greengrass-2017-06-07.json"
+    },
+    {
+      "shape_id": "com.amazonaws.greengrassv2#GreengrassV2",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/greengrassv2/service/2020-11-30/greengrassv2-2020-11-30.json"
+    },
+    {
+      "shape_id": "com.amazonaws.groundstation#GroundStation",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/groundstation/service/2019-05-23/groundstation-2019-05-23.json"
+    },
+    {
+      "shape_id": "com.amazonaws.guardduty#GuardDutyAPIService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/guardduty/service/2017-11-28/guardduty-2017-11-28.json"
+    },
+    {
+      "shape_id": "com.amazonaws.health#AWSHealth_20160804",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/health/service/2016-08-04/health-2016-08-04.json"
+    },
+    {
+      "shape_id": "com.amazonaws.healthlake#HealthLake",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/healthlake/service/2017-07-01/healthlake-2017-07-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.iam#AWSIdentityManagementV20100508",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/iam/service/2010-05-08/iam-2010-05-08.json"
+    },
+    {
+      "shape_id": "com.amazonaws.iamtoolbox#AuthRequestService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/iam-toolbox/service/2018-05-10/iam-toolbox-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.identitystore#AWSIdentityStore",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/identitystore/service/2020-06-15/identitystore-2020-06-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.imagebuilder#imagebuilder",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/imagebuilder/service/2019-12-02/imagebuilder-2019-12-02.json"
+    },
+    {
+      "shape_id": "com.amazonaws.inspector#InspectorService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/inspector/service/2016-02-16/inspector-2016-02-16.json"
+    },
+    {
+      "shape_id": "com.amazonaws.inspector2#Inspector2",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/inspector2/service/2020-06-08/inspector2-2020-06-08.json"
+    },
+    {
+      "shape_id": "com.amazonaws.inspectorscan#InspectorScan",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/inspector-scan/service/2023-08-08/inspector-scan-2023-08-08.json"
+    },
+    {
+      "shape_id": "com.amazonaws.interconnect#Interconnect",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/interconnect/service/2022-07-26/interconnect-2022-07-26.json"
+    },
+    {
+      "shape_id": "com.amazonaws.internetmonitor#InternetMonitor20210603",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/internetmonitor/service/2021-06-03/internetmonitor-2021-06-03.json"
+    },
+    {
+      "shape_id": "com.amazonaws.invoicing#Invoicing",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/invoicing/service/2024-12-01/invoicing-2024-12-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.iot#AWSIotService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/iot/service/2015-05-28/iot-2015-05-28.json"
+    },
+    {
+      "shape_id": "com.amazonaws.iotdataplane#IotMoonrakerService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/iot-data-plane/service/2015-05-28/iot-data-plane-2015-05-28.json"
+    },
+    {
+      "shape_id": "com.amazonaws.iotdeviceadvisor#IotSenateService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/iotdeviceadvisor/service/2020-09-18/iotdeviceadvisor-2020-09-18.json"
+    },
+    {
+      "shape_id": "com.amazonaws.iotfleetwise#IoTAutobahnControlPlane",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/iotfleetwise/service/2021-06-17/iotfleetwise-2021-06-17.json"
+    },
+    {
+      "shape_id": "com.amazonaws.iotjobsdataplane#IotLaserThingJobManagerExternalService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/iot-jobs-data-plane/service/2017-09-29/iot-jobs-data-plane-2017-09-29.json"
+    },
+    {
+      "shape_id": "com.amazonaws.iotmanagedintegrations#IotManagedIntegrations",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/iot-managed-integrations/service/2025-03-03/iot-managed-integrations-2025-03-03.json"
+    },
+    {
+      "shape_id": "com.amazonaws.iotsecuretunneling#IoTSecuredTunneling",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/iotsecuretunneling/service/2018-10-05/iotsecuretunneling-2018-10-05.json"
     }
   ]
 }
