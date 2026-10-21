@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the group that `Group` (a name or a group ARN) or the deprecated `GroupName`
+//! names — with its static memberships and its tags, which are held on the same record —
+//! and reports the group as it was at the moment it was deleted.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +152,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteGroup"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` is deliberately unreachable here and a success says
+        // nothing about the caller's permissions.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteGroupErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the resource-groups store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // Neither member is `@required`, but the operation addresses exactly one
+        // group, so a request naming none cannot be served. `Group` wins over the
+        // deprecated `GroupName`, and the one identifier resolved here is the one
+        // every answer below names.
+        let Some(identifier) = input.group.as_deref().or(input.group_name.as_deref()) else {
+            return Err(DeleteGroupErrorModeled::BadRequestException(BadRequestException {
+                message: Some(
+                    "the request must name the group to delete, in Group or GroupName"
+                        .to_string(),
+                ),
+            })
+            .into());
+        };
+        let not_found = || {
+            DeleteGroupError::from(DeleteGroupErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!("no group found with the identifier {identifier}")),
+                },
+            ))
+        };
+        let mut store = state.lock();
+        let name = store.lookup(identifier).ok_or_else(not_found)?;
+        // Removing the record removes the group's memberships and tags with it:
+        // both are held on the record itself.
+        let removed = store.groups.remove(&name).ok_or_else(not_found)?;
+        Ok(DeleteGroupOutput {
+            group: Some(removed.to_group()),
+        })
     }
 }
