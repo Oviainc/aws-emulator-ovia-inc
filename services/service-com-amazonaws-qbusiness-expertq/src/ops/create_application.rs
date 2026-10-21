@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an Amazon Q Business application: mints and stores the application record
+//! that every other application operation reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -209,18 +202,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplication"))
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateApplicationErrorModeled::InternalServerException(InternalServerException {
+                message: "the Amazon Q Business store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle(now);
+
+        // The real service caps applications per account per Region, and this operation
+        // models ServiceQuotaExceededException for exceeding it. The emulator's own
+        // ceiling is what keeps a create loop from growing this process without bound.
+        if store.applications.len() >= crate::state::MAX_APPLICATIONS {
+            return Err(CreateApplicationErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "You have reached the maximum number of Amazon Q Business applications ({})",
+                        crate::state::MAX_APPLICATIONS
+                    ),
+                    resource_id: ::engine::emulator_account_id().to_string(),
+                    resource_type: "APPLICATION".to_string(),
+                },
+            )
+            .into());
+        }
+
+        // `clientToken` is an @idempotencyToken: a replay returns the application the
+        // first request minted instead of creating a second one.
+        let client_token = input.client_token.clone();
+        let replayed = store
+            .replayed_id(Self::NAME, client_token.as_deref())
+            .filter(|id| store.applications.contains_key(id));
+
+        let application_id = match replayed {
+            Some(application_id) => application_id,
+            None => {
+                let application_id = crate::state::mint_resource_id();
+                let sequence = store.next_sequence();
+                let record = crate::state::StoredApplication {
+                    application_arn: crate::state::application_arn(&region, &application_id),
+                    application_id: application_id.clone(),
+                    display_name: input.display_name,
+                    description: input.description,
+                    identity_type: input.identity_type,
+                    iam_identity_provider_arn: input.iam_identity_provider_arn,
+                    identity_center_instance_arn: input.identity_center_instance_arn,
+                    client_ids_for_oidc: input.client_ids_for_oidc,
+                    role_arn: input.role_arn,
+                    encryption_configuration: input.encryption_configuration,
+                    attachments_configuration: input.attachments_configuration,
+                    q_apps_configuration: input.q_apps_configuration,
+                    personalization_configuration: input.personalization_configuration,
+                    quick_sight_configuration: input.quick_sight_configuration,
+                    tags: input.tags.unwrap_or_default(),
+                    // A new application is not ready yet: the clock owes it ACTIVE.
+                    status: crate::state::STATUS_CREATING.to_string(),
+                    active_due_at: now + crate::state::PROVISIONING_SPAN,
+                    created_at: now,
+                    updated_at: now,
+                    sequence,
+                    indices: ::std::collections::HashMap::new(),
+                };
+                store.applications.insert(application_id.clone(), record);
+                store.remember_client_token(Self::NAME, client_token.as_deref(), &application_id);
+                application_id
+            }
+        };
+
+        // Answer from the stored record, so the response cannot drift from the state a
+        // later GetApplication / ListApplications reads.
+        let stored = store.applications.get(&application_id).ok_or_else(|| {
+            CreateApplicationErrorModeled::InternalServerException(InternalServerException {
+                message: "the created application was not stored".to_string(),
+            })
+        })?;
+        Ok(CreateApplicationOutput {
+            application_id: Some(stored.application_id.clone()),
+            application_arn: Some(stored.application_arn.clone()),
+        })
     }
 }

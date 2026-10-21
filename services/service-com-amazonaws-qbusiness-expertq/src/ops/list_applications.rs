@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApplications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApplications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the stored applications, one page at a time. A reporting operation: it writes
+//! only the `CREATING` -> `ACTIVE` transition the clock already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +149,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApplications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApplicationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApplications"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // A `nextToken` this service never minted cannot be resumed from; the model's own
+        // ValidationException says so, with the CANNOT_PARSE reason.
+        let after = crate::state::decode_cursor(input.next_token.as_deref()).map_err(|_| {
+            ListApplicationsErrorModeled::ValidationException(ValidationException {
+                message: "nextToken is not a pagination token this service issued".to_string(),
+                reason: "CANNOT_PARSE".to_string(),
+                fields: Some(vec![ValidationExceptionField {
+                    name: "nextToken".to_string(),
+                    message: "not a pagination token this service issued".to_string(),
+                }]),
+            })
+        })?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListApplicationsErrorModeled::InternalServerException(InternalServerException {
+                message: "the Amazon Q Business store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        // The only write a report may make: the status transition the clock already owes.
+        store.settle(now);
+
+        let ordered: Vec<(u64, Application)> = store
+            .applications_in_order()
+            .into_iter()
+            .map(|application| (application.sequence, summary_of(application)))
+            .collect();
+        let page = crate::state::page_of(ordered, after, input.max_results);
+
+        Ok(ListApplicationsOutput {
+            applications: Some(page.items),
+            next_token: page.next_token,
+        })
+    }
+}
+
+/// The `Application` summary the model returns for a stored application.
+fn summary_of(application: &crate::state::StoredApplication) -> Application {
+    Application {
+        display_name: Some(application.display_name.clone()),
+        application_id: Some(application.application_id.clone()),
+        created_at: Some(::aws_smithy_types::DateTime::from(application.created_at)),
+        updated_at: Some(::aws_smithy_types::DateTime::from(application.updated_at)),
+        status: Some(application.status.clone()),
+        identity_type: application.identity_type.clone(),
+        quick_sight_configuration: application.quick_sight_configuration.clone(),
     }
 }
