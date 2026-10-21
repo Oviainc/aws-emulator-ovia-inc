@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMLModels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMLModels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMLModels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the stored `MLModel` records. A reporting operation: the only state it writes
+//! is the `PENDING` -> `COMPLETED` move the clock already made due.
+//!
+//! `FilterVariable` names the member each comparator (`EQ`, `NE`, `GT`, `GE`, `LT`,
+//! `LE`, `Prefix`) is applied to, and, as the model documents ("Results are sorted by
+//! FilterVariable"), is also the member the list is ordered by; with no
+//! `FilterVariable` the list is ordered by `CreatedAt`, the default search criterion.
+//! Timestamps are compared through their ISO-8601 UTC rendering, whose lexicographic
+//! order is their chronological order, so one comparator implementation serves every
+//! filter variable. Ties are broken by `MLModelId`, so the order — and therefore the
+//! continuation token — is total and deterministic.
+//!
+//! A soft-deleted model drops out of the DEFAULT, unfiltered list; a request that
+//! names a `FilterVariable` is asking a specific question, and gets the full answer.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +186,220 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMLModels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMLModelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMLModels"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeMLModelsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Amazon ML store is unavailable".to_string()),
+                    code: 500,
+                },
+            )
+            .into());
+        };
+
+        let comparators = [
+            ("EQ", input.eq.as_deref()),
+            ("GT", input.gt.as_deref()),
+            ("LT", input.lt.as_deref()),
+            ("GE", input.ge.as_deref()),
+            ("LE", input.le.as_deref()),
+            ("NE", input.ne.as_deref()),
+            ("Prefix", input.prefix.as_deref()),
+        ];
+        // A comparator compares the value of `FilterVariable`, so without one there is
+        // nothing for it to compare.
+        if input.filter_variable.is_none() && comparators.iter().any(|(_, bound)| bound.is_some()) {
+            return Err(DescribeMLModelsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        "a comparator (EQ, GT, LT, GE, LE, NE, Prefix) requires FilterVariable"
+                            .to_string(),
+                    ),
+                    code: 400,
+                },
+            )
+            .into());
+        }
+
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(
+                Some(token)
+                    .filter(|token| token.len() <= MAX_PAGE_TOKEN_LEN)
+                    .and_then(decode_page_token)
+                    .ok_or_else(|| {
+                        DescribeMLModelsErrorModeled::InvalidInputException(
+                            InvalidInputException {
+                                message: Some(
+                                    "NextToken is not a continuation token this service issued"
+                                        .to_string(),
+                                ),
+                                code: 400,
+                            },
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+
+        let descending = input.sort_order.as_deref() == Some("dsc");
+        let order_by = input
+            .filter_variable
+            .as_deref()
+            .unwrap_or(DEFAULT_FILTER_VARIABLE);
+        let limit = input
+            .limit
+            .and_then(|limit| usize::try_from(limit).ok())
+            .unwrap_or(DEFAULT_LIMIT);
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        // A soft-deleted model is not part of the default list. A request that names a
+        // `FilterVariable` is asking a specific question, so it gets the full answer.
+        let include_deleted = input.filter_variable.is_some();
+
+        let mut ordered: Vec<(String, String)> = Vec::new();
+        for model in store.ml_models.values() {
+            if !include_deleted && model.status == crate::state::entity_status::DELETED {
+                continue;
+            }
+            let value = store.ml_model_filter_value(model, order_by);
+            if input.filter_variable.is_some() && !matches_comparators(value.as_deref(), &comparators)
+            {
+                continue;
+            }
+            ordered.push((value.unwrap_or_default(), model.id.clone()));
+        }
+        ordered.sort();
+        if descending {
+            ordered.reverse();
+        }
+
+        if let Some((token_key, token_id)) = &resume_after {
+            let resume_from = (token_key.as_str(), token_id.as_str());
+            ordered.retain(|(key, id)| {
+                let candidate = (key.as_str(), id.as_str());
+                if descending {
+                    candidate < resume_from
+                } else {
+                    candidate > resume_from
+                }
+            });
+        }
+
+        let more_remain = ordered.len() > limit;
+        ordered.truncate(limit);
+        let next_token = more_remain
+            .then(|| {
+                ordered
+                    .last()
+                    .map(|(key, id)| encode_page_token(key, id))
+            })
+            .flatten();
+
+        let results = ordered
+            .iter()
+            .filter_map(|(_, id)| store.ml_models.get(id))
+            .map(|model| MLModel {
+                ml_model_id: Some(model.id.clone()),
+                training_data_source_id: Some(model.training_data_source_id.clone()),
+                created_by_iam_user: Some(model.created_by_iam_user.clone()),
+                created_at: Some(crate::state::to_date_time(model.created_at)),
+                last_updated_at: Some(crate::state::to_date_time(model.last_updated_at)),
+                name: model.name.clone(),
+                status: Some(model.status.clone()),
+                size_in_bytes: model.size_in_bytes,
+                endpoint_info: Some(model.realtime_endpoint()),
+                training_parameters: Some(
+                    model
+                        .training_parameters
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                ),
+                input_data_location_s3: store.input_data_location_s3(model),
+                algorithm: Some(crate::state::ALGORITHM_SGD.to_string()),
+                ml_model_type: Some(model.model_type.clone()),
+                score_threshold: model.score_threshold,
+                score_threshold_last_updated_at: model
+                    .score_threshold_last_updated_at
+                    .map(crate::state::to_date_time),
+                message: model.message.clone(),
+                compute_time: model.compute_time_ms,
+                finished_at: model.finished_at.map(crate::state::to_date_time),
+                // `StartedAt` is documented as unavailable while the entity is PENDING.
+                started_at: (model.status != crate::state::entity_status::PENDING)
+                    .then(|| crate::state::to_date_time(model.started_at)),
+            })
+            .collect::<Vec<_>>();
+
+        Ok(DescribeMLModelsOutput {
+            results: Some(results),
+            next_token,
+        })
     }
+}
+
+/// The member the list is ordered by when the request names no `FilterVariable`:
+/// `CreatedAt`, the default search criterion.
+const DEFAULT_FILTER_VARIABLE: &str = "CreatedAt";
+
+/// `Limit`'s documented default: "The default value is 100."
+const DEFAULT_LIMIT: usize = 100;
+
+/// The longest `NextToken` worth decoding. The model puts no length constraint on
+/// `NextToken`, so this bounds the work a caller-supplied token can ask for; it is far
+/// above anything [`encode_page_token`] produces for a modelled id and sort value.
+const MAX_PAGE_TOKEN_LEN: usize = 16 * 1024;
+
+/// Whether `value` satisfies every comparator the request supplied.
+///
+/// Comparators combine: a model is in the result only when the `FilterVariable` value
+/// satisfies all of them. A model that has no value for the filter variable satisfies
+/// no comparator, so it is not in a filtered result.
+fn matches_comparators(value: Option<&str>, comparators: &[(&str, Option<&str>)]) -> bool {
+    for (comparator, bound) in comparators {
+        let Some(bound) = *bound else {
+            continue;
+        };
+        let Some(value) = value else {
+            return false;
+        };
+        let satisfied = match *comparator {
+            "EQ" => value == bound,
+            "NE" => value != bound,
+            "GT" => value > bound,
+            "GE" => value >= bound,
+            "LT" => value < bound,
+            "LE" => value <= bound,
+            "Prefix" => value.starts_with(bound),
+            _ => true,
+        };
+        if !satisfied {
+            return false;
+        }
+    }
+    true
+}
+
+/// The opaque continuation token for the page boundary at `(sort_key, id)`.
+///
+/// It carries the whole sort position, not just the id, so the next page resumes at
+/// exactly the right place even if the record at the boundary changed or was deleted
+/// in between. Both halves are hex-encoded before being joined, so a value containing
+/// the separator cannot be misread, and the whole payload is hex-encoded again so the
+/// token is opaque ASCII a client can only hand back.
+fn encode_page_token(sort_key: &str, id: &str) -> String {
+    hex::encode(format!("{}:{}", hex::encode(sort_key), hex::encode(id)))
+}
+
+/// The `(sort_key, id)` page boundary a token encodes, or `None` when the token is not
+/// one [`encode_page_token`] produced.
+fn decode_page_token(token: &str) -> Option<(String, String)> {
+    let payload = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    let (sort_key, id) = payload.split_once(':')?;
+    let sort_key = String::from_utf8(hex::decode(sort_key).ok()?).ok()?;
+    let id = String::from_utf8(hex::decode(id).ok()?).ok()?;
+    Some((sort_key, id))
 }

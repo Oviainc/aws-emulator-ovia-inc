@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMLModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMLModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMLModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an `MLModel` record in [`crate::state`] against a stored training
+//! `DataSource` and answers with the caller-supplied id.
+//!
+//! Amazon ML documents this operation as asynchronous: it returns immediately with the
+//! model `PENDING`, and the model reaches `COMPLETED` once training finishes, which
+//! [`crate::state::SETTLE_AFTER`] governs here.
+//!
+//! Two rules the model cannot express are enforced here. A `TrainingDataSourceId` that
+//! names no usable `DataSource` is `InvalidInputException` - only a `DataSource` in
+//! the `COMPLETED` or `PENDING` state can be used to train a model. And a repeat of an
+//! id that is already taken is an idempotent success only when the request is the one
+//! that created it, otherwise `IdempotentParameterMismatchException`.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +184,189 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMLModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMLModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMLModel"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateMLModelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Amazon ML store is unavailable".to_string()),
+                    code: 500,
+                },
+            )
+            .into());
+        };
+
+        // "You must specify either the recipe or its URI": the two name the same thing,
+        // so supplying both is a contradiction the model cannot refuse on its own.
+        if input.recipe.is_some() && input.recipe_uri.is_some() {
+            crate::state::audit_mutation(
+                ctx,
+                Self::NAME,
+                "MLModel",
+                &input.ml_model_id,
+                "InvalidInputException",
+            );
+            return Err(CreateMLModelErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        "specify either Recipe or RecipeUri for an MLModel, not both".to_string(),
+                    ),
+                    code: 400,
+                },
+            )
+            .into());
+        }
+
+        let mut parameters: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        if let Some(supplied) = &input.parameters {
+            for (key, value) in supplied {
+                parameters.insert(key.clone(), value.clone());
+            }
+        }
+        // The training parameters join the request fingerprint through a fingerprint of
+        // their own, taken over the sorted entries, so two requests that differ only in
+        // the order the map arrived in are still the same request.
+        let parameters_fingerprint = crate::state::fingerprint(
+            parameters
+                .iter()
+                .map(|(key, value)| (key.as_str(), Some(value.as_str()))),
+        );
+        let request_fingerprint = crate::state::fingerprint([
+            ("MLModelId", Some(input.ml_model_id.as_str())),
+            ("MLModelName", input.ml_model_name.as_deref()),
+            ("MLModelType", Some(input.ml_model_type.as_str())),
+            (
+                "TrainingDataSourceId",
+                Some(input.training_data_source_id.as_str()),
+            ),
+            ("Parameters", Some(parameters_fingerprint.as_str())),
+            ("Recipe", input.recipe.as_deref()),
+            ("RecipeUri", input.recipe_uri.as_deref()),
+        ]);
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        if let Some(existing) = store.ml_models.get(&input.ml_model_id) {
+            if existing.request_fingerprint != request_fingerprint {
+                crate::state::audit_mutation(
+                    ctx,
+                    Self::NAME,
+                    "MLModel",
+                    &input.ml_model_id,
+                    "IdempotentParameterMismatchException",
+                );
+                return Err(
+                    CreateMLModelErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(format!(
+                                "an MLModel with the id {} already exists with different parameters",
+                                input.ml_model_id
+                            )),
+                            code: 400,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // An identical retry of a create is the same call: answer with the id of
+            // the record that already exists and change nothing.
+            crate::state::audit_mutation(
+                ctx,
+                Self::NAME,
+                "MLModel",
+                &existing.id,
+                "idempotent-retry",
+            );
+            return Ok(CreateMLModelOutput {
+                ml_model_id: Some(existing.id.clone()),
+            });
+        }
+
+        let Some(training_data_source) = store
+            .data_sources
+            .get(&input.training_data_source_id)
+            .filter(|data_source| data_source.is_usable())
+        else {
+            crate::state::audit_mutation(
+                ctx,
+                Self::NAME,
+                "MLModel",
+                &input.ml_model_id,
+                "InvalidInputException",
+            );
+            return Err(CreateMLModelErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "TrainingDataSourceId {} does not name a DataSource usable for training",
+                        input.training_data_source_id
+                    )),
+                    code: 400,
+                },
+            )
+            .into());
+        };
+        // The schema a model reports is the schema of the data it was trained on.
+        let schema = training_data_source.data_schema.clone();
+
+        // See the cap in `crate::state`: bounded here, before the insert and after the
+        // idempotent-retry branch above.
+        if store.ml_models.len() >= crate::state::MAX_ML_MODELS {
+            crate::state::audit_mutation(
+                ctx,
+                Self::NAME,
+                "MLModel",
+                &input.ml_model_id,
+                "InternalServerException",
+            );
+            return Err(CreateMLModelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!(
+                        "this emulator holds at most {} MLModels",
+                        crate::state::MAX_ML_MODELS
+                    )),
+                    code: 500,
+                },
+            )
+            .into());
+        }
+
+        store.ml_models.insert(
+            input.ml_model_id.clone(),
+            crate::state::MlModel {
+                id: input.ml_model_id.clone(),
+                name: input.ml_model_name,
+                model_type: input.ml_model_type.clone(),
+                training_data_source_id: input.training_data_source_id,
+                training_parameters: parameters,
+                recipe: input.recipe,
+                recipe_uri: input.recipe_uri,
+                schema,
+                // The scoring threshold marks the boundary between a positive and a
+                // negative prediction, which only a binary classification model has;
+                // it starts at the midpoint of the score range.
+                score_threshold: (input.ml_model_type == "BINARY").then_some(0.5),
+                // Nothing has moved the threshold yet; `UpdateMLModel` sets this.
+                score_threshold_last_updated_at: None,
+                status: crate::state::entity_status::PENDING.to_string(),
+                size_in_bytes: None,
+                created_at: now,
+                last_updated_at: now,
+                started_at: now,
+                finished_at: None,
+                compute_time_ms: None,
+                message: None,
+                // A model gets a realtime endpoint only from `CreateRealtimeEndpoint`.
+                endpoint_info: None,
+                created_by_iam_user: crate::state::created_by_iam_user(),
+                settles_at: now + crate::state::SETTLE_AFTER,
+                request_fingerprint,
+            },
+        );
+
+        crate::state::audit_mutation(ctx, Self::NAME, "MLModel", &input.ml_model_id, "created");
+        Ok(CreateMLModelOutput {
+            ml_model_id: Some(input.ml_model_id),
+        })
     }
 }

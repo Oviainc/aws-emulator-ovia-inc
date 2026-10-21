@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMLModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMLModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMLModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Projects the stored `MLModel` record onto the modelled output. A reporting
+//! operation: the only state it writes is the `PENDING` -> `COMPLETED` move the clock
+//! already made due (see [`crate::state::MlModel::settle`]).
+//!
+//! `Recipe` and `Schema` are returned only when `Verbose` is true, as the model
+//! documents, and `StartedAt` only once the model has left `PENDING`.
+//! `InputDataLocationS3` is resolved from the training `DataSource`'s stored
+//! `DataLocationS3` rather than copied at create time. An id no record answers to is
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -207,18 +208,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMLModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMLModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMLModel"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetMLModelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Amazon ML store is unavailable".to_string()),
+                    code: 500,
+                },
+            )
+            .into());
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        // Cloned out of the store so the training `DataSource` can be read for
+        // `InputDataLocationS3` while the model is still in hand.
+        let Some(model) = store.ml_models.get(&input.ml_model_id).cloned() else {
+            return Err(GetMLModelErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("no MLModel with the id {}", input.ml_model_id)),
+                    code: 404,
+                },
+            )
+            .into());
+        };
+        let pending = model.status == crate::state::entity_status::PENDING;
+
+        Ok(GetMLModelOutput {
+            ml_model_id: Some(model.id.clone()),
+            training_data_source_id: Some(model.training_data_source_id.clone()),
+            created_by_iam_user: Some(model.created_by_iam_user.clone()),
+            created_at: Some(crate::state::to_date_time(model.created_at)),
+            last_updated_at: Some(crate::state::to_date_time(model.last_updated_at)),
+            name: model.name.clone(),
+            status: Some(model.status.clone()),
+            size_in_bytes: model.size_in_bytes,
+            endpoint_info: Some(model.realtime_endpoint()),
+            training_parameters: Some(
+                model
+                    .training_parameters
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            input_data_location_s3: store.input_data_location_s3(&model),
+            ml_model_type: Some(model.model_type.clone()),
+            score_threshold: model.score_threshold,
+            score_threshold_last_updated_at: model
+                .score_threshold_last_updated_at
+                .map(crate::state::to_date_time),
+            // No training log is produced.
+            log_uri: None,
+            message: model.message.clone(),
+            compute_time: model.compute_time_ms,
+            finished_at: model.finished_at.map(crate::state::to_date_time),
+            // `StartedAt` is documented as unavailable while the entity is PENDING.
+            started_at: (!pending).then(|| crate::state::to_date_time(model.started_at)),
+            // `Verbose` selects whether the recipe and the schema are returned.
+            recipe: input.verbose.then(|| model.recipe.clone()).flatten(),
+            schema: input.verbose.then(|| model.schema.clone()).flatten(),
+        })
     }
 }
