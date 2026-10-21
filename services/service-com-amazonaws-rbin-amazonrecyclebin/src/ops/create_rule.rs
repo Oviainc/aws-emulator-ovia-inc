@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a retention rule, persists it in [`crate::state`] and answers with
+//! the STORED record (HTTP 201). This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -207,18 +200,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the rbin retention-rule store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let resource_tags = input.resource_tags.unwrap_or_default();
+        let exclude_resource_tags = input.exclude_resource_tags.unwrap_or_default();
+        // The model cannot express this: `ResourceTags` makes the rule tag-level, and
+        // `ExcludeResourceTags` is "[Region-level retention rules only] ... You can't
+        // specify exclusion tags for tag-level retention rules".
+        if !resource_tags.is_empty() && !exclude_resource_tags.is_empty() {
+            return Err(CreateRuleErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "ExcludeResourceTags can't be specified together with ResourceTags: \
+                     exclusion tags apply to Region-level retention rules only"
+                        .to_string(),
+                ),
+                reason: Some("INVALID_PARAMETER_VALUE".to_string()),
+            })
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // Bound the store before it grows: a Region holds at most
+        // `crate::state::MAX_RULES` retention rules, which is the service's own
+        // published quota, so this check dominates every `mint_identifier` /
+        // `insert_rule` below.
+        if store.rules.len() >= crate::state::MAX_RULES {
+            return Err(CreateRuleErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "The request would exceed the quota of {} retention rules per Region",
+                        crate::state::MAX_RULES
+                    )),
+                    reason: Some("SERVICE_QUOTA_EXCEEDED".to_string()),
+                },
+            )
+            .into());
+        }
+        let identifier = store.mint_identifier();
+        let rule_arn = ::engine::emulator_arn("rbin", &region, &format!("rule/{identifier}"));
+        // A rule created WITH a lock configuration starts out `locked`; one created
+        // without one has never been locked, which the model renders as an ABSENT
+        // `LockState` — a state a rule can never return to once locked.
+        let lock_state = input
+            .lock_configuration
+            .as_ref()
+            .map(|_| "locked".to_string());
+        store.insert_rule(crate::state::Rule {
+            identifier: identifier.clone(),
+            rule_arn,
+            description: input.description,
+            resource_type: input.resource_type,
+            retention_period: input.retention_period,
+            resource_tags,
+            exclude_resource_tags,
+            tags: input.tags.unwrap_or_default(),
+            // Recycle Bin hands back a rule that already retains resources, so there is
+            // no `pending` interval here for the clock to work off.
+            status: "available".to_string(),
+            lock_configuration: input.lock_configuration,
+            lock_state,
+            lock_end_time: None,
+            created_at: ::std::time::SystemTime::now(),
+        });
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // GetRule or ListRules will see rather than the request object.
+        let Some(stored) = store.rules.get(&identifier) else {
+            return Err(CreateRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the newly created retention rule could not be read back".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        Ok(CreateRuleOutput {
+            identifier: Some(stored.identifier.clone()),
+            retention_period: Some(stored.retention_period.clone()),
+            description: stored.description.clone(),
+            tags: Some(stored.tags.clone()),
+            resource_type: Some(stored.resource_type.clone()),
+            resource_tags: Some(stored.resource_tags.clone()),
+            status: Some(stored.status.clone()),
+            lock_configuration: stored.lock_configuration.clone(),
+            lock_state: stored.lock_state.clone(),
+            rule_arn: Some(stored.rule_arn.clone()),
+            exclude_resource_tags: Some(stored.exclude_resource_tags.clone()),
+        })
     }
 }
