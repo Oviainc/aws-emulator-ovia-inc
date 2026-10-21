@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRoom
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRoom`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a room and PERSISTS it in [`crate::state`] — the system-generated
+//! id and ARN, the create/update timestamps, and the modelled defaults for the knobs the
+//! request omitted. Every member of the response is read back out of the stored record,
+//! so a later `GetRoom` answers exactly what this call returned.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRoom::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A 501 from this operation would mean "nobody has written it yet"; it no longer
+//! answers one.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +106,23 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The region a resource this request creates lives in: the one the caller signed for,
+/// since an ARN names the region the request was addressed to. Falls back to the
+/// emulator's default region for a request that carries no SigV4 credential scope, and
+/// for a scope region the modelled `RoomArn` pattern (`[a-z0-9-]+`) would not admit.
+fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    const DEFAULT_REGION: &str = "us-east-1";
+    emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .filter(|region| {
+            !region.is_empty()
+                && region
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -181,18 +196,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRoom` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRoomErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRoom"))
+        // Modeled constraints are already refused BEFORE this handler runs, so reaching
+        // here means the input satisfies every one of them.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service. An engine this service cannot read its state
+            // from means the operation cannot be served at all, which is what 501 says.
+            crate::scaffolded::Scaffolded::not_implemented("CreateRoom")
+        })?;
+
+        let region = request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The store is bounded, so a repeated create cannot grow it without limit: past
+        // this Region's room quota the modelled refusal is `ServiceQuotaExceededException`.
+        if store.rooms_at_quota() {
+            return Err(CreateRoomErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "an account may hold at most {} rooms in a Region.",
+                        crate::state::ROOMS_PER_REGION
+                    ),
+                    resource_id: ::engine::emulator_account_id().to_string(),
+                    resource_type: "ROOM".to_string(),
+                    limit: i32::try_from(crate::state::ROOMS_PER_REGION).unwrap_or(i32::MAX),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_room_id();
+        let room = crate::state::Room {
+            arn: ::engine::emulator_arn("ivschat", &region, &format!("room/{id}")),
+            id: id.clone(),
+            name: input.name,
+            create_time: now,
+            update_time: now,
+            maximum_message_rate_per_second: input
+                .maximum_message_rate_per_second
+                .unwrap_or(crate::state::DEFAULT_MAXIMUM_MESSAGE_RATE_PER_SECOND),
+            maximum_message_length: input
+                .maximum_message_length
+                .unwrap_or(crate::state::DEFAULT_MAXIMUM_MESSAGE_LENGTH),
+            message_review_handler: input.message_review_handler,
+            logging_configuration_identifiers: input
+                .logging_configuration_identifiers
+                .unwrap_or_default(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        // Insert, then render the response out of the INSERTED record rather than out of
+        // the request: what this call answers is what a later read of the room answers.
+        // A plain insert, so the record this call persists is the one it describes even if
+        // a test seeded the store with the same id.
+        store.rooms.insert(id.clone(), room);
+        let Some(stored) = store.rooms.get(&id) else {
+            // Unreachable: the insert above put this id in the map while the lock is held.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateRoom"));
+        };
+        Ok(CreateRoomOutput {
+            arn: Some(stored.arn.clone()),
+            id: Some(stored.id.clone()),
+            name: stored.name.clone(),
+            create_time: Some(crate::state::as_date_time(stored.create_time)),
+            update_time: Some(crate::state::as_date_time(stored.update_time)),
+            maximum_message_rate_per_second: Some(stored.maximum_message_rate_per_second),
+            maximum_message_length: Some(stored.maximum_message_length),
+            message_review_handler: stored.message_review_handler.clone(),
+            tags: Some(stored.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            logging_configuration_identifiers: Some(stored.logging_configuration_identifiers.clone()),
+        })
     }
 }
