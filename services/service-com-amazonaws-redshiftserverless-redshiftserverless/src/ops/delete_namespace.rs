@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the namespace from state and answers with the record it removed,
+//! in `DELETING` status — so a following `GetNamespace` is a 404 and `ListNamespaces` no
+//! longer carries it. A namespace a workgroup is still attached to is a 409
+//! `ConflictException`, and an unknown name a 404 `ResourceNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `finalSnapshotName` is NOT served: taking the final snapshot needs the snapshot
+//! resource, which is still scaffolded, so a request naming one answers 501 rather than
+//! silently dropping the snapshot the caller asked for.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +146,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteNamespace"))
+        let _ = ctx;
+        // The final snapshot is a resource this emulator does not serve yet. Answering
+        // 501 is honest; deleting the namespace and dropping the snapshot would not be.
+        if input.final_snapshot_name.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteNamespace with finalSnapshotName",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteNamespaceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the redshift-serverless store is unreachable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        let Some(record) = state.namespaces.get(&input.namespace_name) else {
+            return Err(DeleteNamespaceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no namespace named {}", input.namespace_name),
+                    resource_name: Some(input.namespace_name.clone()),
+                },
+            )
+            .into());
+        };
+        let mut namespace = record.namespace.clone();
+
+        // A workgroup holds the compute attached to this namespace, so the namespace
+        // cannot go while one still references it.
+        let attached: Vec<String> = state
+            .workgroups_in_namespace(&input.namespace_name)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        if !attached.is_empty() {
+            return Err(DeleteNamespaceErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "namespace {} still has workgroups attached: {}",
+                    input.namespace_name,
+                    attached.join(", ")
+                ),
+            })
+            .into());
+        }
+
+        state.namespaces.remove(&input.namespace_name);
+        namespace.status = Some(crate::state::NAMESPACE_DELETING.to_string());
+        Ok(DeleteNamespaceOutput { namespace })
     }
 }
