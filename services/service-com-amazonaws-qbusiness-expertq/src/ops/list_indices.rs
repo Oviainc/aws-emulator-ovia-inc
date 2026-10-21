@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListIndices
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListIndices`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListIndices::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the indices stored under one application, one page at a time. A reporting
+//! operation: it writes only the `CREATING` -> `ACTIVE` transition the clock already made
+//! due.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +153,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListIndices` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListIndicesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListIndices"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // A `nextToken` this service never minted cannot be resumed from; the model's own
+        // ValidationException says so, with the CANNOT_PARSE reason.
+        let after = crate::state::decode_cursor(input.next_token.as_deref()).map_err(|_| {
+            ListIndicesErrorModeled::ValidationException(ValidationException {
+                message: "nextToken is not a pagination token this service issued".to_string(),
+                reason: "CANNOT_PARSE".to_string(),
+                fields: Some(vec![ValidationExceptionField {
+                    name: "nextToken".to_string(),
+                    message: "not a pagination token this service issued".to_string(),
+                }]),
+            })
+        })?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListIndicesErrorModeled::InternalServerException(InternalServerException {
+                message: "the Amazon Q Business store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        // The only write a report may make: the status transition the clock already owes.
+        store.settle(now);
+
+        let application = store.applications.get(&input.application_id).ok_or_else(|| {
+            ListIndicesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("Application with ID {} not found", input.application_id),
+                resource_id: input.application_id.clone(),
+                resource_type: "APPLICATION".to_string(),
+            })
+        })?;
+
+        // Only this application's indices: an index belongs to exactly one application.
+        let ordered: Vec<(u64, Index)> = application
+            .indices_in_order()
+            .into_iter()
+            .map(|index| (index.sequence, summary_of(index)))
+            .collect();
+        let page = crate::state::page_of(ordered, after, input.max_results);
+
+        Ok(ListIndicesOutput {
+            indices: Some(page.items),
+            next_token: page.next_token,
+        })
+    }
+}
+
+/// The `Index` summary the model returns for a stored index.
+fn summary_of(index: &crate::state::StoredIndex) -> Index {
+    Index {
+        display_name: Some(index.display_name.clone()),
+        index_id: Some(index.index_id.clone()),
+        created_at: Some(::aws_smithy_types::DateTime::from(index.created_at)),
+        updated_at: Some(::aws_smithy_types::DateTime::from(index.updated_at)),
+        status: Some(index.status.clone()),
     }
 }
