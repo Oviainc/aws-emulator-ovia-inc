@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSpace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSpace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSpace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the space `CreateSpace` persisted, exactly as stored. The only write this
+//! read makes is materialising a provisioning status the clock already owed (see
+//! [`crate::state::PROVISIONING_SPAN`]).
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +175,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSpace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSpaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSpace"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetSpaceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the repostspace emulator is mounted on an engine that holds \
+                              no state"
+                        .to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        let Some(space) = guard.space(&input.space_id) else {
+            return Err(GetSpaceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Space {} was not found", input.space_id),
+                    resource_id: input.space_id.clone(),
+                    resource_type: crate::state::SPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetSpaceOutput {
+            space_id: space.space_id.clone(),
+            arn: space.arn.clone(),
+            name: space.name.clone(),
+            status: space.status.clone(),
+            configuration_status: space.configuration_status.clone(),
+            client_id: space.client_id.clone(),
+            identity_store_id: space.identity_store_id.clone(),
+            application_arn: space.application_arn.clone(),
+            description: space.description.clone(),
+            vanity_domain_status: space.vanity_domain_status.clone(),
+            vanity_domain: space.vanity_domain.clone(),
+            random_domain: space.random_domain.clone(),
+            customer_role_arn: space.customer_role_arn.clone(),
+            create_date_time: space.create_date_time,
+            delete_date_time: space.delete_date_time,
+            tier: space.tier.clone(),
+            storage_limit: space.storage_limit,
+            // An empty collection is reported as an ABSENT optional member rather than
+            // an empty one: the model marks all three optional, and AWS omits them
+            // until an administrator or a role exists.
+            user_admins: (!space.user_admins.is_empty()).then(|| space.user_admins.clone()),
+            group_admins: (!space.group_admins.is_empty()).then(|| space.group_admins.clone()),
+            roles: (!space.roles.is_empty()).then(|| space.roles.clone()),
+            user_kms_key: space.user_kms_key.clone(),
+            user_count: Some(space.user_count),
+            content_size: Some(space.content_size),
+            supported_email_domains: space.supported_email_domains.clone(),
+        })
     }
 }

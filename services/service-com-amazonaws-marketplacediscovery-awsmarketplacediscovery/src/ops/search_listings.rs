@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchListings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchListings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchListings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns listings from the emulator's seeded catalog, matched on `searchText`, narrowed
+//! by `filters`, ordered by `sortBy`/`sortOrder` and paged by `maxResults`/`nextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +150,201 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchListings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchListingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchListings"))
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| SearchListingsError::validation("the catalog store is unavailable"))?;
+        let state = store.lock();
+
+        let locale = crate::state::resolve_requested_locale(input.locale.as_deref())
+            .map_err(SearchListingsError::validation)?;
+
+        let search_text = input.search_text.as_deref().unwrap_or("").trim().to_string();
+        let needle = search_text.to_lowercase();
+        let filters = input.filters.clone().unwrap_or_default();
+
+        // Narrow first, so `totalResults` counts MATCHES rather than the page.
+        let mut matches: Vec<(f64, &crate::state::Listing)> = Vec::new();
+        for listing in state.listings.values() {
+            let content_locale = listing.text.content_locale(locale);
+            let text = listing.text.text(content_locale);
+            let haystack =
+                format!("{} {}", text.name, text.short_description).to_lowercase();
+            if !needle.is_empty() && !haystack.contains(&needle) {
+                continue;
+            }
+            if !matches_every_filter(&state, listing, &filters)
+                .map_err(SearchListingsError::validation)?
+            {
+                continue;
+            }
+            let score = match input.sort_by.as_str() {
+                "AVERAGE_CUSTOMER_RATING" => {
+                    crate::state::average_customer_rating(listing.review_summary.as_ref())
+                }
+                // RELEVANCE, the model's default.
+                _ => relevance(&text.name.to_lowercase(), &haystack, &needle),
+            };
+            matches.push((score, listing));
+        }
+
+        // Order by the requested key, then by listing id so a page boundary is stable and
+        // `nextToken` neither repeats nor skips an entry.
+        matches.sort_by(|(left, left_listing), (right, right_listing)| {
+            let by_score = match input.sort_order.as_str() {
+                "ASCENDING" => left.total_cmp(right),
+                // DESCENDING, the model's default.
+                _ => right.total_cmp(left),
+            };
+            by_score.then_with(|| left_listing.listing_id.cmp(&right_listing.listing_id))
+        });
+
+        let total_results = i64::try_from(matches.len()).unwrap_or(i64::MAX);
+        let identity = query_identity(locale, &search_text, &filters, &input.sort_by, &input.sort_order);
+        let (page, next_token) = crate::state::page(
+            &matches,
+            input.next_token.as_deref(),
+            &identity,
+            input.max_results,
+        )
+        .map_err(SearchListingsError::validation)?;
+
+        Ok(SearchListingsOutput {
+            total_results,
+            listing_summaries: page
+                .iter()
+                .map(|(_, listing)| state.listing_summary(listing, locale))
+                .collect(),
+            next_token,
+        })
     }
+}
+
+/// How well a listing matches `needle`: a hit in the name outranks a hit in the
+/// description, and a query with no `searchText` ranks every listing alike.
+///
+/// `sortBy=RELEVANCE` has no documented scoring function, so this is the emulator's own
+/// ordering; what the model pins is that RELEVANCE is an ordering over the matches, and
+/// that `sortOrder` reverses it.
+fn relevance(name: &str, haystack: &str, needle: &str) -> f64 {
+    if needle.is_empty() {
+        return 0.0;
+    }
+    let mut score = 0.0;
+    if name.contains(needle) {
+        score += 2.0;
+    }
+    if haystack.contains(needle) {
+        score += 1.0;
+    }
+    score
+}
+
+/// The query whose result set a `nextToken` belongs to: everything that changes WHICH
+/// listings match or in what order, and not `maxResults`, which a client may vary from
+/// page to page.
+fn query_identity(
+    locale: &str,
+    search_text: &str,
+    filters: &[SearchFilter],
+    sort_by: &str,
+    sort_order: &str,
+) -> String {
+    let filters: Vec<String> = filters
+        .iter()
+        .map(|filter| format!("{}={}", filter.filter_type, filter.filter_values.join("|")))
+        .collect();
+    format!(
+        "SearchListings/{locale}/{search_text}/{}/{sort_by}/{sort_order}",
+        filters.join(";")
+    )
+}
+
+/// Whether a listing satisfies every filter (AND across filters, OR within one).
+///
+/// `Err` is the refusal message for a filter value the model's `SearchFilterType` enum
+/// cannot reject on its own — a range filter with more than one value, or a rating outside
+/// the documented 0.0–5.0 range.
+fn matches_every_filter(
+    state: &crate::state::ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState,
+    listing: &crate::state::Listing,
+    filters: &[SearchFilter],
+) -> Result<bool, String> {
+    for filter in filters {
+        let values = &filter.filter_values;
+        let matched = match filter.filter_type.as_str() {
+            "CATEGORY" => listing
+                .categories
+                .iter()
+                .any(|category| values.contains(&category.category_id)),
+            "PUBLISHER" => values.contains(&listing.publisher.seller_profile_id),
+            "FULFILLMENT_OPTION_TYPE" => listing
+                .fulfillment_option_summaries
+                .iter()
+                .any(|option| values.contains(&option.fulfillment_option_type)),
+            "PRICING_MODEL" => listing
+                .pricing_models
+                .iter()
+                .any(|model| values.contains(&model.pricing_model_type)),
+            "PRICING_UNIT" => listing
+                .pricing_units
+                .iter()
+                .any(|unit| values.contains(&unit.pricing_unit_type)),
+            "DEPLOYED_ON_AWS" => listing.product_ids.iter().any(|product_id| {
+                state
+                    .products
+                    .get(product_id)
+                    .is_some_and(|product| values.contains(&product.deployed_on_aws))
+            }),
+            "NUMBER_OF_PRODUCTS" => {
+                let products = listing.product_ids.len();
+                let mut matched = false;
+                for value in values {
+                    let count: usize = value.parse().map_err(|_| {
+                        format!(
+                            "filters: NUMBER_OF_PRODUCTS expects a non-negative integer, got '{value}'"
+                        )
+                    })?;
+                    matched |= count == products;
+                }
+                matched
+            }
+            // Range filters: "accept a single value between 0.0 and 5.0"
+            // (SearchFilter$filterValues documentation).
+            "MIN_AVERAGE_CUSTOMER_RATING" => {
+                let bound = rating_bound(&filter.filter_type, values)?;
+                crate::state::average_customer_rating(listing.review_summary.as_ref()) >= bound
+            }
+            "MAX_AVERAGE_CUSTOMER_RATING" => {
+                let bound = rating_bound(&filter.filter_type, values)?;
+                crate::state::average_customer_rating(listing.review_summary.as_ref()) <= bound
+            }
+            other => {
+                return Err(format!("filters: '{other}' is not a supported filterType"));
+            }
+        };
+        if !matched {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The single rating a range filter carries, refusing a value list or a rating outside the
+/// documented 0.0–5.0 range.
+fn rating_bound(filter_type: &str, values: &[String]) -> Result<f64, String> {
+    let [value] = values else {
+        return Err(format!(
+            "filters: {filter_type} accepts exactly one filterValues entry, got {}",
+            values.len()
+        ));
+    };
+    let rating: f64 = value
+        .parse()
+        .map_err(|_| format!("filters: {filter_type} expects a number, got '{value}'"))?;
+    if !(0.0..=5.0).contains(&rating) {
+        return Err(format!(
+            "filters: {filter_type} expects a value between 0.0 and 5.0, got '{value}'"
+        ));
+    }
+    Ok(rating)
 }

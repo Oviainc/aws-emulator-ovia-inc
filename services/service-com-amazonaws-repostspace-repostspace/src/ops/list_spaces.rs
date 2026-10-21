@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSpaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSpaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSpaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `SpaceData` per persisted space, ordered by `spaceId`, a page at a time
+//! under the model's `@paginated` contract.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +143,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSpaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSpacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSpaces"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListSpacesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the repostspace emulator is mounted on an engine that holds \
+                              no state"
+                        .to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // The model declares `maxResults` `@default: 10` and `@range(1..100)`, and the
+        // framework refuses an out-of-range value before `handle` runs, so the only
+        // value needing a decision here is one no client could send.
+        let page_size = if input.max_results <= 0 {
+            DEFAULT_MAX_RESULTS
+        } else {
+            input.max_results
+        } as usize;
+
+        // A token names the position the previous page stopped at: the page that
+        // follows it holds the spaces whose id sorts after that one.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match decode_token(token) {
+                Some(space_id) => Some(space_id),
+                None => {
+                    return Err(ListSpacesErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "nextToken: the pagination token is not one this \
+                                      service issued"
+                                .to_string(),
+                            reason: "fieldValidationFailed".to_string(),
+                            field_list: Some(vec![ValidationExceptionField {
+                                name: "nextToken".to_string(),
+                                message: "the pagination token is not one this service issued"
+                                    .to_string(),
+                            }]),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let mut guard = state.lock();
+        let ordered = guard.spaces_by_id();
+        let remaining = ordered
+            .iter()
+            .filter(|space| match resume_after.as_deref() {
+                Some(last) => space.space_id.as_str() > last,
+                None => true,
+            });
+
+        let mut spaces: Vec<SpaceData> = Vec::new();
+        let mut truncated_after: Option<String> = None;
+        for space in remaining {
+            if spaces.len() == page_size {
+                // At least one space is left unreported, so this page carries a token.
+                truncated_after = spaces.last().map(|last| last.space_id.clone());
+                break;
+            }
+            spaces.push(SpaceData {
+                space_id: space.space_id.clone(),
+                arn: space.arn.clone(),
+                name: space.name.clone(),
+                description: space.description.clone(),
+                status: space.status.clone(),
+                configuration_status: space.configuration_status.clone(),
+                vanity_domain_status: space.vanity_domain_status.clone(),
+                vanity_domain: space.vanity_domain.clone(),
+                random_domain: space.random_domain.clone(),
+                tier: space.tier.clone(),
+                storage_limit: space.storage_limit,
+                create_date_time: space.create_date_time,
+                delete_date_time: space.delete_date_time,
+                user_kms_key: space.user_kms_key.clone(),
+                user_count: Some(space.user_count),
+                content_size: Some(space.content_size),
+                supported_email_domains: space.supported_email_domains.clone(),
+            });
+        }
+
+        Ok(ListSpacesOutput {
+            spaces,
+            // Omitted on the last page: the `@paginated` contract is that an absent
+            // token ends the iteration.
+            next_token: truncated_after.as_deref().map(encode_token),
+        })
     }
+}
+
+/// The page size the model declares for `maxResults` (`@default: 10`).
+const DEFAULT_MAX_RESULTS: i32 = 10;
+
+/// The version marker an issued token carries, so a token from elsewhere — or from a
+/// future encoding — is refused rather than half-understood.
+const TOKEN_PREFIX: &str = "spaces/v1:";
+
+/// Encode the position a page stopped at (the last `spaceId` it reported) as the opaque
+/// token the next call passes back.
+fn encode_token(last_space_id: &str) -> String {
+    ::hex::encode(format!("{TOKEN_PREFIX}{last_space_id}"))
+}
+
+/// The `spaceId` a token resumes after, or `None` when the token is not one
+/// [`encode_token`] produced.
+fn decode_token(token: &str) -> Option<String> {
+    let decoded = ::hex::decode(token).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let space_id = decoded.strip_prefix(TOKEN_PREFIX)?;
+    (!space_id.is_empty()).then(|| space_id.to_string())
 }
