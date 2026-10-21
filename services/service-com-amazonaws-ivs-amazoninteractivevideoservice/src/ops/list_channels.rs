@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListChannels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListChannels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListChannels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read over the persisted channels, in one stable order (ARN), narrowed by
+//! every `filterBy*` member the caller sent and cut into pages of at most
+//! `maxResults`. The `nextToken` it issues names the last ARN of the page, so the
+//! following page is everything ordered strictly after it.
 //!
 //! ## Shape of an operation
 //!
@@ -102,11 +98,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivs-amazoninteractivevi
 // here — hence the `ListChannelsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivs#ListChannels")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivs#ListChannels",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListChannelsErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
+    InternalServerException(InternalServerException),
     ValidationException(ValidationException),
 }
 
@@ -161,18 +161,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListChannels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListChannelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListChannels"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListChannelsErrorModeled::InternalServerException(InternalServerException {
+                exception_message: Some("the IVS store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        // The resume point the caller's token names. A token this service did not
+        // issue is a bad request, not an empty page.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::CHANNEL_PAGE, token).ok_or_else(
+                    || {
+                        ListChannelsErrorModeled::ValidationException(ValidationException {
+                            exception_message: Some(
+                                "nextToken is not a pagination token this service issued"
+                                    .to_string(),
+                            ),
+                            ..Default::default()
+                        })
+                    },
+                )?,
+            ),
+            None => None,
+        };
+        // `MaxChannelResults` is modelled `range(1..100)`, so the framework has
+        // already refused anything outside it; an absent value means the whole page.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_CHANNEL_RESULTS))
+            .unwrap_or(MAX_CHANNEL_RESULTS as usize)
+            .clamp(1, MAX_CHANNEL_RESULTS as usize);
+
+        let store = state.lock();
+        let (window, next_token) = crate::state::page(
+            crate::state::CHANNEL_PAGE,
+            store
+                .channels
+                .iter()
+                .filter(|(_, channel)| matches_filters(channel, &input)),
+            after.as_deref(),
+            page_size,
+        );
+
+        Ok(ListChannelsOutput {
+            channels: window.into_iter().map(summary).collect(),
+            next_token,
+        })
+    }
+}
+
+/// The `maxResults` ceiling the model declares for this operation
+/// (`MaxChannelResults`, `range(min: 1, max: 100)`), and so also the page size an
+/// absent `maxResults` means.
+const MAX_CHANNEL_RESULTS: i32 = 100;
+
+/// Whether a channel satisfies every `filterBy*` member the caller sent. Each
+/// filter is an exact match on the member it names, and an absent filter matches
+/// everything — so several filters together narrow rather than widen.
+fn matches_filters(channel: &Channel, input: &ListChannelsInput) -> bool {
+    let matches = |filter: Option<&String>, value: Option<&String>| match filter {
+        Some(filter) => value.map(String::as_str).unwrap_or_default() == filter.as_str(),
+        None => true,
+    };
+    matches(input.filter_by_name.as_ref(), channel.name.as_ref())
+        && matches(
+            input.filter_by_recording_configuration_arn.as_ref(),
+            channel.recording_configuration_arn.as_ref(),
+        )
+        && matches(
+            input.filter_by_playback_restriction_policy_arn.as_ref(),
+            channel.playback_restriction_policy_arn.as_ref(),
+        )
+        && matches(
+            input.filter_by_ad_configuration_arn.as_ref(),
+            channel.ad_configuration_arn.as_ref(),
+        )
+}
+
+/// The `ChannelSummary` projection of a persisted channel: every member
+/// `ChannelSummary` declares, read off the stored record.
+fn summary(channel: &Channel) -> ChannelSummary {
+    ChannelSummary {
+        arn: channel.arn.clone(),
+        name: channel.name.clone(),
+        latency_mode: channel.latency_mode.clone(),
+        authorized: channel.authorized,
+        recording_configuration_arn: channel.recording_configuration_arn.clone(),
+        tags: channel.tags.clone(),
+        insecure_ingest: channel.insecure_ingest,
+        r#type: channel.r#type.clone(),
+        preset: channel.preset.clone(),
+        playback_restriction_policy_arn: channel.playback_restriction_policy_arn.clone(),
+        ad_configuration_arn: channel.ad_configuration_arn.clone(),
     }
 }

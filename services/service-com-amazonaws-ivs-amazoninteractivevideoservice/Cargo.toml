@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Hashing for the unique resource ids this service mints (channel ids, stream-key
+# ids and stream-key values).
+sha2 = { workspace = true }
+# Hex codec for those ids and for the opaque `PaginationToken` this service issues.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the stored channel in place: a member the caller sent replaces the
+//! stored one, a member it left out keeps the stored value, and the two
+//! type-dependent rules the model documents (`preset`, `containerFormat`) are
+//! re-applied to the result. The channel's identity and its endpoints — `arn`,
+//! `ingestEndpoint`, `playbackUrl`, `srt` — are not update targets and are left
+//! alone.
 //!
 //! ## Shape of an operation
 //!
@@ -125,11 +123,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivs-amazoninteractivevi
 // here — hence the `UpdateChannelError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivs#UpdateChannel")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivs#UpdateChannel",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum UpdateChannelErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
+    InternalServerException(InternalServerException),
     PendingVerification(PendingVerification),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
@@ -186,18 +188,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateChannel"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateChannelErrorModeled::InternalServerException(InternalServerException {
+                exception_message: Some("the IVS store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let mut store = state.lock();
+        let mut channel = store.channels.get(&input.arn).cloned().ok_or_else(|| {
+            UpdateChannelErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                exception_message: Some(format!("channel {} does not exist", input.arn)),
+                ..Default::default()
+            })
+        })?;
+
+        // Every optional member: present replaces, absent keeps.
+        replace(&mut channel.name, input.name);
+        replace_non_empty(&mut channel.latency_mode, input.latency_mode);
+        replace_non_empty(&mut channel.r#type, input.r#type);
+        replace(
+            &mut channel.recording_configuration_arn,
+            input.recording_configuration_arn,
+        );
+        replace(
+            &mut channel.playback_restriction_policy_arn,
+            input.playback_restriction_policy_arn,
+        );
+        replace(&mut channel.ad_configuration_arn, input.ad_configuration_arn);
+        replace_non_empty(&mut channel.container_format, input.container_format);
+        if input.multitrack_input_configuration.is_some() {
+            channel.multitrack_input_configuration = input.multitrack_input_configuration;
+        }
+        // `authorized` and `insecureIngest` are modelled `@default(false)`, so an
+        // absent member arrives as `false` and there is no "omitted" to preserve:
+        // the request's value is the channel's new value.
+        channel.authorized = input.authorized;
+        channel.insecure_ingest = input.insecure_ingest;
+
+        // Both documented rules are re-applied to the UPDATED record, not to the
+        // request, because either can be broken by changing `type` alone.
+        let channel_type = channel.r#type.clone().unwrap_or_default();
+        channel.preset = Some(crate::state::effective_preset(
+            &channel_type,
+            input.preset.as_deref().or(channel.preset.as_deref()),
+        ));
+        crate::state::check_container_format(
+            channel.container_format.as_deref().unwrap_or_default(),
+            channel.multitrack_input_configuration.as_ref(),
+        )
+        .map_err(|message| {
+            UpdateChannelErrorModeled::ValidationException(ValidationException {
+                exception_message: Some(message),
+                ..Default::default()
+            })
+        })?;
+
+        store.channels.insert(input.arn, channel.clone());
+
+        Ok(UpdateChannelOutput {
+            channel: Some(channel),
+        })
     }
+}
+
+/// Overwrite `stored` when the caller sent the member at all.
+fn replace(stored: &mut Option<String>, sent: Option<String>) {
+    if let Some(sent) = sent {
+        *stored = Some(sent);
+    }
+}
+
+/// Overwrite `stored` only when the caller sent a non-empty value: an enum-valued
+/// member sent as the empty string names no member of its enumeration, so it
+/// expresses no change.
+fn replace_non_empty(stored: &mut Option<String>, sent: Option<String>) {
+    replace(stored, sent.filter(|sent| !sent.is_empty()));
 }
