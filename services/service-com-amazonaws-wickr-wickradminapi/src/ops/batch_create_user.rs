@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchCreateUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchCreateUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates the requested users under one network, each item succeeding or failing on
+//! its own: a user that cannot be created lands in `failed` while the rest are still
+//! created (partial success, HTTP 200).
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchCreateUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +173,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchCreateUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchCreateUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchCreateUser"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchCreateUserErrorModeled::InternalServerError(InternalServerError {
+                message: "the Wickr network store is unavailable".to_string(),
+            })
+        })?;
+
+        if input.users.is_empty() {
+            return Err(refused(
+                "users",
+                "users must carry at least one user to create".to_string(),
+            ));
+        }
+        // `users` carries no `@length`, so without this cap the amount of work one
+        // request does — and the number of records it adds to the store — is chosen
+        // entirely by the caller.
+        if input.users.len() > crate::state::MAX_BATCH_USERS {
+            return Err(refused(
+                "users",
+                format!(
+                    "users must carry at most {} users in one request, got {}",
+                    crate::state::MAX_BATCH_USERS,
+                    input.users.len()
+                ),
+            ));
+        }
+
+        let now = crate::state::now_epoch_secs();
+
+        if !state.lock().networks.contains_key(&input.network_id) {
+            return Err(BatchCreateUserErrorModeled::ResourceNotFoundError(
+                ResourceNotFoundError {
+                    message: Some(format!("network {} does not exist", input.network_id)),
+                },
+            )
+            .into());
+        }
+
+        let mut successful: Vec<User> = Vec::new();
+        let mut failed: Vec<BatchUserErrorResponseItem> = Vec::new();
+
+        for item in input.users {
+            match create_one(&state, &input.network_id, item, now) {
+                Ok(record) => successful.push(crate::state::user_view(&record, now)),
+                Err(failure) => failed.push(failure),
+            }
+            // One item per critical section, with a scheduling point between them: the
+            // state lock is never held across the whole batch, so concurrent requests
+            // to this service are not queued behind it and a cancellation has somewhere
+            // to land.
+            ::tokio::task::yield_now().await;
+        }
+
+        Ok(BatchCreateUserOutput {
+            message: Some(format!(
+                "{} of {} users created",
+                successful.len(),
+                successful.len() + failed.len()
+            )),
+            successful: Some(successful),
+            failed: Some(failed),
+        })
     }
+}
+
+/// A `ValidationError` (HTTP 422) naming the member that was wrong and why.
+fn refused(field: &str, reason: String) -> BatchCreateUserError {
+    BatchCreateUserErrorModeled::ValidationError(ValidationError {
+        reasons: Some(vec![ErrorDetail {
+            field: Some(field.to_string()),
+            reason: Some(reason),
+        }]),
+        message: Some("1 validation error detected".to_string()),
+    })
+    .into()
+}
+
+/// Create ONE requested user, or describe why it could not be created.
+///
+/// Each item is decided against the store as it stands when the item is reached, so an
+/// item that duplicates an earlier item of the same batch fails for the same reason an
+/// item duplicating an already-stored user does. The store is locked for this one item
+/// and released before returning.
+fn create_one(
+    state: &::engine::ServiceState<crate::state::ComAmazonawsWickrWickradminapiState>,
+    network_id: &str,
+    item: BatchCreateUserRequestItem,
+    now: i64,
+) -> Result<crate::state::UserRecord, BatchUserErrorResponseItem> {
+    // "A user can only be assigned to a single security group. Attempting to add a user
+    // to multiple security groups is not supported and will result in an error."
+    // (`BatchCreateUserRequestItem`) — and a user has to be in one, so neither none nor
+    // several is creatable. Decided from the item alone, before the store is locked.
+    if item.security_group_ids.len() != 1 {
+        return Err(BatchUserErrorResponseItem {
+            field: Some("securityGroupIds".to_string()),
+            reason: Some(format!(
+                "a user can only be assigned to a single security group, got {}",
+                item.security_group_ids.len()
+            )),
+            user_id: crate::state::UNASSIGNED_USER_ID.to_string(),
+        });
+    }
+    let group_id = item.security_group_ids[0].clone();
+
+    let mut store = state.lock();
+
+    // The network was there when the batch started; it may have been deleted since.
+    if !store.networks.contains_key(network_id) {
+        return Err(BatchUserErrorResponseItem {
+            field: Some("networkId".to_string()),
+            reason: Some(format!("network {network_id} does not exist")),
+            user_id: crate::state::UNASSIGNED_USER_ID.to_string(),
+        });
+    }
+
+    let group_known = store
+        .security_groups
+        .get(network_id)
+        .is_some_and(|groups| groups.contains_key(&group_id));
+    if !group_known {
+        return Err(BatchUserErrorResponseItem {
+            field: Some("securityGroupIds".to_string()),
+            reason: Some(format!(
+                "security group {group_id} does not exist in network {network_id}"
+            )),
+            user_id: crate::state::UNASSIGNED_USER_ID.to_string(),
+        });
+    }
+
+    // `username` "must be unique within the network".
+    if let Some(existing) = store.user_by_username(network_id, &item.username) {
+        return Err(BatchUserErrorResponseItem {
+            field: Some("username".to_string()),
+            reason: Some(format!(
+                "username {} already exists in network {network_id}",
+                item.username
+            )),
+            user_id: existing.user_id.clone(),
+        });
+    }
+
+    let Some(user_id) = store.mint_user_id() else {
+        return Err(BatchUserErrorResponseItem {
+            field: Some("users".to_string()),
+            reason: Some("the user id space is exhausted".to_string()),
+            user_id: crate::state::UNASSIGNED_USER_ID.to_string(),
+        });
+    };
+
+    let record = crate::state::UserRecord {
+        uname: crate::state::derive_uname(network_id, &item.username),
+        invite_code: item
+            .invite_code
+            .unwrap_or_else(|| crate::state::derive_invite_code(network_id, &user_id)),
+        user_id,
+        username: item.username,
+        first_name: item.first_name,
+        last_name: item.last_name,
+        security_group_ids: vec![group_id],
+        // A batch-created user is invited, not an administrator and not suspended:
+        // `UserStatus` 1 is "invited to the network but has not yet accepted".
+        is_admin: false,
+        suspended: false,
+        status: crate::state::USER_STATUS_PENDING,
+        invite_code_ttl: item.invite_code_ttl,
+        code_validation: item.code_validation,
+        created_at: now,
+    };
+
+    store.insert_user(network_id, record.clone());
+    Ok(record)
 }

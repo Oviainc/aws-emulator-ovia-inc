@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListNetworks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListNetworks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports every stored network, sorted and paginated. Reporting only: it never writes.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListNetworks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +163,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListNetworks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListNetworksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListNetworks"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListNetworksErrorModeled::InternalServerError(InternalServerError {
+                message: "the Wickr network store is unavailable".to_string(),
+            })
+        })?;
+
+        let start = crate::state::page_start(input.max_results, input.next_token.as_deref())
+            .map_err(|problem| refused(problem.field(), problem.reason()))?;
+        // `sortFields` names a member of the shape being listed. The model gives it no
+        // value set, so the accepted names are exactly the `Network` members that carry
+        // an orderable value, and anything else is refused rather than silently ignored.
+        let sort_field = input
+            .sort_fields
+            .as_deref()
+            .unwrap_or(DEFAULT_SORT_FIELD)
+            .to_string();
+        let key: fn(&crate::state::NetworkRecord) -> &str = match sort_field.as_str() {
+            "networkId" => |network| network.network_id.as_str(),
+            "networkName" => |network| network.network_name.as_str(),
+            "accessLevel" => |network| network.access_level.as_str(),
+            "awsAccountId" => |network| network.aws_account_id.as_str(),
+            other => {
+                return Err(refused(
+                    "sortFields",
+                    format!(
+                        "sortFields must name one of {}, got {other}",
+                        SORTABLE_FIELDS.join(", ")
+                    ),
+                ))
+            }
+        };
+
+        let store = state.lock();
+        let mut records: Vec<crate::state::NetworkRecord> =
+            store.networks.values().cloned().collect();
+        drop(store);
+
+        // `networkId` breaks a tie on any other key, so the order is total and two
+        // pages of the same listing cannot interleave.
+        records.sort_by(|left, right| {
+            key(left)
+                .cmp(key(right))
+                .then_with(|| left.network_id.cmp(&right.network_id))
+        });
+        if input.sort_direction.as_deref() == Some(crate::state::SORT_DIRECTION_DESC) {
+            records.reverse();
+        }
+
+        let (page, next_token) = crate::state::page(&records, start, input.max_results);
+        Ok(ListNetworksOutput {
+            networks: page.iter().map(network_view).collect(),
+            next_token,
+        })
+    }
+}
+
+/// The default `sortFields` value: a listing nobody ordered comes back in id order.
+const DEFAULT_SORT_FIELD: &str = "networkId";
+
+/// The `Network` members `sortFields` accepts, for the refusal message.
+const SORTABLE_FIELDS: &[&str] = &["networkId", "networkName", "accessLevel", "awsAccountId"];
+
+/// A `ValidationError` (HTTP 422) naming the member that was wrong and why.
+fn refused(field: &str, reason: String) -> ListNetworksError {
+    ListNetworksErrorModeled::ValidationError(ValidationError {
+        reasons: Some(vec![ErrorDetail {
+            field: Some(field.to_string()),
+            reason: Some(reason),
+        }]),
+        message: Some("1 validation error detected".to_string()),
+    })
+    .into()
+}
+
+/// One stored network as the modelled `Network` shape.
+fn network_view(record: &crate::state::NetworkRecord) -> Network {
+    Network {
+        network_id: record.network_id.clone(),
+        network_name: record.network_name.clone(),
+        access_level: record.access_level.clone(),
+        aws_account_id: record.aws_account_id.clone(),
+        network_arn: record.network_arn.clone(),
+        standing: Some(record.standing),
+        free_trial_expiration: record.free_trial_expiration.clone(),
+        migration_state: Some(record.migration_state),
+        encryption_key_arn: record.encryption_key_arn.clone(),
     }
 }
