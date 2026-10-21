@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateArchiveRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateArchiveRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateArchiveRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores an archive rule under the named analyzer, so `GetArchiveRule` and
+//! `ListArchiveRules` report the filter this call supplied.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +169,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateArchiveRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateArchiveRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateArchiveRule"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateArchiveRuleErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+
+        let analyzer = state
+            .analyzers
+            .get_mut(&input.analyzer_name)
+            .ok_or_else(|| {
+                CreateArchiveRuleErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Analyzer {} does not exist", input.analyzer_name),
+                        resource_id: input.analyzer_name.clone(),
+                        resource_type: crate::state::ANALYZER_RESOURCE_TYPE.to_string(),
+                    },
+                )
+            })?;
+
+        // A repeated `clientToken` naming the same rule is the SAME create retried, not
+        // a second create of an existing rule: it answers success, the way the first
+        // call did, instead of conflicting with the rule that call made.
+        if input
+            .client_token
+            .as_deref()
+            .and_then(|token| analyzer.archive_rule_tokens.get(token))
+            .is_some_and(|recorded| *recorded == input.rule_name)
+        {
+            return Ok(CreateArchiveRuleOutput);
+        }
+
+        if analyzer.archive_rules.contains_key(&input.rule_name) {
+            return Err(CreateArchiveRuleErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Archive rule {} already exists for analyzer {}",
+                    input.rule_name, input.analyzer_name
+                ),
+                resource_id: input.rule_name.clone(),
+                resource_type: crate::state::ARCHIVE_RULE_RESOURCE_TYPE.to_string(),
+            })
+            .into());
+        }
+
+        if analyzer
+            .archive_rules
+            .len()
+            >= crate::state::MAX_ARCHIVE_RULES_PER_ANALYZER
+        {
+            // The emulator's own per-analyzer ceiling, expressed with the quota error
+            // this operation models (HTTP 402) rather than by growing without bound.
+            return Err(CreateArchiveRuleErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "Cannot create archive rule {}: analyzer {} already holds {} rules",
+                        input.rule_name,
+                        input.analyzer_name,
+                        crate::state::MAX_ARCHIVE_RULES_PER_ANALYZER
+                    ),
+                    resource_id: input.rule_name.clone(),
+                    resource_type: crate::state::ARCHIVE_RULE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        analyzer.archive_rules.insert(
+            input.rule_name.clone(),
+            crate::state::ArchiveRule {
+                rule_name: input.rule_name.clone(),
+                filter: input.filter,
+                created_at: now,
+                // A rule that was never updated reports its creation time as its
+                // `updatedAt`, which the model requires.
+                updated_at: now,
+            },
+        );
+        if let Some(token) = input.client_token {
+            // First result wins, and the store is bounded (oldest record evicted first),
+            // so a token already recorded keeps the rule it recorded.
+            analyzer.archive_rule_tokens.remember(token, input.rule_name);
+        }
+
+        Ok(CreateArchiveRuleOutput)
     }
 }

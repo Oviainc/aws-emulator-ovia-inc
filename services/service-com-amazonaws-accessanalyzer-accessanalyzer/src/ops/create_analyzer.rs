@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAnalyzer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAnalyzer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAnalyzer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the analyzer named by the request and STORES it, so every later
+//! `GetAnalyzer`/`ListAnalyzers` rebuilds its summary from that record and the ARN this
+//! operation returns is the one the resource keeps.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +158,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAnalyzer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAnalyzerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAnalyzer"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAnalyzerErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        let mut state = state.lock();
+
+        // A repeated `clientToken` is the SAME create retried, not a second create: it
+        // answers with the ARN the first one returned rather than conflicting with the
+        // analyzer that create already made.
+        if let Some(recorded) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| state.create_analyzer_tokens.get(token))
+            .filter(|recorded| recorded.analyzer_name == input.analyzer_name)
+        {
+            return Ok(CreateAnalyzerOutput {
+                arn: Some(recorded.arn.clone()),
+            });
+        }
+
+        if state.analyzers.contains_key(&input.analyzer_name) {
+            return Err(CreateAnalyzerErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Analyzer {} already exists in this account and Region",
+                    input.analyzer_name
+                ),
+                resource_id: input.analyzer_name.clone(),
+                resource_type: crate::state::ANALYZER_RESOURCE_TYPE.to_string(),
+            })
+            .into());
+        }
+
+        if state.analyzers.len() >= crate::state::MAX_ANALYZERS {
+            // The emulator's own store ceiling, expressed with the quota error this
+            // operation models (HTTP 402) rather than by growing without bound.
+            return Err(CreateAnalyzerErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "Cannot create analyzer {}: this account and Region already hold {} analyzers",
+                        input.analyzer_name,
+                        crate::state::MAX_ANALYZERS
+                    ),
+                    resource_id: input.analyzer_name.clone(),
+                    resource_type: crate::state::ANALYZER_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::analyzer_arn(&region, &input.analyzer_name);
+
+        // Inline `archiveRules` are created with the analyzer, so `ListArchiveRules` and
+        // `GetArchiveRule` see them without a separate `CreateArchiveRule` call.
+        let archive_rules = input
+            .archive_rules
+            .into_iter()
+            .flatten()
+            .map(|rule| {
+                (
+                    rule.rule_name.clone(),
+                    crate::state::ArchiveRule {
+                        rule_name: rule.rule_name,
+                        filter: rule.filter,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                )
+            })
+            .collect();
+
+        let analyzer = crate::state::Analyzer {
+            name: input.analyzer_name.clone(),
+            arn: arn.clone(),
+            r#type: input.r#type,
+            status: crate::state::ANALYZER_STATUS_ACTIVE.to_string(),
+            // `statusReason` explains a non-ACTIVE status; an active analyzer has none.
+            status_reason: None,
+            created_at: now,
+            // Nothing has been analyzed yet, so neither `lastResourceAnalyzed` member is set.
+            last_resource_analyzed: None,
+            last_resource_analyzed_at: None,
+            tags: input.tags,
+            configuration: input.configuration,
+            archive_rules,
+            archive_rule_tokens: crate::state::ClientTokens::default(),
+        };
+        state
+            .analyzers
+            .insert(input.analyzer_name.clone(), analyzer);
+
+        if let Some(token) = input.client_token {
+            // First result wins (and the store is bounded, oldest record first): a token
+            // already recorded keeps the result it recorded, so a later retry of THAT
+            // request still resolves through it.
+            state.create_analyzer_tokens.remember(
+                token,
+                crate::state::CreatedAnalyzerToken {
+                    analyzer_name: input.analyzer_name,
+                    arn: arn.clone(),
+                },
+            );
+        }
+
+        Ok(CreateAnalyzerOutput { arn: Some(arn) })
     }
 }

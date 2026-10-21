@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListArchiveRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListArchiveRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListArchiveRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the archive rules stored under the named analyzer, in rule-name order,
+//! truncated to `maxResults` with a `nextToken` that resumes.
 //!
 //! ## Shape of an operation
 //!
@@ -86,11 +80,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-accessanalyzer-accessan
 // here — hence the `ListArchiveRulesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.accessanalyzer#ListArchiveRules")]
+//
+// `ResourceNotFoundException` is widened in with `extra_errors`: `analyzerName` is an
+// `@httpLabel` naming a resource that may not exist, and the alternative to the 404 the
+// service models for that shape would be reporting an absent analyzer as an EMPTY
+// SUCCESS — a listing a client cannot distinguish from an analyzer with no rules. The
+// shape is this SERVICE's own; only this operation's error list omits it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.accessanalyzer#ListArchiveRules",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum ListArchiveRulesErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -146,18 +150,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListArchiveRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListArchiveRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListArchiveRules"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListArchiveRulesErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        let state = state.lock();
+
+        let analyzer = state.analyzers.get(&input.analyzer_name).ok_or_else(|| {
+            ListArchiveRulesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("Analyzer {} does not exist", input.analyzer_name),
+                resource_id: input.analyzer_name.clone(),
+                resource_type: crate::state::ANALYZER_RESOURCE_TYPE.to_string(),
+            })
+        })?;
+
+        let all: Vec<(String, ArchiveRuleSummary)> = analyzer
+            .archive_rules
+            .iter()
+            .map(|(rule_name, rule)| (rule_name.clone(), rule.summary()))
+            .collect();
+
+        let page = crate::state::page(all, input.max_results, input.next_token.as_deref())
+            .map_err(|error| {
+                ListArchiveRulesErrorModeled::ValidationException(
+                    crate::state::page_validation_exception(&error),
+                )
+            })?;
+
+        Ok(ListArchiveRulesOutput {
+            archive_rules: page.items,
+            next_token: page.next_token,
+        })
     }
 }
