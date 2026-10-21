@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a channel and its first stream key, persists both in
+//! [`crate::state::ComAmazonawsIvsAmazoninteractivevideoserviceState`], and returns
+//! what it stored. Every member the caller omitted is filled from the model's
+//! documented default before the record is written, so a following `GetChannel`
+//! answers the same channel this call returned.
 //!
 //! ## Shape of an operation
 //!
@@ -126,10 +123,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivs-amazoninteractivevi
 // here — hence the `CreateChannelError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivs#CreateChannel")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivs#CreateChannel",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateChannelErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    InternalServerException(InternalServerException),
     PendingVerification(PendingVerification),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
@@ -187,18 +188,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChannel"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateChannelErrorModeled::InternalServerException(InternalServerException {
+                exception_message: Some("the IVS store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+
+        // The model's documented defaults for every member the caller omitted.
+        // `authorized` and `insecureIngest` carry `@default(false)`, so the
+        // framework has already materialised their default by the time the input
+        // reaches this handler.
+        let channel_type = non_empty(input.r#type).unwrap_or_else(|| "STANDARD".to_string());
+        let latency_mode = non_empty(input.latency_mode).unwrap_or_else(|| "LOW".to_string());
+        let container_format = non_empty(input.container_format).unwrap_or_else(|| "TS".to_string());
+        let preset = crate::state::effective_preset(&channel_type, input.preset.as_deref());
+
+        crate::state::check_container_format(
+            &container_format,
+            input.multitrack_input_configuration.as_ref(),
+        )
+        .map_err(|message| {
+            CreateChannelErrorModeled::ValidationException(ValidationException {
+                exception_message: Some(message),
+                ..Default::default()
+            })
+        })?;
+
+        let mut store = state.lock();
+        // The store grows by one channel and one stream key per call and lives for
+        // the life of the process, so the growth is capped; past the cap the service
+        // answers the quota error it models rather than accepting another entry.
+        if store.channels.len() >= crate::state::MAX_CHANNELS {
+            return Err(CreateChannelErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    exception_message: Some(format!(
+                        "the number of channels would exceed the limit of {}",
+                        crate::state::MAX_CHANNELS
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+        let channel_id = store.mint_hex("channel", 6);
+        let ingest_id = store.mint_hex("ingest", 6);
+        let srt_passphrase = store.mint_hex("srt-passphrase", 24);
+        let arn = crate::state::channel_arn(&region, &channel_id);
+        let ingest_endpoint = format!("{ingest_id}.global-contribute.live-video.net");
+        let channel = Channel {
+            arn: Some(arn.clone()),
+            name: Some(input.name.unwrap_or_default()),
+            latency_mode: Some(latency_mode),
+            r#type: Some(channel_type),
+            recording_configuration_arn: Some(input.recording_configuration_arn.unwrap_or_default()),
+            ingest_endpoint: Some(ingest_endpoint.clone()),
+            playback_url: Some(format!(
+                "https://{ingest_id}.{region}.playback.live-video.net/api/video/v1/{region}.{}.channel.{channel_id}.m3u8",
+                ::engine::emulator_account_id()
+            )),
+            authorized: input.authorized,
+            tags: Some(input.tags.unwrap_or_default()),
+            insecure_ingest: input.insecure_ingest,
+            preset: Some(preset),
+            srt: Some(Srt {
+                endpoint: Some(ingest_endpoint),
+                passphrase: Some(srt_passphrase),
+            }),
+            playback_restriction_policy_arn: Some(
+                input.playback_restriction_policy_arn.unwrap_or_default(),
+            ),
+            multitrack_input_configuration: input.multitrack_input_configuration,
+            container_format: Some(container_format),
+            ad_configuration_arn: Some(input.ad_configuration_arn.unwrap_or_default()),
+        };
+        store.channels.insert(arn.clone(), channel.clone());
+        let stream_key = crate::state::mint_stream_key(&mut store, &region, &arn, None);
+
+        Ok(CreateChannelOutput {
+            channel: Some(channel),
+            stream_key: Some(stream_key),
+        })
     }
+}
+
+/// An enum-valued member the caller left out, or sent as the empty string, carries
+/// no choice — the model's documented default applies to both.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
 }

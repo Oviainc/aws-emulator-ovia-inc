@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDetector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDetector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mutates the persisted detector and bumps its `UpdatedAt`, so a later
+//! `GetDetector` observes the new status, publishing frequency and feature
+//! configuration. An unknown id is refused with `BadRequestException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDetector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +146,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDetector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDetectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDetector"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateDetectorErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the GuardDuty state store is unavailable".to_string()),
+                    r#type: None,
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        // Refuse an unacceptable feature list before anything is written, so a
+        // rejected update leaves the detector exactly as it was.
+        if let Err(message) = crate::state::validate_feature_configurations(input.features.as_ref())
+        {
+            return Err(bad_request(message));
+        }
+
+        let mut state = state.lock();
+        if state.detector_in(&region, &input.detector_id).is_none() {
+            return Err(bad_request(format!(
+                "The request is rejected because the specified detector ID does not exist: {}.",
+                input.detector_id
+            )));
+        }
+        let now = state.tick_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            return Err(bad_request(format!(
+                "The request is rejected because the specified detector ID does not exist: {}.",
+                input.detector_id
+            )));
+        };
+
+        if let Some(enable) = input.enable {
+            detector.status = if enable {
+                crate::state::ENABLED.to_string()
+            } else {
+                crate::state::DISABLED.to_string()
+            };
+        }
+        if let Some(frequency) = input.finding_publishing_frequency.clone() {
+            detector.finding_publishing_frequency = Some(frequency);
+        }
+        // The deprecated `DataSources` view is applied first so an explicit
+        // `Features` entry for the same switch wins.
+        crate::state::apply_data_sources(detector, input.data_sources.as_ref(), now);
+        crate::state::apply_feature_configurations(detector, input.features.as_ref(), now);
+        detector.updated_at_millis = now;
+
+        Ok(UpdateDetectorOutput {})
     }
+}
+
+/// Refuse the request with this operation's modeled 400.
+fn bad_request(message: impl Into<String>) -> UpdateDetectorError {
+    UpdateDetectorErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+        r#type: None,
+    })
+    .into()
 }

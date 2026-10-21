@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStreamKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStreamKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStreamKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints and persists another stream key bound to an existing channel. The new
+//! key's ARN is minted in the channel's own region, read off the channel ARN, so a
+//! key always lives where its channel does; a channel that is not in the store is
+//! a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -96,10 +92,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivs-amazoninteractivevi
 // here — hence the `CreateStreamKeyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivs#CreateStreamKey")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivs#CreateStreamKey",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateStreamKeyErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    InternalServerException(InternalServerException),
     PendingVerification(PendingVerification),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
@@ -157,18 +157,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStreamKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStreamKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStreamKey"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateStreamKeyErrorModeled::InternalServerException(InternalServerException {
+                exception_message: Some("the IVS store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let mut store = state.lock();
+        if !store.channels.contains_key(&input.channel_arn) {
+            return Err(CreateStreamKeyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    exception_message: Some(format!(
+                        "channel {} does not exist",
+                        input.channel_arn
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+        // Keys accumulate on a channel for the life of the process, so their count
+        // per channel is capped; past the cap the service answers the quota error it
+        // models rather than accepting another entry.
+        if crate::state::stream_key_count(&store, &input.channel_arn)
+            >= crate::state::MAX_STREAM_KEYS_PER_CHANNEL
+        {
+            return Err(CreateStreamKeyErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    exception_message: Some(format!(
+                        "the number of stream keys for this channel would exceed the limit of {}",
+                        crate::state::MAX_STREAM_KEYS_PER_CHANNEL
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+        // The key belongs to the channel, so it is minted in the channel's region
+        // rather than in whatever region this request happened to be signed for.
+        let region = crate::state::arn_region(&input.channel_arn)
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::state::request_region(ctx.parts()));
+        let stream_key =
+            crate::state::mint_stream_key(&mut store, &region, &input.channel_arn, input.tags);
+
+        Ok(CreateStreamKeyOutput {
+            stream_key: Some(stream_key),
+        })
     }
 }

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFindings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFindings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: lists the ids of the findings persisted for the detector, ordered,
+//! filtered through `FindingCriteria` and paginated through `maxResults` / `nextToken`.
+//! An unknown detector id is refused with `BadRequestException`, and so is a criterion
+//! or sort attribute this emulator does not model — silently ignoring a filter would
+//! return findings the caller asked it to exclude.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFindings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +161,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFindings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFindingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFindings"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListFindingsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the GuardDuty state store is unavailable".to_string()),
+                    r#type: None,
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        // A pure report: nothing below writes to the store.
+        let state = state.lock();
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            return Err(bad_request(format!(
+                "The request is rejected because the specified detector ID does not exist: {}.",
+                input.detector_id
+            )));
+        };
+
+        let mut matched: Vec<&crate::state::FindingRecord> = Vec::new();
+        // Validated up front, so a detector with no findings refuses an unevaluable
+        // criterion exactly as a populated one does.
+        crate::state::validate_finding_criteria(input.finding_criteria.as_ref())
+            .map_err(|path| unsupported_attribute(&path, "findingCriteria"))?;
+        for finding in detector.findings.values() {
+            match crate::state::finding_matches(finding, input.finding_criteria.as_ref()) {
+                Ok(true) => matched.push(finding),
+                Ok(false) => {}
+                Err(path) => return Err(unsupported_attribute(&path, "findingCriteria")),
+            }
+        }
+        crate::state::sort_findings(&mut matched, input.sort_criteria.as_ref())
+            .map_err(|path| unsupported_attribute(&path, "sortCriteria.attributeName"))?;
+
+        let ids: Vec<String> = matched.iter().map(|f| f.id.clone()).collect();
+        let (page, next_token) = crate::state::paginate(
+            &ids,
+            input.max_results,
+            input.next_token.as_deref(),
+            FINDING_IDS_MAX,
+        )
+        .map_err(|token| {
+            bad_request(format!(
+                "The request is rejected because nextToken is not a token this service issued: {token}."
+            ))
+        })?;
+
+        Ok(ListFindingsOutput {
+            finding_ids: page,
+            next_token,
+        })
     }
+}
+
+/// `FindingIds` is `len 0..50` (`smithy_query(operation="ListFindings")`), so one page
+/// can never carry more than 50 ids whatever `maxResults` asks for.
+const FINDING_IDS_MAX: usize = 50;
+
+/// Refuse the request with this operation's modeled 400.
+fn bad_request(message: impl Into<String>) -> ListFindingsError {
+    ListFindingsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+        r#type: None,
+    })
+    .into()
+}
+
+/// Refuse a finding attribute path this emulator does not model, naming the member
+/// and the paths it does support.
+fn unsupported_attribute(path: &str, member: &str) -> ListFindingsError {
+    bad_request(format!(
+        "{member}: '{path}' is not a finding attribute this service can filter or sort on. Supported attributes are {}.",
+        crate::state::FINDING_ATTRIBUTES.join(", ")
+    ))
 }

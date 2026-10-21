@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStreamKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStreamKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStreamKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read: the persisted stream keys bound to one channel, in one stable
+//! order (ARN), paged the same way `ListChannels` pages its channels. A channel
+//! that is not in the store is a 404, not an empty list.
 //!
 //! ## Shape of an operation
 //!
@@ -90,10 +85,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivs-amazoninteractivevi
 // here — hence the `ListStreamKeysError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivs#ListStreamKeys")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivs#ListStreamKeys",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListStreamKeysErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
 }
@@ -149,18 +148,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStreamKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStreamKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStreamKeys"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListStreamKeysErrorModeled::InternalServerException(InternalServerException {
+                exception_message: Some("the IVS store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::STREAM_KEY_PAGE, token).ok_or_else(
+                    || {
+                        ListStreamKeysErrorModeled::ValidationException(ValidationException {
+                            exception_message: Some(
+                                "nextToken is not a pagination token this service issued"
+                                    .to_string(),
+                            ),
+                            ..Default::default()
+                        })
+                    },
+                )?,
+            ),
+            None => None,
+        };
+        // `MaxStreamKeyResults` is modelled `range(1..50)`, so the framework has
+        // already refused anything outside it; an absent value means the whole page.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_STREAM_KEY_RESULTS))
+            .unwrap_or(MAX_STREAM_KEY_RESULTS as usize)
+            .clamp(1, MAX_STREAM_KEY_RESULTS as usize);
+
+        let store = state.lock();
+        if !store.channels.contains_key(&input.channel_arn) {
+            return Err(ListStreamKeysErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    exception_message: Some(format!(
+                        "channel {} does not exist",
+                        input.channel_arn
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let (window, next_token) = crate::state::page(
+            crate::state::STREAM_KEY_PAGE,
+            store
+                .stream_keys
+                .iter()
+                .filter(|(_, key)| key.channel_arn.as_deref() == Some(input.channel_arn.as_str())),
+            after.as_deref(),
+            page_size,
+        );
+
+        Ok(ListStreamKeysOutput {
+            stream_keys: window.into_iter().map(summary).collect(),
+            next_token,
+        })
+    }
+}
+
+/// The `maxResults` ceiling the model declares for this operation
+/// (`MaxStreamKeyResults`, `range(min: 1, max: 50)`), and so also the page size an
+/// absent `maxResults` means.
+const MAX_STREAM_KEY_RESULTS: i32 = 50;
+
+/// The `StreamKeySummary` projection of a persisted stream key. It deliberately
+/// carries no `value`: `StreamKeySummary` declares only `arn`, `channelArn` and
+/// `tags`, so a list never discloses the key material.
+fn summary(key: &StreamKey) -> StreamKeySummary {
+    StreamKeySummary {
+        arn: key.arn.clone(),
+        channel_arn: key.channel_arn.clone(),
+        tags: key.tags.clone(),
     }
 }

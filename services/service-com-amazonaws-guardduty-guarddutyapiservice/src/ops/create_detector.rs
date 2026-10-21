@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDetector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDetector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a detector and persists it in [`crate::state`]. GuardDuty allows
+//! exactly one detector per account per Region, so a second create is refused with
+//! `BadRequestException`, and a replayed `ClientToken` returns the detector the first
+//! call minted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDetector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +161,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDetector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDetectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDetector"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDetectorErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the GuardDuty state store is unavailable".to_string()),
+                    r#type: None,
+                },
+            )
+            .into());
+        };
+
+        // Refuse an unacceptable feature list before anything is written, so a
+        // rejected request leaves no detector behind.
+        if let Err(message) = crate::state::validate_feature_configurations(input.features.as_ref())
+        {
+            return Err(bad_request(message));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        // `ClientToken` is `@idempotencyToken`: a replayed create returns the
+        // detector the first call minted rather than minting a second one.
+        let token_key = input
+            .client_token
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .map(|token| (region.clone(), token.to_string()));
+        if let Some(key) = token_key.as_ref() {
+            if let Some(existing) = state.client_tokens.get(key).cloned() {
+                if state.detector_in(&region, &existing).is_some() {
+                    return Ok(CreateDetectorOutput {
+                        detector_id: Some(existing),
+                        unprocessed_data_sources: None,
+                    });
+                }
+            }
+        }
+
+        // "You can have only one detector per account per Region" and "you must
+        // create a detector in each Region where you enable the service"
+        // (`smithy_query(query="doc",shape="CreateDetector")`), so the limit is
+        // scoped to the Region the request was signed for.
+        if let Some(existing) = state.detector_ids_in(&region).first() {
+            return Err(bad_request(format!(
+                "The request is rejected because a detector already exists for this account in {region}: {existing}."
+            )));
+        }
+
+        let now = state.tick_millis();
+        let id = state.mint_id();
+        let mut detector = crate::state::Detector {
+            id: id.clone(),
+            region: region.clone(),
+            status: if input.enable {
+                crate::state::ENABLED.to_string()
+            } else {
+                crate::state::DISABLED.to_string()
+            },
+            // GuardDuty reads the account's data through its own service-linked
+            // role; the account id and partition come from `engine::emulator_arn`.
+            service_role: ::engine::emulator_arn("iam", "", GUARDDUTY_SERVICE_LINKED_ROLE),
+            finding_publishing_frequency: Some(
+                input
+                    .finding_publishing_frequency
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_FINDING_PUBLISHING_FREQUENCY.to_string()),
+            ),
+            features: crate::state::default_features(now),
+            tags: input
+                .tags
+                .as_ref()
+                .map(|tags| {
+                    tags.iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                })
+                .unwrap_or_default(),
+            created_at_millis: now,
+            updated_at_millis: now,
+            findings: std::collections::BTreeMap::new(),
+            filters: std::collections::BTreeMap::new(),
+        };
+        // The deprecated `DataSources` view is applied first so an explicit
+        // `Features` entry for the same switch wins.
+        crate::state::apply_data_sources(&mut detector, input.data_sources.as_ref(), now);
+        crate::state::apply_feature_configurations(&mut detector, input.features.as_ref(), now);
+
+        state.detectors.insert(id.clone(), detector);
+        if let Some(key) = token_key {
+            state.client_tokens.insert(key, id.clone());
+        }
+
+        Ok(CreateDetectorOutput {
+            detector_id: Some(id),
+            // Nothing failed to enable, so the member stays absent rather than
+            // carrying an empty result.
+            unprocessed_data_sources: None,
+        })
     }
+}
+
+/// The resource portion of GuardDuty's service-linked role, the value `ServiceRole`
+/// reports.
+const GUARDDUTY_SERVICE_LINKED_ROLE: &str =
+    "role/aws-service-role/guardduty.amazonaws.com/AWSServiceRoleForAmazonGuardDuty";
+
+/// The publishing frequency a detector gets when the request names none. AWS
+/// documents SIX_HOURS as the cadence a new detector exports findings on; the
+/// member's three legal values come from
+/// `smithy_query(shape="FindingPublishingFrequency")`.
+const DEFAULT_FINDING_PUBLISHING_FREQUENCY: &str = "SIX_HOURS";
+
+/// Refuse the request with this operation's modeled 400.
+fn bad_request(message: impl Into<String>) -> CreateDetectorError {
+    CreateDetectorErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+        r#type: None,
+    })
+    .into()
 }
