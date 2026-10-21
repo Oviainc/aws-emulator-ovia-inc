@@ -1,5 +1,30 @@
 [workspace]
 members = [
+    "services/service-com-amazonaws-accessanalyzer-accessanalyzer",
+    "services/service-com-amazonaws-account-account",
+    "services/service-com-amazonaws-accountaccess-awsaccountaccess",
+    "services/service-com-amazonaws-acm-certificatemanager",
+    "services/service-com-amazonaws-acmpca-acmprivateca",
+    "services/service-com-amazonaws-agentregistry-agentregistry",
+    "services/service-com-amazonaws-agentregistrycontrol-agentregistrycontrol",
+    "services/service-com-amazonaws-aiops-aiops",
+    "services/service-com-amazonaws-amp-amazonprometheusservice",
+    "services/service-com-amazonaws-amplify-amplify",
+    "services/service-com-amazonaws-amplifybackend-amplifybackend",
+    "services/service-com-amazonaws-amplifyuibuilder-amplifyuibuilder",
+    "services/service-com-amazonaws-apigateway-backplanecontrolservice",
+    "services/service-com-amazonaws-apigatewaymanagementapi-apigatewaymanagementapi",
+    "services/service-com-amazonaws-apigatewayv2-apigatewayv2",
+    "services/service-com-amazonaws-appconfig-amazonappconfig",
+    "services/service-com-amazonaws-appconfigdata-appconfigdata",
+    "services/service-com-amazonaws-appfabric-fabricfrontendservice",
+    "services/service-com-amazonaws-appflow-sandstoneconfigurationservicelambda",
+    "services/service-com-amazonaws-appintegrations-amazonappintegrationservice",
+    "services/service-com-amazonaws-applicationautoscaling-anyscalefrontendservice",
+    "services/service-com-amazonaws-applicationcostprofiler-awsapplicationcostprofiler",
+    "services/service-com-amazonaws-applicationdiscoveryservice-awsposeidonservice-v2015-11-01",
+    "services/service-com-amazonaws-applicationinsights-ec2windowsbarleyservice",
+    "services/service-com-amazonaws-applicationsignals-applicationsignals",
     "core/router",
     "core/embedded",
 ]
@@ -35,6 +60,31 @@ unsafe_code = "forbid"
 
 [workspace.dependencies]
 # Workspace-local crates
+service-com-amazonaws-accessanalyzer-accessanalyzer = { path = "services/service-com-amazonaws-accessanalyzer-accessanalyzer" }
+service-com-amazonaws-account-account = { path = "services/service-com-amazonaws-account-account" }
+service-com-amazonaws-accountaccess-awsaccountaccess = { path = "services/service-com-amazonaws-accountaccess-awsaccountaccess" }
+service-com-amazonaws-acm-certificatemanager = { path = "services/service-com-amazonaws-acm-certificatemanager" }
+service-com-amazonaws-acmpca-acmprivateca = { path = "services/service-com-amazonaws-acmpca-acmprivateca" }
+service-com-amazonaws-agentregistry-agentregistry = { path = "services/service-com-amazonaws-agentregistry-agentregistry" }
+service-com-amazonaws-agentregistrycontrol-agentregistrycontrol = { path = "services/service-com-amazonaws-agentregistrycontrol-agentregistrycontrol" }
+service-com-amazonaws-aiops-aiops = { path = "services/service-com-amazonaws-aiops-aiops" }
+service-com-amazonaws-amp-amazonprometheusservice = { path = "services/service-com-amazonaws-amp-amazonprometheusservice" }
+service-com-amazonaws-amplify-amplify = { path = "services/service-com-amazonaws-amplify-amplify" }
+service-com-amazonaws-amplifybackend-amplifybackend = { path = "services/service-com-amazonaws-amplifybackend-amplifybackend" }
+service-com-amazonaws-amplifyuibuilder-amplifyuibuilder = { path = "services/service-com-amazonaws-amplifyuibuilder-amplifyuibuilder" }
+service-com-amazonaws-apigateway-backplanecontrolservice = { path = "services/service-com-amazonaws-apigateway-backplanecontrolservice" }
+service-com-amazonaws-apigatewaymanagementapi-apigatewaymanagementapi = { path = "services/service-com-amazonaws-apigatewaymanagementapi-apigatewaymanagementapi" }
+service-com-amazonaws-apigatewayv2-apigatewayv2 = { path = "services/service-com-amazonaws-apigatewayv2-apigatewayv2" }
+service-com-amazonaws-appconfig-amazonappconfig = { path = "services/service-com-amazonaws-appconfig-amazonappconfig" }
+service-com-amazonaws-appconfigdata-appconfigdata = { path = "services/service-com-amazonaws-appconfigdata-appconfigdata" }
+service-com-amazonaws-appfabric-fabricfrontendservice = { path = "services/service-com-amazonaws-appfabric-fabricfrontendservice" }
+service-com-amazonaws-appflow-sandstoneconfigurationservicelambda = { path = "services/service-com-amazonaws-appflow-sandstoneconfigurationservicelambda" }
+service-com-amazonaws-appintegrations-amazonappintegrationservice = { path = "services/service-com-amazonaws-appintegrations-amazonappintegrationservice" }
+service-com-amazonaws-applicationautoscaling-anyscalefrontendservice = { path = "services/service-com-amazonaws-applicationautoscaling-anyscalefrontendservice" }
+service-com-amazonaws-applicationcostprofiler-awsapplicationcostprofiler = { path = "services/service-com-amazonaws-applicationcostprofiler-awsapplicationcostprofiler" }
+service-com-amazonaws-applicationdiscoveryservice-awsposeidonservice-v2015-11-01 = { path = "services/service-com-amazonaws-applicationdiscoveryservice-awsposeidonservice-v2015-11-01" }
+service-com-amazonaws-applicationinsights-ec2windowsbarleyservice = { path = "services/service-com-amazonaws-applicationinsights-ec2windowsbarleyservice" }
+service-com-amazonaws-applicationsignals-applicationsignals = { path = "services/service-com-amazonaws-applicationsignals-applicationsignals" }
 
 # The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
 #

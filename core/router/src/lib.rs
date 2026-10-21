@@ -74,7 +74,71 @@ pub fn new_engine() -> Arc<InMemoryEngine> {
 /// `mount_chunk_NN` helpers below, one frame at a time. Collapsing them into a single
 /// chained expression holds every service's `new` frame at once and overflows
 /// the stack here, aborting before either listener binds.
-pub fn build_router(_engine: Arc<InMemoryEngine>) -> MultiServiceRouter {
-    MultiServiceRouter::new()
+pub fn build_router(engine: Arc<InMemoryEngine>) -> MultiServiceRouter {
+    let router = MultiServiceRouter::new();
+    let router = mount_chunk_00(router, &engine);
+    let router = mount_chunk_01(router, &engine);
+    mount_chunk_02(router, &engine)
+}
+
+/// Register services 00 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_00(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_accessanalyzer_accessanalyzer::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_account_account::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_accountaccess_awsaccountaccess::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_acm_certificatemanager::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_acmpca_acmprivateca::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_agentregistry_agentregistry::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_agentregistrycontrol_agentregistrycontrol::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_aiops_aiops::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_amp_amazonprometheusservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_amplify_amplify::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_amplifybackend_amplifybackend::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 01 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_01(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_apigateway_backplanecontrolservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_apigatewaymanagementapi_apigatewaymanagementapi::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_apigatewayv2_apigatewayv2::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_appconfig_amazonappconfig::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_appconfigdata_appconfigdata::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_appfabric_fabricfrontendservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_appintegrations_amazonappintegrationservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_applicationautoscaling_anyscalefrontendservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_applicationcostprofiler_awsapplicationcostprofiler::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 02 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_02(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_applicationdiscoveryservice_awsposeidonservice_v2015_11_01::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_applicationinsights_ec2windowsbarleyservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_applicationsignals_applicationsignals::EmulatedService::new(engine.clone()));
+    router
 }
 

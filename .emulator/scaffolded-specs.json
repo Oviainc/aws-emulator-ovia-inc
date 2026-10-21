@@ -1,3 +1,104 @@
 {
-  "scaffolded_services": []
+  "scaffolded_services": [
+    {
+      "shape_id": "com.amazonaws.accessanalyzer#AccessAnalyzer",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/accessanalyzer/service/2019-11-01/accessanalyzer-2019-11-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.account#Account",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/account/service/2021-02-01/account-2021-02-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.accountaccess#AWSAccountAccess",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/account-access/service/2018-05-10/account-access-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.acm#CertificateManager",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/acm/service/2015-12-08/acm-2015-12-08.json"
+    },
+    {
+      "shape_id": "com.amazonaws.acmpca#ACMPrivateCA",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/acm-pca/service/2017-08-22/acm-pca-2017-08-22.json"
+    },
+    {
+      "shape_id": "com.amazonaws.agentregistry#AgentRegistry",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/agent-registry/service/2025-12-01/agent-registry-2025-12-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.agentregistrycontrol#AgentRegistryControl",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/agent-registry-control/service/2025-12-01/agent-registry-control-2025-12-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.aiops#AIOps",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/aiops/service/2018-05-10/aiops-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.amp#AmazonPrometheusService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/amp/service/2020-08-01/amp-2020-08-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.amplify#Amplify",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/amplify/service/2017-07-25/amplify-2017-07-25.json"
+    },
+    {
+      "shape_id": "com.amazonaws.amplifybackend#AmplifyBackend",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/amplifybackend/service/2020-08-11/amplifybackend-2020-08-11.json"
+    },
+    {
+      "shape_id": "com.amazonaws.amplifyuibuilder#AmplifyUIBuilder",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/amplifyuibuilder/service/2021-08-11/amplifyuibuilder-2021-08-11.json"
+    },
+    {
+      "shape_id": "com.amazonaws.apigateway#BackplaneControlService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/api-gateway/service/2015-07-09/api-gateway-2015-07-09.json"
+    },
+    {
+      "shape_id": "com.amazonaws.apigatewaymanagementapi#ApiGatewayManagementApi",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/apigatewaymanagementapi/service/2018-11-29/apigatewaymanagementapi-2018-11-29.json"
+    },
+    {
+      "shape_id": "com.amazonaws.apigatewayv2#ApiGatewayV2",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/apigatewayv2/service/2018-11-29/apigatewayv2-2018-11-29.json"
+    },
+    {
+      "shape_id": "com.amazonaws.appconfig#AmazonAppConfig",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/appconfig/service/2019-10-09/appconfig-2019-10-09.json"
+    },
+    {
+      "shape_id": "com.amazonaws.appconfigdata#AppConfigData",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/appconfigdata/service/2021-11-11/appconfigdata-2021-11-11.json"
+    },
+    {
+      "shape_id": "com.amazonaws.appfabric#FabricFrontEndService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/appfabric/service/2023-05-19/appfabric-2023-05-19.json"
+    },
+    {
+      "shape_id": "com.amazonaws.appflow#SandstoneConfigurationServiceLambda",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/appflow/service/2020-08-23/appflow-2020-08-23.json"
+    },
+    {
+      "shape_id": "com.amazonaws.appintegrations#AmazonAppIntegrationService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/appintegrations/service/2020-07-29/appintegrations-2020-07-29.json"
+    },
+    {
+      "shape_id": "com.amazonaws.applicationautoscaling#AnyScaleFrontendService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/application-auto-scaling/service/2016-02-06/application-auto-scaling-2016-02-06.json"
+    },
+    {
+      "shape_id": "com.amazonaws.applicationcostprofiler#AWSApplicationCostProfiler",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/applicationcostprofiler/service/2020-09-10/applicationcostprofiler-2020-09-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.applicationdiscoveryservice#AWSPoseidonService_V2015_11_01",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/application-discovery-service/service/2015-11-01/application-discovery-service-2015-11-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.applicationinsights#EC2WindowsBarleyService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/application-insights/service/2018-11-25/application-insights-2018-11-25.json"
+    },
+    {
+      "shape_id": "com.amazonaws.applicationsignals#ApplicationSignals",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/application-signals/service/2024-04-15/application-signals-2024-04-15.json"
+    }
+  ]
 }
