@@ -796,6 +796,73 @@ async fn string_filters_select_findings_by_the_documented_comparisons() {
     }
 }
 
+/// RULE: a `DateFilter` selects findings whose timestamp attribute falls inside the
+/// window it names — between `Start` and `End` inclusive, or `WITHIN` / `OLDER_THAN`
+/// a `DateRange` measured back from now ("If you don't specify a value, the default
+/// is `WITHIN`" — `DateRange$Comparison`).
+#[tokio::test]
+async fn date_filters_select_findings_inside_the_window_they_name() {
+    // Two findings a known distance apart, so an absolute window and a relative one
+    // can each pick out exactly one of them.
+    let mut old = base_finding("date-old");
+    old["CreatedAt"] = json!("2020-01-01T00:00:00Z");
+    old["UpdatedAt"] = json!("2020-01-02T00:00:00Z");
+
+    let mut recent = base_finding("date-recent");
+    recent["CreatedAt"] = json!("2026-10-21T20:00:00Z");
+    recent["UpdatedAt"] = json!("2026-10-21T21:00:00Z");
+
+    let harness = Harness::with_findings(vec![old, recent]).await;
+
+    // (case, Filters, expected ids)
+    let cases: [(&str, Value, Vec<&str>); 5] = [
+        (
+            "Start and End bracket the old finding",
+            json!({ "CreatedAt": [{ "Start": "2019-01-01T00:00:00Z", "End": "2021-01-01T00:00:00Z" }] }),
+            vec!["date-old"],
+        ),
+        (
+            "Start alone excludes the old finding",
+            json!({ "CreatedAt": [{ "Start": "2025-01-01T00:00:00Z" }] }),
+            vec!["date-recent"],
+        ),
+        (
+            "End alone excludes the recent finding",
+            json!({ "CreatedAt": [{ "End": "2021-01-01T00:00:00Z" }] }),
+            vec!["date-old"],
+        ),
+        (
+            "DateRange OLDER_THAN one day keeps only the old finding",
+            json!({ "UpdatedAt": [{ "DateRange": { "Value": 1, "Unit": "DAYS", "Comparison": "OLDER_THAN" } }] }),
+            vec!["date-old"],
+        ),
+        (
+            "two windows on one field are joined by OR",
+            json!({ "CreatedAt": [
+                { "End": "2021-01-01T00:00:00Z" },
+                { "Start": "2025-01-01T00:00:00Z" },
+            ] }),
+            vec!["date-old", "date-recent"],
+        ),
+    ];
+
+    for (case, filters, expected) in cases {
+        let (status, body) = harness.get_findings(json!({ "Filters": filters })).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} with {body}"
+        );
+        let mut ids = returned_ids(&body);
+        ids.sort();
+        let mut expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
+        expected.sort();
+        assert_eq!(
+            ids, expected,
+            "case {case:?}: expected {expected:?}, got {ids:?}"
+        );
+    }
+}
+
 /// RULE: the filter combinations `StringFilter$Comparison` calls out as errors are
 /// refused with `InvalidInputException` (400), and `CONTAINS_WORD` — which "works
 /// only in the GetFindingsV2, GetFindingStatisticsV2, GetResourcesV2, and
@@ -810,7 +877,7 @@ async fn illegal_filter_combinations_are_refused() {
     let (status, _) = empty.enable(None).await;
     assert_eq!(status, 200, "enable on the empty hub: got {status}");
 
-    let cases: [(&str, Value); 6] = [
+    let cases: [(&str, Value); 13] = [
         (
             "CONTAINS with NOT_CONTAINS on one field",
             json!({ "Title": [
@@ -843,6 +910,35 @@ async fn illegal_filter_combinations_are_refused() {
         (
             "DateRange.Unit is not a modelled unit",
             json!({ "UpdatedAt": [{ "DateRange": { "Value": 7, "Unit": "WEEKS" } }] }),
+        ),
+        // A filter that names no predicate must be refused, not ignored: a filtered
+        // request may never answer an unfiltered page.
+        (
+            "StringFilter without a Value",
+            json!({ "Id": [{ "Comparison": "EQUALS" }] }),
+        ),
+        (
+            "NumberFilter without a bound",
+            json!({ "Confidence": [{}] }),
+        ),
+        ("BooleanFilter without a Value", json!({ "Sample": [{}] })),
+        (
+            "DateFilter without Start, End or DateRange",
+            json!({ "CreatedAt": [{}] }),
+        ),
+        // A comparison GetFindings does not evaluate, and a DateRange that names no
+        // window, are refused rather than dropped.
+        (
+            "an unevaluated StringFilterComparison",
+            json!({ "Id": [{ "Value": "finding-1", "Comparison": "STARTS_WITH" }] }),
+        ),
+        (
+            "DateRange without a Value",
+            json!({ "UpdatedAt": [{ "DateRange": { "Unit": "DAYS" } }] }),
+        ),
+        (
+            "DateRange with a negative Value",
+            json!({ "UpdatedAt": [{ "DateRange": { "Value": -30, "Unit": "DAYS" } }] }),
         ),
     ];
 
@@ -1034,6 +1130,183 @@ async fn sort_criteria_orders_the_page() {
             returned_ids(&body),
             expected,
             "case {case:?}: expected {expected:?}, got {body}"
+        );
+    }
+
+    // A criterion that names no field is a bad request; one that names a field this
+    // slice cannot order by is "not written yet".
+    let (status, body) = harness
+        .get_findings(json!({ "SortCriteria": [{ "SortOrder": "asc" }] }))
+        .await;
+    assert_eq!(
+        status, 400,
+        "a SortCriterion without a Field: expected 400, got {status} with {body}"
+    );
+    let (status, body) = harness
+        .get_findings(json!({ "SortCriteria": [{ "Field": "ResourceId", "SortOrder": "asc" }] }))
+        .await;
+    assert_eq!(
+        status, 501,
+        "an unimplemented sort field: expected 501, got {status} with {body}"
+    );
+}
+
+/// RULE: every attribute `GetFindings` advertises as sortable actually orders a page
+/// by that attribute's value, ascending or descending as asked.
+///
+/// The two seeded findings are built so that the FIRST carries the lower value for
+/// every sortable attribute a client can set, so `asc` must be `[a, b]` and `desc`
+/// `[b, a]` for each one. Two attributes are service-populated and therefore equal on
+/// both findings (`Region`, and `ProcessedAt`, which is one instant per import
+/// batch); for those the rule is only that the order does not depend on the
+/// direction. The sweep also pins the pairing between the advertised attribute names
+/// and the accessors that read them: a name the accessor does not know would answer
+/// 501 here.
+#[tokio::test]
+async fn every_sortable_attribute_orders_a_page_by_that_attribute() {
+    use service_com_amazonaws_securityhub_securityhubapiservice::ops::get_findings::{
+        DATE_ATTRIBUTES, NUMBER_ATTRIBUTES, STRING_ATTRIBUTES,
+    };
+
+    /// Attributes Security Hub CSPM populates itself, so both findings carry the
+    /// same value and neither direction can separate them.
+    const SERVICE_POPULATED: [&str; 2] = ["Region", "ProcessedAt"];
+
+    // `a` holds the lower value for every attribute a client can set; `b` the higher.
+    // `Severity.Label` and `Severity.Normalized` are both given explicitly, so the
+    // label's alphabetical order and the normalized value's numeric order agree.
+    let low = json!({
+        "SchemaVersion": SCHEMA_VERSION,
+        "Id": "sortable-a",
+        "ProductArn": "arn:aws:securityhub:us-east-1::product/aws/aaa",
+        "ProductName": "product-a",
+        "CompanyName": "company-a",
+        "GeneratorId": "generator-a",
+        "AwsAccountId": "000000000000",
+        "AwsAccountName": "account-a",
+        "Types": ["Effects/Aaa"],
+        "FirstObservedAt": "2026-10-01T00:00:00Z",
+        "LastObservedAt": "2026-10-02T00:00:00Z",
+        "CreatedAt": "2026-10-03T00:00:00Z",
+        "UpdatedAt": "2026-10-04T00:00:00Z",
+        "Severity": { "Label": "CRITICAL", "Normalized": 1, "Product": 1.0 },
+        "Confidence": 1,
+        "Criticality": 1,
+        "Title": "Title aaa",
+        "Description": "Description aaa",
+        "Remediation": { "Recommendation": { "Text": "Recommendation aaa" } },
+        "SourceUrl": "https://example.invalid/aaa",
+        "Resources": [{ "Type": "AwsEc2Instance", "Id": "i-0aaa" }],
+        "Compliance": { "Status": "FAILED", "SecurityControlId": "control-a" },
+        "VerificationState": "BENIGN_POSITIVE",
+        "WorkflowState": "ASSIGNED",
+        "Workflow": { "Status": "NEW" },
+        "RecordState": "ACTIVE",
+        "Note": { "Text": "note aaa", "UpdatedBy": "user-a", "UpdatedAt": "2026-10-05T00:00:00Z" },
+    });
+    let high = json!({
+        "SchemaVersion": SCHEMA_VERSION,
+        "Id": "sortable-b",
+        "ProductArn": "arn:aws:securityhub:us-east-1::product/aws/bbb",
+        "ProductName": "product-b",
+        "CompanyName": "company-b",
+        "GeneratorId": "generator-b",
+        "AwsAccountId": "000000000001",
+        "AwsAccountName": "account-b",
+        "Types": ["Effects/Bbb"],
+        "FirstObservedAt": "2026-10-11T00:00:00Z",
+        "LastObservedAt": "2026-10-12T00:00:00Z",
+        "CreatedAt": "2026-10-13T00:00:00Z",
+        "UpdatedAt": "2026-10-14T00:00:00Z",
+        "Severity": { "Label": "HIGH", "Normalized": 2, "Product": 2.0 },
+        "Confidence": 2,
+        "Criticality": 2,
+        "Title": "Title bbb",
+        "Description": "Description bbb",
+        "Remediation": { "Recommendation": { "Text": "Recommendation bbb" } },
+        "SourceUrl": "https://example.invalid/bbb",
+        "Resources": [{ "Type": "AwsEc2Instance", "Id": "i-0bbb" }],
+        "Compliance": { "Status": "PASSED", "SecurityControlId": "control-b" },
+        "VerificationState": "TRUE_POSITIVE",
+        "WorkflowState": "NEW",
+        "Workflow": { "Status": "NOTIFIED" },
+        "RecordState": "ARCHIVED",
+        "Note": { "Text": "note bbb", "UpdatedBy": "user-b", "UpdatedAt": "2026-10-15T00:00:00Z" },
+    });
+
+    let harness = Harness::with_findings(vec![low, high]).await;
+
+    for field in STRING_ATTRIBUTES
+        .iter()
+        .chain(NUMBER_ATTRIBUTES.iter())
+        .chain(DATE_ATTRIBUTES.iter())
+    {
+        let mut pages = Vec::new();
+        for order in ["asc", "desc"] {
+            let (status, body) = harness
+                .get_findings(json!({ "SortCriteria": [{ "Field": field, "SortOrder": order }] }))
+                .await;
+            assert_eq!(
+                status, 200,
+                "field {field:?} {order}: expected 200, got {status} with {body}"
+            );
+            pages.push(returned_ids(&body));
+        }
+        let (ascending, descending) = (&pages[0], &pages[1]);
+
+        if SERVICE_POPULATED.contains(field) {
+            assert_eq!(
+                ascending, descending,
+                "field {field:?}: both findings carry the same service-populated value, so the order must not depend on the direction, got asc {ascending:?} and desc {descending:?}"
+            );
+            continue;
+        }
+        assert_eq!(
+            ascending,
+            &vec!["sortable-a".to_string(), "sortable-b".to_string()],
+            "field {field:?} asc: expected the lower value first, got {ascending:?}"
+        );
+        assert_eq!(
+            descending,
+            &vec!["sortable-b".to_string(), "sortable-a".to_string()],
+            "field {field:?} desc: expected the higher value first, got {descending:?}"
+        );
+    }
+}
+
+/// RULE: the published breadth and depth limits on `Filters` are enforced — "You can
+/// filter by up to 10 finding attributes. For each attribute, you can provide up to
+/// 20 filter values."
+#[tokio::test]
+async fn filters_beyond_the_published_limits_are_refused() {
+    use service_com_amazonaws_securityhub_securityhubapiservice::ops::get_findings::STRING_ATTRIBUTES;
+
+    let harness = Harness::with_findings(vec![base_finding("limits-1")]).await;
+
+    // (case, number of attributes, values per attribute, expected status)
+    let cases: [(&str, usize, usize, u16); 6] = [
+        ("1 attribute, 1 value", 1, 1, 200),
+        ("10 attributes (the maximum)", 10, 1, 200),
+        ("11 attributes (one past it)", 11, 1, 400),
+        ("20 values on one attribute (the maximum)", 1, 20, 200),
+        ("21 values on one attribute (one past it)", 1, 21, 400),
+        ("both limits exceeded", 11, 21, 400),
+    ];
+
+    for (case, attributes, values, expected) in cases {
+        let mut filters = serde_json::Map::new();
+        for attribute in STRING_ATTRIBUTES.iter().take(attributes) {
+            let list: Vec<Value> = (0..values)
+                .map(|index| json!({ "Value": format!("v{index}"), "Comparison": "PREFIX" }))
+                .collect();
+            filters.insert((*attribute).to_string(), Value::Array(list));
+        }
+        let (status, body) = harness
+            .get_findings(json!({ "Filters": Value::Object(filters) }))
+            .await;
+        assert_eq!(
+            status, expected,
+            "case {case:?}: expected {expected}, got {status} with {body}"
         );
     }
 }
