@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMetrics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMetrics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMetrics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the metrics this service's store holds. Implemented here — this is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +167,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMetrics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMetricsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMetrics"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListMetricsErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch metric store is unavailable".into()),
+            })
+        })?;
+
+        // "Up to 500 results are returned for any one call. To retrieve additional results,
+        // use the returned token with subsequent calls." (ListMetrics documentation)
+        const PAGE_SIZE: usize = 500;
+        // `RecentlyActive`'s only value, `PT3H`: "To filter the results to show only
+        // metrics that have had data points published in the past three hours".
+        const RECENTLY_ACTIVE_WINDOW_SECS: f64 = 3.0 * 60.0 * 60.0;
+
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListMetricsErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some("NextToken is not a token this service issued".into()),
+                    },
+                )
+            })?),
+        };
+
+        let now = crate::state::now_secs();
+        let store = state.lock();
+
+        // Ordered by the cursor rendering so paging is stable and a token can simply name
+        // the key the next page starts at.
+        let mut keys: Vec<(String, &crate::state::MetricKey)> = store
+            .metrics
+            .iter()
+            .filter(|(key, data)| {
+                if input
+                    .namespace
+                    .as_deref()
+                    .is_some_and(|namespace| namespace != key.namespace)
+                {
+                    return false;
+                }
+                if input
+                    .metric_name
+                    .as_deref()
+                    .is_some_and(|name| name != key.metric_name)
+                {
+                    return false;
+                }
+                if !dimension_filters_match(input.dimensions.as_deref(), &key.dimensions) {
+                    return false;
+                }
+                if input.recently_active.is_some() {
+                    return data
+                        .iter()
+                        .any(|datum| now - datum.timestamp_secs <= RECENTLY_ACTIVE_WINDOW_SECS);
+                }
+                true
+            })
+            .map(|(key, _)| (page_cursor(key), key))
+            .collect();
+        keys.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => keys.partition_point(|(key, _)| key.as_str() < cursor),
+        };
+        let page = keys.get(from..).unwrap_or_default();
+        let next_token = page
+            .get(PAGE_SIZE)
+            .map(|(cursor, _)| crate::state::encode_page_token(cursor));
+
+        let metrics: Vec<Metric> = page
+            .iter()
+            .take(PAGE_SIZE)
+            .map(|(_, key)| Metric {
+                namespace: Some(key.namespace.clone()),
+                metric_name: Some(key.metric_name.clone()),
+                dimensions: Some(crate::state::dimension_list(&key.dimensions)),
+            })
+            .collect();
+
+        Ok(ListMetricsOutput {
+            metrics: Some(metrics),
+            next_token,
+            owning_accounts: None,
+        })
     }
+}
+
+/// Whether a metric's dimension set satisfies every supplied `DimensionFilter`.
+///
+/// "Only the dimension with names that match exactly will be returned. If you specify one
+/// dimension name and a metric has that dimension and also other dimensions, it will be
+/// returned." (`ListMetricsInput$Dimensions`) — so a filter matches on the dimension NAME
+/// being present, narrowed to an exact value only when the filter supplies one, and the
+/// metric must satisfy every filter.
+fn dimension_filters_match(
+    filters: Option<&[DimensionFilter]>,
+    dimensions: &crate::state::DimensionSet,
+) -> bool {
+    filters.into_iter().flatten().all(|filter| {
+        dimensions.get(&filter.name).is_some_and(|value| {
+            filter
+                .value
+                .as_deref()
+                .is_none_or(|wanted| wanted == value.as_str())
+        })
+    })
+}
+
+/// The total order paging walks: one string per metric key, so a cursor names the key the
+/// next page starts at. `\u{1}` cannot appear in a dimension name or value, so no key's
+/// rendering can collide with another's.
+fn page_cursor(key: &crate::state::MetricKey) -> String {
+    let mut cursor = format!("{}\u{1}{}", key.namespace, key.metric_name);
+    for (name, value) in &key.dimensions {
+        cursor.push('\u{1}');
+        cursor.push_str(name);
+        cursor.push('\u{1}');
+        cursor.push_str(value);
+    }
+    cursor
 }

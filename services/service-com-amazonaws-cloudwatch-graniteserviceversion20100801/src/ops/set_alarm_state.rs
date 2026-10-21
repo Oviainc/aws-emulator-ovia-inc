@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetAlarmState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetAlarmState`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetAlarmState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets a stored alarm's state. Implemented here — this is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -113,11 +106,19 @@ impl ::aws_smithy_schema::serde::SerializableStruct for SetAlarmStateOutput {
 // here — hence the `SetAlarmStateError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#SetAlarmState")]
+//
+// `InternalServiceFault` is widened in: it is THIS service's own server fault (every
+// metric operation declares it), and it is the only honest answer when the shared store
+// cannot be reached. Reporting that as a 4xx would tell the caller to fix its request.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#SetAlarmState",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum SetAlarmStateErrorModeled {
     InvalidFormatFault(InvalidFormatFault),
     ResourceNotFound(ResourceNotFound),
+    InternalServiceFault(InternalServiceFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -171,18 +172,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetAlarmState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetAlarmStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetAlarmState"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SetAlarmStateErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch alarm store is unavailable".into()),
+            })
+        })?;
+
+        let now = crate::state::now_secs();
+        let mut store = state.lock();
+
+        let Some(stored) = store.alarms.get_mut(&input.alarm_name) else {
+            return Err(SetAlarmStateErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("alarm {} does not exist", input.alarm_name)),
+            })
+            .into());
+        };
+
+        // `StateTransitionedTimestamp` is "the time stamp of the last change to the alarm's
+        // StateValue", so it only moves when the state value itself changes; the state
+        // update itself always refreshes `StateUpdatedTimestamp`.
+        let changed = stored.alarm.state_value.as_deref() != Some(input.state_value.as_str());
+        stored.alarm.state_value = Some(input.state_value.clone());
+        stored.alarm.state_reason = Some(input.state_reason.clone());
+        stored.alarm.state_reason_data = input.state_reason_data.clone();
+        stored.alarm.state_updated_timestamp = Some(crate::state::to_timestamp(now));
+        if changed {
+            stored.alarm.state_transitioned_timestamp = Some(crate::state::to_timestamp(now));
+        }
+
+        store.record_history(
+            &input.alarm_name,
+            now,
+            AlarmHistoryItem {
+                alarm_name: Some(input.alarm_name.clone()),
+                alarm_contributor_id: None,
+                alarm_type: Some("MetricAlarm".to_string()),
+                timestamp: Some(crate::state::to_timestamp(now)),
+                history_item_type: Some("StateUpdate".to_string()),
+                history_summary: Some(format!(
+                    "Alarm updated from state to {}",
+                    input.state_value
+                )),
+                history_data: input.state_reason_data.clone(),
+                alarm_contributor_attributes: None,
+            },
+        );
+
+        Ok(SetAlarmStateOutput)
     }
 }
