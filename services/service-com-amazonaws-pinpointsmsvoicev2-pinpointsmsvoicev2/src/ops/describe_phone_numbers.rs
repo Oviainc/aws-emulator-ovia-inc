@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePhoneNumbers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePhoneNumbers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePhoneNumbers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a pure read of the phone numbers persisted in [`crate::state`], in a
+//! stable order, narrowed by `PhoneNumberIds` and `Filters` and paged by `MaxResults` /
+//! `NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +90,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The prefix every `NextToken` this operation issues carries, and which one it accepts
+/// must carry. `NextToken` is modelled only as `len 1..1024, pattern ^.+$`, so the shape
+/// of the cursor is this service's own: the prefix makes it self-identifying, and a token
+/// without it is refused whatever offset it encodes.
+const NEXT_TOKEN_PREFIX: &str = "pnlist-";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -167,18 +168,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePhoneNumbers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePhoneNumbersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePhoneNumbers"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribePhoneNumbersErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the phone-number store is unavailable".to_string()),
+                    request_id: None,
+                },
+            )
+            .into());
+        };
+        // A describe reports; it never writes. The guard is taken read-only.
+        let state = store.lock();
+
+        // `PhoneNumberIds` SELECTS: each entry must name a stored number, by id or ARN.
+        // Everything else lists the whole account in the store's stable key order.
+        let selected: Vec<&crate::state::PhoneNumberRecord> = match input.phone_number_ids {
+            Some(ref ids) if !ids.is_empty() => {
+                let mut records = Vec::with_capacity(ids.len());
+                for id in ids {
+                    let Some(record) = state.find_phone_number(id) else {
+                        return Err(
+                            DescribePhoneNumbersErrorModeled::ResourceNotFoundException(
+                                ResourceNotFoundException {
+                                    message: Some(format!("phone number {id} not found")),
+                                    resource_type: Some("phone-number".to_string()),
+                                    resource_id: Some(id.clone()),
+                                },
+                            )
+                            .into(),
+                        );
+                    };
+                    records.push(record);
+                }
+                records
+            }
+            _ => state.phone_numbers.values().collect(),
+        };
+
+        // `Owner` narrows to the numbers this account leases (`SELF`) or ones another
+        // account shared with it (`SHARED`). This emulator holds no shared numbers, so
+        // `SHARED` matches nothing; absent means no narrowing.
+        let selected: Vec<&crate::state::PhoneNumberRecord> = match input.owner.as_deref() {
+            Some("SHARED") => Vec::new(),
+            _ => selected,
+        };
+
+        // Every filter must match (AND); within one filter any value matches (OR).
+        let filters = input.filters.unwrap_or_default();
+        let matching: Vec<&crate::state::PhoneNumberRecord> = selected
+            .into_iter()
+            .filter(|record| {
+                filters.iter().all(|filter| {
+                    record
+                        .filterable(&filter.name)
+                        .is_some_and(|actual| {
+                            actual.iter().any(|value| filter.values.contains(value))
+                        })
+                })
+            })
+            .collect();
+
+        // `NextToken` is this emulator's own cursor: the index into the order above at
+        // which the next page starts, behind a prefix only this handler mints. The prefix
+        // is what makes a fabricated token refusable whatever its value, so a client
+        // cannot drive paging with an offset it made up.
+        let start = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => match token
+                .strip_prefix(NEXT_TOKEN_PREFIX)
+                .and_then(|offset| usize::from_str_radix(offset, 16).ok())
+            {
+                Some(offset) => offset,
+                None => {
+                    return Err(DescribePhoneNumbersErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some("NextToken is not a cursor this service issued".to_string()),
+                            reason: Some("INVALID_NEXT_TOKEN".to_string()),
+                            fields: Some(vec![ValidationExceptionField {
+                                name: "NextToken".to_string(),
+                                message: "not a cursor this service issued".to_string(),
+                            }]),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        if start > matching.len() {
+            return Err(DescribePhoneNumbersErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some("NextToken points past the end of the result set".to_string()),
+                    reason: Some("INVALID_NEXT_TOKEN".to_string()),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "NextToken".to_string(),
+                        message: "points past the end of the result set".to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // `MaxResults` caps one page; absent, the whole remainder is returned.
+        let page_size = input
+            .max_results
+            .map_or(matching.len(), |max| usize::try_from(max).unwrap_or(0));
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page: Vec<PhoneNumberInformation> = matching[start..end]
+            .iter()
+            .copied()
+            .map(phone_number_information)
+            .collect();
+        let next_token = (end < matching.len()).then(|| format!("{NEXT_TOKEN_PREFIX}{end:08x}"));
+
+        Ok(DescribePhoneNumbersOutput {
+            phone_numbers: Some(page),
+            next_token,
+        })
+    }
+}
+
+/// One stored number as the modelled `PhoneNumberInformation`, every member read from
+/// the record.
+fn phone_number_information(
+    record: &crate::state::PhoneNumberRecord,
+) -> PhoneNumberInformation {
+    PhoneNumberInformation {
+        phone_number_arn: record.arn.clone(),
+        phone_number_id: Some(record.id.clone()),
+        phone_number: record.phone_number.clone(),
+        status: record.status.clone(),
+        iso_country_code: record.iso_country_code.clone(),
+        message_type: record.message_type.clone(),
+        number_capabilities: record.number_capabilities.clone(),
+        number_type: record.number_type.clone(),
+        monthly_leasing_price: record.monthly_leasing_price.clone(),
+        two_way_enabled: record.two_way_enabled,
+        two_way_channel_arn: record.two_way_channel_arn.clone(),
+        two_way_channel_role: record.two_way_channel_role.clone(),
+        self_managed_opt_outs_enabled: record.self_managed_opt_outs_enabled,
+        opt_out_list_name: record.opt_out_list_name.clone(),
+        international_sending_enabled: record.international_sending_enabled,
+        deletion_protection_enabled: record.deletion_protection_enabled,
+        pool_id: record.pool_id.clone(),
+        registration_id: record.registration_id.clone(),
+        // Per-number messaging limits and pricing tier are not modelled by this slice.
+        messaging_limits: None,
+        pricing_tier: None,
+        created_timestamp: crate::state::to_timestamp(record.created_timestamp),
     }
 }

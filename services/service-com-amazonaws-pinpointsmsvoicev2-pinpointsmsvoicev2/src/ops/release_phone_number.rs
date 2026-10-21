@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReleasePhoneNumber
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReleasePhoneNumber`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReleasePhoneNumber::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the number from [`crate::state`] and answers from the record it
+//! removed. An unknown id is a `ResourceNotFoundException`; a number with deletion
+//! protection on is a `ConflictException` and stays leased.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +184,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReleasePhoneNumber` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReleasePhoneNumberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReleasePhoneNumber"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ReleasePhoneNumberErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the phone-number store is unavailable".to_string()),
+                    request_id: None,
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+
+        // `PhoneNumberId` is a `PhoneNumberIdOrArn`, so resolve the id the store is
+        // keyed by before removing anything.
+        let Some(id) = state
+            .find_phone_number(&input.phone_number_id)
+            .map(|record| record.id.clone())
+        else {
+            return Err(ReleasePhoneNumberErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("phone number {} not found", input.phone_number_id)),
+                    resource_type: Some("phone-number".to_string()),
+                    resource_id: Some(input.phone_number_id),
+                },
+            )
+            .into());
+        };
+
+        // Deletion protection refuses the release and leaves the lease in place.
+        if state.phone_numbers[&id].deletion_protection_enabled {
+            return Err(ReleasePhoneNumberErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "phone number {id} has deletion protection enabled and cannot be released"
+                    )),
+                    reason: Some("DELETION_PROTECTION_ENABLED".to_string()),
+                    resource_type: Some("phone-number".to_string()),
+                    resource_id: Some(id),
+                },
+            )
+            .into());
+        }
+
+        let released = state
+            .phone_numbers
+            .remove(&id)
+            .expect("the phone number resolved above is present");
+        // The number is gone, so the idempotency entry that points at it is dead
+        // bookkeeping: drop it with the resource rather than retaining it forever.
+        state.forget_client_tokens_for(crate::state::REQUEST_PHONE_NUMBER, &released.id);
+
+        Ok(ReleasePhoneNumberOutput {
+            phone_number_arn: Some(released.arn),
+            phone_number_id: Some(released.id),
+            phone_number: Some(released.phone_number),
+            status: Some(released.status),
+            iso_country_code: Some(released.iso_country_code),
+            message_type: Some(released.message_type),
+            number_capabilities: Some(released.number_capabilities),
+            number_type: Some(released.number_type),
+            monthly_leasing_price: Some(released.monthly_leasing_price),
+            two_way_enabled: released.two_way_enabled,
+            two_way_channel_arn: released.two_way_channel_arn,
+            two_way_channel_role: released.two_way_channel_role,
+            self_managed_opt_outs_enabled: released.self_managed_opt_outs_enabled,
+            opt_out_list_name: Some(released.opt_out_list_name),
+            registration_id: released.registration_id,
+            created_timestamp: Some(crate::state::to_timestamp(released.created_timestamp)),
+        })
     }
 }

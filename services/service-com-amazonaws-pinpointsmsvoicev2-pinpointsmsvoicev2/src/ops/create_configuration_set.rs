@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfigurationSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfigurationSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfigurationSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores a new configuration set in [`crate::state`] and answers from the
+//! stored record. A repeat of the same name is a `ConflictException`; a repeat of the
+//! same `ClientToken` returns the record that token already created.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +164,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfigurationSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConfigurationSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfigurationSet"))
+        let region = crate::state::request_region(ctx);
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateConfigurationSetErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the configuration-set store is unavailable".to_string()),
+                    request_id: None,
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+
+        let name = input.configuration_set_name.clone();
+        // The request this `ClientToken` is scoped to: every member that shapes the set.
+        let mut fingerprinted: Vec<String> = vec![name.clone()];
+        for tag in input.tags.iter().flatten() {
+            fingerprinted.push(format!("{}={}", tag.key, tag.value));
+        }
+        let fingerprint = crate::state::request_fingerprint(
+            &fingerprinted.iter().map(String::as_str).collect::<Vec<&str>>(),
+        );
+
+        // Idempotency: the same `ClientToken` must not create a second set. Answer from
+        // the record that token already created, so a retried request is a read. A token
+        // replayed with a DIFFERENT request is a different request, which AWS does not
+        // answer idempotently, so it is refused.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(seen) = state.client_token_record(Self::NAME, token).cloned() {
+                if seen.fingerprint != fingerprint {
+                    return Err(CreateConfigurationSetErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "ClientToken was already used for a different CreateConfigurationSet request"
+                                    .to_string(),
+                            ),
+                            reason: Some("INVALID_PARAMETER".to_string()),
+                            fields: Some(vec![ValidationExceptionField {
+                                name: "ClientToken".to_string(),
+                                message: "already used for a different request".to_string(),
+                            }]),
+                        },
+                    )
+                    .into());
+                }
+                if let Some(existing) = state.configuration_sets.get(&seen.resource) {
+                    return Ok(configuration_set_output(existing));
+                }
+            }
+        }
+
+        if state.configuration_sets.contains_key(&name) {
+            return Err(CreateConfigurationSetErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!("configuration set {name} already exists")),
+                    reason: Some("RESOURCE_ALREADY_EXISTS".to_string()),
+                    resource_type: Some("configuration-set".to_string()),
+                    resource_id: Some(name),
+                },
+            )
+            .into());
+        }
+
+        // The per-account quota bounds this store: past it the create is refused, so a
+        // loop of creates cannot grow the emulator's memory without limit.
+        if state.configuration_sets.len() >= crate::state::MAX_CONFIGURATION_SETS_PER_ACCOUNT {
+            return Err(
+                CreateConfigurationSetErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "the account already holds {} configuration sets",
+                            crate::state::MAX_CONFIGURATION_SETS_PER_ACCOUNT
+                        )),
+                        reason: Some("CONFIGURATION_SETS_PER_ACCOUNT".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = crate::state::ConfigurationSet {
+            arn: ::emulator_server::emulator_arn(
+                crate::state::SIGNING_NAME,
+                &region,
+                &format!("configuration-set/{name}"),
+            ),
+            name: name.clone(),
+            tags: input.tags.unwrap_or_default(),
+            created_timestamp: ::std::time::SystemTime::now(),
+            default_message_type: None,
+            default_sender_id: None,
+            default_message_feedback_enabled: false,
+            event_destinations: Vec::new(),
+        };
+        state.configuration_sets.insert(name.clone(), record);
+        if let Some(token) = input.client_token.as_deref() {
+            state.remember_client_token(Self::NAME, token, &name, fingerprint);
+        }
+
+        // Read the response back out of the store: what the caller sees is what was
+        // persisted, not what was passed in.
+        let stored = state
+            .configuration_sets
+            .get(&name)
+            .expect("the configuration set just inserted is present");
+        Ok(configuration_set_output(stored))
+    }
+}
+
+/// The response for one stored configuration set, every member read from the record.
+fn configuration_set_output(
+    record: &crate::state::ConfigurationSet,
+) -> CreateConfigurationSetOutput {
+    CreateConfigurationSetOutput {
+        configuration_set_arn: Some(record.arn.clone()),
+        configuration_set_name: Some(record.name.clone()),
+        // `Tags` is optional and AWS omits it when the resource carries none.
+        tags: (!record.tags.is_empty()).then(|| record.tags.clone()),
+        created_timestamp: Some(crate::state::to_timestamp(record.created_timestamp)),
     }
 }

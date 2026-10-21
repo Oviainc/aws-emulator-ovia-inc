@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RequestPhoneNumber
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RequestPhoneNumber`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RequestPhoneNumber::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints an origination phone number, PERSISTS it in [`crate::state`] and
+//! answers from the stored record, so `DescribePhoneNumbers` / `ReleasePhoneNumber` see
+//! the same number. A repeat of the same `ClientToken` returns the number that token
+//! already minted rather than leasing a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -231,18 +227,180 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RequestPhoneNumber` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RequestPhoneNumberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RequestPhoneNumber"))
+        let region = crate::state::request_region(ctx);
+
+        // `NumberPreference` asks the service to pick a number matching a pattern out of
+        // its available inventory. This emulator has no inventory to select from, so it
+        // cannot satisfy such a request; refuse it rather than hand back a number that
+        // does not match what was asked for.
+        if input.number_preference.is_some() {
+            return Err(RequestPhoneNumberErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "NumberPreference is not supported: this emulator mints a synthetic \
+                         number and has no number inventory to select from"
+                            .to_string(),
+                    ),
+                    reason: Some("INVALID_PARAMETER".to_string()),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "NumberPreference".to_string(),
+                        message: "no selectable number inventory exists".to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(RequestPhoneNumberErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the phone-number store is unavailable".to_string()),
+                    request_id: None,
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+
+        let token_key = input.client_token.clone();
+        // The request this `ClientToken` is scoped to: every member that shapes the lease.
+        let mut fingerprinted: Vec<String> = vec![
+            input.iso_country_code.clone(),
+            input.message_type.clone(),
+            input.number_capabilities.join(","),
+            input.number_type.clone(),
+            input.opt_out_list_name.clone().unwrap_or_default(),
+            input.pool_id.clone().unwrap_or_default(),
+            input.registration_id.clone().unwrap_or_default(),
+            input.international_sending_enabled.unwrap_or(false).to_string(),
+            input.deletion_protection_enabled.unwrap_or(false).to_string(),
+        ];
+        for tag in input.tags.iter().flatten() {
+            fingerprinted.push(format!("{}={}", tag.key, tag.value));
+        }
+        let fingerprint = crate::state::request_fingerprint(
+            &fingerprinted.iter().map(String::as_str).collect::<Vec<&str>>(),
+        );
+
+        // A replayed token answers from the number it already minted; the same token on a
+        // DIFFERENT request is a different request, which AWS does not answer
+        // idempotently, so it is refused.
+        if let Some(token) = token_key.as_deref() {
+            if let Some(seen) = state.client_token_record(Self::NAME, token).cloned() {
+                if seen.fingerprint != fingerprint {
+                    return Err(RequestPhoneNumberErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "ClientToken was already used for a different RequestPhoneNumber request"
+                                    .to_string(),
+                            ),
+                            reason: Some("INVALID_PARAMETER".to_string()),
+                            fields: Some(vec![ValidationExceptionField {
+                                name: "ClientToken".to_string(),
+                                message: "already used for a different request".to_string(),
+                            }]),
+                        },
+                    )
+                    .into());
+                }
+                if let Some(existing) = state.phone_numbers.get(&seen.resource) {
+                    return Ok(phone_number_output(existing));
+                }
+            }
+        }
+
+        // The per-account quota bounds this store: past it the lease is refused, so a
+        // loop of requests cannot grow the emulator's memory without limit.
+        if state.phone_numbers.len() >= crate::state::MAX_PHONE_NUMBERS_PER_ACCOUNT {
+            return Err(
+                RequestPhoneNumberErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "the account already leases {} phone numbers",
+                            crate::state::MAX_PHONE_NUMBERS_PER_ACCOUNT
+                        )),
+                        reason: Some("PHONE_NUMBERS_PER_ACCOUNT".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let sequence = state.next_sequence();
+        let id = format!("phone-{sequence:032x}");
+        let record = crate::state::PhoneNumberRecord {
+            arn: ::emulator_server::emulator_arn(
+                crate::state::SIGNING_NAME,
+                &region,
+                &format!("phone-number/{id}"),
+            ),
+            id: id.clone(),
+            // A synthetic number from one reserved range, minted from the monotonic
+            // sequence so no two leases collide. It satisfies `PhoneNumber`
+            // (`^\+?[1-9][0-9]{1,18}$`); the emulator does not claim country-correct
+            // numbering, because no numbering plan is available to it.
+            phone_number: format!("+1555{sequence:07}"),
+            // The emulator provisions synchronously, so the number is handed back in the
+            // terminal `ACTIVE` state and no later transition is owed.
+            status: "ACTIVE".to_string(),
+            iso_country_code: input.iso_country_code,
+            message_type: input.message_type,
+            number_capabilities: input.number_capabilities,
+            number_type: input.number_type,
+            monthly_leasing_price: crate::state::MONTHLY_LEASING_PRICE.to_string(),
+            // Two-way messaging and self-managed opt-outs are off on a fresh lease; the
+            // model declares `false` as the default of each.
+            two_way_enabled: false,
+            two_way_channel_arn: None,
+            two_way_channel_role: None,
+            self_managed_opt_outs_enabled: false,
+            opt_out_list_name: input
+                .opt_out_list_name
+                .as_deref()
+                .map(|value| crate::state::name_from_name_or_arn(value).to_string())
+                .unwrap_or_else(|| crate::state::DEFAULT_OPT_OUT_LIST_NAME.to_string()),
+            international_sending_enabled: input.international_sending_enabled.unwrap_or(false),
+            deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
+            pool_id: input.pool_id.filter(|pool| !pool.is_empty()),
+            registration_id: input.registration_id,
+            tags: input.tags.unwrap_or_default(),
+            created_timestamp: ::std::time::SystemTime::now(),
+        };
+        state.phone_numbers.insert(id.clone(), record);
+        if let Some(token) = token_key.as_deref() {
+            state.remember_client_token(Self::NAME, token, &id, fingerprint);
+        }
+
+        let stored = state
+            .phone_numbers
+            .get(&id)
+            .expect("the phone number just inserted is present");
+        Ok(phone_number_output(stored))
+    }
+}
+
+/// The response for one stored number, every member read from the record.
+fn phone_number_output(record: &crate::state::PhoneNumberRecord) -> RequestPhoneNumberOutput {
+    RequestPhoneNumberOutput {
+        phone_number_arn: Some(record.arn.clone()),
+        phone_number_id: Some(record.id.clone()),
+        phone_number: Some(record.phone_number.clone()),
+        status: Some(record.status.clone()),
+        iso_country_code: Some(record.iso_country_code.clone()),
+        message_type: Some(record.message_type.clone()),
+        number_capabilities: Some(record.number_capabilities.clone()),
+        number_type: Some(record.number_type.clone()),
+        monthly_leasing_price: Some(record.monthly_leasing_price.clone()),
+        two_way_enabled: record.two_way_enabled,
+        two_way_channel_arn: record.two_way_channel_arn.clone(),
+        two_way_channel_role: record.two_way_channel_role.clone(),
+        self_managed_opt_outs_enabled: record.self_managed_opt_outs_enabled,
+        opt_out_list_name: Some(record.opt_out_list_name.clone()),
+        international_sending_enabled: record.international_sending_enabled,
+        deletion_protection_enabled: record.deletion_protection_enabled,
+        pool_id: record.pool_id.clone(),
+        registration_id: record.registration_id.clone(),
+        tags: (!record.tags.is_empty()).then(|| record.tags.clone()),
+        created_timestamp: Some(crate::state::to_timestamp(record.created_timestamp)),
     }
 }

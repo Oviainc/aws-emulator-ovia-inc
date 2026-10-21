@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendTextMessage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendTextMessage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendTextMessage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves `OriginationIdentity` and `ConfigurationSetName` against
+//! [`crate::state`], mints a fresh `MessageId` and APPENDS the send to the stored message
+//! log, so a test can assert the send happened. A `DryRun` is recorded as a dry run and
+//! is not a sent message.
 //!
 //! ## Shape of an operation
 //!
@@ -206,18 +202,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendTextMessage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendTextMessageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendTextMessage"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(SendTextMessageErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the message store is unavailable".to_string()),
+                    request_id: None,
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+
+        // A send needs an origination identity: this slice leases phone numbers, so the
+        // identity must resolve to one of them (by id, ARN or E.164 number). Pools and
+        // sender ids are not held by this emulator, so no identity names one.
+        let Some(origination_identity) = input.origination_identity else {
+            return Err(SendTextMessageErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "OriginationIdentity is required: this emulator has no account \
+                         default origination identity to fall back to"
+                            .to_string(),
+                    ),
+                    reason: Some("MISSING_PARAMETER".to_string()),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "OriginationIdentity".to_string(),
+                        message: "must name a leased phone number".to_string(),
+                    }]),
+                },
+            )
+            .into());
+        };
+        if state.find_phone_number(&origination_identity).is_none() {
+            return Err(SendTextMessageErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "origination identity {origination_identity} not found"
+                    )),
+                    resource_type: Some("phone-number".to_string()),
+                    resource_id: Some(origination_identity),
+                },
+            )
+            .into());
+        }
+
+        // A named configuration set must exist. `ConfigurationSetName` is a
+        // `ConfigurationSetNameOrArn`, so resolve the name the store is keyed by first.
+        let configuration_set_name = match input.configuration_set_name.as_deref() {
+            None => None,
+            Some(named) => {
+                let name = crate::state::name_from_name_or_arn(named).to_string();
+                if !state.configuration_sets.contains_key(&name) {
+                    return Err(SendTextMessageErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!("configuration set {name} not found")),
+                            resource_type: Some("configuration-set".to_string()),
+                            resource_id: Some(name),
+                        },
+                    )
+                    .into());
+                }
+                Some(name)
+            }
+        };
+
+        // A named protect configuration must exist. This emulator holds none (protect
+        // configurations are a later slice), so any id names a resource that is absent.
+        if let Some(protect_configuration_id) = input.protect_configuration_id {
+            return Err(SendTextMessageErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "protect configuration {protect_configuration_id} not found"
+                    )),
+                    resource_type: Some("protect-configuration".to_string()),
+                    resource_id: Some(protect_configuration_id),
+                },
+            )
+            .into());
+        }
+
+        // The message type defaults to the one the number was leased for.
+        let message_type = input.message_type.or_else(|| {
+            state
+                .find_phone_number(&origination_identity)
+                .map(|record| record.message_type.clone())
+        });
+
+        let sequence = state.next_sequence();
+        let message_id = format!("{sequence:032x}");
+        // The log is a ring bounded by `state::MAX_RETAINED_MESSAGES`: `record_message`
+        // drops its oldest record to make room, so a loop of sends cannot grow the
+        // emulator's memory without limit.
+        state.record_message(crate::state::SentMessage {
+            message_id: message_id.clone(),
+            destination_phone_number: input.destination_phone_number,
+            origination_identity,
+            message_body: input.message_body,
+            message_type,
+            configuration_set_name,
+            context: input.context.unwrap_or_default(),
+            dry_run: input.dry_run,
+            sent_at: ::std::time::SystemTime::now(),
+        });
+
+        Ok(SendTextMessageOutput {
+            message_id: Some(message_id),
+        })
     }
 }
