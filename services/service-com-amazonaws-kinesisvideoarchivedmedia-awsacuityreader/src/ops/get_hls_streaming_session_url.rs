@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetHLSStreamingSessionURL
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetHLSStreamingSessionURL`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints an HLS streaming session over one stream's archive and returns the URL
+//! that resolves to it. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetHLSStreamingSessionURL::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## Behaviour
+//!
+//! * The request names exactly one stream, by `StreamName` or `StreamARN`;
+//!   neither or both is `InvalidArgumentException` (400) and a name or ARN no
+//!   stream answers to is `ResourceNotFoundException` (404).
+//! * "Data retention must be greater than 0": a stream with
+//!   `DataRetentionInHours` of 0 is `NoDataRetentionException` (400).
+//! * The documented parameter defaults are applied: `PlaybackMode` LIVE,
+//!   `FragmentSelectorType` SERVER_TIMESTAMP, `ContainerFormat`
+//!   FRAGMENTED_MP4, `DisplayFragmentTimestamp` NEVER, `DiscontinuityMode`
+//!   ALWAYS for SERVER_TIMESTAMP and NEVER for PRODUCER_TIMESTAMP, `Expires`
+//!   300 seconds, and `MaxMediaPlaylistFragmentResults` 5 for LIVE /
+//!   LIVE_REPLAY and 1000 for ON_DEMAND.
+//! * `HLSFragmentSelector` is required for ON_DEMAND and LIVE_REPLAY and must
+//!   carry a `TimestampRange`; a `TimestampRange` on a LIVE session is refused.
+//!   `EndTimestamp` is required for ON_DEMAND and optional for LIVE_REPLAY.
+//! * The session is RECORDED in state with the playlist snapshot it serves, so
+//!   two calls mint two distinct sessions. A session with no fragments to serve
+//!   — none in the requested range for ON_DEMAND / LIVE_REPLAY, none in the
+//!   last 30 seconds for LIVE — is `ResourceNotFoundException`, exactly as the
+//!   error's own documentation states.
 //!
 //! ## Shape of an operation
 //!
@@ -186,6 +201,35 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    date_time_millis, epoch_millis, service_state, SessionProtocol, StreamLookupError,
+    StreamingSession, TimestampOrigin,
+};
+use std::time::{Duration, SystemTime};
+
+/// `Expires` when the request names none: "The default is 300 (5 minutes)."
+const DEFAULT_EXPIRES_SECS: u32 = 300;
+
+/// `MaxMediaPlaylistFragmentResults` when the request names none and the
+/// playback mode is LIVE or LIVE_REPLAY: "The default is 5 fragments if
+/// PlaybackMode is LIVE or LIVE_REPLAY".
+const DEFAULT_LIVE_PLAYLIST_FRAGMENTS: usize = 5;
+
+/// `MaxMediaPlaylistFragmentResults` when the request names none and the
+/// playback mode is ON_DEMAND: "and 1,000 if PlaybackMode is ON_DEMAND".
+const DEFAULT_ON_DEMAND_PLAYLIST_FRAGMENTS: usize = 1000;
+
+/// How recent a fragment must be for a LIVE session to exist: the
+/// `ResourceNotFoundException` documentation states the error is thrown "if a
+/// session with a PlaybackMode of LIVE is requested for a stream that has no
+/// fragments within the last 30 seconds".
+const LIVE_FRAGMENT_WINDOW: Duration = Duration::from_secs(30);
+
+/// The host a session URL names when the request carries neither a `Host`
+/// header nor an authority to read the emulator's own endpoint from. A
+/// loopback literal, never a real AWS host: the session this URL names is
+/// served by this emulator.
+const LOOPBACK_HOST: &str = "127.0.0.1";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -262,18 +306,269 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetHLSStreamingSessionURL` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetHLSStreamingSessionURLErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetHLSStreamingSessionURL"))
+        let invalid = |message: String| -> Self::Error {
+            GetHLSStreamingSessionURLErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+        let not_found = |message: String| -> Self::Error {
+            GetHLSStreamingSessionURLErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        // Documented parameter defaults.
+        let playback_mode = input.playback_mode.clone().unwrap_or_else(|| "LIVE".to_string());
+        if !H_L_S_PLAYBACK_MODE_VALUES.contains(&playback_mode.as_str()) {
+            return Err(invalid(format!(
+                "PlaybackMode must be one of [{}]",
+                H_L_S_PLAYBACK_MODE_VALUES.join(", ")
+            )));
+        }
+        let selector = input.hls_fragment_selector.as_ref();
+        let origin_value = selector
+            .and_then(|s| s.fragment_selector_type.clone())
+            .unwrap_or_else(|| TimestampOrigin::Server.as_str().to_string());
+        let Some(origin) = TimestampOrigin::parse(&origin_value) else {
+            return Err(invalid(format!(
+                "HLSFragmentSelector.FragmentSelectorType must be one of [{}]",
+                H_L_S_FRAGMENT_SELECTOR_TYPE_VALUES.join(", ")
+            )));
+        };
+        let container_format = input
+            .container_format
+            .clone()
+            .unwrap_or_else(|| "FRAGMENTED_MP4".to_string());
+        if !CONTAINER_FORMAT_VALUES.contains(&container_format.as_str()) {
+            return Err(invalid(format!(
+                "ContainerFormat must be one of [{}]",
+                CONTAINER_FORMAT_VALUES.join(", ")
+            )));
+        }
+        let discontinuity_mode = input.discontinuity_mode.clone().unwrap_or_else(|| {
+            match origin {
+                TimestampOrigin::Server => "ALWAYS",
+                TimestampOrigin::Producer => "NEVER",
+            }
+            .to_string()
+        });
+        if !H_L_S_DISCONTINUITY_MODE_VALUES.contains(&discontinuity_mode.as_str()) {
+            return Err(invalid(format!(
+                "DiscontinuityMode must be one of [{}]",
+                H_L_S_DISCONTINUITY_MODE_VALUES.join(", ")
+            )));
+        }
+        let display_fragment_timestamp = input
+            .display_fragment_timestamp
+            .clone()
+            .unwrap_or_else(|| "NEVER".to_string());
+        if !H_L_S_DISPLAY_FRAGMENT_TIMESTAMP_VALUES.contains(&display_fragment_timestamp.as_str()) {
+            return Err(invalid(format!(
+                "DisplayFragmentTimestamp must be one of [{}]",
+                H_L_S_DISPLAY_FRAGMENT_TIMESTAMP_VALUES.join(", ")
+            )));
+        }
+        let expires_in_secs = input
+            .expires
+            .and_then(|secs| u32::try_from(secs).ok())
+            .unwrap_or(DEFAULT_EXPIRES_SECS);
+        let max_fragments = input
+            .max_media_playlist_fragment_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(if playback_mode == "ON_DEMAND" {
+                DEFAULT_ON_DEMAND_PLAYLIST_FRAGMENTS
+            } else {
+                DEFAULT_LIVE_PLAYLIST_FRAGMENTS
+            });
+
+        // The time range the selector asks for, checked against the playback
+        // mode's documented requirements before any state is touched.
+        let range = selector.and_then(|s| s.timestamp_range.as_ref());
+        let live = playback_mode == "LIVE";
+        if live {
+            if range.is_some() {
+                return Err(invalid(
+                    "HLSFragmentSelector.TimestampRange must not be set when PlaybackMode is LIVE"
+                        .to_string(),
+                ));
+            }
+        } else {
+            let Some(range) = range else {
+                return Err(invalid(format!(
+                    "HLSFragmentSelector with a TimestampRange is required when PlaybackMode is \
+                     {playback_mode}"
+                )));
+            };
+            if range.start_timestamp.is_none() {
+                return Err(invalid(
+                    "HLSFragmentSelector.TimestampRange.StartTimestamp is required".to_string(),
+                ));
+            }
+            if playback_mode == "ON_DEMAND" && range.end_timestamp.is_none() {
+                return Err(invalid(
+                    "HLSFragmentSelector.TimestampRange.EndTimestamp is required when PlaybackMode \
+                     is ON_DEMAND"
+                        .to_string(),
+                ));
+            }
+            // STRICTER than the `TimestampRange` of ListFragments and GetClip,
+            // which accept a single-instant range: `HLSTimestampRange`'s own
+            // documentation says the end "must be later than the StartTimestamp
+            // value", wording the other two ranges do not carry. The divergence
+            // is the model's, not an inconsistency here.
+            if let (Some(start), Some(end)) = (&range.start_timestamp, &range.end_timestamp) {
+                if date_time_millis(end) <= date_time_millis(start) {
+                    return Err(invalid(
+                        "HLSFragmentSelector.TimestampRange.EndTimestamp must be later than \
+                         StartTimestamp"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
+        let Some(state) = service_state(&*self.engine) else {
+            // See the note in `list_fragments`: unreachable in the assembled
+            // emulator, and reported as a modelled failure rather than as an
+            // empty success.
+            return Err(GetHLSStreamingSessionURLErrorModeled::ClientLimitExceededException(
+                ClientLimitExceededException {
+                    message: Some("the archived-media store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // Resolve the stream and take the playlist snapshot while the borrow of
+        // the archive is still immutable, then record the session.
+        let (stream_name, fragment_numbers) = {
+            let stream = match state
+                .resolve_stream(input.stream_name.as_deref(), input.stream_arn.as_deref())
+            {
+                Ok(stream) => stream,
+                Err(StreamLookupError::InvalidArgument(message)) => return Err(invalid(message)),
+                Err(StreamLookupError::NotFound(message)) => return Err(not_found(message)),
+            };
+
+            // "Data retention must be greater than 0."
+            if !stream.retains_data() {
+                return Err(GetHLSStreamingSessionURLErrorModeled::NoDataRetentionException(
+                    NoDataRetentionException {
+                        message: Some(format!(
+                            "Stream {} does not retain data (DataRetentionInHours is 0)",
+                            stream.name
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            let selected: Vec<String> = if live {
+                // LIVE serves the most recently INGESTED fragments and only
+                // exists while the stream head is fresh. The ordering is by
+                // server timestamp whatever `FragmentSelectorType` the request
+                // names, because that is what the selector's own documentation
+                // says of LIVE: "the most recently ingested fragments based on
+                // server timestamps are included in the HLS media playlist.
+                // This means that even if fragments ingested in the past have
+                // producer timestamps with values now, they are not included."
+                let now = SystemTime::now();
+                let window_start = epoch_millis(now - LIVE_FRAGMENT_WINDOW);
+                let fresh = stream.fragments.iter().any(|fragment| {
+                    epoch_millis(fragment.server_timestamp) >= window_start
+                });
+                if !fresh {
+                    return Err(not_found(format!(
+                        "Stream {} has no fragments within the last {} seconds",
+                        stream.name,
+                        LIVE_FRAGMENT_WINDOW.as_secs()
+                    )));
+                }
+                let mut newest: Vec<&crate::state::StoredFragment> =
+                    stream.fragments.iter().collect();
+                newest.sort_by_key(|fragment| epoch_millis(fragment.server_timestamp));
+                let skip = newest.len().saturating_sub(max_fragments);
+                newest
+                    .into_iter()
+                    .skip(skip)
+                    .map(|fragment| fragment.fragment_number.clone())
+                    .collect()
+            } else {
+                // ON_DEMAND and LIVE_REPLAY serve the oldest fragments in the
+                // requested range, up to the maximum. An unset LIVE_REPLAY
+                // EndTimestamp leaves the range open-ended.
+                let range = range.expect("checked above for the non-LIVE modes");
+                let start_millis = range
+                    .start_timestamp
+                    .as_ref()
+                    .map_or(i64::MIN, date_time_millis);
+                let end_millis = range
+                    .end_timestamp
+                    .as_ref()
+                    .map_or(i64::MAX, date_time_millis);
+                let in_range = stream.fragments_in_range(origin, start_millis, end_millis);
+                if in_range.is_empty() {
+                    return Err(not_found(format!(
+                        "Stream {} has no fragments within the requested time range",
+                        stream.name
+                    )));
+                }
+                in_range
+                    .into_iter()
+                    .take(max_fragments)
+                    .map(|fragment| fragment.fragment_number.clone())
+                    .collect()
+            };
+
+            (stream.name.clone(), selected)
+        };
+
+        // The session is a resource this call MINTS — the operation's own
+        // documentation says "Kinesis Video Streams creates an HLS streaming
+        // session to be used for accessing content in a stream" — so it is
+        // recorded, with the playlist snapshot it serves, and a second call
+        // mints a distinct one.
+        let created_at = SystemTime::now();
+        let token = state.mint_session_token(created_at);
+        state.record_session(StreamingSession {
+            token: token.clone(),
+            stream_name,
+            protocol: SessionProtocol::Hls,
+            playback_mode,
+            container_format,
+            discontinuity_mode,
+            display_fragment_timestamp,
+            fragment_numbers,
+            created_at,
+            expires_in_secs,
+        });
+
+        // The URL addresses the endpoint the CALLER reached this emulator on,
+        // read from the request itself, exactly as the real service answers on
+        // its own data endpoint. It deliberately names no real AWS host: this
+        // emulator serves the playback session, so a player or test that
+        // follows the URL must come back here and must never be sent to the
+        // real service.
+        let host = ctx
+            .parts()
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .or_else(|| ctx.parts().uri.host())
+            .unwrap_or(LOOPBACK_HOST)
+            .to_string();
+        Ok(GetHLSStreamingSessionURLOutput {
+            hls_streaming_session_url: Some(format!(
+                "https://{host}/{}/v1/getHLSMasterPlaylist.m3u8?SessionToken={token}",
+                SessionProtocol::Hls.url_prefix()
+            )),
+        })
     }
 }
