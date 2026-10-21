@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGroupResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGroupResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGroupResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the group's static memberships — the ARNs `GroupResources` recorded, minus any
+//! removed — from [`crate::state`], in ARN order, as both `Resources` and the deprecated
+//! `ResourceIdentifiers`. A page carries at most `MaxResults` members and, when more
+//! remain, a `NextToken` the next call resumes after.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +190,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGroupResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGroupResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGroupResources"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` and `UnauthorizedException` are deliberately
+        // unreachable here and a success says nothing about the caller's permissions.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListGroupResourcesErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the resource-groups store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // Neither member is `@required`, but the operation addresses exactly one
+        // group, so a request naming none cannot be served. `Group` wins over the
+        // deprecated `GroupName`, and the one identifier resolved here is the one
+        // every answer below names.
+        let Some(identifier) = input.group.as_deref().or(input.group_name.as_deref()) else {
+            return Err(bad_request(
+                "the request must name the group to list, in Group or GroupName",
+            ));
+        };
+
+        let filters = input.filters.unwrap_or_default();
+        for filter in &filters {
+            if filter.name != "resource-type" {
+                return Err(bad_request(format!(
+                    "Filters contains the filter name {}, which is not valid: expected one of {}",
+                    filter.name,
+                    RESOURCE_FILTER_NAME_VALUES.join(", "),
+                )));
+            }
+        }
+
+        let store = state.lock();
+        let not_found = || {
+            ListGroupResourcesError::from(ListGroupResourcesErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!("no group found with the identifier {identifier}")),
+                },
+            ))
+        };
+        let name = store.lookup(identifier).ok_or_else(not_found)?;
+        let group = store.groups.get(&name).ok_or_else(not_found)?;
+
+        // The token is this service's own opaque encoding of the ARN the previous
+        // page stopped at, scoped to THIS listing of THIS group; anything else
+        // cannot name a resume point in it.
+        let listing = listing_of(&name);
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => match crate::state::decode_page_token(&listing, token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(bad_request(
+                        "NextToken is not valid: it was not issued by a previous \
+                         ListGroupResources call for this group",
+                    ))
+                }
+            },
+        };
+
+        let mut remaining: Vec<&crate::state::MemberRecord> = group
+            .members
+            .iter()
+            .filter(|member| filters.iter().all(|filter| matches_filter(member, filter)))
+            .collect();
+        // The listing order is ARN order, which is what the resume key below is
+        // compared against. The store keeps memberships sorted, and sorting here as
+        // well keeps this page correct whatever order it is handed.
+        remaining.sort_by(|left, right| left.resource_arn.cmp(&right.resource_arn));
+        if let Some(resume) = resume_after.as_deref() {
+            remaining.retain(|member| member.resource_arn.as_str() > resume);
+        }
+        let page_size = page_size(input.max_results)?.min(remaining.len());
+        let page = &remaining[..page_size];
+        let next_token = (page.len() < remaining.len())
+            .then(|| {
+                page.last()
+                    .map(|member| crate::state::encode_page_token(&listing, &member.resource_arn))
+            })
+            .flatten();
+
+        Ok(ListGroupResourcesOutput {
+            resources: Some(page.iter().map(|member| member.to_item()).collect()),
+            // Deprecated in favour of `Resources`, and reported from the same page so
+            // the two cannot disagree.
+            resource_identifiers: Some(page.iter().map(|member| member.to_identifier()).collect()),
+            next_token,
+            // `QueryErrors` reports what went wrong while RUNNING a group's query;
+            // listing recorded memberships runs none.
+            query_errors: None,
+        })
     }
+}
+
+/// The listing one group's pagination tokens belong to: a token issued here
+/// resumes THIS listing of THAT group, and no other.
+fn listing_of(group_name: &str) -> String {
+    format!("group-resources/{group_name}")
+}
+
+/// The largest page the modelled `MaxResults` can ask for (`range 1..50`), and the
+/// page size used when the caller asks for none: the model documents the absent
+/// case as "defaults to a value that is specific to the operation", and answering
+/// at the modelled maximum bounds the response and keeps the `NextToken` loop
+/// working the same way whether or not `MaxResults` was sent.
+const MAX_RESULTS: usize = 50;
+
+/// How many memberships one page carries, from the caller's `MaxResults`.
+///
+/// The framework refuses a value outside the modelled range before this handler
+/// runs; checking it again here keeps the conversion lossless rather than letting
+/// a negative value wrap into "every membership".
+fn page_size(max_results: Option<i32>) -> Result<usize, ListGroupResourcesError> {
+    match max_results {
+        None => Ok(MAX_RESULTS),
+        Some(max) => usize::try_from(max)
+            .ok()
+            .filter(|size| (1..=MAX_RESULTS).contains(size))
+            .ok_or_else(|| {
+                bad_request(format!(
+                    "MaxResults {max} is not valid: it must be between 1 and {MAX_RESULTS}"
+                ))
+            }),
+    }
+}
+
+/// Whether `member` satisfies one `resource-type` `ResourceFilter`: its derived
+/// CloudFormation-style resource type equals one of the filter's values. A member
+/// whose type is unknown matches no value.
+fn matches_filter(member: &crate::state::MemberRecord, filter: &ResourceFilter) -> bool {
+    member
+        .resource_type
+        .as_ref()
+        .is_some_and(|resource_type| filter.values.contains(resource_type))
+}
+
+/// A `BadRequestException` (HTTP 400) — the modelled refusal for a request whose
+/// parameters violate this operation's validation rules.
+fn bad_request(message: impl Into<String>) -> ListGroupResourcesError {
+    ListGroupResourcesErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }
