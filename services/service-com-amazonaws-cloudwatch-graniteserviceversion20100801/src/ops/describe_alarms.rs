@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAlarms
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAlarms`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAlarms::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the alarms this service's store holds. Implemented here — this is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -132,10 +125,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `DescribeAlarmsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#DescribeAlarms")]
+//
+// `InternalServiceFault` is widened in: it is THIS service's own server fault (every
+// metric operation declares it), and it is the only honest answer when the shared store
+// cannot be reached. Reporting that as a 4xx would tell the caller to fix its request.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#DescribeAlarms",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeAlarmsErrorModeled {
     InvalidNextToken(InvalidNextToken),
+    InternalServiceFault(InternalServiceFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -189,18 +190,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAlarms` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAlarmsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAlarms"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAlarmsErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch alarm store is unavailable".into()),
+            })
+        })?;
+
+        // `MaxRecords` is modelled `range 1..100`, so 100 is the most a caller can ask for
+        // and the only default that cannot exceed what the model permits.
+        const MAX_RECORDS_CAP: i32 = 100;
+        // "If you omit this parameter, only metric alarms are returned, even if composite
+        // alarms or log alarms exist in the account." (DescribeAlarmsInput$AlarmTypes)
+        const DEFAULT_ALARM_TYPE: &str = "MetricAlarm";
+
+        let names: &[String] = input.alarm_names.as_deref().unwrap_or_default();
+        if !names.is_empty() && input.alarm_name_prefix.is_some() {
+            // "If this parameter is specified, you cannot specify AlarmNames."
+            // (DescribeAlarmsInput$AlarmNamePrefix)
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "AlarmNamePrefix cannot be combined with AlarmNames",
+            ));
+        }
+
+        // A `NextToken` is refused on EVERY path, including the relationship paths below,
+        // so whether a bogus token is rejected never depends on which filter was used.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                DescribeAlarmsErrorModeled::InvalidNextToken(InvalidNextToken {
+                    message: Some("NextToken is not a token this service issued".into()),
+                })
+            })?),
+        };
+
+        // "If you specify ChildrenOfAlarmName, you cannot specify any other parameters in
+        // the request except for MaxRecords and NextToken" — likewise ParentsOfAlarmName.
+        let relationship = input
+            .children_of_alarm_name
+            .as_deref()
+            .map(|_| "ChildrenOfAlarmName")
+            .or_else(|| {
+                input
+                    .parents_of_alarm_name
+                    .as_deref()
+                    .map(|_| "ParentsOfAlarmName")
+            });
+        if let Some(member) = relationship {
+            let others = !names.is_empty()
+                || input.alarm_name_prefix.is_some()
+                || input.alarm_types.is_some()
+                || input.state_value.is_some()
+                || input.action_prefix.is_some()
+                || (input.children_of_alarm_name.is_some()
+                    && input.parents_of_alarm_name.is_some());
+            if others {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "{member} cannot be combined with any parameter other than MaxRecords and \
+                     NextToken"
+                )));
+            }
+            // Both members describe composite-alarm relationships, which are carried by a
+            // composite alarm's `AlarmRule`. No composite alarm can exist yet
+            // (`PutCompositeAlarm` is still scaffolded), so no alarm is a child or a parent.
+            return Ok(DescribeAlarmsOutput {
+                composite_alarms: Some(Vec::new()),
+                metric_alarms: Some(Vec::new()),
+                log_alarms: Some(Vec::new()),
+                next_token: None,
+            });
+        }
+
+        let wants_metric_alarms = input
+            .alarm_types
+            .as_deref()
+            .is_none_or(|types| types.iter().any(|kind| kind == DEFAULT_ALARM_TYPE));
+
+        let store = state.lock();
+        let mut matching: Vec<(&String, &crate::state::StoredAlarm)> = if wants_metric_alarms {
+            store
+                .alarms
+                .iter()
+                .filter(|(name, stored)| {
+                    let alarm = &stored.alarm;
+                    let name = name.as_str();
+                    if !names.is_empty() && !names.iter().any(|wanted| wanted == name) {
+                        return false;
+                    }
+                    if input
+                        .alarm_name_prefix
+                        .as_deref()
+                        .is_some_and(|prefix| !name.starts_with(prefix))
+                    {
+                        return false;
+                    }
+                    if input
+                        .state_value
+                        .as_deref()
+                        .is_some_and(|wanted| alarm.state_value.as_deref() != Some(wanted))
+                    {
+                        return false;
+                    }
+                    if let Some(prefix) = input.action_prefix.as_deref() {
+                        // "only those alarms that use a certain alarm action"
+                        // (DescribeAlarmsInput$ActionPrefix)
+                        let uses = [
+                            &alarm.ok_actions,
+                            &alarm.alarm_actions,
+                            &alarm.insufficient_data_actions,
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .any(|action| action.starts_with(prefix));
+                        if !uses {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // The store KEY is the alarm's identity (`PutMetricAlarm` writes an alarm under its
+        // own name and the name is `length 1..255`, so the key is never empty), so it is
+        // both the stable paging order and the cursor: a token names the alarm the next page
+        // starts at and therefore always advances.
+        matching.sort_by(|left, right| left.0.cmp(right.0));
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => matching.partition_point(|(name, _)| name.as_str() < cursor),
+        };
+        let page = matching.get(from..).unwrap_or_default();
+
+        let limit = usize::try_from(
+            input
+                .max_records
+                .unwrap_or(MAX_RECORDS_CAP)
+                .clamp(1, MAX_RECORDS_CAP),
+        )
+        .unwrap_or(1);
+        let next_token = page
+            .get(limit)
+            .map(|(name, _)| crate::state::encode_page_token(name));
+
+        Ok(DescribeAlarmsOutput {
+            // No composite or log alarm can exist yet: `PutCompositeAlarm` and
+            // `PutLogAlarm` are still scaffolded, so nothing has created one.
+            composite_alarms: Some(Vec::new()),
+            metric_alarms: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|(_, stored)| stored.alarm.clone())
+                    .collect(),
+            ),
+            log_alarms: Some(Vec::new()),
+            next_token,
+        })
     }
 }

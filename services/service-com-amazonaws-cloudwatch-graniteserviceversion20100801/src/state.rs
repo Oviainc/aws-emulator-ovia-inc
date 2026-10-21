@@ -1,11 +1,116 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-cloudwatch-graniteserviceversion20100801 service.
+//!
+//! Two stores plus the helpers the metric and alarm handlers share:
+//!
+//! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::metrics`] — the ingested
+//!   time series, keyed by (namespace, metric name, normalised dimension set), exactly as
+//!   `PutMetricData` creates them and `ListMetrics` / `GetMetricStatistics` read them back.
+//! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::alarms`] and
+//!   [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::alarm_history`] — the
+//!   metric-alarm lifecycle written by `PutMetricAlarm` / `SetAlarmState` / `DeleteAlarms`
+//!   and read by `DescribeAlarms`.
+//!
+//! An alarm is stored as the modelled [`MetricAlarm`] shape itself rather than a parallel
+//! record, so every member `PutMetricAlarm` accepts round-trips through `DescribeAlarms`
+//! without a field-by-field copy that can silently drop one.
+
+use std::collections::{BTreeMap, HashMap};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::ops::types::{AlarmHistoryItem, Dimension, MetricAlarm, Tag};
+
+/// A dimension set, normalised: dimension name to value, ordered by name, so the same set
+/// keys the same time series whatever order a request listed it in.
+pub type DimensionSet = BTreeMap<String, String>;
+
+/// The identity of one CloudWatch time series.
+///
+/// CloudWatch treats the dimension set as part of the metric's identity ("a metric is
+/// uniquely defined by a name, a namespace, and zero or more dimensions"), which is why the
+/// dimensions are in the key rather than on the datum.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MetricKey {
+    /// The metric's namespace.
+    pub namespace: String,
+    /// The metric's name.
+    pub metric_name: String,
+    /// The metric's normalised dimension set.
+    pub dimensions: DimensionSet,
+}
+
+/// One stored observation of a time series.
+///
+/// Every `PutMetricData` form folds into these four aggregate fields, so
+/// `GetMetricStatistics` has a single aggregation path:
+///
+/// * a plain `Value` becomes `sample_count = 1`, `sum = minimum = maximum = value`;
+/// * a `StatisticValues` statistic set is stored as given;
+/// * each entry of `Values`/`Counts` becomes its own datum with `sample_count = count`,
+///   `sum = value * count` and `minimum = maximum = value`, which keeps the individual
+///   published values recoverable for percentile statistics.
+#[derive(Debug, Clone)]
+pub struct StoredDatum {
+    /// The observation's time stamp, as epoch seconds.
+    pub timestamp_secs: f64,
+    /// How many observations this datum stands for.
+    pub sample_count: f64,
+    /// The sum of the observations this datum stands for.
+    pub sum: f64,
+    /// The smallest of the observations this datum stands for.
+    pub minimum: f64,
+    /// The largest of the observations this datum stands for.
+    pub maximum: f64,
+    /// The unit the publisher declared, when it declared one.
+    pub unit: Option<String>,
+    /// The publisher's `StorageResolution`, in seconds (1 or 60).
+    pub storage_resolution: i32,
+}
+
+impl StoredDatum {
+    /// The one value every observation in this datum took, when that value is known.
+    ///
+    /// `GetMetricStatistics` documents exactly when a stored aggregate still yields the
+    /// individual values a percentile needs: "CloudWatch needs raw data points to calculate
+    /// percentile statistics. If you publish data using a statistic set instead, you can
+    /// only retrieve percentile statistics for this data if one of the following conditions
+    /// is true: The SampleCount value of the statistic set is 1. The Min and the Max values
+    /// of the statistic set are equal." `None` is an opaque aggregate whose individual
+    /// values were never published, so no percentile over it can be computed rather than
+    /// invented.
+    #[allow(clippy::float_cmp)]
+    pub fn single_value(&self) -> Option<f64> {
+        if self.minimum == self.maximum {
+            Some(self.minimum)
+        } else if self.sample_count == 1.0 {
+            Some(self.sum)
+        } else {
+            None
+        }
+    }
+}
+
+/// A stored metric alarm: the modelled shape `DescribeAlarms` returns, plus the tags
+/// `PutMetricAlarm` accepted (no `MetricAlarm` member carries them).
+#[derive(Debug, Clone, Default)]
+pub struct StoredAlarm {
+    /// The alarm as `DescribeAlarms` reports it.
+    pub alarm: MetricAlarm,
+    /// The tags `PutMetricAlarm` was given for this alarm.
+    pub tags: Vec<Tag>,
+}
 
 /// Per-service state for com-amazonaws-cloudwatch-graniteserviceversion20100801. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
-    // TODO: add service-specific state fields
+    /// Every time series any `PutMetricData` call has created, with its datapoints in
+    /// ingest order.
+    pub metrics: HashMap<MetricKey, Vec<StoredDatum>>,
+    /// Metric alarms by alarm name.
+    pub alarms: HashMap<String, StoredAlarm>,
+    /// Alarm history by alarm name, in append order.
+    pub alarm_history: HashMap<String, Vec<AlarmHistoryItem>>,
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -18,3 +123,151 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsCloudwatchGraniteserviceversion20100801State>)
 }
+
+/// Wall-clock now, as epoch seconds — the one clock the handlers read.
+pub fn now_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |since| since.as_secs_f64())
+}
+
+/// Epoch seconds as the modelled timestamp type.
+pub fn to_timestamp(secs: f64) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from_secs_f64(secs)
+}
+
+/// A modelled timestamp as epoch seconds.
+pub fn from_timestamp(stamp: &::aws_smithy_types::DateTime) -> f64 {
+    stamp.as_secs_f64()
+}
+
+/// Normalise a request's dimension list into the key form: later entries for one name win,
+/// and the order the request used is discarded.
+pub fn dimension_set(dimensions: Option<&[Dimension]>) -> DimensionSet {
+    dimensions
+        .into_iter()
+        .flatten()
+        .map(|dimension| (dimension.name.clone(), dimension.value.clone()))
+        .collect()
+}
+
+/// Render a stored dimension set back as the modelled list, ordered by dimension name.
+pub fn dimension_list(dimensions: &DimensionSet) -> Vec<Dimension> {
+    dimensions
+        .iter()
+        .map(|(name, value)| Dimension {
+            name: name.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+/// The region this request was signed for, defaulting to the emulator's own default region
+/// when the request carries no SigV4 credential scope.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
+}
+
+/// The region an unsigned request is answered in.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// A metric alarm's ARN: `arn:aws:cloudwatch:<region>:<account>:alarm:<AlarmName>`.
+pub fn alarm_arn(region: &str, alarm_name: &str) -> String {
+    ::engine::emulator_arn("cloudwatch", region, &format!("alarm:{alarm_name}"))
+}
+
+/// Encode a pagination cursor — the key the NEXT page starts at — as an opaque token.
+///
+/// Hex keeps the token opaque to the caller and, unlike the bare key, makes a token the
+/// service did not mint detectable, which is what lets a paginating operation refuse a
+/// malformed `NextToken` instead of silently treating it as a key.
+pub fn encode_page_token(start_at: &str) -> String {
+    ::hex::encode(start_at.as_bytes())
+}
+
+/// Decode a pagination cursor minted by [`encode_page_token`]; `None` for anything else.
+pub fn decode_page_token(token: &str) -> Option<String> {
+    String::from_utf8(::hex::decode(token).ok()?).ok()
+}
+
+/// The largest number of distinct time series this in-memory store holds.
+///
+/// A capacity bound, not an AWS quota: the store lives in this process's memory, so the
+/// number of series a caller can create has to be finite. `PutMetricData` answers
+/// `LimitExceededFault` rather than growing without limit once it is reached; appending to
+/// a series that already exists is unaffected.
+pub const MAX_SERIES: usize = 20_000;
+
+/// The largest number of datapoints retained per series. Reaching it evicts the OLDEST
+/// datapoints, the same direction CloudWatch's own retention ages data out in, so a
+/// long-running emulator's memory stays bounded while recent reads stay exact.
+pub const MAX_DATAPOINTS_PER_SERIES: usize = 50_000;
+
+/// CloudWatch's published alarm quota: 5,000 alarms per Region per account — which is also
+/// what `LimitExceededFault` ("The quota for alarms for this customer has already been
+/// reached") reports on `PutMetricAlarm`.
+pub const MAX_ALARMS: usize = 5_000;
+
+/// The largest number of history items retained per alarm. Reaching it evicts the OLDEST,
+/// so repeated configuration or state updates cannot grow memory without limit.
+pub const MAX_HISTORY_ITEMS_PER_ALARM: usize = 1_000;
+
+/// How long an alarm history item is retained: CloudWatch keeps alarm history for 14 days.
+pub const ALARM_HISTORY_RETENTION_SECS: f64 = 14.0 * 24.0 * 60.0 * 60.0;
+
+impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
+    /// Append `data` to the series `key` names, creating it when it does not exist.
+    ///
+    /// `Err(())` when the store already holds [`MAX_SERIES`] series and `key` names a new
+    /// one; the caller turns that into its own modelled limit error. The series is trimmed
+    /// to [`MAX_DATAPOINTS_PER_SERIES`], oldest first.
+    pub fn append_datapoints(
+        &mut self,
+        key: MetricKey,
+        data: Vec<StoredDatum>,
+    ) -> Result<(), AtCapacity> {
+        let at_capacity = self.metrics.len() >= MAX_SERIES;
+        let series = match self.metrics.entry(key) {
+            std::collections::hash_map::Entry::Occupied(series) => series.into_mut(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                if at_capacity {
+                    return Err(AtCapacity);
+                }
+                slot.insert(Vec::new())
+            }
+        };
+        series.extend(data);
+        if series.len() > MAX_DATAPOINTS_PER_SERIES {
+            series.drain(..series.len() - MAX_DATAPOINTS_PER_SERIES);
+        }
+        Ok(())
+    }
+
+    /// Record an alarm history item, so `DescribeAlarmHistory` can be layered on later
+    /// without re-plumbing the writers.
+    ///
+    /// The alarm's history is bounded on every append: items past the 14-day retention
+    /// window the service documents are dropped (an expiry the clock already made due), and
+    /// what remains is trimmed to [`MAX_HISTORY_ITEMS_PER_ALARM`], oldest first.
+    pub fn record_history(&mut self, alarm_name: &str, now_secs: f64, item: AlarmHistoryItem) {
+        let history = self
+            .alarm_history
+            .entry(alarm_name.to_string())
+            .or_default();
+        history.retain(|item| {
+            item.timestamp
+                .as_ref()
+                .is_none_or(|stamp| now_secs - from_timestamp(stamp) <= ALARM_HISTORY_RETENTION_SECS)
+        });
+        history.push(item);
+        if history.len() > MAX_HISTORY_ITEMS_PER_ALARM {
+            history.drain(..history.len() - MAX_HISTORY_ITEMS_PER_ALARM);
+        }
+    }
+}
+
+/// The store cannot hold another resource of this kind; the caller answers with its own
+/// modelled limit error.
+#[derive(Debug, Clone, Copy)]
+pub struct AtCapacity;
