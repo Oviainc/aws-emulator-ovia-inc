@@ -21,6 +21,8 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Codec for the opaque `NextToken` the List* operations hand out (see `src/state.rs`).
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -28,6 +30,8 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `time` for the clock-due start-transition test's `tokio::time::sleep`.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

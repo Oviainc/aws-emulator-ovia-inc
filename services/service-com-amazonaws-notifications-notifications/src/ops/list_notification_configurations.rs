@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListNotificationConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListNotificationConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListNotificationConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `NotificationConfigurationStructure` per stored configuration,
+//! newest first, narrowed by the request's filters and cut into pages of
+//! `maxResults` with an opaque resume token. A reporting operation: it never
+//! writes.
 //!
 //! ## Shape of an operation
 //!
@@ -131,6 +127,41 @@ impl From<ListNotificationConfigurationsErrorModeled> for ListNotificationConfig
     }
 }
 
+/// The page size this operation uses when a request names none: "Defaults to
+/// 20", from the `maxResults` member's own documentation. The modelled range
+/// (1..100) bounds what a request may ask for, and the boundary validator
+/// refuses anything outside it before this handler runs.
+const DEFAULT_MAX_RESULTS: usize = 20;
+
+/// Encode the resume point of a page as a `nextToken`.
+///
+/// The token is this process's [`crate::state::page_token_tag`] followed by the
+/// creation sequence of the last configuration on the page; the next page is
+/// everything older than that cursor. Rendered through the `hex` codec so the
+/// token is an opaque fixed-width string of word characters, within the modelled
+/// `NextToken` length (1..4096) and pattern (`^[\w+-/=]+$`). The tag is what
+/// makes a forged-but-well-formed cursor distinguishable from one this emulator
+/// issued.
+fn encode_page_token(cursor: u64) -> String {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&crate::state::page_token_tag().to_be_bytes());
+    bytes[8..].copy_from_slice(&cursor.to_be_bytes());
+    hex::encode(bytes)
+}
+
+/// Recover the cursor from a `nextToken` this operation issued. `None` for a
+/// token it did not issue — wrong length, not hex, or carrying another tag —
+/// which the handler refuses as a validation failure rather than silently
+/// restarting the listing at the newest record.
+fn decode_page_token(token: &str) -> Option<u64> {
+    let bytes: [u8; 16] = hex::decode(token).ok()?.try_into().ok()?;
+    let tag = u64::from_be_bytes(bytes[..8].try_into().ok()?);
+    if tag != crate::state::page_token_tag() {
+        return None;
+    }
+    Some(u64::from_be_bytes(bytes[8..].try_into().ok()?))
+}
+
 /// The `ListNotificationConfigurations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -167,18 +198,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListNotificationConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListNotificationConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListNotificationConfigurations"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListNotificationConfigurationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the notifications store is unavailable".to_string(),
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                ListNotificationConfigurationsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "nextToken is not a token this service issued".to_string(),
+                        reason: Some("fieldValidationFailed".to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "nextToken".to_string(),
+                            message: "the value is not a pagination token this service issued"
+                                .to_string(),
+                        }]),
+                    },
+                )
+            })?),
+            None => None,
+        };
+
+        // "in reverse chronological order (newest first)", so the most recently
+        // created configuration leads the listing and a page token walks
+        // backwards through creation order.
+        let mut ordered = store.configurations_in_creation_order();
+        ordered.reverse();
+
+        let matching: Vec<&crate::state::NotificationConfigurationRecord> = ordered
+            .into_iter()
+            .filter(|record| {
+                // Each filter the request carries must hold. `status` and
+                // `subtype` are matched against the record's own persisted
+                // values.
+                if let Some(status) = input.status.as_deref() {
+                    if record.status != status {
+                        return false;
+                    }
+                }
+                if input.subtype.is_some() && record.subtype.as_deref() != input.subtype.as_deref()
+                {
+                    return false;
+                }
+                // `eventRuleSource` selects the configurations carrying an
+                // EventRule with that source, and `channelArn` those associated
+                // with that channel, so both are looked up on the record's own
+                // associations. Those sets are empty on every record today
+                // because `CreateEventRule` and `AssociateChannel` are still 501
+                // stubs; implementing them populates the record and makes these
+                // filters select without another change here.
+                if let Some(source) = input.event_rule_source.as_deref() {
+                    if !record.event_rule_sources.contains(source) {
+                        return false;
+                    }
+                }
+                if let Some(channel) = input.channel_arn.as_deref() {
+                    if !record.channel_arns.contains(channel) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+
+        let start = match resume_after {
+            Some(cursor) => matching
+                .iter()
+                .position(|record| record.sequence < cursor)
+                .unwrap_or(matching.len()),
+            None => 0,
+        };
+        let page_size = match input.max_results {
+            Some(requested) => usize::try_from(requested).map_err(|_| {
+                // The modelled range (1..100) makes this unreachable through the
+                // boundary validator; refuse rather than quietly substituting a
+                // page size the caller did not ask for.
+                ListNotificationConfigurationsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "maxResults must be a positive count".to_string(),
+                        reason: Some("fieldValidationFailed".to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "maxResults".to_string(),
+                            message: "the value is not a positive count".to_string(),
+                        }]),
+                    },
+                )
+            })?,
+            None => DEFAULT_MAX_RESULTS,
+        };
+
+        let page: Vec<&crate::state::NotificationConfigurationRecord> =
+            matching.iter().skip(start).take(page_size).copied().collect();
+
+        // A token is emitted only while configurations remain behind this page;
+        // the final page carries none.
+        let next_token = match page.last() {
+            Some(last) if start + page.len() < matching.len() => {
+                Some(encode_page_token(last.sequence))
+            }
+            _ => None,
+        };
+
+        Ok(ListNotificationConfigurationsOutput {
+            next_token,
+            notification_configurations: page
+                .into_iter()
+                .map(|record| NotificationConfigurationStructure {
+                    arn: record.arn.clone(),
+                    name: record.name.clone(),
+                    description: record.description.clone(),
+                    status: record.status.clone(),
+                    creation_time: record.creation_time,
+                    aggregation_duration: record.aggregation_duration.clone(),
+                    subtype: record.subtype.clone(),
+                })
+                .collect(),
+        })
     }
 }

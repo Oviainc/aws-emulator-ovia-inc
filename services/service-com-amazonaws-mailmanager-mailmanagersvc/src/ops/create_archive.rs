@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateArchive
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateArchive`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateArchive::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints an `ArchiveId`, stores the archive in this service's state and
+//! returns the stored id. `ClientToken` (`@idempotencyToken`) makes a retry return the id
+//! the first call minted; a name already in use is refused with the modelled
+//! `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +154,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateArchive` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateArchiveErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateArchive"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the service is always mounted on the shared
+            // `InMemoryEngine`. Answered with a modelled retryable error rather than a
+            // 501, which would claim the operation is unwritten.
+            return Err(CreateArchiveErrorModeled::ThrottlingException(ThrottlingException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        store.purge_permanently_deleted(now);
+
+        let fingerprint = crate::state::create_archive_fingerprint(
+            &input.archive_name,
+            input.retention.as_ref(),
+            input.kms_key_arn.as_deref(),
+            input.tags.as_deref(),
+        );
+
+        // `ClientToken` is `@idempotencyToken`: a retry must observe the first call's
+        // outcome, so it is resolved BEFORE the name-uniqueness check — otherwise the
+        // retry would be refused as a duplicate of the archive it itself created. A token
+        // presented with a DIFFERENT request is not a retry and is refused, rather than
+        // being answered with the first request's archive.
+        if let Some(recorded) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.idempotency.get(token))
+        {
+            if recorded.fingerprint == fingerprint {
+                return Ok(CreateArchiveOutput {
+                    archive_id: recorded.archive_id.clone(),
+                });
+            }
+            return Err(CreateArchiveErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "ClientToken was already used to create archive {} with different \
+                     parameters.",
+                    recorded.archive_id
+                )),
+            })
+            .into());
+        }
+
+        if let Some(existing) = store.archive_names.get(&input.archive_name) {
+            return Err(CreateArchiveErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Archive name {} is already used by archive {existing}.",
+                    input.archive_name
+                )),
+            })
+            .into());
+        }
+
+        // The per-account archive quota. Checked AFTER the idempotency lookup, so a retry
+        // of a create that already succeeded is never refused by a quota it did not
+        // consume, and BEFORE any insert, so a refused create stores nothing.
+        if store.archives.len() >= crate::state::MAX_ARCHIVES {
+            return Err(CreateArchiveErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "The maximum number of archives ({}) has been reached. Delete an \
+                         archive before creating another.",
+                        crate::state::MAX_ARCHIVES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let archive_id = store.mint_archive_id(now);
+        let record = crate::state::ArchiveRecord {
+            archive_arn: crate::state::archive_arn(&region, &archive_id),
+            archive_id: archive_id.clone(),
+            archive_name: input.archive_name.clone(),
+            // `ArchiveState` has no non-terminal value: the model declares only ACTIVE
+            // and PENDING_DELETION, so a freshly created archive is ready at once.
+            archive_state: crate::state::ARCHIVE_STATE_ACTIVE.to_string(),
+            retention: input.retention.unwrap_or(ArchiveRetention::RetentionPeriod(
+                crate::state::DEFAULT_RETENTION_PERIOD.to_string(),
+            )),
+            kms_key_arn: input.kms_key_arn,
+            created_at_millis: now,
+            last_updated_at_millis: now,
+            tags: input.tags.unwrap_or_default(),
+            pending_deletion_at_millis: None,
+        };
+
+        store
+            .archive_names
+            .insert(input.archive_name, archive_id.clone());
+        if let Some(token) = input.client_token {
+            store.idempotency.insert(
+                token,
+                crate::state::IdempotentCreate {
+                    archive_id: archive_id.clone(),
+                    fingerprint,
+                },
+            );
+        }
+        store.archives.insert(archive_id.clone(), record);
+
+        Ok(CreateArchiveOutput { archive_id })
     }
 }

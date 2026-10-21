@@ -176,10 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteVoiceConnectorErrorModeled::ServiceFailureException(
-                ServiceFailureException {
-                    code: Some("ServiceFailure".to_string()),
-                    message: Some("the Voice Connector store is unavailable".to_string()),
-                },
+                crate::state::store_unavailable(),
             )
             .into());
         };
@@ -190,13 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove(&input.voice_connector_id)
             .is_none()
         {
-            return Err(DeleteVoiceConnectorErrorModeled::NotFoundException(NotFoundException {
-                code: Some("NotFound".to_string()),
-                message: Some(format!(
-                    "no Voice Connector with id {}",
-                    input.voice_connector_id
-                )),
-            })
+            return Err(DeleteVoiceConnectorErrorModeled::NotFoundException(
+                crate::state::voice_connector_not_found(&input.voice_connector_id),
+            )
             .into());
         }
         drop(store);

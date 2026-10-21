@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDatasets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDatasets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDatasets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: lists the datasets stored in [`crate::state`] for one identity, in a
+//! deterministic order, bounded by `MaxResults` and resumed from `NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +165,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDatasets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDatasetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDatasets"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(state_unavailable());
+        };
+
+        // `MaxResults` carries no modelled range, but a page of fewer than one dataset
+        // is not a page: refuse it as a parameter that does not comply with its
+        // constraint.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(ListDatasetsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: format!("MaxResults must be at least 1, got {max_results}"),
+                    },
+                )
+                .into());
+            }
+            Some(max_results) => usize::try_from(max_results)
+                .unwrap_or(usize::MAX)
+                // The caller may ask for a smaller page than the server's, never a
+                // larger one; `NextToken` carries whatever did not fit.
+                .min(crate::state::MAX_PAGE_SIZE),
+            // No `MaxResults`: the server's own page size.
+            None => crate::state::MAX_PAGE_SIZE,
+        };
+
+        let store = state.lock();
+        let mut matching = store
+            .datasets_of_identity(&input.identity_pool_id, &input.identity_id)
+            .filter(|((_, _, dataset_name), _)| {
+                input
+                    .next_token
+                    .as_deref()
+                    .is_none_or(|resume_from| dataset_name.as_str() >= resume_from)
+            });
+        let datasets: Vec<Dataset> = matching
+            .by_ref()
+            .take(page_size)
+            .map(|(key, dataset)| dataset.to_shape(key))
+            .collect();
+        // The next page resumes at the first dataset this one left out.
+        let next_token = matching
+            .next()
+            .map(|((_, _, dataset_name), _)| dataset_name.clone());
+
+        Ok(ListDatasetsOutput {
+            // "Count — Number of datasets returned."
+            count: i32::try_from(datasets.len()).unwrap_or(i32::MAX),
+            datasets: Some(datasets),
+            next_token,
+        })
     }
+}
+
+/// This service's store is not mounted on the engine the operation was built from — a
+/// server fault, answered with the modelled server error rather than a panic.
+fn state_unavailable() -> ListDatasetsError {
+    ListDatasetsErrorModeled::InternalErrorException(InternalErrorException {
+        message: crate::state::STORE_UNAVAILABLE.to_string(),
+    })
+    .into()
 }

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLogGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLogGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: enumerates the log groups in the shared store, honouring the prefix,
+//! pattern, class and identifier filters and the page bounds. This is the ONLY file to
+//! touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeLogGroups::handle`] with real behaviour and
@@ -151,6 +151,63 @@ impl From<DescribeLogGroupsErrorModeled> for DescribeLogGroupsError {
     }
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by
+/// another paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "DescribeLogGroups";
+
+/// Where the next page resumes: the last log group name returned, plus the filters of
+/// the scan it belongs to. A continuation that changes a filter is refused, because the
+/// token is only a position within one filtered enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    log_group_name_prefix: Option<String>,
+    log_group_name_pattern: Option<String>,
+    log_group_class: Option<String>,
+    log_group_identifiers: Option<Vec<String>>,
+    after: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "logGroupNamePrefix": self.log_group_name_prefix,
+            "logGroupNamePattern": self.log_group_name_pattern,
+            "logGroupClass": self.log_group_class,
+            "logGroupIdentifiers": self.log_group_identifiers,
+            "after": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        let string = |name: &str| {
+            value
+                .get(name)
+                .and_then(::serde_json::Value::as_str)
+                .map(ToString::to_string)
+        };
+        Some(Self {
+            log_group_name_prefix: string("logGroupNamePrefix"),
+            log_group_name_pattern: string("logGroupNamePattern"),
+            log_group_class: string("logGroupClass"),
+            log_group_identifiers: value
+                .get("logGroupIdentifiers")
+                .and_then(::serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|entry| entry.as_str().map(ToString::to_string))
+                        .collect()
+                }),
+            after: value.get("after")?.as_str()?.to_string(),
+        })
+    }
+}
+
 /// The `DescribeLogGroups` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -187,18 +244,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLogGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLogGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLogGroups"))
+        // `ctx` carries only request metadata.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeLogGroupsError::from(
+                DescribeLogGroupsErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let store = state.lock();
+
+        let invalid = |message: &str| {
+            DescribeLogGroupsError::from(DescribeLogGroupsErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            ))
+        };
+
+        // "logGroupNamePattern and logGroupNamePrefix are mutually exclusive. Only one
+        // of these parameters can be passed."
+        if input.log_group_name_prefix.is_some() && input.log_group_name_pattern.is_some() {
+            return Err(invalid(
+                "logGroupNamePrefix and logGroupNamePattern are mutually exclusive; specify only one",
+            ));
+        }
+
+        // "When includeLinkedAccounts is set to true, use this parameter [
+        // accountIdentifiers] to specify the list of accounts to search"; otherwise the
+        // search is the caller's own account. This emulator serves exactly one account,
+        // so a request that searches only other accounts matches nothing here rather
+        // than being answered with this account's log groups.
+        let searches_this_account = !input.include_linked_accounts.unwrap_or(false)
+            || input.account_identifiers.as_ref().is_none_or(|accounts| {
+                accounts.is_empty()
+                    || accounts
+                        .iter()
+                        .any(|account| account == ::engine::emulator_account_id())
+            });
+        if !searches_this_account {
+            return Ok(DescribeLogGroupsOutput {
+                log_groups: Some(Vec::new()),
+                next_token: None,
+            });
+        }
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token"));
+                };
+                if cursor.log_group_name_prefix != input.log_group_name_prefix
+                    || cursor.log_group_name_pattern != input.log_group_name_pattern
+                    || cursor.log_group_class != input.log_group_class
+                    || cursor.log_group_identifiers != input.log_group_identifiers
+                {
+                    return Err(invalid(
+                        "nextToken was issued for a different DescribeLogGroups request",
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // `logGroupIdentifiers` names groups by name or by ARN.
+        let wanted: Option<Vec<&str>> = input.log_group_identifiers.as_ref().map(|identifiers| {
+            identifiers
+                .iter()
+                .map(|identifier| crate::state::log_group_name_from_identifier(identifier))
+                .collect()
+        });
+
+        // The store keys groups by name, so iteration is already in name order.
+        let matching: Vec<&crate::state::LogGroupRecord> = store
+            .log_groups
+            .values()
+            .filter(|group| {
+                input
+                    .log_group_name_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| group.name.starts_with(prefix))
+            })
+            // "the operation returns only log groups that have names that match the
+            // string based on a case-sensitive substring search".
+            .filter(|group| {
+                input
+                    .log_group_name_pattern
+                    .as_deref()
+                    .is_none_or(|pattern| group.name.contains(pattern))
+            })
+            .filter(|group| {
+                input
+                    .log_group_class
+                    .as_deref()
+                    .is_none_or(|class| group.log_group_class == class)
+            })
+            .filter(|group| {
+                wanted
+                    .as_ref()
+                    .is_none_or(|names| names.contains(&group.name.as_str()))
+            })
+            .collect();
+
+        let first = match &cursor {
+            Some(cursor) => matching.partition_point(|group| group.name <= cursor.after),
+            None => 0,
+        };
+        // `limit` is modelled `range 1..50`, so the boundary validator has already
+        // refused a value outside it; `max(1)` only keeps the page bounds sane.
+        let limit = usize::try_from(input.limit.unwrap_or(crate::state::DEFAULT_DESCRIBE_LIMIT))
+            .unwrap_or(0)
+            .max(1);
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        let next_token = page.last().filter(|_| last < matching.len()).map(|group| {
+            Cursor {
+                log_group_name_prefix: input.log_group_name_prefix.clone(),
+                log_group_name_pattern: input.log_group_name_pattern.clone(),
+                log_group_class: input.log_group_class.clone(),
+                log_group_identifiers: input.log_group_identifiers.clone(),
+                after: group.name.clone(),
+            }
+            .encode()
+        });
+
+        // "If you specify logGroupNamePattern in your request, then only arn,
+        // creationTime, and logGroupName are included in the response."
+        let pattern_search = input.log_group_name_pattern.is_some();
+
+        Ok(DescribeLogGroupsOutput {
+            log_groups: Some(
+                page.iter()
+                    .map(|group| LogGroup {
+                        log_group_name: Some(group.name.clone()),
+                        creation_time: Some(group.creation_time_ms),
+                        arn: Some(group.arn.clone()),
+                        retention_in_days: group.retention_in_days.filter(|_| !pattern_search),
+                        metric_filter_count: (!pattern_search)
+                            .then_some(group.metric_filter_count),
+                        stored_bytes: (!pattern_search).then_some(group.stored_bytes),
+                        kms_key_id: group.kms_key_id.clone().filter(|_| !pattern_search),
+                        data_protection_status: None,
+                        inherited_properties: None,
+                        log_group_class: (!pattern_search)
+                            .then(|| group.log_group_class.clone()),
+                        log_group_arn: (!pattern_search).then(|| group.log_group_arn.clone()),
+                        deletion_protection_enabled: (!pattern_search)
+                            .then_some(group.deletion_protection_enabled),
+                        bearer_token_authentication_enabled: None,
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

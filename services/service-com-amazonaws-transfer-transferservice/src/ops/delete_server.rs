@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteServer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteServer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteServer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the stored server AND everything that hangs off it — its users and their
+//! SSH keys — so `DescribeServer` answers 404 and `ListServers` no longer lists it. An
+//! unknown `ServerId` is a `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +159,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteServer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteServerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteServer"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            DeleteServerErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+
+        if guard.servers.remove(&input.server_id).is_none() {
+            return Err(DeleteServerErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Unknown server {}", input.server_id),
+                    resource: input.server_id.clone(),
+                    resource_type: "server".to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The users (and with them their stored SSH keys) belong to the server, so they
+        // go with it — leaving them would make `DescribeUser` answer for a server that
+        // no longer exists.
+        guard
+            .users
+            .retain(|(server_id, _), _| server_id != &input.server_id);
+
+        Ok(DeleteServerOutput)
     }
 }

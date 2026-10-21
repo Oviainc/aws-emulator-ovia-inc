@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The embed URL's one-shot bearer token is minted by hashing the session counter,
+# the generation instant and a per-process random seed.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers from the stored group record. `GroupName` and `GroupARN` resolve the
+//! same record; neither supplied, or a selector naming no stored group, is an
+//! `InvalidRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +66,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::GroupRecord;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -141,18 +138,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGroup"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetGroupErrorModeled::ThrottledException(ThrottledException {
+                message: Some(
+                    "the X-Ray group store is unavailable on this emulator engine".to_string(),
+                ),
+            })
+            .into());
+        };
+
+        let store = state.lock();
+        let group_name = store
+            .resolve_group_name(input.group_name.as_deref(), input.group_arn.as_deref())
+            .map_err(|failure| {
+                GetGroupErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: Some(
+                        failure.message(input.group_name.as_deref(), input.group_arn.as_deref()),
+                    ),
+                })
+            })?;
+        // `resolve_group_name` ran under this same guard, so the record is there;
+        // read it fallibly all the same, so no request-reachable path can panic.
+        let Some(group) = store.groups.get(&group_name).map(GroupRecord::to_group) else {
+            return Err(GetGroupErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        crate::state::GroupLookupError::NotFound
+                            .message(input.group_name.as_deref(), input.group_arn.as_deref()),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetGroupOutput { group: Some(group) })
     }
 }

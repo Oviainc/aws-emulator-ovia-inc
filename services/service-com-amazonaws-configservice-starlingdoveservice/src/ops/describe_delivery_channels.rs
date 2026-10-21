@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDeliveryChannels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDeliveryChannels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDeliveryChannels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the delivery channels read back out of [`crate::state`], as
+//! `PutDeliveryChannel` persisted them.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +132,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDeliveryChannels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDeliveryChannelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDeliveryChannels"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let names = input.delivery_channel_names.unwrap_or_default();
+        let store = state.lock();
+
+        let selected: Vec<DeliveryChannel> = if names.is_empty() {
+            let mut all: Vec<&crate::state::DeliveryChannelEntry> =
+                store.delivery_channels.values().collect();
+            all.sort_by(|left, right| left.name.cmp(&right.name));
+            all.into_iter()
+                .map(crate::state::DeliveryChannelEntry::to_shape)
+                .collect()
+        } else {
+            let mut found = Vec::with_capacity(names.len());
+            for name in &names {
+                let Some(channel) = store.delivery_channels.get(name) else {
+                    return Err(
+                        DescribeDeliveryChannelsErrorModeled::NoSuchDeliveryChannelException(
+                            NoSuchDeliveryChannelException {
+                                message: Some(format!(
+                                    "there is no delivery channel named '{name}'"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                found.push(channel.to_shape());
+            }
+            found
+        };
+
+        Ok(DescribeDeliveryChannelsOutput {
+            delivery_channels: Some(selected),
+        })
     }
 }

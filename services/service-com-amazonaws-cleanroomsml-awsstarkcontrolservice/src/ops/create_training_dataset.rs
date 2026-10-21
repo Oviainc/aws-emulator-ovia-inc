@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrainingDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrainingDataset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrainingDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a training dataset: the record is persisted in [`crate::state`], keyed by the ARN
+//! this operation returns, and every later `GetTrainingDataset` / `ListTrainingDatasets`
+//! answer is computed from it. A `name` that already names a persisted training dataset is
+//! refused, because the model documents the name as unique in the account and region.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +164,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrainingDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTrainingDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrainingDataset"))
+        // `service_state` answers `None` only for an engine that carries no store for
+        // this service, and nothing in this operation can be served without it. Every
+        // error this service models is a 4xx about the request, so the honest answer is
+        // the scaffold's 501: the operation cannot run on that engine.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // The store is bounded: past its quota a create is refused rather than
+        // adding another record. This operation declares no quota error of its own
+        // (its whole error set is AccessDenied / Conflict / Throttling /
+        // Validation), and the bound is the emulator's, not the request's fault —
+        // so it is reported through the declared client-error channel, saying what
+        // the caller has to do about it.
+        if store.training_datasets.len() >= crate::state::RESOURCE_QUOTA {
+            return Err(CreateTrainingDatasetErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "this account already holds the maximum of {} training datasets; \
+                         delete one before creating another",
+                        crate::state::RESOURCE_QUOTA
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `CreateTrainingDatasetRequest$name` documents the one rule the model cannot
+        // express: "This name must be unique in your account and region." The scope is
+        // the account AND the region, so the scan is over the datasets created under the
+        // region this request was signed for; one name is free in every other region. A
+        // request that breaks it carries an incorrect request parameter, which is what
+        // this service's `ValidationException` reports; `ConflictException` is reserved
+        // for the dependency the delete operations document.
+        if let Some(taken) = store
+            .training_datasets
+            .values()
+            .find(|dataset| dataset.region == region && dataset.name == input.name)
+        {
+            return Err(CreateTrainingDatasetErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "name must be unique in your account and region: {:?} already names \
+                         training dataset {}",
+                        input.name, taken.arn
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_resource_id();
+        let arn = crate::state::training_dataset_arn(&id, &region);
+        store.training_datasets.insert(
+            arn.clone(),
+            crate::state::TrainingDataset {
+                arn: arn.clone(),
+                region,
+                name: input.name,
+                role_arn: input.role_arn,
+                training_data: input.training_data,
+                description: input.description,
+                tags: input.tags.unwrap_or_default().into_iter().collect(),
+                // A training dataset is metadata pointing at a Glue table, read only
+                // during audience model creation, so the create has nothing to do
+                // asynchronously — and `TrainingDatasetStatus` models no status but
+                // `ACTIVE` that a transient one could be reported as.
+                status: crate::state::STATUS_ACTIVE.to_string(),
+                create_time: now,
+                update_time: now,
+            },
+        );
+
+        Ok(CreateTrainingDatasetOutput {
+            training_dataset_arn: arn,
+        })
     }
 }
