@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProfilingGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProfilingGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProfilingGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a profiling group and stores it; every response member is built from the
+//! stored record. Idempotent on `clientToken`: a retry of the same create returns the
+//! group that token already created instead of conflicting.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +155,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProfilingGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProfilingGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProfilingGroup"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateProfilingGroupErrorModeled::InternalServerException(InternalServerException {
+                message: "the profiling-group store is unavailable".to_string(),
+            })
+        })?;
+
+        // `computePlatform` targets the closed `ComputePlatform` enum, so the boundary
+        // validator already refuses anything outside it; this refusal keeps the stored
+        // platform inside the catalogue even if that trait ever stops being enforced,
+        // rather than persisting a value no reader can interpret.
+        let compute_platform = match input.compute_platform.as_deref() {
+            None => crate::state::DEFAULT_COMPUTE_PLATFORM.to_string(),
+            Some(value) if COMPUTE_PLATFORM_VALUES.contains(&value) => value.to_string(),
+            Some(value) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "computePlatform must be one of {}, got {value}",
+                    COMPUTE_PLATFORM_VALUES.join(", ")
+                )));
+            }
+        };
+
+        let mut guard = state.lock();
+
+        // Idempotency: the same `clientToken` that already created THIS name replays the
+        // stored group. A used token naming a different group is a different create and
+        // falls through to the name-conflict check below.
+        if guard
+            .create_tokens
+            .get(&input.client_token)
+            .is_some_and(|name| name == &input.profiling_group_name)
+        {
+            if let Some(group) = guard.groups.get(&input.profiling_group_name) {
+                return Ok(CreateProfilingGroupOutput {
+                    profiling_group: group.description(),
+                });
+            }
+        }
+
+        if guard.groups.contains_key(&input.profiling_group_name) {
+            return Err(CreateProfilingGroupErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "a profiling group named {} already exists",
+                        input.profiling_group_name
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The store holds a bounded number of groups, so a caller cannot grow it
+        // without limit. The operation's own ServiceQuotaExceededException is exactly
+        // this answer: "You have exceeded your service quota. To perform the requested
+        // action, remove some of the relevant resources, or use Service Quotas to
+        // request a service quota increase."
+        if guard.groups.len() >= crate::state::MAX_PROFILING_GROUPS {
+            return Err(
+                CreateProfilingGroupErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "the profiling-group quota of {} is already in use; delete a \
+                             profiling group before creating another",
+                            crate::state::MAX_PROFILING_GROUPS
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let created_at = crate::state::now();
+        let group = crate::state::ProfilingGroup {
+            name: input.profiling_group_name.clone(),
+            arn: crate::state::profiling_group_arn(
+                &crate::state::request_region(ctx),
+                &input.profiling_group_name,
+            ),
+            compute_platform,
+            // `agentOrchestrationConfig` is optional. CodeGuru Profiler orchestrates the
+            // agents of a new group unless the caller asks it not to, so an absent config
+            // leaves profiling enabled.
+            profiling_enabled: input
+                .agent_orchestration_config
+                .as_ref()
+                .is_none_or(|config| config.profiling_enabled),
+            created_at,
+            updated_at: created_at,
+            tags: input.tags.clone().unwrap_or_default(),
+            latest_agent_orchestrated_at: None,
+            latest_agent_profile_reported_at: None,
+            profiles: ::std::collections::VecDeque::new(),
+            seen_profile_tokens: ::std::collections::VecDeque::new(),
+        };
+        let description = group.description();
+        guard
+            .groups
+            .insert(input.profiling_group_name.clone(), group);
+        guard
+            .create_tokens
+            .insert(input.client_token.clone(), input.profiling_group_name.clone());
+
+        Ok(CreateProfilingGroupOutput {
+            profiling_group: description,
+        })
     }
 }

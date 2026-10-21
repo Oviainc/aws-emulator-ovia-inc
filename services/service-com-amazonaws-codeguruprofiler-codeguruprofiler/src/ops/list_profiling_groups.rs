@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProfilingGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProfilingGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProfilingGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the stored profiling groups in a stable name order, a page at a time with
+//! `maxResults`/`nextToken`, and fills `profilingGroups` only when the caller asks for
+//! descriptions. Reporting only: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +156,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProfilingGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProfilingGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProfilingGroups"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListProfilingGroupsErrorModeled::InternalServerException(InternalServerException {
+                message: "the profiling-group store is unavailable".to_string(),
+            })
+        })?;
+
+        // The page token is this service's own opaque cursor: the index into the
+        // name-ordered group list at which the next page starts. It satisfies the
+        // modelled `PaginationToken` constraints (len 1..64, `^[\w-]+$`) for any number
+        // of groups, which a token built out of a group name (len 1..255) would not.
+        let start = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => token.parse::<usize>().map_err(|_| {
+                crate::scaffolded::Scaffolded::validation(format!(
+                    "nextToken is not a token this service issued: {token}"
+                ))
+            })?,
+        };
+
+        let guard = state.lock();
+        let names = guard.sorted_group_names();
+        // A token that points past the end of the list is one this service never
+        // issued: it is refused rather than answered with an empty page.
+        if start > names.len() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "nextToken is not a token this service issued",
+            ));
+        }
+        // Without `maxResults` the page is this service's default size, so one
+        // unparameterised request cannot materialise a response that grows with the
+        // number of stored groups.
+        let limit = input.max_results.map_or(
+            crate::state::DEFAULT_LIST_PAGE_SIZE,
+            |max| usize::try_from(max).unwrap_or(0),
+        );
+        let end = start.saturating_add(limit).min(names.len());
+        let page = names.get(start..end).unwrap_or_default();
+
+        let descriptions = if input.include_description.unwrap_or(false) {
+            Some(
+                page.iter()
+                    .filter_map(|name| guard.groups.get(name))
+                    .map(crate::state::ProfilingGroup::description)
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        Ok(ListProfilingGroupsOutput {
+            profiling_group_names: page.to_vec(),
+            profiling_groups: descriptions,
+            next_token: (end < names.len()).then(|| end.to_string()),
+        })
     }
 }

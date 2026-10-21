@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns a stored agent profile for a group: the bytes exactly as
+//! `PostAgentProfile` uploaded them, under the `Content-Type` they were posted with.
+//! Reporting only: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +113,75 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The aggregation periods this service offers, as seconds, from the operation's own
+/// doc: "Aggregated profiles are available with aggregation periods of 5 minutes, 1
+/// hour, and 1 day, aligned to UTC" — the same three values the model's
+/// `AggregationPeriod` enum declares (PT5M, PT1H, P1D).
+const AGGREGATION_PERIODS: &[(&str, f64)] = &[
+    ("PT5M", 5.0 * 60.0),
+    ("PT1H", 60.0 * 60.0),
+    ("P1D", 24.0 * 60.0 * 60.0),
+];
+
+/// The time window a `GetProfile` request selects over, as (start, end) bounds either
+/// of which may be open.
+///
+/// The operation's doc fixes the rule: "Specify the time range for the requested
+/// aggregated profile using 1 or 2 of the following parameters: startTime, endTime,
+/// period. … If you specify all 3 parameters, an exception is thrown. If you specify
+/// only period, the latest aggregated profile is returned." So `period` completes
+/// whichever single bound was given, and on its own selects nothing.
+#[allow(clippy::type_complexity)]
+fn requested_window(
+    input: &GetProfileInput,
+) -> Result<
+    (
+        Option<::aws_smithy_types::DateTime>,
+        Option<::aws_smithy_types::DateTime>,
+    ),
+    GetProfileError,
+> {
+    let period_seconds = match input.period.as_deref() {
+        None => None,
+        Some(period) => Some(
+            AGGREGATION_PERIODS
+                .iter()
+                .find(|(name, _)| *name == period)
+                .map(|(_, seconds)| *seconds)
+                .ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation(format!(
+                        "period must be one of {}, got {period}",
+                        AGGREGATION_PERIODS
+                            .iter()
+                            .map(|(name, _)| *name)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                })?,
+        ),
+    };
+
+    match (input.start_time, input.end_time, period_seconds) {
+        (Some(_), Some(_), Some(_)) => Err(crate::scaffolded::Scaffolded::validation(
+            "specify 1 or 2 of startTime, endTime and period, not all 3",
+        )),
+        (Some(start), None, Some(seconds)) => Ok((
+            Some(start),
+            Some(::aws_smithy_types::DateTime::from_secs_f64(
+                start.as_secs_f64() + seconds,
+            )),
+        )),
+        (None, Some(end), Some(seconds)) => Ok((
+            Some(::aws_smithy_types::DateTime::from_secs_f64(
+                end.as_secs_f64() - seconds,
+            )),
+            Some(end),
+        )),
+        // `period` alone (and no bound at all) selects the latest profile.
+        (start, end, _) => Ok((start, end)),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -190,18 +253,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetProfile"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetProfileErrorModeled::InternalServerException(InternalServerException {
+                message: "the profiling-group store is unavailable".to_string(),
+            })
+        })?;
+
+        // An agent profile is an opaque payload (Amazon Ion or JSON) this emulator
+        // stores and returns verbatim. Truncating its call stacks (`maxDepth`) or
+        // transcoding it into another media type (`accept`) would mean parsing and
+        // rewriting that payload, which this emulator does not do — so those are
+        // refused with the operation's own ValidationException rather than answered
+        // with a profile that is not the one the caller asked for.
+        if input.max_depth.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "maxDepth is not supported: this emulator returns the stored agent \
+                 profile unmodified and cannot truncate its call stacks",
+            ));
+        }
+
+        let (start, end) = requested_window(&input)?;
+
+        let guard = state.lock();
+        let group = guard.groups.get(&input.profiling_group_name).ok_or_else(|| {
+            GetProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("no profiling group named {}", input.profiling_group_name),
+            })
+        })?;
+        let profile = group.latest_profile_in(start, end).ok_or_else(|| {
+            GetProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!(
+                    "no profile has been posted to profiling group {} in the requested time range",
+                    input.profiling_group_name
+                ),
+            })
+        })?;
+
+        if let Some(accept) = input.accept.as_deref() {
+            let acceptable = accept
+                .split(',')
+                .map(|media_type| media_type.split(';').next().unwrap_or("").trim())
+                .any(|media_type| media_type == "*/*" || media_type == profile.content_type);
+            if !acceptable {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "accept {accept} does not accept {}, the content type this profile \
+                     was posted under, and this emulator does not transcode profiles",
+                    profile.content_type
+                )));
+            }
+        }
+
+        Ok(GetProfileOutput {
+            profile: profile.bytes.clone(),
+            content_type: profile.content_type.clone(),
+            // Profiles are stored and returned uncompressed, so there is no content
+            // encoding to report.
+            content_encoding: None,
+        })
     }
 }
