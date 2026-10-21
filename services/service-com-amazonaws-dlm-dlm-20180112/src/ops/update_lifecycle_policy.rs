@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLifecyclePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLifecyclePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLifecyclePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +165,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLifecyclePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLifecyclePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLifecyclePolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateLifecyclePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the dlm lifecycle-policy store is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(policy) = store.policies.get_mut(&input.policy_id) else {
+            return Err(
+                UpdateLifecyclePolicyErrorModeled::ResourceNotFoundException(
+                    crate::state::policies_not_found(&[input.policy_id]),
+                )
+                .into(),
+            );
+        };
+
+        // A partial update: only the members the request carries overwrite the
+        // stored policy, and every absent member keeps the value the create or an
+        // earlier update stored.
+        if let Some(execution_role_arn) = input.execution_role_arn {
+            policy.execution_role_arn = execution_role_arn;
+        }
+        if let Some(new_state) = input.state {
+            policy.state = new_state;
+        }
+        if let Some(description) = input.description {
+            policy.description = description;
+        }
+        if let Some(policy_details) = input.policy_details {
+            policy.policy_details = Some(policy_details);
+        }
+        if let Some(create_interval) = input.create_interval {
+            policy.create_interval = Some(create_interval);
+        }
+        if let Some(retain_interval) = input.retain_interval {
+            policy.retain_interval = Some(retain_interval);
+        }
+        if let Some(copy_tags) = input.copy_tags {
+            policy.copy_tags = Some(copy_tags);
+        }
+        if let Some(extend_deletion) = input.extend_deletion {
+            policy.extend_deletion = Some(extend_deletion);
+        }
+        if let Some(cross_region_copy_targets) = input.cross_region_copy_targets {
+            policy.cross_region_copy_targets = cross_region_copy_targets;
+        }
+        if let Some(exclusions) = input.exclusions {
+            policy.exclusions = Some(exclusions);
+        }
+        // "The local date and time when the lifecycle policy was last modified."
+        policy.date_modified = now;
+
+        Ok(UpdateLifecyclePolicyOutput {})
     }
 }

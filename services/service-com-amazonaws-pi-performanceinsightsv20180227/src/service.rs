@@ -96,17 +96,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Performance Insights has no `ValidationException`: every bad argument —
+        // an absent required member, a value outside a modelled `length`,
+        // `range`, `pattern` or enum value set — is reported as
+        // `InvalidArgumentException` (HTTP 400), which is the client-input error
+        // its model declares on all 14 operations. Both the code and the message
+        // are replaced, so a client branching on the code sees the same code the
+        // handlers return for the same class of failure. An authentication
+        // refusal keeps the framework's wording: the service does not word it.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "InvalidArgumentException".to_string(),
+                message: violations
+                    .iter()
+                    .map(aws_smithy_schema_server::constraints::Violation::message)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

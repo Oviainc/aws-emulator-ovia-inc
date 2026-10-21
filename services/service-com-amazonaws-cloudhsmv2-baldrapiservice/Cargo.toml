@@ -21,13 +21,13 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Id minting: SHA-256 over a per-store counter and the clock, folded into the
+# alphabets the modelled cluster-/hsm-/eni- id patterns accept.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

@@ -28,6 +28,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `time` only for `tokio::time::sleep` in `tests/all/`; the production build of
+# this crate does not pull the timer driver.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

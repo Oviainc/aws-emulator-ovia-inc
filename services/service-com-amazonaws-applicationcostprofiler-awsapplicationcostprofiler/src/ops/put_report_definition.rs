@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutReportDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutReportDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutReportDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +146,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutReportDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutReportDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutReportDefinition"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutReportDefinitionErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the ApplicationCostProfiler state store is unavailable on this engine".into(),
+                ),
+            })
+        })?;
+
+        crate::state::validate_s3_bucket(
+            "destinationS3Location.bucket",
+            &input.destination_s3_location.bucket,
+        )
+        .map_err(invalid)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Keyed by `reportId`, so re-putting one refreshes the definition in
+        // place instead of duplicating it. `createdAt` is a property of the
+        // resource's first creation and is preserved; `lastUpdated` moves.
+        let existing = store.report_definitions.get(&input.report_id);
+        let created_at = existing.map_or(now, |existing| existing.created_at);
+        // Only a NEW id grows the store, so only a new id can exceed the quota.
+        if existing.is_none()
+            && store.report_definitions.len() >= crate::state::MAX_REPORT_DEFINITIONS
+        {
+            return Err(PutReportDefinitionErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds {} report definitions, the maximum this \
+                         service allows; delete one before creating another",
+                        crate::state::MAX_REPORT_DEFINITIONS
+                    )),
+                },
+            )
+            .into());
+        }
+        store.report_definitions.insert(
+            input.report_id.clone(),
+            crate::state::ReportDefinitionRecord {
+                report_id: input.report_id.clone(),
+                report_description: input.report_description,
+                report_frequency: input.report_frequency,
+                format: input.format,
+                destination_bucket: input.destination_s3_location.bucket,
+                destination_prefix: input.destination_s3_location.prefix,
+                created_at,
+                last_updated: now,
+            },
+        );
+        drop(store);
+
+        Ok(PutReportDefinitionOutput {
+            report_id: Some(input.report_id),
+        })
     }
+}
+
+/// Refuse the request with the service's own client-input error: HTTP 400
+/// `ValidationException`, whose message names the member and the constraint it
+/// broke.
+fn invalid(message: String) -> PutReportDefinitionError {
+    PutReportDefinitionErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRecord
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRecord`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation ingests one record into the feature group's OnlineStore
+//! held in [`crate::state`]. The write is a full over-write of the identified record's
+//! feature values; it is skipped when the posted record is historic (its event time is
+//! not later than the stored record's) or when `TargetStores` names only the
+//! OfflineStore, and it carries `ExpiresAt = EventTime + TtlDuration` when the caller
+//! asked for a TTL.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRecord::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Authorization is not emulated, so the modelled `AccessForbidden` is unreachable, and
+//! the OfflineStore is not modelled at all: this file serves the OnlineStore side of
+//! the operation only.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +186,189 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRecord` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRecordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRecord"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutRecordErrorModeled::InternalFailure(InternalFailure {
+                message: Some("PutRecord: this service holds no state on the mounted engine".into()),
+            })
+            .into());
+        };
+
+        // A value outside the `TargetStore` enum would be read below as "not the
+        // OnlineStore" and silently turn the write into a no-op success. The boundary
+        // validator refuses an undeclared enum value first; this is the handler's own
+        // guard, against the model's own value list (`TARGET_STORE_VALUES`).
+        if let Some(stores) = input.target_stores.as_ref() {
+            if let Some(unknown) = crate::state::undeclared_value(stores, TARGET_STORE_VALUES) {
+                return Err(validation(format!(
+                    "TargetStores: '{unknown}' is not a TargetStore; expected one of {}",
+                    TARGET_STORE_VALUES.join(", ")
+                )));
+            }
+        }
+
+        // `TargetStores` is "A list of stores to which you're adding the record. By
+        // default, Feature Store adds the record to all of the stores that you're
+        // using for the FeatureGroup." This service is the OnlineStore data plane, so
+        // a request naming only the OfflineStore leaves the online store alone.
+        if !crate::state::targets_online_store(input.target_stores.as_ref()) {
+            return Ok(PutRecordOutput);
+        }
+
+        // `Record` is modelled `len 1..` and refused at the boundary; read it
+        // fallibly all the same, so a handler reached with an empty list answers the
+        // modelled error instead of panicking.
+        let Some(first_posted) = input.record.first() else {
+            return Err(validation("Record must carry at least one FeatureValue"));
+        };
+        let key = crate::state::group_key(&input.feature_group_name).to_owned();
+
+        // ONE critical section for the whole read-resolve-write: the group's learned
+        // feature names decide the record identifier, so reading them under the same
+        // guard that performs the insert is what keeps two concurrent first writes to
+        // one group from learning two different identifier features. Nothing below can
+        // panic — every failure is a modelled error return, which releases the guard.
+        let mut store = state.lock();
+        let (learned_identifier, learned_event_time) =
+            store.learned_feature_names(&input.feature_group_name);
+
+        // The runtime API carries no feature-group definition, so the group's
+        // record-identifier feature is the one already learned for it, or — on the
+        // first record written to the group — the first `FeatureValue` posted.
+        let identifier_feature_name =
+            learned_identifier.unwrap_or_else(|| first_posted.feature_name.clone());
+
+        let identifier = match input
+            .record
+            .iter()
+            .find(|feature| feature.feature_name == identifier_feature_name)
+        {
+            Some(FeatureValue {
+                value_as_string: Some(value),
+                ..
+            }) => value.clone(),
+            Some(_) => {
+                return Err(validation(format!(
+                    "the record identifier feature '{identifier_feature_name}' must carry \
+                     ValueAsString, not ValueAsStringList"
+                )))
+            }
+            None => {
+                return Err(validation(format!(
+                    "Record is missing the record identifier feature \
+                     '{identifier_feature_name}' of feature group '{key}'"
+                )))
+            }
+        };
+
+        // Likewise for the event-time feature: already learned for the group, or
+        // recognised in this record by its conventional name.
+        let event_time_feature_name = learned_event_time.or_else(|| {
+            input
+                .record
+                .iter()
+                .map(|feature| &feature.feature_name)
+                .find(|name| crate::state::is_event_time_feature_name(name))
+                .cloned()
+        });
+        let event_time = event_time_feature_name
+            .as_ref()
+            .and_then(|name| {
+                input
+                    .record
+                    .iter()
+                    .find(|feature| feature.feature_name == *name)
+            })
+            .and_then(|feature| feature.value_as_string.clone());
+
+        // An event time the group identified must be a timestamp: the TTL and the
+        // historic-record rule are both computed from it, so a value in neither
+        // accepted format is refused rather than silently disabling both.
+        let posted_secs = match event_time.as_deref() {
+            Some(at) => match crate::state::parse_event_time_secs(at) {
+                Some(secs) => Some(secs),
+                None => {
+                    let name = event_time_feature_name.unwrap_or_default();
+                    return Err(validation(format!(
+                        "EventTime: the event time feature '{name}' must carry an ISO-8601 \
+                         timestamp or seconds since the epoch, not '{at}'"
+                    )));
+                }
+            },
+            None => None,
+        };
+
+        // `ExpiresAt = EventTime + TtlDuration`, per the `TtlDuration` shape's doc.
+        let expiry = match (&input.ttl_duration, event_time.as_deref()) {
+            (Some(ttl), Some(at)) => crate::state::expires_at(at, ttl),
+            _ => None,
+        };
+
+        let Some(group) = store.group_or_create(&input.feature_group_name) else {
+            return Err(at_capacity(format!(
+                "the emulator's online store already holds {} feature groups",
+                crate::state::MAX_FEATURE_GROUPS
+            )));
+        };
+        group.record_identifier_feature_name = Some(identifier_feature_name);
+        if group.event_time_feature_name.is_none() {
+            group.event_time_feature_name = event_time_feature_name;
+        }
+
+        // "If a new record's EventTime is greater, the new record is written to both
+        // the OnlineStore and OfflineStore. Otherwise, the record is a historic record
+        // and it is written only to the OfflineStore." Only the OnlineStore is served
+        // here, so a historic record leaves the stored record standing.
+        if let (Some(posted), Some(stored)) = (
+            posted_secs,
+            group
+                .record(&identifier)
+                .and_then(crate::state::StoredRecord::event_time_secs),
+        ) {
+            if posted <= stored {
+                return Ok(PutRecordOutput);
+            }
+        }
+
+        let stored = group.insert_record(crate::state::StoredRecord {
+            identifier,
+            features: input
+                .record
+                .iter()
+                .map(crate::state::StoredFeatureValue::from)
+                .collect(),
+            event_time,
+            expires_at: expiry.as_ref().map(|(iso, _)| iso.clone()),
+            expires_at_secs: expiry.map(|(_, secs)| secs),
+            soft_deleted: false,
+        });
+        if !stored {
+            return Err(at_capacity(format!(
+                "the online store of feature group '{key}' already holds {} records",
+                crate::state::MAX_RECORDS_PER_GROUP
+            )));
+        }
+
+        Ok(PutRecordOutput)
     }
+}
+
+/// The modelled `ValidationError` (HTTP 400) for a request this operation refuses.
+fn validation(message: impl Into<String>) -> PutRecordError {
+    PutRecordErrorModeled::ValidationError(ValidationError {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled `ServiceUnavailable` (HTTP 503) for a write the emulator's bounded
+/// store cannot take.
+///
+/// Not a `ValidationError`: the request is well-formed, it is the emulator that is out
+/// of room, so it must not be reported to the caller as its own mistake.
+fn at_capacity(message: impl Into<String>) -> PutRecordError {
+    PutRecordErrorModeled::ServiceUnavailable(ServiceUnavailable {
+        message: Some(message.into()),
+    })
+    .into()
 }

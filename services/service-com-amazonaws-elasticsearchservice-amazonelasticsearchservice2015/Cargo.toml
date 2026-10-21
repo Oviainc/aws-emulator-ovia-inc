@@ -21,13 +21,16 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque, stable per-domain suffix for a generated search endpoint.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# `time` is a test-only need: the lifecycle suite awaits the provisioning span.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

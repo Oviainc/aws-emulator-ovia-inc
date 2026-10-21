@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a domain from [`crate::state`] and answers with the record as it was just
+//! before removal. A domain must be empty to be deleted: one that still holds
+//! repositories is a `ConflictException` (409), so the delete is never partial.
 //!
 //! ## Shape of an operation
 //!
@@ -92,12 +86,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codeartifact-codeartifa
 // here — hence the `DeleteDomainError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codeartifact#DeleteDomain")]
+// `ResourceNotFoundException` is widened in with `extra_errors`: CodeArtifact answers a
+// `DeleteDomain` for a domain it does not hold with that error (404), but this
+// operation's shape does not list it. It IS a service-modelled shape (every other
+// domain-scoped operation declares it), so widening names an existing error rather than
+// inventing one.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codeartifact#DeleteDomain",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum DeleteDomainErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -151,20 +154,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDomain"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteDomainErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // Resolve and refuse FIRST, so a refused delete removes nothing; the record the
+        // response reports is projected here, while the domain is still held.
+        let description = match store.domain(&input.domain, input.domain_owner.as_deref()) {
+            None => {
+                return Err(DeleteDomainErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Domain {} not found.", input.domain),
+                        resource_id: Some(input.domain.clone()),
+                        resource_type: Some("domain".to_string()),
+                    },
+                )
+                .into());
+            }
+            // A domain is deletable only once it is empty; its repositories have to be
+            // deleted first.
+            Some(domain) if !domain.repositories.is_empty() => {
+                return Err(DeleteDomainErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "Domain {} cannot be deleted because it still contains {} repositories.",
+                        input.domain,
+                        domain.repositories.len()
+                    ),
+                    resource_id: Some(input.domain.clone()),
+                    resource_type: Some("domain".to_string()),
+                })
+                .into());
+            }
+            Some(domain) => domain.description(),
+        };
+
+        // Answer with the record as it was just before removal — and remove it, so the
+        // next DescribeDomain / ListDomains no longer sees it.
+        store.domains.remove(&input.domain);
+
+        Ok(DeleteDomainOutput {
+            domain: Some(description),
+        })
     }
 }

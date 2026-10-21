@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation enumerates the record identifiers the feature group's
+//! OnlineStore holds in [`crate::state`], one page at a time: soft-deleted records are
+//! excluded unless the caller asks for them, the page is truncated to `MaxResults`, and
+//! `NextToken` names the identifier the next page resumes at.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRecords::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Authorization is not emulated, so the modelled `AccessForbidden` is unreachable.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +157,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRecords"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRecordsErrorModeled::InternalFailure(InternalFailure {
+                message: Some(
+                    "ListRecords: this service holds no state on the mounted engine".into(),
+                ),
+            })
+            .into());
+        };
+
+        // The page cursor: an opaque token whose only content is the identifier the
+        // page resumes at, so a page boundary survives records being added or removed
+        // between calls (a positional index would not).
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_next_token(token).ok_or_else(|| {
+                ListRecordsErrorModeled::ValidationError(ValidationError {
+                    message: Some(
+                        "NextToken is not a ListRecords pagination token".to_owned(),
+                    ),
+                })
+            })?),
+        };
+
+        let mut store = state.lock();
+        let Some(group) = store.group_mut(&input.feature_group_name) else {
+            return Err(ListRecordsErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!(
+                    "Feature group '{}' has no OnlineStore",
+                    input.feature_group_name
+                )),
+            })
+            .into());
+        };
+
+        let include_soft_deleted = input.include_soft_deleted_records.unwrap_or(false);
+        // `records()` iterates in ascending identifier order (a `BTreeMap`), which is
+        // what makes the cursor below a correct resume point: `filter` keeps every
+        // identifier at or after it regardless of iteration order, and the token the
+        // page emits is the first identifier it did not return.
+        let mut remaining = group
+            .records()
+            .filter(|record| include_soft_deleted || !record.soft_deleted)
+            .map(|record| record.identifier.clone())
+            .filter(|identifier| {
+                resume_at
+                    .as_deref()
+                    .is_none_or(|resume| identifier.as_str() >= resume)
+            });
+
+        // `MaxResults` caps the page; with none named the page holds at most
+        // `DEFAULT_LIST_PAGE_SIZE` (the model's own published maximum for MaxResults),
+        // so a minimal request never returns a response linear in the whole store. A
+        // page of zero is never served: it would answer an empty page beside a
+        // `NextToken` and loop a paginating client forever.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::DEFAULT_LIST_PAGE_SIZE, |max| {
+                max.max(1) as usize
+            });
+        let record_identifiers: Vec<String> = remaining.by_ref().take(page_size).collect();
+        let next_token = remaining
+            .next()
+            .map(|identifier| encode_next_token(&identifier));
+
+        Ok(ListRecordsOutput {
+            record_identifiers,
+            next_token,
+        })
     }
+}
+
+/// The per-process key every page token this operation issues carries.
+///
+/// Derived once at first use from `RandomState`, which the standard library seeds
+/// randomly per process, so a caller cannot mint a cursor: only a token this emulator
+/// issued decodes. It is only a cursor — no authorization decision rides on it — so a
+/// 64-bit marker is enough, and it deliberately does not survive a restart, exactly as
+/// a page token should not.
+fn page_token_key() -> u64 {
+    static KEY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *KEY.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write(b"ListRecords page token");
+        hasher.finish()
+    })
+}
+
+/// The page token for the identifier the next page resumes at.
+///
+/// Hex of this process's token key plus the identifier: opaque to a caller (the
+/// modelled `NextToken` promises nothing about its content), stable across calls, and
+/// carrying no server state, so a token handed out by one page resumes exactly where
+/// that page stopped.
+fn encode_next_token(identifier: &str) -> String {
+    hex::encode(format!("{:016x}:{identifier}", page_token_key()).as_bytes())
+}
+
+/// The identifier a page token resumes at, or `None` when the token is not one this
+/// operation handed out.
+fn decode_next_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    decoded
+        .strip_prefix(&format!("{:016x}:", page_token_key()))
+        .map(str::to_owned)
 }

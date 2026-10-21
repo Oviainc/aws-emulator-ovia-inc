@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutReportDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutReportDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutReportDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: inserts the supplied `ReportDefinition` into this service's store.
+//! Keyed by `ReportDefinition.ReportName`; this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -142,23 +135,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::PUT_REPORT_DEFINITION_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Create a report definition.
+    ///
+    /// Refuses a name the account already holds with `DuplicateReportNameException`,
+    /// and refuses any creation once the account holds [`crate::state::MAX_REPORTS`]
+    /// definitions with `ReportLimitReachedException` — the two conditions the modelled
+    /// error docs state. Otherwise the definition is stored member for member, with the
+    /// tags supplied beside it, and becomes visible to every later read.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutReportDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutReportDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutReportDefinition"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutReportDefinitionErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the report definition store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        let report_name = input.report_definition.report_name.clone();
+        if store.position(&report_name).is_some() {
+            return Err(PutReportDefinitionErrorModeled::DuplicateReportNameException(
+                DuplicateReportNameException {
+                    message: Some(format!(
+                        "A report with the name {report_name} already exists in the account. \
+                         Specify a different report name."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The account-wide cap, per the modelled `ReportLimitReachedException` doc
+        // ("This account already has five reports defined"). Checked against the count
+        // actually stored, so deleting a report frees a slot.
+        if store.reports.len() >= crate::state::MAX_REPORTS {
+            let limit = crate::state::MAX_REPORTS;
+            return Err(PutReportDefinitionErrorModeled::ReportLimitReachedException(
+                ReportLimitReachedException {
+                    message: Some(format!(
+                        "This account already has {limit} reports defined. To define a new \
+                         report, you must delete an existing report."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A report holds at most `MAX_TAGS_PER_REPORT` tags (the modelled `Tag` doc:
+        // "You can add up to 50 tags to a report definition"), so tags that would take
+        // it past the limit refuse the whole creation rather than storing a report with
+        // only some of them.
+        let tags = input.tags.unwrap_or_default();
+        let report = match crate::state::StoredReport::new(input.report_definition, &tags) {
+            Ok(report) => report,
+            Err(crate::state::TagLimitExceeded { requested, limit }) => {
+                return Err(PutReportDefinitionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "Tags: a report definition can hold at most {limit} tags; the \
+                             request supplies {requested}."
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+        store.reports.push(report);
+
+        Ok(PutReportDefinitionOutput {})
     }
 }

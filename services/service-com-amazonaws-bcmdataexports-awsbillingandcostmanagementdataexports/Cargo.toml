@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque, self-verifying pagination tokens: hex codec for the token body and SHA-256
+# for its integrity tag, rather than hand-rolled encoders or digests.
+hex = { workspace = true }
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

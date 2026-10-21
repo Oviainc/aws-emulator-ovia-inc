@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListComponents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListComponents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListComponents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages the parent application's stored components in
+//! `ComponentName` order, under the same `MaxResults` / `NextToken` rules as
+//! `ListApplications`.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +145,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListComponents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComponentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListComponents"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListComponentsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let (application_component_list, next_token) = {
+            let store = state.lock();
+            let application = store
+                .applications
+                .get(&input.resource_group_name)
+                // `AccountId` names the account that owns the application; this
+                // emulator serves exactly one, so under any other account the
+                // application does not exist.
+                .filter(|application| {
+                    input
+                        .account_id
+                        .as_deref()
+                        .is_none_or(|asked| asked == application.account_id)
+                });
+            let Some(application) = application else {
+                return Err(ListComponentsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no application exists for resource group {}",
+                            input.resource_group_name
+                        )),
+                    },
+                )
+                .into());
+            };
+            let page = crate::state::paginate(
+                &application.components,
+                input.next_token.as_deref(),
+                input.max_results,
+            )
+            .map_err(|message| {
+                ListComponentsErrorModeled::ValidationException(ValidationException {
+                    message: Some(message.to_string()),
+                })
+            })?;
+            let components: Vec<ApplicationComponent> =
+                page.values.iter().map(|c| c.describe()).collect();
+            (components, page.next_token)
+        };
+
+        Ok(ListComponentsOutput {
+            application_component_list: Some(application_component_list),
+            next_token,
+        })
     }
 }

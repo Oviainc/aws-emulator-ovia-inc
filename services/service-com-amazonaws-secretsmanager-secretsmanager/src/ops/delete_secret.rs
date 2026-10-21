@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSecret
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSecret`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSecret::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Schedules a stored secret for deletion after a recovery window, or — with
+//! `ForceDeleteWithoutRecovery` — removes it outright.
 //!
 //! ## Shape of an operation
 //!
@@ -188,20 +181,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSecret` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSecretErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSecret"))
+        // "You can't use both this parameter and ForceDeleteWithoutRecovery in
+        // the same call."
+        if input.recovery_window_in_days.is_some() && input.force_delete_without_recovery.is_some()
+        {
+            return Err(invalid_parameter(
+                "You can't use both RecoveryWindowInDays and ForceDeleteWithoutRecovery in the \
+                 same call.",
+            ));
+        }
+        // "The number of days from 7 to 30 that Secrets Manager waits before
+        // permanently deleting the secret." The model declares no range for the
+        // member, so the documented one is enforced here.
+        if let Some(window) = input.recovery_window_in_days {
+            if !(crate::state::MIN_RECOVERY_WINDOW_DAYS..=crate::state::MAX_RECOVERY_WINDOW_DAYS)
+                .contains(&window)
+            {
+                return Err(invalid_parameter(format!(
+                    "RecoveryWindowInDays must be between {} and {} days, inclusive; got {window}.",
+                    crate::state::MIN_RECOVERY_WINDOW_DAYS,
+                    crate::state::MAX_RECOVERY_WINDOW_DAYS,
+                )));
+            }
+        }
+        let force = input.force_delete_without_recovery.unwrap_or(false);
+        let window = input
+            .recovery_window_in_days
+            .unwrap_or(crate::state::DEFAULT_RECOVERY_WINDOW_DAYS);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        store.expire_due(now);
+
+        let Some(name) = store.resolve(&input.secret_id) else {
+            // "If you forcibly delete an already deleted or nonexistent secret,
+            // the operation does not return ResourceNotFoundException." There is
+            // no secret to report, so the response carries no ARN, name or date.
+            if force {
+                return Ok(DeleteSecretOutput::default());
+            }
+            return Err(DeleteSecretErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Secrets Manager can't find the specified secret: {}",
+                        input.secret_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        if force {
+            let removed = store.remove(&name).ok_or_else(state_unavailable)?;
+            return Ok(DeleteSecretOutput {
+                arn: Some(removed.arn),
+                name: Some(removed.name),
+                // With no recovery window there is nothing to wait for: the
+                // secret is gone as of this call.
+                deletion_date: Some(crate::state::timestamp(now)),
+            });
+        }
+
+        let Some(secret) = store.secrets.get_mut(&name) else {
+            return Err(state_unavailable());
+        };
+        if secret.scheduled_for_deletion() {
+            return Err(DeleteSecretErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "You can't perform this operation on the secret because it was marked \
+                         for deletion."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        // "This value is the date and time of the delete request plus the number
+        // of days in RecoveryWindowInDays."
+        let deletion_date = crate::state::after_days(now, window);
+        secret.deleted_date = Some(deletion_date);
+        secret.last_changed_date = now;
+
+        Ok(DeleteSecretOutput {
+            arn: Some(secret.arn.clone()),
+            name: Some(secret.name.clone()),
+            deletion_date: Some(crate::state::timestamp(deletion_date)),
+        })
     }
+}
+
+/// `InvalidParameterException` for a parameter combination the service refuses.
+fn invalid_parameter(message: impl Into<String>) -> DeleteSecretError {
+    DeleteSecretErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> DeleteSecretError {
+    DeleteSecretErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSecrets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSecrets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSecrets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists stored secrets: filtered, sorted, and paged with an opaque `NextToken`
+//! that resumes where the previous page ended. A read: it does not change what a
+//! later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -173,20 +167,214 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSecrets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSecretsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSecrets"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        // The only write a read performs: dropping secrets whose recovery window
+        // has already elapsed, which the clock made due whether or not anybody
+        // called.
+        store.expire_due(::std::time::SystemTime::now());
+
+        // A secret scheduled for deletion is hidden unless the caller asks for it.
+        let include_deleted = input.include_planned_deletion.unwrap_or(false);
+        let filters = input.filters.as_deref().unwrap_or(&[]);
+        let mut matching: Vec<&crate::state::Secret> = store
+            .secrets
+            .values()
+            .filter(|secret| include_deleted || !secret.scheduled_for_deletion())
+            .filter(|secret| filters.iter().all(|filter| matches_filter(secret, filter)))
+            .collect();
+        sort_secrets(&mut matching, input.sort_by.as_deref(), input.sort_order.as_deref());
+
+        // The cursor names the first secret of the page to return, so the next
+        // page resumes exactly where the previous one ended.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resume = crate::state::decode_next_token(token)
+                    .and_then(|name| matching.iter().position(|secret| secret.name == name));
+                match resume {
+                    Some(index) => index,
+                    None => {
+                        return Err(ListSecretsErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "The NextToken you provided is not valid for this request."
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into());
+                    }
+                }
+            }
+        };
+        // `MaxResults` is "the number of results to include in the response";
+        // absent, the whole remainder is one page. `MaxResultsType` is modelled
+        // with a range of 1..100, so the boundary has already refused 0 — the
+        // floor of 1 keeps a page non-empty whatever reaches here, since an
+        // empty page beside a `NextToken` would never terminate for a client.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(matching.len())
+            .max(1);
+        let page: Vec<&crate::state::Secret> =
+            matching.iter().skip(start).take(page_size).copied().collect();
+        let next_token = matching
+            .get(start + page.len())
+            .map(|secret| crate::state::encode_next_token(&secret.name));
+
+        Ok(ListSecretsOutput {
+            secret_list: Some(page.into_iter().map(entry_for).collect()),
+            next_token,
+        })
     }
+}
+
+/// One `SecretListEntry`, built from the stored secret.
+fn entry_for(secret: &crate::state::Secret) -> SecretListEntry {
+    SecretListEntry {
+        arn: Some(secret.arn.clone()),
+        name: Some(secret.name.clone()),
+        r#type: secret.secret_type.clone(),
+        description: secret.description.clone(),
+        kms_key_id: secret.kms_key_id.clone(),
+        rotation_enabled: Some(secret.rotation_enabled),
+        // Rotation is not emulated (`RotateSecret` carries its own stub issue),
+        // so nothing has ever configured or run it for this secret.
+        rotation_lambda_arn: None,
+        rotation_rules: None,
+        external_secret_rotation_metadata: None,
+        external_secret_rotation_role_arn: None,
+        last_rotated_date: None,
+        next_rotation_date: None,
+        last_changed_date: Some(crate::state::timestamp(secret.last_changed_date)),
+        last_accessed_date: secret.last_accessed_date.map(crate::state::timestamp),
+        deleted_date: secret.deleted_date.map(crate::state::timestamp),
+        tags: secret.tags_out(),
+        secret_versions_to_stages: secret.versions_to_stages(),
+        owning_service: secret.owning_service.clone(),
+        created_date: Some(crate::state::timestamp(secret.created_date)),
+        primary_region: Some(secret.region.clone()),
+    }
+}
+
+/// Order the matches by the requested attribute.
+///
+/// `SortBy` accepts `created-date`, `last-accessed-date`, `last-changed-date`
+/// and `name` (`SORT_BY_TYPE_VALUES`, from this service's model), and `SortOrder`
+/// accepts `asc` and `desc` (`SORT_ORDER_TYPE_VALUES`). With no `SortBy` the
+/// secrets stay in name order, which is the order the store holds them in.
+fn sort_secrets(
+    secrets: &mut [&crate::state::Secret],
+    sort_by: Option<&str>,
+    sort_order: Option<&str>,
+) {
+    match sort_by {
+        Some("created-date") => secrets.sort_by_key(|secret| secret.created_date),
+        Some("last-changed-date") => secrets.sort_by_key(|secret| secret.last_changed_date),
+        Some("last-accessed-date") => secrets.sort_by_key(|secret| secret.last_accessed_date),
+        // `name`, and any value the enum does not name, leave the store's own
+        // name order in place.
+        _ => secrets.sort_by(|a, b| a.name.cmp(&b.name)),
+    }
+    if sort_order == Some("desc") {
+        secrets.reverse();
+    }
+}
+
+/// Whether a secret satisfies one filter.
+///
+/// A filter's `Values` are alternatives (any one matching is enough) and each
+/// value may be negated with a leading `!`; separate filters all have to hold.
+fn matches_filter(secret: &crate::state::Secret, filter: &Filter) -> bool {
+    let Some(key) = filter.key.as_deref() else {
+        return true;
+    };
+    let values = filter.values.as_deref().unwrap_or(&[]);
+    if values.is_empty() {
+        return true;
+    }
+    values.iter().any(|value| match value.strip_prefix('!') {
+        Some(negated) => !matches_value(secret, key, negated),
+        None => matches_value(secret, key, value),
+    })
+}
+
+/// Whether a secret matches one filter value.
+///
+/// The per-key rules come from `Filter$Key` in this service's model: `name`,
+/// `tag-key`, `tag-value`, `primary-region` and `owning-service` are
+/// case-sensitive prefix matches, `description` is a prefix match that is not
+/// case-sensitive, and `all` "breaks the filter value string into words and then
+/// searches all attributes for matches", not case-sensitive.
+fn matches_value(secret: &crate::state::Secret, key: &str, value: &str) -> bool {
+    match key {
+        "name" => secret.name.starts_with(value),
+        "description" => secret
+            .description
+            .as_deref()
+            .is_some_and(|description| starts_with_ignoring_case(description, value)),
+        "tag-key" => secret
+            .tags
+            .iter()
+            .filter_map(|tag| tag.key.as_deref())
+            .any(|tag_key| tag_key.starts_with(value)),
+        "tag-value" => secret
+            .tags
+            .iter()
+            .filter_map(|tag| tag.value.as_deref())
+            .any(|tag_value| tag_value.starts_with(value)),
+        "primary-region" => secret.region.starts_with(value),
+        "owning-service" => secret
+            .owning_service
+            .as_deref()
+            .is_some_and(|owner| owner.starts_with(value)),
+        "all" => {
+            let attributes = searchable_attributes(secret);
+            value.split_whitespace().all(|word| {
+                attributes
+                    .iter()
+                    .any(|attribute| starts_with_ignoring_case(attribute, word))
+            })
+        }
+        // A key the model does not name matches nothing.
+        _ => false,
+    }
+}
+
+/// The attributes the `all` filter key searches.
+fn searchable_attributes(secret: &crate::state::Secret) -> Vec<&str> {
+    let mut attributes = vec![secret.name.as_str(), secret.region.as_str()];
+    attributes.extend(secret.description.as_deref());
+    attributes.extend(secret.owning_service.as_deref());
+    for tag in &secret.tags {
+        attributes.extend(tag.key.as_deref());
+        attributes.extend(tag.value.as_deref());
+    }
+    attributes
+}
+
+/// A prefix match that ignores ASCII case.
+///
+/// Compares BYTES rather than slicing the haystack at `prefix.len()`: both
+/// operands are request-derived, so a byte-indexed slice would panic whenever
+/// that offset fell inside a multi-byte character of the haystack. Case folding
+/// is ASCII-only, as `eq_ignore_ascii_case` makes it: a non-ASCII byte has to
+/// match exactly, which is the most the model's "not case-sensitive" pins down.
+fn starts_with_ignoring_case(haystack: &str, prefix: &str) -> bool {
+    let (haystack, prefix) = (haystack.as_bytes(), prefix.as_bytes());
+    haystack.len() >= prefix.len() && haystack[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> ListSecretsError {
+    ListSecretsErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetServiceNetworkServiceAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetServiceNetworkServiceAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetServiceNetworkServiceAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reads one persisted service-network/service association, by id or ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -145,6 +138,18 @@ impl From<GetServiceNetworkServiceAssociationErrorModeled> for GetServiceNetwork
     }
 }
 
+/// HTTP 404 for an identifier that names no persisted association.
+fn not_found(identifier: &str) -> GetServiceNetworkServiceAssociationError {
+    GetServiceNetworkServiceAssociationErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: format!("service network service association {identifier} not found"),
+            resource_id: identifier.to_string(),
+            resource_type: crate::state::KIND_SERVICE_ASSOCIATION.to_string(),
+        },
+    )
+    .into()
+}
+
 /// The `GetServiceNetworkServiceAssociation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -181,18 +186,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetServiceNetworkServiceAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetServiceNetworkServiceAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetServiceNetworkServiceAssociation"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetServiceNetworkServiceAssociationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the vpc-lattice state store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let identifier = &input.service_network_service_association_identifier;
+        let Some(id) = crate::state::id_from_identifier(
+            identifier,
+            crate::state::PREFIX_SERVICE_ASSOCIATION,
+        ) else {
+            return Err(not_found(identifier));
+        };
+        let now = std::time::SystemTime::now();
+        let store = state.lock();
+        let Some(association) = store.service_associations.get(&id) else {
+            return Err(not_found(identifier));
+        };
+        Ok(GetServiceNetworkServiceAssociationOutput {
+            id: Some(association.id.clone()),
+            status: Some(association.status(now).to_string()),
+            arn: Some(association.arn.clone()),
+            created_by: Some(association.created_by.clone()),
+            created_at: Some(crate::state::timestamp(association.created_at)),
+            service_id: Some(association.service_id.clone()),
+            service_name: Some(association.service_name.clone()),
+            service_arn: Some(association.service_arn.clone()),
+            service_network_id: Some(association.service_network_id.clone()),
+            service_network_name: Some(association.service_network_name.clone()),
+            service_network_arn: Some(association.service_network_arn.clone()),
+            dns_entry: Some(DnsEntry {
+                domain_name: Some(association.dns_domain_name.clone()),
+                hosted_zone_id: Some(association.dns_hosted_zone_id.clone()),
+            }),
+            custom_domain_name: association.custom_domain_name.clone(),
+            // `failureCode`/`failureMessage` describe a failed association; nothing
+            // persisted here has failed.
+            failure_message: None,
+            failure_code: None,
+        })
     }
 }

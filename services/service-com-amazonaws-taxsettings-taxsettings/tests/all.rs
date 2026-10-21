@@ -13,3 +13,5 @@
 // points it into `tests/all/`.
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tax_registration_lifecycle.rs"]
+mod tax_registration_lifecycle;

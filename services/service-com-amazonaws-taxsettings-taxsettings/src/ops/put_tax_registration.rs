@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutTaxRegistration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutTaxRegistration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutTaxRegistration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the submitted TRN as this account's tax registration and reports the
+//! status it was stored with. Writing again replaces the account's record and
+//! bumps its revision, so the document access tokens the previous write minted
+//! no longer name anything.
+//!
+//! Three refusals this handler adds beyond the constraints the boundary
+//! validator enforces, spelled out here so a later fixer does not read them as
+//! model-derived:
+//!
+//! * `legalName` and `legalAddress` are optional on `TaxRegistrationEntry` but
+//!   `@required` on every shape that REPORTS a registration (`TaxRegistration`,
+//!   `TaxRegistrationWithJurisdiction`), so an entry omitting either is refused
+//!   rather than stored in a form no read could return. The model documents a
+//!   Brazil carve-out for both, which rests on a billing address verified in the
+//!   Billing console; this service models no API that supplies one, so the
+//!   carve-out is knowingly NOT emulated — a Brazilian TRN must be submitted
+//!   with its legal name and address here.
+//! * the model's non-blank pattern `^(?!\s*$)[\s\S]+$` is a negative lookahead
+//!   the boundary validator's regex engine cannot compile, so this handler
+//!   applies it to `registrationId`, `legalName` and every address line.
+//! * a write that would take the resident store past
+//!   [`crate::state::MAX_STORED_REGISTRATIONS`] is refused with the modelled
+//!   `ConflictException`; see that constant for why the store is bounded.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +195,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutTaxRegistration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutTaxRegistrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutTaxRegistration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutTaxRegistrationErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        let account_id = crate::state::resolve_account_id(input.account_id);
+        let entry = &input.tax_registration_entry;
+
+        // Both shapes that report a registration (`TaxRegistration`,
+        // `TaxRegistrationWithJurisdiction`) mark `legalName` and `legalAddress`
+        // `@required`, so a record missing either could never be read back:
+        // refuse the write rather than store one.
+        let Some(legal_name) = entry.legal_name.as_deref() else {
+            return Err(PutTaxRegistrationErrorModeled::ValidationException(
+                crate::state::validation(
+                    crate::state::ERROR_CODE_MISSING_INPUT,
+                    "taxRegistrationEntry.legalName",
+                    "legalName is required to store a tax registration.",
+                ),
+            )
+            .into());
+        };
+        let Some(legal_address) = entry.legal_address.as_ref() else {
+            return Err(PutTaxRegistrationErrorModeled::ValidationException(
+                crate::state::validation(
+                    crate::state::ERROR_CODE_MISSING_INPUT,
+                    "taxRegistrationEntry.legalAddress",
+                    "legalAddress is required to store a tax registration.",
+                ),
+            )
+            .into());
+        };
+
+        // `registrationId`, `legalName` and the address lines carry the model's
+        // non-blank pattern `^(?!\s*$)[\s\S]+$`, a negative lookahead the
+        // boundary validator's regex engine cannot compile, so a blank value
+        // reaches this handler having satisfied every constraint the boundary
+        // could check. Everything else on this input (the 12-digit `accountId`,
+        // the 1..=200 lengths, the closed `TaxRegistrationType` / `Sector` value
+        // sets, the `certifiedEmailId` pattern, the 1..=5 document list) it
+        // already refused before this handler ran.
+        crate::state::check_not_blank(
+            "taxRegistrationEntry.registrationId",
+            &entry.registration_id,
+        )
+        .map_err(PutTaxRegistrationErrorModeled::ValidationException)?;
+        crate::state::check_not_blank("taxRegistrationEntry.legalName", legal_name)
+            .map_err(PutTaxRegistrationErrorModeled::ValidationException)?;
+        crate::state::check_address("taxRegistrationEntry.legalAddress", legal_address)
+            .map_err(PutTaxRegistrationErrorModeled::ValidationException)?;
+
+        // A write replaces the account's record and bumps its revision, which the
+        // document access tokens derived below carry. `accountId` is
+        // caller-supplied, so a write that would ADD a record is refused once the
+        // store holds as many as this emulator keeps resident; rewriting an
+        // account that already has one adds nothing and is always allowed.
+        let mut store = state.lock();
+        let previous_revision = store
+            .registrations
+            .get(&account_id)
+            .map(|stored| stored.revision);
+        if previous_revision.is_none()
+            && store.registrations.len() >= crate::state::MAX_STORED_REGISTRATIONS
+        {
+            return Err(PutTaxRegistrationErrorModeled::ConflictException(
+                crate::state::registration_store_full(),
+            )
+            .into());
+        }
+        let revision = previous_revision.map_or(1, |revision| revision.saturating_add(1));
+        let stored = crate::state::StoredTaxRegistration::from_entry(entry, &account_id, revision);
+        let status = stored.status.clone();
+        store.registrations.insert(account_id, stored);
+
+        Ok(PutTaxRegistrationOutput {
+            status: Some(status),
+        })
     }
 }

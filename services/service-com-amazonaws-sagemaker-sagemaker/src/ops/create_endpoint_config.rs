@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEndpointConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEndpointConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEndpointConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores the configuration's variants verbatim in `crate::state`, refuses
+//! a name already in use and a variant naming a model that does not exist. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -199,18 +193,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEndpointConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEndpointConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEndpointConfig"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(&region, "endpoint-config", &input.endpoint_config_name);
+
+        let mut store = state.lock();
+        // The store is bounded, so a caller varying `EndpointConfigName` cannot grow it
+        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.endpoint_configs_below_quota() {
+            return Err(CreateEndpointConfigErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for endpoint configurations is {}, \
+                         with current utilization of {} and a request delta of 1.",
+                        crate::state::ENDPOINT_CONFIG_QUOTA,
+                        store.endpoint_configs.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        if store.endpoint_configs.contains_key(&input.endpoint_config_name) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Cannot create already existing endpoint configuration \"{arn}\"."
+            )));
+        }
+
+        // A variant may name a model (a model-hosted variant) or leave it out (an
+        // inference-component variant). Where it names one, that model must already
+        // exist: accepting a dangling reference would let CreateEndpoint deploy nothing.
+        let named_models = input
+            .production_variants
+            .iter()
+            .chain(input.shadow_production_variants.iter().flatten())
+            .filter_map(|variant| variant.model_name.as_deref());
+        for model_name in named_models {
+            if !store.models.contains_key(model_name) {
+                let model_arn = crate::state::resource_arn(&region, "model", model_name);
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Could not find model \"{model_arn}\"."
+                )));
+            }
+        }
+
+        store.endpoint_configs.insert(
+            input.endpoint_config_name.clone(),
+            crate::state::EndpointConfig {
+                name: input.endpoint_config_name.clone(),
+                arn: arn.clone(),
+                production_variants: input.production_variants,
+                shadow_production_variants: input.shadow_production_variants,
+                data_capture_config: input.data_capture_config,
+                async_inference_config: input.async_inference_config,
+                explainer_config: input.explainer_config,
+                metrics_config: input.metrics_config,
+                kms_key_id: input.kms_key_id,
+                execution_role_arn: input.execution_role_arn,
+                vpc_config: input.vpc_config,
+                enable_network_isolation: input.enable_network_isolation,
+                tags: input.tags.unwrap_or_default(),
+                creation_time: ::std::time::SystemTime::now(),
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateEndpointConfigOutput {
+            endpoint_config_arn: arn,
+        })
     }
 }

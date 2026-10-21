@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: looks the endpoint configuration up in `crate::state`, snapshots its
+//! variants as `ProductionVariantSummary`s and stores the endpoint in `Creating`, with
+//! the instant the clock owes it `InService`. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,6 +161,34 @@ impl<Eng> CreateEndpoint<Eng> {
     }
 }
 
+/// The variant summaries an endpoint reports, derived from the configuration's stored
+/// `ProductionVariant`s.
+///
+/// `CurrentWeight`/`DesiredWeight` come from `InitialVariantWeight`, whose model doc
+/// says "If unspecified, it defaults to 1.0"; the instance counts come from
+/// `InitialInstanceCount`, and a serverless variant reports its serverless config
+/// instead of a count.
+fn variant_summaries(variants: &[ProductionVariant]) -> Vec<ProductionVariantSummary> {
+    variants
+        .iter()
+        .map(|variant| ProductionVariantSummary {
+            variant_name: variant.variant_name.clone(),
+            deployed_images: None,
+            current_weight: Some(variant.initial_variant_weight.unwrap_or(1.0)),
+            desired_weight: Some(variant.initial_variant_weight.unwrap_or(1.0)),
+            current_instance_count: variant.initial_instance_count,
+            desired_instance_count: variant.initial_instance_count,
+            instance_pools: None,
+            variant_status: None,
+            current_serverless_config: variant.serverless_config.clone(),
+            desired_serverless_config: variant.serverless_config.clone(),
+            managed_instance_scaling: variant.managed_instance_scaling.clone(),
+            routing_config: variant.routing_config.clone(),
+            capacity_reservation_config: None,
+        })
+        .collect()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateEndpoint<Eng>
 {
@@ -183,18 +206,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEndpoint"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(&region, "endpoint", &input.endpoint_name);
+
+        let mut store = state.lock();
+        // The store is bounded, so a caller varying `EndpointName` cannot grow it without
+        // end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.endpoints_below_quota() {
+            return Err(CreateEndpointErrorModeled::ResourceLimitExceeded(ResourceLimitExceeded {
+                message: Some(format!(
+                    "The account-level service limit for endpoints is {}, with current \
+                     utilization of {} and a request delta of 1.",
+                    crate::state::ENDPOINT_QUOTA,
+                    store.endpoints.len()
+                )),
+            })
+            .into());
+        }
+        if store.endpoints.contains_key(&input.endpoint_name) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Cannot create already existing endpoint \"{arn}\"."
+            )));
+        }
+
+        let Some(config) = store.endpoint_configs.get(&input.endpoint_config_name) else {
+            let config_arn =
+                crate::state::resource_arn(&region, "endpoint-config", &input.endpoint_config_name);
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Could not find endpoint configuration \"{config_arn}\"."
+            )));
+        };
+
+        // The endpoint snapshots the configuration it was created from, the way the real
+        // service does: a later CreateEndpointConfig does not retroactively change it.
+        let production_variants = variant_summaries(&config.production_variants);
+        let shadow_production_variants = config
+            .shadow_production_variants
+            .as_deref()
+            .map(variant_summaries)
+            .unwrap_or_default();
+        let data_capture_config = config.data_capture_config.clone();
+        let async_inference_config = config.async_inference_config.clone();
+        let explainer_config = config.explainer_config.clone();
+        let metrics_config = config.metrics_config.clone();
+
+        let now = ::std::time::SystemTime::now();
+        store.endpoints.insert(
+            input.endpoint_name.clone(),
+            crate::state::Endpoint {
+                name: input.endpoint_name.clone(),
+                arn: arn.clone(),
+                config_name: input.endpoint_config_name.clone(),
+                status: crate::state::STATUS_CREATING.to_string(),
+                failure_reason: None,
+                production_variants,
+                shadow_production_variants,
+                data_capture_config,
+                async_inference_config,
+                explainer_config,
+                metrics_config,
+                tags: input.tags.unwrap_or_default(),
+                creation_time: now,
+                last_modified_time: now,
+                in_service_at: now + crate::state::ENDPOINT_IN_SERVICE_AFTER,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateEndpointOutput { endpoint_arn: arn })
     }
 }

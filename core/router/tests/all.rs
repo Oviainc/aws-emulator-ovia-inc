@@ -13,3 +13,5 @@
 // points it into `tests/all/`.
 #[path = "all/boot_serve.rs"]
 mod boot_serve;
+#[path = "all/connect_signing_name_routing.rs"]
+mod connect_signing_name_routing;

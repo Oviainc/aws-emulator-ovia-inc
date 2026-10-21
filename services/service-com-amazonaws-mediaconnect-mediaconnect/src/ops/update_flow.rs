@@ -156,12 +156,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for UpdateFlow<Eng>
 {
     type Input = UpdateFlowInput;
-    type Output = UpdateFlowOutput;
+    type Output = UpdateFlowResponse;
     type Error = UpdateFlowError;
 
     const NAME: &'static str = "UpdateFlow";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_FLOW_INPUT_SCHEMA;
-    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_FLOW_OUTPUT_SCHEMA;
+    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_FLOW_RESPONSE_SCHEMA;
     const SUCCESS_STATUS: u16 = 202u16;
 
     async fn handle(

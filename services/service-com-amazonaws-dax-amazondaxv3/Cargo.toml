@@ -16,11 +16,16 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Derives a subnet group's VPC id and a subnet's AZ placement from the subnet
+# identifiers, so one set of subnets always reports one VPC.
+sha2 = { workspace = true }
+# Renders that digest as the hex an EC2 `vpc-` identifier carries.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

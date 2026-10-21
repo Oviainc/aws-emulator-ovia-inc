@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEndpointConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEndpointConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEndpointConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reconstructs the configuration from `crate::state` — the round-trip
+//! reader for `CreateEndpointConfig` — and refuses an unknown `EndpointConfigName`.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +158,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEndpointConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEndpointConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEndpointConfig"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let store = state.lock();
+        let Some(config) = store.endpoint_configs.get(&input.endpoint_config_name) else {
+            let arn = crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                "endpoint-config",
+                &input.endpoint_config_name,
+            );
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Could not find endpoint configuration \"{arn}\"."
+            )));
+        };
+
+        Ok(DescribeEndpointConfigOutput {
+            endpoint_config_name: config.name.clone(),
+            endpoint_config_arn: config.arn.clone(),
+            production_variants: config.production_variants.clone(),
+            data_capture_config: config.data_capture_config.clone(),
+            kms_key_id: config.kms_key_id.clone(),
+            creation_time: crate::state::timestamp(config.creation_time),
+            async_inference_config: config.async_inference_config.clone(),
+            explainer_config: config.explainer_config.clone(),
+            shadow_production_variants: config.shadow_production_variants.clone(),
+            execution_role_arn: config.execution_role_arn.clone(),
+            vpc_config: config.vpc_config.clone(),
+            enable_network_isolation: config.enable_network_isolation,
+            metrics_config: config.metrics_config.clone(),
+        })
     }
 }

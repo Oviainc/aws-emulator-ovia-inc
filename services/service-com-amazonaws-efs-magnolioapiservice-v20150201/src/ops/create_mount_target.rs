@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMountTarget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMountTarget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMountTarget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: records a mount target against its file system in [`crate::state`],
+//! allocating the network interface, Availability Zone, VPC and address its description
+//! reports from the subnet the request names.
 //!
 //! ## Shape of an operation
 //!
@@ -260,18 +254,297 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMountTarget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMountTargetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMountTarget"))
+        use crate::state as efs;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+        let region = efs::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // "Specify the type of IP address of the mount target you are creating. ... If
+        // you don’t specify an IpAddressType, then IPv4 is used." The modelled enum
+        // closure is already refused at the boundary.
+        let ip_address_type = input
+            .ip_address_type
+            .clone()
+            .unwrap_or_else(|| efs::IP_ADDRESS_TYPE_IPV4_ONLY.to_string());
+        let wants_ipv4 = ip_address_type != efs::IP_ADDRESS_TYPE_IPV6_ONLY;
+        let wants_ipv6 = ip_address_type != efs::IP_ADDRESS_TYPE_IPV4_ONLY;
+        if !wants_ipv4 && input.ip_address.is_some() {
+            return Err(bad_request(format!(
+                "IpAddress is valid only when IpAddressType is {} or {}",
+                efs::IP_ADDRESS_TYPE_IPV4_ONLY,
+                efs::IP_ADDRESS_TYPE_DUAL_STACK
+            )));
+        }
+        if !wants_ipv6 && input.ipv6_address.is_some() {
+            return Err(bad_request(format!(
+                "Ipv6Address is valid only when IpAddressType is {} or {}",
+                efs::IP_ADDRESS_TYPE_IPV6_ONLY,
+                efs::IP_ADDRESS_TYPE_DUAL_STACK
+            )));
+        }
+
+        // "VPC security group IDs, of the form sg-xxxxxxxx." The form and the count
+        // limit are modelled (`^sg-[0-9a-f]{8,40}$`, list length 0..100), so the
+        // boundary has already refused a malformed or over-long list.
+        let security_groups = input.security_groups.clone().unwrap_or_default();
+
+        let mut state = state.lock();
+        state.materialize_due_transitions(now);
+
+        let file_system_id = efs::file_system_id_of(&input.file_system_id).to_string();
+        let Some(file_system) = state.file_systems.get(&file_system_id) else {
+            return Err(CreateMountTargetErrorModeled::FileSystemNotFound(
+                FileSystemNotFound {
+                    error_code: "FileSystemNotFound".to_string(),
+                    message: Some(format!("File system {file_system_id} does not exist")),
+                },
+            )
+            .into());
+        };
+        // "To create a mount target for a file system, the file system's lifecycle state
+        // must be available."
+        if file_system.life_cycle_state != efs::LIFE_CYCLE_AVAILABLE {
+            return Err(
+                CreateMountTargetErrorModeled::IncorrectFileSystemLifeCycleState(
+                    IncorrectFileSystemLifeCycleState {
+                        error_code: "IncorrectFileSystemLifeCycleState".to_string(),
+                        message: Some(format!(
+                            "File system {file_system_id} is in life cycle state {}, not {}",
+                            file_system.life_cycle_state,
+                            efs::LIFE_CYCLE_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let one_zone_az = file_system.availability_zone_name.clone();
+
+        // The subnet "determines the VPC in which Amazon EFS creates the mount target,
+        // the Availability Zone ... and the IP address range from which Amazon EFS
+        // selects the IP address of the mount target". The facts are RESOLVED here and
+        // committed only past every refusal below, so a request that is turned away
+        // leaves nothing behind; and the emulated VPC holds at most the published number
+        // of subnets, so a caller naming a fresh subnet on every request cannot grow the
+        // registry without limit either.
+        let Some(subnet) = state.subnet(&input.subnet_id, &region) else {
+            return Err(CreateMountTargetErrorModeled::SubnetNotFound(SubnetNotFound {
+                error_code: "SubnetNotFound".to_string(),
+                message: Some(format!(
+                    "Subnet {} does not exist: VPC {} already holds the maximum of {} subnets",
+                    input.subnet_id,
+                    state.vpc_id(),
+                    efs::MAX_SUBNETS_PER_VPC
+                )),
+            })
+            .into());
+        };
+
+        // Each mount target holds one elastic network interface, so the store is bounded
+        // by the interface ceiling it reports.
+        if state.mount_targets.len() >= efs::MAX_MOUNT_TARGETS {
+            return Err(
+                CreateMountTargetErrorModeled::NetworkInterfaceLimitExceeded(
+                    NetworkInterfaceLimitExceeded {
+                        error_code: "NetworkInterfaceLimitExceeded".to_string(),
+                        message: Some(format!(
+                            "This account has reached the limit of {} network interfaces in \
+                             {region}",
+                            efs::MAX_MOUNT_TARGETS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You can create only one mount target for a One Zone file system. You must
+        // create that mount target in the same Availability Zone in which the file system
+        // is located."
+        if let Some(file_system_az) = one_zone_az {
+            if file_system_az != subnet.availability_zone_name {
+                return Err(CreateMountTargetErrorModeled::AvailabilityZonesMismatch(
+                    AvailabilityZonesMismatch {
+                        error_code: Some("AvailabilityZonesMismatch".to_string()),
+                        message: Some(format!(
+                            "Subnet {} is in Availability Zone {}, but One Zone file system \
+                             {file_system_id} is in {file_system_az}",
+                            subnet.subnet_id, subnet.availability_zone_name
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "there can be only one mount target per Availability Zone" and a new mount
+        // target "must belong to the same VPC as the subnets of the existing mount
+        // targets". The zone rule is also what bounds a file system's mount-target list:
+        // it can hold at most one entry per Availability Zone of the Region.
+        for existing in state.mount_targets_of(&file_system_id) {
+            if existing.availability_zone_name == subnet.availability_zone_name {
+                return Err(CreateMountTargetErrorModeled::MountTargetConflict(
+                    MountTargetConflict {
+                        error_code: "MountTargetConflict".to_string(),
+                        message: Some(format!(
+                            "File system {file_system_id} already has mount target {} in \
+                             Availability Zone {}",
+                            existing.mount_target_id, existing.availability_zone_name
+                        )),
+                    },
+                )
+                .into());
+            }
+            if existing.vpc_id != subnet.vpc_id {
+                return Err(CreateMountTargetErrorModeled::MountTargetConflict(
+                    MountTargetConflict {
+                        error_code: "MountTargetConflict".to_string(),
+                        message: Some(format!(
+                            "Subnet {} is in VPC {}, but file system {file_system_id} already \
+                             has mount targets in VPC {}",
+                            subnet.subnet_id, subnet.vpc_id, existing.vpc_id
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "If the request provides an IpAddress, Amazon EFS assigns that IP address to
+        // the network interface. Otherwise, Amazon EFS assigns a free address in the
+        // subnet."
+        let ip_address = if wants_ipv4 {
+            match input.ip_address.clone() {
+                Some(requested) => {
+                    if state.ipv4_in_use(&subnet.subnet_id, &requested) {
+                        return Err(CreateMountTargetErrorModeled::IpAddressInUse(
+                            IpAddressInUse {
+                                error_code: "IpAddressInUse".to_string(),
+                                message: Some(format!(
+                                    "IpAddress {requested} is already in use in subnet {}",
+                                    subnet.subnet_id
+                                )),
+                            },
+                        )
+                        .into());
+                    }
+                    Some(requested)
+                }
+                None => match state.free_ipv4(&subnet) {
+                    Some(allocated) => Some(allocated),
+                    None => {
+                        return Err(CreateMountTargetErrorModeled::NoFreeAddressesInSubnet(
+                            NoFreeAddressesInSubnet {
+                                error_code: "NoFreeAddressesInSubnet".to_string(),
+                                message: Some(format!(
+                                    "Subnet {} has no free IPv4 address left",
+                                    subnet.subnet_id
+                                )),
+                            },
+                        )
+                        .into())
+                    }
+                },
+            }
+        } else {
+            None
+        };
+        let ipv6_address = if wants_ipv6 {
+            match input.ipv6_address.clone() {
+                Some(requested) => {
+                    if state.ipv6_in_use(&subnet.subnet_id, &requested) {
+                        return Err(CreateMountTargetErrorModeled::IpAddressInUse(
+                            IpAddressInUse {
+                                error_code: "IpAddressInUse".to_string(),
+                                message: Some(format!(
+                                    "Ipv6Address {requested} is already in use in subnet {}",
+                                    subnet.subnet_id
+                                )),
+                            },
+                        )
+                        .into());
+                    }
+                    Some(requested)
+                }
+                None => match state.free_ipv6(&subnet) {
+                    Some(allocated) => Some(allocated),
+                    None => {
+                        return Err(CreateMountTargetErrorModeled::NoFreeAddressesInSubnet(
+                            NoFreeAddressesInSubnet {
+                                error_code: "NoFreeAddressesInSubnet".to_string(),
+                                message: Some(format!(
+                                    "Subnet {} has no free IPv6 address left",
+                                    subnet.subnet_id
+                                )),
+                            },
+                        )
+                        .into())
+                    }
+                },
+            }
+        } else {
+            None
+        };
+
+        let ordinal = state.next_ordinal();
+        let mount_target_id = format!("fsmt-{}", state.mint_hex());
+        // "Also creates a new network interface in the subnet".
+        let network_interface_id = format!("eni-{}", state.mint_hex());
+        let mount_target = efs::MountTarget {
+            ordinal,
+            mount_target_id: mount_target_id.clone(),
+            file_system_id: file_system_id.clone(),
+            subnet_id: subnet.subnet_id.clone(),
+            owner_id: ::engine::emulator_account_id().to_string(),
+            // A new mount target is reported while it is still being created; the clock
+            // owes it `available`.
+            life_cycle_state: efs::LIFE_CYCLE_CREATING.to_string(),
+            available_at: now + efs::CREATING_FOR,
+            ip_address,
+            ipv6_address,
+            network_interface_id,
+            availability_zone_id: subnet.availability_zone_id.clone(),
+            availability_zone_name: subnet.availability_zone_name.clone(),
+            vpc_id: subnet.vpc_id.clone(),
+            security_groups,
+        };
+
+        let description = mount_target.describe();
+        // Past every refusal, so this is the first write the request makes: the subnet
+        // facts the description was built from are committed alongside the mount target
+        // itself, never by a call that was turned away.
+        state.record_subnet(subnet);
+        state
+            .mount_targets
+            .insert(mount_target_id.clone(), mount_target);
+        // `NumberOfMountTargets` is the length of this list, so the count a later
+        // DescribeFileSystems reports moves with the mount targets that back it.
+        if let Some(file_system) = state.file_systems.get_mut(&file_system_id) {
+            file_system.mount_target_ids.push(mount_target_id);
+        }
+        Ok(description)
     }
+}
+
+/// A 400 `BadRequest`: "the request is malformed or contains an error such as an invalid
+/// parameter value or a missing required parameter".
+fn bad_request(message: impl Into<String>) -> CreateMountTargetError {
+    CreateMountTargetErrorModeled::BadRequest(BadRequest {
+        error_code: "BadRequest".to_string(),
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 500 `InternalServerError`, for the one case this handler cannot serve: the engine
+/// this service was mounted on holds no store for it.
+fn internal_server_error() -> CreateMountTargetError {
+    CreateMountTargetErrorModeled::InternalServerError(InternalServerError {
+        error_code: "InternalServerError".to_string(),
+        message: Some("the EFS emulator state store is unavailable".to_string()),
+    })
+    .into()
 }

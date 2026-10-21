@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPerformanceAnalysisReports
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPerformanceAnalysisReports`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: pages the stored reports of one monitored resource, sorted by the
+//! start time of each report as this operation documents, computing every summary
+//! from the store.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPerformanceAnalysisReports::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Authorization is NOT emulated here: the emulator holds no IAM principals or
+//! policies, so the modelled `NotAuthorizedException` is never the answer and a
+//! well-formed request for a resource is served. That is a deliberate,
+//! documented divergence, not a permission decision.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +159,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPerformanceAnalysisReports` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPerformanceAnalysisReportsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPerformanceAnalysisReports"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListPerformanceAnalysisReportsErrorModeled::InternalServiceError(
+                    InternalServiceError {
+                        message: Some(
+                            "the Performance Insights report store is unavailable".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let _ = ctx;
+
+        // A cursor is only valid for the result set it was handed out for, which
+        // for this operation is one monitored resource.
+        let scope = format!("{}|{}", input.service_type, input.identifier);
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::decode_page_token(token, &scope) {
+                Some(offset) => offset,
+                None => {
+                    return Err(
+                        ListPerformanceAnalysisReportsErrorModeled::InvalidArgumentException(
+                            InvalidArgumentException {
+                                message: Some(
+                                    "The NextToken was not issued for this request's ServiceType and Identifier."
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        let mut store = state.lock();
+        // The clock-owed RUNNING -> SUCCEEDED move, materialised before the
+        // summaries are read so a listed status matches a Get of the same report.
+        store.materialize_due_statuses(&input.service_type, &input.identifier);
+
+        // Documented for this operation: "The reports are sorted based on the
+        // start time of each report."
+        let reports = store.listed_reports_of(&input.service_type, &input.identifier);
+        // `MaxResults` has a modelled minimum of 0, and a page size of zero could
+        // never advance a cursor, so 0 reads as "no caller-imposed page size" —
+        // the same as omitting it.
+        let page_size = match input.max_results {
+            Some(max) if max > 0 => max as usize,
+            _ => reports.len(),
+        };
+        let end = offset.saturating_add(page_size).min(reports.len());
+        let page = reports.get(offset..end).unwrap_or_default();
+
+        let analysis_reports: Vec<AnalysisReportSummary> = page
+            .iter()
+            .map(|report| AnalysisReportSummary {
+                analysis_report_id: Some(report.analysis_report_id.clone()),
+                create_time: Some(report.create_time),
+                start_time: Some(report.start_time),
+                end_time: report.end_time,
+                status: Some(report.status.clone()),
+                // Documented on `ListTags`: the tags are returned only when the
+                // caller asks for them.
+                tags: input
+                    .list_tags
+                    .unwrap_or(false)
+                    .then(|| report.tags.clone()),
+            })
+            .collect();
+
+        // A cursor resumes exactly where this page stopped, and is absent on the
+        // last page.
+        let next_token = (end < reports.len()).then(|| crate::state::encode_page_token(&scope, end));
+
+        Ok(ListPerformanceAnalysisReportsOutput {
+            analysis_reports: Some(analysis_reports),
+            next_token,
+        })
     }
 }

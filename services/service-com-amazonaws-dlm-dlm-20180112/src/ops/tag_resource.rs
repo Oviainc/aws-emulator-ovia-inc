@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +129,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the dlm lifecycle-policy store is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // `ResourceArn` is a `PolicyArn`, so the resource it names is the policy
+        // whose STORED `PolicyArn` it equals — not one derived from the request.
+        let Some(policy_id) = store.policy_id_for_arn(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::policy_not_found_by_arn(&input.resource_arn),
+            )
+            .into());
+        };
+        let Some(policy) = store.policies.get_mut(&policy_id) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::policy_not_found_by_arn(&input.resource_arn),
+            )
+            .into());
+        };
+
+        // Adding a tag whose key is already held replaces that tag's value.
+        for (key, value) in input.tags {
+            policy.tags.insert(key, value);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPerformanceAnalysisReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPerformanceAnalysisReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: returns the stored report, with the window and the metadata
+//! `CreatePerformanceAnalysisReport` persisted, and materialises the status the clock
+//! already owes it. An unknown id is `InvalidArgumentException` (HTTP 400).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPerformanceAnalysisReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Authorization is NOT emulated: the emulator holds no IAM principals or
+//! policies, so the modelled `NotAuthorizedException` is never the answer and a
+//! well-formed request for a stored report is served. That is a deliberate,
+//! documented divergence, not a permission decision.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +156,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPerformanceAnalysisReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPerformanceAnalysisReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPerformanceAnalysisReport"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetPerformanceAnalysisReportErrorModeled::InternalServiceError(
+                InternalServiceError {
+                    message: Some(
+                        "the Performance Insights report store is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        let mut store = state.lock();
+        // The only write a reporting operation may make: the RUNNING ->
+        // SUCCEEDED move the clock already owed at this instant, whether or not
+        // anybody called.
+        store.materialize_due_statuses(&input.service_type, &input.identifier);
+
+        let Some(report) = store.report(
+            &input.service_type,
+            &input.identifier,
+            &input.analysis_report_id,
+        ) else {
+            return Err(
+                GetPerformanceAnalysisReportErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(format!(
+                            "AnalysisReportId {} was not found for the resource {}.",
+                            input.analysis_report_id, input.identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `TextFormat` and `AcceptLanguage` choose the rendering of an insight's
+        // prose. The emulator analyses no DB session data, so a report carries no
+        // insights and there is no prose for them to re-render; both are accepted
+        // (the model's value sets are refused at the boundary) and change nothing.
+        Ok(GetPerformanceAnalysisReportOutput {
+            analysis_report: Some(AnalysisReport {
+                analysis_report_id: report.analysis_report_id.clone(),
+                identifier: Some(report.identifier.clone()),
+                service_type: Some(report.service_type.clone()),
+                create_time: Some(report.create_time),
+                start_time: Some(report.start_time),
+                end_time: report.end_time,
+                status: Some(report.status.clone()),
+                insights: Some(report.insights.clone()),
+            }),
+        })
     }
 }

@@ -1,11 +1,377 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-dlm-dlm-20180112 service.
+//!
+//! The lifecycle policy is the primary resource of the Amazon Data Lifecycle
+//! Manager control plane: `CreateLifecyclePolicy` mints one,
+//! `GetLifecyclePolicy` / `GetLifecyclePolicies` report it,
+//! `UpdateLifecyclePolicy` mutates it, `DeleteLifecyclePolicy` removes it and the
+//! three tag operations read and write its tags. [`LifecyclePolicyRecord`] below
+//! is the ONE copy of a policy every one of those handlers reads and writes, plus
+//! the two projections the model asks for (`LifecyclePolicy` and
+//! `LifecyclePolicySummary`).
+
+use std::collections::{BTreeMap, HashMap};
+use std::time::SystemTime;
+
+use crate::ops::types::{
+    CrossRegionCopyTarget, Exclusions, LifecyclePolicy, LifecyclePolicySummary, PolicyDetails,
+    ResourceNotFoundException, Tag,
+};
+
+/// The region a policy ARN is built for when the request carries no SigV4
+/// credential scope to read one from.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The `arnNamespace` / sigv4 signing name this service's ARNs carry
+/// (`smithy_query(query="service_info")`: `arnNamespace: dlm`).
+pub const ARN_NAMESPACE: &str = "dlm";
+
+/// The `ResourceType` a `ResourceNotFoundException` / `LimitExceededException`
+/// reports for a lifecycle policy — "the type of resource that was not found".
+pub const POLICY_RESOURCE_TYPE: &str = "policy";
+
+/// The policy type a policy carries when `PolicyDetails$PolicyType` names none:
+/// "The default is `EBS_SNAPSHOT_MANAGEMENT`."
+pub const DEFAULT_POLICY_TYPE: &str = "EBS_SNAPSHOT_MANAGEMENT";
+
+/// The policy type of a policy whose target resource type is `INSTANCE`: a
+/// default policy for `INSTANCE` "creates EBS-backed AMIs from all instances in
+/// the Region", and `IMAGE_MANAGEMENT` is the `PolicyTypeValues` member that
+/// "manages the lifecycle of EBS-backed AMIs".
+pub const IMAGE_POLICY_TYPE: &str = "IMAGE_MANAGEMENT";
+
+/// The `PolicyLanguage` value that marks a policy as a DEFAULT policy:
+/// `PolicyDetails$PolicyLanguage` documents `SIMPLIFIED` as "To create a default
+/// policy" and `STANDARD` as "To create a custom policy".
+pub const SIMPLIFIED_POLICY_LANGUAGE: &str = "SIMPLIFIED";
+
+/// The creation frequency a default policy runs at when the request names none:
+/// `CreateInterval` documents "If you do not specify a value, the default is 1."
+pub const DEFAULT_CREATE_INTERVAL: i32 = 1;
+
+/// How long a default policy retains snapshots or AMIs when the request names
+/// no value: `RetainInterval` documents "If you do not specify a value, the
+/// default is 7."
+pub const DEFAULT_RETAIN_INTERVAL: i32 = 7;
+
+/// Whether a default policy copies tags from the source resource when the
+/// request names no value: `CopyTags` documents "If you do not specify a value,
+/// the default is false."
+pub const DEFAULT_COPY_TAGS: bool = false;
+
+/// Whether a default policy extends deletion when the request names no value:
+/// `ExtendDeletion` documents "If you do not specify a value, the default is
+/// false."
+pub const DEFAULT_EXTEND_DELETION: bool = false;
+
+/// How many policies the store holds before `CreateLifecyclePolicy` refuses with
+/// the modelled `LimitExceededException`.
+///
+/// This is the emulator's OWN bound on the store, not a claim about any
+/// account's Amazon Data Lifecycle Manager quota (which is adjustable, and which
+/// this emulator does not model). It is set far above any workflow an emulator
+/// serves, and it is what stops the state growing without end: every record it
+/// holds is released by `DeleteLifecyclePolicy`.
+pub const POLICY_QUOTA: usize = 1_000;
+
+/// One Amazon Data Lifecycle Manager lifecycle policy, as this emulator persists
+/// it. Every member a read operation reports comes from here, never from the
+/// request being served.
+#[derive(Debug, Clone)]
+pub struct LifecyclePolicyRecord {
+    /// `^policy-[a-f0-9]+$`, minted by
+    /// [`ComAmazonawsDlmDlm20180112State::mint_policy_id`].
+    pub policy_id: String,
+    /// `arn:aws:dlm:<region>:<account>:policy/<policy id>`, derived at create.
+    pub policy_arn: String,
+    pub description: String,
+    /// One of `GettablePolicyStateValues` (`ENABLED` | `DISABLED` | `ERROR`).
+    pub state: String,
+    /// "The description of the status" — reported only for a policy whose state
+    /// carries one, which in this emulator no policy does: nothing moves a
+    /// policy into `ERROR`.
+    pub status_message: Option<String>,
+    pub execution_role_arn: String,
+    pub date_created: SystemTime,
+    pub date_modified: SystemTime,
+    pub policy_details: Option<PolicyDetails>,
+    /// True when this is a default policy rather than a custom one.
+    pub default_policy: bool,
+    /// `DefaultPolicyTypeValues` (`INSTANCE` | `VOLUME`) for a default policy.
+    pub default_policy_type: Option<String>,
+    pub create_interval: Option<i32>,
+    pub retain_interval: Option<i32>,
+    pub copy_tags: Option<bool>,
+    pub extend_deletion: Option<bool>,
+    pub cross_region_copy_targets: Vec<CrossRegionCopyTarget>,
+    pub exclusions: Option<Exclusions>,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl LifecyclePolicyRecord {
+    /// The `PolicyDetails` this policy reports: "The configuration of the
+    /// lifecycle policy".
+    ///
+    /// A CUSTOM policy's configuration is exactly the structure the request
+    /// carried. A DEFAULT policy's may instead have been stated in the request
+    /// body — `CreateLifecyclePolicy` documents the two as alternatives ("either
+    /// in the request body, or in the PolicyDetails request structure, but not
+    /// both") — so for one of those the stored body parameters are reported
+    /// here, each with the default its member documents when the request named
+    /// no value.
+    pub fn effective_policy_details(&self) -> Option<PolicyDetails> {
+        if !self.default_policy {
+            return self.policy_details.clone();
+        }
+        let mut details = self.policy_details.clone().unwrap_or_default();
+        details.policy_language = Some(SIMPLIFIED_POLICY_LANGUAGE.to_string());
+        details.policy_type = Some(self.policy_type());
+        details.resource_type = self
+            .default_policy_type
+            .clone()
+            .or(details.resource_type.clone());
+        details.create_interval = Some(
+            self.create_interval
+                .or(details.create_interval)
+                .unwrap_or(DEFAULT_CREATE_INTERVAL),
+        );
+        details.retain_interval = Some(
+            self.retain_interval
+                .or(details.retain_interval)
+                .unwrap_or(DEFAULT_RETAIN_INTERVAL),
+        );
+        details.copy_tags = Some(
+            self.copy_tags
+                .or(details.copy_tags)
+                .unwrap_or(DEFAULT_COPY_TAGS),
+        );
+        details.extend_deletion = Some(
+            self.extend_deletion
+                .or(details.extend_deletion)
+                .unwrap_or(DEFAULT_EXTEND_DELETION),
+        );
+        if !self.cross_region_copy_targets.is_empty() {
+            details.cross_region_copy_targets = Some(self.cross_region_copy_targets.clone());
+        }
+        details.exclusions = self.exclusions.clone().or(details.exclusions.clone());
+        Some(details)
+    }
+
+    /// This policy's `PolicyTypeValues`.
+    ///
+    /// `PolicyDetails$PolicyType` is what states it; absent that, a policy whose
+    /// target resource type is `INSTANCE` manages EBS-backed AMIs
+    /// ([`IMAGE_POLICY_TYPE`]) and anything else takes the documented default
+    /// ([`DEFAULT_POLICY_TYPE`]).
+    pub fn policy_type(&self) -> String {
+        if let Some(declared) = self
+            .policy_details
+            .as_ref()
+            .and_then(|details| details.policy_type.clone())
+        {
+            return declared;
+        }
+        match self.target_resource_type().as_deref() {
+            Some("INSTANCE") => IMAGE_POLICY_TYPE.to_string(),
+            _ => DEFAULT_POLICY_TYPE.to_string(),
+        }
+    }
+
+    /// The single resource type this policy targets, however it was stated: a
+    /// default policy names it in `DefaultPolicy` (or `PolicyDetails$ResourceType`),
+    /// a custom snapshot policy in `PolicyDetails$ResourceTypes`.
+    fn target_resource_type(&self) -> Option<String> {
+        if let Some(default_type) = self.default_policy_type.clone() {
+            return Some(default_type);
+        }
+        let details = self.policy_details.as_ref()?;
+        if let Some(resource_type) = details.resource_type.clone() {
+            return Some(resource_type);
+        }
+        details
+            .resource_types
+            .as_ref()
+            .and_then(|types| types.first().cloned())
+    }
+
+    /// Every resource type this policy targets, for the `resourceTypes` filter.
+    pub fn target_resource_types(&self) -> Vec<String> {
+        let mut types: Vec<String> = Vec::new();
+        if let Some(default_type) = self.default_policy_type.as_ref() {
+            types.push(default_type.clone());
+        }
+        if let Some(details) = self.policy_details.as_ref() {
+            if let Some(resource_type) = details.resource_type.as_ref() {
+                types.push(resource_type.clone());
+            }
+            if let Some(resource_types) = details.resource_types.as_ref() {
+                types.extend(resource_types.iter().cloned());
+            }
+        }
+        types
+    }
+
+    /// This policy's target tags as the `key=value` strings the `targetTags`
+    /// filter is expressed in ("Tags are strings in the format key=value").
+    pub fn target_tag_filters(&self) -> Vec<String> {
+        self.policy_details
+            .as_ref()
+            .and_then(|details| details.target_tags.as_ref())
+            .map(|tags| tags.iter().map(tag_filter).collect())
+            .unwrap_or_default()
+    }
+
+    /// The tags this policy's schedules add to the objects they create, as
+    /// `key=value` strings, for the `tagsToAdd` filter.
+    pub fn tags_to_add_filters(&self) -> Vec<String> {
+        let Some(schedules) = self
+            .policy_details
+            .as_ref()
+            .and_then(|details| details.schedules.as_ref())
+        else {
+            return Vec::new();
+        };
+        schedules
+            .iter()
+            .filter_map(|schedule| schedule.tags_to_add.as_ref())
+            .flat_map(|tags| tags.iter().map(tag_filter))
+            .collect()
+    }
+
+    /// The policy's tags as the wire map, or `None` when it carries none:
+    /// `TagMap` is modelled `@length(min: 1, max: 200)`, so an EMPTY map is not
+    /// a value this member admits — an untagged policy reports no member at all.
+    pub fn wire_tags(&self) -> Option<HashMap<String, String>> {
+        if self.tags.is_empty() {
+            return None;
+        }
+        Some(
+            self.tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )
+    }
+
+    /// The `LifecyclePolicy` projection `GetLifecyclePolicy` returns.
+    pub fn to_policy(&self) -> LifecyclePolicy {
+        LifecyclePolicy {
+            policy_id: Some(self.policy_id.clone()),
+            description: Some(self.description.clone()),
+            state: Some(self.state.clone()),
+            status_message: self.status_message.clone(),
+            execution_role_arn: Some(self.execution_role_arn.clone()),
+            date_created: Some(::aws_smithy_types::DateTime::from(self.date_created)),
+            date_modified: Some(::aws_smithy_types::DateTime::from(self.date_modified)),
+            policy_details: self.effective_policy_details(),
+            tags: self.wire_tags(),
+            policy_arn: Some(self.policy_arn.clone()),
+            default_policy: Some(self.default_policy),
+        }
+    }
+
+    /// The `LifecyclePolicySummary` projection `GetLifecyclePolicies` returns.
+    ///
+    /// `DefaultPolicy` is modelled `boolean` on this shape too (the prose
+    /// describing it as a type is stale), so it carries the same flag the full
+    /// shape does.
+    pub fn to_summary(&self) -> LifecyclePolicySummary {
+        LifecyclePolicySummary {
+            policy_id: Some(self.policy_id.clone()),
+            description: Some(self.description.clone()),
+            state: Some(self.state.clone()),
+            tags: self.wire_tags(),
+            policy_type: Some(self.policy_type()),
+            default_policy: Some(self.default_policy),
+        }
+    }
+}
+
+/// A `Tag` as the `key=value` string Amazon Data Lifecycle Manager's tag filters
+/// are expressed in.
+fn tag_filter(tag: &Tag) -> String {
+    format!("{}={}", tag.key, tag.value)
+}
 
 /// Per-service state for com-amazonaws-dlm-dlm-20180112. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsDlmDlm20180112State {
-    // TODO: add service-specific state fields
+    /// Every lifecycle policy, keyed by its id — the single source of truth. A
+    /// `BTreeMap` gives `GetLifecyclePolicies` a stable total order, and ids sort
+    /// in the order they were minted.
+    pub policies: BTreeMap<String, LifecyclePolicyRecord>,
+    /// The counter policy ids are minted from.
+    pub next_policy_suffix: u64,
+}
+
+impl ComAmazonawsDlmDlm20180112State {
+    /// Mint an unused policy id matching `PolicyId`'s `^policy-[a-f0-9]+$`.
+    ///
+    /// Sixteen lower-case hex digits keep every id the same width, so the
+    /// `BTreeMap`'s key order is the order the ids were minted in; the loop skips
+    /// an id already taken, which is what makes the wrap safe.
+    pub fn mint_policy_id(&mut self) -> String {
+        loop {
+            self.next_policy_suffix = self.next_policy_suffix.wrapping_add(1);
+            let id = format!("policy-{:016x}", self.next_policy_suffix);
+            if !self.policies.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// The id of the policy whose stored `PolicyArn` is `arn`.
+    ///
+    /// The tag operations address a policy by ARN; no index is kept for it,
+    /// because the ARN is derived from the id and the store is small.
+    pub fn policy_id_for_arn(&self, arn: &str) -> Option<String> {
+        self.policies
+            .values()
+            .find(|policy| policy.policy_arn == arn)
+            .map(|policy| policy.policy_id.clone())
+    }
+}
+
+/// The region this request was signed for — what a policy ARN names.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The ARN of the policy `policy_id` names, in `region`.
+pub fn policy_arn(policy_id: &str, region: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("policy/{policy_id}"))
+}
+
+/// The `ResourceNotFoundException` payload for policy ids that name no policy.
+///
+/// `Code` is left unset: the model declares it, but no rule for its value is
+/// documented, and this emulator does not invent one.
+pub fn policies_not_found(ids: &[String]) -> ResourceNotFoundException {
+    let message = match ids {
+        [one] => format!("Policy {one} could not be found."),
+        many => format!("Policies {} could not be found.", many.join(", ")),
+    };
+    ResourceNotFoundException {
+        message: Some(message),
+        code: None,
+        resource_type: Some(POLICY_RESOURCE_TYPE.to_string()),
+        resource_ids: Some(ids.to_vec()),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an ARN that names no policy.
+pub fn policy_not_found_by_arn(arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Policy {arn} could not be found.")),
+        code: None,
+        resource_type: Some(POLICY_RESOURCE_TYPE.to_string()),
+        // `ResourceIds` is "a list of resource IDs that were not found", and the
+        // request named an ARN rather than an id that could be echoed here.
+        resource_ids: None,
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

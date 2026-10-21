@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateService
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateService`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateService::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a synchronous create that returns the full `Service` computed from the
+//! record it just persisted, and keeps the owning namespace's `ServiceCount` true.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +185,187 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateService` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServiceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateService"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateServiceErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        if input
+            .tags
+            .as_ref()
+            .is_some_and(|tags| tags.len() > crate::state::MAX_TAGS_PER_RESOURCE)
+        {
+            return Err(CreateServiceErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "The list of tags on the resource is over the quota of {}.",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                    resource_name: None,
+                },
+            )
+            .into());
+        }
+
+        // Documented on `HealthCheckCustomConfig`: "you can specify either
+        // HealthCheckCustomConfig or HealthCheckConfig but not both".
+        if input.health_check_config.is_some() && input.health_check_custom_config.is_some() {
+            return Err(CreateServiceErrorModeled::InvalidInput(InvalidInput {
+                message: Some(
+                    "Specify either HealthCheckConfig or HealthCheckCustomConfig, not both."
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
+        // The namespace is named either directly or by the (deprecated)
+        // `DnsConfig.NamespaceId`; one of the two must be present.
+        let Some(namespace_reference) = input
+            .namespace_id
+            .clone()
+            .or_else(|| {
+                input
+                    .dns_config
+                    .as_ref()
+                    .and_then(|dns_config| dns_config.namespace_id.clone())
+            })
+        else {
+            return Err(CreateServiceErrorModeled::InvalidInput(InvalidInput {
+                message: Some(
+                    "NamespaceId is required: name the namespace the service belongs to."
+                        .to_string(),
+                ),
+            })
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+
+        let Some(namespace_id) = state.resolve_namespace_id(&namespace_reference) else {
+            return Err(CreateServiceErrorModeled::NamespaceNotFound(NamespaceNotFound {
+                message: Some(format!(
+                    "No namespace exists with the specified ID {namespace_reference}."
+                )),
+            })
+            .into());
+        };
+        // What the token identifies: this service name in this namespace.
+        let requested = format!("{namespace_id}/{}", input.name);
+
+        // A replayed `CreatorRequestId` returns the service the FIRST call created.
+        let replayed = input
+            .creator_request_id
+            .as_deref()
+            .and_then(|token| {
+                state.replayed(
+                    crate::state::IdempotencyScope::CreateService,
+                    token,
+                    &requested,
+                )
+            })
+            .and_then(|service_id| state.services.get(&service_id).cloned());
+        if let Some(existing) = replayed {
+            return Ok(CreateServiceOutput {
+                service: Some(crate::state::service_view(&existing)),
+            });
+        }
+
+        let name_key = (namespace_id.clone(), input.name.clone());
+        if let Some(existing) = state
+            .service_ids_by_namespace_and_name
+            .get(&name_key)
+            .and_then(|service_id| state.services.get(service_id))
+        {
+            return Err(CreateServiceErrorModeled::ServiceAlreadyExists(
+                ServiceAlreadyExists {
+                    message: Some(format!(
+                        "The service {} already exists in namespace {namespace_id}.",
+                        input.name
+                    )),
+                    creator_request_id: existing.creator_request_id.clone(),
+                    service_id: Some(existing.id.clone()),
+                    service_arn: Some(existing.arn.clone()),
+                },
+            )
+            .into());
+        }
+
+        // `Service$Type` says what can discover the instances: `HTTP` when no DNS
+        // record is registered for them — the caller asked for `HTTP`, supplied no
+        // `DnsConfig`, or the namespace is an HTTP namespace, which holds no hosted
+        // zone — and `DNS_HTTP` when DNS records are registered, which both DNS
+        // queries and `DiscoverInstances` can then find.
+        let namespace_is_http = state
+            .namespaces
+            .get(&namespace_id)
+            .is_some_and(|namespace| namespace.namespace_type == "HTTP");
+        let http_only = input.r#type.as_deref() == Some("HTTP")
+            || input.dns_config.is_none()
+            || namespace_is_http;
+        let service_type = if http_only { "HTTP" } else { "DNS_HTTP" };
+
+        if usize::try_from(state.service_count(&namespace_id)).unwrap_or(usize::MAX)
+            >= crate::state::MAX_SERVICES_PER_NAMESPACE
+        {
+            return Err(CreateServiceErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The service can't be created because namespace {namespace_id} holds this \
+                         emulator's quota of {} services.",
+                        crate::state::MAX_SERVICES_PER_NAMESPACE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.next_id("srv", 16);
+        let record = crate::state::ServiceRecord {
+            arn: crate::state::service_arn(&region, &format!("service/{id}")),
+            id: id.clone(),
+            name: input.name.clone(),
+            namespace_id,
+            description: input.description.clone(),
+            dns_config: input.dns_config.clone(),
+            health_check_config: input.health_check_config.clone(),
+            health_check_custom_config: input.health_check_custom_config.clone(),
+            service_type: service_type.to_string(),
+            create_date: now,
+            creator_request_id: input.creator_request_id.clone(),
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| (tag.key, tag.value))
+                .collect(),
+            instances: std::collections::BTreeMap::new(),
+            instances_revision: 0,
+        };
+        state
+            .service_ids_by_namespace_and_name
+            .insert(name_key, id.clone());
+        state.services.insert(id.clone(), record);
+        if let Some(token) = input.creator_request_id.as_deref() {
+            state.remember(
+                crate::state::IdempotencyScope::CreateService,
+                token,
+                &requested,
+                &id,
+            );
+        }
+
+        let view = state
+            .services
+            .get(&id)
+            .map(crate::state::service_view)
+            .expect("the service just inserted is present");
+        Ok(CreateServiceOutput {
+            service: Some(view),
+        })
     }
 }

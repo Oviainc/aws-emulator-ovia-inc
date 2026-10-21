@@ -1,11 +1,517 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-vpclattice-mercurycontrolplane service.
+//!
+//! One store holds the service-network / service / service-association slice, and the
+//! helpers every handler in `src/ops/` shares live here too: identifier resolution
+//! (bare id or ARN), id and ARN minting, the request's region, and the clock-owed
+//! `CREATE_IN_PROGRESS -> ACTIVE` span. Handlers reach the store through
+//! [`service_state`]; nothing in `src/ops/` keeps a second copy of a resource.
+
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
+
+/// This service's ARN namespace and sigv4 signing name (OPERATIONS.md, "Wire protocol").
+pub const ARN_SERVICE: &str = "vpc-lattice";
+
+/// The region for a request that carries no SigV4 credential scope (an unsigned call).
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The ARN resource kind of a service network: `.../servicenetwork/sn-…`.
+pub const KIND_SERVICE_NETWORK: &str = "servicenetwork";
+/// The ARN resource kind of a service: `.../service/svc-…`.
+pub const KIND_SERVICE: &str = "service";
+/// The ARN resource kind of a service-network/service association.
+pub const KIND_SERVICE_ASSOCIATION: &str = "servicenetworkserviceassociation";
+
+/// The id prefix of a service network (`^sn-[0-9a-z]{17}$`).
+pub const PREFIX_SERVICE_NETWORK: &str = "sn-";
+/// The id prefix of a service (`^svc-[0-9a-z]{17}$`).
+pub const PREFIX_SERVICE: &str = "svc-";
+/// The id prefix of a service-network/service association (`^snsa-[0-9a-z]{17}$`).
+pub const PREFIX_SERVICE_ASSOCIATION: &str = "snsa-";
+
+/// Every modelled id of this service is its prefix plus 17 `[0-9a-z]` characters.
+const ID_SUFFIX_LEN: usize = 17;
+
+/// The most items one page of a list operation carries.
+///
+/// This is the maximum the model allows `maxResults` (`range 1..100`), so it is also
+/// the right ceiling for a request that sends no `maxResults`: a single list call can
+/// never be made to serialise the whole store, and `nextToken` pages the rest.
+pub const MAX_PAGE_SIZE: usize = 100;
+
+/// The `idleTimeoutSeconds` a service gets when its create omits the member.
+///
+/// From that member's own documentation: "The valid range is 60 to 600 seconds. If you
+/// don't specify a value, the default is 60 seconds."
+pub const DEFAULT_IDLE_TIMEOUT_SECONDS: i32 = 60;
+
+/// The `@length` ceiling the model puts on `TagMap` (`len ..200`).
+///
+/// Checked in the handlers: a map's cardinality is one of the modelled constraints the
+/// boundary does not refuse for this service's `tags` member, and a caller must not be
+/// able to store more tags than AWS accepts.
+pub const MAX_TAGS: usize = 200;
+
+/// How many service networks this emulator will hold for the account.
+///
+/// The real service caps service networks per account per Region with a service quota,
+/// and `CreateServiceNetwork` models `ServiceQuotaExceededException` (HTTP 402) for
+/// exceeding it. The number here is NOT a fidelity claim about the published quota
+/// (which is smaller and adjustable): it is the emulator's own ceiling, set generously
+/// so no realistic workflow meets it, so that a caller looping on create cannot grow
+/// this process's memory without bound.
+pub const MAX_SERVICE_NETWORKS: usize = 1_000;
+
+/// How many services this emulator will hold for the account. Same reasoning, and
+/// `CreateService` models the same `ServiceQuotaExceededException`.
+pub const MAX_SERVICES: usize = 1_000;
+
+/// How many service-network/service associations this emulator will hold. Same
+/// reasoning, and `CreateServiceNetworkServiceAssociation` models the same
+/// `ServiceQuotaExceededException`.
+pub const MAX_SERVICE_ASSOCIATIONS: usize = 1_000;
+
+/// How long after its create call a resource still reports `CREATE_IN_PROGRESS`.
+///
+/// VPC Lattice creates are asynchronous: the model gives a service and an association a
+/// non-terminal `CREATE_IN_PROGRESS` status and the resource reaches `ACTIVE` on its
+/// own. AWS documents no duration for it, so this is the emulator's CHOSEN span, inside
+/// the 250–750 ms window this project fixes for a transition the clock owes. It is
+/// never zero, so a caller that reads straight back still observes the transient
+/// status; nothing sleeps for it — the due instant is stored and compared on read.
+pub const CREATE_TRANSITION: Duration = Duration::from_millis(500);
+
+/// The lowercase base-36 alphabet the modelled id patterns allow (`[0-9a-z]`).
+const BASE36_LOWER: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+/// The uppercase base-36 alphabet a Route 53 hosted-zone id is drawn from (`[0-9A-Z]`).
+const BASE36_UPPER: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/// A service network: the logical boundary services and VPCs associate with.
+#[derive(Debug, Clone)]
+pub struct ServiceNetwork {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    /// `AuthType`: `NONE` unless the create call asked for `AWS_IAM` (the model
+    /// documents `NONE` as the default).
+    pub auth_type: String,
+    /// `sharingConfig.enabled` exactly as the create call set it; `None` when it
+    /// did not send `sharingConfig` at all.
+    pub sharing_enabled: Option<bool>,
+    pub tags: HashMap<String, String>,
+    pub created_at: SystemTime,
+    pub last_updated_at: SystemTime,
+    /// Creation order, so a listing pages deterministically. See [`encode_cursor`].
+    pub sequence: u64,
+}
+
+/// A VPC Lattice service. Named `LatticeService` so it does not read as this crate's
+/// emulated `Service`.
+#[derive(Debug, Clone)]
+pub struct LatticeService {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub custom_domain_name: Option<String>,
+    pub certificate_arn: Option<String>,
+    pub auth_type: String,
+    /// What the caller sent, or [`DEFAULT_IDLE_TIMEOUT_SECONDS`] — the value the
+    /// member's own documentation gives a create that omits it.
+    pub idle_timeout_seconds: i32,
+    pub dns_domain_name: String,
+    pub dns_hosted_zone_id: String,
+    pub tags: HashMap<String, String>,
+    pub created_at: SystemTime,
+    pub last_updated_at: SystemTime,
+    /// The instant the clock owes this service its `ACTIVE` status.
+    pub active_at: SystemTime,
+    /// Creation order, so a listing pages deterministically. See [`encode_cursor`].
+    pub sequence: u64,
+}
+
+impl LatticeService {
+    /// `ServiceStatus` at `now`: the transient create status until the stored due
+    /// instant passes, `ACTIVE` from then on. A pure function of stored state and the
+    /// clock, so reading it changes nothing a later caller sees.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now >= self.active_at {
+            "ACTIVE"
+        } else {
+            "CREATE_IN_PROGRESS"
+        }
+    }
+
+    /// This service's DNS entry, as persisted.
+    pub fn dns_entry(&self) -> (String, String) {
+        (self.dns_domain_name.clone(), self.dns_hosted_zone_id.clone())
+    }
+}
+
+/// An association between one service network and one service.
+#[derive(Debug, Clone)]
+pub struct ServiceNetworkServiceAssociation {
+    pub id: String,
+    pub arn: String,
+    pub created_by: String,
+    pub created_at: SystemTime,
+    /// The instant the clock owes this association its `ACTIVE` status.
+    pub active_at: SystemTime,
+    pub service_id: String,
+    pub service_arn: String,
+    pub service_name: String,
+    pub service_network_id: String,
+    pub service_network_arn: String,
+    pub service_network_name: String,
+    pub dns_domain_name: String,
+    pub dns_hosted_zone_id: String,
+    pub custom_domain_name: Option<String>,
+    pub tags: HashMap<String, String>,
+    /// Creation order, so a listing pages deterministically. See [`encode_cursor`].
+    pub sequence: u64,
+}
+
+impl ServiceNetworkServiceAssociation {
+    /// `ServiceNetworkServiceAssociationStatus` at `now`, on the same clock-owed rule
+    /// as [`LatticeService::status`].
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now >= self.active_at {
+            "ACTIVE"
+        } else {
+            "CREATE_IN_PROGRESS"
+        }
+    }
+}
+
+/// The most `@idempotencyToken` -> resource-id entries this service remembers.
+///
+/// Tokens are caller-supplied, so the map is caller-driven growth that holds no resource
+/// of its own: an entry naming a deleted resource is dropped with it
+/// ([`IdempotencyTokens::forget_resource`]), and beyond this many live entries the oldest
+/// is evicted ([`IdempotencyTokens::record`]). An evicted token is indistinguishable from
+/// one whose idempotency window has passed: the next create carrying it mints a new
+/// resource.
+const MAX_IDEMPOTENCY_TOKENS: usize = 1024;
+
+/// A bounded `@idempotencyToken` -> created-resource-id store.
+///
+/// Insertion-ordered and capped at [`MAX_IDEMPOTENCY_TOKENS`]: recording the
+/// (cap + 1)-th token forgets the oldest one rather than growing the map.
+#[derive(Debug, Default)]
+pub struct IdempotencyTokens {
+    by_key: HashMap<String, String>,
+    oldest_first: std::collections::VecDeque<String>,
+}
+
+impl IdempotencyTokens {
+    /// The resource id a previous call recorded under `key`, if it is still remembered.
+    pub fn get(&self, key: &str) -> Option<&String> {
+        self.by_key.get(key)
+    }
+
+    /// Remember that `key` created `resource_id`, evicting the oldest entries to stay
+    /// within [`MAX_IDEMPOTENCY_TOKENS`].
+    pub fn record(&mut self, key: String, resource_id: String) {
+        if self.by_key.insert(key.clone(), resource_id).is_none() {
+            self.oldest_first.push_back(key);
+        }
+        while self.oldest_first.len() > MAX_IDEMPOTENCY_TOKENS {
+            if let Some(evicted) = self.oldest_first.pop_front() {
+                self.by_key.remove(&evicted);
+            }
+        }
+    }
+
+    /// How many tokens are remembered right now.
+    pub fn len(&self) -> usize {
+        self.by_key.len()
+    }
+
+    /// Whether no token is remembered.
+    pub fn is_empty(&self) -> bool {
+        self.by_key.is_empty()
+    }
+
+    /// Forget every token that names `resource_id` — called when that resource is
+    /// deleted, so a token record never outlives the resource it created.
+    pub fn forget_resource(&mut self, resource_id: &str) {
+        self.by_key.retain(|_, created| created != resource_id);
+        let live = &self.by_key;
+        self.oldest_first.retain(|key| live.contains_key(key));
+    }
+}
 
 /// Per-service state for com-amazonaws-vpclattice-mercurycontrolplane. A handler reaches it through [`service_state`].
+///
+/// Every map here is bounded. The three resource maps are capped at
+/// [`MAX_SERVICE_NETWORKS`], [`MAX_SERVICES`] and [`MAX_SERVICE_ASSOCIATIONS`] — a create
+/// that would exceed its ceiling is refused with the modelled
+/// `ServiceQuotaExceededException` — and `name_index` holds exactly one key per stored
+/// resource, released by the same delete that removes the record. The token store is
+/// capped and evicted on its own terms; see [`IdempotencyTokens`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsVpclatticeMercurycontrolplaneState {
-    // TODO: add service-specific state fields
+    /// Keyed by `sn-…` id. At most [`MAX_SERVICE_NETWORKS`] entries.
+    pub service_networks: HashMap<String, ServiceNetwork>,
+    /// Keyed by `svc-…` id. At most [`MAX_SERVICES`] entries.
+    pub services: HashMap<String, LatticeService>,
+    /// Keyed by `snsa-…` id. At most [`MAX_SERVICE_ASSOCIATIONS`] entries.
+    pub service_associations: HashMap<String, ServiceNetworkServiceAssociation>,
+    /// `<ARN resource kind>/<name>` -> id. A name must be unique to the account, so a
+    /// second create under a taken name is a `ConflictException`. One key per stored
+    /// resource, so the resource ceilings bound this map too.
+    pub name_index: HashMap<String, String>,
+    /// `<operation>/<clientToken>` -> the id the first call created, so a retry with the
+    /// same `@idempotencyToken` returns that resource instead of creating a second one.
+    pub idempotency_tokens: IdempotencyTokens,
+    /// Hands out [`ServiceNetwork::sequence`] and its siblings: the creation order a
+    /// listing pages by. Monotonic, so a deleted resource's place is never reused.
+    next_sequence: u64,
+}
+
+impl ComAmazonawsVpclatticeMercurycontrolplaneState {
+    /// The creation-order number for the resource being created now.
+    pub fn next_sequence(&mut self) -> u64 {
+        self.next_sequence += 1;
+        self.next_sequence
+    }
+
+    /// How many services are associated with `service_network_id`, counted from the
+    /// association records at read time rather than from a stored counter.
+    pub fn associated_service_count(&self, service_network_id: &str) -> i64 {
+        i64::try_from(
+            self.service_associations
+                .values()
+                .filter(|assoc| assoc.service_network_id == service_network_id)
+                .count(),
+        )
+        .unwrap_or(i64::MAX)
+    }
+
+    /// How many service networks `service_id` is associated with, counted the same way.
+    pub fn associated_network_count(&self, service_id: &str) -> i64 {
+        i64::try_from(
+            self.service_associations
+                .values()
+                .filter(|assoc| assoc.service_id == service_id)
+                .count(),
+        )
+        .unwrap_or(i64::MAX)
+    }
+
+    /// The association of this exact (service network, service) pair, if there is one.
+    pub fn association_of(
+        &self,
+        service_network_id: &str,
+        service_id: &str,
+    ) -> Option<&ServiceNetworkServiceAssociation> {
+        self.service_associations.values().find(|assoc| {
+            assoc.service_network_id == service_network_id && assoc.service_id == service_id
+        })
+    }
+}
+
+/// The key [`ComAmazonawsVpclatticeMercurycontrolplaneState::name_index`] is read with.
+pub fn name_key(kind: &str, name: &str) -> String {
+    format!("{kind}/{name}")
+}
+
+/// A `nextToken` no listing of this service ever minted.
+#[derive(Debug, Clone, Copy)]
+pub struct MalformedCursor;
+
+/// Encode the resume cursor that follows the item with creation-order number `sequence`.
+///
+/// Opaque to the caller (hex of the internal cursor text) and well within `NextToken`'s
+/// `@length(1, 2048)`. Naming the ORDER rather than an id keeps the cursor usable when
+/// the item the page ended on is deleted between pages: the next page resumes at the
+/// first surviving item after that point, instead of refusing a token this service
+/// itself handed out.
+pub fn encode_cursor(sequence: u64) -> String {
+    ::hex::encode(format!("after-sequence:{sequence}"))
+}
+
+/// Decode a cursor minted by [`encode_cursor`]; no cursor starts at the beginning.
+pub fn decode_cursor(next_token: Option<&str>) -> Result<u64, MalformedCursor> {
+    let Some(token) = next_token else {
+        return Ok(0);
+    };
+    let bytes = ::hex::decode(token).map_err(|_| MalformedCursor)?;
+    let text = String::from_utf8(bytes).map_err(|_| MalformedCursor)?;
+    text.strip_prefix("after-sequence:")
+        .and_then(|sequence| sequence.parse::<u64>().ok())
+        .ok_or(MalformedCursor)
+}
+
+/// The key [`ComAmazonawsVpclatticeMercurycontrolplaneState::idempotency_tokens`] is
+/// read with: a token is scoped to the operation that minted it.
+pub fn token_key(operation: &str, client_token: &str) -> String {
+    format!("{operation}/{client_token}")
+}
+
+/// The region this request was signed for, from its SigV4 credential scope;
+/// [`DEFAULT_REGION`] when it carries none.
+pub fn region_of(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The emulator's account id, the `createdBy` and ARN account of every resource here.
+pub fn account_id() -> &'static str {
+    ::engine::emulator_account_id()
+}
+
+/// `arn:aws:vpc-lattice:<region>:<account>:<kind>/<id>`.
+pub fn arn_for(region: &str, kind: &str, id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("{kind}/{id}"))
+}
+
+/// Mint a fresh resource id: `prefix` plus 17 `[0-9a-z]` characters, as the modelled
+/// id patterns require.
+pub fn mint_id(prefix: &str) -> String {
+    format!(
+        "{prefix}{}",
+        encode_base36(fresh_entropy(), ID_SUFFIX_LEN, BASE36_LOWER)
+    )
+}
+
+/// Mint the Route 53 hosted-zone id of a service's DNS entry: `Z` plus 19 `[0-9A-Z]`
+/// characters, the shape Route 53 gives a hosted zone.
+pub fn mint_hosted_zone_id() -> String {
+    format!("Z{}", encode_base36(fresh_entropy(), 19, BASE36_UPPER))
+}
+
+/// The generated domain name of a service's DNS entry:
+/// `<name>-<id suffix>.<account segment>.vpc-lattice-svcs.<region>.on.aws`, the form
+/// VPC Lattice hands out. The account segment is derived from the account id, so every
+/// service of one account shares it and it is stable across reads.
+pub fn service_domain_name(name: &str, service_id: &str, region: &str) -> String {
+    let suffix = service_id
+        .strip_prefix(PREFIX_SERVICE)
+        .unwrap_or(service_id);
+    format!(
+        "{name}-{suffix}.{}.vpc-lattice-svcs.{region}.on.aws",
+        account_segment()
+    )
+}
+
+/// The 7-hex account segment of a lattice domain name, derived from the account id.
+fn account_segment() -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(account_id().as_bytes());
+    digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()[..7]
+        .to_string()
+}
+
+/// Entropy for one minted id.
+///
+/// Mixes this process's OS-seeded [`std::collections::hash_map::RandomState`] keys with
+/// the clock and a process-wide counter, then hashes them, so ids are unique within a
+/// run and unguessable across runs without any id ever being derived from the request.
+fn fresh_entropy() -> u128 {
+    use sha2::{Digest, Sha256};
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static MINTED: AtomicU64 = AtomicU64::new(0);
+
+    let minted = MINTED.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let os_seeded = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    let digest = Sha256::digest(format!("{nanos}:{minted}:{os_seeded}").as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    u128::from_be_bytes(bytes)
+}
+
+/// `value` rendered in `alphabet`, exactly `len` characters, most significant first.
+fn encode_base36(mut value: u128, len: usize, alphabet: &[u8; 36]) -> String {
+    let mut out = vec![alphabet[0]; len];
+    for slot in out.iter_mut().rev() {
+        *slot = alphabet[(value % 36) as usize];
+        value /= 36;
+    }
+    String::from_utf8(out).expect("the base-36 alphabets are ASCII")
+}
+
+/// The resource id named by an identifier member, accepting both forms the model allows:
+/// the bare id, or the resource's ARN (`arn:…:<kind>/<id>`).
+///
+/// `None` when the identifier names no id of `prefix`'s kind — which every handler
+/// answers with `ResourceNotFoundException`, never with a lookup against another kind.
+pub fn id_from_identifier(identifier: &str, prefix: &str) -> Option<String> {
+    let tail = identifier
+        .rsplit_once('/')
+        .map_or(identifier, |(_, tail)| tail);
+    let suffix = tail.strip_prefix(prefix)?;
+    (suffix.len() == ID_SUFFIX_LEN
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()))
+    .then(|| tail.to_string())
+}
+
+/// Refuse a resource name the modelled name pattern forbids, with the text that names
+/// the broken constraint; `Ok(())` when the name satisfies it.
+///
+/// The rule the `ServiceName` / `ServiceNetworkName` patterns state: lowercase letters,
+/// digits and hyphens only, no leading or trailing hyphen, no two adjacent hyphens,
+/// and — where the resource's ids carry one — not beginning with that id prefix. The
+/// length bounds are a separate `@length` trait the framework already enforces.
+///
+/// This has to be enforced in the handler: those patterns are written with negative
+/// lookahead, which the regex engine behind `@pattern` cannot compile, and a pattern
+/// that does not compile is treated as matching, so the boundary lets the name through.
+pub fn check_resource_name(name: &str, reserved_prefix: Option<&str>) -> Result<(), String> {
+    if reserved_prefix.is_some_and(|prefix| name.starts_with(prefix)) {
+        return Err(format!(
+            "must not begin with the reserved prefix {}",
+            reserved_prefix.unwrap_or_default()
+        ));
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err("may contain only lowercase letters, digits and hyphens".to_string());
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return Err("must not begin or end with a hyphen".to_string());
+    }
+    if name.contains("--") {
+        return Err("must not contain two adjacent hyphens".to_string());
+    }
+    Ok(())
+}
+
+/// Refuse a `tags` map larger than the modelled `TagMap` ceiling, with the text naming
+/// the constraint; `Ok(())` when it fits.
+pub fn check_tag_count(tags: Option<&HashMap<String, String>>) -> Result<(), String> {
+    let count = tags.map_or(0, HashMap::len);
+    if count > MAX_TAGS {
+        return Err(format!(
+            "must carry at most {MAX_TAGS} tags, got {count}"
+        ));
+    }
+    Ok(())
+}
+
+/// A stored instant as the modelled timestamp.
+pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    let since_epoch = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

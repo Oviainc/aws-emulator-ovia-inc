@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateScope
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateScope`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateScope::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a scope into this service's store ([`crate::state`]) and answers with the
+//! stored record. `@idempotent` with an `@idempotencyToken`: a replay carrying a
+//! `clientToken` this store has already seen answers with the scope that token
+//! minted, never a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +171,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateScope` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateScopeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateScope"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateScopeErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        // The `@idempotent` replay: the same `clientToken` answers with the scope
+        // it already minted, and only when this request asks for the same scope —
+        // a token reused with different parameters is a conflict.
+        if let Some(token) = input.client_token.as_deref() {
+            let minted = state.scope_idempotency.get(token).cloned();
+            if let Some(scope) = minted.and_then(|scope_id| state.scopes.get(&scope_id)) {
+                if scope.matches_create(&input) {
+                    return Ok(output(scope));
+                }
+                return Err(CreateScopeErrorModeled::ConflictException(
+                    crate::state::idempotency_conflict(
+                        crate::state::SCOPE_RESOURCE,
+                        &scope.scope_id,
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // Not a replay, so this request would add a scope: refuse it when the store
+        // is already at its ceiling, rather than growing without limit.
+        if state.scopes.len() >= crate::state::MAX_SCOPES {
+            return Err(CreateScopeErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded(
+                    crate::state::SCOPE_RESOURCE,
+                    crate::state::MAX_SCOPES,
+                ),
+            )
+            .into());
+        }
+
+        let sequence = state.next_sequence();
+        let scope_id = crate::state::scope_id(sequence);
+        let scope_arn =
+            crate::state::resource_arn(&region, crate::state::SCOPE_RESOURCE, &scope_id);
+        let scope = crate::state::Scope {
+            scope_id: scope_id.clone(),
+            scope_arn: scope_arn.clone(),
+            // A scope is being set up — permissions are enabled and the topology
+            // is discovered — so it reports the model's non-terminal IN_PROGRESS
+            // until the clock owes it SUCCEEDED.
+            status: crate::state::ScopeStatus::InProgress,
+            targets: input.targets,
+            tags: crate::state::tags_of(input.tags.as_ref()),
+            created_at: now,
+            succeeded_at: now + crate::state::PROVISIONING_DELAY,
+        };
+
+        state
+            .arn_index
+            .insert(scope_arn, crate::state::ResourceRef::Scope(scope_id.clone()));
+        if let Some(token) = input.client_token {
+            state.scope_idempotency.insert(token, scope_id.clone());
+        }
+        state.scopes.insert(scope_id.clone(), scope);
+        // Read the stored record back, so the response is the state rather than the
+        // value that went into it.
+        let stored = state.scopes.get(&scope_id).ok_or_else(|| {
+            CreateScopeErrorModeled::InternalServerException(crate::state::state_unavailable())
+        })?;
+        Ok(output(stored))
+    }
+}
+
+/// This operation's output for a stored scope — every member read off the record,
+/// so a create answers exactly what the following `GetScope` answers.
+fn output(scope: &crate::state::Scope) -> CreateScopeOutput {
+    CreateScopeOutput {
+        scope_id: scope.scope_id.clone(),
+        scope_arn: scope.scope_arn.clone(),
+        status: scope.status.as_wire().to_string(),
+        tags: crate::state::tags_for_output(&scope.tags),
     }
 }

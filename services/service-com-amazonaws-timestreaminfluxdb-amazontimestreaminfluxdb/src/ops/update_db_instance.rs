@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDbInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDbInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDbInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -238,18 +229,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDbInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDbInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDbInstance"))
+        use crate::state as st;
+
+        let _ = ctx;
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(UpdateDbInstanceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        let Some(record) = state.db_instances.get_mut(&input.identifier) else {
+            return Err(UpdateDbInstanceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("DB instance {} not found", input.identifier),
+                    resource_id: input.identifier.clone(),
+                    resource_type: st::RESOURCE_TYPE_DB_INSTANCE.to_string(),
+                },
+            )
+            .into());
+        };
+        record.settle(now);
+
+        // Which transient status the change moves through: the modeled `Status` enum
+        // names the instance-type and deployment-type reconfigurations separately from a
+        // plain update, so report the one that matches what actually changed. A member
+        // the request omitted is left alone — this is a partial update.
+        let changes_deployment_type = input
+            .deployment_type
+            .as_ref()
+            .is_some_and(|new| Some(new) != record.deployment_type.as_ref());
+        let changes_instance_type = input
+            .db_instance_type
+            .as_ref()
+            .is_some_and(|new| *new != record.db_instance_type);
+
+        if let Some(value) = input.db_instance_type {
+            record.db_instance_type = value;
+        }
+        if let Some(value) = input.port {
+            record.port = value;
+        }
+        if let Some(value) = input.allocated_storage {
+            record.allocated_storage = value;
+        }
+        if let Some(value) = input.db_storage_type {
+            record.db_storage_type = Some(value);
+        }
+        if let Some(value) = input.deployment_type {
+            record.deployment_type = Some(value);
+        }
+        if let Some(value) = input.db_parameter_group_identifier {
+            record.db_parameter_group_identifier = Some(value);
+        }
+        if let Some(value) = input.log_delivery_configuration {
+            record.log_delivery_configuration = Some(value);
+        }
+        if let Some(value) = input.maintenance_schedule {
+            record.maintenance_schedule = Some(value);
+        }
+        if let Some(value) = input.db_backup_configurations {
+            record.db_backup_configurations = Some(value);
+        }
+
+        // A standby lives in a second Availability Zone only under the deployment type
+        // that places one, so the reported zones follow the new deployment type.
+        let (availability_zone, secondary_availability_zone) =
+            st::availability_zones(&record.region, record.deployment_type.as_deref());
+        record.availability_zone = Some(availability_zone);
+        record.secondary_availability_zone = secondary_availability_zone;
+
+        let status = if changes_deployment_type {
+            st::STATUS_UPDATING_DEPLOYMENT_TYPE
+        } else if changes_instance_type {
+            st::STATUS_UPDATING_INSTANCE_TYPE
+        } else {
+            st::STATUS_UPDATING
+        };
+        record.begin_transition(status, now);
+
+        Ok(record.to_update_output())
     }
 }

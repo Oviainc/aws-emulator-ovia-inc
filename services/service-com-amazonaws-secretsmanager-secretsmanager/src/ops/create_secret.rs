@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSecret
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSecret`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSecret::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a secret under the caller's `Name`, allocates its ARN as the name plus
+//! a hyphen and six random characters, and — when the request carries a value —
+//! stores an initial version labelled `AWSCURRENT`. The response is read back out
+//! of the stored secret.
 //!
 //! ## Shape of an operation
 //!
@@ -266,18 +261,177 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSecret` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSecretErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSecret"))
+        // Cross-region replication is not emulated: there is no second Region to
+        // place a replica in. Answering 501 for the request that asks for one is
+        // honest, where creating an unreplicated secret and reporting success
+        // would not be. `ReplicateSecretToRegions` carries its own stub issue.
+        if input
+            .add_replica_regions
+            .as_ref()
+            .is_some_and(|regions| !regions.is_empty())
+        {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateSecret with AddReplicaRegions",
+            ));
+        }
+
+        // "The secret name can contain ASCII letters, numbers, and the following
+        // characters: /_+=.@-". The model declares no pattern for `NameType`,
+        // so the documented charset is enforced here — and it is what keeps the
+        // name a safe literal inside the ARN this operation allocates.
+        if !crate::state::is_valid_secret_name(&input.name) {
+            return Err(CreateSecretErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid name. Name must be a string of ASCII letters, numbers and the \
+                         characters {}; got {:?}.",
+                        crate::state::SECRET_NAME_EXTRA_CHARS,
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Either SecretString or SecretBinary must have a value, but not both."
+        if input.secret_string.is_some() && input.secret_binary.is_some() {
+            return Err(CreateSecretErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        "You can't specify both SecretString and SecretBinary in the same request."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        store.expire_due(now);
+
+        if let Some(existing) = store.secrets.get(&input.name) {
+            if existing.scheduled_for_deletion() {
+                return Err(CreateSecretErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "You can't create this secret because a secret with the name {} is \
+                             already scheduled for deletion.",
+                            input.name
+                        )),
+                    },
+                )
+                .into());
+            }
+            // `ClientRequestToken` becomes the version id, and it is an
+            // @idempotencyToken: a repeat naming a version that already holds
+            // exactly this value is the same request, so it is answered from
+            // what is stored rather than refused.
+            let replay = input
+                .client_request_token
+                .as_deref()
+                .and_then(|token| existing.version(token))
+                .filter(|version| {
+                    version
+                        .holds_same_value(input.secret_string.as_ref(), input.secret_binary.as_ref())
+                });
+            if let Some(version) = replay {
+                return Ok(CreateSecretOutput {
+                    arn: Some(existing.arn.clone()),
+                    name: Some(existing.name.clone()),
+                    version_id: Some(version.version_id.clone()),
+                    replication_status: None,
+                });
+            }
+            return Err(CreateSecretErrorModeled::ResourceExistsException(
+                ResourceExistsException {
+                    message: Some(format!(
+                        "The operation failed because the secret {} already exists.",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Bound the store before it grows: "The request failed because it would
+        // exceed one of the Secrets Manager quotas." The bound is the
+        // emulator's own (see `state::SECRET_QUOTA`) and every record it holds
+        // is released by `DeleteSecret`.
+        if store.secrets.len() >= crate::state::SECRET_QUOTA {
+            return Err(CreateSecretErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The request failed because it would exceed the maximum of {} secrets \
+                         this emulator stores.",
+                        crate::state::SECRET_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());        let arn = ::engine::emulator_arn(
+            "secretsmanager",
+            &region,
+            &format!("secret:{}-{}", input.name, crate::state::new_arn_suffix()),
+        );
+        let mut secret = crate::state::Secret::new(input.name.clone(), arn, region, now);
+        secret.description = input.description.clone();
+        secret.kms_key_id = input.kms_key_id.clone();
+        secret.secret_type = input.r#type.clone();
+        secret.tags = input
+            .tags
+            .iter()
+            .flatten()
+            .map(crate::state::StoredTag::from_modeled)
+            .collect();
+
+        // "If you include SecretString or SecretBinary then Secrets Manager
+        // creates an initial secret version and automatically attaches the
+        // staging label AWSCURRENT to it" — so a secret created with no value
+        // has no version at all, and no `VersionId` to report.
+        if input.secret_string.is_some() || input.secret_binary.is_some() {
+            secret.put_version(
+                crate::state::SecretVersion {
+                    version_id: input
+                        .client_request_token
+                        .clone()
+                        .unwrap_or_else(crate::state::new_version_id),
+                    secret_string: input.secret_string.clone(),
+                    secret_binary: input.secret_binary.clone(),
+                    version_stages: vec![crate::state::STAGE_CURRENT.to_string()],
+                    created_date: now,
+                },
+                now,
+            );
+        }
+        store.insert(secret);
+
+        // Read the response back out of the store, so what the caller is told is
+        // what a later GetSecretValue / DescribeSecret will find.
+        let stored = store
+            .secrets
+            .get(&input.name)
+            .ok_or_else(state_unavailable)?;
+        Ok(CreateSecretOutput {
+            arn: Some(stored.arn.clone()),
+            name: Some(stored.name.clone()),
+            version_id: stored
+                .version_with_stage(crate::state::STAGE_CURRENT)
+                .map(|version| version.version_id.clone()),
+            replication_status: None,
+        })
     }
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> CreateSecretError {
+    CreateSecretErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }
