@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `botId`, stores the bot in [`crate::state`] and answers from the stored
+//! record. The bot starts in `Creating`; the `Available` transition the clock owes is
+//! due [`crate::state::CREATION_SETTLES_AFTER`] later and is materialised by the next
+//! read, so a caller reading straight back still observes `Creating`.
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +193,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBot"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBotErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        // `botType` is a modelled enum; the wire accepts any string, so a value outside
+        // the enum is refused here rather than stored.
+        if let Some(bot_type) = input.bot_type.as_deref() {
+            if !crate::state::BOT_TYPES.contains(&bot_type) {
+                return Err(CreateBotErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "botType must be one of [{}]; received {bot_type}",
+                        crate::state::BOT_TYPES.join(", ")
+                    )),
+                })
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+
+        // The published "Bots per account per Region" quota bounds the store: past it
+        // the service answers its modelled quota error rather than growing forever.
+        if store.bots.len() >= crate::state::BOTS_PER_ACCOUNT_QUOTA {
+            return Err(CreateBotErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "You have reached the quota of {} bots for this account; delete a bot or request a quota increase",
+                        crate::state::BOTS_PER_ACCOUNT_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The bot name must be unique in the account that creates the bot."
+        if store.bot_name_taken(&input.bot_name) {
+            return Err(CreateBotErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "A bot with the name {} already exists; choose another name",
+                    input.bot_name
+                )),
+            })
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let bot_id = store.mint_bot_id();
+        let mut bot = crate::state::Bot {
+            bot_id: bot_id.clone(),
+            bot_name: input.bot_name,
+            description: input.description,
+            role_arn: input.role_arn,
+            data_privacy: input.data_privacy,
+            idle_session_ttl_in_seconds: input.idle_session_ttl_in_seconds,
+            bot_status: crate::state::BOT_STATUS_CREATING.to_string(),
+            bot_type: input.bot_type,
+            bot_members: input.bot_members.unwrap_or_default(),
+            error_log_settings: input.error_log_settings,
+            creation_date_time: now,
+            last_updated_date_time: now,
+            bot_tags: input.bot_tags.unwrap_or_default(),
+            test_bot_alias_tags: input.test_bot_alias_tags.unwrap_or_default(),
+            pending_status: None,
+        };
+        bot.schedule_status(
+            crate::state::BOT_STATUS_AVAILABLE,
+            crate::state::CREATION_SETTLES_AFTER,
+        );
+
+        // The response is read back off the record that was just stored, so a `botId`
+        // this operation hands out always has a backing bot.
+        let stored = store.bots.entry(bot_id).or_insert(bot);
+        Ok(CreateBotOutput {
+            bot_id: Some(stored.bot_id.clone()),
+            bot_name: Some(stored.bot_name.clone()),
+            description: stored.description.clone(),
+            role_arn: Some(stored.role_arn.clone()),
+            data_privacy: Some(stored.data_privacy.clone()),
+            idle_session_ttl_in_seconds: Some(stored.idle_session_ttl_in_seconds),
+            bot_status: Some(stored.bot_status.clone()),
+            creation_date_time: Some(crate::state::to_date_time(stored.creation_date_time)),
+            bot_tags: stored.wire_bot_tags(),
+            test_bot_alias_tags: stored.wire_test_bot_alias_tags(),
+            bot_type: stored.bot_type.clone(),
+            bot_members: stored.wire_bot_members(),
+            error_log_settings: stored.error_log_settings.clone(),
+        })
     }
 }
