@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFindings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFindings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers from the findings `BatchImportFindings` persisted in [`crate::state`] for
+//! the caller's account and Region, honouring `Filters`, `SortCriteria`,
+//! `MaxResults` and the opaque `NextToken` cursor. This operation only READS: it
+//! never writes to the store.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFindings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The filter-combination rules are the ones `StringFilter$Comparison` documents —
+//! `CONTAINS`/`EQUALS`/`PREFIX` on one field are joined by `OR`,
+//! `NOT_CONTAINS`/`NOT_EQUALS`/`PREFIX_NOT_EQUALS` on one field by `AND`, and the
+//! combinations that doc calls out as errors are refused with the modelled
+//! `InvalidInputException`. A filter member this slice does not evaluate answers 501
+//! naming that member, rather than silently returning findings it did not filter.
 //!
 //! ## Shape of an operation
 //!
@@ -143,6 +145,730 @@ impl<Eng> GetFindings<Eng> {
     }
 }
 
+/// `MaxResults`' upper bound (`@range(min: 1, max: 100)` on `MaxResults`), which is
+/// also the page size used when the caller names none.
+pub const MAX_RESULTS_LIMIT: usize = 100;
+
+/// Marker the opaque `NextToken` carries, so a token minted for another list — or a
+/// value a caller invented — is rejected rather than read as an offset.
+const NEXT_TOKEN_PREFIX: &str = "securityhub:findings:";
+
+/// A `NextToken` resuming at `offset` in the sorted result. Opaque to the caller:
+/// the cursor is hex-encoded, so nothing in the response invites arithmetic on it.
+fn encode_next_token(offset: usize) -> String {
+    ::hex::encode(format!("{NEXT_TOKEN_PREFIX}{offset}"))
+}
+
+/// The offset a `NextToken` resumes at, or `None` when it is not one this operation
+/// minted.
+fn decode_next_token(token: &str) -> Option<usize> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    decoded.strip_prefix(NEXT_TOKEN_PREFIX)?.parse().ok()
+}
+
+/// The `StringFilterComparison` values that select findings which HAVE the filter
+/// value; `StringFilter$Comparison` documents them as joined by `OR` on one field.
+const POSITIVE_STRING_COMPARISONS: [&str; 3] = ["EQUALS", "PREFIX", "CONTAINS"];
+
+/// The `StringFilterComparison` values that select findings which do NOT have the
+/// filter value; `StringFilter$Comparison` documents them as joined by `AND` on one
+/// field.
+const NEGATIVE_STRING_COMPARISONS: [&str; 3] = ["NOT_EQUALS", "PREFIX_NOT_EQUALS", "NOT_CONTAINS"];
+
+/// Does `value` satisfy `comparison` against `filter_value`, read as the positive
+/// form of the comparison? `NOT_*` comparisons are evaluated by negating their
+/// positive twin, which is why they share one function.
+fn positive_form_matches(value: &str, filter_value: &str, comparison: &str) -> bool {
+    match comparison {
+        "EQUALS" | "NOT_EQUALS" => value == filter_value,
+        "PREFIX" | "PREFIX_NOT_EQUALS" => value.starts_with(filter_value),
+        // Filter values are case sensitive (`StringFilter$Value`).
+        "CONTAINS" | "NOT_CONTAINS" => value.contains(filter_value),
+        _ => false,
+    }
+}
+
+/// The comparison a `StringFilter` asks for; `EQUALS` when the member is absent, the
+/// only comparison that reads a bare value as itself.
+fn comparison_of(filter: &StringFilter) -> &str {
+    filter.comparison.as_deref().unwrap_or("EQUALS")
+}
+
+/// Refuse the filter combinations `StringFilter$Comparison` documents as errors:
+/// "You can't have both a `CONTAINS` filter and a `NOT_CONTAINS` filter on the same
+/// field. Similarly, you can't provide both an `EQUALS` filter and a `NOT_EQUALS` or
+/// `PREFIX_NOT_EQUALS` filter on the same field. ... `CONTAINS` filters can only be
+/// used with other `CONTAINS` filters. `NOT_CONTAINS` filters can only be used with
+/// other `NOT_CONTAINS` filters."
+///
+/// `CONTAINS_WORD` is refused here too: that comparison "works only in the
+/// `GetFindingsV2`, `GetFindingStatisticsV2`, `GetResourcesV2`, and
+/// `GetResourcesStatisticsV2` APIs".
+fn check_string_filter_combination(attribute: &str, filters: &[StringFilter]) -> Result<(), String> {
+    let comparisons: Vec<&str> = filters.iter().map(comparison_of).collect();
+    if comparisons.contains(&"CONTAINS_WORD") {
+        return Err(format!(
+            "Filter {attribute}: the CONTAINS_WORD comparison is not supported by GetFindings"
+        ));
+    }
+    let has = |wanted: &str| comparisons.contains(&wanted);
+    if has("CONTAINS") && comparisons.iter().any(|c| *c != "CONTAINS") {
+        return Err(format!(
+            "Filter {attribute}: CONTAINS filters can only be used with other CONTAINS filters"
+        ));
+    }
+    if has("NOT_CONTAINS") && comparisons.iter().any(|c| *c != "NOT_CONTAINS") {
+        return Err(format!(
+            "Filter {attribute}: NOT_CONTAINS filters can only be used with other NOT_CONTAINS filters"
+        ));
+    }
+    if has("EQUALS") && (has("NOT_EQUALS") || has("PREFIX_NOT_EQUALS")) {
+        return Err(format!(
+            "Filter {attribute}: an EQUALS filter cannot be combined with a NOT_EQUALS or PREFIX_NOT_EQUALS filter on the same field"
+        ));
+    }
+    Ok(())
+}
+
+/// Evaluate one field's string filters against every value the finding carries for
+/// that field (a list-valued attribute such as `Type` carries several).
+fn string_filters_match(values: &[&str], filters: &[StringFilter]) -> bool {
+    let mut saw_positive = false;
+    let mut positive_hit = false;
+    for filter in filters {
+        let Some(filter_value) = filter.value.as_deref() else {
+            continue;
+        };
+        let comparison = comparison_of(filter);
+        let any_value_matches = values
+            .iter()
+            .any(|value| positive_form_matches(value, filter_value, comparison));
+        if POSITIVE_STRING_COMPARISONS.contains(&comparison) {
+            saw_positive = true;
+            positive_hit |= any_value_matches;
+        } else if NEGATIVE_STRING_COMPARISONS.contains(&comparison) && any_value_matches {
+            // Negative filters are joined by AND: one hit excludes the finding.
+            return false;
+        }
+    }
+    !saw_positive || positive_hit
+}
+
+/// Evaluate one field's number filters. Several filters on one field are joined by
+/// `OR`, matching the string-filter rule; the bounds within one filter are joined by
+/// `AND`.
+fn number_filters_match(value: Option<f64>, filters: &[NumberFilter]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let Some(value) = value else {
+        return false;
+    };
+    filters.iter().any(|filter| {
+        filter.eq.is_none_or(|eq| (value - eq).abs() < f64::EPSILON)
+            && filter.gte.is_none_or(|gte| value >= gte)
+            && filter.lte.is_none_or(|lte| value <= lte)
+            && filter.gt.is_none_or(|gt| value > gt)
+            && filter.lt.is_none_or(|lt| value < lt)
+    })
+}
+
+/// Evaluate one field's date filters, joined by `OR` like the other filter kinds.
+/// `Start`/`End` are absolute inclusive bounds; a `DateRange` is relative to `now`,
+/// `WITHIN` the window or `OLDER_THAN` it ("If you don't specify a value, the default
+/// is `WITHIN`" — `DateRange$Comparison`).
+fn date_filters_match(
+    attribute: &str,
+    value: Option<&str>,
+    filters: &[DateFilter],
+    now_nanos: i128,
+) -> Result<bool, String> {
+    if filters.is_empty() {
+        return Ok(true);
+    }
+    let Some(instant) = value.and_then(crate::state::parse_iso8601_nanos) else {
+        return Ok(false);
+    };
+    let mut any = false;
+    for filter in filters {
+        let mut matches = true;
+        if let Some(start) = filter.start.as_deref() {
+            let start = crate::state::parse_iso8601_nanos(start)
+                .ok_or_else(|| format!("Filter {attribute}: Start must be an ISO-8601 timestamp"))?;
+            matches &= instant >= start;
+        }
+        if let Some(end) = filter.end.as_deref() {
+            let end = crate::state::parse_iso8601_nanos(end)
+                .ok_or_else(|| format!("Filter {attribute}: End must be an ISO-8601 timestamp"))?;
+            matches &= instant <= end;
+        }
+        if let Some(range) = filter.date_range.as_ref() {
+            let window = date_range_nanos(attribute, range)?;
+            let boundary = now_nanos - window;
+            matches &= match range.comparison.as_deref().unwrap_or("WITHIN") {
+                "WITHIN" => instant >= boundary,
+                "OLDER_THAN" => instant < boundary,
+                other => {
+                    return Err(format!(
+                        "Filter {attribute}: DateRange.Comparison {other} is not a supported comparison"
+                    ))
+                }
+            };
+        }
+        any |= matches;
+    }
+    Ok(any)
+}
+
+/// The width of a `DateRange` in nanoseconds. `DateRangeUnit` models `DAYS` only.
+fn date_range_nanos(attribute: &str, range: &DateRange) -> Result<i128, String> {
+    let value = i128::from(range.value.unwrap_or(0));
+    match range.unit.as_deref().unwrap_or("DAYS") {
+        "DAYS" => Ok(value * 24 * 60 * 60 * 1_000_000_000),
+        other => Err(format!(
+            "Filter {attribute}: DateRange.Unit {other} is not a supported unit"
+        )),
+    }
+}
+
+/// Evaluate one field's boolean filters, joined by `OR`.
+fn boolean_filters_match(value: Option<bool>, filters: &[BooleanFilter]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    filters
+        .iter()
+        .any(|filter| filter.value.is_none_or(|wanted| value == Some(wanted)))
+}
+
+/// The value(s) a finding carries for a string-valued finding attribute, or `None`
+/// when the attribute is not one this slice knows. The attribute names are the
+/// `AwsSecurityFindingFilters` member names, which are also the names
+/// `SortCriterion$Field` uses.
+fn string_attribute<'a>(finding: &'a AwsSecurityFinding, attribute: &str) -> Option<Vec<&'a str>> {
+    let one = |value: Option<&'a str>| Some(value.into_iter().collect::<Vec<&'a str>>());
+    match attribute {
+        "Id" => one(Some(finding.id.as_str())),
+        "ProductArn" => one(Some(finding.product_arn.as_str())),
+        "AwsAccountId" => one(Some(finding.aws_account_id.as_str())),
+        "AwsAccountName" => one(finding.aws_account_name.as_deref()),
+        "GeneratorId" => one(Some(finding.generator_id.as_str())),
+        "Region" => one(finding.region.as_deref()),
+        "ProductName" => one(finding.product_name.as_deref()),
+        "CompanyName" => one(finding.company_name.as_deref()),
+        "Title" => one(Some(finding.title.as_str())),
+        "Description" => one(Some(finding.description.as_str())),
+        "SourceUrl" => one(finding.source_url.as_deref()),
+        "SeverityLabel" => one(finding.severity.as_ref().and_then(|s| s.label.as_deref())),
+        "RecordState" => one(finding.record_state.as_deref()),
+        "WorkflowState" => one(finding.workflow_state.as_deref()),
+        "WorkflowStatus" => one(finding.workflow.as_ref().and_then(|w| w.status.as_deref())),
+        "VerificationState" => one(finding.verification_state.as_deref()),
+        "ComplianceStatus" => one(finding.compliance.as_ref().and_then(|c| c.status.as_deref())),
+        "ComplianceSecurityControlId" => one(finding
+            .compliance
+            .as_ref()
+            .and_then(|c| c.security_control_id.as_deref())),
+        "RecommendationText" => one(finding
+            .remediation
+            .as_ref()
+            .and_then(|r| r.recommendation.as_ref())
+            .and_then(|r| r.text.as_deref())),
+        "NoteText" => one(finding.note.as_ref().map(|n| n.text.as_str())),
+        "NoteUpdatedBy" => one(finding.note.as_ref().map(|n| n.updated_by.as_str())),
+        "Type" => Some(
+            finding
+                .types
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str)
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// The value a finding carries for a number-valued finding attribute; the outer
+/// `None` means the attribute is not one this slice knows.
+fn number_attribute(finding: &AwsSecurityFinding, attribute: &str) -> Option<Option<f64>> {
+    match attribute {
+        "Confidence" => Some(finding.confidence.map(f64::from)),
+        "Criticality" => Some(finding.criticality.map(f64::from)),
+        "SeverityNormalized" => Some(
+            finding
+                .severity
+                .as_ref()
+                .and_then(|s| s.normalized)
+                .map(f64::from),
+        ),
+        "SeverityProduct" => Some(finding.severity.as_ref().and_then(|s| s.product)),
+        _ => None,
+    }
+}
+
+/// The value a finding carries for a timestamp-valued finding attribute; the outer
+/// `None` means the attribute is not one this slice knows.
+fn date_attribute<'a>(
+    finding: &'a AwsSecurityFinding,
+    attribute: &str,
+) -> Option<Option<&'a str>> {
+    match attribute {
+        "CreatedAt" => Some(Some(finding.created_at.as_str())),
+        "UpdatedAt" => Some(Some(finding.updated_at.as_str())),
+        "FirstObservedAt" => Some(finding.first_observed_at.as_deref()),
+        "LastObservedAt" => Some(finding.last_observed_at.as_deref()),
+        "ProcessedAt" => Some(finding.processed_at.as_deref()),
+        "NoteUpdatedAt" => Some(finding.note.as_ref().map(|n| n.updated_at.as_str())),
+        _ => None,
+    }
+}
+
+/// The value a finding carries for a boolean-valued finding attribute; the outer
+/// `None` means the attribute is not one this slice knows.
+fn boolean_attribute(finding: &AwsSecurityFinding, attribute: &str) -> Option<Option<bool>> {
+    match attribute {
+        "Sample" => Some(finding.sample),
+        _ => None,
+    }
+}
+
+/// The `AwsSecurityFindingFilters` members this slice evaluates, paired with the
+/// finding attribute each one filters.
+fn string_filter_bindings(
+    filters: &AwsSecurityFindingFilters,
+) -> Vec<(&'static str, &[StringFilter])> {
+    let bindings: [(&'static str, Option<&Vec<StringFilter>>); 22] = [
+        ("Id", filters.id.as_ref()),
+        ("ProductArn", filters.product_arn.as_ref()),
+        ("AwsAccountId", filters.aws_account_id.as_ref()),
+        ("AwsAccountName", filters.aws_account_name.as_ref()),
+        ("GeneratorId", filters.generator_id.as_ref()),
+        ("Region", filters.region.as_ref()),
+        ("ProductName", filters.product_name.as_ref()),
+        ("CompanyName", filters.company_name.as_ref()),
+        ("Title", filters.title.as_ref()),
+        ("Description", filters.description.as_ref()),
+        ("SourceUrl", filters.source_url.as_ref()),
+        ("SeverityLabel", filters.severity_label.as_ref()),
+        ("RecordState", filters.record_state.as_ref()),
+        ("WorkflowState", filters.workflow_state.as_ref()),
+        ("WorkflowStatus", filters.workflow_status.as_ref()),
+        ("VerificationState", filters.verification_state.as_ref()),
+        ("ComplianceStatus", filters.compliance_status.as_ref()),
+        (
+            "ComplianceSecurityControlId",
+            filters.compliance_security_control_id.as_ref(),
+        ),
+        ("RecommendationText", filters.recommendation_text.as_ref()),
+        ("NoteText", filters.note_text.as_ref()),
+        ("NoteUpdatedBy", filters.note_updated_by.as_ref()),
+        ("Type", filters.r#type.as_ref()),
+    ];
+    bindings
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|v| (name, v.as_slice())))
+        .collect()
+}
+
+/// The number-filter members this slice evaluates.
+fn number_filter_bindings(
+    filters: &AwsSecurityFindingFilters,
+) -> Vec<(&'static str, &[NumberFilter])> {
+    let bindings: [(&'static str, Option<&Vec<NumberFilter>>); 4] = [
+        ("Confidence", filters.confidence.as_ref()),
+        ("Criticality", filters.criticality.as_ref()),
+        ("SeverityNormalized", filters.severity_normalized.as_ref()),
+        ("SeverityProduct", filters.severity_product.as_ref()),
+    ];
+    bindings
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|v| (name, v.as_slice())))
+        .collect()
+}
+
+/// The date-filter members this slice evaluates.
+fn date_filter_bindings(filters: &AwsSecurityFindingFilters) -> Vec<(&'static str, &[DateFilter])> {
+    let bindings: [(&'static str, Option<&Vec<DateFilter>>); 5] = [
+        ("CreatedAt", filters.created_at.as_ref()),
+        ("UpdatedAt", filters.updated_at.as_ref()),
+        ("FirstObservedAt", filters.first_observed_at.as_ref()),
+        ("LastObservedAt", filters.last_observed_at.as_ref()),
+        ("NoteUpdatedAt", filters.note_updated_at.as_ref()),
+    ];
+    bindings
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|v| (name, v.as_slice())))
+        .collect()
+}
+
+/// The first `AwsSecurityFindingFilters` member the caller set that this slice does
+/// not evaluate. Reported as a 501 rather than ignored: a response that silently
+/// dropped a filter would claim findings matched a predicate nothing applied.
+fn unsupported_filter_member(filters: &AwsSecurityFindingFilters) -> Option<&'static str> {
+    let set: [(&'static str, bool); 75] = [
+        ("ProductFields", filters.product_fields.is_some()),
+        ("UserDefinedFields", filters.user_defined_fields.is_some()),
+        ("Keyword", filters.keyword.is_some()),
+        ("MalwareName", filters.malware_name.is_some()),
+        ("MalwareType", filters.malware_type.is_some()),
+        ("MalwarePath", filters.malware_path.is_some()),
+        ("MalwareState", filters.malware_state.is_some()),
+        ("NetworkDirection", filters.network_direction.is_some()),
+        ("NetworkProtocol", filters.network_protocol.is_some()),
+        ("NetworkSourceIpV4", filters.network_source_ip_v4.is_some()),
+        ("NetworkSourceIpV6", filters.network_source_ip_v6.is_some()),
+        ("NetworkSourcePort", filters.network_source_port.is_some()),
+        (
+            "NetworkSourceDomain",
+            filters.network_source_domain.is_some(),
+        ),
+        ("NetworkSourceMac", filters.network_source_mac.is_some()),
+        (
+            "NetworkDestinationIpV4",
+            filters.network_destination_ip_v4.is_some(),
+        ),
+        (
+            "NetworkDestinationIpV6",
+            filters.network_destination_ip_v6.is_some(),
+        ),
+        (
+            "NetworkDestinationPort",
+            filters.network_destination_port.is_some(),
+        ),
+        (
+            "NetworkDestinationDomain",
+            filters.network_destination_domain.is_some(),
+        ),
+        ("ProcessName", filters.process_name.is_some()),
+        ("ProcessPath", filters.process_path.is_some()),
+        ("ProcessPid", filters.process_pid.is_some()),
+        ("ProcessParentPid", filters.process_parent_pid.is_some()),
+        ("ProcessLaunchedAt", filters.process_launched_at.is_some()),
+        (
+            "ProcessTerminatedAt",
+            filters.process_terminated_at.is_some(),
+        ),
+        (
+            "ThreatIntelIndicatorType",
+            filters.threat_intel_indicator_type.is_some(),
+        ),
+        (
+            "ThreatIntelIndicatorValue",
+            filters.threat_intel_indicator_value.is_some(),
+        ),
+        (
+            "ThreatIntelIndicatorCategory",
+            filters.threat_intel_indicator_category.is_some(),
+        ),
+        (
+            "ThreatIntelIndicatorLastObservedAt",
+            filters.threat_intel_indicator_last_observed_at.is_some(),
+        ),
+        (
+            "ThreatIntelIndicatorSource",
+            filters.threat_intel_indicator_source.is_some(),
+        ),
+        (
+            "ThreatIntelIndicatorSourceUrl",
+            filters.threat_intel_indicator_source_url.is_some(),
+        ),
+        ("ResourceType", filters.resource_type.is_some()),
+        ("ResourceId", filters.resource_id.is_some()),
+        ("ResourcePartition", filters.resource_partition.is_some()),
+        ("ResourceRegion", filters.resource_region.is_some()),
+        ("ResourceTags", filters.resource_tags.is_some()),
+        (
+            "ResourceAwsEc2InstanceType",
+            filters.resource_aws_ec2_instance_type.is_some(),
+        ),
+        (
+            "ResourceAwsEc2InstanceImageId",
+            filters.resource_aws_ec2_instance_image_id.is_some(),
+        ),
+        (
+            "ResourceAwsEc2InstanceIpV4Addresses",
+            filters.resource_aws_ec2_instance_ip_v4_addresses.is_some(),
+        ),
+        (
+            "ResourceAwsEc2InstanceIpV6Addresses",
+            filters.resource_aws_ec2_instance_ip_v6_addresses.is_some(),
+        ),
+        (
+            "ResourceAwsEc2InstanceKeyName",
+            filters.resource_aws_ec2_instance_key_name.is_some(),
+        ),
+        (
+            "ResourceAwsEc2InstanceIamInstanceProfileArn",
+            filters
+                .resource_aws_ec2_instance_iam_instance_profile_arn
+                .is_some(),
+        ),
+        (
+            "ResourceAwsEc2InstanceVpcId",
+            filters.resource_aws_ec2_instance_vpc_id.is_some(),
+        ),
+        (
+            "ResourceAwsEc2InstanceSubnetId",
+            filters.resource_aws_ec2_instance_subnet_id.is_some(),
+        ),
+        (
+            "ResourceAwsEc2InstanceLaunchedAt",
+            filters.resource_aws_ec2_instance_launched_at.is_some(),
+        ),
+        (
+            "ResourceAwsS3BucketOwnerId",
+            filters.resource_aws_s3_bucket_owner_id.is_some(),
+        ),
+        (
+            "ResourceAwsS3BucketOwnerName",
+            filters.resource_aws_s3_bucket_owner_name.is_some(),
+        ),
+        (
+            "ResourceAwsIamAccessKeyUserName",
+            filters.resource_aws_iam_access_key_user_name.is_some(),
+        ),
+        (
+            "ResourceAwsIamAccessKeyPrincipalName",
+            filters.resource_aws_iam_access_key_principal_name.is_some(),
+        ),
+        (
+            "ResourceAwsIamAccessKeyStatus",
+            filters.resource_aws_iam_access_key_status.is_some(),
+        ),
+        (
+            "ResourceAwsIamAccessKeyCreatedAt",
+            filters.resource_aws_iam_access_key_created_at.is_some(),
+        ),
+        (
+            "ResourceAwsIamUserUserName",
+            filters.resource_aws_iam_user_user_name.is_some(),
+        ),
+        (
+            "ResourceContainerName",
+            filters.resource_container_name.is_some(),
+        ),
+        (
+            "ResourceContainerImageId",
+            filters.resource_container_image_id.is_some(),
+        ),
+        (
+            "ResourceContainerImageName",
+            filters.resource_container_image_name.is_some(),
+        ),
+        (
+            "ResourceContainerLaunchedAt",
+            filters.resource_container_launched_at.is_some(),
+        ),
+        (
+            "ResourceDetailsOther",
+            filters.resource_details_other.is_some(),
+        ),
+        (
+            "RelatedFindingsProductArn",
+            filters.related_findings_product_arn.is_some(),
+        ),
+        ("RelatedFindingsId", filters.related_findings_id.is_some()),
+        (
+            "FindingProviderFieldsConfidence",
+            filters.finding_provider_fields_confidence.is_some(),
+        ),
+        (
+            "FindingProviderFieldsCriticality",
+            filters.finding_provider_fields_criticality.is_some(),
+        ),
+        (
+            "FindingProviderFieldsRelatedFindingsId",
+            filters.finding_provider_fields_related_findings_id.is_some(),
+        ),
+        (
+            "FindingProviderFieldsRelatedFindingsProductArn",
+            filters
+                .finding_provider_fields_related_findings_product_arn
+                .is_some(),
+        ),
+        (
+            "FindingProviderFieldsSeverityLabel",
+            filters.finding_provider_fields_severity_label.is_some(),
+        ),
+        (
+            "FindingProviderFieldsSeverityOriginal",
+            filters.finding_provider_fields_severity_original.is_some(),
+        ),
+        (
+            "FindingProviderFieldsTypes",
+            filters.finding_provider_fields_types.is_some(),
+        ),
+        ("ComplianceAssociatedStandardsId",
+            filters.compliance_associated_standards_id.is_some(),
+        ),
+        (
+            "VulnerabilitiesExploitAvailable",
+            filters.vulnerabilities_exploit_available.is_some(),
+        ),
+        (
+            "VulnerabilitiesFixAvailable",
+            filters.vulnerabilities_fix_available.is_some(),
+        ),
+        (
+            "ComplianceSecurityControlParametersName",
+            filters
+                .compliance_security_control_parameters_name
+                .is_some(),
+        ),
+        (
+            "ComplianceSecurityControlParametersValue",
+            filters
+                .compliance_security_control_parameters_value
+                .is_some(),
+        ),
+        (
+            "ResourceApplicationName",
+            filters.resource_application_name.is_some(),
+        ),
+        (
+            "ResourceApplicationArn",
+            filters.resource_application_arn.is_some(),
+        ),
+        (
+            "ResourceOwnerAccountId",
+            filters.resource_owner_account_id.is_some(),
+        ),
+        (
+            "ResourceOwnerOrgId",
+            filters.resource_owner_org_id.is_some(),
+        ),
+        ("ResourceProvider", filters.resource_provider.is_some()),
+    ];
+    set.into_iter()
+        .find_map(|(name, present)| present.then_some(name))
+}
+
+/// Refuse a `Filters` the model's own rules reject, BEFORE any finding is examined:
+/// whether a request is valid cannot depend on what happens to be stored, so an
+/// illegal filter combination or an unparseable date bound is a 400 even for a hub
+/// that holds no findings.
+fn validate_filters(filters: &AwsSecurityFindingFilters) -> Result<(), String> {
+    for (attribute, field_filters) in string_filter_bindings(filters) {
+        check_string_filter_combination(attribute, field_filters)?;
+    }
+    for (attribute, field_filters) in date_filter_bindings(filters) {
+        for filter in field_filters {
+            for (member, bound) in [
+                ("Start", filter.start.as_deref()),
+                ("End", filter.end.as_deref()),
+            ] {
+                if let Some(bound) = bound {
+                    if crate::state::parse_iso8601_nanos(bound).is_none() {
+                        return Err(format!(
+                            "Filter {attribute}: {member} must be an ISO-8601 timestamp, got {bound}"
+                        ));
+                    }
+                }
+            }
+            if let Some(range) = filter.date_range.as_ref() {
+                date_range_nanos(attribute, range)?;
+                match range.comparison.as_deref().unwrap_or("WITHIN") {
+                    "WITHIN" | "OLDER_THAN" => {}
+                    other => {
+                        return Err(format!(
+                            "Filter {attribute}: DateRange.Comparison {other} is not a supported comparison"
+                        ))
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Does this finding satisfy every filter member the caller set? `Err` carries the
+/// text of an `InvalidInputException` for a filter the model's own rules refuse.
+fn finding_matches(
+    finding: &AwsSecurityFinding,
+    filters: &AwsSecurityFindingFilters,
+    now_nanos: i128,
+) -> Result<bool, String> {
+    for (attribute, field_filters) in string_filter_bindings(filters) {
+        let values = string_attribute(finding, attribute).unwrap_or_default();
+        if !string_filters_match(&values, field_filters) {
+            return Ok(false);
+        }
+    }
+    for (attribute, field_filters) in number_filter_bindings(filters) {
+        let value = number_attribute(finding, attribute).unwrap_or_default();
+        if !number_filters_match(value, field_filters) {
+            return Ok(false);
+        }
+    }
+    for (attribute, field_filters) in date_filter_bindings(filters) {
+        let value = date_attribute(finding, attribute).unwrap_or_default();
+        if !date_filters_match(attribute, value, field_filters, now_nanos)? {
+            return Ok(false);
+        }
+    }
+    if let Some(sample_filters) = filters.sample.as_ref() {
+        let value = boolean_attribute(finding, "Sample").unwrap_or_default();
+        if !boolean_filters_match(value, sample_filters) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// One finding's value for a sort field, in a form two findings can be compared on.
+#[derive(Debug, PartialEq)]
+enum SortValue {
+    /// The finding carries no value for the field; sorts before every present one.
+    Absent,
+    Text(String),
+    Number(f64),
+    Instant(i128),
+}
+
+impl SortValue {
+    fn compare(&self, other: &Self) -> ::std::cmp::Ordering {
+        use ::std::cmp::Ordering;
+        match (self, other) {
+            (Self::Absent, Self::Absent) => Ordering::Equal,
+            (Self::Absent, _) => Ordering::Less,
+            (_, Self::Absent) => Ordering::Greater,
+            (Self::Text(a), Self::Text(b)) => a.cmp(b),
+            (Self::Number(a), Self::Number(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+            (Self::Instant(a), Self::Instant(b)) => a.cmp(b),
+            // Two different kinds never arise: a field resolves to one kind.
+            _ => Ordering::Equal,
+        }
+    }
+}
+
+/// This finding's value for the sort field `field`, or `None` when sorting on that
+/// field is not implemented.
+fn sort_value(finding: &AwsSecurityFinding, field: &str) -> Option<SortValue> {
+    if let Some(value) = date_attribute(finding, field) {
+        return Some(
+            value
+                .and_then(crate::state::parse_iso8601_nanos)
+                .map_or(SortValue::Absent, SortValue::Instant),
+        );
+    }
+    if let Some(value) = number_attribute(finding, field) {
+        return Some(value.map_or(SortValue::Absent, SortValue::Number));
+    }
+    if let Some(values) = string_attribute(finding, field) {
+        return Some(
+            values
+                .first()
+                .map_or(SortValue::Absent, |v| SortValue::Text((*v).to_string())),
+        );
+    }
+    None
+}
+
+/// The field and direction a page is ordered by when the caller names no
+/// `SortCriteria`: the most recently updated finding first.
+const DEFAULT_SORT_FIELD: &str = "UpdatedAt";
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for GetFindings<Eng>
 {
@@ -160,18 +886,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFindings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFindingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFindings"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetFindingsError::Modeled(GetFindingsErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the Security Hub CSPM state store is unavailable".to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+        let invalid_input = |message: String| {
+            GetFindingsError::Modeled(GetFindingsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                    code: Some("InvalidInputException".to_string()),
+                },
+            ))
+        };
+
+        let (account_id, region) = crate::state::hub_key(ctx);
+        let store = state.lock();
+        if !store.hubs.contains_key(&(account_id.clone(), region.clone())) {
+            return Err(GetFindingsErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(format!(
+                        "Account {account_id} is not subscribed to Security Hub CSPM in Region {region}"
+                    )),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let empty_filters = AwsSecurityFindingFilters::default();
+        let filters = input.filters.as_ref().unwrap_or(&empty_filters);
+        if let Some(member) = unsupported_filter_member(filters) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "GetFindings filter {member}"
+            )));
+        }
+        // Whether the request is valid is decided before any finding is read, so an
+        // illegal filter is refused identically on a full and on an empty hub.
+        if let Err(message) = validate_filters(filters) {
+            return Err(invalid_input(message));
+        }
+
+        // Every sort field is resolved before any finding is ordered, so an
+        // unimplemented field is answered instead of silently ignored.
+        let sort_criteria = input.sort_criteria.as_deref().unwrap_or_default();
+        let mut ordering: Vec<(String, bool)> = Vec::new();
+        for criterion in sort_criteria {
+            let field = criterion.field.clone().unwrap_or_default();
+            if sort_value(&AwsSecurityFinding::default(), &field).is_none() {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "GetFindings SortCriteria field {field}"
+                )));
+            }
+            let descending = match criterion.sort_order.as_deref() {
+                Some("desc") => true,
+                Some("asc") | None => false,
+                Some(other) => {
+                    return Err(invalid_input(format!(
+                        "SortCriteria.SortOrder {other} is not a supported sort order"
+                    )))
+                }
+            };
+            ordering.push((field, descending));
+        }
+        if ordering.is_empty() {
+            ordering.push((DEFAULT_SORT_FIELD.to_string(), true));
+        }
+
+        let now_nanos = crate::state::now_nanos();
+        let mut matched: Vec<(&crate::state::FindingKey, &crate::state::StoredFinding)> = Vec::new();
+        for (key, stored) in &store.findings {
+            if key.account_id != account_id || key.region != region {
+                continue;
+            }
+            match finding_matches(&stored.finding, filters, now_nanos) {
+                Ok(true) => matched.push((key, stored)),
+                Ok(false) => {}
+                Err(message) => return Err(invalid_input(message)),
+            }
+        }
+
+        matched.sort_by(|(left_key, left), (right_key, right)| {
+            for (field, descending) in &ordering {
+                let left_value = sort_value(&left.finding, field).unwrap_or(SortValue::Absent);
+                let right_value = sort_value(&right.finding, field).unwrap_or(SortValue::Absent);
+                let mut order = left_value.compare(&right_value);
+                if *descending {
+                    order = order.reverse();
+                }
+                if order != ::std::cmp::Ordering::Equal {
+                    return order;
+                }
+            }
+            // A total order is what makes `NextToken` paging repeatable: the most
+            // recent write first, then the identifier, so equal sort values never
+            // swap places between two calls.
+            right
+                .updated_seq
+                .cmp(&left.updated_seq)
+                .then_with(|| left_key.cmp(right_key))
+        });
+
+        let page_size = match input.max_results {
+            Some(requested) => usize::try_from(requested).unwrap_or(MAX_RESULTS_LIMIT),
+            None => MAX_RESULTS_LIMIT,
+        };
+        let offset = match input.next_token.as_deref() {
+            Some(token) => decode_next_token(token).ok_or_else(|| {
+                invalid_input("NextToken is not a token this operation issued".to_string())
+            })?,
+            None => 0,
+        };
+        if offset > matched.len() {
+            return Err(invalid_input(
+                "NextToken refers to a position past the end of the result set".to_string(),
+            ));
+        }
+
+        let page: Vec<AwsSecurityFinding> = matched
+            .iter()
+            .skip(offset)
+            .take(page_size)
+            .map(|(_, stored)| stored.finding.clone())
+            .collect();
+        let next_offset = offset + page.len();
+        let next_token = (next_offset < matched.len()).then(|| encode_next_token(next_offset));
+
+        Ok(GetFindingsOutput {
+            findings: page,
+            next_token,
+        })
     }
 }

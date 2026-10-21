@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableSecurityHub
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableSecurityHub`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableSecurityHub::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Unsubscribes the caller's account from Security Hub CSPM in the request's Region:
+//! the `Hub` record and every finding imported into it are removed from
+//! [`crate::state`]. An account with no subscription has no hub to delete, which is
+//! the modelled `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +142,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableSecurityHub` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableSecurityHubErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableSecurityHub"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisableSecurityHubError::Modeled(DisableSecurityHubErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the Security Hub CSPM state store is unavailable".to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+        let _ = &input;
+
+        let (account_id, region) = crate::state::hub_key(ctx);
+        let mut store = state.lock();
+        if store
+            .hubs
+            .remove(&(account_id.clone(), region.clone()))
+            .is_none()
+        {
+            return Err(DisableSecurityHubErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Account {account_id} is not subscribed to Security Hub CSPM in Region {region}"
+                    )),
+                    code: Some("ResourceNotFoundException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Disabling Security Hub CSPM deletes the hub's findings with it, so the
+        // account keeps nothing from the subscription it just ended.
+        store
+            .findings
+            .retain(|key, _| key.account_id != account_id || key.region != region);
+
+        Ok(DisableSecurityHubOutput::default())
     }
 }
