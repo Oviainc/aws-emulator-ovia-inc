@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches a user to an EXISTING server and persists it, so `DescribeUser` /
+//! `ListUsers` rebuild their answers from stored values rather than from the request.
+//! An unknown `ServerId` is a `ResourceNotFoundException` (404); a `UserName` already
+//! taken on that server is a `ResourceExistsException` (409). An `SshPublicKeyBody`
+//! supplied here becomes the user's first stored key, with a minted
+//! `SshPublicKeyId` and the `DateImported` of this call.
 //!
 //! ## Shape of an operation
 //!
@@ -217,18 +215,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUser"))
+        use crate::state as st;
+
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            CreateUserErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+        let region = st::request_region(ctx.parts());
+
+        let mut guard = state.lock();
+
+        if !guard.servers.contains_key(&input.server_id) {
+            return Err(CreateUserErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Unknown server {}", input.server_id),
+                    resource: input.server_id.clone(),
+                    resource_type: "server".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let key = (input.server_id.clone(), input.user_name.clone());
+        if guard.users.contains_key(&key) {
+            return Err(CreateUserErrorModeled::ResourceExistsException(
+                ResourceExistsException {
+                    message: format!(
+                        "User {} already exists on server {}",
+                        input.user_name, input.server_id
+                    ),
+                    resource: input.user_name.clone(),
+                    resource_type: "user".to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Each server's user set is BOUNDED: past its capacity a create is refused
+        // rather than adding another record. The modelled `ServiceUnavailableException`
+        // is the refusal that says the service cannot take this request; the capacity
+        // is released by `DeleteUser`, and all of it by `DeleteServer`.
+        if !guard.server_has_user_capacity(&input.server_id) {
+            return Err(CreateUserErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some(format!(
+                        "server {} already holds the maximum of {} users; \
+                         delete one before creating another",
+                        input.server_id,
+                        st::MAX_USERS_PER_SERVER
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A key supplied with the create is the user's first stored key, minted and
+        // dated here so `DescribeUser` reports it without the request being replayed.
+        let ssh_public_keys = match input.ssh_public_key_body {
+            Some(body) => {
+                let ssh_public_key_id = guard.mint_id("key");
+                vec![st::SshKey {
+                    ssh_public_key_id,
+                    ssh_public_key_body: body,
+                    date_imported: ::std::time::SystemTime::now(),
+                }]
+            }
+            None => Vec::new(),
+        };
+
+        let user = st::User {
+            arn: st::user_arn(&region, &input.server_id, &input.user_name),
+            role: input.role,
+            home_directory: input.home_directory,
+            home_directory_type: input.home_directory_type,
+            home_directory_mappings: input.home_directory_mappings.unwrap_or_default(),
+            policy: input.policy,
+            posix_profile: input.posix_profile,
+            ssh_public_keys,
+            tags: input.tags.unwrap_or_default(),
+            server_id: input.server_id.clone(),
+            user_name: input.user_name.clone(),
+        };
+        guard.users.insert(key, user);
+        drop(guard);
+
+        Ok(CreateUserOutput {
+            server_id: input.server_id,
+            user_name: input.user_name,
+        })
     }
 }

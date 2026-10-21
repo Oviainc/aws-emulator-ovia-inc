@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Rebuilds `DescribedUser` from the stored user — every member is the value
+//! `CreateUser` persisted, not a value echoed from this request. An unknown server or
+//! user is a `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +148,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeUser"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            DescribeUserErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let guard = state.lock();
+
+        if !guard.servers.contains_key(&input.server_id) {
+            return Err(DescribeUserErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Unknown server {}", input.server_id),
+                    resource: input.server_id.clone(),
+                    resource_type: "server".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let key = (input.server_id.clone(), input.user_name.clone());
+        let stored = guard.users.get(&key).ok_or_else(|| {
+            DescribeUserErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!(
+                    "Unknown user {} on server {}",
+                    input.user_name, input.server_id
+                ),
+                resource: input.user_name.clone(),
+                resource_type: "user".to_string(),
+            })
+        })?;
+
+        let user = DescribedUser {
+            arn: stored.arn.clone(),
+            home_directory: stored.home_directory.clone(),
+            // `HomeDirectoryMappings` is modelled `len 1..50000`: absent, not empty,
+            // when the user has none.
+            home_directory_mappings: Some(stored.home_directory_mappings.clone())
+                .filter(|mappings| !mappings.is_empty()),
+            home_directory_type: stored.home_directory_type.clone(),
+            policy: stored.policy.clone(),
+            posix_profile: stored.posix_profile.clone(),
+            role: Some(stored.role.clone()),
+            ssh_public_keys: Some(
+                stored
+                    .ssh_public_keys
+                    .iter()
+                    .map(|key| SshPublicKey {
+                        date_imported: ::aws_smithy_types::DateTime::from(key.date_imported),
+                        ssh_public_key_body: key.ssh_public_key_body.clone(),
+                        ssh_public_key_id: key.ssh_public_key_id.clone(),
+                    })
+                    .collect(),
+            ),
+            // `Tags` is modelled `len 1..50`, so an untagged user reports it absent.
+            tags: Some(stored.tags.clone()).filter(|tags| !tags.is_empty()),
+            user_name: Some(stored.user_name.clone()),
+        };
+
+        Ok(DescribeUserOutput {
+            server_id: input.server_id,
+            user,
+        })
     }
 }

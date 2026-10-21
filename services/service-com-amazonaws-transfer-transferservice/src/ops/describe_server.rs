@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeServer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeServer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeServer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Rebuilds `DescribedServer` from the stored server. `UserCount` is DERIVED from the
+//! live user map, never read from a stored counter. The only write this reporting
+//! operation makes is materialising the `STARTING` -> `ONLINE` transition the clock
+//! already made due, so two reads at one instant answer the same thing.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +144,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeServer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeServerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeServer"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            DescribeServerErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let now = ::std::time::Instant::now();
+        let mut guard = state.lock();
+
+        // `UserCount` first, so the lookup below is the ONLY one and there is no
+        // unreachable second 404 branch.
+        let user_count = guard.user_count(&input.server_id);
+        let Some(stored) = guard.servers.get_mut(&input.server_id) else {
+            return Err(DescribeServerErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Unknown server {}", input.server_id),
+                    resource: input.server_id.clone(),
+                    resource_type: "server".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Settle ONLY the server being described — the single write this reporting
+        // operation makes, and only for a change the clock already owed at `now`.
+        // `ListServers` needs the bulk form; a single-resource read does not.
+        stored.settle(now);
+
+        let server = DescribedServer {
+            arn: stored.arn.clone(),
+            certificate: stored.certificate.clone(),
+            protocol_details: stored.protocol_details.clone(),
+            domain: Some(stored.domain.clone()),
+            endpoint_details: stored.endpoint_details.clone(),
+            endpoint_type: Some(stored.endpoint_type.clone()),
+            host_key_fingerprint: stored.host_key_fingerprint.clone(),
+            identity_provider_details: stored.identity_provider_details.clone(),
+            identity_provider_type: Some(stored.identity_provider_type.clone()),
+            logging_role: stored.logging_role.clone(),
+            post_authentication_login_banner: stored.post_authentication_login_banner.clone(),
+            pre_authentication_login_banner: stored.pre_authentication_login_banner.clone(),
+            protocols: Some(stored.protocols.clone()),
+            security_policy_name: Some(stored.security_policy_name.clone()),
+            server_id: Some(stored.server_id.clone()),
+            state: Some(stored.state.clone()),
+            // `Tags` is modelled `len 1..50`, so an untagged server reports it absent
+            // rather than as an empty list.
+            tags: Some(stored.tags.clone()).filter(|tags| !tags.is_empty()),
+            user_count: Some(user_count),
+            workflow_details: stored.workflow_details.clone(),
+            // Unlike `Tags` and `HomeDirectoryMappings`, `StructuredLogDestinations` is
+            // modelled `len 0..1` — an empty list is a legal value and is how the real
+            // service reports structured logging turned off — so it is reported as an
+            // empty list rather than as absent.
+            structured_log_destinations: Some(stored.structured_log_destinations.clone()),
+            s3_storage_options: stored.s3_storage_options.clone(),
+            // Egress IPs are only meaningful for AS2 servers and the emulator runs no
+            // AS2 transport, so there is nothing to report.
+            as2_service_managed_egress_ip_addresses: None,
+            ip_address_type: Some(stored.ip_address_type.clone()),
+        };
+
+        Ok(DescribeServerOutput { server })
     }
 }
