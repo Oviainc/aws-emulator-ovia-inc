@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableSecurityHub
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableSecurityHub`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableSecurityHub::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Subscribes the caller's account to Security Hub CSPM in the request's Region by
+//! creating the one `hub/default` resource for that `(account, Region)` in
+//! [`crate::state`]. A second call for an already-subscribed account/Region answers the
+//! modelled `ResourceConflictException` (409), never a second success.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +163,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableSecurityHub` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableSecurityHubErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableSecurityHub"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            EnableSecurityHubError::Modeled(EnableSecurityHubErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the Security Hub CSPM state store is unavailable".to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+
+        let key = crate::state::hub_key(ctx);
+        let mut store = state.lock();
+        if store.hubs.contains_key(&key) {
+            return Err(EnableSecurityHubErrorModeled::ResourceConflictException(
+                ResourceConflictException {
+                    message: Some(format!(
+                        "Security Hub CSPM is already enabled for account {} in Region {}",
+                        key.0, key.1
+                    )),
+                    code: Some("ResourceConflictException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let hub = crate::state::Hub {
+            hub_arn: crate::state::hub_arn(&key),
+            subscribed_at: crate::state::now_iso8601(),
+            auto_enable_controls: crate::state::DEFAULT_AUTO_ENABLE_CONTROLS,
+            control_finding_generator: input
+                .control_finding_generator
+                .unwrap_or_else(|| crate::state::DEFAULT_CONTROL_FINDING_GENERATOR.to_string()),
+            enable_default_standards: input
+                .enable_default_standards
+                .unwrap_or(crate::state::DEFAULT_ENABLE_DEFAULT_STANDARDS),
+            tags: input.tags.unwrap_or_default(),
+        };
+        store.hubs.insert(key, hub);
+
+        Ok(EnableSecurityHubOutput::default())
     }
 }

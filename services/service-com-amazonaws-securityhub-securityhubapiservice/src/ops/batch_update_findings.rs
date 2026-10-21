@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchUpdateFindings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchUpdateFindings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchUpdateFindings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the requested updates to the findings already stored in [`crate::state`],
+//! addressed by the modelled `AwsSecurityFindingIdentifier` (`ProductArn` + `Id`), so
+//! a later `GetFindings` reports the new values. An identifier that matches no stored
+//! finding, or that the same request already named, is reported in
+//! `UnprocessedFindings` and is NOT reported as processed.
 //!
 //! ## Shape of an operation
 //!
@@ -173,6 +169,16 @@ impl<Eng> BatchUpdateFindings<Eng> {
     }
 }
 
+/// `BatchUpdateFindingsUnprocessedFinding.ErrorCode` when no stored finding carries
+/// the requested `AwsSecurityFindingIdentifier`.
+pub const UPDATE_ERROR_FINDING_NOT_FOUND: &str = "FindingNotFound";
+
+/// `BatchUpdateFindingsUnprocessedFinding.ErrorCode` when one request names the same
+/// `AwsSecurityFindingIdentifier` more than once: only the first occurrence is
+/// applied, because a second update of the same record in one call has no defined
+/// order.
+pub const UPDATE_ERROR_DUPLICATED_IDENTIFIER: &str = "DuplicatedFindingIdentifier";
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for BatchUpdateFindings<Eng>
 {
@@ -190,18 +196,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchUpdateFindings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchUpdateFindingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchUpdateFindings"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchUpdateFindingsError::Modeled(BatchUpdateFindingsErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the Security Hub CSPM state store is unavailable".to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+
+        let (account_id, region) = crate::state::hub_key(ctx);
+        let mut store = state.lock();
+        if !store.hubs.contains_key(&(account_id.clone(), region.clone())) {
+            return Err(BatchUpdateFindingsErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(format!(
+                        "Account {account_id} is not subscribed to Security Hub CSPM in Region {region}"
+                    )),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // One instant for the whole call: `Note.UpdatedAt` records when this update
+        // was made, so every note it writes carries the same timestamp.
+        let note_updated_at = crate::state::now_iso8601();
+        let mut processed_findings: Vec<AwsSecurityFindingIdentifier> = Vec::new();
+        let mut unprocessed_findings: Vec<BatchUpdateFindingsUnprocessedFinding> = Vec::new();
+        let mut already_named: ::std::collections::HashSet<(String, String)> =
+            ::std::collections::HashSet::new();
+
+        for identifier in input.finding_identifiers {
+            if !already_named.insert((identifier.product_arn.clone(), identifier.id.clone())) {
+                unprocessed_findings.push(BatchUpdateFindingsUnprocessedFinding {
+                    error_code: UPDATE_ERROR_DUPLICATED_IDENTIFIER.to_string(),
+                    error_message: format!(
+                        "Finding {} from product {} is named more than once in this request",
+                        identifier.id, identifier.product_arn
+                    ),
+                    finding_identifier: identifier,
+                });
+                continue;
+            }
+
+            let key = crate::state::FindingKey {
+                account_id: account_id.clone(),
+                region: region.clone(),
+                product_arn: identifier.product_arn.clone(),
+                finding_id: identifier.id.clone(),
+            };
+            if !store.findings.contains_key(&key) {
+                unprocessed_findings.push(BatchUpdateFindingsUnprocessedFinding {
+                    error_code: UPDATE_ERROR_FINDING_NOT_FOUND.to_string(),
+                    error_message: format!(
+                        "No finding with Id {} from product {} exists in this account and Region",
+                        identifier.id, identifier.product_arn
+                    ),
+                    finding_identifier: identifier,
+                });
+                continue;
+            }
+            // Minted only once the record is known to exist, so an identifier that
+            // ends up unprocessed consumes no write sequence.
+            let seq = store.next_write_seq();
+            let Some(stored) = store.findings.get_mut(&key) else {
+                continue;
+            };
+
+            let finding = &mut stored.finding;
+            if let Some(note) = input.note.as_ref() {
+                finding.note = Some(Note {
+                    text: note.text.clone(),
+                    updated_by: note.updated_by.clone(),
+                    updated_at: note_updated_at.clone(),
+                });
+            }
+            if let Some(severity) = input.severity.as_ref() {
+                // `Product` and `Original` are provider-owned and are not part of
+                // `SeverityUpdate`'s Label/Normalized pair, so they survive an update
+                // that does not carry them.
+                let previous = finding.severity.clone().unwrap_or_default();
+                let mut updated = Severity {
+                    product: severity.product.or(previous.product),
+                    label: severity.label.clone(),
+                    normalized: severity.normalized,
+                    original: previous.original,
+                };
+                crate::state::complete_severity(&mut updated);
+                finding.severity = Some(updated);
+            }
+            if let Some(verification_state) = input.verification_state.as_ref() {
+                finding.verification_state = Some(verification_state.clone());
+            }
+            if let Some(confidence) = input.confidence {
+                finding.confidence = Some(confidence);
+            }
+            if let Some(criticality) = input.criticality {
+                finding.criticality = Some(criticality);
+            }
+            if let Some(types) = input.types.as_ref() {
+                finding.types = Some(types.clone());
+            }
+            if let Some(user_defined_fields) = input.user_defined_fields.as_ref() {
+                finding.user_defined_fields = Some(user_defined_fields.clone());
+            }
+            if let Some(status) = input.workflow.as_ref().and_then(|w| w.status.as_ref()) {
+                finding.workflow = Some(Workflow {
+                    status: Some(status.clone()),
+                });
+            }
+            if let Some(related_findings) = input.related_findings.as_ref() {
+                finding.related_findings = Some(related_findings.clone());
+            }
+            stored.updated_seq = seq;
+
+            processed_findings.push(identifier);
+        }
+
+        Ok(BatchUpdateFindingsOutput {
+            processed_findings,
+            unprocessed_findings,
+        })
     }
 }
