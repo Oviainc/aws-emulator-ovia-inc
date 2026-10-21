@@ -1,11 +1,487 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-datasync-fmrsservice service.
+//!
+//! This module owns the DataSync resources the handlers in `src/ops/` share — S3
+//! transfer locations, transfer tasks and task executions — plus the two pieces of
+//! behaviour that cannot live in any single operation file:
+//!
+//! * [`ComAmazonawsDatasyncFmrsserviceState::advance_clock`], which materialises the
+//!   transitions the clock has already made due (a task leaving `CREATING`, an
+//!   execution walking its phases). Every handler calls it before reading or writing,
+//!   so a reporting operation reports what the clock already owed and nothing more.
+//! * the modelled defaults ([`default_options`]) and the per-execution overlay
+//!   ([`overlay_options`]) that `CreateTask`, `StartTaskExecution` and the two
+//!   `Describe*` operations must agree on.
+//!
+//! Resource ids are minted from monotonic counters held here, so every ARN this
+//! service hands out is also stored here and can be resolved again.
+
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
+
+use crate::ops::types::{
+    FilterRule, ManifestConfig, Options, S3Config, TagListEntry, TaskReportConfig, TaskSchedule,
+};
+
+/// How long each clock-owed transition takes.
+///
+/// The project's emulator contract requires a transition the clock owes to fall due
+/// 250–750 ms after the call that starts it, so a caller acting immediately after a
+/// create or a start still observes the transient state. 300 ms sits inside that band
+/// and is used for every span in this service: `CREATING` -> `AVAILABLE` for a task,
+/// and each phase of a task execution.
+pub const TRANSITION_SPAN: Duration = Duration::from_millis(300);
+
+/// The region segment to use when a request carries no SigV4 credential scope to read
+/// one from (an unsigned request to the emulator).
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The `datasync` ARN namespace, as the Smithy model's `awsService` trait declares it.
+const ARN_NAMESPACE: &str = "datasync";
+
+/// `ListTasks`' page size when the request declares none.
+///
+/// `MaxResults` is modelled `0..100`, so 100 is the largest page the service will
+/// ever return and is what an unspecified page size resolves to.
+pub const LIST_TASKS_DEFAULT_PAGE_SIZE: usize = 100;
+
+/// What kind of storage a transfer location addresses.
+///
+/// Only the S3 family is implemented so far; the other eleven `CreateLocation*`
+/// operations are still scaffolded and will each add their own variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocationKind {
+    /// An Amazon S3 bucket or access point.
+    S3,
+}
+
+impl LocationKind {
+    /// The scheme this kind uses in a `LocationUri`.
+    pub fn uri_scheme(self) -> &'static str {
+        match self {
+            Self::S3 => "s3",
+        }
+    }
+}
+
+/// A transfer location: what `CreateLocationS3` stored and `DescribeLocationS3` reports.
+#[derive(Debug, Clone)]
+pub struct Location {
+    pub arn: String,
+    pub location_uri: String,
+    pub kind: LocationKind,
+    pub s3_bucket_arn: String,
+    pub s3_config: S3Config,
+    pub s3_storage_class: String,
+    pub subdirectory: Option<String>,
+    pub agent_arns: Vec<String>,
+    pub tags: Vec<TagListEntry>,
+    pub creation_time: SystemTime,
+}
+
+/// A transfer task's lifecycle status, as the modelled `TaskStatus` enum spells it.
+///
+/// Only the three states this slice can reach are modelled here; `QUEUED` and
+/// `UNAVAILABLE` belong to behaviour (task queueing, agent health) that no implemented
+/// operation drives yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskStatus {
+    Creating,
+    Available,
+    Running,
+}
+
+impl TaskStatus {
+    /// The wire value, one of `shared_types::TASK_STATUS_VALUES`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Creating => "CREATING",
+            Self::Available => "AVAILABLE",
+            Self::Running => "RUNNING",
+        }
+    }
+}
+
+/// A transfer task: what `CreateTask` stored and `DescribeTask`/`ListTasks` report.
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub arn: String,
+    /// Creation order. `ListTasks` pages over tasks sorted by this, and its opaque
+    /// `NextToken` carries the sequence number the next page resumes after, so a page
+    /// boundary survives a task being deleted between pages.
+    pub seq: u64,
+    pub name: Option<String>,
+    pub status: TaskStatus,
+    /// When `CREATING` -> `AVAILABLE` falls due. See [`TRANSITION_SPAN`].
+    pub available_at: SystemTime,
+    pub source_location_arn: String,
+    pub destination_location_arn: String,
+    pub cloud_watch_log_group_arn: Option<String>,
+    pub options: Options,
+    pub includes: Vec<FilterRule>,
+    pub excludes: Vec<FilterRule>,
+    pub schedule: Option<TaskSchedule>,
+    pub manifest_config: Option<ManifestConfig>,
+    pub task_report_config: Option<TaskReportConfig>,
+    pub task_mode: String,
+    pub tags: Vec<TagListEntry>,
+    pub creation_time: SystemTime,
+    pub current_task_execution_arn: Option<String>,
+    /// Execution ARNs in creation order, for `ListTaskExecutions` later.
+    pub execution_arns: Vec<String>,
+}
+
+/// A task execution's status, as the modelled `TaskExecutionStatus` enum spells it.
+///
+/// `QUEUED`, `CANCELLING` and `ERROR` belong to task queueing, `CancelTaskExecution`
+/// and transfer failure — none of which an implemented operation drives yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskExecutionStatus {
+    Launching,
+    Preparing,
+    Transferring,
+    Verifying,
+    Success,
+}
+
+impl TaskExecutionStatus {
+    /// The wire value, one of `shared_types::TASK_EXECUTION_STATUS_VALUES`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Launching => "LAUNCHING",
+            Self::Preparing => "PREPARING",
+            Self::Transferring => "TRANSFERRING",
+            Self::Verifying => "VERIFYING",
+            Self::Success => "SUCCESS",
+        }
+    }
+
+    /// Whether no further transition is owed from this status.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Success)
+    }
+
+    /// This status's position in the phase sequence an execution walks, so a reader
+    /// can ask whether a given phase is already behind the execution.
+    pub fn phase_index(self) -> u8 {
+        match self {
+            Self::Launching => 0,
+            Self::Preparing => 1,
+            Self::Transferring => 2,
+            Self::Verifying => 3,
+            Self::Success => 4,
+        }
+    }
+}
+
+/// The instants at which an execution's phase transitions fall due.
+///
+/// Stored when the execution starts, so the phase an observer sees is a pure function
+/// of the clock and nothing has to sleep or run in the background.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutionSchedule {
+    /// `LAUNCHING` -> `PREPARING`; also the execution's `LaunchTime`.
+    pub launched_at: SystemTime,
+    /// `PREPARING` -> `TRANSFERRING`.
+    pub transfer_at: SystemTime,
+    /// `TRANSFERRING` -> `VERIFYING`.
+    pub verify_at: SystemTime,
+    /// `VERIFYING` -> `SUCCESS`; also the execution's `EndTime`.
+    pub finished_at: SystemTime,
+}
+
+impl ExecutionSchedule {
+    /// The schedule for an execution started at `start`, one [`TRANSITION_SPAN`] per phase.
+    pub fn starting_at(start: SystemTime) -> Self {
+        Self {
+            launched_at: start + TRANSITION_SPAN,
+            transfer_at: start + 2 * TRANSITION_SPAN,
+            verify_at: start + 3 * TRANSITION_SPAN,
+            finished_at: start + 4 * TRANSITION_SPAN,
+        }
+    }
+}
+
+/// The file and byte counters `DescribeTaskExecution` reports.
+///
+/// The emulator has no S3 data plane behind a transfer location, so no bytes or files
+/// are ever moved and these stay at the zero the model declares as each member's
+/// default. They are a record field rather than literals in the handler so that a
+/// future data plane reports from the same place.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExecutionCounters {
+    pub estimated_files_to_transfer: i64,
+    pub estimated_bytes_to_transfer: i64,
+    pub files_transferred: i64,
+    pub bytes_written: i64,
+    pub bytes_transferred: i64,
+    pub bytes_compressed: i64,
+    pub files_deleted: i64,
+    pub files_skipped: i64,
+    pub files_verified: i64,
+    pub estimated_files_to_delete: i64,
+    pub files_prepared: i64,
+}
+
+/// A task execution: what `StartTaskExecution` stored and `DescribeTaskExecution` reports.
+#[derive(Debug, Clone)]
+pub struct TaskExecution {
+    pub arn: String,
+    pub task_arn: String,
+    pub status: TaskExecutionStatus,
+    /// The options actually in effect: the task's options overlaid with this
+    /// execution's `OverrideOptions`.
+    pub options: Options,
+    pub includes: Vec<FilterRule>,
+    pub excludes: Vec<FilterRule>,
+    pub manifest_config: Option<ManifestConfig>,
+    pub task_report_config: Option<TaskReportConfig>,
+    pub tags: Vec<TagListEntry>,
+    pub task_mode: String,
+    pub start_time: SystemTime,
+    pub launch_time: Option<SystemTime>,
+    pub end_time: Option<SystemTime>,
+    pub schedule: ExecutionSchedule,
+    pub counters: ExecutionCounters,
+}
+
+impl TaskExecution {
+    /// The phase this execution is in at `now`, from the stored schedule.
+    pub fn phase_at(&self, now: SystemTime) -> TaskExecutionStatus {
+        if now >= self.schedule.finished_at {
+            TaskExecutionStatus::Success
+        } else if now >= self.schedule.verify_at {
+            TaskExecutionStatus::Verifying
+        } else if now >= self.schedule.transfer_at {
+            TaskExecutionStatus::Transferring
+        } else if now >= self.schedule.launched_at {
+            TaskExecutionStatus::Preparing
+        } else {
+            TaskExecutionStatus::Launching
+        }
+    }
+}
 
 /// Per-service state for com-amazonaws-datasync-fmrsservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsDatasyncFmrsserviceState {
-    // TODO: add service-specific state fields
+    /// Transfer locations by `LocationArn`.
+    pub locations: HashMap<String, Location>,
+    /// Transfer tasks by `TaskArn`.
+    pub tasks: HashMap<String, Task>,
+    /// Task executions by `TaskExecutionArn`.
+    pub task_executions: HashMap<String, TaskExecution>,
+    next_location_seq: u64,
+    next_task_seq: u64,
+    next_execution_seq: u64,
+}
+
+impl ComAmazonawsDatasyncFmrsserviceState {
+    /// Mint the next `LocationArn`: `location/loc-<17 lowercase alphanumerics>`.
+    pub fn mint_location_arn(&mut self, region: &str) -> String {
+        self.next_location_seq += 1;
+        emulator_arn(region, &format!("location/loc-{:017x}", self.next_location_seq))
+    }
+
+    /// Mint the next `TaskArn` and its creation sequence: `task/task-<17 hex digits>`.
+    pub fn mint_task_arn(&mut self, region: &str) -> (String, u64) {
+        self.next_task_seq += 1;
+        let seq = self.next_task_seq;
+        (emulator_arn(region, &format!("task/task-{seq:017x}")), seq)
+    }
+
+    /// Mint the next `TaskExecutionArn`, which the model nests under its task's ARN.
+    pub fn mint_execution_arn(&mut self, task_arn: &str) -> String {
+        self.next_execution_seq += 1;
+        format!(
+            "{task_arn}/execution/exec-{seq:017x}",
+            seq = self.next_execution_seq
+        )
+    }
+
+    /// Materialise every transition the clock has already made due at `now`.
+    ///
+    /// This is the ONLY write a reporting operation performs: each change here was
+    /// owed at `now` whether or not anybody called, because its due instant was stored
+    /// when the task was created or the execution was started.
+    pub fn advance_clock(&mut self, now: SystemTime) {
+        for task in self.tasks.values_mut() {
+            if task.status == TaskStatus::Creating && now >= task.available_at {
+                task.status = TaskStatus::Available;
+            }
+        }
+
+        // The executions that have just reached a terminal phase, with the task each
+        // belongs to: a task stops being RUNNING when its current execution finishes.
+        let mut finished: Vec<(String, String)> = Vec::new();
+        for execution in self.task_executions.values_mut() {
+            execution.status = execution.phase_at(now);
+            if execution.launch_time.is_none() && now >= execution.schedule.launched_at {
+                execution.launch_time = Some(execution.schedule.launched_at);
+            }
+            if execution.status.is_terminal() {
+                if execution.end_time.is_none() {
+                    execution.end_time = Some(execution.schedule.finished_at);
+                }
+                finished.push((execution.task_arn.clone(), execution.arn.clone()));
+            }
+        }
+
+        for (task_arn, execution_arn) in finished {
+            if let Some(task) = self.tasks.get_mut(&task_arn) {
+                let is_current = task.current_task_execution_arn.as_deref() == Some(&execution_arn);
+                if is_current && task.status == TaskStatus::Running {
+                    task.status = TaskStatus::Available;
+                }
+            }
+        }
+    }
+
+    /// Tasks in creation order — the order `ListTasks` pages over.
+    pub fn tasks_in_creation_order(&self) -> Vec<&Task> {
+        let mut tasks: Vec<&Task> = self.tasks.values().collect();
+        tasks.sort_by_key(|task| task.seq);
+        tasks
+    }
+}
+
+/// An ARN in this service's `datasync` namespace, with the emulator's account id.
+fn emulator_arn(region: &str, resource: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, resource)
+}
+
+/// The region a request was signed for, from its SigV4 credential scope.
+///
+/// Falls back to [`DEFAULT_REGION`] for an unsigned request, and for a scope whose
+/// region segment could not appear in an ARN this service mints (the modelled ARN
+/// patterns allow `[a-z\-0-9]+` there).
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .filter(|region| {
+            !region.is_empty()
+                && region
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// A `SystemTime` as the modelled `Time` timestamp.
+pub fn as_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    let since_epoch = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
+}
+
+/// Whole milliseconds from `from` to `to`, or 0 when `to` precedes `from`.
+pub fn millis_between(from: SystemTime, to: SystemTime) -> i64 {
+    to.duration_since(from)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// The task options a `CreateTask` that declared none ends up with.
+///
+/// Every value is the default the Smithy model's own member documentation names:
+/// `OverwriteMode ALWAYS`, `Atime BEST_EFFORT`, `Mtime PRESERVE`, `Uid INT_VALUE`,
+/// `Gid INT_VALUE`, `PreserveDeletedFiles PRESERVE`, `PreserveDevices NONE`,
+/// `PosixPermissions PRESERVE`, `TaskQueueing ENABLED`, `TransferMode CHANGED`,
+/// `SecurityDescriptorCopyFlags OWNER_DACL`, `ObjectTags PRESERVE`,
+/// `ObjectMetadata PRESERVE`. `VerifyMode` is mode-dependent: the model documents
+/// `ONLY_FILES_TRANSFERRED` as "the default option for Enhanced mode tasks" and
+/// `POINT_IN_TIME_CONSISTENT` as "the default option for Basic mode tasks".
+/// `BytesPerSecond` is the no-limit sentinel the member's `range` admits (`min: -1`),
+/// and `LogLevel` is `OFF`, the value the model describes as publishing no logs —
+/// which is what a task with no `CloudWatchLogGroupArn` does.
+pub fn default_options(task_mode: &str) -> Options {
+    Options {
+        verify_mode: Some(
+            if task_mode == "ENHANCED" {
+                "ONLY_FILES_TRANSFERRED"
+            } else {
+                "POINT_IN_TIME_CONSISTENT"
+            }
+            .to_string(),
+        ),
+        overwrite_mode: Some("ALWAYS".to_string()),
+        atime: Some("BEST_EFFORT".to_string()),
+        mtime: Some("PRESERVE".to_string()),
+        uid: Some("INT_VALUE".to_string()),
+        gid: Some("INT_VALUE".to_string()),
+        preserve_deleted_files: Some("PRESERVE".to_string()),
+        preserve_devices: Some("NONE".to_string()),
+        posix_permissions: Some("PRESERVE".to_string()),
+        bytes_per_second: Some(-1),
+        task_queueing: Some("ENABLED".to_string()),
+        log_level: Some("OFF".to_string()),
+        transfer_mode: Some("CHANGED".to_string()),
+        security_descriptor_copy_flags: Some("OWNER_DACL".to_string()),
+        object_tags: Some("PRESERVE".to_string()),
+        object_metadata: Some("PRESERVE".to_string()),
+    }
+}
+
+/// `base` with every member the caller declared in `requested` replacing it.
+///
+/// Used twice, for the same reason the model documents once ("Each option has a
+/// default value… You also can override your task options for each task execution"):
+/// `CreateTask` overlays the request's `Options` on [`default_options`], and
+/// `StartTaskExecution` overlays `OverrideOptions` on the task's stored options.
+pub fn overlay_options(base: &Options, requested: Option<&Options>) -> Options {
+    let Some(requested) = requested else {
+        return base.clone();
+    };
+    Options {
+        verify_mode: requested
+            .verify_mode
+            .clone()
+            .or_else(|| base.verify_mode.clone()),
+        overwrite_mode: requested
+            .overwrite_mode
+            .clone()
+            .or_else(|| base.overwrite_mode.clone()),
+        atime: requested.atime.clone().or_else(|| base.atime.clone()),
+        mtime: requested.mtime.clone().or_else(|| base.mtime.clone()),
+        uid: requested.uid.clone().or_else(|| base.uid.clone()),
+        gid: requested.gid.clone().or_else(|| base.gid.clone()),
+        preserve_deleted_files: requested
+            .preserve_deleted_files
+            .clone()
+            .or_else(|| base.preserve_deleted_files.clone()),
+        preserve_devices: requested
+            .preserve_devices
+            .clone()
+            .or_else(|| base.preserve_devices.clone()),
+        posix_permissions: requested
+            .posix_permissions
+            .clone()
+            .or_else(|| base.posix_permissions.clone()),
+        bytes_per_second: requested.bytes_per_second.or(base.bytes_per_second),
+        task_queueing: requested
+            .task_queueing
+            .clone()
+            .or_else(|| base.task_queueing.clone()),
+        log_level: requested.log_level.clone().or_else(|| base.log_level.clone()),
+        transfer_mode: requested
+            .transfer_mode
+            .clone()
+            .or_else(|| base.transfer_mode.clone()),
+        security_descriptor_copy_flags: requested
+            .security_descriptor_copy_flags
+            .clone()
+            .or_else(|| base.security_descriptor_copy_flags.clone()),
+        object_tags: requested
+            .object_tags
+            .clone()
+            .or_else(|| base.object_tags.clone()),
+        object_metadata: requested
+            .object_metadata
+            .clone()
+            .or_else(|| base.object_metadata.clone()),
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

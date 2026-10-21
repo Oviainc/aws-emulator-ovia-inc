@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEnvironments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEnvironments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEnvironments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the stored environments as summaries, in name order, one page at a time:
+//! `maxResults` bounds the page, `nextToken` resumes the listing after the last item of
+//! the previous page, and `environmentTemplates` narrows the listing to the
+//! template/major-version pairs it names.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +150,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEnvironments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEnvironmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEnvironments"))
+        // A read. The only write is `settle_environments`, which materialises the
+        // deployment and deletion completions the CLOCK had already made due.
+        let _ = ctx;
+        // `maxResults` carries the modelled 1..100 range and `nextToken` the modelled
+        // pattern, both already refused by the centralized walk. A token that satisfies
+        // the pattern can still be one this service never minted, which is a bad request
+        // the model cannot express.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(after) => Some(after),
+                None => {
+                    return Err(ListEnvironmentsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "nextToken is not a token this service issued"
+                                .to_string(),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        let page_size = match input.max_results {
+            Some(max) => usize::try_from(max).unwrap_or(crate::state::DEFAULT_PAGE_SIZE),
+            None => crate::state::DEFAULT_PAGE_SIZE,
+        };
+        // An absent filter list, and an empty one, both select every environment; a
+        // filter entry selects the environments deployed from that template at that
+        // major version.
+        let filters = input.environment_templates.unwrap_or_default();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEnvironmentsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Proton store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.settle_environments(::std::time::SystemTime::now());
+
+        let selected = state
+            .environments
+            .iter()
+            .filter(|(name, _)| match resume_after.as_deref() {
+                Some(after) => name.as_str() > after,
+                None => true,
+            })
+            .map(|(_, record)| record)
+            .filter(|record| {
+                filters.is_empty()
+                    || filters.iter().any(|filter| {
+                        filter.template_name == record.template_name
+                            && filter.major_version == record.template_major_version
+                    })
+            });
+
+        // One item beyond the page tells the listing whether a further page exists,
+        // without walking the rest of the store.
+        let mut page: Vec<&crate::state::EnvironmentRecord> =
+            selected.take(page_size.saturating_add(1)).collect();
+        let next_token = if page.len() > page_size {
+            page.truncate(page_size);
+            page.last()
+                .map(|record| crate::state::encode_page_token(&record.name))
+        } else {
+            None
+        };
+
+        Ok(ListEnvironmentsOutput {
+            environments: page.iter().map(|record| record.summary()).collect(),
+            next_token,
+        })
     }
 }

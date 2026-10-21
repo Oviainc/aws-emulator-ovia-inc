@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `TaskArn` and stores the whole transfer-task configuration in
+//! [`crate::state`]. Both location ARNs must resolve to locations this service
+//! already holds; an unknown one is `InvalidRequestException` (HTTP 400). A new task
+//! starts in `CREATING` and becomes `AVAILABLE` once
+//! [`crate::state::TRANSITION_SPAN`] has elapsed.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +186,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTask"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateTaskErrorModeled::InternalException(InternalException {
+                message: Some(
+                    "the DataSync emulator could not reach its state store".to_string(),
+                ),
+                error_code: None,
+            })
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        // `TaskMode` documents `BASIC` as its default, and `VerifyMode`'s default
+        // depends on the mode, so the mode is resolved before the options are.
+        let task_mode = input.task_mode.clone().unwrap_or_else(|| "BASIC".to_string());
+        let options = crate::state::overlay_options(
+            &crate::state::default_options(&task_mode),
+            input.options.as_ref(),
+        );
+
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        for (member, arn) in [
+            ("SourceLocationArn", &input.source_location_arn),
+            ("DestinationLocationArn", &input.destination_location_arn),
+        ] {
+            if !store.locations.contains_key(arn) {
+                return Err(CreateTaskErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!("{member} {arn} is not found.")),
+                        error_code: None,
+                        datasync_error_code: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        let (task_arn, seq) = store.mint_task_arn(&region);
+        store.tasks.insert(
+            task_arn.clone(),
+            crate::state::Task {
+                arn: task_arn.clone(),
+                seq,
+                name: input.name,
+                status: crate::state::TaskStatus::Creating,
+                available_at: now + crate::state::TRANSITION_SPAN,
+                source_location_arn: input.source_location_arn,
+                destination_location_arn: input.destination_location_arn,
+                cloud_watch_log_group_arn: input.cloud_watch_log_group_arn,
+                options,
+                includes: input.includes.unwrap_or_default(),
+                excludes: input.excludes.unwrap_or_default(),
+                schedule: input.schedule,
+                manifest_config: input.manifest_config,
+                task_report_config: input.task_report_config,
+                task_mode,
+                tags: input.tags.unwrap_or_default(),
+                creation_time: now,
+                current_task_execution_arn: None,
+                execution_arns: Vec::new(),
+            },
+        );
+        drop(store);
+
+        Ok(CreateTaskOutput {
+            task_arn: Some(task_arn),
+        })
     }
 }
