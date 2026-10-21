@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchImportFindings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchImportFindings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchImportFindings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores each accepted finding in [`crate::state`], keyed by the hub it belongs to
+//! plus the modelled `AwsSecurityFindingIdentifier` (`ProductArn` + `Id`), so a
+//! re-import of the same identifier UPDATES the stored record instead of creating a
+//! duplicate. `SuccessCount` / `FailedCount` are counted from what was stored, and a
+//! finding refused for violating one of the `AwsSecurityFinding` shape's documented
+//! constraints is reported in `FailedFindings` with the member and constraint it
+//! broke.
 //!
 //! ## Shape of an operation
 //!
@@ -149,6 +147,107 @@ impl<Eng> BatchImportFindings<Eng> {
     }
 }
 
+/// The `ImportFindingsError.ErrorCode` for a finding that violates one of the
+/// `AwsSecurityFinding` shape's documented constraints.
+pub const IMPORT_ERROR_INVALID_INPUT: &str = "InvalidInput";
+
+/// `AwsSecurityFinding$Id`: "Minimum length of 1. Maximum length of 512."
+const MAX_ID_LEN: usize = 512;
+/// `AwsSecurityFinding$Title`: "Minimum length of 1. Maximum length of 256."
+const MAX_TITLE_LEN: usize = 256;
+/// `AwsSecurityFinding$Description`: "Minimum length of 1. Maximum length of 1024."
+const MAX_DESCRIPTION_LEN: usize = 1024;
+/// `AwsSecurityFinding$AwsAccountId`: "Length Constraints: 12."
+const AWS_ACCOUNT_ID_LEN: usize = 12;
+/// `AwsSecurityFinding$Resources`: "Minimum number of 1 item. Maximum number of 32
+/// items."
+const MAX_RESOURCES: usize = 32;
+/// `AwsSecurityFinding$Types`: "Array Members: Maximum number of 50 items."
+const MAX_TYPES: usize = 50;
+/// `AwsSecurityFinding$ProductFields` / `$UserDefinedFields`: "Can contain up to 50
+/// key-value pairs."
+const MAX_FIELD_MAP_ENTRIES: usize = 50;
+
+/// Why this finding cannot be stored, naming the member and the constraint it
+/// violates, or `None` when it satisfies every one of them.
+///
+/// Each rule is a length / count / format constraint the `AwsSecurityFinding` shape
+/// documents but the Smithy model does not express as a trait, so the framework's
+/// boundary validation cannot refuse it: the operation reports it per finding in
+/// `FailedFindings` rather than failing the whole batch.
+fn rejection_reason(finding: &AwsSecurityFinding) -> Option<String> {
+    if finding.schema_version != crate::state::FINDING_SCHEMA_VERSION {
+        return Some(format!(
+            "SchemaVersion must be {}, got {}",
+            crate::state::FINDING_SCHEMA_VERSION, finding.schema_version
+        ));
+    }
+    if finding.id.len() > MAX_ID_LEN {
+        return Some(format!(
+            "Id must be at most {MAX_ID_LEN} characters, got {}",
+            finding.id.len()
+        ));
+    }
+    if finding.title.len() > MAX_TITLE_LEN {
+        return Some(format!(
+            "Title must be at most {MAX_TITLE_LEN} characters, got {}",
+            finding.title.len()
+        ));
+    }
+    if finding.description.len() > MAX_DESCRIPTION_LEN {
+        return Some(format!(
+            "Description must be at most {MAX_DESCRIPTION_LEN} characters, got {}",
+            finding.description.len()
+        ));
+    }
+    if finding.aws_account_id.len() != AWS_ACCOUNT_ID_LEN {
+        return Some(format!(
+            "AwsAccountId must be exactly {AWS_ACCOUNT_ID_LEN} characters, got {}",
+            finding.aws_account_id.len()
+        ));
+    }
+    if finding.resources.is_empty() || finding.resources.len() > MAX_RESOURCES {
+        return Some(format!(
+            "Resources must contain between 1 and {MAX_RESOURCES} items, got {}",
+            finding.resources.len()
+        ));
+    }
+    if let Some(types) = finding.types.as_ref() {
+        if types.len() > MAX_TYPES {
+            return Some(format!(
+                "Types must contain at most {MAX_TYPES} items, got {}",
+                types.len()
+            ));
+        }
+    }
+    for (member, map) in [
+        ("ProductFields", finding.product_fields.as_ref()),
+        ("UserDefinedFields", finding.user_defined_fields.as_ref()),
+    ] {
+        if let Some(map) = map {
+            if map.len() > MAX_FIELD_MAP_ENTRIES {
+                return Some(format!(
+                    "{member} must contain at most {MAX_FIELD_MAP_ENTRIES} key-value pairs, got {}",
+                    map.len()
+                ));
+            }
+        }
+    }
+    for (member, value) in [
+        ("CreatedAt", Some(finding.created_at.as_str())),
+        ("UpdatedAt", Some(finding.updated_at.as_str())),
+        ("FirstObservedAt", finding.first_observed_at.as_deref()),
+        ("LastObservedAt", finding.last_observed_at.as_deref()),
+    ] {
+        if let Some(value) = value {
+            if crate::state::parse_iso8601_nanos(value).is_none() {
+                return Some(format!("{member} must be an ISO-8601 timestamp, got {value}"));
+            }
+        }
+    }
+    None
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for BatchImportFindings<Eng>
 {
@@ -166,18 +265,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchImportFindings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchImportFindingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchImportFindings"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchImportFindingsError::Modeled(BatchImportFindingsErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the Security Hub CSPM state store is unavailable".to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+
+        let (account_id, region) = crate::state::hub_key(ctx);
+        let mut store = state.lock();
+        if !store.hubs.contains_key(&(account_id.clone(), region.clone())) {
+            return Err(BatchImportFindingsErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(format!(
+                        "Account {account_id} is not subscribed to Security Hub CSPM in Region {region}"
+                    )),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // One instant for the whole batch: every finding in it was received together.
+        let received_at = crate::state::now_iso8601();
+        let mut success_count: i32 = 0;
+        let mut failed_findings: Vec<ImportFindingsError> = Vec::new();
+
+        for mut finding in input.findings {
+            if let Some(reason) = rejection_reason(&finding) {
+                failed_findings.push(ImportFindingsError {
+                    id: finding.id.clone(),
+                    error_code: IMPORT_ERROR_INVALID_INPUT.to_string(),
+                    error_message: reason,
+                });
+                continue;
+            }
+
+            let key = crate::state::FindingKey {
+                account_id: account_id.clone(),
+                region: region.clone(),
+                product_arn: finding.product_arn.clone(),
+                finding_id: finding.id.clone(),
+            };
+
+            // `Region` and `ProcessedAt` are service-populated: "Security Hub CSPM
+            // populates this attribute automatically for each finding. You cannot
+            // update it using BatchImportFindings or BatchUpdateFindings"
+            // (`AwsSecurityFinding$Region`), and `ProcessedAt` is "when Security Hub
+            // CSPM received a finding and begins to process it".
+            finding.region = Some(region.clone());
+            finding.processed_at = Some(received_at.clone());
+            if let Some(severity) = finding.severity.as_mut() {
+                crate::state::complete_severity(severity);
+            }
+
+            let seq = store.next_write_seq();
+            match store.findings.get_mut(&key) {
+                // Re-importing an identifier updates the stored finding in place.
+                Some(existing) => {
+                    existing.finding = finding;
+                    existing.updated_seq = seq;
+                }
+                None => {
+                    store.findings.insert(
+                        key,
+                        crate::state::StoredFinding {
+                            finding,
+                            imported_seq: seq,
+                            updated_seq: seq,
+                        },
+                    );
+                }
+            }
+            success_count += 1;
+        }
+
+        Ok(BatchImportFindingsOutput {
+            failed_count: i32::try_from(failed_findings.len()).unwrap_or(i32::MAX),
+            success_count,
+            failed_findings: Some(failed_findings),
+        })
     }
 }
