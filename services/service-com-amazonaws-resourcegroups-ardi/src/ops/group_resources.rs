@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GroupResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GroupResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GroupResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records each ARN in `ResourceArns` as a static member of the group `Group` names, in
+//! [`crate::state`], and reports the memberships that now hold in `Succeeded`. Adding an
+//! ARN that is already a member is a no-op, so a repeated call does not duplicate it.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +161,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GroupResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GroupResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GroupResources"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` is deliberately unreachable here and a success says
+        // nothing about the caller's permissions.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GroupResourcesErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the resource-groups store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // Every member must be an ARN: the modelled `ResourceArn` is
+        // `arn:<partition>:<service>:<region>:<account>:<resource>`, and a string
+        // that is not one names no resource to add.
+        if let Some(not_an_arn) = input
+            .resource_arns
+            .iter()
+            .find(|arn| !crate::state::is_resource_arn(arn))
+        {
+            return Err(GroupResourcesErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "ResourceArns contains {not_an_arn}, which is not a resource ARN"
+                )),
+            })
+            .into());
+        }
+
+        let mut store = state.lock();
+        let not_found = || {
+            GroupResourcesError::from(GroupResourcesErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "no group found with the identifier {}",
+                        input.group,
+                    )),
+                },
+            ))
+        };
+        // `Group` is the only identifier this operation models, and it carries
+        // either a bare group name or a group ARN; `lookup` resolves both.
+        let name = store.lookup(input.group.as_str()).ok_or_else(not_found)?;
+        let group = store.groups.get_mut(&name).ok_or_else(not_found)?;
+        // The emulator's own ceiling on stored state (see `MAX_MEMBERS_PER_GROUP`),
+        // so a client looping on this operation is refused instead of growing one
+        // group's membership without end.
+        let incoming = input
+            .resource_arns
+            .iter()
+            .filter(|arn| {
+                !group
+                    .members
+                    .iter()
+                    .any(|member| &&member.resource_arn == arn)
+            })
+            .count();
+        if group.members.len() + incoming > crate::state::MAX_MEMBERS_PER_GROUP {
+            return Err(GroupResourcesErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "this emulator holds at most {} resources per group; ungroup some \
+                     before adding more",
+                    crate::state::MAX_MEMBERS_PER_GROUP,
+                )),
+            })
+            .into());
+        }
+        for arn in &input.resource_arns {
+            group.add_member(arn);
+        }
+        // Reported from the memberships the group now holds, not from the request:
+        // an ARN appears in `Succeeded` because it IS a member.
+        let succeeded: Vec<String> = group
+            .members
+            .iter()
+            .filter(|member| input.resource_arns.contains(&member.resource_arn))
+            .map(|member| member.resource_arn.clone())
+            .collect();
+        Ok(GroupResourcesOutput {
+            succeeded: Some(succeeded),
+            // Nothing was refused, and a static membership this emulator accepts is
+            // immediate — so neither list has an entry.
+            failed: Some(Vec::new()),
+            pending: Some(Vec::new()),
+        })
     }
 }
