@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartEarthObservationJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartEarthObservationJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartEarthObservationJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an Earth Observation job: a stored record, keyed by a newly minted ARN,
+//! opening in `INITIALIZING`. Every member of the response is read back out of that
+//! record, and a repeated call carrying the same `ClientToken` returns the job the
+//! first call minted rather than a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -106,6 +101,36 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Refuse the request with this operation's own modelled `ValidationException`
+/// (HTTP 400), for a rule the model cannot express.
+fn validation(message: &str) -> StartEarthObservationJobError {
+    StartEarthObservationJobErrorModeled::ValidationException(ValidationException {
+        message: message.to_string(),
+        resource_id: None,
+    })
+    .into()
+}
+
+/// This operation's response, every member read back out of the stored record.
+fn output_for(
+    store: &crate::state::ComAmazonawsSagemakergeospatialSagemakergeospatialState,
+    job: &crate::state::EarthObservationJob,
+    now: ::std::time::Instant,
+) -> StartEarthObservationJobOutput {
+    StartEarthObservationJobOutput {
+        name: job.name.clone(),
+        arn: job.arn.clone(),
+        creation_time: job.creation_time,
+        duration_in_seconds: job.duration_in_seconds(now),
+        status: job.status.clone(),
+        kms_key_id: job.kms_key_id.clone(),
+        input_config: Some(store.input_config_output(job)),
+        job_config: job.job_config.clone(),
+        execution_role_arn: job.execution_role_arn.clone(),
+        tags: job.tags_for_output(),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -180,18 +205,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartEarthObservationJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartEarthObservationJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartEarthObservationJob"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartEarthObservationJobError::from(
+                StartEarthObservationJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the sagemaker-geospatial store is unavailable".to_string(),
+                        resource_id: None,
+                    },
+                ),
+            )
+        })?;
+
+        // `InputConfigInput` carries two alternative sources and the model marks
+        // neither required, but a job has exactly one input: either it chains on a
+        // previous job or it queries a raster data collection.
+        let previous_arn = input.input_config.previous_earth_observation_job_arn.clone();
+        let has_query = input.input_config.raster_data_collection_query.is_some();
+        match (&previous_arn, has_query) {
+            (None, false) => {
+                return Err(validation(
+                    "InputConfig must set exactly one of PreviousEarthObservationJobArn or \
+                     RasterDataCollectionQuery",
+                ))
+            }
+            (Some(_), true) => {
+                return Err(validation(
+                    "InputConfig must not set both PreviousEarthObservationJobArn and \
+                     RasterDataCollectionQuery",
+                ))
+            }
+            _ => {}
+        }
+
+        // The same bound `TagResource` applies: AWS's tagging restrictions put the
+        // maximum number of tags per resource at 50, and this model declares no
+        // constraint on the map.
+        if input
+            .tags
+            .as_ref()
+            .is_some_and(|tags| tags.len() > crate::state::MAX_TAGS_PER_RESOURCE)
+        {
+            return Err(validation(&format!(
+                "A resource carries at most {} tags",
+                crate::state::MAX_TAGS_PER_RESOURCE
+            )));
+        }
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // Idempotency: the first call carrying this token minted a job, so this one
+        // reports that job instead of minting a second. Only that job's clock-owed
+        // transitions are materialised — this call touches no other record.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(arn) = store.idempotency.get(token).cloned() {
+                if store.materialize_job(&arn, now) {
+                    let job = store
+                        .earth_observation_jobs
+                        .get(&arn)
+                        .expect("the record this token resolves to");
+                    return Ok(output_for(&store, job, now));
+                }
+            }
+        }
+
+        // A job chained on a previous one can only start when that job is held here.
+        if let Some(previous) = previous_arn.as_deref() {
+            if !store.earth_observation_jobs.contains_key(previous) {
+                return Err(
+                    StartEarthObservationJobErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: format!(
+                                "No Earth Observation job exists with the ARN {previous}"
+                            ),
+                            resource_id: Some(previous.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The store is bounded: a caller cannot grow this process's memory without
+        // limit by looping this call. Past the bound the service's own quota error
+        // is the answer.
+        if store.is_full() {
+            return Err(
+                StartEarthObservationJobErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "This emulator holds the maximum of {} Earth Observation jobs; \
+                             delete one before starting another",
+                            crate::state::MAX_EARTH_OBSERVATION_JOBS
+                        ),
+                        resource_id: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx);
+        let arn = store.mint_earth_observation_job_arn(&region);
+        let client_token = input.client_token.clone();
+        let job = crate::state::EarthObservationJob::new(arn.clone(), input, now);
+        store.earth_observation_jobs.insert(arn.clone(), job);
+        if let Some(token) = client_token {
+            store.idempotency.insert(token, arn.clone());
+        }
+
+        let job = store
+            .earth_observation_jobs
+            .get(&arn)
+            .expect("the record inserted under this ARN a moment ago");
+        Ok(output_for(&store, job, now))
     }
 }
