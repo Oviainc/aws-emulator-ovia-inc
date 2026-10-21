@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCommonControls
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCommonControls`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCommonControls::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the catalog's common controls, a page at a time, out of this service's
+//! state (`crate::state`), optionally narrowed to one objective — each common control
+//! carrying the stored objective and domain it belongs to.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +76,39 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page `ListCommonControls` returns, and the page size a request that
+/// sends no `MaxResults` gets: the maximum of the modeled
+/// `MaxListCommonControlsResults` range (1..100).
+const MAX_LIST_COMMON_CONTROLS_RESULTS: i32 = 100;
+
+/// Project a stored common control into the modeled `CommonControlSummary`, resolving
+/// its domain and objective out of the same catalog ListDomains and ListObjectives
+/// report.
+fn common_control_summary(
+    common_control: &crate::state::CommonControl,
+    state: &crate::state::ComAmazonawsControlcatalogControlcatalogState,
+) -> CommonControlSummary {
+    let domain = state.domains.get(&common_control.domain_arn);
+    let objective = state.objectives.get(&common_control.objective_arn);
+    CommonControlSummary {
+        arn: common_control.arn.clone(),
+        name: common_control.name.clone(),
+        description: common_control.description.clone(),
+        domain: AssociatedDomainSummary {
+            arn: Some(common_control.domain_arn.clone()),
+            name: domain.map(|domain| domain.name.clone()),
+        },
+        objective: AssociatedObjectiveSummary {
+            arn: Some(common_control.objective_arn.clone()),
+            name: objective.map(|objective| objective.name.clone()),
+        },
+        create_time: ::aws_smithy_types::DateTime::from_secs(common_control.create_time),
+        last_update_time: ::aws_smithy_types::DateTime::from_secs(
+            common_control.last_update_time,
+        ),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -153,18 +180,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCommonControls` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCommonControlsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCommonControls"))
+        // `ctx` carries request metadata only; this operation reads none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListCommonControlsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Control Catalog store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // `CommonControlFilter.Objectives` is modeled as a list —
+        // `ObjectiveResourceFilterList` carries no `@length`, so the boundary validator
+        // admits several entries — but its documentation is explicit that it carries
+        // one objective ARN at a time and that passing several is not supported, which
+        // is the constraint enforced here. An entry without an ARN names no objective
+        // to filter on.
+        let mut objective_filter: Option<String> = None;
+        if let Some(filter) = input.common_control_filter.as_ref() {
+            if let Some(objectives) = filter.objectives.as_ref() {
+                if objectives.len() > 1 {
+                    return Err(ListCommonControlsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "commonControlFilter.objectives accepts one objective ARN at \
+                                 a time; {} were supplied",
+                                objectives.len()
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                if let Some(entry) = objectives.first() {
+                    let Some(arn) = entry.arn.as_ref() else {
+                        return Err(ListCommonControlsErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(
+                                    "commonControlFilter.objectives[0].arn must be set"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into());
+                    };
+                    objective_filter = Some(arn.clone());
+                }
+            }
+        }
+
+        let fingerprint = crate::state::filter_fingerprint(&[(
+            "objectives",
+            objective_filter.clone().into_iter().collect(),
+        )]);
+        let page = crate::state::page(
+            "common-controls",
+            &fingerprint,
+            state
+                .common_controls
+                .iter()
+                .filter(|(_, common_control)| {
+                    objective_filter
+                        .as_deref()
+                        .is_none_or(|arn| common_control.objective_arn == arn)
+                })
+                .map(|(arn, common_control)| {
+                    (arn.clone(), common_control_summary(common_control, &state))
+                }),
+            input.next_token.as_deref(),
+            input.max_results,
+            MAX_LIST_COMMON_CONTROLS_RESULTS,
+        )
+        .map_err(|error| {
+            ListCommonControlsErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::page_refusal("ListCommonControls", error)),
+            })
+        })?;
+
+        Ok(ListCommonControlsOutput {
+            common_controls: page.items,
+            next_token: page.next_token,
+        })
     }
 }
