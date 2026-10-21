@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSecretValue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSecretValue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSecretValue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns a stored secret version's value. The version is named by `VersionId`,
+//! or by `VersionStage` (`AWSCURRENT` when the caller names neither). A read: it
+//! does not change what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -198,20 +192,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSecretValue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSecretValueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSecretValue"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        // The only write a read performs: dropping secrets whose recovery window
+        // has already elapsed, which the clock made due whether or not anybody
+        // called.
+        store.expire_due(::std::time::SystemTime::now());
+
+        let Some(secret) = store.get(&input.secret_id) else {
+            return Err(no_such_secret(&input.secret_id));
+        };
+        // "If a secret is scheduled for deletion, then its details, including the
+        // encrypted secret value, is not accessible."
+        if secret.scheduled_for_deletion() {
+            return Err(GetSecretValueErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "You can't perform this operation on the secret because it was marked \
+                         for deletion."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let stage = input.version_stage.as_deref();
+        let version = match input.version_id.as_deref() {
+            // A `VersionId` names the version outright; a `VersionStage` given
+            // alongside it has to agree with the labels that version carries.
+            Some(version_id) => secret
+                .version(version_id)
+                .filter(|version| stage.is_none_or(|stage| version.has_stage(stage))),
+            // "If you don't specify either a VersionStage or VersionId, Secrets
+            // Manager returns the AWSCURRENT version."
+            None => secret.version_with_stage(stage.unwrap_or(crate::state::STAGE_CURRENT)),
+        };
+        let Some(version) = version else {
+            return Err(GetSecretValueErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(match (input.version_id.as_deref(), stage) {
+                        (Some(version_id), _) => format!(
+                            "Secrets Manager can't find the specified secret version: {version_id}"
+                        ),
+                        (None, stage) => format!(
+                            "Secrets Manager can't find the specified secret value for staging \
+                             label: {}",
+                            stage.unwrap_or(crate::state::STAGE_CURRENT)
+                        ),
+                    }),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetSecretValueOutput {
+            arn: Some(secret.arn.clone()),
+            name: Some(secret.name.clone()),
+            version_id: Some(version.version_id.clone()),
+            secret_binary: version.secret_binary.clone(),
+            secret_string: version.secret_string.clone(),
+            version_stages: version.stages_out(),
+            created_date: Some(crate::state::timestamp(version.created_date)),
+        })
     }
+}
+
+/// `ResourceNotFoundException` for a `SecretId` that names no stored secret.
+fn no_such_secret(secret_id: &str) -> GetSecretValueError {
+    GetSecretValueErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "Secrets Manager can't find the specified secret: {secret_id}"
+        )),
+    })
+    .into()
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> GetSecretValueError {
+    GetSecretValueErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }
