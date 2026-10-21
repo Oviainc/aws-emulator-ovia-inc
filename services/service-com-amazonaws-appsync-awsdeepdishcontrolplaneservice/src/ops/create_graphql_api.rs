@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGraphqlApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGraphqlApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGraphqlApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: creates a `GraphqlApi`, mints its `apiId`, and persists it in
+//! [`crate::state`]; `GetGraphqlApi` / `ListGraphqlApis` project the same record.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +187,189 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGraphqlApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGraphqlApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGraphqlApi"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateGraphqlApiErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `CreateGraphqlApiRequest$name` targets a plain string, so the boundary
+        // validator never applies `GraphqlApi$name`'s own `length`/`pattern`
+        // constraints — but that is the shape every later read answers with, so a
+        // name it cannot hold is refused here instead of being stored.
+        if !is_resource_name(&input.name) {
+            return Err(CreateGraphqlApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "name must be 1-{RESOURCE_NAME_MAX_LEN} characters matching \
+                     {RESOURCE_NAME_RULE}, got \"{}\"",
+                    input.name
+                )),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // `ownerContact` "accepts any string input with a length of 0 - 256
+        // characters" (its own member documentation), a bound the plain `String`
+        // target leaves to the service.
+        if input
+            .owner_contact
+            .as_deref()
+            .is_some_and(|contact| contact.chars().count() > OWNER_CONTACT_MAX_LEN)
+        {
+            return Err(CreateGraphqlApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "ownerContact accepts 0-{OWNER_CONTACT_MAX_LEN} characters"
+                )),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        let region = request_region(ctx);
+        let mut guard = state.lock();
+
+        // The store is bounded, so a repeated create cannot grow it without limit:
+        // AppSync's quota is 25 GraphQL APIs per account per Region, and
+        // `ApiLimitExceededException` ("The GraphQL API exceeded a limit") is the
+        // modelled refusal for a create past it. This emulator serves one Region's
+        // worth of state, so the cap applies to the whole store.
+        if guard.graphql_apis.len() >= APIS_PER_REGION {
+            return Err(CreateGraphqlApiErrorModeled::ApiLimitExceededException(
+                ApiLimitExceededException {
+                    message: Some(format!(
+                        "an account may hold at most {APIS_PER_REGION} GraphQL APIs in a Region"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Mint an id that is not already taken. The id is drawn from the state's own
+        // counter, so it is new on every call even for an identical request.
+        let mut api_id = guard.mint_id();
+        while guard.graphql_apis.contains_key(&api_id) {
+            api_id = guard.mint_id();
+        }
+        let seq = guard.next_seq();
+
+        let record = crate::state::GraphqlApiRecord {
+            seq,
+            arn: ::engine::emulator_arn(ARN_SERVICE, &region, &format!("apis/{api_id}")),
+            uris: api_uris(&api_id, &region),
+            api_id: api_id.clone(),
+            name: input.name,
+            authentication_type: input.authentication_type,
+            // The model documents the value each of these three takes when the
+            // request omits it.
+            api_type: input
+                .api_type
+                .unwrap_or_else(|| DEFAULT_API_TYPE.to_string()),
+            visibility: input
+                .visibility
+                .unwrap_or_else(|| DEFAULT_VISIBILITY.to_string()),
+            introspection_config: input
+                .introspection_config
+                .unwrap_or_else(|| DEFAULT_INTROSPECTION_CONFIG.to_string()),
+            owner: ::engine::emulator_account_id().to_string(),
+            owner_contact: input.owner_contact,
+            xray_enabled: input.xray_enabled,
+            query_depth_limit: input.query_depth_limit,
+            resolver_count_limit: input.resolver_count_limit,
+            merged_api_execution_role_arn: input.merged_api_execution_role_arn,
+            log_config: input.log_config,
+            user_pool_config: input.user_pool_config,
+            open_id_connect_config: input.open_id_connect_config,
+            lambda_authorizer_config: input.lambda_authorizer_config,
+            additional_authentication_providers: input
+                .additional_authentication_providers
+                .unwrap_or_default(),
+            enhanced_metrics_config: input.enhanced_metrics_config,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at: std::time::SystemTime::now(),
+            api_keys: std::collections::BTreeMap::new(),
+        };
+
+        guard.graphql_apis.insert(api_id.clone(), record);
+
+        // Answer from the STORED record, so this body is the one `GetGraphqlApi` and
+        // `ListGraphqlApis` answer with later.
+        let graphql_api = guard
+            .graphql_apis
+            .get(&api_id)
+            .map(crate::state::GraphqlApiRecord::to_graphql_api);
+
+        Ok(CreateGraphqlApiOutput { graphql_api })
     }
+}
+
+/// The ARN namespace (and endpoint prefix) this service's resources carry.
+const ARN_SERVICE: &str = "appsync";
+
+/// `GraphqlApi$name`'s modelled pattern, quoted in a refusal so the caller can fix the
+/// request from the message alone.
+const RESOURCE_NAME_RULE: &str = "^[_A-Za-z][_0-9A-Za-z]*$";
+
+/// `GraphqlApi$name`'s modelled maximum length.
+const RESOURCE_NAME_MAX_LEN: usize = 65_536;
+
+/// `ownerContact`'s documented maximum length: "This field accepts any string input
+/// with a length of 0 - 256 characters."
+const OWNER_CONTACT_MAX_LEN: usize = 256;
+
+/// The AppSync service quota for GraphQL APIs an account holds in one Region, which
+/// `ApiLimitExceededException` reports. It is also what bounds this service's store.
+const APIS_PER_REGION: usize = 25;
+
+/// The model's documented value for `apiType` when the request omits it.
+const DEFAULT_API_TYPE: &str = "GRAPHQL";
+
+/// The model's documented value for `visibility` when the request omits it.
+const DEFAULT_VISIBILITY: &str = "GLOBAL";
+
+/// The model's documented value for `introspectionConfig` when the request omits it.
+const DEFAULT_INTROSPECTION_CONFIG: &str = "ENABLED";
+
+/// Whether `name` satisfies `GraphqlApi$name`'s modelled `length` (1..65536) and
+/// `pattern` (`^[_A-Za-z][_0-9A-Za-z]*$`).
+///
+/// Hand-written rather than taken from a regex crate because the pattern is a
+/// two-class character test, not a general expression: a leading ASCII letter or
+/// underscore, then letters, digits or underscores.
+fn is_resource_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if name.chars().count() > RESOURCE_NAME_MAX_LEN {
+        return false;
+    }
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The endpoints AppSync publishes for a GraphQL API, keyed as it keys them.
+fn api_uris(api_id: &str, region: &str) -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([
+        (
+            "GRAPHQL".to_string(),
+            format!("https://{api_id}.appsync-api.{region}.amazonaws.com/graphql"),
+        ),
+        (
+            "REALTIME".to_string(),
+            format!("wss://{api_id}.appsync-realtime-api.{region}.amazonaws.com/graphql"),
+        ),
+    ])
+}
+
+/// The region the caller addressed, read from the request's SigV4 credential scope.
+///
+/// Falls back to the emulator's default region for an unsigned request, which carries
+/// no scope to read.
+fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map_or_else(|| "us-east-1".to_string(), |scope| scope.region)
 }
