@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEmailIdentity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEmailIdentity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEmailIdentity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Verifies (registers) an email identity: inserts one record per `EmailIdentity` into
+//! [`crate::state`], classifies the identity from its own form, and answers from the
+//! record it persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +158,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEmailIdentity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEmailIdentityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEmailIdentity"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateEmailIdentityErrorModeled::ConcurrentModificationException(
+                ConcurrentModificationException {
+                    message: Some(crate::state::STATE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `Identity` carries no length constraint, so the boundary validator accepts an
+        // empty string; an identity has to name something.
+        if input.email_identity.is_empty() {
+            return Err(CreateEmailIdentityErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some("EmailIdentity must not be empty".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // The store holds a bounded number of identities (see `MAX_EMAIL_IDENTITIES`), so
+        // a create that would grow it past the cap is refused rather than served.
+        if !store.identities.contains_key(&input.email_identity)
+            && store.identities.len() >= crate::state::MAX_EMAIL_IDENTITIES
+        {
+            return Err(CreateEmailIdentityErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} email identities",
+                        crate::state::MAX_EMAIL_IDENTITIES
+                    )),
+                },
+            )
+            .into());
+        }
+        // One record per identity: verifying an identity that already exists keeps the
+        // single record (so it is still listed once) rather than replacing it, which would
+        // throw away the DKIM tokens the customer has already put in DNS.
+        let now = ::std::time::SystemTime::now();
+        let record = store
+            .identities
+            .entry(input.email_identity.clone())
+            .or_insert_with(|| {
+                crate::state::EmailIdentityRecord::new(&input.email_identity, now)
+            });
+        // A repeat create reports the record as it stands now, including a verification
+        // the clock made due since the first call.
+        record.materialize_due_verification(now);
+        if let Some(tags) = input.tags {
+            record.tags = tags;
+        }
+
+        Ok(CreateEmailIdentityOutput {
+            identity_type: Some(record.identity_type.clone()),
+            verified_for_sending_status: record.verified_for_sending,
+            dkim_attributes: record.dkim.clone(),
+        })
     }
 }

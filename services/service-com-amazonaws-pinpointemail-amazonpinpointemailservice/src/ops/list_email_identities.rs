@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEmailIdentities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEmailIdentities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEmailIdentities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the email identities stored in [`crate::state`], in the store's own key
+//! order, honouring `PageSize` and the opaque `NextToken` this handler mints. Reporting:
+//! the only state it writes is the identity verification the clock had already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +74,73 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The bounds `PageSize` documents: "The value you specify has to be at least 0, and can
+/// be no more than 1000" (`ListEmailIdentitiesRequest$PageSize`). The model declares no
+/// `@range`, so the boundary validator passes any integer and the handler enforces it.
+const PAGE_SIZE_MIN: i32 = 0;
+/// See [`PAGE_SIZE_MIN`].
+const PAGE_SIZE_MAX: i32 = 1000;
+/// The page size applied when the request names none — the documented maximum, so one
+/// request's response stays bounded however large the store is.
+const PAGE_SIZE_DEFAULT: usize = PAGE_SIZE_MAX as usize;
+
+/// Where a page starts: at the beginning of the list, or just after one identity.
+///
+/// A token names the LAST identity the previous page returned rather than an index, so a
+/// page boundary still means the same thing when identities are created or deleted
+/// between two calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Position {
+    Start,
+    After(String),
+}
+
+/// The token's byte prefix for [`Position::After`] — the rest of the payload is the key.
+const POSITION_AFTER: u8 = b'A';
+/// The token's byte prefix for [`Position::Start`], which carries no key.
+const POSITION_START: u8 = b'S';
+
+/// Render a position as an opaque `NextToken`.
+///
+/// `NextToken` is documented only as a token to pass back, so its encoding is the
+/// service's business: hex keeps the payload opaque to a client and safe to carry in a
+/// query string, and keeps the token a pure function of the position, so the same
+/// position always yields the same token.
+fn encode_token(position: &Position) -> String {
+    let mut payload = Vec::new();
+    match position {
+        Position::Start => payload.push(POSITION_START),
+        Position::After(key) => {
+            payload.push(POSITION_AFTER);
+            payload.extend_from_slice(key.as_bytes());
+        }
+    }
+    hex::encode(payload)
+}
+
+/// Read back a position from a token, or refuse a value no token of this shape encodes.
+///
+/// The check is on the token's shape, not on the key inside it: a position names where to
+/// resume from, and the identity it names may well have been deleted between two calls —
+/// which is exactly the case paging has to keep working through.
+fn decode_token(token: &str) -> Result<Position, ListEmailIdentitiesError> {
+    let refuse = || {
+        ListEmailIdentitiesError::from(ListEmailIdentitiesErrorModeled::BadRequestException(
+            BadRequestException {
+                message: Some("NextToken is not a token returned by ListEmailIdentities".to_string()),
+            },
+        ))
+    };
+    let payload = hex::decode(token).map_err(|_| refuse())?;
+    match payload.split_first() {
+        Some((&POSITION_START, [])) => Ok(Position::Start),
+        Some((&POSITION_AFTER, rest)) => String::from_utf8(rest.to_vec())
+            .map(Position::After)
+            .map_err(|_| refuse()),
+        _ => Err(refuse()),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -149,18 +210,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEmailIdentities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEmailIdentitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEmailIdentities"))
+        let _ = ctx;
+        // This operation models no server fault, and the condition is unreachable in a
+        // router-built emulator (its engine always carries this store), so the request is
+        // refused rather than answered with an empty list that would read as "no
+        // identities exist".
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEmailIdentitiesErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::STATE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        let page_size = match input.page_size {
+            // No `PageSize` means the server picks one. It picks the documented maximum,
+            // so a request that names no page size still cannot ask for a response
+            // proportional to the whole store: the rest is reached through `NextToken`.
+            None => PAGE_SIZE_DEFAULT,
+            Some(size) if (PAGE_SIZE_MIN..=PAGE_SIZE_MAX).contains(&size) => {
+                usize::try_from(size).unwrap_or(0)
+            }
+            Some(size) => {
+                return Err(ListEmailIdentitiesErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!(
+                            "PageSize has to be at least {PAGE_SIZE_MIN} and no more than \
+                             {PAGE_SIZE_MAX}, but was {size}"
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let position = match input.next_token.as_deref() {
+            None => Position::Start,
+            Some(token) => decode_token(token)?,
+        };
+
+        let mut store = state.lock();
+        // The only write a read makes: the verifications these identities were already
+        // owed, applied before the page is read so a listed identity reports the same
+        // state `GetEmailIdentity` would.
+        store.materialize_due_verifications(::std::time::SystemTime::now());
+
+        let remaining: Box<dyn Iterator<Item = (&String, &crate::state::EmailIdentityRecord)>> =
+            match &position {
+                Position::Start => Box::new(store.identities.iter()),
+                Position::After(key) => Box::new(store.identities.range::<String, _>((
+                    ::std::ops::Bound::Excluded(key),
+                    ::std::ops::Bound::Unbounded,
+                ))),
+            };
+
+        // One identity more than the page is taken, to learn whether a further page
+        // exists at all.
+        let mut taken: Vec<(&String, &crate::state::EmailIdentityRecord)> =
+            remaining.take(page_size.saturating_add(1)).collect();
+        let overflows = taken.len() > page_size;
+        if overflows {
+            taken.pop();
+        }
+        // A page that returned nothing carries no token: it cannot name a position to
+        // resume from, and a client looping on the token has to be able to stop.
+        let more = overflows && !taken.is_empty();
+
+        let next_position = match taken.last() {
+            Some((key, _)) => Position::After((*key).clone()),
+            None => position,
+        };
+        let email_identities = taken
+            .into_iter()
+            .map(|(name, record)| IdentityInfo {
+                identity_type: Some(record.identity_type.clone()),
+                identity_name: Some(name.clone()),
+                sending_enabled: record.sending_enabled,
+            })
+            .collect();
+
+        Ok(ListEmailIdentitiesOutput {
+            email_identities: Some(email_identities),
+            // A token only when identities remain, so paging through the list ends.
+            next_token: more.then(|| encode_token(&next_position)),
+        })
     }
 }

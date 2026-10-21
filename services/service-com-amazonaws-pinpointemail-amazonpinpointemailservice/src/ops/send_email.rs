@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendEmail
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendEmail`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendEmail::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Accepts one outbound message: validates it against the persisted configuration sets,
+//! appends it to the sent-message log in [`crate::state`], and returns the `MessageId`
+//! minted for that log entry.
 //!
 //! ## Shape of an operation
 //!
@@ -104,6 +98,90 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How many recipients a destination names. `Destination` is required but all three of
+/// its address lists are optional, so a request can carry a destination with nobody in it.
+fn recipient_count(destination: &Destination) -> usize {
+    [
+        destination.to_addresses.as_ref(),
+        destination.cc_addresses.as_ref(),
+        destination.bcc_addresses.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .flatten()
+    .filter(|address| !address.is_empty())
+    .count()
+}
+
+/// What the log retains about a message: which content member it carried, a bounded prefix
+/// of its subject, and the SIZE of its body rather than the body itself.
+struct ContentSummary {
+    form: &'static str,
+    subject: Option<String>,
+    body_bytes: usize,
+}
+
+/// The first non-empty body part of a simple message — the text part, else the HTML part —
+/// as the content form it makes the message and the size of that part.
+fn simple_body(body: &Body) -> Option<(&'static str, usize)> {
+    if let Some(text) = &body.text {
+        if !text.data.is_empty() {
+            return Some(("SIMPLE_TEXT", text.data.len()));
+        }
+    }
+    if let Some(html) = &body.html {
+        if !html.data.is_empty() {
+            return Some(("SIMPLE_HTML", html.data.len()));
+        }
+    }
+    None
+}
+
+/// Summarise the message a request carried.
+///
+/// `None` means it carried no message at all — an `EmailContent` naming none of `Simple`,
+/// `Raw` or `Template`, a `Raw` with an empty payload, a `Simple` with neither a subject
+/// nor a body part, or a `Template` naming neither a template nor its data.
+fn content_summary(content: &EmailContent) -> Option<ContentSummary> {
+    if let Some(simple) = &content.simple {
+        let subject = (!simple.subject.data.is_empty())
+            .then(|| crate::state::retained_subject(&simple.subject.data));
+        let body = simple_body(&simple.body);
+        if subject.is_none() && body.is_none() {
+            return None;
+        }
+        return Some(ContentSummary {
+            form: body.map_or("SIMPLE", |(form, _)| form),
+            subject,
+            body_bytes: body.map_or(0, |(_, bytes)| bytes),
+        });
+    }
+    if let Some(raw) = &content.raw {
+        // The raw payload is a whole MIME message; the log keeps its size, not its bytes.
+        return (!raw.data.is_empty()).then_some(ContentSummary {
+            form: "RAW",
+            subject: None,
+            body_bytes: raw.data.len(),
+        });
+    }
+    if let Some(template) = &content.template {
+        let named = template
+            .template_arn
+            .as_ref()
+            .or(template.template_data.as_ref())
+            .is_some();
+        return named.then(|| ContentSummary {
+            form: "TEMPLATE",
+            subject: None,
+            body_bytes: template
+                .template_data
+                .as_ref()
+                .map_or(0, |data| data.len()),
+        });
+    }
+    None
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -179,18 +257,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendEmail` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendEmailErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendEmail"))
+        let _ = ctx;
+        // This operation models no server fault, and the condition is unreachable in a
+        // router-built emulator (its engine always carries this store), so the send is
+        // refused rather than reported as accepted when nothing could record it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SendEmailErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::STATE_UNAVAILABLE.to_string()),
+            })
+            .into());
+        };
+
+        let recipients = recipient_count(&input.destination);
+        if recipients == 0 {
+            return Err(SendEmailErrorModeled::BadRequestException(BadRequestException {
+                message: Some(
+                    "Destination must name at least one ToAddresses, CcAddresses or \
+                     BccAddresses recipient"
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
+        let Some(content) = content_summary(&input.content) else {
+            return Err(SendEmailErrorModeled::BadRequestException(BadRequestException {
+                message: Some(
+                    "Content must carry a Simple, Raw or Template message with content"
+                        .to_string(),
+                ),
+            })
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // A configuration set applies the rules an email is sent under, so a name that
+        // was never created cannot be applied to this message.
+        if let Some(name) = &input.configuration_set_name {
+            if !store.configuration_sets.contains_key(name) {
+                return Err(SendEmailErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!("configuration set {name} does not exist")),
+                })
+                .into());
+            }
+        }
+
+        let sent_at = ::std::time::SystemTime::now();
+        let message_id = store.mint_message_id(sent_at);
+        store.record_sent_message(crate::state::SentMessageRecord {
+            message_id: message_id.clone(),
+            from_email_address: input
+                .from_email_address
+                .as_deref()
+                .map(crate::state::retained_address),
+            recipient_count: recipients,
+            content_form: content.form.to_string(),
+            content_subject: content.subject,
+            content_body_bytes: content.body_bytes,
+            reply_to_address_count: input.reply_to_addresses.as_ref().map_or(0, Vec::len),
+            email_tag_count: input.email_tags.as_ref().map_or(0, Vec::len),
+            configuration_set_name: input
+                .configuration_set_name
+                .as_deref()
+                .map(crate::state::retained_address),
+            sent_at,
+        });
+
+        Ok(SendEmailOutput {
+            message_id: Some(message_id),
+        })
     }
 }
