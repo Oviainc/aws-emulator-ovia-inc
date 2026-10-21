@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEarthObservationJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEarthObservationJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports a page of the stored Earth Observation jobs: one summary per job this
+//! service holds, filtered by `StatusEquals`, ordered by `SortBy`/`SortOrder`, and
+//! truncated at `MaxResults` with an opaque `NextToken` that resumes exactly where
+//! the page stopped.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEarthObservationJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The one write this reporting operation makes is materialising the status
+//! transitions the clock already owed — see `crate::state::EarthObservationJob::materialize`.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +84,109 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The sort keys this operation accepts for `SortBy`.
+///
+/// The model types `SortBy` as a plain string and documents it only as "the
+/// parameter by which to sort the results", so the keys are the summary members a
+/// result can be ordered by: the ones `ListEarthObservationJobOutputConfig`
+/// declares and that every job carries.
+const SORT_KEYS: &[&str] = &["CreationTime", "Name", "Status", "DurationInSeconds"];
+
+/// `SortBy` when the request names none. SageMaker's list operations sort by
+/// creation time by default, newest first.
+const DEFAULT_SORT_BY: &str = "CreationTime";
+
+/// `SortOrder` when the request names none, for the same reason as
+/// [`DEFAULT_SORT_BY`].
+const DEFAULT_SORT_ORDER: &str = "DESCENDING";
+
+/// The page size when the request names no `MaxResults`: the largest page the
+/// model's `@range(min: 1, max: 20)` on `MaxResults` allows.
+const DEFAULT_MAX_RESULTS: usize = 20;
+
+/// The version marker an opaque `NextToken` this operation mints carries, so a
+/// token from a different scheme is refused rather than misread.
+const TOKEN_VERSION: &str = "v1";
+
+/// Refuse the request with this operation's own modelled `ValidationException`
+/// (HTTP 400), for a rule the model cannot express.
+fn validation(message: String) -> ListEarthObservationJobsError {
+    ListEarthObservationJobsErrorModeled::ValidationException(ValidationException {
+        message,
+        resource_id: None,
+    })
+    .into()
+}
+
+/// A job's value for `sort_by`, rendered so that the plain ordering of these
+/// strings is the ordering of the underlying values (timestamps and durations are
+/// zero-padded decimals, which keeps them in numeric order).
+fn sort_key(
+    job: &crate::state::EarthObservationJob,
+    sort_by: &str,
+    now: ::std::time::Instant,
+) -> String {
+    match sort_by {
+        "Name" => job.name.clone(),
+        "Status" => job.status.clone(),
+        "DurationInSeconds" => format!("{:011}", job.duration_in_seconds(now)),
+        // `CreationTime`, the default. Nanosecond resolution, so two jobs created
+        // in the same millisecond still order by which was created first.
+        _ => {
+            let nanos = job.creation_time.secs() * 1_000_000_000
+                + i64::from(job.creation_time.subsec_nanos());
+            format!("{nanos:020}")
+        }
+    }
+}
+
+/// The cursor a `NextToken` carries: the sort key and ARN of the last summary the
+/// previous page returned.
+///
+/// Carrying the key as well as the ARN is what lets a page resume exactly where
+/// the last one stopped even if that job has since been deleted — the position in
+/// the order is reconstructed from the value, not from the record.
+struct Cursor {
+    key: String,
+    arn: String,
+}
+
+/// Encode a cursor as the opaque `NextToken` a caller hands back.
+fn encode_token(cursor: &Cursor) -> String {
+    ::aws_smithy_types::base64::encode(format!(
+        "{TOKEN_VERSION}|{}|{}",
+        cursor.key, cursor.arn
+    ))
+}
+
+/// The longest `NextToken` this operation will decode.
+///
+/// A token it mints is base64 of `v1|<sort key>|<arn>`: the sort key is at most a
+/// job `Name` (`@length(max: 200)` in the model) and the ARN at most a few dozen
+/// more characters, so roughly 450 encoded characters is the ceiling. The model's
+/// own `@length(max: 8192)` on `NextToken` is enforced before this handler runs;
+/// this tighter bound is local and explicit, so nothing larger than a token this
+/// operation could have issued is ever decoded.
+const MAX_NEXT_TOKEN_LEN: usize = 1024;
+
+/// Decode a `NextToken` this operation minted, or `None` when it did not mint it.
+///
+/// The ARN is taken from the last `|`, so a sort key containing one (a job name,
+/// say) survives the round trip; ARNs never contain one.
+fn decode_token(token: &str) -> Option<Cursor> {
+    if token.len() > MAX_NEXT_TOKEN_LEN {
+        return None;
+    }
+    let decoded = ::aws_smithy_types::base64::decode(token).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let body = decoded.strip_prefix(TOKEN_VERSION)?.strip_prefix('|')?;
+    let (key, arn) = body.rsplit_once('|')?;
+    Some(Cursor {
+        key: key.to_string(),
+        arn: arn.to_string(),
+    })
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,18 +259,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEarthObservationJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEarthObservationJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEarthObservationJobs"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListEarthObservationJobsError::from(
+                ListEarthObservationJobsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the sagemaker-geospatial store is unavailable".to_string(),
+                        resource_id: None,
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+
+        let sort_by = input.sort_by.as_deref().unwrap_or(DEFAULT_SORT_BY);
+        let Some(sort_by) = SORT_KEYS
+            .iter()
+            .find(|key| key.eq_ignore_ascii_case(sort_by))
+            .copied()
+        else {
+            return Err(validation(format!(
+                "SortBy must be one of {}",
+                SORT_KEYS.join(", ")
+            )));
+        };
+        let descending = input
+            .sort_order
+            .as_deref()
+            .unwrap_or(DEFAULT_SORT_ORDER)
+            .eq_ignore_ascii_case("DESCENDING");
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => Some(decode_token(token).ok_or_else(|| {
+                validation("NextToken is not a token this service issued".to_string())
+            })?),
+            None => None,
+        };
+
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+        // This call reports every record, so every record's clock-owed
+        // transitions are materialised. Bounded work: the store holds at most
+        // `crate::state::MAX_EARTH_OBSERVATION_JOBS` records.
+        store.materialize_all(now);
+
+        // Every stored job, filtered, then ordered by (sort key, ARN) — the ARN
+        // breaks ties, so the order is total and a page resumes at one place.
+        let mut rows: Vec<(String, &crate::state::EarthObservationJob)> = store
+            .earth_observation_jobs
+            .values()
+            .filter(|job| {
+                input
+                    .status_equals
+                    .as_deref()
+                    .is_none_or(|status| job.status == status)
+            })
+            .map(|job| (sort_key(job, sort_by, now), job))
+            .collect();
+        rows.sort_by(|(left_key, left), (right_key, right)| {
+            let ordering = (left_key.as_str(), left.arn.as_str())
+                .cmp(&(right_key.as_str(), right.arn.as_str()));
+            if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+
+        // Resume strictly after the cursor's position in that order.
+        let start = match &cursor {
+            Some(cursor) => rows
+                .iter()
+                .position(|(key, job)| {
+                    let row = (key.as_str(), job.arn.as_str());
+                    let from = (cursor.key.as_str(), cursor.arn.as_str());
+                    if descending {
+                        row < from
+                    } else {
+                        row > from
+                    }
+                })
+                .unwrap_or(rows.len()),
+            None => 0,
+        };
+
+        let page = &rows[start..rows.len().min(start + page_size)];
+        let summaries: Vec<ListEarthObservationJobOutputConfig> = page
+            .iter()
+            .map(|(_, job)| ListEarthObservationJobOutputConfig {
+                arn: job.arn.clone(),
+                name: job.name.clone(),
+                creation_time: job.creation_time,
+                duration_in_seconds: job.duration_in_seconds(now),
+                status: job.status.clone(),
+                operation_type: job.operation_type().to_string(),
+                tags: job.tags_for_output(),
+            })
+            .collect();
+
+        // A token only when a later page exists, so the last page ends the walk.
+        let next_token = if start + page.len() < rows.len() {
+            page.last().map(|(key, job)| {
+                encode_token(&Cursor {
+                    key: key.clone(),
+                    arn: job.arn.clone(),
+                })
+            })
+        } else {
+            None
+        };
+
+        Ok(ListEarthObservationJobsOutput {
+            earth_observation_job_summaries: summaries,
+            next_token,
+        })
     }
 }
