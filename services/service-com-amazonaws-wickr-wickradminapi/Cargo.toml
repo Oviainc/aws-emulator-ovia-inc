@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# SHA-256 for the content-derived `uname` / invite code a created user carries.
+sha2 = { workspace = true }
+# Hex codec for those digests and for the opaque pagination tokens.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
