@@ -299,7 +299,32 @@ members = [
     "services/service-com-amazonaws-partnercentralchannel-partnercentralchannel",
     "services/service-com-amazonaws-partnercentralrevenuemeasurement-partnercentralrevenuemeasurement",
     "services/service-com-amazonaws-partnercentralselling-awspartnercentralselling",
+    "services/service-com-amazonaws-paymentcryptography-paymentcryptographycontrolplane",
     "services/service-com-amazonaws-paymentcryptographydata-paymentcryptographydataplane",
+    "services/service-com-amazonaws-pcaconnectorad-pcaconnectorad",
+    "services/service-com-amazonaws-pcaconnectorscep-pcaconnectorscep",
+    "services/service-com-amazonaws-pcs-awsparallelcomputingservice",
+    "services/service-com-amazonaws-personalize-amazonpersonalize",
+    "services/service-com-amazonaws-personalizeevents-amazonpersonalizeevents",
+    "services/service-com-amazonaws-personalizeruntime-amazonpersonalizeruntime",
+    "services/service-com-amazonaws-pi-performanceinsightsv20180227",
+    "services/service-com-amazonaws-pinpoint-pinpoint",
+    "services/service-com-amazonaws-pinpointemail-amazonpinpointemailservice",
+    "services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice",
+    "services/service-com-amazonaws-pinpointsmsvoicev2-pinpointsmsvoicev2",
+    "services/service-com-amazonaws-pipes-pipes",
+    "services/service-com-amazonaws-polly-parrot-v1",
+    "services/service-com-amazonaws-pricing-awspricelistservice",
+    "services/service-com-amazonaws-pricingplanmanager-awspricingplanmanager",
+    "services/service-com-amazonaws-proton-awsproton20200720",
+    "services/service-com-amazonaws-qapps-qappsservice",
+    "services/service-com-amazonaws-qbusiness-expertq",
+    "services/service-com-amazonaws-qconnect-wisdomservice",
+    "services/service-com-amazonaws-quicksight-quicksight-20180401",
+    "services/service-com-amazonaws-ram-amazonresourcesharing",
+    "services/service-com-amazonaws-rbin-amazonrecyclebin",
+    "services/service-com-amazonaws-rds-amazonrdsv19",
+    "services/service-com-amazonaws-rdsdata-rdsdataservice",
     "core/router",
     "core/embedded",
 ]
@@ -634,7 +659,32 @@ service-com-amazonaws-partnercentralbenefits-partnercentralbenefitsservice = { p
 service-com-amazonaws-partnercentralchannel-partnercentralchannel = { path = "services/service-com-amazonaws-partnercentralchannel-partnercentralchannel" }
 service-com-amazonaws-partnercentralrevenuemeasurement-partnercentralrevenuemeasurement = { path = "services/service-com-amazonaws-partnercentralrevenuemeasurement-partnercentralrevenuemeasurement" }
 service-com-amazonaws-partnercentralselling-awspartnercentralselling = { path = "services/service-com-amazonaws-partnercentralselling-awspartnercentralselling" }
+service-com-amazonaws-paymentcryptography-paymentcryptographycontrolplane = { path = "services/service-com-amazonaws-paymentcryptography-paymentcryptographycontrolplane" }
 service-com-amazonaws-paymentcryptographydata-paymentcryptographydataplane = { path = "services/service-com-amazonaws-paymentcryptographydata-paymentcryptographydataplane" }
+service-com-amazonaws-pcaconnectorad-pcaconnectorad = { path = "services/service-com-amazonaws-pcaconnectorad-pcaconnectorad" }
+service-com-amazonaws-pcaconnectorscep-pcaconnectorscep = { path = "services/service-com-amazonaws-pcaconnectorscep-pcaconnectorscep" }
+service-com-amazonaws-pcs-awsparallelcomputingservice = { path = "services/service-com-amazonaws-pcs-awsparallelcomputingservice" }
+service-com-amazonaws-personalize-amazonpersonalize = { path = "services/service-com-amazonaws-personalize-amazonpersonalize" }
+service-com-amazonaws-personalizeevents-amazonpersonalizeevents = { path = "services/service-com-amazonaws-personalizeevents-amazonpersonalizeevents" }
+service-com-amazonaws-personalizeruntime-amazonpersonalizeruntime = { path = "services/service-com-amazonaws-personalizeruntime-amazonpersonalizeruntime" }
+service-com-amazonaws-pi-performanceinsightsv20180227 = { path = "services/service-com-amazonaws-pi-performanceinsightsv20180227" }
+service-com-amazonaws-pinpoint-pinpoint = { path = "services/service-com-amazonaws-pinpoint-pinpoint" }
+service-com-amazonaws-pinpointemail-amazonpinpointemailservice = { path = "services/service-com-amazonaws-pinpointemail-amazonpinpointemailservice" }
+service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice = { path = "services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice" }
+service-com-amazonaws-pinpointsmsvoicev2-pinpointsmsvoicev2 = { path = "services/service-com-amazonaws-pinpointsmsvoicev2-pinpointsmsvoicev2" }
+service-com-amazonaws-pipes-pipes = { path = "services/service-com-amazonaws-pipes-pipes" }
+service-com-amazonaws-polly-parrot-v1 = { path = "services/service-com-amazonaws-polly-parrot-v1" }
+service-com-amazonaws-pricing-awspricelistservice = { path = "services/service-com-amazonaws-pricing-awspricelistservice" }
+service-com-amazonaws-pricingplanmanager-awspricingplanmanager = { path = "services/service-com-amazonaws-pricingplanmanager-awspricingplanmanager" }
+service-com-amazonaws-proton-awsproton20200720 = { path = "services/service-com-amazonaws-proton-awsproton20200720" }
+service-com-amazonaws-qapps-qappsservice = { path = "services/service-com-amazonaws-qapps-qappsservice" }
+service-com-amazonaws-qbusiness-expertq = { path = "services/service-com-amazonaws-qbusiness-expertq" }
+service-com-amazonaws-qconnect-wisdomservice = { path = "services/service-com-amazonaws-qconnect-wisdomservice" }
+service-com-amazonaws-quicksight-quicksight-20180401 = { path = "services/service-com-amazonaws-quicksight-quicksight-20180401" }
+service-com-amazonaws-ram-amazonresourcesharing = { path = "services/service-com-amazonaws-ram-amazonresourcesharing" }
+service-com-amazonaws-rbin-amazonrecyclebin = { path = "services/service-com-amazonaws-rbin-amazonrecyclebin" }
+service-com-amazonaws-rds-amazonrdsv19 = { path = "services/service-com-amazonaws-rds-amazonrdsv19" }
+service-com-amazonaws-rdsdata-rdsdataservice = { path = "services/service-com-amazonaws-rdsdata-rdsdataservice" }
 
 # The vendored framework (under vendor/, Apache-2.0, see vendor/README.md).
 #

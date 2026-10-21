@@ -103,7 +103,9 @@ pub fn build_router(engine: Arc<InMemoryEngine>) -> MultiServiceRouter {
     let router = mount_chunk_24(router, &engine);
     let router = mount_chunk_25(router, &engine);
     let router = mount_chunk_26(router, &engine);
-    mount_chunk_27(router, &engine)
+    let router = mount_chunk_27(router, &engine);
+    let router = mount_chunk_28(router, &engine);
+    mount_chunk_29(router, &engine)
 }
 
 /// Register services 00 of this workspace on `router`.
@@ -738,7 +740,56 @@ fn mount_chunk_27(
 ) -> MultiServiceRouter {
     router.register_service(service_com_amazonaws_partnercentralrevenuemeasurement_partnercentralrevenuemeasurement::EmulatedService::new(engine.clone()));
     router.register_service(service_com_amazonaws_partnercentralselling_awspartnercentralselling::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_paymentcryptography_paymentcryptographycontrolplane::EmulatedService::new(engine.clone()));
     router.register_service(service_com_amazonaws_paymentcryptographydata_paymentcryptographydataplane::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_pcaconnectorad_pcaconnectorad::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_pcs_awsparallelcomputingservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_personalize_amazonpersonalize::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_personalizeevents_amazonpersonalizeevents::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_personalizeruntime_amazonpersonalizeruntime::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_pi_performanceinsightsv20180227::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 28 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_28(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_pinpoint_pinpoint::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_pinpointemail_amazonpinpointemailservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_pinpointsmsvoice_pinpointsmsvoice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_pinpointsmsvoicev2_pinpointsmsvoicev2::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_pipes_pipes::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_polly_parrot_v1::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_pricing_awspricelistservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_pricingplanmanager_awspricingplanmanager::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_proton_awsproton20200720::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_qapps_qappsservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_qbusiness_expertq::EmulatedService::new(engine.clone()));
+    router
+}
+
+/// Register services 29 of this workspace on `router`.
+///
+/// `#[inline(never)]` is LOAD-BEARING: inlined back into `build_router` the frames
+/// would coalesce again and the stack saving would be lost.
+#[inline(never)]
+fn mount_chunk_29(
+    mut router: MultiServiceRouter,
+    engine: &Arc<InMemoryEngine>,
+) -> MultiServiceRouter {
+    router.register_service(service_com_amazonaws_qconnect_wisdomservice::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_quicksight_quicksight_20180401::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_ram_amazonresourcesharing::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_rbin_amazonrecyclebin::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_rds_amazonrdsv19::EmulatedService::new(engine.clone()));
+    router.register_service(service_com_amazonaws_rdsdata_rdsdataservice::EmulatedService::new(engine.clone()));
     router
 }
 

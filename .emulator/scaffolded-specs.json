@@ -1197,8 +1197,108 @@
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/partnercentral-selling/service/2022-07-26/partnercentral-selling-2022-07-26.json"
     },
     {
+      "shape_id": "com.amazonaws.paymentcryptography#PaymentCryptographyControlPlane",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/payment-cryptography/service/2021-09-14/payment-cryptography-2021-09-14.json"
+    },
+    {
       "shape_id": "com.amazonaws.paymentcryptographydata#PaymentCryptographyDataPlane",
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/payment-cryptography-data/service/2022-02-03/payment-cryptography-data-2022-02-03.json"
+    },
+    {
+      "shape_id": "com.amazonaws.pcaconnectorad#PcaConnectorAd",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/pca-connector-ad/service/2018-05-10/pca-connector-ad-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.pcaconnectorscep#PcaConnectorScep",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/pca-connector-scep/service/2018-05-10/pca-connector-scep-2018-05-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.pcs#AWSParallelComputingService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/pcs/service/2023-02-10/pcs-2023-02-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.personalize#AmazonPersonalize",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/personalize/service/2018-05-22/personalize-2018-05-22.json"
+    },
+    {
+      "shape_id": "com.amazonaws.personalizeevents#AmazonPersonalizeEvents",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/personalize-events/service/2018-03-22/personalize-events-2018-03-22.json"
+    },
+    {
+      "shape_id": "com.amazonaws.personalizeruntime#AmazonPersonalizeRuntime",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/personalize-runtime/service/2018-05-22/personalize-runtime-2018-05-22.json"
+    },
+    {
+      "shape_id": "com.amazonaws.pi#PerformanceInsightsv20180227",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/pi/service/2018-02-27/pi-2018-02-27.json"
+    },
+    {
+      "shape_id": "com.amazonaws.pinpoint#Pinpoint",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/pinpoint/service/2016-12-01/pinpoint-2016-12-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.pinpointemail#AmazonPinpointEmailService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/pinpoint-email/service/2018-07-26/pinpoint-email-2018-07-26.json"
+    },
+    {
+      "shape_id": "com.amazonaws.pinpointsmsvoice#PinpointSMSVoice",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/pinpoint-sms-voice/service/2018-09-05/pinpoint-sms-voice-2018-09-05.json"
+    },
+    {
+      "shape_id": "com.amazonaws.pinpointsmsvoicev2#PinpointSMSVoiceV2",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/pinpoint-sms-voice-v2/service/2022-03-31/pinpoint-sms-voice-v2-2022-03-31.json"
+    },
+    {
+      "shape_id": "com.amazonaws.pipes#Pipes",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/pipes/service/2015-10-07/pipes-2015-10-07.json"
+    },
+    {
+      "shape_id": "com.amazonaws.polly#Parrot_v1",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/polly/service/2016-06-10/polly-2016-06-10.json"
+    },
+    {
+      "shape_id": "com.amazonaws.pricing#AWSPriceListService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/pricing/service/2017-10-15/pricing-2017-10-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.pricingplanmanager#AWSPricingPlanManager",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/pricing-plan-manager/service/2025-08-05/pricing-plan-manager-2025-08-05.json"
+    },
+    {
+      "shape_id": "com.amazonaws.proton#AwsProton20200720",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/proton/service/2020-07-20/proton-2020-07-20.json"
+    },
+    {
+      "shape_id": "com.amazonaws.qapps#QAppsService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/qapps/service/2023-11-27/qapps-2023-11-27.json"
+    },
+    {
+      "shape_id": "com.amazonaws.qbusiness#ExpertQ",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/qbusiness/service/2023-11-27/qbusiness-2023-11-27.json"
+    },
+    {
+      "shape_id": "com.amazonaws.qconnect#WisdomService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/qconnect/service/2020-10-19/qconnect-2020-10-19.json"
+    },
+    {
+      "shape_id": "com.amazonaws.quicksight#QuickSight_20180401",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/quicksight/service/2018-04-01/quicksight-2018-04-01.json"
+    },
+    {
+      "shape_id": "com.amazonaws.ram#AmazonResourceSharing",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/ram/service/2018-01-04/ram-2018-01-04.json"
+    },
+    {
+      "shape_id": "com.amazonaws.rbin#AmazonRecycleBin",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/rbin/service/2021-06-15/rbin-2021-06-15.json"
+    },
+    {
+      "shape_id": "com.amazonaws.rds#AmazonRDSv19",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/rds/service/2014-10-31/rds-2014-10-31.json"
+    },
+    {
+      "shape_id": "com.amazonaws.rdsdata#RdsDataService",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/rds-data/service/2018-08-01/rds-data-2018-08-01.json"
     }
   ]
 }
