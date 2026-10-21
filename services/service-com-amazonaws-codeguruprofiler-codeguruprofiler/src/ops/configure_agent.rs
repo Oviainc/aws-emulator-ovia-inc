@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ConfigureAgent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ConfigureAgent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ConfigureAgent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records that the agent of a profiling group pinged back, and answers with the
+//! orchestration decision stored for that group: `shouldProfile` is the group's
+//! `agentOrchestrationConfig.profilingEnabled`.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +83,48 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How long an agent profiles before calling `ConfigureAgent` again. The model's doc
+/// for `AgentConfiguration$periodInSeconds`: "if this is set to 300, the profiling
+/// agent calls ConfigureAgent every 5 minutes to submit the profiled data collected
+/// during that period".
+const PERIOD_IN_SECONDS: i32 = 300;
+
+/// The profiler parameters handed to the agent. The KEYS are the whole
+/// `AgentParameterField` catalogue the model declares (smithy_query
+/// `query="shape", shape="AgentParameterField"`): SamplingIntervalInMilliseconds,
+/// ReportingIntervalInMilliseconds, MinimumTimeForReportingInMilliseconds,
+/// MemoryUsageLimitPercent, MaxStackDepth. `ReportingIntervalInMilliseconds` is
+/// derived from [`PERIOD_IN_SECONDS`] below so the reporting interval the agent is
+/// told to use always agrees with the period it is told to profile for.
+const SAMPLING_INTERVAL_IN_MILLISECONDS: i32 = 1_000;
+const MINIMUM_TIME_FOR_REPORTING_IN_MILLISECONDS: i32 = 60_000;
+const MEMORY_USAGE_LIMIT_PERCENT: i32 = 10;
+const MAX_STACK_DEPTH: i32 = 1_000;
+
+/// The `agentParameters` map of an [`AgentConfiguration`], keyed by
+/// `AgentParameterField`.
+fn agent_parameters() -> ::std::collections::HashMap<String, String> {
+    [
+        (
+            "SamplingIntervalInMilliseconds",
+            SAMPLING_INTERVAL_IN_MILLISECONDS,
+        ),
+        (
+            "ReportingIntervalInMilliseconds",
+            PERIOD_IN_SECONDS * 1_000,
+        ),
+        (
+            "MinimumTimeForReportingInMilliseconds",
+            MINIMUM_TIME_FOR_REPORTING_IN_MILLISECONDS,
+        ),
+        ("MemoryUsageLimitPercent", MEMORY_USAGE_LIMIT_PERCENT),
+        ("MaxStackDepth", MAX_STACK_DEPTH),
+    ]
+    .into_iter()
+    .map(|(field, value)| (field.to_string(), value.to_string()))
+    .collect()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +196,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ConfigureAgent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ConfigureAgentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ConfigureAgent"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ConfigureAgentErrorModeled::InternalServerException(InternalServerException {
+                message: "the profiling-group store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+        let group = guard
+            .groups
+            .get_mut(&input.profiling_group_name)
+            .ok_or_else(|| {
+                ConfigureAgentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!("no profiling group named {}", input.profiling_group_name),
+                })
+            })?;
+
+        // This call IS the agent reporting its current state, so it records the ping:
+        // `profilingStatus.latestAgentOrchestratedAt` is "the date and time when the
+        // profiling agent most recently pinged back", which a later
+        // DescribeProfilingGroup reads back.
+        group.latest_agent_orchestrated_at = Some(crate::state::now());
+
+        Ok(ConfigureAgentOutput {
+            configuration: AgentConfiguration {
+                should_profile: group.profiling_enabled,
+                period_in_seconds: PERIOD_IN_SECONDS,
+                agent_parameters: Some(agent_parameters()),
+            },
+        })
     }
 }
