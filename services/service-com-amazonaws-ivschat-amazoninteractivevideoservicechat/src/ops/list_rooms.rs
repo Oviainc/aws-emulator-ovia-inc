@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRooms
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRooms`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enumerates the rooms held in [`crate::state`], narrowed by the filters the
+//! request carries, capped at `maxResults` and resumable through an opaque `nextToken`
+//! that names where the previous page stopped. `rooms` is always present, empty when no
+//! stored room matches.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRooms::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A 501 from this operation would mean "nobody has written it yet"; it no longer
+//! answers one.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +80,41 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// A room's position in the page order: `updateTime` descending, room id ascending.
+type PageKey = (::std::cmp::Reverse<u128>, String);
+
+/// The page position of a room in the order this operation reports: `updateTime`
+/// DESCENDING, as the model documents ("Results are sorted in descending order of
+/// updateTime"), with the room id ascending as the tiebreak that makes the order total —
+/// without it two rooms updated in the same millisecond could swap places between pages.
+///
+/// The time is taken at the millisecond precision the response's ISO 8601 timestamps
+/// carry, so the key orders exactly what the caller sees.
+fn page_order(room: &crate::state::Room) -> PageKey {
+    let millis = room
+        .update_time
+        .duration_since(::std::time::SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0);
+    (::std::cmp::Reverse(millis), room.id.clone())
+}
+
+/// Render a page position as the opaque `nextToken` the response carries.
+///
+/// Hex-encoded so a caller cannot read or hand-build one: the only thing a client may do
+/// with a token is pass it back, which is what `@paginated` means.
+fn encode_page_token(key: &PageKey) -> String {
+    hex::encode(format!("{}:{}", key.0 .0, key.1))
+}
+
+/// The page position an opaque `nextToken` names, or `None` when the value is not a token
+/// this service issued.
+fn decode_page_token(token: &str) -> Option<PageKey> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    let (millis, id) = decoded.split_once(':')?;
+    Some((::std::cmp::Reverse(millis.parse().ok()?), id.to_string()))
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -152,18 +185,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRooms` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRoomsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRooms"))
+        let _ = ctx;
+        // Modeled constraints are already refused BEFORE this handler runs, so reaching
+        // here means every filter and `maxResults` satisfy their modelled bounds.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service. An engine this service cannot read its state
+            // from means the operation cannot be served at all, which is what 501 says.
+            crate::scaffolded::Scaffolded::not_implemented("ListRooms")
+        })?;
+
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => match decode_page_token(token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListRoomsErrorModeled::ValidationException(
+                        crate::state::field_validation_failed(
+                            "nextToken",
+                            "nextToken is not a pagination token this service issued.",
+                        ),
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::DEFAULT_MAX_ROOM_RESULTS)
+                .clamp(1, crate::state::MAX_ROOM_RESULTS),
+        )
+        .unwrap_or(1);
+
+        // A reporting operation: the store is read, never written.
+        let store = state.lock();
+        // Each room's page key is computed ONCE, here, and carried alongside the room
+        // through sorting, resuming and the next-token.
+        let mut matching: Vec<(PageKey, &crate::state::Room)> = store
+            .rooms
+            .values()
+            .filter(|room| {
+                // Each filter the request carries narrows the list; an absent one does not.
+                input
+                    .name
+                    .as_deref()
+                    .is_none_or(|name| room.name.as_deref() == Some(name))
+                    && input.message_review_handler_uri.as_deref().is_none_or(|uri| {
+                        room.message_review_handler
+                            .as_ref()
+                            .and_then(|handler| handler.uri.as_deref())
+                            == Some(uri)
+                    })
+                    && input
+                        .logging_configuration_identifier
+                        .as_deref()
+                        .is_none_or(|identifier| {
+                            room.logging_configuration_identifiers
+                                .iter()
+                                .any(|attached| attached == identifier)
+                        })
+            })
+            .map(|room| (page_order(room), room))
+            .collect();
+        // The modelled order: "Results are sorted in descending order of updateTime."
+        // Ties break on the room id, so one order is total and every page is reproducible.
+        matching.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        // Resume strictly after the key the previous page ended on. Comparing keys rather
+        // than looking the room up means a room deleted between pages drops out without
+        // shifting or repeating the rooms around it.
+        let start = match resume_from {
+            None => 0,
+            Some(key) => matching
+                .iter()
+                .position(|(room_key, _)| *room_key > key)
+                .unwrap_or(matching.len()),
+        };
+
+        let page = &matching[start.min(matching.len())..];
+        let taken = &page[..page_size.min(page.len())];
+        let rooms: Vec<RoomSummary> = taken
+            .iter()
+            .map(|(_, room)| RoomSummary {
+                arn: Some(room.arn.clone()),
+                id: Some(room.id.clone()),
+                name: room.name.clone(),
+                message_review_handler: room.message_review_handler.clone(),
+                create_time: Some(crate::state::as_date_time(room.create_time)),
+                update_time: Some(crate::state::as_date_time(room.update_time)),
+                tags: Some(room.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                logging_configuration_identifiers: Some(
+                    room.logging_configuration_identifiers.clone(),
+                ),
+            })
+            .collect();
+
+        // A token only when rooms remain after this page, so a caller that follows tokens
+        // to the end sees every matching room exactly once.
+        let next_token = match (page.len() > taken.len(), taken.last()) {
+            (true, Some((last_key, _))) => Some(encode_page_token(last_key)),
+            _ => None,
+        };
+
+        Ok(ListRoomsOutput { rooms, next_token })
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSpace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSpace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSpace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the stored space in place: every member is a partial update, so an absent
+//! one leaves the persisted value untouched and a following `GetSpace` reports the rest.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +168,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSpace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSpaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSpace"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateSpaceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the repostspace emulator is mounted on an engine that holds \
+                              no state"
+                        .to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // Resolve the new tier BEFORE touching the record, so a request this service
+        // cannot store leaves the stored space exactly as it was.
+        let retiered = match input.tier.as_deref() {
+            None => None,
+            Some(tier) => match crate::state::storage_limit_for_tier(tier) {
+                Some(storage_limit) => Some((tier.to_string(), storage_limit)),
+                None => {
+                    return Err(field_validation(
+                        "tier",
+                        &format!(
+                            "Value '{}' is not a member of TierLevel: {}",
+                            tier,
+                            TIER_LEVEL_VALUES.join(" | ")
+                        ),
+                    ));
+                }
+            },
+        };
+        if let Some(parameters) = input.supported_email_domains.as_ref() {
+            if let Some(enabled) = parameters.enabled.as_ref() {
+                if !FEATURE_ENABLE_PARAMETER_VALUES.contains(&enabled.as_str()) {
+                    return Err(field_validation(
+                        "supportedEmailDomains.enabled",
+                        &format!(
+                            "Value '{}' is not a member of FeatureEnableParameter: {}",
+                            enabled,
+                            FEATURE_ENABLE_PARAMETER_VALUES.join(" | ")
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let mut guard = state.lock();
+        let Some(space) = guard.space_mut(&input.space_id) else {
+            return Err(UpdateSpaceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Space {} was not found", input.space_id),
+                    resource_id: input.space_id.clone(),
+                    resource_type: crate::state::SPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Each member is a partial update: an absent one leaves the stored value alone.
+        if let Some(description) = input.description.clone() {
+            space.description = Some(description);
+        }
+        if let Some((tier, storage_limit)) = retiered {
+            space.tier = tier;
+            // The storage limit is a function of the tier, so it follows a tier change.
+            space.storage_limit = storage_limit;
+        }
+        if let Some(role_arn) = input.role_arn.clone() {
+            space.customer_role_arn = Some(role_arn);
+        }
+        if let Some(parameters) = input.supported_email_domains.as_ref() {
+            space.supported_email_domains = Some(crate::state::email_domains_status(parameters));
+        }
+
+        Ok(UpdateSpaceOutput)
     }
+}
+
+/// A modelled `ValidationException` (HTTP 400) naming the member that failed and the
+/// constraint it failed, the way the service's own boundary validator words one.
+fn field_validation(member: &str, message: &str) -> UpdateSpaceError {
+    UpdateSpaceErrorModeled::ValidationException(ValidationException {
+        message: format!("{member}: {message}"),
+        reason: "fieldValidationFailed".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: message.to_string(),
+        }]),
+    })
+    .into()
 }

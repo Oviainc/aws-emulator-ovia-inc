@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Unique opaque ids for the resources this service mints (spaceId, clientId, channelId).
+uuid = { version = "1", features = ["v4"] }
+# Hex codec for the opaque `nextToken` ListSpaces issues and parses back.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
