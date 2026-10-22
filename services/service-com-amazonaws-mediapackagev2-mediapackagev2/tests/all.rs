@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
+#[path = "all/channel_policy.rs"]
+mod channel_policy;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
