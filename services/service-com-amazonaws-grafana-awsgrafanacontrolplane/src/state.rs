@@ -15,7 +15,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AuthenticationDescription, AuthenticationSummary, AwsSsoAuthentication,
     NetworkAccessConfiguration, ResourceNotFoundException, SamlAuthentication, SamlConfiguration,
-    VpcConfiguration, WorkspaceDescription, WorkspaceSummary,
+    ValidationException, ValidationExceptionField, VpcConfiguration, WorkspaceDescription,
+    WorkspaceSummary,
 };
 
 /// The Grafana versions this emulator supports, OLDEST FIRST.
@@ -81,6 +82,27 @@ pub const WORKSPACE_PAGE_LIMIT: i32 = 100;
 /// request names no `maxResults`: `ListVersionsRequest$maxResults` is modelled
 /// `@range(min: 1, max: 100)`.
 pub const VERSION_PAGE_LIMIT: i32 = 100;
+
+/// The most tags one resource holds.
+///
+/// `TagMap` is modelled `@length(max: 50)`, so a single request can carry 50 tag
+/// pairs; the same bound is what a tagged resource can hold, and `TagResource`
+/// refuses a request that would take a workspace past it.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The shortest `TagKey` the model admits: `@length(min: 1, max: 128)`.
+pub const MIN_TAG_KEY_LENGTH: usize = 1;
+
+/// The longest `TagKey` the model admits: `@length(min: 1, max: 128)`.
+pub const MAX_TAG_KEY_LENGTH: usize = 128;
+
+/// The largest `TagValue` the model admits: `@length(min: 0, max: 256)`, so an
+/// empty value is a value and there is no lower bound to check.
+pub const MAX_TAG_VALUE_LENGTH: usize = 256;
+
+/// The resource-type segment of an Amazon Managed Grafana workspace ARN:
+/// `arn:aws:grafana:<region>:<account>:/workspaces/<workspace-id>`.
+pub const WORKSPACE_ARN_RESOURCE_TYPE: &str = "workspaces";
 
 /// How many workspaces the store holds before `CreateWorkspace` refuses with the
 /// modelled `ServiceQuotaExceededException`.
@@ -232,7 +254,10 @@ impl Workspace {
         }
     }
 
-    fn tag_map(&self) -> HashMap<String, String> {
+    /// This workspace's tags, as the `TagMap` every operation that reports them
+    /// serialises: `WorkspaceDescription$tags`, `WorkspaceSummary$tags` and
+    /// `ListTagsForResourceResponse$tags` are all this one map.
+    pub fn tag_map(&self) -> HashMap<String, String> {
         self.tags
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
@@ -410,6 +435,87 @@ pub fn workspace_not_found(id: &str) -> ResourceNotFoundException {
         message: format!("Workspace {id} not found"),
         resource_id: id.to_string(),
         resource_type: WORKSPACE_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The workspace id the resource ARN `arn` names, or `None` when `arn` does not
+/// name a Grafana workspace at all.
+///
+/// The tagging operations take a `resourceArn` the model constrains no further
+/// than `String`, and the only resource Amazon Managed Grafana can tag is a
+/// workspace — so the ARN is accepted when it is an ARN of THIS service whose
+/// resource section is `workspaces/<workspace-id>` (the leading `/` the service's
+/// ARNs carry is optional here, since it separates nothing). The partition, the
+/// region and the account segments are not matched: this emulator serves one
+/// account, and the workspace id is what identifies the resource within it.
+pub fn workspace_id_in_arn(arn: &str) -> Option<&str> {
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    // The partition, region and account segments must be PRESENT (an ARN has
+    // six colon-separated fields) but are not matched against this request.
+    let _partition = fields.next()?;
+    if fields.next()? != "grafana" {
+        return None;
+    }
+    let _region = fields.next()?;
+    let _account = fields.next()?;
+    let resource = fields.next()?;
+    let resource = resource.strip_prefix('/').unwrap_or(resource);
+    let (resource_type, id) = resource.split_once('/')?;
+    (resource_type == WORKSPACE_ARN_RESOURCE_TYPE && is_workspace_id(id)).then_some(id)
+}
+
+/// The modelled `ValidationException` for a tag whose key or value is outside the
+/// bounds `TagKey` / `TagValue` are modelled with, or `None` when the pair is
+/// within them.
+///
+/// The request-boundary validator refuses a modelled constraint on a member, but
+/// does not walk a map's KEY and VALUE constraints, so the handler that writes
+/// tags is what enforces these two. Lengths are counted in characters, as
+/// `@length` on a string is defined.
+pub fn out_of_bounds_tag(key: &str, value: &str) -> Option<ValidationException> {
+    let key_length = key.chars().count();
+    let value_length = value.chars().count();
+    let message = if !(MIN_TAG_KEY_LENGTH..=MAX_TAG_KEY_LENGTH).contains(&key_length) {
+        format!(
+            "tag key {key:?} is {key_length} characters long; a tag key is \
+             {MIN_TAG_KEY_LENGTH} to {MAX_TAG_KEY_LENGTH} characters"
+        )
+    } else if value_length > MAX_TAG_VALUE_LENGTH {
+        format!(
+            "the value of tag key {key:?} is {value_length} characters long; a tag \
+             value is at most {MAX_TAG_VALUE_LENGTH} characters"
+        )
+    } else {
+        return None;
+    };
+    Some(ValidationException {
+        message: message.clone(),
+        reason: "FIELD_VALIDATION_FAILED".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "tags".to_string(),
+            message,
+        }]),
+    })
+}
+
+/// The modelled `ValidationException` for a `resourceArn` that names no taggable
+/// Grafana resource.
+///
+/// `ValidationException$reason` is `FIELD_VALIDATION_FAILED`, and the field list
+/// names the member at fault, exactly as the other refusals in this service do.
+pub fn not_a_workspace_arn(arn: &str) -> ValidationException {
+    ValidationException {
+        message: format!("{arn} is not the ARN of an Amazon Managed Grafana workspace"),
+        reason: "FIELD_VALIDATION_FAILED".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "resourceArn".to_string(),
+            message: format!(
+                "must be an ARN of the form arn:aws:grafana:<region>:<account>:/{WORKSPACE_ARN_RESOURCE_TYPE}/<workspaceId>"
+            ),
+        }]),
     }
 }
 
