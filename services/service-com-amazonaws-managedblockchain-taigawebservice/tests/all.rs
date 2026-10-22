@@ -17,3 +17,5 @@ mod invitations;
 mod network_and_node_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_node_log_publishing.rs"]
+mod update_node_log_publishing;

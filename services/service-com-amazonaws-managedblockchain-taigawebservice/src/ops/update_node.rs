@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateNode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateNode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateNode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `UpdateNode` applies the node configuration parameters a request names to the stored
+//! node record; `GetNode` reads the result back.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +145,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateNode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateNodeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateNode"))
+        // The update is driven entirely by stored state and the request body; nothing
+        // region-dependent is minted here (the node's ARN and endpoints were minted by
+        // its create and are never recomputed).
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateNodeErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        guard.settle(::std::time::SystemTime::now());
+
+        let Some(network) = guard.networks.get_mut(&input.network_id) else {
+            return Err(UpdateNodeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "network {} does not exist on this account",
+                        input.network_id
+                    )),
+                    resource_name: Some(input.network_id.clone()),
+                },
+            )
+            .into());
+        };
+
+        // `UpdateNodeInput$MemberId` is "The unique identifier of the member that owns
+        // the node. Applies only to Hyperledger Fabric" — and, unlike
+        // `GetNodeInput$MemberId`, `ListNodesInput$MemberId` and `DeleteNodeInput$MemberId`,
+        // it does NOT carry "and is required for Hyperledger Fabric". So a member named
+        // here only SCOPES the lookup: a node the named member does not own is not found
+        // under it, exactly as an unknown node id is not, while a request that names no
+        // member addresses the node by network and node id alone.
+        let found = network.nodes.get_mut(&input.node_id).filter(|node| {
+            input
+                .member_id
+                .as_deref()
+                .is_none_or(|member_id| node.member_id.as_deref() == Some(member_id))
+        });
+        let Some(node) = found else {
+            return Err(UpdateNodeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "node {} does not exist on network {}",
+                        input.node_id, input.network_id
+                    )),
+                    resource_name: Some(input.node_id.clone()),
+                },
+            )
+            .into());
+        };
+
+        // "Updates a node configuration with new parameters", over HTTP `PATCH`: the
+        // parameters the request names are applied to the stored record and every one it
+        // leaves out keeps the value it already had, so a request that names no
+        // configuration at all changes nothing.
+        if let Some(requested) = input.log_publishing_configuration {
+            let merged = merge_node_logs(node.log_publishing_configuration.take(), requested);
+            node.log_publishing_configuration = Some(merged);
+        }
+
+        // `UpdateNodeOutput` models no members: the updated record is read back through
+        // `GetNode`.
+        Ok(UpdateNodeOutput {})
     }
+}
+
+/// Apply the `NodeLogPublishingConfiguration` a request named on top of the stored one.
+///
+/// Each nested structure the request names carries only the members it itself names, so
+/// turning one log stream on or off leaves the other stream's setting alone. `Enabled` is
+/// the only leaf (`LogConfiguration$Enabled`, "Indicates whether logging is enabled"), so
+/// an omitted `Enabled` keeps the stored one.
+fn merge_node_logs(
+    stored: Option<NodeLogPublishingConfiguration>,
+    requested: NodeLogPublishingConfiguration,
+) -> NodeLogPublishingConfiguration {
+    let stored = stored.unwrap_or_default();
+    NodeLogPublishingConfiguration {
+        fabric: merge_fabric_logs(stored.fabric, requested.fabric),
+    }
+}
+
+/// Merge `NodeFabricLogPublishingConfiguration`'s two log streams independently.
+fn merge_fabric_logs(
+    stored: Option<NodeFabricLogPublishingConfiguration>,
+    requested: Option<NodeFabricLogPublishingConfiguration>,
+) -> Option<NodeFabricLogPublishingConfiguration> {
+    let Some(requested) = requested else {
+        return stored;
+    };
+    let stored = stored.unwrap_or_default();
+    Some(NodeFabricLogPublishingConfiguration {
+        chaincode_logs: merge_log_configurations(stored.chaincode_logs, requested.chaincode_logs),
+        peer_logs: merge_log_configurations(stored.peer_logs, requested.peer_logs),
+    })
+}
+
+/// Merge one log stream's `LogConfigurations`; its only member is the CloudWatch one.
+fn merge_log_configurations(
+    stored: Option<LogConfigurations>,
+    requested: Option<LogConfigurations>,
+) -> Option<LogConfigurations> {
+    let Some(requested) = requested else {
+        return stored;
+    };
+    let stored = stored.unwrap_or_default();
+    Some(LogConfigurations {
+        cloudwatch: merge_log_configuration(stored.cloudwatch, requested.cloudwatch),
+    })
+}
+
+/// Merge one `LogConfiguration`: a named `Enabled` wins, an omitted one keeps the stored
+/// setting.
+fn merge_log_configuration(
+    stored: Option<LogConfiguration>,
+    requested: Option<LogConfiguration>,
+) -> Option<LogConfiguration> {
+    let Some(requested) = requested else {
+        return stored;
+    };
+    let stored = stored.unwrap_or_default();
+    Some(LogConfiguration {
+        enabled: requested.enabled.or(stored.enabled),
+    })
 }
