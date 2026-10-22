@@ -125,7 +125,7 @@ pub(crate) fn git_blob_id(content: &[u8]) -> String {
     hex::encode(&hasher.finalize()[..20])
 }
 
-fn is_object_id(value: &str) -> bool {
+pub(crate) fn is_object_id(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 

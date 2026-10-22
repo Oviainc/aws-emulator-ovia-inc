@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFileCommitHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFileCommitHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFileCommitHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation reports
+//!
+//! The revision DAG of ONE file: the commits reachable from the resolved commit
+//! specifier in whose tree the file's content differs from the content in every
+//! parent — the commits that changed the file — newest first, each carrying that
+//! commit's stored metadata, the blob the file had there, and the ids of the
+//! revisions that hold a more recent version of it (`revisionChildren`). It is a
+//! pure read: nothing in the store changes.
 //!
 //! ## Shape of an operation
 //!
@@ -102,8 +102,18 @@
 //!   provided commit specifiers is too great to determine whether there might be any merge
 //!   conflicts. Locally compare the specifiers using git diff or a diff tool.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 #[allow(unused_imports)]
 use super::types::*;
+
+/// File versions per page, both when the caller names no `maxResults` and as the
+/// SERVER-SIDE maximum a larger `maxResults` is clamped to — so the size of one
+/// response is fixed by this service, never by the request. CodeCommit pages this
+/// operation (`nextToken` in, `nextToken` out) but documents no page size, so this
+/// is the emulator's OWN, chosen like the `PAGE_SIZE` of
+/// `src/ops/list_repositories.rs`; the paging contract is what matters.
+pub const MAX_RESULTS_PER_PAGE: usize = 100;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -186,18 +196,192 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFileCommitHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFileCommitHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFileCommitHistory"))
+        let _ = ctx;
+        // `Path` carries no modelled constraint, so an empty or unusable `filePath`
+        // reaches the handler. This operation models no path error (unlike
+        // `GetFile`), so such a request is refused as invalid rather than answered
+        // with an empty history.
+        let file_path = crate::state::normalize_path(&input.file_path).map_err(|problem| {
+            crate::scaffolded::Scaffolded::validation(match problem {
+                crate::state::PathProblem::Missing => {
+                    "a file path is required (member: filePath)".to_string()
+                }
+                crate::state::PathProblem::Invalid => format!(
+                    "the path {} cannot name a file in a tree (member: filePath)",
+                    input.file_path
+                ),
+            })
+        })?;
+
+        // `maxResults` is "a non-zero, non-negative integer used to limit the number
+        // of returned results", so zero or a negative value is the modelled
+        // `InvalidMaxResultsException`. The model gives `Limit` no range, so the
+        // boundary validator passes such a value through to here. A larger value is
+        // served, not refused, but it only ever SHRINKS the page: the response size
+        // stays bounded by this service's own maximum rather than by the request.
+        let page_size = match input.max_results {
+            None => MAX_RESULTS_PER_PAGE,
+            Some(max_results) if max_results > 0 => usize::try_from(max_results)
+                .unwrap_or(MAX_RESULTS_PER_PAGE)
+                .min(MAX_RESULTS_PER_PAGE),
+            Some(max_results) => {
+                return Err(ListFileCommitHistoryErrorModeled::InvalidMaxResultsException(
+                    InvalidMaxResultsException {
+                        message: Some(format!(
+                            "the maxResults value {max_results} is not valid: a non-zero, non-negative integer is required"
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let store = state.lock();
+        let repository = store.repositories.get(&input.repository_name).ok_or_else(|| {
+            ListFileCommitHistoryErrorModeled::RepositoryDoesNotExistException(
+                RepositoryDoesNotExistException {
+                    message: Some(format!(
+                        "the repository {} does not exist",
+                        input.repository_name
+                    )),
+                },
+            )
+        })?;
+
+        // `commitSpecifier` names a commit or a branch; absent, it is the
+        // repository's default branch. A specifier that names neither — including
+        // the absent one in a repository with no default branch — is
+        // `CommitDoesNotExistException`, which is what that error documents.
+        let specifier = input
+            .commit_specifier
+            .clone()
+            .or_else(|| repository.default_branch.clone())
+            .unwrap_or_default();
+        let head = repository.resolve_commit(&specifier).ok_or_else(|| {
+            ListFileCommitHistoryErrorModeled::CommitDoesNotExistException(
+                CommitDoesNotExistException {
+                    message: Some(format!(
+                        "the commit {specifier} does not exist in the repository {}",
+                        input.repository_name
+                    )),
+                },
+            )
+        })?;
+
+        // The history this call reports on: everything reachable from the resolved
+        // commit. A commit is a VERSION of the file when its tree holds the path and
+        // the blob there differs from the blob every parent holds at that path — a
+        // commit that changed another file is no revision of this one.
+        let mut revisions: Vec<&crate::state::Commit> = repository
+            .ancestry(&head.commit_id)
+            .iter()
+            .filter_map(|commit_id| repository.commits.get(commit_id))
+            .filter(|commit| match commit.blob_at(&file_path) {
+                None => false,
+                Some(blob_id) => commit.parents.iter().all(|parent| {
+                    repository
+                        .commits
+                        .get(parent)
+                        .and_then(|parent| parent.blob_at(&file_path))
+                        != Some(blob_id)
+                }),
+            })
+            .collect();
+        // Newest first. A commit's sequence is its write order in the repository, so
+        // a commit always sorts before its own parents; the commit id breaks any
+        // remaining tie, which keeps a page boundary stable across calls.
+        revisions.sort_by(|left, right| {
+            right
+                .sequence
+                .cmp(&left.sequence)
+                .then_with(|| left.commit_id.cmp(&right.commit_id))
+        });
+
+        // One page of the ordered DAG. The token is the offset the next page starts
+        // at, and one is only ever emitted while versions remain, so an offset at or
+        // past the end of the history is refused rather than answered with an empty
+        // page.
+        let start = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => token
+                .parse::<usize>()
+                .ok()
+                .filter(|offset| *offset < revisions.len())
+                .ok_or_else(|| {
+                    ListFileCommitHistoryErrorModeled::InvalidContinuationTokenException(
+                        InvalidContinuationTokenException {
+                            message: Some(format!("the continuation token {token} is not valid")),
+                        },
+                    )
+                })?,
+        };
+        let end = revisions.len().min(start.saturating_add(page_size));
+
+        // The DAG edges: a revision's `revisionChildren` are the commits holding a
+        // more recent version of the file, which are the revisions whose nearest
+        // revision ancestor it is. Commits between two revisions left the file
+        // alone, so they are walked through rather than reported. Only an edge INTO
+        // this page is reported, and a child is always NEWER than its ancestor, so
+        // the walk starts at the revisions down to the page's end and nowhere
+        // else — the work is bounded by the page, not by the whole history. Every
+        // id is borrowed from the store rather than cloned.
+        let reported: BTreeSet<&str> = revisions[start..end]
+            .iter()
+            .map(|commit| commit.commit_id.as_str())
+            .collect();
+        let revision_ids: BTreeSet<&str> = revisions
+            .iter()
+            .map(|commit| commit.commit_id.as_str())
+            .collect();
+        let mut children: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for revision in revisions[..end].iter().copied() {
+            let mut walked: BTreeSet<&str> = BTreeSet::new();
+            let mut pending: Vec<&str> = revision.parents.iter().map(String::as_str).collect();
+            while let Some(commit_id) = pending.pop() {
+                if !walked.insert(commit_id) {
+                    continue;
+                }
+                if let Some(ancestor) = revision_ids.get(commit_id) {
+                    if reported.contains(ancestor) {
+                        children
+                            .entry(ancestor)
+                            .or_default()
+                            .push(revision.commit_id.clone());
+                    }
+                    continue;
+                }
+                if let Some(ancestor) = repository.commits.get(commit_id) {
+                    pending.extend(ancestor.parents.iter().map(String::as_str));
+                }
+            }
+        }
+
+        let revision_dag: Vec<FileVersion> = revisions[start..end]
+            .iter()
+            .map(|commit| FileVersion {
+                commit: Some(commit.info()),
+                blob_id: commit.blob_at(&file_path).map(str::to_string),
+                path: Some(file_path.clone()),
+                // "If there are no additional versions of the file, this array will
+                // be empty" — so the newest revision reports an empty list rather
+                // than an absent one.
+                revision_children: Some(
+                    children
+                        .get(commit.commit_id.as_str())
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+            })
+            .collect();
+
+        Ok(ListFileCommitHistoryOutput {
+            revision_dag,
+            next_token: (end < revisions.len()).then(|| end.to_string()),
+        })
     }
 }

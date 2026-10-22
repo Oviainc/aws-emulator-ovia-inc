@@ -200,6 +200,12 @@ impl Commit {
             additional_data: None,
         }
     }
+
+    /// The id of the blob this commit's tree holds at `path`, or `None` where the
+    /// tree does not hold that path at all.
+    pub fn blob_at(&self, path: &str) -> Option<&str> {
+        self.files.get(path).map(|entry| entry.blob_id.as_str())
+    }
 }
 
 /// The comparison a comment was posted on: the two commits that establish its
@@ -359,6 +365,24 @@ impl Repository {
             return self.commits.get(&branch.commit_id);
         }
         self.commits.get(specifier)
+    }
+
+    /// Every commit id reachable from `commit_id` by following parents, including
+    /// `commit_id` itself: the history a read at that commit sees. An id whose
+    /// commit [`Repository::prune_history`] has dropped is still reported, because
+    /// a retained commit's `parents` keeps naming it.
+    pub fn ancestry(&self, commit_id: &str) -> std::collections::BTreeSet<String> {
+        let mut reachable = std::collections::BTreeSet::new();
+        let mut pending = vec![commit_id.to_string()];
+        while let Some(id) = pending.pop() {
+            if !reachable.insert(id.clone()) {
+                continue;
+            }
+            if let Some(commit) = self.commits.get(&id) {
+                pending.extend(commit.parents.iter().cloned());
+            }
+        }
+        reachable
     }
 
     /// Drop the oldest commits beyond [`MAX_COMMITS_RETAINED`], then every blob no
