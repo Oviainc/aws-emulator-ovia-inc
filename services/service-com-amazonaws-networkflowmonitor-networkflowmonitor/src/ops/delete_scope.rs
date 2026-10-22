@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteScope
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteScope`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteScope::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a scope from this service's store ([`crate::state`]), so the next
+//! `GetScope` answers the modelled `ResourceNotFoundException` and nothing resolves
+//! its ARN any more. Deleting an id the store does not hold is that same 404: the
+//! scope is gone after the first call, which is what `@idempotent` amounts to here.
+//!
+//! "Deletes a scope that has been defined" is all the model documents, so this
+//! handler deletes exactly the scope: it neither cascades into the monitors created
+//! under the scope's ARN nor invents an "in use" refusal for them, so a monitor keeps
+//! reporting the `scopeArn` it was created with (now the ARN of a resource that no
+//! longer exists), while a later `CreateMonitor` naming that ARN is refused because
+//! the ARN resolves to no scope.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +149,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteScope` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteScopeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteScope"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteScopeErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+        state.settle(::std::time::SystemTime::now());
+
+        let Some(scope) = state.scopes.remove(&input.scope_id) else {
+            return Err(DeleteScopeErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::SCOPE_RESOURCE, &input.scope_id),
+            )
+            .into());
+        };
+
+        // The records that named the scope go with it: its ARN, so no later operation
+        // resolves an ARN to a scope that is gone, and the idempotency record, so a
+        // replayed `CreateScope` mints a new scope rather than answering with a dead
+        // one and the store stays bounded by the scopes that are still live.
+        state.arn_index.remove(&scope.scope_arn);
+        state
+            .scope_idempotency
+            .retain(|_, scope_id| scope_id != &scope.scope_id);
+
+        // `DeleteScopeOutput` models no members: the answer is the 200 itself.
+        Ok(DeleteScopeOutput {})
     }
 }

@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     ArtifactConfigOutput, BrowserConfig, Canary, CanaryCodeOutput, CanaryRun,
     CanaryRunConfigOutput, CanaryRunStatus, CanaryRunTimeline, CanaryScheduleOutput, CanaryStatus,
-    CanaryTimeline, Dependency, RetryConfigOutput, RuntimeVersion, S3EncryptionConfig,
+    CanaryTimeline, Dependency, Group, RetryConfigOutput, RuntimeVersion, S3EncryptionConfig,
     VpcConfigOutput,
 };
 
@@ -38,6 +38,33 @@ use crate::ops::types::{
 /// ids minted by different processes differ too. NOTHING about the request enters the
 /// seed: an id is not derived from client input.
 pub fn new_uuid() -> String {
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&fresh_digest()[..16]);
+    // Version 4 in the high nibble of byte 6 and the RFC 4122 variant in the top bits of
+    // byte 8, the layout a random UUID carries on the wire.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    let digits = ::hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &digits[0..8],
+        &digits[8..12],
+        &digits[12..16],
+        &digits[16..20],
+        &digits[20..32]
+    )
+}
+
+/// Sixteen-plus bytes of fresh, request-independent entropy: SHA-256 (the `sha2` crate,
+/// not a hand-written hash) over a seed that is unique per call.
+///
+/// The seed is a process-unique counter, the current instant and one operating-system
+/// seeded value per process, so two values drawn by one process differ by construction and
+/// values drawn by different processes differ too. NOTHING about the request enters the
+/// seed: an identifier is never derived from client input. Shared by every identifier this
+/// service mints ([`new_uuid`], [`new_group_id`]) so there is one entropy source.
+fn fresh_digest() -> [u8; 32] {
     use sha2::Digest as _;
 
     /// Distinguishes two ids minted in the same instant by the same process.
@@ -61,22 +88,26 @@ pub fn new_uuid() -> String {
     digest.update(process_seed.to_le_bytes());
     digest.update(minted.to_le_bytes());
     digest.update(nanos.to_le_bytes());
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest.finalize()[..16]);
-    // Version 4 in the high nibble of byte 6 and the RFC 4122 variant in the top bits of
-    // byte 8, the layout a random UUID carries on the wire.
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    digest.finalize().into()
+}
 
-    let digits = ::hex::encode(bytes);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &digits[0..8],
-        &digits[8..12],
-        &digits[12..16],
-        &digits[16..20],
-        &digits[20..32]
-    )
+/// How many bytes of digest a minted group id carries, which hex-encoding doubles into
+/// twelve characters. `Group$Id` is modelled only as a string (`length 1..1024`), but
+/// `Group$Arn`'s pattern pins the resource segment it appears in to `group:[0-9a-z]+`, and
+/// the real service's ids are a short fixed-width token; twelve characters is that width.
+const GROUP_ID_BYTES: usize = 6;
+
+/// Mint a fresh group id.
+///
+/// `Group$Arn` is modelled as
+/// `^arn:(aws[a-zA-Z-]*)?:synthetics:…:\d{12}:group:[0-9a-z]+$`, so a group's id is the
+/// ARN's resource segment and must be lowercase alphanumeric. This mints
+/// [`GROUP_ID_BYTES`] bytes from [`fresh_digest`] as hex digits — a subset of that
+/// alphabet — hex-encoded with the `hex` crate rather than a hand-written codec. Nothing
+/// about the request enters it: an id is not derived from the group's name.
+pub fn new_group_id() -> String {
+    let digest = fresh_digest();
+    ::hex::encode(&digest[..GROUP_ID_BYTES])
 }
 
 /// Whether `value` has the shape the model gives `Canary$Id` and `CanaryRun$Id`:
@@ -173,6 +204,18 @@ pub const CANARY_NOT_FOUND: &str = "Canary not found.";
 /// rule as [`CANARY_NOT_FOUND`]: a missing-resource message names the resource KIND that
 /// was not found and never the identifier the request asked for.
 pub const DRY_RUN_NOT_FOUND: &str = "Dry run not found.";
+
+/// `ResourceNotFoundException$Message` for a group that does not exist, by the same rule
+/// as [`CANARY_NOT_FOUND`]: the sentence names the resource KIND and never the
+/// `GroupIdentifier` the request asked for.
+pub const GROUP_NOT_FOUND: &str = "Group not found.";
+
+/// The most groups this store holds, which is also the real service's quota: "You can have
+/// as many as 20 groups in your account" (`CreateGroup`'s own documentation, via
+/// `smithy_query(query="doc",shape="CreateGroup")`). A caller past this bound is past the
+/// real service's bound too and is refused with the modelled
+/// `ServiceQuotaExceededException`.
+pub const MAX_GROUPS: usize = 20;
 
 /// The most canaries this store holds, so a request-driven create loop cannot grow it
 /// without limit.
@@ -567,11 +610,62 @@ impl StoredCanary {
     }
 }
 
+/// One group, as this emulator persists it. Every reported field is read from here.
+///
+/// A group is a plain container: the model gives it an id, a name, an ARN, tags and the
+/// two timestamps, and no status — `CreateGroup` returns it ready, so there is no
+/// transition the clock owes it.
+#[derive(Debug, Clone)]
+pub struct StoredGroup {
+    pub id: String,
+    pub name: String,
+    /// The Region the create was signed for, which is the Region in the group's ARN:
+    /// "Although the group ARN format reflects the Region name where it was created, a
+    /// group is not constrained to any Region."
+    pub region: String,
+    pub created: SystemTime,
+    pub last_modified: SystemTime,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl StoredGroup {
+    /// This group's ARN: `arn:aws:synthetics:<region>:<account>:group:<id>`.
+    pub fn arn(&self) -> String {
+        group_arn(&self.region, &self.id)
+    }
+
+    /// Project this record onto the modelled `Group` shape. The ONLY way a handler
+    /// produces a `Group`, so `CreateGroup` and `GetGroup` cannot disagree about the
+    /// same record.
+    pub fn to_group(&self) -> Group {
+        Group {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            arn: Some(self.arn()),
+            // `TagMap` is modelled `length 1..50`, so an untagged group reports no map
+            // rather than an empty one.
+            tags: (!self.tags.is_empty()).then(|| {
+                self.tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+            created_time: Some(self.created.into()),
+            last_modified_time: Some(self.last_modified.into()),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-synthetics-synthetics. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSyntheticsSyntheticsState {
     /// Canaries by name — the identity the API addresses them by.
     pub canaries: BTreeMap<String, StoredCanary>,
+    /// Groups by name. "The names for all groups in your account, across all Regions,
+    /// must be unique" (`CreateGroupRequest$Name`), so the name is a key; a [`BTreeMap`]
+    /// because `ListGroups` pages over this collection and a tokenised page boundary
+    /// needs a total, stable order.
+    pub groups: BTreeMap<String, StoredGroup>,
 }
 
 impl ComAmazonawsSyntheticsSyntheticsState {
@@ -582,6 +676,44 @@ impl ComAmazonawsSyntheticsSyntheticsState {
             canary.settle(now);
         }
     }
+
+    /// The group a `GroupIdentifier` names, if the store holds it.
+    ///
+    /// `GetGroupRequest$GroupIdentifier` (and every other group-addressing member):
+    /// "You can specify the group name, the ARN, or the group ID as the GroupIdentifier",
+    /// so exactly those three forms resolve to the same record. An ARN identifies a group
+    /// only when it is THAT group's whole ARN: the partition, the service, the Region and
+    /// the account are part of a resource's identity, so an ARN naming another service or
+    /// another account resolves to nothing rather than to the local group that happens to
+    /// share its resource segment.
+    pub fn group_by_identifier(&self, identifier: &str) -> Option<&StoredGroup> {
+        if let Some(group) = self.groups.get(identifier) {
+            return Some(group);
+        }
+        if identifier.starts_with(ARN_PREFIX) {
+            return self
+                .groups
+                .values()
+                .find(|group| group.arn() == identifier);
+        }
+        self.groups
+            .values()
+            .find(|group| group.id == identifier)
+    }
+}
+
+/// Every ARN starts with this, which is what tells an ARN-form identifier apart from a
+/// group name or a group id.
+pub const ARN_PREFIX: &str = "arn:";
+
+/// A group's ARN: `arn:aws:synthetics:<region>:<account>:group:<id>`.
+///
+/// `Group$Arn` is modelled
+/// `^arn:(aws[a-zA-Z-]*)?:synthetics:[a-z]{2,4}(-[a-z]{2,4})?-[a-z]+-\d{1}:\d{12}:group:[0-9a-z]+$`,
+/// so the resource segment carries the group's ID — not its name, which may hold "any
+/// Unicode characters".
+pub fn group_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn("synthetics", region, &format!("group:{id}"))
 }
 
 /// `RuntimeVersion$Description` for the Node.js/Puppeteer runtime family.
@@ -862,6 +994,23 @@ pub fn request_region(headers: &::http::HeaderMap) -> String {
     ::emulator_server::sigv4_credential_scope(headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The `target` every audit record this service emits carries, so a consumer can select
+/// the access trail without reading the rest of the emulator's traces.
+///
+/// A state-changing operation emits ONE record, at `INFO`, naming the operation, the
+/// caller's presented access key id, the Region the request resolved to, the resource it
+/// changed and the outcome. Metadata only — never a request body, a tag value or a
+/// credential secret.
+pub const AUDIT_TARGET: &str = "emulator::audit";
+
+/// The identity a request presents, for an audit record: the access key id in its SigV4
+/// credential scope. `emulator_server::extract_akid` answers `"default"` when the request
+/// carries no scope. An access key id NAMES a caller and is not a secret — the signature
+/// and the secret key are never read here.
+pub fn request_caller(parts: &::http::request::Parts) -> String {
+    ::emulator_server::extract_akid(&parts.headers)
 }
 
 /// The region an unsigned request is attributed to.

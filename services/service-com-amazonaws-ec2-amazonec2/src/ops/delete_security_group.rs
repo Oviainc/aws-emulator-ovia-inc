@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSecurityGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSecurityGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes a stored security group once nothing references it, refusing the
+//! default group of a VPC — which only `DeleteVpc` removes.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSecurityGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +134,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSecurityGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSecurityGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSecurityGroup"))
+        // `ctx` carries request metadata only; this operation reads none of it — a group is
+        // named by id, or by name within the default VPC. The store is reached through the
+        // engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // Whether an instance still holds the group is a question about the CURRENT states,
+        // so a termination the clock already owed is applied before it is asked: the move
+        // was due at that instant whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "You can specify either the security group name or the security group ID"
+        // (`DeleteSecurityGroupRequest$GroupName`) — and a name only names a group of the
+        // DEFAULT VPC: "For security groups in a nondefault VPC, you must specify the
+        // security group ID", because a name is unique per VPC and not per account.
+        let group_id = match (input.group_id.as_deref(), input.group_name.as_deref()) {
+            (None, None) => {
+                return Err(state::missing_parameter(
+                    "The request must contain either the parameter GroupId or GroupName",
+                ))
+            }
+            (Some(group_id), None) => group_id.to_string(),
+            (None, Some(group_name)) => {
+                let default_vpc = store
+                    .default_vpc_id()
+                    .ok_or_else(|| state::invalid_group_not_found(group_name))?;
+                store
+                    .security_group_id_for_name(&default_vpc, group_name)
+                    .ok_or_else(|| state::invalid_group_not_found(group_name))?
+            }
+            (Some(group_id), Some(group_name)) => {
+                // Both members name one group, so they have to name the SAME group:
+                // honouring the id and ignoring a name that disagrees would delete a group
+                // the request did not ask for.
+                let named = store
+                    .security_groups
+                    .get(group_id)
+                    .and_then(|group| group.group_name.as_deref());
+                if !named.is_some_and(|held| held.eq_ignore_ascii_case(group_name)) {
+                    return Err(state::invalid_parameter_combination(format!(
+                        "The security group '{group_id}' is not named '{group_name}'"
+                    )));
+                }
+                group_id.to_string()
+            }
+        };
+
+        // A group id this account holds no group for is a refusal, not a no-op — a caller
+        // that deletes twice has to be able to tell the deletion it performed from one it
+        // did not.
+        if !store.security_groups.contains_key(&group_id) {
+            return Err(state::invalid_group_not_found(&group_id));
+        }
+        // "When you delete the VPC, it deletes the default security group" (`DeleteVpc`):
+        // the default group of a VPC lives exactly as long as its VPC, so deleting it on its
+        // own is refused rather than leaving the VPC without the group an instance is
+        // launched into by default.
+        if store.is_default_security_group(&group_id) {
+            return Err(state::cannot_delete(&group_id));
+        }
+        // "If you attempt to delete a security group that is associated with an instance or
+        // network interface, is referenced by another security group in the same VPC, or has
+        // a VPC association, the operation fails with `DependencyViolation`"
+        // (`DeleteSecurityGroup`).
+        let dependencies = store.security_group_dependencies(&group_id);
+        if !dependencies.is_empty() {
+            return Err(state::dependency_violation(format!(
+                "The security group '{group_id}' has dependencies and cannot be deleted: \
+                 {held}",
+                held = dependencies.join(", "),
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (DryRun).
+        // Nothing has been removed yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // `remove_security_group` is what gives the record's caller-supplied bytes back to
+        // the store's budget.
+        if store.remove_security_group(&group_id).is_none() {
+            return Err(state::internal_error(
+                "the security group checked a moment ago could not be removed",
+            ));
+        }
+        // "Returns true if the request succeeds; otherwise, returns an error"
+        // (`DeleteSecurityGroupResult$Return`), beside "the ID of the deleted security
+        // group" — which is the id the request resolved to, whether it named the group by
+        // id or by name.
+        Ok(DeleteSecurityGroupOutput {
+            r#return: Some(true),
+            group_id: Some(group_id),
+        })
     }
 }
