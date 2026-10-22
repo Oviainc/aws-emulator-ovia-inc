@@ -7,6 +7,9 @@
 //! rule under test is the registry's own: a repository and an image are whatever the
 //! create or the push stored, addressed by name and by content digest, and every
 //! reporting operation computes its answer from those records.
+//!
+//! `manifest_digest` and `given_repository` are `pub(crate)` so a sibling suite under
+//! `tests/all/` reuses them beside the shared wire harness in `tests/all/wire.rs`.
 
 use std::collections::BTreeSet;
 
@@ -50,7 +53,7 @@ type ScanningCase<'a> = (&'a str, &'a str, Option<bool>, Vec<bool>, bool);
 
 /// The digest a registry addresses a manifest by: `sha256:<hex>` over the manifest
 /// bytes. Computed here independently of the crate's own helper.
-fn manifest_digest(manifest: &str) -> String {
+pub(crate) fn manifest_digest(manifest: &str) -> String {
     use sha2::{Digest, Sha256};
     format!("sha256:{}", hex::encode(Sha256::digest(manifest.as_bytes())))
 }
@@ -71,7 +74,11 @@ fn listed_pairs(body: &Value) -> BTreeSet<ImagePair> {
 }
 
 /// Create a repository that the case under test only needs to exist.
-async fn given_repository(router: &MultiServiceRouter, name: &str, request: Value) -> Value {
+pub(crate) async fn given_repository(
+    router: &MultiServiceRouter,
+    name: &str,
+    request: Value,
+) -> Value {
     let mut request = request;
     request["repositoryName"] = json!(name);
     ok(router, name, "CreateRepository", &request).await
