@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPodIdentityAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPodIdentityAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPodIdentityAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the EKS Pod Identity associations one cluster holds, as this
+//! service's state records them (`crate::state::pod_identity_associations`),
+//! optionally narrowed by `namespace` and `serviceAccount` and paged by
+//! `maxResults`/`nextToken`. It is a REPORTING operation: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -103,6 +99,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{self, DEFAULT_LIST_PAGE_SIZE, POD_IDENTITY_ASSOCIATIONS_LISTING};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -175,18 +172,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPodIdentityAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPodIdentityAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPodIdentityAssociations"))
+        let region = state::request_region(ctx.parts());
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPodIdentityAssociationsError::from(
+                ListPodIdentityAssociationsErrorModeled::ServerException(ServerException {
+                    cluster_name: Some(input.cluster_name.clone()),
+                    message: Some("the eks emulator store is unavailable".to_string()),
+                    ..Default::default()
+                }),
+            )
+        })?;
+
+        // FORM FIRST, as every other pod identity operation does: a `clusterName`
+        // outside `CreateCluster$name`'s own pattern and length names no cluster in
+        // any account or Region, so it is an invalid parameter rather than a
+        // not-found — and it is checked BEFORE the pagination members, so the
+        // refusal does not depend on what else the request carried. The member
+        // carries no modelled constraint, so nothing refused it before this handler
+        // ran.
+        if !state::is_cluster_name(&input.cluster_name) {
+            return Err(
+                ListPodIdentityAssociationsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        cluster_name: Some(input.cluster_name.clone()),
+                        message: Some(state::cluster_name_refusal(
+                            "clusterName",
+                            &input.cluster_name,
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A `nextToken` names the association to resume AFTER. One this service did
+        // not issue — including one another listing of this service issued, which is
+        // what the token's listing scope separates — is a bad parameter, not an empty
+        // page.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_scoped_page_token(POD_IDENTITY_ASSOCIATIONS_LISTING, token)
+                    .ok_or_else(|| {
+                        ListPodIdentityAssociationsError::from(
+                            ListPodIdentityAssociationsErrorModeled::InvalidParameterException(
+                                InvalidParameterException {
+                                    cluster_name: Some(input.cluster_name.clone()),
+                                    message: Some(
+                                        "Member must be a nextToken returned by a previous \
+                                         ListPodIdentityAssociations call"
+                                            .to_string(),
+                                    ),
+                                    ..Default::default()
+                                },
+                            ),
+                        )
+                    })?,
+            ),
+        };
+
+        // `maxResults` is modelled 1..100, so a value outside that range is REFUSED by
+        // schema validation before this handler runs. It is not coerced here — that
+        // would quietly hide a future gap in that validation — so a value this handler
+        // cannot page with is refused as the bad parameter it is. Only the ABSENT case
+        // gets a value: "If you don't use this parameter, ListPodIdentityAssociations
+        // returns up to 100 results".
+        let page_size = match input.max_results {
+            None => DEFAULT_LIST_PAGE_SIZE as usize,
+            Some(requested) => usize::try_from(requested)
+                .ok()
+                .filter(|size| *size > 0)
+                .ok_or_else(|| {
+                    ListPodIdentityAssociationsError::from(
+                        ListPodIdentityAssociationsErrorModeled::InvalidParameterException(
+                            InvalidParameterException {
+                                cluster_name: Some(input.cluster_name.clone()),
+                                message: Some(format!(
+                                    "1 validation error detected: Value '{requested}' at \
+                                     'maxResults' failed to satisfy constraint: Member must \
+                                     have value greater than or equal to 1"
+                                )),
+                                ..Default::default()
+                            },
+                        ),
+                    )
+                })?,
+        };
+
+        // Nothing here materialises a clock-owed transition: an association carries no
+        // status, and whether the CLUSTER is still `CREATING` does not change which
+        // associations it holds — only that it exists.
+        let guard = store.lock();
+        // A `clusterName` names a cluster only within the region the request is signed
+        // for, so an unknown name there is not found even if another region holds one.
+        if !guard
+            .clusters
+            .contains_key(&(region.clone(), input.cluster_name.clone()))
+        {
+            return Err(
+                ListPodIdentityAssociationsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        cluster_name: Some(input.cluster_name.clone()),
+                        message: Some(format!(
+                            "No cluster found for name: {}.",
+                            input.cluster_name
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You can filter the list by the namespace that the association is in or the
+        // service account that the association uses": each filter is an exact match on
+        // that member, and an absent filter narrows nothing.
+        let mut remaining = guard
+            .pod_identity_associations_in(&region, &input.cluster_name)
+            .filter(|record| {
+                input
+                    .namespace
+                    .as_deref()
+                    .is_none_or(|namespace| record.namespace == namespace)
+            })
+            .filter(|record| {
+                input
+                    .service_account
+                    .as_deref()
+                    .is_none_or(|account| record.service_account == account)
+            })
+            .filter(|record| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| record.association_id.as_str() > after)
+            });
+        // The page is taken as RECORDS, so the token below names the id of the record
+        // that was paged over rather than re-reading it out of the summary projection
+        // (which declares every member optional).
+        let page: Vec<&crate::state::PodIdentityAssociationRecord> =
+            remaining.by_ref().take(page_size).collect();
+        // "This value is null when there are no more results to return", so a token is
+        // returned only when something is left to resume from.
+        let next_token = match (remaining.next(), page.last()) {
+            (Some(_), Some(last)) => Some(state::encode_scoped_page_token(
+                POD_IDENTITY_ASSOCIATIONS_LISTING,
+                &last.association_id,
+            )),
+            _ => None,
+        };
+        let associations: Vec<PodIdentityAssociationSummary> = page
+            .into_iter()
+            .map(crate::state::PodIdentityAssociationRecord::to_summary)
+            .collect();
+
+        Ok(ListPodIdentityAssociationsOutput {
+            associations: Some(associations),
+            next_token,
+        })
     }
 }
