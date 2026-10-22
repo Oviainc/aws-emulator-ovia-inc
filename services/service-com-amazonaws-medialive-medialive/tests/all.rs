@@ -17,5 +17,8 @@ mod channel_lifecycle;
 #[path = "all/input_lifecycle.rs"]
 mod input_lifecycle;
 
+#[path = "all/input_security_group.rs"]
+mod input_security_group;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

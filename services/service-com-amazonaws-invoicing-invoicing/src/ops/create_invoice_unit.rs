@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInvoiceUnit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInvoiceUnit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInvoiceUnit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an invoice unit, persists it in [`crate::state`] keyed by the ARN it minted,
+//! and returns that ARN. `@idempotent`: a repeat carrying the same `ClientToken`
+//! returns the ARN the first call minted and creates nothing further.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +157,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInvoiceUnit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInvoiceUnitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInvoiceUnit"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateInvoiceUnitErrorModeled::InternalServerException(crate::state::state_unavailable())
+        })?;
+        let mut store = state.lock();
+        let client_token = input.client_token.as_deref();
+
+        // `@idempotent`: a replay of the same request (same `ClientToken` and the same
+        // `Name` it creates) answers with the ARN the first call minted rather than
+        // minting a second invoice unit. A record whose unit has since been deleted is
+        // not a replay: there is nothing left to answer with, so the request creates.
+        if let Some(arn) = store.replayed_result(Self::NAME, &input.name, client_token) {
+            if store.invoice_units.contains_key(&arn) {
+                return Ok(CreateInvoiceUnitOutput {
+                    invoice_unit_arn: Some(arn),
+                });
+            }
+        }
+
+        // The model's `ValidationExceptionReason` declares `maxInvoiceUnitsExceeded`, so
+        // the real service refuses a create past its maximum; this emulator's maximum is
+        // `MAX_INVOICE_UNITS`.
+        if store.invoice_units.len() >= crate::state::MAX_INVOICE_UNITS {
+            return Err(CreateInvoiceUnitErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "This account already holds the maximum of {} invoice units",
+                    crate::state::MAX_INVOICE_UNITS
+                )),
+                reason: Some("maxInvoiceUnitsExceeded".to_string()),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // `Name` is documented as "a unique name that is distinctive within your Amazon
+        // Web Services [account]", and the model's `ValidationExceptionReason` enum
+        // carries `duplicateInvoiceUnit` for the collision.
+        if store.invoice_units.values().any(|unit| unit.name == input.name) {
+            return Err(CreateInvoiceUnitErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "An invoice unit named {} already exists in this account",
+                    input.name
+                )),
+                reason: Some("duplicateInvoiceUnit".to_string()),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        let arn = store.mint_invoice_unit_arn();
+        let created_at = crate::state::now();
+        let name = input.name;
+        let unit = crate::state::StoredInvoiceUnit {
+            arn: arn.clone(),
+            name: name.clone(),
+            invoice_receiver: input.invoice_receiver,
+            created_at,
+            current: crate::state::InvoiceUnitVersion {
+                description: input.description,
+                tax_inheritance_disabled: input.tax_inheritance_disabled,
+                rule: input.rule,
+                last_modified: created_at,
+            },
+            superseded: Vec::new(),
+        };
+        store.invoice_units.insert(arn.clone(), unit);
+
+        if let Some(tags) = input.resource_tags {
+            let tags = tags
+                .into_iter()
+                .map(|tag| (tag.key, tag.value))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            store.resource_tags.insert(arn.clone(), tags);
+        }
+
+        store.record_result(Self::NAME, &name, client_token, &arn);
+        Ok(CreateInvoiceUnitOutput {
+            invoice_unit_arn: Some(arn),
+        })
     }
 }
