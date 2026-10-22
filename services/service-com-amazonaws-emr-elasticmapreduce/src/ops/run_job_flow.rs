@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RunJobFlow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RunJobFlow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RunJobFlow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a cluster id, persists a [`crate::state::ClusterRecord`] built from the
+//! request (with one [`crate::state::StepRecord`] per submitted `StepConfig`) in the
+//! shared engine, and answers with that cluster's id and ARN. Every later request reads
+//! the record this handler wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -300,18 +295,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RunJobFlow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RunJobFlowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RunJobFlow"))
+        use crate::state::{
+            cluster_state, ClusterRecord, ClusterStatusRecord, InstancesRecord, StepRecord,
+            DEFAULT_STEP_CONCURRENCY_LEVEL, MAX_STEPS_PER_JOB_FLOW, MAX_STEP_CONCURRENCY_LEVEL,
+            TRANSITION_SPAN,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut input = input;
+
+        // "The RunJobFlow request can contain InstanceFleets parameters or
+        // InstanceGroups parameters, but not both." (RunJobFlow doc.) The model cannot
+        // express the exclusion, so it is refused here rather than at the boundary.
+        let has_groups = input
+            .instances
+            .instance_groups
+            .as_ref()
+            .is_some_and(|groups| !groups.is_empty());
+        let has_fleets = input
+            .instances
+            .instance_fleets
+            .as_ref()
+            .is_some_and(|fleets| !fleets.is_empty());
+        if has_groups && has_fleets {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Instances may carry InstanceGroups or InstanceFleets, but not both",
+            ));
+        }
+
+        // "A maximum of 256 steps are allowed in each job flow." (RunJobFlow doc.)
+        let step_configs = input.steps.take().unwrap_or_default();
+        if step_configs.len() > MAX_STEPS_PER_JOB_FLOW {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Steps carries {} steps; a maximum of {MAX_STEPS_PER_JOB_FLOW} steps are \
+                 allowed in each job flow",
+                step_configs.len(),
+            )));
+        }
+
+        // "Specifies the number of steps that can be executed concurrently. The default
+        // value is 1. The maximum value is 256." (RunJobFlow$StepConcurrencyLevel doc.)
+        let step_concurrency_level = input
+            .step_concurrency_level
+            .unwrap_or(DEFAULT_STEP_CONCURRENCY_LEVEL);
+        if !(DEFAULT_STEP_CONCURRENCY_LEVEL..=MAX_STEP_CONCURRENCY_LEVEL)
+            .contains(&step_concurrency_level)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "StepConcurrencyLevel {step_concurrency_level} is outside \
+                 {DEFAULT_STEP_CONCURRENCY_LEVEL}..{MAX_STEP_CONCURRENCY_LEVEL}"
+            )));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RunJobFlowErrorModeled::InternalServerError(InternalServerError {}).into());
+        };
+        let mut store = state.lock();
+
+        let id = store.mint_cluster_id();
+        let arn = crate::state::cluster_arn(&region, &id);
+        let instances = InstancesRecord::from_config(&input.instances);
+
+        // One Step record per submitted StepConfig, in submission order.
+        let mut steps = Vec::with_capacity(step_configs.len());
+        for config in step_configs {
+            let step_id = store.mint_step_id();
+            steps.push(StepRecord::from_config(
+                step_id,
+                config,
+                input.step_execution_role_arn.clone(),
+                now,
+            ));
+        }
+
+        let record = ClusterRecord {
+            id: id.clone(),
+            arn: arn.clone(),
+            name: input.name,
+            release_label: input.release_label,
+            requested_ami_version: input.ami_version,
+            log_uri: input.log_uri,
+            log_encryption_kms_key_id: input.log_encryption_kms_key_id,
+            service_role: input.service_role,
+            job_flow_role: input.job_flow_role,
+            auto_scaling_role: input.auto_scaling_role,
+            scale_down_behavior: input.scale_down_behavior,
+            custom_ami_id: input.custom_ami_id,
+            security_configuration: input.security_configuration,
+            os_release_label: input.os_release_label,
+            repo_upgrade_on_boot: input.repo_upgrade_on_boot,
+            // "The VisibleToAllUsers parameter is no longer supported. By default, the
+            // value is set to true. Setting it to false now has no effect."
+            // (RunJobFlow$VisibleToAllUsers doc.)
+            visible_to_all_users: true,
+            // "Specifies whether the cluster should terminate after completing all
+            // steps" (Cluster$AutoTerminate) — the complement of the request's
+            // KeepJobFlowAliveWhenNoSteps.
+            auto_terminate: !instances.keep_job_flow_alive_when_no_steps,
+            step_concurrency_level,
+            ebs_root_volume_size: input.ebs_root_volume_size,
+            ebs_root_volume_iops: input.ebs_root_volume_iops,
+            ebs_root_volume_throughput: input.ebs_root_volume_throughput,
+            extended_support: input.extended_support,
+            session_enabled: input.session_enabled,
+            applications: input.applications.unwrap_or_default(),
+            configurations: input.configurations.unwrap_or_default(),
+            bootstrap_actions: input.bootstrap_actions.unwrap_or_default(),
+            placement_groups: input.placement_group_configs.unwrap_or_default(),
+            kerberos_attributes: input.kerberos_attributes,
+            monitoring_configuration: input.monitoring_configuration,
+            instances,
+            tags: input.tags.unwrap_or_default(),
+            status: ClusterStatusRecord {
+                // A new cluster is not up yet; the clock owes it the move to RUNNING,
+                // or to WAITING when it is to stay alive with no steps.
+                state: cluster_state::STARTING.to_string(),
+                state_change_reason: None,
+                creation_date_time: now,
+                ready_date_time: None,
+                end_date_time: None,
+                ready_due_at: Some(now + TRANSITION_SPAN),
+                terminated_due_at: None,
+            },
+            steps,
+        };
+        store.clusters.insert(id.clone(), record);
+        drop(store);
+
+        Ok(RunJobFlowOutput {
+            job_flow_id: Some(id),
+            cluster_arn: Some(arn),
+        })
     }
 }
