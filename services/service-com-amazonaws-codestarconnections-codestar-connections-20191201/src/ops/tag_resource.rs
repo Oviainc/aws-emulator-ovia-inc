@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: merges the tags onto the stored resource's tag map in
+//! [`crate::state`]. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -80,9 +73,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codestarconnections-cod
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codestarconnections#TagResource")]
+// `InternalServerException` is widened in through `extra_errors`: the service models it
+// (see `types::shared_types`) but this operation does not list it, and it is the only
+// honest answer for "this service is mounted on an engine that holds no state" — a 400
+// would blame the caller's request and a 501 would claim the operation is unwritten.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codestarconnections#TagResource",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
+    InternalServerException(InternalServerException),
     LimitExceededException(LimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
@@ -138,18 +139,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "CodeStar connections state is unavailable on this engine".to_string(),
+                ),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // Tags attach to a resource this service holds; an ARN naming no stored
+        // resource is not taggable.
+        if !store.connections.contains_key(&input.resource_arn) {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Could not find resource {}", input.resource_arn)),
+                },
+            )
+            .into());
+        }
+        // A resource holds at most as many tags as one request could set
+        // (`TagList` is modeled `len 0..200`), so repeated merges cannot grow it past
+        // what the service accepts at once.
+        let merged = store.tag_count_after_merge(&input.resource_arn, &input.tags);
+        if merged > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Exceeded the maximum limit of {} tags for resource {}",
+                        crate::state::MAX_TAGS_PER_RESOURCE, input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        }
+        store.merge_tags(&input.resource_arn, &input.tags);
+
+        Ok(TagResourceOutput::default())
     }
 }

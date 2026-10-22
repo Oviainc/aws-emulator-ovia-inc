@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a connection, persists it in [`crate::state`] and answers out of
+//! that record. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -96,9 +89,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codestarconnections-cod
 // here — hence the `CreateConnectionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codestarconnections#CreateConnection")]
+// `InternalServerException` is widened in through `extra_errors`: the service models it
+// (see `types::shared_types`) but this operation does not list it, and it is the only
+// honest answer for "this service is mounted on an engine that holds no state" — a 400
+// would blame the caller's request and a 501 would claim the operation is unwritten.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codestarconnections#CreateConnection",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateConnectionErrorModeled {
+    InternalServerException(InternalServerException),
     LimitExceededException(LimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
     ResourceUnavailableException(ResourceUnavailableException),
@@ -155,18 +156,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConnection"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateConnectionErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "CodeStar connections state is unavailable on this engine".to_string(),
+                ),
+            })
+        })?;
+
+        // The ARN carries the region the caller signed for, so an ARN this service mints
+        // resolves against the endpoint the client addressed.
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // The service caps how many connections it holds; the model declares
+        // `LimitExceededException` ("Exceeded the maximum limit for connections.") for
+        // exactly this, and the cap is what keeps state from growing without bound.
+        if store.connections.len() >= crate::state::MAX_CONNECTIONS {
+            return Err(CreateConnectionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Exceeded the maximum limit of {} connections",
+                        crate::state::MAX_CONNECTIONS
+                    )),
+                },
+            )
+            .into());
+        }
+        // The id is minted from the store's own creation-order sequence, so it is unique
+        // by construction and nothing is minted for a request the cap refuses.
+        let sequence = store.take_sequence();
+        let connection_id = crate::state::mint_connection_id(sequence);
+        let connection_arn = crate::state::connection_arn(&region, &connection_id);
+        store.connections.insert(
+            connection_arn.clone(),
+            crate::state::StoredConnection {
+                connection_id,
+                connection_name: input.connection_name,
+                connection_arn: connection_arn.clone(),
+                provider_type: input.provider_type,
+                owner_account_id: ::engine::emulator_account_id().to_string(),
+                // A connection created through the API is PENDING; see
+                // `crate::state::CONNECTION_STATUS_PENDING` for the modeled doc sentence.
+                connection_status: crate::state::CONNECTION_STATUS_PENDING.to_string(),
+                host_arn: input.host_arn,
+                created_at: ::std::time::SystemTime::now(),
+                sequence,
+            },
+        );
+        if let Some(tags) = input.tags.as_deref() {
+            store.merge_tags(&connection_arn, tags);
+        }
+        // Read the tags back out of state rather than echoing the request, so the
+        // response reports what was stored.
+        let tags = store.tag_list(&connection_arn);
+        drop(store);
+
+        Ok(CreateConnectionOutput {
+            connection_arn,
+            tags: (!tags.is_empty()).then_some(tags),
+        })
     }
 }
