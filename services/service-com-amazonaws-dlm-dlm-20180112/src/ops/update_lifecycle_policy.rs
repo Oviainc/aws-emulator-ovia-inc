@@ -177,6 +177,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+
+        // The one cross-member rule `UpdateLifecyclePolicy` inherits from the
+        // shapes it carries: a schedule's `CreateRule` states when to create
+        // EITHER as a cron expression OR as an interval, never both. It runs
+        // BEFORE the store is touched, so a refused update leaves the stored
+        // policy exactly as it was.
+        if let Some(schedule) =
+            crate::state::schedule_with_conflicting_create_rule(input.policy_details.as_ref())
+        {
+            return Err(
+                UpdateLifecyclePolicyErrorModeled::InvalidRequestException(
+                    crate::state::conflicting_create_rule(&schedule),
+                )
+                .into(),
+            );
+        }
+
         let mut store = state.lock();
         let Some(policy) = store.policies.get_mut(&input.policy_id) else {
             return Err(
