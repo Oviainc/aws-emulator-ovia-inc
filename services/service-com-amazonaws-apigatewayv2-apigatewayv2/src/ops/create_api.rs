@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints an `ApiId`, persists an [`crate::state::Api`] record under it,
+//! and answers with that STORED record. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Quick create (`Target`, with an optional `RouteKey`) mints the catch-all route
+//! alongside the api; the integration and the auto-deploy stage quick create also
+//! produces belong to the integration and stage slices, whose operations are still
+//! scaffolded.
 //!
 //! ## Shape of an operation
 //!
@@ -216,18 +215,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApi"))
+        let bad_request = |message: &str| -> Self::Error {
+            CreateApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message.to_string()),
+            })
+            .into()
+        };
+
+        // `ProtocolType` is a modelled enum, so the boundary validator already refuses a
+        // value outside `PROTOCOL_TYPE_VALUES` before this handler runs. Checking it here
+        // too means an unexpected value is named in the refusal rather than silently
+        // taking the non-HTTP branches below and being reported as a WebSocket problem.
+        if !PROTOCOL_TYPE_VALUES.contains(&input.protocol_type.as_str()) {
+            return Err(bad_request(&format!(
+                "Invalid value for ProtocolType: '{}'. Valid values are: {}.",
+                input.protocol_type,
+                PROTOCOL_TYPE_VALUES.join(", ")
+            )));
+        }
+        let is_http = input.protocol_type == HTTP_PROTOCOL_TYPE;
+
+        // `RouteSelectionExpression` "is required for WebSocket APIs" and defaults to
+        // `$request.method $request.path` for HTTP APIs
+        // (`CreateApi$RouteSelectionExpression`). The modelled `Api` shape requires the
+        // member, so a record without one could not be reported at all.
+        let route_selection_expression = match input.route_selection_expression.as_deref() {
+            Some(expression) => expression.to_string(),
+            None if is_http => crate::state::HTTP_ROUTE_SELECTION_EXPRESSION.to_string(),
+            None => {
+                return Err(bad_request(
+                    "RouteSelectionExpression is required for WebSocket APIs.",
+                ))
+            }
+        };
+
+        // Quick create (`Target`/`RouteKey`) and `CorsConfiguration` are each documented
+        // "Supported only for HTTP APIs", and `RouteKey` only names the route quick
+        // create mints, so it means nothing without a `Target`.
+        if !is_http {
+            if input.target.is_some() {
+                return Err(bad_request("Target is supported only for HTTP APIs."));
+            }
+            if input.cors_configuration.is_some() {
+                return Err(bad_request(
+                    "CorsConfiguration is supported only for HTTP APIs.",
+                ));
+            }
+        }
+        if input.route_key.is_some() && input.target.is_none() {
+            return Err(bad_request(
+                "RouteKey is part of quick create and requires a Target.",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator: the router builds one shared
+            // `engine::InMemoryEngine` and hands it to every service. With no store
+            // there is nothing for this operation to persist into, which is "not
+            // served here", not a client error.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateApi"));
+        };
+        let mut store = state.lock();
+
+        // Bound the growth a caller drives: AWS's published quota is 600 APIs per
+        // account per Region, and `TooManyRequestsException` is the modelled error for
+        // "a limit has been exceeded" (it carries the limit's name in `LimitType`).
+        if store.apis.len() >= crate::state::MAX_APIS {
+            return Err(CreateApiErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("API".to_string()),
+                    message: Some(format!(
+                        "The maximum number of APIs ({}) for this account has been reached.",
+                        crate::state::MAX_APIS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let api_id = store.mint_api_id();
+
+        let region = crate::state::request_region(ctx.parts());
+        let record = crate::state::Api {
+            api_endpoint: crate::state::execute_api_endpoint(&api_id, &region),
+            api_id: api_id.clone(),
+            name: input.name,
+            protocol_type: input.protocol_type,
+            description: input.description,
+            version: input.version,
+            route_selection_expression,
+            api_key_selection_expression: input
+                .api_key_selection_expression
+                .unwrap_or_else(|| {
+                    crate::state::DEFAULT_API_KEY_SELECTION_EXPRESSION.to_string()
+                }),
+            cors_configuration: input.cors_configuration,
+            disable_execute_api_endpoint: input.disable_execute_api_endpoint.unwrap_or(false),
+            disable_schema_validation: input.disable_schema_validation.unwrap_or(false),
+            ip_address_type: input
+                .ip_address_type
+                .unwrap_or_else(|| crate::state::DEFAULT_IP_ADDRESS_TYPE.to_string()),
+            created_date: ::std::time::SystemTime::now(),
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            routes: ::std::collections::BTreeMap::new(),
+            route_id_seed: 0,
+            stages: ::std::collections::BTreeMap::new(),
+        };
+
+        // `api_id` comes from the store's own id bijection, so it names no existing
+        // api and this inserts. Taking the entry back gives the STORED record, so what
+        // the caller is told is what a later GetApi will report.
+        let stored = store.apis.entry(api_id).or_insert(record);
+
+        // Quick create's catch-all route, minted with the api so a later GetRoutes
+        // reports it. `$default` "acts as a catch-all for any request made to your API"
+        // (`CreateApi$RouteKey`) and is the route API Gateway manages.
+        if let Some(target) = input.target.as_ref() {
+            let route_key = input
+                .route_key
+                .clone()
+                .unwrap_or_else(|| DEFAULT_ROUTE_KEY.to_string());
+            let route_id = stored.mint_route_id();
+            stored.routes.insert(
+                route_id.clone(),
+                crate::state::Route {
+                    route_id,
+                    api_gateway_managed: route_key == DEFAULT_ROUTE_KEY,
+                    route_key,
+                    target: Some(target.clone()),
+                    authorization_type: crate::state::DEFAULT_AUTHORIZATION_TYPE.to_string(),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let stored = stored.to_wire();
+        Ok(CreateApiOutput {
+            api_endpoint: stored.api_endpoint,
+            api_gateway_managed: stored.api_gateway_managed,
+            api_id: stored.api_id,
+            api_key_selection_expression: stored.api_key_selection_expression,
+            cors_configuration: stored.cors_configuration,
+            created_date: stored.created_date,
+            description: stored.description,
+            disable_schema_validation: stored.disable_schema_validation,
+            disable_execute_api_endpoint: stored.disable_execute_api_endpoint,
+            import_info: stored.import_info,
+            ip_address_type: stored.ip_address_type,
+            name: Some(stored.name),
+            protocol_type: Some(stored.protocol_type),
+            route_selection_expression: Some(stored.route_selection_expression),
+            tags: stored.tags,
+            version: stored.version,
+            warnings: stored.warnings,
+        })
     }
 }
+
+/// The `ProtocolType` value that selects an HTTP API, from `PROTOCOL_TYPE_VALUES`
+/// (`HTTP | WEBSOCKET`).
+const HTTP_PROTOCOL_TYPE: &str = "HTTP";
+
+/// The catch-all `RouteKey` quick create uses when the request names none
+/// (`CreateApi$RouteKey`: "If you don't specify a routeKey, a default route of
+/// $default is created").
+const DEFAULT_ROUTE_KEY: &str = "$default";

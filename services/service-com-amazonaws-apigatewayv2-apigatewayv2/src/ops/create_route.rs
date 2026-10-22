@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRoute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRoute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRoute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a `RouteId` and persists a [`crate::state::Route`] record under
+//! its parent api. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -199,18 +192,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRoute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRouteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRoute"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateRoute"));
+        };
+        let mut store = state.lock();
+
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(CreateRouteErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "Invalid API identifier specified {}:{}",
+                    ::engine::emulator_account_id(),
+                    input.api_id
+                )),
+                resource_type: ::std::option::Option::None,
+            })
+            .into());
+        };
+
+        // A route key identifies the route within its api, so one api cannot carry two
+        // routes with the same key.
+        if api
+            .routes
+            .values()
+            .any(|route| route.route_key == input.route_key)
+        {
+            return Err(CreateRouteErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Route with key {} already exists for this API.",
+                    input.route_key
+                )),
+            })
+            .into());
+        }
+
+        // Bound the growth a caller drives: AWS's published quota is 300 routes per
+        // API, and `TooManyRequestsException` is the modelled error for "a limit has
+        // been exceeded" (it carries the limit's name in `LimitType`). The route-key
+        // check above refuses a DUPLICATE key; this bounds the number of distinct ones.
+        if api.routes.len() >= crate::state::MAX_ROUTES_PER_API {
+            return Err(CreateRouteErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("Route".to_string()),
+                    message: Some(format!(
+                        "The maximum number of routes ({}) for this API has been reached.",
+                        crate::state::MAX_ROUTES_PER_API
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let route_id = api.mint_route_id();
+
+        let record = crate::state::Route {
+            route_id: route_id.clone(),
+            route_key: input.route_key,
+            target: input.target,
+            // "valid values are NONE for open access" (`Route$AuthorizationType`): a
+            // route the request gave no authorization type is open.
+            authorization_type: input
+                .authorization_type
+                .unwrap_or_else(|| crate::state::DEFAULT_AUTHORIZATION_TYPE.to_string()),
+            authorizer_id: input.authorizer_id,
+            api_key_required: input.api_key_required.unwrap_or(false),
+            operation_name: input.operation_name,
+            authorization_scopes: input.authorization_scopes.unwrap_or_default(),
+            model_selection_expression: input.model_selection_expression,
+            route_response_selection_expression: input.route_response_selection_expression,
+            request_models: input.request_models.unwrap_or_default().into_iter().collect(),
+            request_parameters: input
+                .request_parameters
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            // Only quick create's `$default` route is API-Gateway-managed; a route the
+            // caller asked for is its own.
+            api_gateway_managed: false,
+        };
+
+        // Read the response back out of the STORE, so what the caller gets is what a
+        // later GetRoute will report. `route_id` comes from this api's own id
+        // bijection, so it names no existing route and this inserts.
+        let stored = api.routes.entry(route_id).or_insert(record).to_wire();
+        Ok(CreateRouteOutput {
+            api_gateway_managed: stored.api_gateway_managed,
+            api_key_required: stored.api_key_required,
+            authorization_scopes: stored.authorization_scopes,
+            authorization_type: stored.authorization_type,
+            authorizer_id: stored.authorizer_id,
+            model_selection_expression: stored.model_selection_expression,
+            operation_name: stored.operation_name,
+            request_models: stored.request_models,
+            request_parameters: stored.request_parameters,
+            route_id: stored.route_id,
+            route_key: Some(stored.route_key),
+            route_response_selection_expression: stored.route_response_selection_expression,
+            target: stored.target,
+        })
     }
 }
