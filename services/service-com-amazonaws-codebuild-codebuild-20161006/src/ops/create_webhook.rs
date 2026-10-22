@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWebhook
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWebhook`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Connects a build project to its repository's events and persists the webhook on that
+//! project in [`crate::state`]: this is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWebhook::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this emulator does and does not do
+//!
+//! CodeBuild's half of a webhook is the record kept against the project — the payload
+//! URL events arrive at, the secret they are signed with, and the filters that decide
+//! which of them start a build — and that record is what is created here, read back by
+//! `BatchGetProjects` through `Project$webhook`. The repository provider's half (the
+//! hook registered in GitHub, Bitbucket or GitLab) needs an outbound call to that
+//! provider, which this emulator never makes, so `Webhook$url` — "the URL to the
+//! webhook", i.e. the provider-side hook — is left absent exactly as it is for a
+//! `manualCreation` webhook, where AWS "doesn't create a webhook in GitHub and instead
+//! returns payloadUrl and secret values".
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +183,220 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWebhook` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWebhookErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWebhook"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this service models no server fault, and 501 is the
+            // only honest answer for "this emulator cannot serve the call at all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateWebhook (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_millis();
+        let project_arn = crate::state::project_arn(&region, &input.project_name);
+
+        // Checked before anything is read or written: the constraint is on the request
+        // alone, and the model cannot express it.
+        check_filter_groups(input.filter_groups.as_deref())?;
+
+        // READ PASS: the project's source type decides whether a webhook can exist at
+        // all, so it is read first and the request is judged against it. The write pass
+        // below re-asserts both under the same lock.
+        let source_type = {
+            let guard = state.lock();
+            let Some(stored) = guard.projects.get(&input.project_name) else {
+                return Err(not_found(&project_arn));
+            };
+            if stored.project.webhook.is_some() {
+                return Err(already_exists(&project_arn));
+            }
+            stored
+                .project
+                .source
+                .as_ref()
+                .map(|source| source.r#type.clone())
+                .unwrap_or_default()
+        };
+
+        check_source_supports_webhook(&source_type, &input, &project_arn)?;
+
+        // A webhook's secret is minted by the emulator's credential store, never built
+        // here — and a Bitbucket webhook carries none, which AWS documents on
+        // `Webhook$secret`. A store that minted nothing leaves the operation to refuse
+        // rather than report a secret it made up: what could not be settled is the
+        // repository provider's side of the webhook, which is what
+        // `OAuthProviderException` says.
+        let secret = if source_type == crate::state::SECRETLESS_WEBHOOK_SOURCE_TYPE {
+            None
+        } else {
+            let Some(secret) = crate::state::mint_webhook_secret(ctx.credential_store()) else {
+                return Err(CreateWebhookErrorModeled::OAuthProviderException(
+                    OAuthProviderException {
+                        message: Some(format!(
+                            "No webhook secret could be created for project: {project_arn}"
+                        )),
+                    },
+                )
+                .into());
+            };
+            Some(secret)
+        };
+
+        let webhook = Webhook {
+            // The provider-side hook this emulator registers nowhere; see the module
+            // docs. `payloadUrl` is CodeBuild's own endpoint, which it does report.
+            url: None,
+            payload_url: Some(crate::state::webhook_payload_url(
+                &region,
+                &input.project_name,
+                now,
+            )),
+            // Stamped only when there IS a secret, since the member reports "the last
+            // time a repository's secret token was modified".
+            last_modified_secret: secret.as_ref().map(|_| crate::state::datetime(now)),
+            secret,
+            branch_filter: input.branch_filter,
+            filter_groups: input.filter_groups,
+            build_type: input.build_type,
+            manual_creation: input.manual_creation,
+            scope_configuration: input.scope_configuration,
+            pull_request_build_policy: input.pull_request_build_policy,
+            // Nothing is provisioned asynchronously here: CodeBuild's `CREATING` status
+            // covers registering the hook with the repository provider, which this
+            // emulator does not do, so the record is in force the moment it is
+            // persisted and carries no status message.
+            status: Some(WEBHOOK_ACTIVE_STATUS.to_string()),
+            status_message: None,
+        };
+
+        // WRITE PASS: one critical section that re-asserts what the read pass saw, so a
+        // project deleted — or given a webhook by a concurrent request — while this one
+        // was resolving cannot be written over.
+        let mut guard = state.lock();
+        let Some(stored) = guard.projects.get_mut(&input.project_name) else {
+            return Err(not_found(&project_arn));
+        };
+        if stored.project.webhook.is_some() {
+            return Err(already_exists(&project_arn));
+        }
+        stored.project.webhook = Some(webhook.clone());
+        // The project's settings changed, which is what `Project$lastModified` reports.
+        stored.last_modified_millis = now;
+        stored.project.last_modified = Some(crate::state::datetime(now));
+
+        Ok(CreateWebhookOutput {
+            webhook: Some(webhook),
+        })
     }
+}
+
+/// The `WebhookStatus` a persisted webhook reports: "ACTIVE: The webhook has succeeded
+/// and is active". One of the model's four `WebhookStatus` values.
+const WEBHOOK_ACTIVE_STATUS: &str = "ACTIVE";
+
+/// No project of that name is held, so there is nothing to attach a webhook to. The
+/// wording is the one every operation of this service uses for a missing project.
+fn not_found(project_arn: &str) -> CreateWebhookError {
+    CreateWebhookErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("Project cannot be found: {project_arn}")),
+    })
+    .into()
+}
+
+/// The project already carries a webhook, and a project has at most one: AWS models
+/// that as `ResourceAlreadyExistsException`, "the specified resource cannot be created,
+/// because a resource with the same settings already exists".
+fn already_exists(project_arn: &str) -> CreateWebhookError {
+    CreateWebhookErrorModeled::ResourceAlreadyExistsException(ResourceAlreadyExistsException {
+        message: Some(format!(
+            "A webhook already exists for CodeBuild project: {project_arn}"
+        )),
+    })
+    .into()
+}
+
+/// Refuse a filter group no webhook event can ever satisfy.
+///
+/// AWS documents the rule on `filterGroups`: "At least one WebhookFilter in the array
+/// must specify EVENT as its type", and "for a filter group to pass, each of its
+/// filters must pass", so a group without an `EVENT` filter can never trigger a build.
+/// The model expresses no such constraint, so the boundary validator passes it and the
+/// refusal belongs here; it names the member and the constraint the way a boundary
+/// refusal does.
+fn check_filter_groups(
+    filter_groups: Option<&[Vec<WebhookFilter>]>,
+) -> Result<(), CreateWebhookError> {
+    for (index, group) in filter_groups.unwrap_or_default().iter().enumerate() {
+        if !group
+            .iter()
+            .any(|filter| filter.r#type == crate::state::EVENT_WEBHOOK_FILTER_TYPE)
+        {
+            return Err(CreateWebhookErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Value at 'filterGroups[{index}]' failed to satisfy constraint: \
+                         at least one WebhookFilter must specify {} as its type",
+                        crate::state::EVENT_WEBHOOK_FILTER_TYPE
+                    )),
+                },
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a webhook the project's source provider cannot deliver events for.
+///
+/// Three rules, each documented on the member it is about:
+///
+/// * a repository-event webhook needs a source whose provider sends repository events
+///   ([`crate::state::WEBHOOK_SOURCE_TYPES`]);
+/// * a runner webhook (`buildType` [`crate::state::RUNNER_WEBHOOK_BUILD_TYPE`]) is
+///   "only available for NO_SOURCE source type projects", and is the only webhook such
+///   a project takes;
+/// * `manualCreation` is "only available for GitHub webhooks".
+fn check_source_supports_webhook(
+    source_type: &str,
+    input: &CreateWebhookInput,
+    project_arn: &str,
+) -> Result<(), CreateWebhookError> {
+    let invalid = |message: String| -> CreateWebhookError {
+        CreateWebhookErrorModeled::InvalidInputException(InvalidInputException {
+            message: Some(message),
+        })
+        .into()
+    };
+    let runner = input
+        .build_type
+        .as_deref()
+        .is_some_and(|build_type| build_type == crate::state::RUNNER_WEBHOOK_BUILD_TYPE);
+    if runner {
+        if source_type != crate::state::RUNNER_WEBHOOK_SOURCE_TYPE {
+            return Err(invalid(format!(
+                "Value at 'buildType' failed to satisfy constraint: {} is only available for \
+                 {} source type projects, and project {project_arn} has source type \
+                 {source_type}",
+                crate::state::RUNNER_WEBHOOK_BUILD_TYPE,
+                crate::state::RUNNER_WEBHOOK_SOURCE_TYPE,
+            )));
+        }
+    } else if !crate::state::WEBHOOK_SOURCE_TYPES.contains(&source_type) {
+        return Err(invalid(format!(
+            "A webhook cannot be created for project {project_arn}: its source type \
+             {source_type} does not support webhooks. Supported source types are {}",
+            crate::state::WEBHOOK_SOURCE_TYPES.join(", "),
+        )));
+    }
+    if input.manual_creation == Some(true)
+        && source_type != crate::state::MANUAL_CREATION_SOURCE_TYPE
+    {
+        return Err(invalid(format!(
+            "Value at 'manualCreation' failed to satisfy constraint: manualCreation is only \
+             available for {} webhooks, and project {project_arn} has source type {source_type}",
+            crate::state::MANUAL_CREATION_SOURCE_TYPE,
+        )));
+    }
+    Ok(())
 }
