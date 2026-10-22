@@ -402,6 +402,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state::VPC_STATE_PENDING,
             tags,
         );
+        // "When you create a VPC, it comes with a default security group" (Amazon VPC User
+        // Guide, "Default security groups for your VPCs") — the same group the seeded
+        // default VPC has, so a VPC this operation creates is not missing the one group a
+        // caller can launch into without creating anything else. Its ARN names the Region
+        // this request was signed for.
+        store.insert_default_security_group(&vpc_id, &region);
         // What the clock now owes this VPC: `available`, one TRANSITION_DELAY from now —
         // the same span, off the same monotonic clock, as an instance's pending move.
         store

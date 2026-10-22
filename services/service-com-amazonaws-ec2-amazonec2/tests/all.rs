@@ -32,6 +32,8 @@ mod instance_lifecycle;
 mod instance_type_offerings;
 #[path = "all/launch_templates.rs"]
 mod launch_templates;
+#[path = "all/security_group_filter_limits.rs"]
+mod security_group_filter_limits;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/vpc_lifecycle.rs"]

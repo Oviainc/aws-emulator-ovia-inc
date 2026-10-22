@@ -46,9 +46,9 @@
 //! drop one. The store is keyed by `VpcId` in a [`BTreeMap`], which gives the describe
 //! path one stable order and lets a pagination token name the id the next page starts
 //! at. [`ComAmazonawsEc2Amazonec2State::subnets`] holds the account's subnets the same
-//! way, keyed by `SubnetId`. Further caller-created resources (security groups, …)
-//! belong beside them as they are implemented, and should be validated against
-//! [`availability_zones_in_region`] rather than against a second zone list.
+//! way, keyed by `SubnetId`. Further caller-created resources belong beside them as they
+//! are implemented, and should be validated against [`availability_zones_in_region`]
+//! rather than against a second zone list.
 //!
 //! ## Launch templates
 //!
@@ -98,6 +98,7 @@
 //! [`SecurityGroup`] shape itself, keyed by `GroupId` in a [`BTreeMap`], for the same
 //! reasons the VPC and subnet stores do.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv6Addr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -820,6 +821,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// rather than by each writer, so no writer can store them uncharged; a create still
     /// asks [`Self::has_vpc_capacity`] and [`Self::would_exceed_stored_bytes`] first so it
     /// can refuse instead of overshooting.
+    ///
+    /// The default security group a VPC comes with is NOT written here: it is
+    /// [`Self::insert_default_security_group`], which every writer of a VPC calls, because
+    /// that group's ARN names a Region and a VPC record carries none.
     pub fn insert_vpc(
         &mut self,
         cidr_block: &str,
@@ -2377,6 +2382,37 @@ impl FilterPattern {
 /// compares one value against many candidates should compile the pattern instead.
 pub fn filter_value_matches(pattern: &str, value: &str) -> bool {
     FilterPattern::compile(pattern).matches(value)
+}
+
+/// Does a candidate resource satisfy EVERY compiled filter, charging each comparison to
+/// `budget`?
+///
+/// The AND/OR evaluation EC2 defines for every `Filters` member, in one place: "If you
+/// specify multiple filters, the filters are joined with an AND" (`Filter`), and within one
+/// filter "if you specify multiple values for a filter, the values are joined with an OR"
+/// (`Filter$Values`), each value matched case-sensitively with EC2's `*`/`?` wildcards. Only
+/// the per-operation lookup differs, so a describe passes it as `values_of`: the values its
+/// candidate holds for one filter name, or none at all when the candidate carries nothing
+/// for that attribute — which then matches nothing rather than everything.
+///
+/// One step is charged per candidate as well, so even an unfiltered scan is counted and
+/// cannot walk a whole store for free; the budget is what bounds the PRODUCT of candidates,
+/// filters, values and value length, which no per-factor cap can do on its own.
+pub fn matches_every_filter<'a>(
+    filters: &[CompiledFilter],
+    budget: &mut MatchBudget,
+    values_of: &dyn Fn(&str) -> Vec<Cow<'a, str>>,
+) -> bool {
+    if !budget.spend() {
+        return false;
+    }
+    filters.iter().all(|filter| {
+        let held = values_of(&filter.name);
+        filter.patterns.iter().any(|pattern| {
+            held.iter()
+                .any(|value| pattern.matches_within(value, budget))
+        })
+    })
 }
 
 /// Refuse a request member's value the way EC2 does: HTTP 400 `InvalidParameterValue`,

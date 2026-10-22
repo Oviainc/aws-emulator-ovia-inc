@@ -160,7 +160,8 @@ fn seed(engine: &engine::InMemoryEngine) -> Seeded {
         .find(|vpc| vpc.is_default == Some(true))
         .and_then(|vpc| vpc.vpc_id.clone())
         .expect("a fresh account has its default VPC");
-    let fixture_vpc_id = guard.insert_vpc("10.0.0.0/16", false, "default", "available", Vec::new());
+    let fixture_vpc_id =
+        guard.insert_vpc("10.0.0.0/16", false, "default", "available", Vec::new());
 
     let zones = availability_zones_in_region(REGION);
     let mut fixture_ids = Vec::new();

@@ -84,6 +84,12 @@
 use super::types::*;
 
 use std::borrow::Cow;
+use std::collections::HashSet;
+
+use crate::state::{
+    CompiledFilter, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES,
+    MAX_RESOURCE_IDS, MatchBudget,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -179,39 +185,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
+        // Matching cost is filters x values x value length x stored groups, and the model
+        // bounds none of them (`FilterList` and `Filter$Values` carry no `@length`), so
+        // every request-controlled factor is capped HERE, before any work proportional to
+        // it is done and before the store is locked — the same ceilings
+        // `DescribeInstances` enforces, from `crate::state`.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
         // A filter name this operation does not document is refused whether or not any
         // group would have matched it, so an unsupported filter can never read as "no
-        // results".
-        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
-        let mut selectors: Vec<(&str, &[String])> = Vec::with_capacity(filters.len());
+        // results". Each value is compiled into its pattern ONCE here, rather than
+        // recompiled for every candidate group.
+        let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
         for filter in filters {
             let name = filter.name.as_deref().unwrap_or_default();
             let canonical = canonical_filter_name(name).ok_or_else(|| {
                 crate::state::invalid_parameter_value(format!("The filter '{name}' is invalid"))
             })?;
-            selectors.push((canonical, filter.values.as_deref().unwrap_or_default()));
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so a value's size is bounded
+            // here too.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            compiled.push(CompiledFilter::new(canonical.to_string(), values.to_vec()));
+        }
+
+        // The two selector lists are caller-sized as well, and each entry is resolved
+        // against the store, so they are capped the way every other EC2 operation of this
+        // crate caps a resource-id list.
+        let requested_ids: &[String] = input.group_ids.as_deref().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "GroupIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+        let requested_names: &[String] = input.group_names.as_deref().unwrap_or_default();
+        if requested_names.len() > MAX_RESOURCE_IDS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "GroupNames carries {} names, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_names.len()
+            )));
         }
 
         let store = state.lock();
 
         // "The IDs of the security groups" / "the names of the security groups"
         // (`DescribeSecurityGroupsRequest$GroupIds`, `$GroupNames`): an id or a name that
-        // names no group of the account is an error, not an absent row.
-        let requested_ids: &[String] = input.group_ids.as_deref().unwrap_or_default();
-        let requested_names: &[String] = input.group_names.as_deref().unwrap_or_default();
+        // names no group of the account is an error, not an absent row. Sets, so narrowing
+        // below costs one lookup per group rather than a scan of the asked-for lists.
+        let wanted_ids: HashSet<&str> = requested_ids.iter().map(String::as_str).collect();
         if let Some(unknown) = requested_ids
             .iter()
             .find(|id| !store.security_groups.contains_key(id.as_str()))
         {
             return Err(crate::state::invalid_group_not_found(unknown));
         }
-        if let Some(unknown) = requested_names.iter().find(|name| {
-            !store
+        let wanted_names: HashSet<&str> = requested_names.iter().map(String::as_str).collect();
+        if !wanted_names.is_empty() {
+            // The names the store holds, collected ONCE rather than rescanned per name.
+            let stored_names: HashSet<&str> = store
                 .security_groups
                 .values()
-                .any(|group| group.group_name.as_deref() == Some(name.as_str()))
-        }) {
-            return Err(crate::state::invalid_group_not_found(unknown));
+                .filter_map(|group| group.group_name.as_deref())
+                .collect();
+            if let Some(unknown) = requested_names
+                .iter()
+                .find(|name| !stored_names.contains(name.as_str()))
+            {
+                return Err(crate::state::invalid_group_not_found(unknown));
+            }
         }
 
         // "Default: Describes all of your security groups": `GroupIds` and `GroupNames`
@@ -219,21 +283,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // group name or the security group ID", so a group named by either is selected —
         // and every filter must then hold ("If you specify multiple filters, the filters
         // are joined with an AND" — `Filter`).
-        let named_any = !requested_ids.is_empty() || !requested_names.is_empty();
-        let mut selected: Vec<&SecurityGroup> = store
-            .security_groups
-            .values()
-            .filter(|group| {
-                !named_any
-                    || requested_ids
-                        .iter()
-                        .any(|id| group.group_id.as_deref() == Some(id.as_str()))
-                    || requested_names
-                        .iter()
-                        .any(|name| group.group_name.as_deref() == Some(name.as_str()))
-            })
-            .filter(|group| matches_every_filter(group, &selectors))
-            .collect();
+        //
+        // Every comparison is charged to ONE budget, so the product of stored groups,
+        // filters, values and value length is bounded however the caller combines them —
+        // which is also what bounds how long this holds the store's lock.
+        let named_any = !wanted_ids.is_empty() || !wanted_names.is_empty();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<&SecurityGroup> = Vec::new();
+        for group in store.security_groups.values() {
+            if budget.exhausted() {
+                break;
+            }
+            if named_any
+                && !wanted_ids.contains(group.group_id.as_deref().unwrap_or_default())
+                && !wanted_names.contains(group.group_name.as_deref().unwrap_or_default())
+            {
+                continue;
+            }
+            if crate::state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(group, name)
+            }) {
+                selected.push(group);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                     comparisons to evaluate; narrow them or page with MaxResults"
+                ),
+            ));
+        }
 
         // Page in `GroupId` order, which the cursor below names a position in. The store is
         // an ordered map, so its iteration order already satisfies this sort; doing it here
@@ -457,19 +540,7 @@ fn filter_values<'a>(group: &'a SecurityGroup, name: &str) -> Vec<Cow<'a, str>> 
     }
 }
 
-/// Does `group` satisfy every filter?
-///
-/// "If you specify multiple filters, the filters are joined with an AND" (`Filter`), and
-/// within one filter "if you specify multiple values for a filter, the values are joined
-/// with an OR" (`Filter$Values`) — each value matched case-sensitively, with EC2's own
-/// `*`/`?` wildcards, by [`crate::state::filter_value_matches`]. So a filter carrying no
-/// value at all matches nothing, there being no value for the attribute to match.
-fn matches_every_filter(group: &SecurityGroup, selectors: &[(&str, &[String])]) -> bool {
-    selectors.iter().all(|(name, wanted_values)| {
-        let held = filter_values(group, name);
-        wanted_values.iter().any(|wanted| {
-            held.iter()
-                .any(|value| crate::state::filter_value_matches(wanted, value))
-        })
-    })
-}
+// The AND/OR evaluation of this operation's filters, and the budget that bounds it, live
+// in `crate::state::matches_every_filter`, which every filtered describe of this crate
+// shares; only `filter_values` — what THIS resource holds for a filter name — is this
+// operation's own.
