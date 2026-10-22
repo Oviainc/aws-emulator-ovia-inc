@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges the request's `tags` onto the resource `resourceArn` names: a key the
+//! resource does not carry is appended, and a key it already carries takes the new
+//! value, which is exactly what this operation's doc below describes. A merge that
+//! would leave the resource carrying more than [`crate::state::MAX_TAGS_PER_RESOURCE`]
+//! tags — the maximum the modelled `TagMap` states — is refused whole with the
+//! modelled `ValidationException`, so repeated calls cannot grow one record without
+//! limit.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +148,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // `ctx` carries only request metadata, and an ARN identifies the resource on
+        // its own — region included — so nothing here is read from it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        let mut store = state.lock();
+        let Some(slot) = store.resource_tags_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::messages::TAG_RESOURCE_NOT_FOUND.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `tags` is modelled `length 0..200`, so an EMPTY map reaches this handler: it
+        // asks for no key to be set, so the record is left exactly as it was rather
+        // than gaining an empty tag map it never had.
+        if !input.tags.is_empty() {
+            // The merge is bounded by the same figure the model states for a tag map,
+            // so repeated calls cannot grow one record's tags without limit. The size
+            // the merge WOULD leave is computed before anything is written: a key the
+            // resource already carries takes a new value without adding an entry, and
+            // a refused request leaves the stored map exactly as it was.
+            let stored = slot
+                .as_ref()
+                .map_or(0, ::std::collections::HashMap::len);
+            let appended = slot.as_ref().map_or(input.tags.len(), |tags| {
+                input
+                    .tags
+                    .keys()
+                    .filter(|key| !tags.contains_key(key.as_str()))
+                    .count()
+            });
+            if stored + appended > crate::state::MAX_TAGS_PER_RESOURCE {
+                return Err(TagResourceErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "tags: the merge would leave {} tags on the resource, more than \
+                             the maximum of {} tags a resource may carry",
+                            stored + appended,
+                            crate::state::MAX_TAGS_PER_RESOURCE
+                        )),
+                    },
+                )
+                .into());
+            }
+            slot.get_or_insert_with(::std::collections::HashMap::new)
+                .extend(input.tags);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }
