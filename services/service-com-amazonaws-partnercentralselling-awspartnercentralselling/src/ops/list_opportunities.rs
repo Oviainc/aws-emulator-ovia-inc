@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOpportunities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOpportunities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOpportunities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: enumerates the stored opportunities of one catalog, applies the
+//! request's filters and sort, and pages them behind an opaque `NextToken`.
+//! A reporting operation (`@readonly`): it writes nothing, not even the token.
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +196,251 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOpportunities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOpportunitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOpportunities"))
+        use crate::state;
+
+        // Request metadata only; this operation reports stored state.
+        let _ = ctx;
+
+        state::check_catalog(&input.catalog)
+            .map_err(ListOpportunitiesErrorModeled::ValidationException)?;
+
+        let start = match input.next_token.as_deref() {
+            Some(token) => decode_next_token(token, &input.catalog)
+                .map_err(ListOpportunitiesErrorModeled::ValidationException)?,
+            None => 0,
+        };
+        // Modelled `range 1..100`, so the boundary already refused anything outside it;
+        // an absent value takes the documented default ("Default: 20").
+        let page_size = usize::try_from(input.max_results.unwrap_or(state::DEFAULT_LIST_MAX_RESULTS))
+            .unwrap_or(state::DEFAULT_LIST_MAX_RESULTS as usize);
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(ListOpportunitiesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = store.lock();
+
+        let mut matching: Vec<&state::StoredOpportunity> = store
+            .opportunities
+            .values()
+            .filter(|record| record.catalog == input.catalog)
+            .filter(|record| matches_filters(record, &input))
+            .collect();
+        sort_records(&mut matching, input.sort.as_ref());
+
+        let total = matching.len();
+        let start = start.min(total);
+        let opportunity_summaries: Vec<OpportunitySummary> = matching[start..]
+            .iter()
+            .take(page_size)
+            .map(|record| summary_of(record))
+            .collect();
+        let next_offset = start + opportunity_summaries.len();
+        let next_token =
+            (next_offset < total).then(|| encode_next_token(&input.catalog, next_offset));
+
+        Ok(ListOpportunitiesOutput {
+            opportunity_summaries,
+            next_token,
+        })
+    }
+}
+
+/// The opaque `NextToken`: the catalog it was issued for and the offset it resumes at,
+/// base64-encoded so a client treats it as the opaque value the model says it is.
+/// Encoding the cursor in the token rather than storing it keeps this `@readonly`
+/// operation free of writes, so paging changes nothing a later caller sees.
+fn encode_next_token(catalog: &str, offset: usize) -> String {
+    ::aws_smithy_types::base64::encode(format!("v1:{catalog}:{offset}"))
+}
+
+/// Resolve a `NextToken` back to its offset, refusing one this service did not issue
+/// or one issued for another catalog (whose offset means nothing in this list).
+fn decode_next_token(token: &str, catalog: &str) -> Result<usize, ValidationException> {
+    let invalid = || {
+        crate::state::field_validation(
+            "REQUEST_VALIDATION_FAILED",
+            "NextToken",
+            "INVALID_VALUE",
+            "NextToken is not a pagination token this service issued for this catalog.",
+        )
+    };
+    let decoded = ::aws_smithy_types::base64::decode(token).map_err(|_| invalid())?;
+    let decoded = String::from_utf8(decoded).map_err(|_| invalid())?;
+    let mut fields = decoded.splitn(3, ':');
+    match (fields.next(), fields.next(), fields.next()) {
+        (Some("v1"), Some(issued_for), Some(offset)) if issued_for == catalog => {
+            offset.parse::<usize>().map_err(|_| invalid())
+        }
+        _ => Err(invalid()),
+    }
+}
+
+/// Whether one stored opportunity satisfies every filter the request carries. An
+/// absent filter, and an empty filter list, constrains nothing.
+fn matches_filters(
+    record: &crate::state::StoredOpportunity,
+    input: &ListOpportunitiesInput,
+) -> bool {
+    if !matches_values(input.identifier.as_deref(), Some(record.id.as_str())) {
+        return false;
+    }
+    if !matches_values(input.life_cycle_stage.as_deref(), stage_of(record)) {
+        return false;
+    }
+    if !matches_values(
+        input.life_cycle_review_status.as_deref(),
+        record.review_status(),
+    ) {
+        return false;
+    }
+    if !matches_values(input.customer_company_name.as_deref(), company_name_of(record)) {
+        return false;
+    }
+    if let Some(filter) = input.created_date.as_ref() {
+        if !within(
+            record.created_date_ms,
+            filter.after_created_date.as_ref(),
+            filter.before_created_date.as_ref(),
+        ) {
+            return false;
+        }
+    }
+    if let Some(filter) = input.last_modified_date.as_ref() {
+        if !within(
+            record.last_modified_date_ms,
+            filter.after_last_modified_date.as_ref(),
+            filter.before_last_modified_date.as_ref(),
+        ) {
+            return false;
+        }
+    }
+    if let Some(filter) = input.target_close_date.as_ref() {
+        // `Date` members are `^[0-9]{4}-[0-9]{2}-[0-9]{2}$`-shaped, so ordering them as
+        // strings orders them chronologically.
+        let target = target_close_date_of(record);
+        let after_ok = filter
+            .after_target_close_date
+            .as_deref()
+            .is_none_or(|after| target.is_some_and(|date| date >= after));
+        let before_ok = filter
+            .before_target_close_date
+            .as_deref()
+            .is_none_or(|before| target.is_some_and(|date| date <= before));
+        if !(after_ok && before_ok) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A set filter: the record matches when the filter is absent or empty, or when the
+/// record's own value is one of the filter's values.
+fn matches_values(filter: Option<&[String]>, value: Option<&str>) -> bool {
+    match filter {
+        None => true,
+        Some([]) => true,
+        Some(values) => value.is_some_and(|value| values.iter().any(|want| want == value)),
+    }
+}
+
+/// An inclusive date-range filter over a stored millisecond timestamp.
+fn within(
+    millis: i64,
+    after: Option<&::aws_smithy_types::DateTime>,
+    before: Option<&::aws_smithy_types::DateTime>,
+) -> bool {
+    after.is_none_or(|bound| millis >= crate::state::millis_of(bound))
+        && before.is_none_or(|bound| millis <= crate::state::millis_of(bound))
+}
+
+fn stage_of(record: &crate::state::StoredOpportunity) -> Option<&str> {
+    record
+        .life_cycle
+        .as_ref()
+        .and_then(|life_cycle| life_cycle.stage.as_deref())
+}
+
+fn target_close_date_of(record: &crate::state::StoredOpportunity) -> Option<&str> {
+    record
+        .life_cycle
+        .as_ref()
+        .and_then(|life_cycle| life_cycle.target_close_date.as_deref())
+}
+
+fn company_name_of(record: &crate::state::StoredOpportunity) -> Option<&str> {
+    record
+        .customer
+        .as_ref()
+        .and_then(|customer| customer.account.as_ref())
+        .map(|account| account.company_name.as_str())
+}
+
+/// Order the matching records as `Sort` asks.
+///
+/// "The default `Sort.SortBy` value is `LastModifiedDate`" and the `SortOrder` default
+/// is `Descending`. Every comparison breaks ties on the identifier, so the order is
+/// total: paging through it can neither repeat nor skip a record.
+fn sort_records(records: &mut [&crate::state::StoredOpportunity], sort: Option<&OpportunitySort>) {
+    let sort_by = sort.map_or("LastModifiedDate", |sort| sort.sort_by.as_str());
+    records.sort_by(|left, right| {
+        let primary = match sort_by {
+            "CreatedDate" => left.created_date_ms.cmp(&right.created_date_ms),
+            "Identifier" => left.id.cmp(&right.id),
+            "CustomerCompanyName" => company_name_of(left).cmp(&company_name_of(right)),
+            "TargetCloseDate" => target_close_date_of(left).cmp(&target_close_date_of(right)),
+            _ => left.last_modified_date_ms.cmp(&right.last_modified_date_ms),
+        };
+        primary.then_with(|| left.id.cmp(&right.id))
+    });
+    let descending = sort.is_none_or(|sort| sort.sort_order != "ASCENDING");
+    if descending {
+        records.reverse();
+    }
+}
+
+/// The `OpportunitySummary` view of a stored opportunity: the summary shapes carry a
+/// subset of the full members, so each one is projected from the stored record.
+fn summary_of(record: &crate::state::StoredOpportunity) -> OpportunitySummary {
+    OpportunitySummary {
+        catalog: record.catalog.clone(),
+        id: Some(record.id.clone()),
+        arn: Some(record.arn.clone()),
+        partner_opportunity_identifier: record.partner_opportunity_identifier.clone(),
+        opportunity_type: record.opportunity_type.clone(),
+        last_modified_date: Some(crate::state::date_time(record.last_modified_date_ms)),
+        created_date: Some(crate::state::date_time(record.created_date_ms)),
+        life_cycle: record.life_cycle.as_ref().map(|life_cycle| LifeCycleSummary {
+            stage: life_cycle.stage.clone(),
+            closed_lost_reason: life_cycle.closed_lost_reason.clone(),
+            next_steps: life_cycle.next_steps.clone(),
+            target_close_date: life_cycle.target_close_date.clone(),
+            review_status: life_cycle.review_status.clone(),
+            review_comments: life_cycle.review_comments.clone(),
+            review_status_reason: life_cycle.review_status_reason.clone(),
+        }),
+        customer: record.customer.as_ref().map(|customer| CustomerSummary {
+            account: customer.account.as_ref().map(|account| AccountSummary {
+                industry: account.industry.clone(),
+                other_industry: account.other_industry.clone(),
+                company_name: account.company_name.clone(),
+                website_url: account.website_url.clone(),
+                address: account.address.as_ref().map(|address| AddressSummary {
+                    city: address.city.clone(),
+                    postal_code: address.postal_code.clone(),
+                    state_or_region: address.state_or_region.clone(),
+                    country_code: address.country_code.clone(),
+                }),
+            }),
+        }),
+        project: record.project.as_ref().map(|project| ProjectSummary {
+            delivery_models: project.delivery_models.clone(),
+            expected_customer_spend: project.expected_customer_spend.clone(),
+            expected_contract_duration: project.expected_contract_duration.clone(),
+        }),
     }
 }

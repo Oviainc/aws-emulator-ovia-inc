@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssignOpportunity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssignOpportunity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssignOpportunity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores the assignee as the opportunity's owner contact and advances
+//! `LastModifiedDate`, so a following `GetOpportunity` reports it.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +185,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssignOpportunity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssignOpportunityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssignOpportunity"))
+        use crate::state;
+
+        // Request metadata only; the assignee comes from the body.
+        let _ = ctx;
+
+        state::check_catalog(&input.catalog)
+            .map_err(AssignOpportunityErrorModeled::ValidationException)?;
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(AssignOpportunityErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = store.lock();
+        let key = (input.catalog.clone(), input.identifier.clone());
+        let Some(record) = store.opportunities.get_mut(&key) else {
+            return Err(AssignOpportunityErrorModeled::ResourceNotFoundException(
+                state::opportunity_not_found(&input.catalog, &input.identifier),
+            )
+            .into());
+        };
+
+        // "By default, the opportunity owner is the one who creates it" and this call
+        // reassigns it, so the assignee is carried on `OpportunityTeam` — the only member
+        // the model exposes a contact on when the opportunity is read back. Reassignment
+        // REPLACES the previous owner's entry (and any entry for the same person) rather
+        // than appending, so repeated assignment cannot grow the team.
+        let assignee = input.assignee;
+        let previous_email = record.assignee.as_ref().map(|contact| contact.email.clone());
+        let mut team = record.opportunity_team.take().unwrap_or_default();
+        team.retain(|member| {
+            let email = member.email.as_deref();
+            email != Some(assignee.email.as_str()) && email != previous_email.as_deref()
+        });
+        team.insert(
+            0,
+            Contact {
+                email: Some(assignee.email.clone()),
+                first_name: Some(assignee.first_name.clone()),
+                last_name: Some(assignee.last_name.clone()),
+                business_title: Some(assignee.business_title.clone()),
+                phone: assignee.phone.clone(),
+            },
+        );
+        // Modelled `len ..10` on `PartnerOpportunityTeamMembersList`, which the read side
+        // declares too: the owner is kept, the oldest members give way.
+        team.truncate(state::MAX_OPPORTUNITY_TEAM_MEMBERS);
+        record.opportunity_team = Some(team);
+        record.assignee = Some(assignee);
+        record.touch();
+
+        Ok(AssignOpportunityOutput)
     }
 }
