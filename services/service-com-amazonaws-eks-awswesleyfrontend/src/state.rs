@@ -14,6 +14,13 @@
 //! `platformVersion`) are optional on the record, because a connected cluster
 //! reports none of them — it reports [`ClusterRecord::connector_config`] instead.
 //!
+//! It also holds the access-entry slice, as part of the cluster record rather than
+//! beside it: an access entry belongs to exactly one cluster, so
+//! [`ClusterRecord::access_entries`] is where `CreateAccessEntry` writes and
+//! `DescribeAccessEntry`, `AssociateAccessPolicy` and
+//! `ListAssociatedAccessPolicies` read — and deleting the cluster takes its access
+//! entries with it, without a second map to keep in step.
+//!
 //! It also holds the EKS Pod Identity association slice:
 //! `CreatePodIdentityAssociation` writes a [`PodIdentityAssociationRecord`] here
 //! and `DescribePodIdentityAssociation`, `UpdatePodIdentityAssociation` and
@@ -44,8 +51,8 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AccessConfigResponse, Certificate, Cluster, ClusterVersionInformation, ComputeConfigResponse,
-    ConnectorConfigResponse,
+    AccessConfigResponse, AccessEntry, AccessScope, AssociatedAccessPolicy, Certificate, Cluster,
+    ClusterVersionInformation, ComputeConfigResponse, ConnectorConfigResponse,
     ControlPlaneScalingConfig, EncryptionConfig, Identity, KubeApiServerConfigResponse,
     KubeControllerManagerConfigResponse, KubeSchedulerConfigResponse,
     KubernetesNetworkConfigResponse, Logging, OidcIdentityProviderConfig, OutpostConfigResponse,
@@ -202,6 +209,306 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// `maxResults`. The model bounds `maxResults` at 1..100, so the full page is the
 /// natural default.
 pub const DEFAULT_LIST_PAGE_SIZE: i32 = 100;
+
+/// The message the access-entry operations report when the cluster or the access
+/// entry a request names does not exist.
+///
+/// The access-entry APIs report a GENERIC not-found sentence rather than naming
+/// the resource the way the older cluster APIs do (`DescribeCluster` answers "No
+/// cluster found for name: <name>."), so this slice uses one constant across
+/// `CreateAccessEntry`, `DescribeAccessEntry`, `AssociateAccessPolicy` and
+/// `ListAssociatedAccessPolicies` instead of a sentence built per operation. The
+/// model documents no message text for `ResourceNotFoundException`, so a client
+/// branches on the error CODE (and on the `clusterName` the exception carries),
+/// never on this string.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource does not exist.";
+
+/// The `type` an access entry gets when `CreateAccessEntry` is called without one:
+/// "If you don't specify a value, Amazon EKS sets the value to `STANDARD`"
+/// (`CreateAccessEntryRequest$type`).
+pub const ACCESS_ENTRY_TYPE_STANDARD: &str = "STANDARD";
+/// The access-entry type for a self-managed Linux Amazon EC2 node role.
+pub const ACCESS_ENTRY_TYPE_EC2_LINUX: &str = "EC2_LINUX";
+/// The access-entry type for a self-managed Windows Amazon EC2 node role.
+pub const ACCESS_ENTRY_TYPE_EC2_WINDOWS: &str = "EC2_WINDOWS";
+/// The access-entry type for a Fargate profile pod execution role.
+pub const ACCESS_ENTRY_TYPE_FARGATE_LINUX: &str = "FARGATE_LINUX";
+
+/// Every access-entry `type` this service accepts.
+///
+/// `AccessEntry$type` is a plain string member, so the model refuses nothing before
+/// a handler runs; the set is the one `CreateAccessEntryRequest$type` documents:
+/// "Valid values are `STANDARD`, `FARGATE_LINUX`, `EC2_LINUX`, `EC2_WINDOWS`,
+/// `EC2` (for EKS Auto Mode), `HYBRID_LINUX`, and `HYPERPOD_LINUX`."
+pub const ACCESS_ENTRY_TYPES: &[&str] = &[
+    ACCESS_ENTRY_TYPE_STANDARD,
+    ACCESS_ENTRY_TYPE_FARGATE_LINUX,
+    ACCESS_ENTRY_TYPE_EC2_LINUX,
+    ACCESS_ENTRY_TYPE_EC2_WINDOWS,
+    "EC2",
+    "HYBRID_LINUX",
+    "HYPERPOD_LINUX",
+];
+
+/// Whether an access entry of this `type` is a NODE entry, which can only name an
+/// IAM role: "For `STANDARD` access entries, you can use every IAM principal type.
+/// For nodes (`EC2` (for EKS Auto Mode), `EC2_LINUX`, `EC2_WINDOWS`,
+/// `FARGATE_LINUX`, and `HYBRID_LINUX`), the only valid ARN is IAM roles"
+/// (`CreateAccessEntryRequest$principalArn`) — which is the list below.
+pub const NODE_ACCESS_ENTRY_TYPES: &[&str] = &[
+    "EC2",
+    ACCESS_ENTRY_TYPE_EC2_LINUX,
+    ACCESS_ENTRY_TYPE_EC2_WINDOWS,
+    ACCESS_ENTRY_TYPE_FARGATE_LINUX,
+    "HYBRID_LINUX",
+];
+
+/// See [`NODE_ACCESS_ENTRY_TYPES`].
+pub fn is_node_access_entry_type(entry_type: &str) -> bool {
+    NODE_ACCESS_ENTRY_TYPES.contains(&entry_type)
+}
+
+/// Whether an access entry of this `type` is a self-managed Amazon EC2 node entry,
+/// which carries neither Kubernetes groups nor access policies: "If you set the
+/// value to `EC2_LINUX` or `EC2_WINDOWS`, you can't specify values for
+/// `kubernetesGroups`, or associate an `AccessPolicy` to the access entry"
+/// (`CreateAccessEntryRequest$type`).
+pub fn is_self_managed_node_entry_type(entry_type: &str) -> bool {
+    entry_type == ACCESS_ENTRY_TYPE_EC2_LINUX || entry_type == ACCESS_ENTRY_TYPE_EC2_WINDOWS
+}
+
+/// The two `AccessScopeType` members (`smithy_query query="shape"
+/// shape="AccessScopeType"`): a policy is scoped to the whole cluster or to named
+/// Kubernetes namespaces. `AccessScope$type` is carried as the wire token.
+pub const ACCESS_SCOPE_TYPE_CLUSTER: &str = "cluster";
+/// See [`ACCESS_SCOPE_TYPE_CLUSTER`].
+pub const ACCESS_SCOPE_TYPE_NAMESPACE: &str = "namespace";
+
+/// The username EKS assigns a self-managed Amazon EC2 node access entry when the
+/// caller specifies none. The model points at "Creating access entries" in the
+/// Amazon EKS User Guide for "the value Amazon EKS specifies for you"
+/// (`CreateAccessEntryRequest$username`); that is the `system:node:` username
+/// Kubernetes resolves per node from its private DNS name.
+pub const DEFAULT_USERNAME_EC2_NODE: &str = "system:node:{{EC2PrivateDNSName}}";
+/// The username EKS assigns a Fargate access entry when the caller specifies none
+/// — see [`DEFAULT_USERNAME_EC2_NODE`]; a Fargate pod is identified by its
+/// session name rather than by a DNS name.
+pub const DEFAULT_USERNAME_FARGATE: &str = "system:node:{{SessionName}}";
+
+/// The username an access entry reports when `CreateAccessEntry` is called without
+/// one.
+///
+/// Every type other than the node types authenticates as the IAM principal itself,
+/// so the principal ARN is the username; the node types get the `system:node:`
+/// username for their platform (see [`DEFAULT_USERNAME_EC2_NODE`]).
+///
+/// Only the types whose `system:node:` username the user guide publishes are
+/// templated here — the self-managed Amazon EC2 ones and Fargate. `EC2` (EKS Auto
+/// Mode), `HYBRID_LINUX` and `HYPERPOD_LINUX` are node types for the purpose of
+/// [`is_node_access_entry_type`] (their principal must be a role) but no username
+/// template is published for them, so rather than invent one this reports the
+/// principal ARN, which is a username the principal really authenticates as.
+pub fn default_username(entry_type: &str, principal_arn: &str) -> String {
+    if is_self_managed_node_entry_type(entry_type) {
+        DEFAULT_USERNAME_EC2_NODE.to_string()
+    } else if entry_type == ACCESS_ENTRY_TYPE_FARGATE_LINUX {
+        DEFAULT_USERNAME_FARGATE.to_string()
+    } else {
+        principal_arn.to_string()
+    }
+}
+
+/// The name of the EKS-managed access policy `arn` identifies, or `None` when
+/// `arn` is not the ARN of a policy this service publishes.
+///
+/// `AssociateAccessPolicyRequest$policyArn` is "The ARN of the AccessPolicy that
+/// you're associating. For a list of ARNs, use ListAccessPolicies" — so the ARN
+/// must name a policy from [`ACCESS_POLICY_NAMES`], the catalogue
+/// `ListAccessPolicies` reports, which is this service's single source of truth
+/// for which policies exist. The returned name is the catalogue's own `&'static`
+/// entry, not a slice of the caller's string.
+pub fn access_policy_name(arn: &str) -> Option<&'static str> {
+    let name = arn.strip_prefix(ACCESS_POLICY_ARN_PREFIX)?;
+    ACCESS_POLICY_NAMES
+        .iter()
+        .copied()
+        .find(|published| *published == name)
+}
+
+/// The number of digits an AWS account id carries, which an IAM principal ARN's
+/// account field must be ([`::engine::emulator_account_id`] is one such id).
+pub const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// The parts of an IAM principal ARN an access entry is keyed and named by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IamPrincipalArn<'a> {
+    /// The resource type: `role` or `user`.
+    pub kind: &'a str,
+    /// The [`ACCOUNT_ID_DIGITS`]-digit account the principal belongs to.
+    pub account: &'a str,
+    /// The principal's path and name, as the ARN spells it.
+    pub name: &'a str,
+}
+
+/// The IAM principal `arn` names, or `None` when it is not an IAM user or role ARN.
+///
+/// `CreateAccessEntryRequest$principalArn` is "The ARN of the IAM principal for the
+/// access entry", and an IAM principal ARN is
+/// `arn:<partition>:iam::<account-id>:(role|user)/<name>` — global (no region) and
+/// account-scoped, the account being the [`ACCOUNT_ID_DIGITS`]-digit id an AWS
+/// account carries. Anything else (an assumed-role or service ARN, a bare name) is
+/// not a principal this service can file an access entry under.
+pub fn parse_iam_principal_arn(arn: &str) -> Option<IamPrincipalArn<'_>> {
+    let mut fields = arn.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some("iam"), Some(""), Some(account), Some(resource)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return None;
+    };
+    if partition.is_empty()
+        || account.len() != ACCOUNT_ID_DIGITS
+        || !account.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let (kind, name) = resource.split_once('/')?;
+    ((kind == "role" || kind == "user") && !name.is_empty()).then_some(IamPrincipalArn {
+        kind,
+        account,
+        name,
+    })
+}
+
+/// The server-generated identifier that ends an access entry's ARN, in the
+/// `8-4-4-4-12` hex form EKS publishes there.
+///
+/// Derived from the cluster, region and principal the entry belongs to — the
+/// triple that identifies it — so it is distinct per entry and stable for the
+/// record's whole life. It is computed once, when the entry is created, and stored
+/// on the record; no read recomputes it.
+pub fn derive_access_entry_id(seed: &str) -> String {
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&Sha256::digest(seed.as_bytes())[..16]);
+    // The same `8-4-4-4-12` renderer the minted ids use, so every UUID-shaped
+    // identifier this service publishes is laid out in one place.
+    hyphenate_uuid(&bytes)
+}
+
+/// The ARN of the access entry for `principal` on `cluster_name` in `region`, in
+/// the form EKS publishes:
+/// `arn:aws:eks:<region>:<account>:access-entry/<cluster>/<kind>/<principal
+/// account>/<principal name>/<id>`.
+pub fn access_entry_arn(
+    region: &str,
+    cluster_name: &str,
+    principal: &IamPrincipalArn<'_>,
+    principal_arn: &str,
+) -> String {
+    let id = derive_access_entry_id(&format!("{region}/{cluster_name}/{principal_arn}"));
+    ::engine::emulator_arn(
+        "eks",
+        region,
+        &format!(
+            "access-entry/{cluster_name}/{}/{}/{}/{id}",
+            principal.kind, principal.account, principal.name
+        ),
+    )
+}
+
+/// The number of access entries one cluster holds before `CreateAccessEntry`
+/// answers `ResourceLimitExceededException`.
+///
+/// AWS publishes an adjustable quota for access entries per cluster but this
+/// emulator does not pin its value, so the ceiling is CHOSEN rather than cited:
+/// what it is for is bounding the store, so a long-lived emulator cannot grow
+/// without limit on repeated creates. Exceeding a service limit is exactly what
+/// that modelled error reports.
+pub const MAX_ACCESS_ENTRIES_PER_CLUSTER: usize = 100;
+
+/// One access policy associated to an access entry, as this service stores it.
+#[derive(Debug, Clone)]
+pub struct AssociatedPolicyRecord {
+    pub policy_arn: String,
+    /// The `AccessScopeType` token the association is scoped with
+    /// ([`ACCESS_SCOPE_TYPE_CLUSTER`] or [`ACCESS_SCOPE_TYPE_NAMESPACE`]).
+    pub scope_type: String,
+    /// The namespaces a `namespace`-scoped association names; empty for a
+    /// `cluster`-scoped one.
+    pub namespaces: Vec<String>,
+    pub associated_at: SystemTime,
+    pub modified_at: SystemTime,
+}
+
+impl AssociatedPolicyRecord {
+    /// This record as the modelled `AssociatedAccessPolicy` shape.
+    pub fn to_associated_access_policy(&self) -> AssociatedAccessPolicy {
+        AssociatedAccessPolicy {
+            policy_arn: Some(self.policy_arn.clone()),
+            access_scope: Some(AccessScope {
+                r#type: Some(self.scope_type.clone()),
+                // A `cluster`-scoped association has no namespaces, and the member
+                // is optional, so it is omitted rather than reported empty.
+                namespaces: (!self.namespaces.is_empty()).then(|| self.namespaces.clone()),
+            }),
+            associated_at: Some(::aws_smithy_types::DateTime::from(self.associated_at)),
+            modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+        }
+    }
+}
+
+/// One access entry, as this service stores it.
+///
+/// Everything an `AccessEntry` reports is held here — including the
+/// server-generated parts (`accessEntryArn`, `createdAt`, `modifiedAt`, and the
+/// `username` EKS fills in) — so a read returns exactly what the write stored
+/// rather than recomputing anything per request.
+#[derive(Debug, Clone)]
+pub struct AccessEntryRecord {
+    pub cluster_name: String,
+    pub principal_arn: String,
+    pub arn: String,
+    pub created_at: SystemTime,
+    pub modified_at: SystemTime,
+    pub kubernetes_groups: Vec<String>,
+    pub username: String,
+    pub entry_type: String,
+    pub tags: BTreeMap<String, String>,
+    pub client_request_token: Option<String>,
+    /// The access policies associated to this entry, by policy ARN. A `BTreeMap`
+    /// so `ListAssociatedAccessPolicies` walks a stable, sorted order and a page
+    /// token can name the policy ARN to resume after. What BOUNDS it is
+    /// [`ACCESS_POLICY_NAMES`]: only a policy Amazon EKS publishes can be
+    /// associated and each is keyed once, so an entry holds at most one record per
+    /// published policy however often `AssociateAccessPolicy` is called.
+    pub associated_policies: BTreeMap<String, AssociatedPolicyRecord>,
+}
+
+impl AccessEntryRecord {
+    /// This record as the modelled `AccessEntry` shape.
+    pub fn to_access_entry(&self) -> AccessEntry {
+        AccessEntry {
+            cluster_name: Some(self.cluster_name.clone()),
+            principal_arn: Some(self.principal_arn.clone()),
+            kubernetes_groups: Some(self.kubernetes_groups.clone()),
+            access_entry_arn: Some(self.arn.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+            tags: Some(
+                self.tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            username: Some(self.username.clone()),
+            r#type: Some(self.entry_type.clone()),
+        }
+    }
+}
 
 /// The one value `ListClusters`' `include` takes: "Use 'all' to return connected
 /// clusters, or blank to return only Amazon EKS clusters. 'all' must be in
@@ -424,6 +731,14 @@ pub struct ClusterRecord {
     pub kube_api_server_config: Option<KubeApiServerConfigResponse>,
     pub kube_scheduler_config: Option<KubeSchedulerConfigResponse>,
     pub kube_controller_manager_config: Option<KubeControllerManagerConfigResponse>,
+    /// This cluster's access entries, by IAM principal ARN — the principal is what
+    /// identifies an access entry within a cluster
+    /// (`/clusters/{clusterName}/access-entries/{principalArn}`). They live on the
+    /// cluster record because an access entry belongs to exactly one cluster, so
+    /// deleting the cluster deletes them with it. A `BTreeMap` so a listing walks a
+    /// stable, sorted order. Bounded by [`MAX_ACCESS_ENTRIES_PER_CLUSTER`], which
+    /// `CreateAccessEntry` enforces.
+    pub access_entries: BTreeMap<String, AccessEntryRecord>,
     /// The identity provider configurations associated to this cluster, by
     /// `identityProviderConfigName`.
     ///
@@ -1312,6 +1627,13 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// The first 16 bytes of `seed`'s SHA-256 digest, as lowercase hex. The shared
+/// step of the identifier this service derives from stable content
+/// ([`derive_cluster_resource_id`]); 16 bytes is the width it publishes.
+fn digest_hex(seed: &str) -> String {
+    hex::encode(&Sha256::digest(seed.as_bytes())[..16])
+}
+
 /// 16 bytes rendered in the hyphenated `8-4-4-4-12` lowercase-hex layout a UUID
 /// takes. The one renderer for both of this service's UUID-shaped identifiers
 /// ([`new_update_id`] and [`derive_activation_id`]).
@@ -1365,8 +1687,7 @@ pub fn new_update_id(sequence: u64) -> String {
 /// It is computed once, when the cluster is created, and stored on the record;
 /// no read recomputes it.
 pub fn derive_cluster_resource_id(arn: &str) -> String {
-    let digest = Sha256::digest(arn.as_bytes());
-    hex::encode_upper(&digest[..16])
+    digest_hex(arn).to_ascii_uppercase()
 }
 
 /// The cluster's Kubernetes API server endpoint, in the host form EKS publishes:
@@ -1525,6 +1846,9 @@ pub const ACCESS_POLICIES_LISTING: &str = "access-policies";
 /// The scope `DescribeClusterVersions`'s tokens carry, over the calendar rows'
 /// [`ClusterVersionRecord::page_key`]s. See [`CLUSTERS_LISTING`].
 pub const CLUSTER_VERSIONS_LISTING: &str = "cluster-versions";
+/// The scope `ListAssociatedAccessPolicies`'s tokens carry, over one access
+/// entry's associated policy ARNs. See [`CLUSTERS_LISTING`].
+pub const ASSOCIATED_ACCESS_POLICIES_LISTING: &str = "associated-access-policies";
 
 /// Encode a page token for `listing` that resumes AFTER `last_returned`.
 ///
