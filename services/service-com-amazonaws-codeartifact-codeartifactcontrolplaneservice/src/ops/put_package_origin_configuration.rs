@@ -251,15 +251,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // versions and the requested restrictions are set on the package." So the write
         // is an upsert keyed by the (format, namespace, package) triple, and the record's
         // identity comes from the key, never from the previous value.
-        let package = repository
-            .packages
-            .entry(key)
-            .or_insert_with(|| crate::state::Package {
-                format: input.format.clone(),
-                namespace: input.namespace.clone(),
-                name: input.package.clone(),
-                origin_restrictions: input.restrictions.clone(),
-            });
+        let package = repository.packages.entry(key).or_insert_with(|| {
+            crate::state::Package::new(
+                &input.format,
+                input.namespace.as_deref(),
+                &input.package,
+            )
+        });
         // The restrictions are set on both paths — the insert above stores them for a new
         // record, so only an existing one still needs overwriting.
         package.origin_restrictions = input.restrictions;

@@ -751,9 +751,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-cloudwatchlogs"
-version = "1.159.0"
+version = "1.160.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20f6a822d5aa208af15881ad127b1fe6af4ce5a4a62f0091b8ba71e21d140cee"
+checksum = "b9ffb5aa6c64847b66ef776046bdf7e131c538395a626c25b947d10b753bec1b"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -777,9 +777,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-iam"
-version = "1.130.0"
+version = "1.131.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23b9d7eb3c9d721560a40103eb09738249289b345bd779603e848861a09573fe"
+checksum = "dc89557e7ef337287f7d30fd9dd3988d4f8cfa081cd3cfeb5e01e4ee302ee53c"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -803,9 +803,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3"
-version = "1.154.0"
+version = "1.155.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "910c6e60689f021154dc701ad219035066fb94decce71ee72ff0f06e90df4067"
+checksum = "5a542f0e9261b9ce56708d591a62062079fa3c58a362ffbf49a2e48a4f6ced16"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -839,9 +839,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sigv4"
-version = "1.6.2"
+version = "1.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a3ccec0607ae3839cd76830df5ed62468ac1330acdb3dc4ec0502404113d2b6"
+checksum = "9d3d48355cb86b15ccbb38b8bc6b87500c824ee4ed8cbc10a961b435242b5e16"
 dependencies = [
  "aws-credential-types",
  "aws-smithy-eventstream 0.61.6",
@@ -900,7 +900,7 @@ dependencies = [
  "http-body-util",
  "md-5 0.11.0",
  "pin-project-lite",
- "sha1",
+ "sha1 0.11.0",
  "sha2 0.11.1",
  "tracing",
 ]
@@ -5622,10 +5622,13 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
+ "base64 0.22.1",
  "bytes",
  "hex",
  "http",
+ "md-5 0.10.6",
  "serde_json",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -13820,6 +13823,17 @@ dependencies = [
  "http",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
 ]
 
 [[package]]
