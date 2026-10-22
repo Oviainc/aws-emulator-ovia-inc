@@ -7,6 +7,8 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+# The shared request-claim rule for a SigV4 signing name several services share.
+service-common = { path = "../common" }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
@@ -25,6 +27,9 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Hashes the id-minting seed into an `agentRuntimeId` suffix (src/state.rs).
 sha2 = { workspace = true }
+# Resolves a gateway target's Lambda function against the emulator's own Lambda,
+# through the in-process callback (src/state.rs).
+aws-sdk-lambda = { version = "1", default-features = false }
 # Encodes the opaque `nextToken` ListAgentRuntimes pages with.
 hex = { workspace = true }
 

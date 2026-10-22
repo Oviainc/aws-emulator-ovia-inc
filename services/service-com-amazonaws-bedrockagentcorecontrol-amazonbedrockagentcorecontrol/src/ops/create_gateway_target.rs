@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGatewayTarget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGatewayTarget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGatewayTarget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds a target to a gateway and PERSISTS it on that gateway's record in
+//! [`crate::state`]. A target whose MCP tool handler is a Lambda function is resolved
+//! against Lambda FIRST — the gateway has to invoke that function to serve a tool call —
+//! so a target naming a function that does not exist is refused with the operation's
+//! modelled validation error and nothing is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -212,18 +209,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGatewayTarget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGatewayTargetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGatewayTarget"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateGatewayTargetErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the gateway store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // Everything that can be decided from stored state alone is decided
+        // first, and the store guard is DROPPED before the cross-service call
+        // below: a lock is not held across an await, and the Lambda the target
+        // names is resolved only for a request that would otherwise be written.
+        let gateway_arn = {
+            let store = state.lock();
+            if let Some((gateway_id, Some(target_id))) =
+                store.replayed_gateway_result(Self::NAME, input.client_token.as_deref())
+            {
+                // A replayed request carrying the same `clientToken` answers with
+                // the target that token first produced, rather than adding a second.
+                if let Some(gateway) = store.gateways.get(&gateway_id) {
+                    if let Some(target) = gateway.targets.get(&target_id) {
+                        return Ok(target.create_output(&gateway.gateway_arn, now));
+                    }
+                }
+            }
+            let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
+                CreateGatewayTargetErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no gateway with identifier {} exists in this account",
+                            input.gateway_identifier
+                        )),
+                    },
+                )
+            })?;
+            // The targets one gateway holds are bounded, so a caller looping on
+            // create meets the modelled quota instead of this process's memory
+            // limit.
+            if gateway.targets.len() >= crate::state::MAX_TARGETS_PER_GATEWAY {
+                return Err(CreateGatewayTargetErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "gateway {} already holds the maximum of {} targets",
+                            gateway.gateway_id,
+                            crate::state::MAX_TARGETS_PER_GATEWAY
+                        )),
+                    },
+                )
+                .into());
+            }
+            gateway.gateway_arn.clone()
+        };
+
+        // `name` is optional on the request and `@required` on every response
+        // that reports a target, so a target with no name is refused rather than
+        // stored under a name this service invented for it.
+        let name = input.name.clone().ok_or_else(|| {
+            CreateGatewayTargetErrorModeled::ValidationException(
+                crate::state::field_validation_failed("name", "is required"),
+            )
+        })?;
+
+        // The cross-service check: a Lambda MCP target must name a function that
+        // exists. Only a Lambda target has one to resolve.
+        if let Some(lambda_arn) = crate::state::mcp_lambda_arn(&input.target_configuration) {
+            if crate::state::lambda_function_is_absent(ctx, lambda_arn).await {
+                return Err(CreateGatewayTargetErrorModeled::ValidationException(
+                    crate::state::field_validation_failed(
+                        crate::state::LAMBDA_ARN_MEMBER,
+                        crate::state::LAMBDA_FUNCTION_ABSENT,
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+        // The gateway is read again: the guard was dropped for the call above, so
+        // nothing promises it is still there.
+        let gateway_id = store
+            .gateways
+            .get(&input.gateway_identifier)
+            .map(|gateway| gateway.gateway_id.clone())
+            .ok_or_else(|| {
+                CreateGatewayTargetErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no gateway with identifier {} exists in this account",
+                            input.gateway_identifier
+                        )),
+                    },
+                )
+            })?;
+        let target_id = store.mint_target_id(&gateway_id, &name, now);
+        let record = crate::state::GatewayTargetRecord {
+            target_id: target_id.clone(),
+            name,
+            description: input.description,
+            created_at: now,
+            updated_at: now,
+            // A new target is created, not ready: the transition to READY is owed
+            // by the clock, not by this call.
+            transient_status: crate::state::STATUS_CREATING.to_string(),
+            settled_status: crate::state::STATUS_READY.to_string(),
+            settles_at: now + crate::state::GATEWAY_SETTLE_DELAY,
+            target_configuration: input.target_configuration,
+            credential_provider_configurations:
+                crate::state::effective_credential_provider_configurations(
+                    input.credential_provider_configurations,
+                ),
+            metadata_configuration: input.metadata_configuration,
+            private_endpoint: input.private_endpoint,
+            certificate_configurations: input.certificate_configurations,
+        };
+        let output = record.create_output(&gateway_arn, now);
+        if let Some(gateway) = store.gateways.get_mut(&gateway_id) {
+            gateway.updated_at = now;
+            gateway.targets.insert(target_id.clone(), record);
+        }
+        store.remember_gateway_client_token(
+            Self::NAME,
+            input.client_token,
+            &gateway_id,
+            Some(&target_id),
+        );
+
+        Ok(output)
     }
 }
