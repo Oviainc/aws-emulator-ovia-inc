@@ -296,10 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if machine.sm_type == crate::state::STATE_MACHINE_TYPE_EXPRESS {
             return Err(ListExecutionsErrorModeled::StateMachineTypeNotSupported(
                 StateMachineTypeNotSupported {
-                    message: Some(format!(
-                        "ListExecutions does not support the EXPRESS state machine \
-                         {state_machine_arn}"
-                    )),
+                    message: Some(crate::state::STATE_MACHINE_TYPE_NOT_SUPPORTED.to_string()),
                 },
             )
             .into());

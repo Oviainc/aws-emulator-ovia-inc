@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_validation.rs"]
 mod arn_validation;
+#[path = "all/error_messages.rs"]
+mod error_messages;
 #[path = "all/execution_redrive.rs"]
 mod execution_redrive;
 #[path = "all/resource_tags.rs"]

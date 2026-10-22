@@ -249,11 +249,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if let Some(name) = input.name.as_deref() {
-            if let Some(why) = crate::state::invalid_name_reason(name) {
-                return Err(
-                    StartExecutionErrorModeled::InvalidName(InvalidName { message: Some(why) })
-                        .into(),
-                );
+            if !crate::state::is_valid_name(name) {
+                return Err(StartExecutionErrorModeled::InvalidName(InvalidName {
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::INVALID_NAME,
+                        name,
+                    )),
+                })
+                .into());
             }
         }
 
