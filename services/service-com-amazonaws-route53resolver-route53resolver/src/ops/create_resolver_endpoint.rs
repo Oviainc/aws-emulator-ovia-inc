@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResolverEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResolverEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResolverEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. The Resolver-endpoint slice (create, get,
+//! list, update, list-ip-addresses, delete) computes every response from the
+//! records in [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -238,18 +232,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResolverEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResolverEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResolverEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateResolverEndpointErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Documented pairing: "OutpostArn ... If you specify this, you must also
+        // specify a value for the PreferredInstanceType", and the converse on
+        // `PreferredInstanceType`. The model cannot express it, so the service
+        // refuses the half-specified request here.
+        if input.outpost_arn.is_some() != input.preferred_instance_type.is_some() {
+            return Err(CreateResolverEndpointErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "OutpostArn and PreferredInstanceType must be specified together"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The model puts no length on `SecurityGroupIds`, and a stored endpoint's
+        // groups are walked once per filtered list scan, so the list is bounded
+        // here: both what one record can hold and the per-record cost of filtering
+        // on it. Refused before the store is locked, so nothing is written.
+        if input.security_group_ids.len() > crate::state::MAX_SECURITY_GROUP_IDS {
+            return Err(CreateResolverEndpointErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "A Resolver endpoint accepts at most {} security groups in this emulator",
+                        crate::state::MAX_SECURITY_GROUP_IDS
+                    )),
+                    resource_type: Some("ResolverEndpoint".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // `CreatorRequestId` exists so "failed requests [can] be retried without
+        // the risk of running the operation twice": a repeat of a request id that
+        // already created an endpoint resolves to THAT endpoint and creates nothing.
+        if let Some(existing_id) = store.creator_request_id_index.get(&input.creator_request_id) {
+            if let Some(record) = store.resolver_endpoints.get(existing_id) {
+                return Ok(CreateResolverEndpointOutput {
+                    resolver_endpoint: Some(record.to_endpoint(::std::time::Instant::now())),
+                });
+            }
+        }
+
+        // The store is bounded: a new endpoint past the cap is refused with the
+        // `LimitExceededException` this operation models, BEFORE anything is
+        // written, rather than growing the process without limit. The retry path
+        // above is unaffected — it allocates no record — and a delete frees a slot.
+        if !store.can_store_another_endpoint() {
+            return Err(CreateResolverEndpointErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This emulator stores at most {} Resolver endpoints; delete one before creating another",
+                        crate::state::MAX_STORED_ENDPOINTS
+                    )),
+                    resource_type: Some("ResolverEndpoint".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let now = ::std::time::Instant::now();
+        let ready_at = now + crate::state::PROVISIONING_DELAY;
+        let timestamp = crate::state::now_rfc3339();
+
+        let seq = store.next_seq();
+        let id = crate::state::mint_endpoint_id(&input.direction, seq);
+        let arn = ::engine::emulator_arn(
+            crate::state::ARN_NAMESPACE,
+            &region,
+            &format!("resolver-endpoint/{id}"),
+        );
+
+        let subnet_ids: Vec<String> = input
+            .ip_addresses
+            .iter()
+            .map(|requested| requested.subnet_id.clone())
+            .collect();
+
+        let mut ip_addresses = Vec::with_capacity(input.ip_addresses.len());
+        for requested in &input.ip_addresses {
+            let ip_seq = store.next_seq();
+            ip_addresses.push(crate::state::IpAddressRecord {
+                ip_id: crate::state::mint_ip_id(ip_seq),
+                subnet_id: requested.subnet_id.clone(),
+                // An address the request did not supply is left unset rather than
+                // invented: the emulator holds no subnet inventory, so it cannot
+                // know a value that lies inside the subnet's CIDR.
+                ip: requested.ip.clone(),
+                ipv6: requested.ipv6.clone(),
+                status: crate::state::IP_STATUS_CREATING.to_string(),
+                status_message: None,
+                creation_time: timestamp.clone(),
+                modification_time: timestamp.clone(),
+                attached_at: ready_at,
+            });
+        }
+
+        let record = crate::state::ResolverEndpointRecord {
+            seq,
+            id: id.clone(),
+            arn,
+            name: input.name.clone(),
+            creator_request_id: input.creator_request_id.clone(),
+            security_group_ids: input.security_group_ids.clone(),
+            direction: input.direction.clone(),
+            host_vpc_id: Some(crate::state::host_vpc_id(&subnet_ids)),
+            status: crate::state::ENDPOINT_STATUS_CREATING.to_string(),
+            status_message: None,
+            endpoint_type: input.resolver_endpoint_type.clone(),
+            // `Protocols`: "None, which is treated as Do53."
+            protocols: input
+                .protocols
+                .clone()
+                .filter(|protocols| !protocols.is_empty())
+                .unwrap_or_else(|| vec![crate::state::DEFAULT_PROTOCOL.to_string()]),
+            outpost_arn: input.outpost_arn.clone(),
+            preferred_instance_type: input.preferred_instance_type.clone(),
+            rni_enhanced_metrics_enabled: input.rni_enhanced_metrics_enabled,
+            target_name_server_metrics_enabled: input.target_name_server_metrics_enabled,
+            dns64_enabled: input.dns64_enabled,
+            ipv6_internet_access_enabled: input.ipv6_internet_access_enabled,
+            ip_addresses,
+            tags: input.tags.clone().unwrap_or_default(),
+            creation_time: timestamp.clone(),
+            modification_time: timestamp,
+            ready_at,
+        };
+
+        let endpoint = record.to_endpoint(now);
+        store
+            .creator_request_id_index
+            .insert(input.creator_request_id.clone(), id.clone());
+        store.resolver_endpoints.insert(id, record);
+
+        Ok(CreateResolverEndpointOutput {
+            resolver_endpoint: Some(endpoint),
+        })
     }
 }

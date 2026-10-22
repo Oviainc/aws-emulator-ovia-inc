@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResolverEndpointIpAddresses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResolverEndpointIpAddresses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResolverEndpointIpAddresses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. Pages the IP address records stored for the
+//! Resolver endpoint in [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +110,10 @@ pub enum ListResolverEndpointIpAddressesErrorModeled {
 /// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
 pub type ListResolverEndpointIpAddressesError = crate::scaffolded::Scaffolded<ListResolverEndpointIpAddressesErrorModeled>;
 
+/// Names the collection this operation's `NextToken` cursors over; the endpoint
+/// id is appended, because each endpoint has its own IP address collection.
+const PAGE_SCOPE: &str = "ListResolverEndpointIpAddresses";
+
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
 /// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
@@ -163,18 +160,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResolverEndpointIpAddresses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResolverEndpointIpAddressesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResolverEndpointIpAddresses"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListResolverEndpointIpAddressesErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A pure read of the addresses stored at create/update time.
+        let store = state.lock();
+        let Some(record) = store.resolver_endpoints.get(&input.resolver_endpoint_id) else {
+            return Err(
+                ListResolverEndpointIpAddressesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Resolver endpoint with ID '{}' does not exist",
+                            input.resolver_endpoint_id
+                        )),
+                        resource_type: Some("ResolverEndpoint".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::Instant::now();
+        let all: Vec<IpAddressResponse> = record
+            .ip_addresses
+            .iter()
+            .map(|stored| stored.to_response(now))
+            .collect();
+
+        // The cursor is scoped to THIS endpoint's collection, so one minted for
+        // another endpoint is not a cursor this collection accepts.
+        let scope = format!("{PAGE_SCOPE}/{}", input.resolver_endpoint_id);
+        let Some(page) = crate::state::paginate(
+            all,
+            &scope,
+            input.max_results,
+            input.next_token.as_deref(),
+        ) else {
+            return Err(
+                ListResolverEndpointIpAddressesErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: Some(
+                            "The NextToken you provided was not issued by this service for this Resolver endpoint"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(ListResolverEndpointIpAddressesOutput {
+            next_token: page.next_token,
+            // "The value that you specified for MaxResults in the request."
+            max_results: input.max_results,
+            ip_addresses: Some(page.items),
+        })
     }
 }

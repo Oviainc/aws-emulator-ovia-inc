@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateResolverEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateResolverEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateResolverEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. Mutates the Resolver endpoint record in
+//! [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +190,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateResolverEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateResolverEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateResolverEndpoint"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateResolverEndpointErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let Some(record) = store
+            .resolver_endpoints
+            .get_mut(&input.resolver_endpoint_id)
+        else {
+            return Err(UpdateResolverEndpointErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Resolver endpoint with ID '{}' does not exist",
+                        input.resolver_endpoint_id
+                    )),
+                    resource_type: Some("ResolverEndpoint".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Documented: "You can only update between IPV4 and DUALSTACK, IPV6 endpoint
+        // type can't be updated to other type" / "Updating to IPV6 type isn't
+        // currently supported." Refuse before any member is written, so a rejected
+        // update leaves the record exactly as it was.
+        if let Some(requested_type) = input.resolver_endpoint_type.as_deref() {
+            let current_type = record.endpoint_type.as_deref();
+            if requested_type == "IPV6" && current_type != Some("IPV6") {
+                return Err(UpdateResolverEndpointErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "ResolverEndpointType cannot be updated to IPV6".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            if current_type == Some("IPV6") && requested_type != "IPV6" {
+                return Err(UpdateResolverEndpointErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "the ResolverEndpointType of an IPV6 endpoint cannot be updated"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // `UpdateIpAddresses` names the IP to change by its `IpId`, so an id this
+        // endpoint does not hold is refused and nothing is written.
+        for update in input.update_ip_addresses.iter().flatten() {
+            if !record
+                .ip_addresses
+                .iter()
+                .any(|stored| stored.ip_id == update.ip_id)
+            {
+                return Err(UpdateResolverEndpointErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Resolver endpoint '{}' has no IP address with ID '{}'",
+                            input.resolver_endpoint_id, update.ip_id
+                        )),
+                        resource_type: Some("IpAddressResponse".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let now = ::std::time::Instant::now();
+        let ready_at = now + crate::state::PROVISIONING_DELAY;
+        let timestamp = crate::state::now_rfc3339();
+
+        // Only the members the request carries are written; an absent member leaves
+        // the stored value alone. A request that carries none of them writes
+        // nothing at all, so it does not drive a settled endpoint back out of
+        // `OPERATIONAL` or move its `ModificationTime`.
+        let mut written = false;
+        if input.name.is_some() {
+            record.name = input.name.clone();
+            written = true;
+        }
+        if input.resolver_endpoint_type.is_some() {
+            record.endpoint_type = input.resolver_endpoint_type.clone();
+            written = true;
+        }
+        if let Some(protocols) = input.protocols.clone() {
+            // `Protocols`: "None, which is treated as Do53."
+            record.protocols = if protocols.is_empty() {
+                vec![crate::state::DEFAULT_PROTOCOL.to_string()]
+            } else {
+                protocols
+            };
+            written = true;
+        }
+        if input.rni_enhanced_metrics_enabled.is_some() {
+            record.rni_enhanced_metrics_enabled = input.rni_enhanced_metrics_enabled;
+            written = true;
+        }
+        if input.target_name_server_metrics_enabled.is_some() {
+            record.target_name_server_metrics_enabled = input.target_name_server_metrics_enabled;
+            written = true;
+        }
+        if input.dns64_enabled.is_some() {
+            record.dns64_enabled = input.dns64_enabled;
+            written = true;
+        }
+        if input.ipv6_internet_access_enabled.is_some() {
+            record.ipv6_internet_access_enabled = input.ipv6_internet_access_enabled;
+            written = true;
+        }
+
+        for update in input.update_ip_addresses.iter().flatten() {
+            if let Some(stored) = record
+                .ip_addresses
+                .iter_mut()
+                .find(|stored| stored.ip_id == update.ip_id)
+            {
+                stored.ipv6 = Some(update.ipv6.clone());
+                stored.status = crate::state::IP_STATUS_UPDATING.to_string();
+                stored.attached_at = ready_at;
+                stored.modification_time = timestamp.clone();
+                written = true;
+            }
+        }
+
+        if written {
+            record.status = crate::state::ENDPOINT_STATUS_UPDATING.to_string();
+            record.ready_at = ready_at;
+            record.modification_time = timestamp;
+        }
+
+        Ok(UpdateResolverEndpointOutput {
+            resolver_endpoint: Some(record.to_endpoint(now)),
+        })
     }
 }
