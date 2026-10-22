@@ -183,7 +183,9 @@ impl SerializableStruct for ValidationException {
 pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
-    /// A modeled error the operation declares. Renders with the model's own status.
+    /// A modeled error the operation declares. Renders with the status this service
+    /// serves that shape with — the model's own, except where
+    /// [`crate::state::served_status`] says otherwise.
     Modeled(E),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
@@ -282,10 +284,14 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     ///
     /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
     /// retryable, so a client would retry an operation that can never succeed.
+    ///
+    /// A modelled error reports the status this SERVICE serves its shape with, which is
+    /// the shape's own `@httpError` everywhere [`crate::state::served_status`] — this
+    /// service's own, hand-written rule — does not override it.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
+            Self::Modeled(e) => crate::state::served_status(e.shape_name(), e.http_status()),
             Self::ValidationException(_) => 400,
         }
     }

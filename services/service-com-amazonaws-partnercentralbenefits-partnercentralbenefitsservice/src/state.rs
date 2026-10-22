@@ -39,9 +39,43 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 pub const STORE_UNAVAILABLE: &str =
     "the benefit application store is unavailable; retry the request";
 
+/// The local name of the error shape this service denies an unauthorized caller with:
+/// the modelled `com.amazonaws.partnercentralbenefits#AccessDeniedException`, which is
+/// also what `smithy_server_runtime::OperationError::shape_name` reports for it and what
+/// the wire carries as the error code.
+pub const ACCESS_DENIED_SHAPE: &str = "AccessDeniedException";
+
+/// The HTTP status this service serves `AccessDeniedException` with.
+///
+/// The model declares the shape `@error("client")` with `@httpError(403)`, but the
+/// service answers its access denial with **400**: recorded behaviour (corpus
+/// `simparity-wire-aws-v1`, fixture
+/// `partnercentral-benefits-list-and-tag-validation-error-paths`, step `task#1`
+/// `ListBenefits` and step `task#4` `ListTagsForResource`), where the body is the
+/// modelled `AccessDeniedException` carrying the partner-entitlement sentence and the
+/// status on the wire is 400. A status the model does not predict is settled by what the
+/// service serves, so the recording is the authority for this one.
+pub const ACCESS_DENIED_STATUS: u16 = 400;
+
+/// The status this service serves a modelled error with, given the status that error's
+/// own `@httpError` declares.
+///
+/// The model is the authority for every error shape but [`ACCESS_DENIED_SHAPE`], whose
+/// served status is [`ACCESS_DENIED_STATUS`]. The choice is keyed on the error SHAPE and
+/// made once for the whole service — `crate::scaffolded`'s `OperationError::http_status`
+/// is its only caller — so every operation that can deny a caller answers the same
+/// status rather than one handler differing from the next.
+pub fn served_status(shape_name: &str, modelled: u16) -> u16 {
+    match shape_name {
+        ACCESS_DENIED_SHAPE => ACCESS_DENIED_STATUS,
+        _ => modelled,
+    }
+}
+
 /// What this service answers a caller whose account holds no active AWS partner
 /// benefit: the entitlement gate's refusal, carried by the modelled
-/// `AccessDeniedException` (HTTP 403).
+/// `AccessDeniedException` (served with [`ACCESS_DENIED_STATUS`], which is the status the
+/// recordings show rather than the model's `@httpError`).
 ///
 /// The gate is an account-level authorization stage, not a per-request computation, so
 /// its wording is a fixed sentence rather than something built from the request. This
@@ -1148,12 +1182,15 @@ pub fn not_found_message(resource: &str, identifier: &str) -> String {
 
 /// The entitlement gate: `Some(..)` when the calling account holds no active AWS partner
 /// benefit, and the request must be refused with the modelled `AccessDeniedException`
-/// (HTTP 403) instead of being served.
+/// (served with [`ACCESS_DENIED_STATUS`]) instead of being served.
 ///
 /// Every operation applies this BEFORE it looks any resource up, so an un-entitled
 /// caller is told it is not entitled rather than whether a resource exists; the
 /// modelled constraints are refused earlier still, by the centralized request walk, so
 /// a malformed request is a `ValidationException` whether the caller is entitled or not.
+///
+/// The two tag-MUTATING operations (`TagResource`, `UntagResource`) are the one recorded
+/// exception and do not apply it — see `crate::ops::tag_resource`.
 ///
 /// The emulator presents exactly one account (`engine::EMULATOR_ACCOUNT_ID`), so that is
 /// the account every request is made from and the only one the gate can be asked about.
@@ -1225,7 +1262,14 @@ pub fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
 ///
 /// `None` is the tagging operations' case — they bind no `Catalog` member — and renders
 /// as [`CATALOG_ABSENT`], which is what the service reports for a tagging call whose
-/// `resourceArn` resolves to no resource.
+/// `resourceArn` resolves to no resource: recorded behaviour (corpus
+/// `simparity-behavioral-aws-v1`, units
+/// `partnercentral-benefits.tag-resource-malformed-arn-rejected` and
+/// `partnercentral-benefits.untag-resource-malformed-arn-rejected`), where a well-formed
+/// tagging call naming a resource that does not exist is answered ``(
+/// "ResourceNotFoundException", "Catalog `null` not found")``. The absent catalog is the
+/// SERVICE's own wording for a path that carries no catalog, not an unset emulator value
+/// rendered by accident.
 pub fn catalog_not_found_message(catalog: Option<&str>) -> String {
     not_found_message(CATALOG_KIND, catalog.unwrap_or(CATALOG_ABSENT))
 }

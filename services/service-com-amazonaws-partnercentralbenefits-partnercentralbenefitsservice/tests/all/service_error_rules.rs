@@ -12,10 +12,11 @@
 //!    — never a rendering of the value that was rejected — with a `@pattern` requirement
 //!    quoted WITHOUT the `^` / `$` anchors the model spells it with.
 //! 2. **The partner-entitlement gate**: a request from an account that holds no active
-//!    AWS partner benefit is refused 403 `AccessDeniedException`, on reads as well as
-//!    writes, after the modelled constraints are checked and before any resource is
-//!    looked up — on every operation the gate fronts, which per the recorded answers is
-//!    every one except the tagging path (see [`UNGATED_OPERATIONS`]).
+//!    AWS partner benefit is refused `AccessDeniedException` with the status the service
+//!    serves that shape with ([`DENIED_STATUS`]), on reads as well as writes, after the
+//!    modelled constraints are checked and before any resource is looked up — on every
+//!    operation the gate fronts, which per the recorded answers is every one except the
+//!    two tag-MUTATING operations (see [`UNGATED_OPERATIONS`]).
 //! 3. **A lookup that found nothing** is answered 404 `ResourceNotFoundException` whose
 //!    message names the resource and the identifier the request named it with,
 //!    backtick-quoted: ``<Resource> `<identifier>` not found``.
@@ -91,17 +92,30 @@ pub(crate) fn taggable_arn() -> String {
     )
 }
 
+/// The status this service serves its `AccessDeniedException` with, written out here
+/// rather than read from the service's own constant so the value itself is under test.
+///
+/// The model declares the shape `@httpError(403)`; the recorded answers (corpus
+/// `simparity-wire-aws-v1`, fixture
+/// `partnercentral-benefits-list-and-tag-validation-error-paths`, steps `task#1`
+/// `ListBenefits` and `task#4` `ListTagsForResource`) carry 400, and the status a
+/// service serves is settled by what it serves.
+const DENIED_STATUS: u16 = 400;
+
 /// The operations the entitlement gate does NOT front.
 ///
 /// Recorded behaviour (corpus `simparity-behavioral-aws-v1`, units
 /// `partnercentral-benefits.tag-resource-malformed-arn-rejected` and
 /// `partnercentral-benefits.untag-resource-malformed-arn-rejected`): a well-formed
-/// tagging call naming a resource that does not exist is answered
+/// tag-MUTATING call naming a resource that does not exist is answered
 /// ``("ResourceNotFoundException", "Catalog `null` not found")`` — the resource lookup's
 /// own answer — from the same account whose `ListBenefits` and `CreateBenefitApplication`
-/// calls record the gate's 403 refusal. So the tagging path answers an un-entitled caller
-/// with its own logic, and the gate's table below spans every other operation.
-const UNGATED_OPERATIONS: &[&str] = &["ListTagsForResource", "TagResource", "UntagResource"];
+/// calls record the gate's refusal; the wire corpus records the same asymmetry on one
+/// fixture, whose `TagResource` step is answered `ResourceNotFoundException` while its
+/// `ListTagsForResource` step is answered `AccessDeniedException`. So the two tag-writing
+/// operations answer an un-entitled caller with their own logic, and the gate's table
+/// below spans every other operation — the tag-READING one included.
+const UNGATED_OPERATIONS: &[&str] = &["TagResource", "UntagResource"];
 
 /// The envelope a single violation renders into.
 pub(crate) fn one(clause: &str) -> String {
@@ -208,8 +222,8 @@ async fn refusal(
 
 /// One well-formed request per operation the service declares — nothing in any of them
 /// violates a modelled constraint, so the only thing that can refuse them is the
-/// entitlement gate, except on the tagging path ([`UNGATED_OPERATIONS`]), which the gate
-/// does not front and which answers its own resource lookup instead.
+/// entitlement gate, except on the tag-MUTATING path ([`UNGATED_OPERATIONS`]), which the
+/// gate does not front and which answers its own resource lookup instead.
 pub(crate) fn well_formed_requests() -> Vec<(&'static str, Value)> {
     vec![
         ("ListBenefits", json!({ "Catalog": CATALOG })),
@@ -777,9 +791,10 @@ fn violation(path: &str, kind: ViolationKind) -> Violation {
 // ---------------------------------------------------------------------------
 
 /// Every operation the entitlement gate fronts refuses a well-formed request from an
-/// account with no active AWS partner benefit — reads exactly as writes — with 403
-/// `AccessDeniedException` and the entitlement message; the tagging path
-/// ([`UNGATED_OPERATIONS`]) answers such a caller with its own logic instead.
+/// account with no active AWS partner benefit — reads exactly as writes — with
+/// `AccessDeniedException`, [`DENIED_STATUS`] and the entitlement message; the
+/// tag-MUTATING path ([`UNGATED_OPERATIONS`]) answers such a caller with its own logic
+/// instead.
 #[tokio::test]
 async fn every_operation_refuses_a_caller_with_no_active_partner_benefit() {
     let harness = Harness::unentitled();
@@ -787,9 +802,10 @@ async fn every_operation_refuses_a_caller_with_no_active_partner_benefit() {
         if UNGATED_OPERATIONS.contains(&operation) {
             let (status, response) = harness.call(operation, &body).await;
             assert_ne!(
-                status, 403,
-                "case {operation:?}: the tagging path is not behind the gate, got {status} \
-                 with {response:?}"
+                error_code(&response),
+                "AccessDeniedException",
+                "case {operation:?}: the tag-mutating path is not behind the gate, got \
+                 {status} with {response:?}"
             );
             assert!(
                 [404, 501].contains(&status),
@@ -803,7 +819,7 @@ async fn every_operation_refuses_a_caller_with_no_active_partner_benefit() {
             operation,
             operation,
             &body,
-            403,
+            DENIED_STATUS,
             "AccessDeniedException",
         )
         .await;
@@ -815,7 +831,7 @@ async fn every_operation_refuses_a_caller_with_no_active_partner_benefit() {
 }
 
 /// The other side of the gate: the SAME requests from an account that does hold an
-/// active partner benefit are not refused with 403 — they are served, or answered by the
+/// active partner benefit are not refused as denied — they are served, or answered by the
 /// operation's own logic (a lookup that found nothing, or the 501 of an operation this
 /// emulator has not implemented yet).
 #[tokio::test]
@@ -824,7 +840,8 @@ async fn an_entitled_account_is_not_refused_by_the_gate() {
     for (operation, body) in well_formed_requests() {
         let (status, response) = harness.call(operation, &body).await;
         assert_ne!(
-            status, 403,
+            error_code(&response),
+            "AccessDeniedException",
             "case {operation:?}: an entitled account must not be refused by the gate, \
              got {status} with {response:?}"
         );
@@ -896,7 +913,8 @@ async fn shape_validation_precedes_the_gate_and_the_gate_precedes_every_lookup()
         ),
     ];
     for (case, operation, body) in absent {
-        let message = refusal(&harness, case, operation, &body, 403, "AccessDeniedException").await;
+        let message =
+            refusal(&harness, case, operation, &body, DENIED_STATUS, "AccessDeniedException").await;
         assert_eq!(
             message, ENTITLEMENT_MESSAGE,
             "case {case:?}: expected the entitlement message, got {message:?}"
@@ -922,7 +940,7 @@ async fn a_refused_request_leaves_the_store_untouched() {
             &case,
             "CreateBenefitApplication",
             &body,
-            403,
+            DENIED_STATUS,
             "AccessDeniedException",
         )
         .await;

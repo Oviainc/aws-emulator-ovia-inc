@@ -169,7 +169,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `UntagResource` naming a resource that does not exist is answered
         // ``("ResourceNotFoundException", "Catalog `null` not found")``, the resource
         // lookup's own answer, from the same account whose benefit operations record the
-        // 403 entitlement refusal.
+        // entitlement refusal. The tag-READING operation is gated (its own recording
+        // shows the refusal) — see `crate::ops::list_tags_for_resource`.
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServerException(

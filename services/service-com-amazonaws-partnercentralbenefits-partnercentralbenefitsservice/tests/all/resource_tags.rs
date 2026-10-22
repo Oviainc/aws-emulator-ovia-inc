@@ -419,9 +419,9 @@ async fn untagging_an_arn_that_names_no_resource_is_404() {
     );
 }
 
-/// The recorded shape of the issue's own call: the tagging path is NOT behind the
+/// The recorded shape of the issue's own call: the tag-MUTATING path is NOT behind the
 /// partner-entitlement gate, so an account with no active partner benefit — every caller
-/// from the wire — is answered by the resource lookup, not with 403.
+/// from the wire — is answered by the resource lookup, not by the gate.
 #[tokio::test]
 async fn an_unentitled_untag_is_answered_by_the_resource_lookup() {
     let harness = Harness::unentitled();
