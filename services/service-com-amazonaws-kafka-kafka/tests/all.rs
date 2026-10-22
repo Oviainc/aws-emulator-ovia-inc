@@ -25,6 +25,8 @@ mod describe_cluster_v2;
 mod kafka_harness;
 #[path = "all/list_clusters_v2.rs"]
 mod list_clusters_v2;
+#[path = "all/replicator_lifecycle.rs"]
+mod replicator_lifecycle;
 #[path = "all/replicator_listing.rs"]
 mod replicator_listing;
 #[path = "all/state_roundtrip.rs"]

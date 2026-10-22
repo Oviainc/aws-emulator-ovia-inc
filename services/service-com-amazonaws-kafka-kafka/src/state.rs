@@ -22,8 +22,10 @@
 //! with it.
 //!
 //! The replicator registry sits beside them on the same principle: a [`Replicator`]
-//! holds the whole replication setup, and [`Replicator::to_replicator_summary`] is
-//! the one rendering `ListReplicators` reports it through.
+//! holds the whole replication setup, and the readers derive their shapes from that
+//! one record — [`Replicator::to_replicator_summary`] for `ListReplicators`, and
+//! [`Replicator::kafka_cluster_descriptions`] /
+//! [`Replicator::replication_info_descriptions`] for `DescribeReplicator`.
 //!
 //! The service's Apache Kafka version catalog lives here too
 //! ([`KAFKA_VERSION_CATALOG`], with [`compatible_target_versions`] and
@@ -37,10 +39,11 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     BrokerNodeGroupInfo, BrokerSoftwareInfo, ChannelLoggingInfo, ClientAuthentication, ClusterInfo,
     ConfigurationInfo, ConnectivityInfo, CreateChannelInput, CreateClusterInput,
-    DescribeChannelOutput, EncryptionAtRest, EncryptionConfiguration, EncryptionInTransit,
-    EncryptionInfo, IcebergDestinationConfiguration, JmxExporter, JmxExporterInfo, KafkaCluster,
-    KafkaClusterSummary, LoggingInfo, NodeExporter, NodeExporterInfo, OpenMonitoring,
-    OpenMonitoringInfo, Prometheus, PrometheusInfo, Provisioned, Rebalancing, ReplicationInfo,
+    CreateReplicatorInput, DescribeChannelOutput, EncryptionAtRest, EncryptionConfiguration,
+    EncryptionInTransit, EncryptionInfo, IcebergDestinationConfiguration, JmxExporter,
+    JmxExporterInfo, KafkaCluster, KafkaClusterDescription, KafkaClusterSummary, LogDelivery,
+    LoggingInfo, NodeExporter, NodeExporterInfo, OpenMonitoring, OpenMonitoringInfo, Prometheus,
+    PrometheusInfo, Provisioned, Rebalancing, ReplicationInfo, ReplicationInfoDescription,
     ReplicationInfoSummary, ReplicatorSummary, S3DestinationConfiguration, TopicConfiguration,
     ZookeeperAccess,
 };
@@ -105,6 +108,46 @@ pub const TOPIC_CONFIGURATIONS_PER_CHANNEL: usize = 1;
 /// with the number of calls. Sized well above what any realistic client script
 /// creates against one cluster.
 pub const MAX_CHANNELS_PER_CLUSTER: usize = 100;
+
+/// How long after `CreateReplicator` a new replicator becomes `RUNNING`.
+///
+/// CHOSEN, not documented: the real service takes minutes to stand a MirrorMaker
+/// fleet up. The project fixes an emulated clock-owed transition at 250–750 ms, so
+/// a caller that describes the replicator immediately still observes `CREATING`
+/// while a caller that waits sees `RUNNING` — the same span, and the same
+/// reasoning, as [`CLUSTER_ACTIVATION_DELAY`].
+pub const REPLICATOR_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// Absolute ceiling on the replicator registry.
+///
+/// CHOSEN as a process-safety backstop, not an AWS quota (AWS publishes no
+/// per-region replicator limit this emulator could cite): the signing region comes
+/// from the request, so without a ceiling a caller could grow the store by naming
+/// new regions. Sized well past anything a realistic client script creates, so it
+/// can only be reached by a caller trying to exhaust the emulator.
+pub const MAX_REPLICATORS_IN_REGISTRY: usize = 1024;
+
+/// The most `KafkaClusters` entries one replicator may hold.
+///
+/// CHOSEN, not an AWS quota (the model declares `__listOfKafkaCluster` with no
+/// `length` trait): a replicator's cluster list and its replication list are both
+/// caller-sized, and every reader resolves each replication against the cluster
+/// list, so without ceilings on BOTH one create would size the work of every
+/// later read. Sized far above any real setup — AWS Replicator documents
+/// replication between a source and a target — so a realistic client never meets
+/// it, while the product with [`MAX_FLOWS_PER_REPLICATOR`] stays small.
+pub const MAX_CLUSTERS_PER_REPLICATOR: usize = 16;
+
+/// The most `ReplicationInfoList` entries one replicator may hold. CHOSEN for the
+/// same reason, and on the same model evidence, as
+/// [`MAX_CLUSTERS_PER_REPLICATOR`]: a replicator cannot hold more distinct
+/// ordered cluster pairs than this anyway.
+pub const MAX_FLOWS_PER_REPLICATOR: usize = 32;
+
+/// The most tags one replicator may carry, from AWS's general limit of 50 tags
+/// per resource. The model declares `__mapOf__string` with no `length` trait, so
+/// the ceiling is enforced here.
+pub const MAX_TAGS_PER_REPLICATOR: usize = 50;
 
 /// Amazon MSK provisions a three-node Apache ZooKeeper ensemble alongside a
 /// provisioned cluster, which is what `ZookeeperConnectString` enumerates.
@@ -479,14 +522,6 @@ pub struct ClusterPage {
     pub next_token: Option<String>,
 }
 
-/// How long after `CreateReplicator` a new replicator reaches `RUNNING`.
-///
-/// CHOSEN, not documented: the real service takes minutes to stand a replicator
-/// up. The project fixes an emulated clock-owed transition at 250–750 ms, so a
-/// caller that lists immediately still observes `CREATING` while one that waits
-/// sees `RUNNING`.
-pub const REPLICATOR_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
-
 /// The `ReplicatorState` value a replicator holds until the clock owes it
 /// [`REPLICATOR_STATE_RUNNING`]; both are members of the model's
 /// `ReplicatorState` enum.
@@ -540,6 +575,19 @@ impl ReplicatorCluster {
             kafka_cluster_alias: Some(self.alias.clone()),
         }
     }
+
+    /// The cluster as the richer `KafkaClusterDescription` `DescribeReplicator`
+    /// reports: the alias plus every member of the submitted `KafkaCluster`.
+    pub fn to_description(&self) -> KafkaClusterDescription {
+        KafkaClusterDescription {
+            amazon_msk_cluster: self.cluster.amazon_msk_cluster.clone(),
+            apache_kafka_cluster: self.cluster.apache_kafka_cluster.clone(),
+            kafka_cluster_alias: Some(self.alias.clone()),
+            vpc_config: self.cluster.vpc_config.clone(),
+            client_authentication: self.cluster.client_authentication.clone(),
+            encryption_in_transit: self.cluster.encryption_in_transit.clone(),
+        }
+    }
 }
 
 /// A replicator, holding the whole replication setup so every reader is computed
@@ -554,10 +602,17 @@ pub struct Replicator {
     pub resource_arn: String,
     pub name: String,
     /// The region this replicator lives in: the signing region of the request
-    /// that created it, and the region segment of its ARN. `ListReplicators` is
-    /// regional, so this is what scopes it to one endpoint.
+    /// that created it, and the region segment of its ARN. `ListReplicators` and
+    /// `DescribeReplicator` are regional, so this is what scopes it to one
+    /// endpoint. A replicator name is unique per account and region, so this is
+    /// also half of its registry key.
     pub region: String,
     pub current_version: String,
+    /// `ReplicatorDescription` — the summary description the request carried, if
+    /// any.
+    pub description: Option<String>,
+    /// The IAM role the replicator uses to reach the source and target clusters.
+    pub service_execution_role_arn: String,
     pub creation_time: SystemTime,
     /// The instant the clock owes this replicator its `CREATING` -> `RUNNING`
     /// transition. Stored, never slept on.
@@ -571,9 +626,94 @@ pub struct Replicator {
     pub kafka_clusters: Vec<ReplicatorCluster>,
     /// The replications configured between those clusters, in submission order.
     pub replication_info: Vec<ReplicationInfo>,
+    /// Where the replicator's own logs are delivered, as submitted.
+    pub log_delivery: Option<LogDelivery>,
+    /// Ordered so a reader renders a stable map.
+    pub tags: BTreeMap<String, String>,
 }
 
 impl Replicator {
+    /// Mint a replicator from the submitted configuration.
+    ///
+    /// `region` is the caller's signing region, `suffix` the registry's monotonic
+    /// counter (used as the 1-based ordinal `suffix + 1`, so one value seeds the
+    /// whole identity), `now` the creation instant, and `input` the submitted
+    /// configuration as `CreateReplicator` deserialized it.
+    pub fn provisioned(
+        region: &str,
+        suffix: u64,
+        now: SystemTime,
+        input: CreateReplicatorInput,
+    ) -> Self {
+        let name = input.replicator_name.as_str();
+        let ordinal = suffix + 1;
+        let digest = stable_digest(&format!(
+            "{}:{region}:replicator:{name}:{ordinal}",
+            ::engine::emulator_account_id()
+        ));
+        let arn = ::engine::emulator_arn(
+            "kafka",
+            region,
+            &format!(
+                "replicator/{name}/{}-{ordinal}",
+                uuid_v4_shaped_from_digest(&digest)
+            ),
+        );
+        // CAPPED, not trusted: the handler refuses an over-size request with the
+        // modelled `BadRequestException`, but this constructor must not let any
+        // caller of this module store a record whose size — and so the work of
+        // every later read of it — comes from an unchecked request value.
+        let kafka_clusters = input
+            .kafka_clusters
+            .into_iter()
+            .take(MAX_CLUSTERS_PER_REPLICATOR)
+            .map(|cluster| ReplicatorCluster {
+                // UNREACHABLE empty: the handler refuses an entry that identifies
+                // no cluster, so every stored entry carries the alias its MSK ARN
+                // or its Apache cluster id gives it.
+                alias: kafka_cluster_alias(&cluster).unwrap_or_default(),
+                cluster,
+            })
+            .collect();
+        Self {
+            current_version: current_version_token(&arn, 1),
+            resource_arn: arn.clone(),
+            arn,
+            name: input.replicator_name,
+            region: region.to_string(),
+            description: input.description,
+            service_execution_role_arn: input.service_execution_role_arn,
+            creation_time: now,
+            running_due: now + REPLICATOR_ACTIVATION_DELAY,
+            state: REPLICATOR_STATE_CREATING.to_string(),
+            // A replicator created here is the replicator itself, never the
+            // read-only reference AWS surfaces in the OTHER region of a
+            // cross-region setup.
+            is_replicator_reference: false,
+            kafka_clusters,
+            // Capped for the same reason as the cluster list above.
+            replication_info: input
+                .replication_info_list
+                .into_iter()
+                .take(MAX_FLOWS_PER_REPLICATOR)
+                .collect(),
+            log_delivery: input.log_delivery,
+            // The handler already refuses an over-tagged request, so this cap is
+            // an unreachable backstop — and it takes the surviving tags in KEY
+            // order out of an ordered map, so if it ever did fire the subset it
+            // keeps is deterministic rather than whatever order the request map
+            // happened to iterate in.
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .take(MAX_TAGS_PER_REPLICATOR)
+                .collect(),
+        }
+    }
+
     /// Apply the `CREATING` -> `RUNNING` transition once `now` has reached
     /// [`Self::running_due`]. Idempotent, and a no-op for every other state: only
     /// a transition the clock already owed is materialised here.
@@ -585,11 +725,40 @@ impl Replicator {
 
     /// The alias of the stored cluster an endpoint of a `ReplicationInfo` names,
     /// or `None` when the setup holds no such cluster.
+    ///
+    /// A single lookup, linear in the cluster list. A reader resolving EVERY
+    /// replication builds [`Self::alias_index`] once instead, so its work is
+    /// `O(n + m)` in the replications and the clusters rather than their product.
     pub fn alias_of(&self, arn: Option<&str>, id: Option<&str>) -> Option<String> {
         self.kafka_clusters
             .iter()
             .find(|cluster| cluster.names(arn, id))
             .map(|cluster| cluster.alias.clone())
+    }
+
+    /// A lookup from the way a `ReplicationInfo` can name a cluster — by ARN for
+    /// an Amazon MSK cluster (`true`) or by id for an Apache Kafka one (`false`)
+    /// — to that cluster's alias.
+    ///
+    /// Built ONCE per rendering, so resolving every replication costs `O(n + m)`
+    /// rather than one linear scan of the clusters per replication endpoint. The
+    /// first cluster to claim a key keeps it, which is the same cluster
+    /// [`Self::alias_of`]'s `find` would have returned.
+    fn alias_index(&self) -> HashMap<(bool, &str), &str> {
+        let mut index = HashMap::with_capacity(self.kafka_clusters.len());
+        for entry in &self.kafka_clusters {
+            if let Some(msk) = entry.cluster.amazon_msk_cluster.as_ref() {
+                index
+                    .entry((true, msk.msk_cluster_arn.as_str()))
+                    .or_insert(entry.alias.as_str());
+            }
+            if let Some(apache) = entry.cluster.apache_kafka_cluster.as_ref() {
+                index
+                    .entry((false, apache.apache_kafka_cluster_id.as_str()))
+                    .or_insert(entry.alias.as_str());
+            }
+        }
+        index
     }
 
     /// The replicator as the `ReplicatorSummary` `ListReplicators` reports.
@@ -599,6 +768,7 @@ impl Replicator {
     /// ARN or id member, so the aliases are derived from the stored setup rather
     /// than echoed from it.
     pub fn to_replicator_summary(&self) -> ReplicatorSummary {
+        let aliases = self.alias_index();
         ReplicatorSummary {
             creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
             current_version: Some(self.current_version.clone()),
@@ -613,11 +783,13 @@ impl Replicator {
                 self.replication_info
                     .iter()
                     .map(|info| ReplicationInfoSummary {
-                        source_kafka_cluster_alias: self.alias_of(
+                        source_kafka_cluster_alias: indexed_alias(
+                            &aliases,
                             info.source_kafka_cluster_arn.as_deref(),
                             info.source_kafka_cluster_id.as_deref(),
                         ),
-                        target_kafka_cluster_alias: self.alias_of(
+                        target_kafka_cluster_alias: indexed_alias(
+                            &aliases,
                             info.target_kafka_cluster_arn.as_deref(),
                             info.target_kafka_cluster_id.as_deref(),
                         ),
@@ -630,15 +802,74 @@ impl Replicator {
             replicator_state: Some(self.state.clone()),
         }
     }
+
+    /// The replicator's Kafka clusters as `DescribeReplicator` reports them: the
+    /// same stored records [`Self::to_replicator_summary`] summarises, rendered
+    /// into the richer description shape.
+    pub fn kafka_cluster_descriptions(&self) -> Vec<KafkaClusterDescription> {
+        self.kafka_clusters
+            .iter()
+            .map(ReplicatorCluster::to_description)
+            .collect()
+    }
+
+    /// The replicator's replications as `DescribeReplicator` reports them: the
+    /// stored configuration, with each end named by the ALIAS resolved against
+    /// this replicator's own cluster list — through the SAME index
+    /// [`Self::to_replicator_summary`] uses, so the two readers cannot disagree
+    /// about which cluster an end names, and neither does work proportional to
+    /// the product of the two lists.
+    pub fn replication_info_descriptions(&self) -> Vec<ReplicationInfoDescription> {
+        let aliases = self.alias_index();
+        self.replication_info
+            .iter()
+            .map(|info| ReplicationInfoDescription {
+                consumer_group_replication: Some(info.consumer_group_replication.clone()),
+                source_kafka_cluster_alias: indexed_alias(
+                    &aliases,
+                    info.source_kafka_cluster_arn.as_deref(),
+                    info.source_kafka_cluster_id.as_deref(),
+                ),
+                target_compression_type: Some(info.target_compression_type.clone()),
+                target_kafka_cluster_alias: indexed_alias(
+                    &aliases,
+                    info.target_kafka_cluster_arn.as_deref(),
+                    info.target_kafka_cluster_id.as_deref(),
+                ),
+                topic_replication: Some(info.topic_replication.clone()),
+            })
+            .collect()
+    }
 }
 
-/// Why [`ComAmazonawsKafkaKafkaState::register_cluster`] refused to register a
-/// cluster. Every variant leaves the registry exactly as it was.
+/// The alias a replication endpoint resolves to through an index
+/// [`Replicator::alias_index`] built, or `None` when the setup holds no cluster
+/// the endpoint names. The ARN is tried first and the id second, exactly as
+/// [`ReplicatorCluster::names`] matches them.
+fn indexed_alias(
+    aliases: &HashMap<(bool, &str), &str>,
+    arn: Option<&str>,
+    id: Option<&str>,
+) -> Option<String> {
+    if let Some(arn) = arn {
+        if let Some(alias) = aliases.get(&(true, arn)) {
+            return Some((*alias).to_string());
+        }
+    }
+    aliases
+        .get(&(false, id?))
+        .map(|alias| (*alias).to_string())
+}
+
+/// Why [`ComAmazonawsKafkaKafkaState::register_cluster`] or
+/// [`ComAmazonawsKafkaKafkaState::register_replicator`] refused to register a
+/// resource. Every variant leaves the registry exactly as it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegisterRejected {
     /// The region already holds [`MAX_CLUSTERS_PER_REGION`] clusters.
     RegionQuota,
-    /// The registry already holds [`MAX_CLUSTERS_IN_REGISTRY`] clusters.
+    /// The registry already holds its ceiling of resources of this kind
+    /// ([`MAX_CLUSTERS_IN_REGISTRY`], [`MAX_REPLICATORS_IN_REGISTRY`]).
     RegistryCeiling,
     /// A cluster with this ARN is already registered. The registry's monotonic
     /// ordinal makes this unreachable; it is refused rather than overwriting an
@@ -681,6 +912,13 @@ pub struct ComAmazonawsKafkaKafkaState {
     /// `ListReplicators` has one total order to page through, the same way the
     /// cluster registry gives `ListClusters` one.
     pub replicators: BTreeMap<String, Replicator>,
+    /// (region, replicator name) -> ARN. A replicator name is unique within an
+    /// account and region, which is what makes a repeated `CreateReplicator`
+    /// under one name a conflict.
+    pub replicator_arn_by_name: HashMap<(String, String), String>,
+    /// Monotonic counter feeding replicator ARNs, so each replicator gets a
+    /// distinct identity.
+    pub next_replicator_suffix: u64,
 }
 
 impl ComAmazonawsKafkaKafkaState {
@@ -773,44 +1011,6 @@ impl ComAmazonawsKafkaKafkaState {
             .filter(|cluster| cluster.region == region)
     }
 
-    /// Add `replicator` to the registry, handing back whether it went in.
-    ///
-    /// The one insertion path, so no caller can overwrite a registered
-    /// replicator: a repeated ARN is refused and the registry is left exactly as
-    /// it was. No AWS quota is claimed here — the writer that will register
-    /// replicators (`CreateReplicator`) is still a scaffold, and whatever quota
-    /// it enforces belongs with it, next to the error it answers.
-    pub fn register_replicator(&mut self, replicator: Replicator) -> Result<(), RegisterRejected> {
-        if self.replicators.contains_key(&replicator.arn) {
-            return Err(RegisterRejected::DuplicateArn);
-        }
-        self.replicators.insert(replicator.arn.clone(), replicator);
-        Ok(())
-    }
-
-    /// The replicator `arn` names, as an endpoint for `region` sees it, with the
-    /// `CREATING` -> `RUNNING` transition the clock already owed THAT replicator
-    /// materialised.
-    ///
-    /// Scoped to the one replicator being reported: a read must not do work
-    /// proportional to the whole registry, and no other replicator's state is
-    /// this request's business. A regional endpoint serves only its own region's
-    /// replicators, so a replicator of another region resolves to `None` exactly
-    /// as an absent one does.
-    pub fn settled_replicator_in(
-        &mut self,
-        region: &str,
-        arn: &str,
-        now: SystemTime,
-    ) -> Option<&Replicator> {
-        let replicator = self.replicators.get_mut(arn)?;
-        if replicator.region != region {
-            return None;
-        }
-        replicator.settle(now);
-        Some(replicator)
-    }
-
     /// The same lookup, with the transitions the clock already owed THIS cluster
     /// materialised (`CREATING` -> `ACTIVE`, and an in-flight update whose
     /// completion is due).
@@ -844,6 +1044,76 @@ impl ComAmazonawsKafkaKafkaState {
         }
         cluster.settle(now);
         Some(cluster)
+    }
+
+    /// The ARN registered for the replicator `name` in `region`, if any. This is
+    /// the lookup that makes a repeated `CreateReplicator` a conflict.
+    pub fn replicator_arn_for_name(&self, region: &str, name: &str) -> Option<&String> {
+        self.replicator_arn_by_name
+            .get(&(region.to_string(), name.to_string()))
+    }
+
+    /// Add `replicator` to every index that must know about it. The one insertion
+    /// path, so the ARN registry and the (region, name) index cannot drift apart
+    /// — and the one place the registry's ceiling is enforced, so it holds for
+    /// every caller of this module rather than only for a handler that remembers
+    /// to check first.
+    ///
+    /// Refuses, changing nothing, when the registry is at
+    /// [`MAX_REPLICATORS_IN_REGISTRY`] or when the ARN is already registered.
+    pub fn register_replicator(&mut self, replicator: Replicator) -> Result<(), RegisterRejected> {
+        if self.replicators.contains_key(&replicator.arn) {
+            return Err(RegisterRejected::DuplicateArn);
+        }
+        if self.replicators.len() >= MAX_REPLICATORS_IN_REGISTRY {
+            return Err(RegisterRejected::RegistryCeiling);
+        }
+        self.replicator_arn_by_name.insert(
+            (replicator.region.clone(), replicator.name.clone()),
+            replicator.arn.clone(),
+        );
+        self.replicators.insert(replicator.arn.clone(), replicator);
+        Ok(())
+    }
+
+    /// Remove the replicator `arn` names from every index, handing it back. The
+    /// one removal path, for the same reason.
+    pub fn unregister_replicator(&mut self, arn: &str) -> Option<Replicator> {
+        let replicator = self.replicators.remove(arn)?;
+        self.replicator_arn_by_name
+            .remove(&(replicator.region.clone(), replicator.name.clone()));
+        Some(replicator)
+    }
+
+    /// The replicator `arn` names, as an endpoint for `region` sees it.
+    ///
+    /// A regional endpoint serves only its own region's replicators, so a
+    /// well-formed ARN belonging to another region resolves to `None` exactly as
+    /// an absent one does.
+    pub fn replicator_in(&self, region: &str, arn: &str) -> Option<&Replicator> {
+        self.replicators
+            .get(arn)
+            .filter(|replicator| replicator.region == region)
+    }
+
+    /// The same lookup, with the `CREATING` -> `RUNNING` transition the clock
+    /// already owed THIS replicator materialised.
+    ///
+    /// Scoped to the one replicator being reported: a read must not do work
+    /// proportional to the whole registry, and no other replicator's status is
+    /// this request's business.
+    pub fn settled_replicator_in(
+        &mut self,
+        region: &str,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<&Replicator> {
+        let replicator = self.replicators.get_mut(arn)?;
+        if replicator.region != region {
+            return None;
+        }
+        replicator.settle(now);
+        Some(replicator)
     }
 
     /// The ARN registered for channel `name` under the cluster `cluster_arn`, if
@@ -1002,6 +1272,40 @@ pub fn decode_cluster_page_token(token: &str) -> Option<String> {
     decoded
         .strip_prefix(CLUSTER_PAGE_TOKEN_PREFIX)
         .map(ToString::to_string)
+}
+
+/// The alias of one `KafkaCluster` entry: an Amazon MSK cluster is aliased by its
+/// cluster name (the first segment of its ARN's resource part), and an Apache
+/// Kafka cluster by the id the caller gave it. The alias is what prefixes the
+/// names of replicated topics, per `KafkaClusterDescription$KafkaClusterAlias`.
+pub fn kafka_cluster_alias(cluster: &KafkaCluster) -> Option<String> {
+    if let Some(msk) = cluster.amazon_msk_cluster.as_ref() {
+        return flow_cluster_alias(Some(msk.msk_cluster_arn.as_str()), None);
+    }
+    cluster
+        .apache_kafka_cluster
+        .as_ref()
+        .map(|apache| apache.apache_kafka_cluster_id.clone())
+}
+
+/// The alias of the cluster a replication flow names at one end, from the ARN or
+/// the cluster id the flow carries. Same rule as [`kafka_cluster_alias`]: the
+/// cluster name for an MSK ARN, the id itself for an Apache Kafka cluster.
+pub fn flow_cluster_alias(arn: Option<&str>, id: Option<&str>) -> Option<String> {
+    if let Some(arn) = arn.filter(|value| !value.is_empty()) {
+        return Some(cluster_name_in_arn(arn).unwrap_or(arn).to_string());
+    }
+    id.filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+/// The cluster name inside an MSK cluster ARN (`...:cluster/<name>/<id>`), or
+/// `None` when `value` is not an ARN of that form.
+fn cluster_name_in_arn(value: &str) -> Option<&str> {
+    if !is_cluster_arn(value) {
+        return None;
+    }
+    value.splitn(6, ':').nth(5)?.split('/').nth(1)
 }
 
 impl Channel {
@@ -1714,6 +2018,23 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// well-formed ARN no live cluster holds: that is the distinction the real
 /// service draws between a request it cannot parse and a resource it cannot find.
 pub fn is_cluster_arn(value: &str) -> bool {
+    is_kafka_arn_for(value, "cluster")
+}
+
+/// Whether `value` is shaped like an MSK replicator ARN —
+/// `arn:<partition>:kafka:<region>:<account>:replicator/<name>/<id>`.
+///
+/// Same distinction, same reason, as [`is_cluster_arn`]: a value that is not an
+/// ARN of this kind is a `BadRequestException`, and a well-formed ARN no live
+/// replicator holds is a `NotFoundException`.
+pub fn is_replicator_arn(value: &str) -> bool {
+    is_kafka_arn_for(value, "replicator")
+}
+
+/// Whether `value`'s resource part is `<kind>/<name>/<id>` — the shape both a
+/// cluster and a replicator ARN take, so the two predicates above cannot
+/// disagree about what a well-formed ARN of their kind is.
+fn is_kafka_arn_for(value: &str, kind: &str) -> bool {
     let Some(resource) = kafka_arn_resource(value) else {
         return false;
     };
@@ -1725,7 +2046,8 @@ pub fn is_cluster_arn(value: &str) -> bool {
             segments.next(),
             segments.next()
         ),
-        (Some("cluster"), Some(name), Some(id), None) if !name.is_empty() && !id.is_empty()
+        (Some(found), Some(name), Some(id), None)
+            if found == kind && !name.is_empty() && !id.is_empty()
     )
 }
 
