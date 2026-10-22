@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's API endpoint for the region the request is signed for.
+//!
+//! `DEFAULT` mode (the default) answers the endpoint already stored for that region, or
+//! creates and persists one and answers it when none exists yet — the one write this
+//! operation's own documentation sanctions. `GET_ONLY` only reads: it answers the stored
+//! endpoint, or an empty list when the account has none in that region. An endpoint once
+//! stored is never rewritten, so the URL a caller reads back is the URL an earlier call
+//! persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +88,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    DESCRIBE_ENDPOINTS_MODE_DEFAULT, DESCRIBE_ENDPOINTS_MODE_GET_ONLY, MAX_ENDPOINT_RESULTS,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -162,18 +166,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEndpoints"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeEndpointsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("this service's state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `MaxResults` is a bare `__integer` in the model, so the boundary validator lets
+        // any integer through; the window the member documents ("up to twenty") is
+        // enforced here, as a request problem rather than as a silent clamp.
+        if let Some(max_results) = input.max_results {
+            if !(1..=MAX_ENDPOINT_RESULTS).contains(&max_results) {
+                return Err(DescribeEndpointsErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!(
+                            "maxResults must be between 1 and {MAX_ENDPOINT_RESULTS}, got \
+                             {max_results}."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // An account has exactly one API endpoint per region, so a response never fills
+        // `nextToken` and there is no page after the first: any token handed back is not
+        // one this service issued.
+        if let Some(token) = input.next_token.as_deref() {
+            return Err(DescribeEndpointsErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "nextToken is not a token this service issued: {token:?}."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mode = input
+            .mode
+            .as_deref()
+            .unwrap_or(DESCRIBE_ENDPOINTS_MODE_DEFAULT);
+        let mut state = state.lock();
+
+        let url = match mode {
+            // "Specify GET_ONLY to return your endpoints if any exist, or an empty list
+            // if none exist" — a pure read, so an account with no endpoint in this region
+            // still has none after this call.
+            DESCRIBE_ENDPOINTS_MODE_GET_ONLY => state.endpoint(&region).map(str::to_string),
+            // "Specify DEFAULT for this operation to return your endpoints if any exist,
+            // or to create an endpoint for you and return it if one doesn't already
+            // exist": the write this mode documents. An endpoint already stored comes
+            // back unchanged, which is what makes the URL stable.
+            DESCRIBE_ENDPOINTS_MODE_DEFAULT => {
+                let Some(url) = state.ensure_endpoint(&region).map(str::to_string) else {
+                    return Err(DescribeEndpointsErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(format!(
+                                "this account already has API endpoints in {} regions.",
+                                crate::state::MAX_ENDPOINTS
+                            )),
+                        },
+                    )
+                    .into());
+                };
+                Some(url)
+            }
+            other => {
+                return Err(DescribeEndpointsErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!(
+                            "mode must be one of {DESCRIBE_ENDPOINTS_MODE_DEFAULT} or \
+                             {DESCRIBE_ENDPOINTS_MODE_GET_ONLY}, got {other:?}."
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        Ok(DescribeEndpointsOutput {
+            endpoints: Some(
+                url.map(|url| Endpoint { url: Some(url) })
+                    .into_iter()
+                    .collect(),
+            ),
+            // The account's single endpoint per region always fits in one page.
+            next_token: None,
+        })
     }
 }
