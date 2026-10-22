@@ -205,12 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // TOP_LEVEL keeps only the assets that are nobody's child; ALL keeps every
             // asset of the named model.
             //
-            // NOTE for a later reader: `asset_hierarchy_children`, the store this reads,
-            // is written only by the association operations (`AssociateAssets`,
-            // `BatchAssociateProjectAssets`), which are still 501 scaffolds. Until one
-            // of them lands no asset is anybody's child, so TOP_LEVEL and ALL select
-            // the same set. The derivation is the modelled rule; the data it reads is
-            // what is still missing.
+            // `asset_hierarchy_children`, the store this reads, is written by
+            // `AssociateAssets` and pruned by `DeleteAsset`, so TOP_LEVEL and ALL now
+            // select different sets once an association has been recorded.
             .filter(|asset| filter != "TOP_LEVEL" || !is_child(&store, &asset.id))
             .collect();
         // A stable order is what makes `nextToken` resumable: oldest first, ties broken

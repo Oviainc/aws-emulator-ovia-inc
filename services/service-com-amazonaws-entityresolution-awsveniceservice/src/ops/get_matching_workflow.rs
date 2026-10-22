@@ -180,10 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetMatchingWorkflowErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Matching workflow {} not found",
-                            input.workflow_name
-                        )),
+                        message: Some(
+                            crate::state::messages::GET_MATCHING_WORKFLOW_NOT_FOUND.to_string(),
+                        ),
                     },
                 )
             })?;

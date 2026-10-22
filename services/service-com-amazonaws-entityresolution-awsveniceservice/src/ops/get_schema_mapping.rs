@@ -173,10 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let stored = store.schema_mappings.get(&input.schema_name).ok_or_else(|| {
             GetSchemaMappingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "Schema mapping {} not found",
-                    input.schema_name
-                )),
+                message: Some(crate::state::messages::GET_SCHEMA_MAPPING_NOT_FOUND.to_string()),
             })
         })?;
 

@@ -31,11 +31,11 @@ pub(crate) const STORE: &str = "d-1234567890";
 /// A second store, so the per-store scope of a uniqueness claim is observable.
 pub(crate) const OTHER_STORE: &str = "d-abcdef0123";
 
-/// The bounds of the modelled `MaxResults` range on `ListGroupMemberships`
-/// (`smithy_query(query="operation",operation="ListGroupMemberships")`: range 1..100,
-/// `@default: 100`).
-const MAX_RESULTS_MIN: i64 = 1;
-const MAX_RESULTS_MAX: i64 = 100;
+/// The bounds of the modelled `MaxResults` range every `List*` operation of this
+/// service shares (`smithy_query(query="operation",operation="ListUsers")` and
+/// `operation="ListGroupMemberships"`: range 1..100, `@default: 100`).
+pub(crate) const MAX_RESULTS_MIN: i64 = 1;
+pub(crate) const MAX_RESULTS_MAX: i64 = 100;
 
 /// The bounds of the modelled `UserName` length (1..128).
 const USER_NAME_MIN_LEN: usize = 1;
@@ -68,7 +68,8 @@ const PROFILE_MEMBERS: &[&str] = &[
 ///
 /// `pub(crate)` because the wire harness below is shared with this crate's other
 /// suites (`tests/all/get_group_id.rs`, `tests/all/is_member_in_groups.rs`,
-/// `tests/all/list_groups.rs`) rather than copied into each of them.
+/// `tests/all/list_groups.rs`, `tests/all/list_users.rs`) rather than copied into each
+/// of them.
 pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -235,7 +236,7 @@ fn contains(sent: &Value, got: &Value) -> bool {
 }
 
 /// Assert every member `sent` carries comes back in `got` unchanged.
-fn assert_round_tripped(sent: &Map<String, Value>, got: &Value, case: &str) {
+pub(crate) fn assert_round_tripped(sent: &Map<String, Value>, got: &Value, case: &str) {
     for (member, value) in sent {
         if member == "IdentityStoreId" {
             continue;
@@ -250,7 +251,7 @@ fn assert_round_tripped(sent: &Map<String, Value>, got: &Value, case: &str) {
 
 /// Assert the response carries no member the request did not send: a profile is
 /// reported, not synthesised.
-fn assert_absent(sent: &Map<String, Value>, got: &Value, case: &str) {
+pub(crate) fn assert_absent(sent: &Map<String, Value>, got: &Value, case: &str) {
     for member in PROFILE_MEMBERS {
         if sent.contains_key(*member) {
             continue;
@@ -272,7 +273,7 @@ fn assert_absent(sent: &Map<String, Value>, got: &Value, case: &str) {
 /// A `UserName` for `case`'s row: the modelled `UserName` pattern
 /// (`^[\p{L}\p{M}\p{S}\p{N}\p{P}]+$`) admits letters, marks, symbols, numbers and
 /// punctuation but NOT whitespace, so a case's spaces become hyphens.
-fn user_name(case: &str, index: usize) -> String {
+pub(crate) fn user_name(case: &str, index: usize) -> String {
     format!("user-{}-{index}", case.replace(' ', "-"))
 }
 

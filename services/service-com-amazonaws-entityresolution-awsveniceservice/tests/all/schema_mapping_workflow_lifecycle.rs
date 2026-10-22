@@ -16,6 +16,10 @@
 //! from both the reader and the list. Each table spans the class the rule generalises
 //! over — attribute type, field count, resolution type, which optional members a
 //! request carries, page size — rather than one recorded request.
+//!
+//! The wire harness here (`Emulator`, `Reply`, `string_member`, the ARN helpers) is
+//! `pub(crate)` so the sibling suite `response_messages` drives the SAME path instead
+//! of cloning a second harness.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -35,38 +39,38 @@ const SIGNED_FOR_ENTITY_RESOLUTION: &str = "AWS4-HMAC-SHA256 \
 
 /// The account id every emulated ARN carries, and the region the harness signs for.
 const ACCOUNT_ID: &str = "000000000000";
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// A Glue table ARN, which is what `InputSource$inputSourceARN` models for a table
 /// input (`^arn:(aws|aws-us-gov|aws-cn):glue:…:(table/<db>/<table>)$`, from
 /// `smithy_query(query="shape",shape="InputSource")`). Note it is NOT a schema-mapping
 /// ARN: the workflow's reference to a schema mapping is `InputSource$schemaName`.
-fn glue_table_arn(table: &str) -> String {
+pub(crate) fn glue_table_arn(table: &str) -> String {
     format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:table/crm/{table}")
 }
 
 /// The IAM role ARN a workflow is created with. `roleArn` is modelled as a plain
 /// required string on `CreateMatchingWorkflow`, so no pattern constrains it.
-fn role_arn() -> String {
+pub(crate) fn role_arn() -> String {
     format!("arn:aws:iam::{ACCOUNT_ID}:role/entity-resolution")
 }
 
 /// One response, reduced to what a client branches on.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_code: Option<String>,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_code: Option<String>,
+    pub(crate) body: Value,
 }
 
 /// The emulator under test: ONE shared engine with the Entity Resolution service
 /// mounted on it, reached the way the production router reaches it.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -74,7 +78,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
         let payload = body.map_or_else(Vec::new, |value| {
             serde_json::to_vec(value).expect("a request body serializes")
         });
@@ -108,16 +112,16 @@ impl Emulator {
         }
     }
 
-    async fn create_schema_mapping(&self, request: &Value) -> Reply {
+    pub(crate) async fn create_schema_mapping(&self, request: &Value) -> Reply {
         self.call("POST", "/schemas", Some(request)).await
     }
 
-    async fn get_schema_mapping(&self, schema_name: &str) -> Reply {
+    pub(crate) async fn get_schema_mapping(&self, schema_name: &str) -> Reply {
         self.call("GET", &format!("/schemas/{schema_name}"), None)
             .await
     }
 
-    async fn delete_schema_mapping(&self, schema_name: &str) -> Reply {
+    pub(crate) async fn delete_schema_mapping(&self, schema_name: &str) -> Reply {
         self.call("DELETE", &format!("/schemas/{schema_name}"), None)
             .await
     }
@@ -126,16 +130,16 @@ impl Emulator {
         self.call("GET", &format!("/schemas{query}"), None).await
     }
 
-    async fn create_matching_workflow(&self, request: &Value) -> Reply {
+    pub(crate) async fn create_matching_workflow(&self, request: &Value) -> Reply {
         self.call("POST", "/matchingworkflows", Some(request)).await
     }
 
-    async fn get_matching_workflow(&self, workflow_name: &str) -> Reply {
+    pub(crate) async fn get_matching_workflow(&self, workflow_name: &str) -> Reply {
         self.call("GET", &format!("/matchingworkflows/{workflow_name}"), None)
             .await
     }
 
-    async fn delete_matching_workflow(&self, workflow_name: &str) -> Reply {
+    pub(crate) async fn delete_matching_workflow(&self, workflow_name: &str) -> Reply {
         self.call(
             "DELETE",
             &format!("/matchingworkflows/{workflow_name}"),
@@ -150,7 +154,7 @@ impl Emulator {
     }
 }
 
-fn string_member(record: &Value, member: &str) -> String {
+pub(crate) fn string_member(record: &Value, member: &str) -> String {
     record
         .get(member)
         .and_then(Value::as_str)

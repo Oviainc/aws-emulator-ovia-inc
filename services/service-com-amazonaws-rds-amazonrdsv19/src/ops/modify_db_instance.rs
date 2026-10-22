@@ -437,6 +437,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The version the instance RUNS once the modification is applied: the same
+        // resolution `CreateDBInstance` does, against the engine the modification
+        // leaves the instance on. Resolved BEFORE the record is taken out of the
+        // store, so a version this service cannot provision is refused with the
+        // instance left exactly as it was.
+        let resolved_engine_version = match &input.engine_version {
+            Some(requested) => {
+                let engine = input
+                    .engine
+                    .clone()
+                    .unwrap_or_else(|| store.db_instances[&key].engine.clone());
+                let resolved = crate::ops::describe_db_engine_versions::resolve_version(
+                    &engine,
+                    Some(requested.as_str()),
+                )
+                .map_err(ModifyDBInstanceError::validation)?;
+                Some(match resolved {
+                    Some(entry) => entry.engine_version.to_string(),
+                    // An engine the catalogue publishes no available version for:
+                    // there is nothing to resolve against, so what the request named
+                    // stands.
+                    None => requested.clone(),
+                })
+            }
+            None => None,
+        };
+
         let mut record = store
             .db_instances
             .remove(&key)
@@ -459,7 +486,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             changed = true;
             record.engine = value;
         }
-        if let Some(value) = input.engine_version {
+        if let Some(value) = resolved_engine_version {
             changed = true;
             record.engine_version = Some(value);
         }
@@ -527,9 +554,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             changed = true;
             record.db_parameter_group_name = Some(value);
         }
+        if let Some(value) = input.option_group_name {
+            changed = true;
+            record.option_group_name = Some(value);
+        }
         if let Some(value) = input.vpc_security_group_ids {
             changed = true;
             record.vpc_security_group_ids = value;
+        }
+        if let Some(value) = input.db_security_groups {
+            changed = true;
+            record.db_security_group_names = value;
+        }
+        if let Some(value) = input.ca_certificate_identifier {
+            changed = true;
+            record.ca_certificate_identifier = value;
+        }
+        if let Some(value) = input.monitoring_interval {
+            changed = true;
+            record.monitoring_interval = value;
+        }
+        if let Some(value) = input.enable_performance_insights {
+            changed = true;
+            record.performance_insights_enabled = value;
+        }
+        if let Some(value) = input.enable_iam_database_authentication {
+            changed = true;
+            record.iam_database_authentication_enabled = value;
+        }
+        if let Some(value) = input.database_insights_mode {
+            changed = true;
+            record.database_insights_mode = value;
+        }
+        if let Some(value) = input.dedicated_log_volume {
+            changed = true;
+            record.dedicated_log_volume = value;
+        }
+        if let Some(value) = input.enable_customer_owned_ip {
+            changed = true;
+            record.customer_owned_ip_enabled = value;
+        }
+        if let Some(value) = input.network_type {
+            changed = true;
+            record.network_type = value;
+        }
+        if let Some(value) = input.engine_lifecycle_support {
+            changed = true;
+            record.engine_lifecycle_support = value;
+        }
+        if let Some(value) = input.storage_throughput {
+            changed = true;
+            record.storage_throughput = value;
         }
         // `DisableDomain` wins over `Domain`, as its name says: it leaves the domain.
         if let Some(value) = input.domain {
