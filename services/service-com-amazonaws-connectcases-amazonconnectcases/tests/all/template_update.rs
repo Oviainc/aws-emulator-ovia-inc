@@ -27,7 +27,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcases_amazonconnectcases::ops::types::TEMPLATE_STATUS_VALUES;
 
-use crate::case_lifecycle::{domain, string_at, Emulator};
+use crate::harness::{domain, string_at, Emulator};
 
 /// The published bounds of the members `UpdateTemplate` writes, from the model:
 /// `TemplateName` is `@length(1..100)`, `TemplateDescription` `@length(..255)`,

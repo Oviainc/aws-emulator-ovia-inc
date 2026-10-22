@@ -178,18 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(CreateFieldErrorModeled::ServiceQuotaExceededException)?;
 
         // A field name identifies the field to a human within its domain, so a
-        // create under a name a live field already holds is refused.
-        if let Some(existing) = domain
+        // create under a name a live field already holds — including a reserved
+        // System field's own name — is refused.
+        if domain
             .fields
             .values()
-            .find(|f| !f.deleted && f.name == input.name)
+            .any(|f| !f.deleted && f.name == input.name)
         {
-            return Err(CreateFieldErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "a field named {} already exists in domain {} (fieldId {})",
-                    input.name, input.domain_id, existing.field_id
-                ),
-            })
+            return Err(CreateFieldErrorModeled::ConflictException(
+                crate::state::name_conflict(crate::state::ResourceKind::Field, &input.name),
+            )
             .into());
         }
 

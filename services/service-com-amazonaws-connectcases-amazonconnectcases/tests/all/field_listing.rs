@@ -24,12 +24,12 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcases_amazonconnectcases::ops::types::FIELD_TYPE_VALUES;
 use service_com_amazonaws_connectcases_amazonconnectcases::state::{
-    FIELD_NAMESPACE_CUSTOM, MAX_PAGE_SIZE,
+    FIELD_NAMESPACE_CUSTOM, FIELD_NAMESPACE_SYSTEM, MAX_PAGE_SIZE, RESERVED_SYSTEM_FIELDS,
 };
 
 // The crate's shared test harness: one emulator behind the production router,
 // and the domain-creating helper every suite in this target uses.
-use crate::case_lifecycle::{domain, string_at, Emulator};
+use crate::harness::{domain, string_at, Emulator};
 
 /// `ListFields` for `domain_id` with `query` appended verbatim.
 async fn list(emulator: &Emulator, case: &str, domain_id: &str, query: &str) -> Value {
@@ -134,6 +134,54 @@ async fn create_fields(emulator: &Emulator, domain_id: &str, count: usize) -> Ve
     expected
 }
 
+/// The reserved `System` fields every domain is provisioned with at creation
+/// (`state::RESERVED_SYSTEM_FIELDS`), as the summaries a listing must report for
+/// them: they are fields of the domain like any other, so a listing reports them
+/// too. They share the domain's creation instant, so the listing's order key
+/// falls back to the id, which is what sorts them here.
+fn reserved_summaries(domain_id: &str) -> Vec<(String, Value)> {
+    let mut reserved: Vec<(String, Value)> = RESERVED_SYSTEM_FIELDS
+        .iter()
+        .map(|(field_id, field_type)| {
+            (
+                (*field_id).to_string(),
+                json!({
+                    "fieldId": field_id,
+                    "fieldArn": format!(
+                        "arn:aws:cases:us-east-1:000000000000:domain/{domain_id}/field/{field_id}"
+                    ),
+                    "name": field_id,
+                    "type": field_type,
+                    "namespace": FIELD_NAMESPACE_SYSTEM,
+                }),
+            )
+        })
+        .collect();
+    reserved.sort_by(|(left, _), (right, _)| left.cmp(right));
+    reserved
+}
+
+/// The reserved ids a listing of `domain_id` reports, in that order.
+fn reserved_ids(domain_id: &str) -> Vec<String> {
+    reserved_summaries(domain_id)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Every summary a listing of `domain_id` must report after `count` fields are
+/// created in it: the reserved ones the domain was provisioned with, then the
+/// created ones in creation order.
+async fn expected_listing(
+    emulator: &Emulator,
+    domain_id: &str,
+    count: usize,
+) -> Vec<(String, Value)> {
+    let mut expected = reserved_summaries(domain_id);
+    expected.extend(create_fields(emulator, domain_id, count).await);
+    expected
+}
+
 /// Follow the cursor to its end, returning every summary reported and how many
 /// pages it took. Asserts the page-size bound and that a token only ever
 /// arrives with a full page on the way.
@@ -218,10 +266,11 @@ async fn list_fields_walks_every_stored_field_exactly_once() {
     for (case, count, max_results) in rows {
         let emulator = Emulator::new();
         let domain_id = domain(&emulator, &format!("domain-of-{count}-fields")).await;
-        let expected = create_fields(&emulator, &domain_id, count).await;
+        let expected = expected_listing(&emulator, &domain_id, count).await;
         let expected_ids: Vec<String> = expected.iter().map(|(id, _)| id.clone()).collect();
+        let total = expected.len();
 
-        let (reported, pages) = walk(&emulator, case, &domain_id, max_results, count).await;
+        let (reported, pages) = walk(&emulator, case, &domain_id, max_results, total).await;
         let ids: Vec<String> = reported
             .iter()
             .map(|summary| string_at(summary, "fieldId", case))
@@ -239,10 +288,10 @@ async fn list_fields_walks_every_stored_field_exactly_once() {
             "case {case:?}: no field may be reported twice across pages, got {ids:?}"
         );
         let limit = max_results.unwrap_or(MAX_PAGE_SIZE) as usize;
-        let wanted_pages = count.div_ceil(limit).max(1);
+        let wanted_pages = total.div_ceil(limit).max(1);
         assert_eq!(
             pages, wanted_pages,
-            "case {case:?}: {count} fields at {limit} per page is {wanted_pages} page(s), \
+            "case {case:?}: {total} fields at {limit} per page is {wanted_pages} page(s), \
              took {pages}"
         );
 
@@ -302,10 +351,13 @@ async fn list_fields_summarises_every_field_type_as_the_batch_read_does() {
 
     let answer = list(&emulator, case, &domain_id, "").await;
     let summaries = listed(case, &answer);
+    let mut expected_ids = reserved_ids(&domain_id);
+    expected_ids.extend(ids.iter().cloned());
     assert_eq!(
         listed_ids(case, &answer),
-        ids,
-        "case {case:?}: every created field must be listed, in creation order, got {answer:?}"
+        expected_ids,
+        "case {case:?}: the reserved fields and every created field must be listed, in order, \
+         got {answer:?}"
     );
 
     // The same fields read through `BatchGetField`: the listing's summary must be
@@ -403,13 +455,15 @@ async fn list_fields_reports_only_the_fields_of_the_domain_it_names() {
         (&second, in_second, None),
         (&empty, Vec::new(), Some(1)),
     ] {
-        let (reported, _) = walk(&emulator, case, domain_id, size, stored.len()).await;
+        let mut expected = reserved_ids(domain_id);
+        expected.extend(stored.iter().cloned());
+        let (reported, _) = walk(&emulator, case, domain_id, size, expected.len()).await;
         let ids: Vec<String> = reported
             .iter()
             .map(|summary| string_at(summary, "fieldId", case))
             .collect();
         assert_eq!(
-            ids, stored,
+            ids, expected,
             "case {case:?}: domain {domain_id} must list only its own fields, got {ids:?}"
         );
     }
@@ -425,6 +479,10 @@ async fn list_fields_refuses_an_unknown_domain_a_bad_page_size_and_a_foreign_cur
         .into_iter()
         .map(|(id, _)| id)
         .collect();
+    // The whole listing: the reserved fields the domain carries, then the three
+    // created here.
+    let mut all_ids = reserved_ids(&listed_domain);
+    all_ids.extend(stored.iter().cloned());
     create_fields(&emulator, &other_domain, 3).await;
 
     let (status, code) = refused(
@@ -527,7 +585,7 @@ async fn list_fields_refuses_an_unknown_domain_a_bad_page_size_and_a_foreign_cur
     let from_empty = list(&emulator, "empty nextToken", &listed_domain, "?nextToken=").await;
     assert_eq!(
         listed_ids("empty nextToken", &from_empty),
-        stored,
+        all_ids,
         "case \"empty nextToken\": an empty token means the start of the listing, \
          got {from_empty:?}"
     );
@@ -543,7 +601,7 @@ async fn list_fields_refuses_an_unknown_domain_a_bad_page_size_and_a_foreign_cur
     .await;
     assert_eq!(
         listed_ids("the listing's own cursor", &resumed),
-        stored[1..2].to_vec(),
+        all_ids[1..2].to_vec(),
         "case \"the listing's own cursor\": a cursor resumes after the page it came from, \
          got {resumed:?}"
     );
@@ -559,6 +617,8 @@ async fn listing_fields_changes_nothing_a_later_caller_sees() {
         .into_iter()
         .map(|(id, _)| id)
         .collect();
+    let mut all_ids = reserved_ids(&domain_id);
+    all_ids.extend(stored.iter().cloned());
 
     // A cursor is not consumed by being followed: the same page and the same
     // resumption answer the same entries however often they are replayed.
@@ -591,17 +651,20 @@ async fn listing_fields_changes_nothing_a_later_caller_sees() {
     // And a second full walk — at a different page size — still reports exactly
     // the same fields in the same order, so nothing the first walk did moved or
     // dropped one.
-    let (second_walk, second_pages) = walk(&emulator, case, &domain_id, Some(3), stored.len()).await;
+    let (second_walk, second_pages) =
+        walk(&emulator, case, &domain_id, Some(3), all_ids.len()).await;
     let ids: Vec<String> = second_walk
         .iter()
         .map(|summary| string_at(summary, "fieldId", case))
         .collect();
     assert_eq!(
-        ids, stored,
+        ids, all_ids,
         "case {case:?}: a listing must not change what a later listing sees, got {ids:?}"
     );
+    let wanted_pages = all_ids.len().div_ceil(3);
     assert_eq!(
-        second_pages, 2,
-        "case {case:?}: five fields take two pages of three, took {second_pages}"
+        second_pages, wanted_pages,
+        "case {case:?}: {} fields take {wanted_pages} pages of three, took {second_pages}",
+        all_ids.len()
     );
 }

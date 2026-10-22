@@ -201,7 +201,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
                 None => errors.push(FieldError {
                     id: requested.id.clone(),
-                    error_code: "ResourceNotFoundException".to_string(),
+                    // The per-item code is the service's own per-item
+                    // vocabulary, not the name of the modelled exception shape
+                    // a whole call would fail with: see
+                    // `state::BATCH_ITEM_NOT_FOUND_CODE`.
+                    error_code: crate::state::BATCH_ITEM_NOT_FOUND_CODE.to_string(),
                     message: Some(format!(
                         "Field {} was not found in domain {}",
                         requested.id, input.domain_id
