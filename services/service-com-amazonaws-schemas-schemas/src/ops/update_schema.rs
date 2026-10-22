@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSchema
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSchema`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSchema::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes a new version of a stored schema, or updates its description.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +149,167 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSchema` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSchemaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSchema"))
+        // `ctx` carries request metadata only. Only a caller's own registry can be
+        // written to (the guard below), and a schema in one reports the ARN its create
+        // minted, so nothing here derives one.
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateSchemaError::from(UpdateSchemaErrorModeled::InternalServerErrorException(
+                crate::state::internal_error(),
+            ))
+        })?;
+        // ONE lock for the whole read-decide-write: the version number is taken from
+        // the schema this call then writes, so two racing updates of one schema are
+        // serialised here and cannot be handed the same number. Nothing between the
+        // mint and the insert can yield.
+        let mut state = store.lock();
+
+        // A property of the WHOLE store, so it is read while the borrow is still
+        // shared — and only for a request that could add to it; it is CHECKED below,
+        // once the registry and the schema have been resolved, because a request
+        // naming neither is a 404 whatever the size.
+        let stored_bytes = if input.content.is_some() {
+            crate::state::stored_content_bytes(&state)
+        } else {
+            0
+        };
+
+        let registry = state
+            .registries
+            .get_mut(&input.registry_name)
+            .ok_or_else(|| {
+                UpdateSchemaError::from(UpdateSchemaErrorModeled::NotFoundException(
+                    crate::state::registry_not_found(&input.registry_name),
+                ))
+            })?;
+        // AWS owns the schemas in a service-owned registry, so a caller cannot write
+        // a version of one.
+        if registry.scope.is_managed() {
+            return Err(UpdateSchemaErrorModeled::ForbiddenException(
+                crate::state::managed_registry_is_read_only(&input.registry_name),
+            )
+            .into());
+        }
+        let schema = registry
+            .schemas
+            .get_mut(&input.schema_name)
+            .ok_or_else(|| {
+                UpdateSchemaError::from(UpdateSchemaErrorModeled::NotFoundException(
+                    crate::state::schema_not_found(&input.registry_name, &input.schema_name),
+                ))
+            })?;
+
+        // `Type` is the type OF the content: a stored document cannot be relabelled
+        // without being rewritten, or every reader of the old version would be told
+        // the wrong type for the bytes it gets.
+        let retyped = input
+            .r#type
+            .as_deref()
+            .is_some_and(|requested| requested != schema.r#type);
+        if retyped && input.content.is_none() {
+            return Err(UpdateSchemaErrorModeled::BadRequestException(
+                crate::state::bad_request(
+                    "Type names the type of the schema content, so it can only be changed \
+                     by a request that also sends Content.",
+                ),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let reported_version = match input.content.clone() {
+            // `Content` IS the schema definition, so sending it writes a new,
+            // immutable version and leaves every earlier one as it was.
+            Some(content) => {
+                // Unless this is a RETRY of a call that already wrote one: the token
+                // the first attempt carried names the version it minted, and a retry
+                // must answer that rather than write the same definition twice. A
+                // token whose version has since been deleted names nothing.
+                let already_minted = input
+                    .client_token_id
+                    .as_deref()
+                    .and_then(|token| schema.minted_by_token.get(token))
+                    .copied()
+                    .filter(|version| schema.versions.contains_key(version));
+                match already_minted {
+                    Some(version) => version,
+                    None => {
+                        if schema.versions.len() >= crate::state::MAX_VERSIONS_PER_SCHEMA {
+                            return Err(UpdateSchemaErrorModeled::BadRequestException(
+                                crate::state::store_cap_reached(
+                                    "versions per schema",
+                                    crate::state::MAX_VERSIONS_PER_SCHEMA,
+                                ),
+                            )
+                            .into());
+                        }
+                        if stored_bytes.saturating_add(content.len())
+                            > crate::state::MAX_STORED_CONTENT_BYTES
+                        {
+                            return Err(UpdateSchemaErrorModeled::BadRequestException(
+                                crate::state::store_cap_reached(
+                                    "bytes of schema content",
+                                    crate::state::MAX_STORED_CONTENT_BYTES,
+                                ),
+                            )
+                            .into());
+                        }
+                        let r#type =
+                            input.r#type.clone().unwrap_or_else(|| schema.r#type.clone());
+                        // An absent `Description` leaves the schema's description as
+                        // it is, rather than clearing it: a member a request does not
+                        // send asks for no change.
+                        let description = input
+                            .description
+                            .clone()
+                            .or_else(|| schema.description.clone());
+                        let minted = schema.add_version(content, r#type, description, now).version;
+                        if let Some(token) = input.client_token_id.clone() {
+                            schema.minted_by_token.insert(token, minted);
+                        }
+                        minted
+                    }
+                }
+            }
+            // No `Content`: the definition is unchanged, so no version is minted and
+            // the only thing a request can still change is the description.
+            None => {
+                if let Some(description) = input.description.clone() {
+                    schema.description = Some(description.clone());
+                    // `DescribeSchema` reports the description recorded WITH a
+                    // version, and the latest version is the schema's current
+                    // definition, so the new description has to reach it or no read
+                    // would ever show it. Earlier versions keep theirs.
+                    let latest = schema.latest_version;
+                    if let Some(version) = schema.versions.get_mut(&latest) {
+                        version.description = Some(description);
+                    }
+                    schema.last_modified = now;
+                }
+                schema.latest_version
+            }
+        };
+
+        // Answer from the STORED schema and its stored version, never from `input`.
+        let version = schema
+            .versions
+            .get(&reported_version)
+            .ok_or_else(|| {
+                UpdateSchemaError::from(UpdateSchemaErrorModeled::InternalServerErrorException(
+                    crate::state::internal_error(),
+                ))
+            })?
+            .clone();
+        let schema_arn = schema.arn.clone();
+        Ok(UpdateSchemaOutput {
+            description: version.description.clone(),
+            last_modified: Some(schema.last_modified.into()),
+            schema_arn: Some(schema_arn),
+            schema_name: Some(schema.name.clone()),
+            schema_version: Some(version.version.to_string()),
+            tags: crate::state::tags_to_output(&schema.tags),
+            r#type: Some(version.r#type.clone()),
+            version_created_date: Some(version.created_date.into()),
+        })
     }
 }

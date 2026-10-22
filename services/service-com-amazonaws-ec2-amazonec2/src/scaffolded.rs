@@ -193,8 +193,9 @@ static SERVICE_ERROR_MESSAGE: Schema = Schema::new_member(
 /// Schema for the synthetic `ServiceError` error shape.
 ///
 /// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the
-/// shape is not in any service's model. The wire `<Code>` comes from the variant's
-/// own `code`, not from this schema's shape name.
+/// shape is not in any service's model. Only the `Message` element comes from here —
+/// the wire `<Code>` comes from the variant's own `code` (via
+/// [`OperationError::shape_name`]), not from this schema's shape name.
 pub static SERVICE_ERROR_SCHEMA: Schema = Schema::new_struct(
     ShapeId::from_static(
         "smithy.framework#ServiceError",
@@ -210,21 +211,25 @@ pub static SERVICE_ERROR_SCHEMA: Schema = Schema::new_struct(
 ///
 /// EC2's model declares ZERO error shapes — every operation's `errors` list is empty
 /// (`smithy_query(query="operation",operation="<Op>")`) — while the real service
-/// refuses requests with codes its clients branch on: `InvalidParameterValue` for a
-/// value it cannot accept, `DryRunOperation` for a `DryRun` request that would have
-/// succeeded. This is how a handler answers with THAT code and status instead of
-/// flattening every such refusal into `ValidationException`, which no EC2 client
-/// matches on. Reach it through a named constructor in `crate::state` rather than
-/// inventing a code at the call site.
+/// refuses requests with codes its clients branch on: `InvalidInstanceID.NotFound`
+/// for an instance that does not exist, `IncorrectInstanceState` for a transition the
+/// current state does not admit, `InvalidParameterValue` for a value it cannot
+/// accept, `DryRunOperation` for a `DryRun` request that would have succeeded. This
+/// is how a handler answers with THAT code and status instead of flattening every
+/// such refusal into `ValidationException`, which no EC2 client matches on, or into a
+/// 501, which would claim the operation is unwritten. Reach it through one of the
+/// named constructors below rather than inventing a code at the call site.
 #[derive(Debug, Clone)]
 pub struct ServiceError {
     /// The wire error code (`<Code>`). A `&'static str` so it can only be one of
     /// this service's known codes, never text taken from a request.
     pub code: &'static str,
+    /// Why the request was refused. Says what was wrong and names the member or the
+    /// resource, so the caller can fix the request from this text alone; built from
+    /// the request, never from a recording.
+    pub message: String,
     /// The HTTP status the real service answers this code with.
     pub status: u16,
-    /// Why the request was refused; built from the request, never from a recording.
-    pub message: String,
 }
 
 impl std::fmt::Display for ServiceError {
@@ -250,6 +255,9 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// An error the service itself defines, which its model does not declare for this
+    /// operation. Renders with the carried code and status.
+    ServiceError(ServiceError),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -261,9 +269,6 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
-    /// The request was refused with one of this service's own error codes, for a
-    /// failure its model declares no shape for. Renders with that code and status.
-    ServiceError(ServiceError),
 }
 
 impl<E> Scaffolded<E> {
@@ -290,17 +295,153 @@ impl<E> Scaffolded<E> {
         Self::ValidationException(ValidationException::new(message))
     }
 
-    /// Refuse the request with one of this service's own error codes.
+    /// Refuse (or fail) the request with one of this service's own error codes.
     ///
-    /// For a service whose model declares no error shapes, this is the only way to
-    /// answer the code and status the real service answers — see [`ServiceError`].
-    /// `code` is `&'static str` so the wire code is always one this service chose.
+    /// For a service whose model declares no error shapes — which, for EC2, is every
+    /// error it has — this is the only way to answer the code and status the real
+    /// service answers; see [`ServiceError`]. `code` is `&'static str` so the wire
+    /// code is always one this service chose. Use one of the named constructors below
+    /// rather than calling this with a fresh literal, so one code is worded one way
+    /// across every operation.
     pub fn service_error(code: &'static str, status: u16, message: impl Into<String>) -> Self {
         Self::ServiceError(ServiceError {
             code,
-            status,
             message: message.into(),
+            status,
         })
+    }
+
+    /// `InvalidInstanceID.NotFound` (HTTP 400): the request named an instance id this
+    /// account holds no instance for.
+    pub fn invalid_instance_id_not_found(instance_id: &str) -> Self {
+        Self::service_error(
+            "InvalidInstanceID.NotFound",
+            400,
+            format!("The instance ID '{instance_id}' does not exist"),
+        )
+    }
+
+    /// `InvalidInstanceID.Malformed` (HTTP 400): the request named something that is
+    /// not an instance id at all, so there is nothing to look up.
+    pub fn invalid_instance_id_malformed(instance_id: &str) -> Self {
+        Self::service_error(
+            "InvalidInstanceID.Malformed",
+            400,
+            format!("Invalid id: '{instance_id}'"),
+        )
+    }
+
+    /// `InvalidID` (HTTP 400): the request named a resource id of a kind this
+    /// operation cannot resolve at all.
+    pub fn invalid_id(resource_id: &str) -> Self {
+        Self::service_error(
+            "InvalidID",
+            400,
+            format!("The ID '{resource_id}' is not valid"),
+        )
+    }
+
+    /// `IncorrectInstanceState` (HTTP 400): the instance exists, but its current
+    /// state does not admit the requested lifecycle transition.
+    pub fn incorrect_instance_state(instance_id: &str, state: &str, action: &str) -> Self {
+        Self::service_error(
+            "IncorrectInstanceState",
+            400,
+            format!(
+                "The instance '{instance_id}' is in state '{state}', \
+                 which is not a state from which it can be {action}"
+            ),
+        )
+    }
+
+    /// `OperationNotPermitted` (HTTP 400): the request is well formed and the
+    /// resource exists, but an attribute on it forbids the action.
+    pub fn operation_not_permitted(message: impl Into<String>) -> Self {
+        Self::service_error("OperationNotPermitted", 400, message)
+    }
+
+    /// `InvalidParameterValue` (HTTP 400): a parameter carries a value the service
+    /// rejects.
+    pub fn invalid_parameter_value(message: impl Into<String>) -> Self {
+        Self::service_error("InvalidParameterValue", 400, message)
+    }
+
+    /// `InvalidParameterCombination` (HTTP 400): each parameter is valid alone, but
+    /// they cannot be given together.
+    pub fn invalid_parameter_combination(message: impl Into<String>) -> Self {
+        Self::service_error("InvalidParameterCombination", 400, message)
+    }
+
+    /// `MissingParameter` (HTTP 400): a parameter the operation needs was not given.
+    /// Distinct from a modelled `@required` member, which the boundary validator
+    /// refuses before a handler runs.
+    pub fn missing_parameter(message: impl Into<String>) -> Self {
+        Self::service_error("MissingParameter", 400, message)
+    }
+
+    /// `TagLimitExceeded` (HTTP 400): the request would push a resource past the
+    /// documented maximum number of tags.
+    pub fn tag_limit_exceeded(message: impl Into<String>) -> Self {
+        Self::service_error("TagLimitExceeded", 400, message)
+    }
+
+    /// `InstanceLimitExceeded` (HTTP 400): the launch would take the account past
+    /// the number of instances it may run.
+    pub fn instance_limit_exceeded(message: impl Into<String>) -> Self {
+        Self::service_error("InstanceLimitExceeded", 400, message)
+    }
+
+    /// `InsufficientFreeAddressesInSubnet` (HTTP 400): no primary private address
+    /// is left to give the instance.
+    pub fn insufficient_free_addresses() -> Self {
+        Self::service_error(
+            "InsufficientFreeAddressesInSubnet",
+            400,
+            "The subnet does not have enough free private IPv4 addresses to \
+             satisfy the request",
+        )
+    }
+
+    /// `InvalidIPAddress.InUse` (HTTP 400): the private address the request asked
+    /// for is already held by another instance.
+    pub fn invalid_ip_address_in_use(address: &str) -> Self {
+        Self::service_error(
+            "InvalidIPAddress.InUse",
+            400,
+            format!("Address {address} is in use"),
+        )
+    }
+
+    /// `UnsupportedHibernationConfiguration` (HTTP 400): the instance was not
+    /// launched with hibernation enabled, so it cannot be hibernated.
+    pub fn unsupported_hibernation_configuration(instance_id: &str) -> Self {
+        Self::service_error(
+            "UnsupportedHibernationConfiguration",
+            400,
+            format!("The instance '{instance_id}' was not launched with hibernation enabled"),
+        )
+    }
+
+    /// `DryRunOperation` (HTTP 412): `DryRun` was set and the request would
+    /// otherwise have succeeded, so nothing was done.
+    pub fn dry_run_operation() -> Self {
+        Self::service_error(
+            "DryRunOperation",
+            412,
+            "Request would have succeeded, but DryRun flag is set.",
+        )
+    }
+
+    /// `RequestLimitExceeded` (HTTP 503): the request asked for more work than the
+    /// service will do in one call.
+    pub fn request_limit_exceeded(message: impl Into<String>) -> Self {
+        Self::service_error("RequestLimitExceeded", 503, message)
+    }
+
+    /// `InternalError` (HTTP 500): the service could not serve the request for a
+    /// reason that is not the caller's fault.
+    pub fn internal_error(message: impl Into<String>) -> Self {
+        Self::service_error("InternalError", 500, message)
     }
 }
 
@@ -309,8 +450,8 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
-            Self::ValidationException(e) => write!(f, "{e}"),
             Self::ServiceError(e) => write!(f, "{e}"),
+            Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
 }
@@ -322,8 +463,8 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
-            Self::ValidationException(e) => e.source(),
             Self::ServiceError(e) => e.source(),
+            Self::ValidationException(e) => e.source(),
         }
     }
 }
@@ -337,8 +478,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
-            Self::ValidationException(e) => e,
             Self::ServiceError(e) => e,
+            Self::ValidationException(e) => e,
         }
     }
 
@@ -346,8 +487,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
-            Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::ServiceError(_) => &SERVICE_ERROR_SCHEMA,
+            Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
 
@@ -359,8 +500,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
-            Self::ValidationException(_) => "ValidationException",
+            // The service's own code, carried on the variant.
             Self::ServiceError(e) => e.code,
+            Self::ValidationException(_) => "ValidationException",
         }
     }
 
@@ -372,8 +514,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
-            Self::ValidationException(_) => 400,
             Self::ServiceError(e) => e.status,
+            Self::ValidationException(_) => 400,
         }
     }
 
@@ -384,11 +526,12 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
+            // The code on the variant is ALREADY the query wire code the service
+            // answers with, and `shape_name` returns it, so there is nothing to
+            // override here.
+            Self::ServiceError(_) => None,
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
-            // The code is already the wire code the query envelope renders, so there
-            // is no legacy `awsQueryError` alias to add on top of it.
-            Self::ServiceError(_) => None,
         }
     }
 }

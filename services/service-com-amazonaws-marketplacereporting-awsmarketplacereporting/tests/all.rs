@@ -14,5 +14,8 @@
 #[path = "all/buyer_dashboard.rs"]
 mod buyer_dashboard;
 
+#[path = "all/buyer_dashboard_authorization.rs"]
+mod buyer_dashboard_authorization;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

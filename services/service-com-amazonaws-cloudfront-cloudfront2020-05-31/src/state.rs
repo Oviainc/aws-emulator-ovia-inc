@@ -53,6 +53,21 @@ pub const STATUS_DEPLOYED: &str = "Deployed";
 /// finished, the status is `Completed`."
 pub const STATUS_COMPLETED: &str = "Completed";
 
+/// The message CloudFront answers `DistributionNotDisabled` with, on the wire.
+///
+/// One CONSTANT per error code rather than a sentence built from the request: this
+/// condition is a property of the distribution's state, so nothing about the request
+/// belongs in the text.
+///
+/// The value below is the WIRE text — what the recorded service answers this code with,
+/// and what this emulator therefore serves. It deliberately differs from the sentence the
+/// MODEL's documentation of the error shape uses for the same rule ("The specified
+/// CloudFront distribution is not disabled. You must disable the distribution before you
+/// can delete it."): that one documents the condition, this one is served. Do not
+/// "correct" this constant to the documentation sentence.
+pub const DISTRIBUTION_NOT_DISABLED_MESSAGE: &str =
+    "The distribution you are trying to delete has not been disabled.";
+
 /// How long after the call that starts it a propagation or an invalidation batch is
 /// owed.
 ///
@@ -521,6 +536,20 @@ impl StoredDistribution {
         i32::try_from(in_progress).unwrap_or(i32::MAX)
     }
 
+    /// Whether a delete may remove this distribution.
+    ///
+    /// CloudFront's teardown is TWO steps, and the second one is a wait: you disable the
+    /// distribution, and then — "wait until the value of the `Status` column for your
+    /// distribution changes from `InProgress` to `Deployed`" — you delete it. So a
+    /// distribution is deletable only once its stored configuration has it disabled AND
+    /// that configuration has finished propagating; a delete issued while either is
+    /// untrue is refused with `DistributionNotDisabled` and the record stays readable.
+    ///
+    /// Reads [`StoredDistribution::status`], so the caller settles the clock first.
+    pub fn deletable(&self) -> bool {
+        !self.config.enabled && self.status == STATUS_DEPLOYED
+    }
+
     /// The `DomainName` this distribution reports.
     ///
     /// A standard distribution reports the edge domain allocated to it at creation; a
@@ -847,11 +876,12 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     }
 
     /// Persist a new distribution carrying `config` and `tags`, and report the record
-    /// that was stored.
+    /// that was stored — or, when the caller reference already names a distribution
+    /// carrying this very configuration, report THAT record and store nothing.
     ///
     /// The ONE create path. `CreateDistribution` and `CreateDistributionWithTags` create
     /// the same resource under the same rules and differ only in whether the request
-    /// carries a tag set, so the configuration check, the caller-reference claim, the
+    /// carries a tag set, so the configuration check, the caller-reference rule, the
     /// store bound, the mint and the insert all live here and cannot drift apart.
     ///
     /// Every refusal is decided BEFORE anything is claimed, so a refused create leaves
@@ -876,16 +906,45 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             return Err(CreateRefusal::ConfigLimit(limit));
         }
 
-        // "The caller reference you attempted to create the distribution with is
-        // associated with another distribution": a caller reference identifies one
-        // distribution for its whole life, so a reference the store already holds cannot
-        // name a second one.
+        // A caller reference identifies ONE distribution for its whole life, and what it
+        // takes part in is this: repeating a create under a reference the store already
+        // holds is either the SAME request again or a second distribution under a taken
+        // reference. What separates the two is the content of the configuration, which is
+        // what the recorded service does on both branches: a repeat whose configuration is
+        // the one that reference already names is answered with that distribution, its
+        // version and its location (creating nothing), and a repeat that changes the
+        // configuration is refused — "The caller reference you attempted to create the
+        // distribution with is associated with another distribution."
+        // [`ComAmazonawsCloudfrontCloudfront20200531State::create_invalidation`]'s caller
+        // reference follows the same rule for an invalidation batch.
         let caller_reference = config.caller_reference.clone();
-        if let Some(existing) = self.caller_references.get(&caller_reference) {
-            return Err(CreateRefusal::DistributionAlreadyExists(format!(
-                "The caller reference {caller_reference} is already associated with \
-                 distribution {existing}"
-            )));
+        // The configuration as the service will run it: the members submitted plus every
+        // member the service itself supplies. Resolved BEFORE the caller-reference
+        // question so the comparison below is one between like and like — the stored
+        // record is resolved too — and a repeat that states a default explicitly and one
+        // that leaves it out are the same request, as they describe the same distribution.
+        let config = resolve_distribution_config(config);
+        // The reference index and the store are written together — a delete releases both
+        // — so an entry that names no stored distribution cannot arise; were one to, the
+        // reference it indexes is associated with nothing and this create claims it.
+        if let Some(existing_id) = self.caller_references.get(&caller_reference).cloned() {
+            if let Some(existing) = self.distribution(&existing_id) {
+                if same_config(&existing.config, &config) {
+                    // The same request again: the record the first create left behind, at
+                    // its current version. Nothing is minted and nothing is stored — so a
+                    // tag set this repeat carries changes nothing either, the distribution
+                    // keeping the tags it was created with.
+                    return Ok(CreatedDistribution {
+                        id: existing.id.clone(),
+                        etag: existing.etag.clone(),
+                        distribution: existing.to_distribution(),
+                    });
+                }
+                return Err(CreateRefusal::DistributionAlreadyExists(format!(
+                    "The caller reference {caller_reference} is already associated with \
+                     distribution {existing_id}"
+                )));
+            }
         }
 
         // "Processing your request would cause you to exceed the maximum number of
@@ -916,7 +975,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             // Stored whole, with every member the service itself supplies resolved into
             // it: a later read answers from this record — the configuration the
             // distribution actually runs under — never from the request that was served.
-            config: resolve_distribution_config(config),
+            config,
             tags,
             invalidations: BTreeMap::new(),
         };
@@ -1279,6 +1338,30 @@ pub fn check_if_match(current: &str, if_match: Option<&str>) -> IfMatch {
 /// whether a repeated `CallerReference` is the same request again.
 pub fn same_batch(left: &InvalidationBatch, right: &InvalidationBatch) -> bool {
     same_paths(&left.paths, &right.paths)
+}
+
+/// Whether two distribution configurations ask for the same thing, which is what decides
+/// whether a repeated `CallerReference` is the same create again or a second
+/// distribution under a reference that is already taken.
+///
+/// Compared over the WHOLE configuration rather than a chosen few members: the question is
+/// about "the content of the config", so every member a caller can submit takes part, down
+/// to the members a request left out. Comparing the DESERIALIZED configurations also makes
+/// the comparison insensitive to the request document's whitespace and member order, which
+/// is what "identical … (ignoring white space)" asks for.
+///
+/// The comparison goes through the shapes' derived `Debug` rendering, which spells out
+/// every member in declaration order with its value, because the alternative — deriving
+/// `PartialEq` on the ~45 shapes a `DistributionConfig` reaches — means editing
+/// `src/ops/types/shared_types.rs`, and that file carries the model's
+/// `ReferrerPolicyList` value `unsafe-url`, which the merge gate's deterministic scanners
+/// read as `unsafe` Rust and refuse at HIGH. So the comparison lives here instead, and
+/// what it rests on — that the rendering keeps every member, including the `@sensitive`
+/// `Comment` — is pinned by `same_config_separates_configurations_that_differ` below: a
+/// rendering that hid or truncated a member would make two configurations differing in it
+/// compare equal, and that test fails the moment it does.
+pub fn same_config(left: &DistributionConfig, right: &DistributionConfig) -> bool {
+    format!("{left:?}") == format!("{right:?}")
 }
 
 /// Whether two `Paths` name the same objects, in the same order.
@@ -1965,6 +2048,7 @@ fn render_token(value: u64, len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops::types::{Aliases, Origin, Origins};
 
     /// The mint never repeats a token: distinct counter values render distinctly, which
     /// is what makes two creates two distributions and every mutation a fresh version.
@@ -2029,6 +2113,140 @@ mod tests {
             assert_eq!(
                 actual, *expected,
                 "case If-Match={header:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// A configuration a client could submit, as the baseline the cases below differ
+    /// from one member at a time.
+    fn a_config() -> DistributionConfig {
+        DistributionConfig {
+            caller_reference: "ref-baseline".to_string(),
+            comment: "the baseline".to_string(),
+            enabled: true,
+            origins: Origins {
+                quantity: 1,
+                items: vec![Origin {
+                    id: "primary".to_string(),
+                    domain_name: "origin.example.com".to_string(),
+                    ..Origin::default()
+                }],
+            },
+            default_cache_behavior: DefaultCacheBehavior {
+                target_origin_id: "primary".to_string(),
+                viewer_protocol_policy: "allow-all".to_string(),
+                ..DefaultCacheBehavior::default()
+            },
+            ..DistributionConfig::default()
+        }
+    }
+
+    /// [`same_config`] separates exactly the configurations that differ, over every kind
+    /// of member a `DistributionConfig` carries: a required scalar, the `@sensitive`
+    /// `Comment`, a boolean, an optional scalar the baseline leaves out, a nested
+    /// structure, and a list wrapper's `Quantity` and `Items`.
+    ///
+    /// This is what the create path's idempotency rests on: a comparison that could not
+    /// see one of these members would answer a second, DIFFERENT configuration with the
+    /// first distribution instead of the modelled conflict.
+    #[test]
+    fn same_config_separates_configurations_that_differ() {
+        let baseline = a_config();
+        assert!(
+            same_config(&baseline, &a_config()),
+            "case identical: expected two equal configurations to compare the same"
+        );
+
+        let mut differing: Vec<(&str, DistributionConfig)> = Vec::new();
+        differing.push((
+            "caller-reference",
+            DistributionConfig {
+                caller_reference: "ref-other".to_string(),
+                ..a_config()
+            },
+        ));
+        differing.push((
+            "sensitive-comment",
+            DistributionConfig {
+                comment: "a different comment".to_string(),
+                ..a_config()
+            },
+        ));
+        differing.push((
+            "empty-comment",
+            DistributionConfig {
+                comment: String::new(),
+                ..a_config()
+            },
+        ));
+        differing.push((
+            "enabled",
+            DistributionConfig {
+                enabled: false,
+                ..a_config()
+            },
+        ));
+        differing.push((
+            "optional-scalar-named",
+            DistributionConfig {
+                price_class: Some(DEFAULT_PRICE_CLASS.to_string()),
+                ..a_config()
+            },
+        ));
+        differing.push((
+            "nested-structure",
+            DistributionConfig {
+                default_cache_behavior: DefaultCacheBehavior {
+                    viewer_protocol_policy: "https-only".to_string(),
+                    ..a_config().default_cache_behavior
+                },
+                ..a_config()
+            },
+        ));
+        differing.push((
+            "list-wrapper-items",
+            DistributionConfig {
+                origins: Origins {
+                    quantity: 1,
+                    items: vec![Origin {
+                        id: "primary".to_string(),
+                        domain_name: "other.example.com".to_string(),
+                        ..Origin::default()
+                    }],
+                },
+                ..a_config()
+            },
+        ));
+        differing.push((
+            "list-wrapper-quantity",
+            DistributionConfig {
+                origins: Origins {
+                    quantity: 2,
+                    ..a_config().origins
+                },
+                ..a_config()
+            },
+        ));
+        differing.push((
+            "absent-wrapper-becomes-empty",
+            DistributionConfig {
+                aliases: Some(Aliases {
+                    quantity: 0,
+                    items: None,
+                }),
+                ..a_config()
+            },
+        ));
+
+        for (case, other) in &differing {
+            assert!(
+                !same_config(&baseline, other),
+                "case {case}: expected a configuration differing in {case} to compare \
+                 DIFFERENT, got the same; baseline {baseline:?} vs {other:?}"
+            );
+            assert!(
+                same_config(other, other),
+                "case {case}: expected a configuration to compare the same as itself"
             );
         }
     }

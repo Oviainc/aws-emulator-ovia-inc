@@ -21,7 +21,7 @@ use service_com_amazonaws_accessanalyzer_accessanalyzer::state::{
 };
 
 // The wire harness is shared by every suite in this target; see `tests/all/harness.rs`.
-use crate::harness::{Emulator, Reply};
+use crate::harness::{Emulator, Reply, VALIDATION_REASONS};
 
 /// The analyzer `type`s that carry an `unusedAccess` configuration, from the model's
 /// `Type` enum (`smithy_query(query="shape", shape="Type")`).
@@ -90,7 +90,12 @@ async fn listed_configuration(emulator: &Emulator, case: &str, name: &str) -> Op
 }
 
 /// Assert a reply is this service's modelled `ValidationException`: HTTP 400, the wire
-/// code, and a `reason` the model's own `ValidationExceptionReason` enum lists.
+/// code, and a `reason` the model's own `ValidationExceptionReason` enum names.
+///
+/// The accepted values are the model's SCREAMING_SNAKE NAMES, which is what a response
+/// carries (`harness::VALIDATION_REASONS` holds the pairs and cites them); the lowerCamel
+/// discriminators `VALIDATION_EXCEPTION_REASON_VALUES` lists are the other half of those
+/// pairs.
 fn assert_validation_exception(case: &str, reply: &Reply) {
     assert_eq!(
         reply.status, 400,
@@ -106,9 +111,15 @@ fn assert_validation_exception(case: &str, reply: &Reply) {
         .member("reason")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let names: Vec<&str> = VALIDATION_REASONS.iter().map(|(_, name)| *name).collect();
     assert!(
-        VALIDATION_EXCEPTION_REASON_VALUES.contains(&reason),
-        "case {case:?}: reason must be one of {VALIDATION_EXCEPTION_REASON_VALUES:?}, got {reason:?}"
+        names.contains(&reason),
+        "case {case:?}: reason must be one of {names:?}, got {reason:?}"
+    );
+    assert_eq!(
+        names.len(),
+        VALIDATION_EXCEPTION_REASON_VALUES.len(),
+        "the catalog must name every modelled discriminator: {names:?} vs {VALIDATION_EXCEPTION_REASON_VALUES:?}"
     );
 }
 
@@ -385,6 +396,18 @@ async fn update_analyzer_is_refused_for_external_access_analyzers() {
             let case = format!("{analyzer_type} with {body_case}");
             let update = emulator.update_analyzer(&name, body.clone()).await;
             assert_validation_exception(&case, &update);
+            // The refusal is about the analyzer the path names rather than about one
+            // member, so it classifies as the field-validation discriminator AWS answers
+            // with and names no member in `fieldList`.
+            assert_eq!(
+                update.member("reason").and_then(Value::as_str),
+                Some(crate::harness::wire_reason("fieldValidationFailed")),
+                "case {case:?}: the refusal must carry the field-validation reason, got {update:?}"
+            );
+            assert!(
+                update.member("fieldList").is_none(),
+                "case {case:?}: no single member is at fault, so there is no fieldList, got {update:?}"
+            );
             assert_eq!(
                 stored_configuration(&emulator, &case, &name).await,
                 None,

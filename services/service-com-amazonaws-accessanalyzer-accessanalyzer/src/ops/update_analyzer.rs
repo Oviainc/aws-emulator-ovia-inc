@@ -168,9 +168,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "This action is not supported for external access analyzers" — an `ACCOUNT` or
         // `ORGANIZATION` analyzer has no `AnalyzerConfiguration` to modify, so the
-        // request is refused rather than silently storing one.
+        // request is refused rather than silently storing one. The refusal is about the
+        // analyzer the path names rather than about one malformed member, so it carries
+        // no `fieldList` — and its reason is the field-validation discriminator AWS
+        // answers with, not the modelled `notSupported`; see
+        // [`crate::state::unsupported_action_exception`].
         let configured_access = analyzer.configured_access().ok_or_else(|| {
-            UpdateAnalyzerErrorModeled::ValidationException(crate::state::not_supported_exception(
+            UpdateAnalyzerErrorModeled::ValidationException(crate::state::unsupported_action_exception(
                 format!(
                     "UpdateAnalyzer is not supported for an analyzer of type {}",
                     analyzer.r#type

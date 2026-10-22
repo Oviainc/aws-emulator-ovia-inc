@@ -158,7 +158,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::CancelOutcome::Canceled => Ok(CancelJobOutput {}),
             crate::state::CancelOutcome::NotFound => {
                 Err(CancelJobErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!("Job {} not found.", input.id)),
+                    // The refusal names the request member the lookup read, `Id`.
+                    message: Some(crate::state::not_found_message("id")),
                 })
                 .into())
             }

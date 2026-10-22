@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/cloud_map_core.rs"]
 mod cloud_map_core;
+#[path = "all/custom_health_status.rs"]
+mod custom_health_status;
 #[path = "all/delete_namespace.rs"]
 mod delete_namespace;
 #[path = "all/delete_service.rs"]

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: writes the tags onto the stored records — the instances
+//! `RunInstances` minted and the VPCs the VPC slice holds — so a later describe
+//! reports them and the `tag:<key>` / `tag-key` filters match on them.
+//!
+//! Those are the only resources this crate stores, so an id of any other kind is
+//! refused rather than silently accepted. Every id in the request is resolved
+//! BEFORE any tag is written.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +159,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTags"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            deduplicate_ids, instance_id_is_well_formed, merge_tag_list, require_service_state,
+            tag_bytes, tag_list_bytes, validate_tag_size, MAX_RESOURCE_IDS, MAX_STORED_BYTES,
+            MAX_TAGS_PER_RESOURCE, RESERVED_TAG_PREFIX,
+        };
+
+        let _ = ctx;
+
+        if input.resources.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter Resources",
+            ));
+        }
+        // Documented on `Resources`: "Up to 1000 resource IDs." The model declares no
+        // `@length`, so this is the only place the bound can exist, and it is what
+        // keeps the work below proportional to a bounded number.
+        if input.resources.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Resources carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                input.resources.len()
+            )));
+        }
+        if input.tags.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter Tags",
+            ));
+        }
+        if input.tags.len() > MAX_TAGS_PER_RESOURCE {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "The request carries {} tags, above the maximum of \
+                 {MAX_TAGS_PER_RESOURCE} per resource",
+                input.tags.len()
+            )));
+        }
+        // Documented: "Tag keys must be unique per resource." Two entries for one
+        // key in a single request have no defined winner, so the request is refused
+        // rather than silently collapsed.
+        let mut keys_seen: ::std::collections::BTreeSet<String> =
+            ::std::collections::BTreeSet::new();
+        for tag in &input.tags {
+            let key = tag.key.clone().unwrap_or_default();
+            if key.is_empty() {
+                return Err(Scaffolded::invalid_parameter_value(
+                    "A tag key cannot be empty",
+                ));
+            }
+            if key.starts_with(RESERVED_TAG_PREFIX) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Tag key '{key}' is invalid: the '{RESERVED_TAG_PREFIX}' prefix is reserved"
+                )));
+            }
+            if !keys_seen.insert(key.clone()) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Tag key '{key}' is given more than once; tag keys must be unique"
+                )));
+            }
+            // A count cap is not a byte cap: without these a request could store
+            // caller-chosen megabytes on each of the resources it names.
+            validate_tag_size(&key, tag.value.as_deref().unwrap_or_default())?;
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        store.materialize_due_transitions();
+
+        // One resource is tagged once however many times the request names it.
+        let resource_ids = deduplicate_ids(&input.resources);
+
+        // The tags to write, in request order, with their keys already validated.
+        let updates: Vec<(String, String)> = input
+            .tags
+            .iter()
+            .filter_map(|tag| {
+                Some((
+                    tag.key.clone()?,
+                    tag.value.clone().unwrap_or_default(),
+                ))
+            })
+            .collect();
+
+        // Every resource is resolved, and its resulting tag count and byte size
+        // checked, BEFORE a single tag is written: a request naming one unknown id
+        // leaves none of the others tagged.
+        let mut added_bytes: usize = 0;
+        for resource_id in &resource_ids {
+            if let Some(instance) = store.instances.get(resource_id) {
+                let mut keys: ::std::collections::BTreeSet<&str> =
+                    instance.tags.keys().map(String::as_str).collect();
+                for (key, _) in &updates {
+                    keys.insert(key.as_str());
+                }
+                if keys.len() > MAX_TAGS_PER_RESOURCE {
+                    return Err(Scaffolded::tag_limit_exceeded(format!(
+                        "The resource '{resource_id}' would carry {} tags, \
+                         above the maximum of {MAX_TAGS_PER_RESOURCE}",
+                        keys.len()
+                    )));
+                }
+                // How many MORE bytes this resource would hold once the write lands.
+                let mut merged = instance.tags.clone();
+                for (key, value) in &updates {
+                    merged.insert(key.clone(), value.clone());
+                }
+                added_bytes = added_bytes.saturating_add(
+                    tag_bytes(&merged).saturating_sub(tag_bytes(&instance.tags)),
+                );
+                continue;
+            }
+            if let Some(vpc) = store.vpcs.get(resource_id) {
+                let existing = vpc.tags.clone().unwrap_or_default();
+                let mut merged = existing.clone();
+                merge_tag_list(&mut merged, &updates);
+                if merged.len() > MAX_TAGS_PER_RESOURCE {
+                    return Err(Scaffolded::tag_limit_exceeded(format!(
+                        "The resource '{resource_id}' would carry {} tags, \
+                         above the maximum of {MAX_TAGS_PER_RESOURCE}",
+                        merged.len()
+                    )));
+                }
+                added_bytes = added_bytes.saturating_add(
+                    tag_list_bytes(&merged).saturating_sub(tag_list_bytes(&existing)),
+                );
+                continue;
+            }
+            return Err(if instance_id_is_well_formed(resource_id) {
+                Scaffolded::invalid_instance_id_not_found(resource_id)
+            } else {
+                // Instances and VPCs are the only taggable resources this crate
+                // stores, so any other id names nothing it can tag.
+                Scaffolded::invalid_id(resource_id)
+            });
+        }
+        if store.would_exceed_stored_bytes(added_bytes) {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied instance data, so it cannot store {added_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        // DryRun sits AFTER every resource has been resolved and checked and BEFORE
+        // the first write: the flag asks whether the request would have succeeded, so
+        // a request naming a resource that does not exist must be refused with that
+        // reason instead. The checks above only read state.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        for resource_id in &resource_ids {
+            if let Some(instance) = store.instances.get_mut(resource_id) {
+                for (key, value) in &updates {
+                    // Documented: "When you specify an existing tag key, the value
+                    // is overwritten with the new value."
+                    instance.tags.insert(key.clone(), value.clone());
+                }
+                continue;
+            }
+            if let Some(vpc) = store.vpcs.get_mut(resource_id) {
+                let mut tags = vpc.tags.take().unwrap_or_default();
+                merge_tag_list(&mut tags, &updates);
+                vpc.tags = Some(tags);
+            }
+        }
+        store.add_stored_bytes(added_bytes);
+
+        Ok(CreateTagsOutput)
     }
 }

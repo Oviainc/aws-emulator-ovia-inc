@@ -41,5 +41,7 @@ mod marketplace_signing_name_routing;
 mod partnercentral_channel_target_routing;
 #[path = "all/personalize_signing_name_routing.rs"]
 mod personalize_signing_name_routing;
+#[path = "all/rds_docdb_neptune_signing_name_routing.rs"]
+mod rds_docdb_neptune_signing_name_routing;
 #[path = "all/shared_signing_name_routing.rs"]
 mod shared_signing_name_routing;

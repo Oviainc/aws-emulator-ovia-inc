@@ -536,7 +536,8 @@ async fn optional_parameters_narrow_the_result_only_when_they_match_something() 
 
 /// `HealthStatus` "is ignored for services that don't have a health check configured,
 /// and all instances are returned"; with one configured, the filter selects on the
-/// instance's own status, which is `UNKNOWN` until a checker reports.
+/// instance's own status — which for a Route 53 health check is the verdict the service
+/// computes once the check is due (`ROUTE53_HEALTH_CHECK_VERDICT`).
 ///
 /// The filter values come from the model's `HealthStatusFilter` enum
 /// (`HEALTH_STATUS_FILTER_VALUES` in `src/ops/types/shared_types.rs`).
@@ -581,12 +582,17 @@ async fn the_health_status_filter_applies_only_to_a_health_checked_service() {
         ("plain-svc", Some("HEALTHY_OR_ELSE_ALL"), vec!["i-1"]),
         ("checked-svc", None, vec!["i-1"]),
         ("checked-svc", Some("ALL"), vec!["i-1"]),
-        // Nothing has reported on the instance, so it is neither healthy nor unhealthy.
+        // The service's own checker reported: nothing it can probe here answers, so
+        // the instance is unhealthy rather than healthy.
         ("checked-svc", Some("HEALTHY"), vec![]),
-        ("checked-svc", Some("UNHEALTHY"), vec![]),
+        ("checked-svc", Some("UNHEALTHY"), vec!["i-1"]),
         // Failing open: no healthy instance, so everything is returned.
         ("checked-svc", Some("HEALTHY_OR_ELSE_ALL"), vec!["i-1"]),
     ];
+    // The Route 53 verdict is owed, not instant, so the filter rows below are read
+    // once the clock has reached it. Blocking is fine here: the test owns the runtime,
+    // and the service never sleeps for the span.
+    std::thread::sleep(cloudmap::state::ROUTE53_HEALTH_CHECK_SPAN + Duration::from_millis(50));
     for (service_name, filter, expected) in cases {
         let mut body = json!({ "NamespaceName": "health-ns", "ServiceName": service_name });
         if let Some(filter) = filter {
@@ -1049,6 +1055,7 @@ async fn a_full_resource_store_is_refused_with_resource_limit_exceeded() {
                     attributes: std::collections::HashMap::new(),
                     creator_request_id: None,
                     health_status: cloudmap::state::HEALTH_STATUS_UNKNOWN.to_string(),
+                    pending_health_status: None,
                 },
             );
         }

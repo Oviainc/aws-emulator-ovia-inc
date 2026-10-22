@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the reservations and instances [`crate::state`] holds, in
+//! launch order, narrowed by `InstanceIds` and `Filters` and paged by
+//! `MaxResults`/`NextToken`.
+//!
+//! It also materialises any instance transition the CLOCK already owed before
+//! reporting — each one was due at this instant whether or not anybody called — and
+//! writes nothing else.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +175,196 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            decode_page_token, encode_page_token, filter_name_supported, require_known_instance,
+            require_service_state, CompiledFilter, MatchBudget, MAX_FILTERS, MAX_FILTER_MATCH_STEPS,
+            MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
+        };
+
+        let _ = ctx;
+
+        let requested_ids = input.instance_ids.clone().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "InstanceIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+        // Documented on `MaxResults`: "You cannot specify this parameter and the
+        // instance IDs parameter in the same request."
+        if !requested_ids.is_empty() && input.max_results.is_some() {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "MaxResults cannot be specified together with InstanceIds",
+            ));
+        }
+        if input.max_results.is_some_and(|max_results| max_results < 1) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for maxResults. It must be at least 1",
+                input.max_results.unwrap_or_default()
+            )));
+        }
+        // Documented maximum for this operation's `MaxResults`; the model declares no
+        // `@range`, so the handler is the only place it can be enforced.
+        if input
+            .max_results
+            .is_some_and(|max_results| usize::try_from(max_results).unwrap_or(0) > MAX_PAGE_SIZE)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for maxResults. It must be at most {MAX_PAGE_SIZE}",
+                input.max_results.unwrap_or_default()
+            )));
+        }
+
+        // Matching cost is filters x values x stored instances and the model bounds
+        // none of them, so the two request-controlled factors are capped here,
+        // before any work proportional to them is done.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name the service does not resolve is refused, never silently
+        // ignored: ignoring it would answer a wider set than the caller asked for.
+        let mut filters: Vec<CompiledFilter> = Vec::new();
+        for filter in input.filters.iter().flatten() {
+            let name = filter.name.clone().unwrap_or_default();
+            if !filter_name_supported(&name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is not one this emulator resolves"
+                )));
+            }
+            let values = filter.values.clone().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost
+            // is the product of the pattern's length and the value's, so the value's
+            // size is bounded here too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the \
+                     maximum of {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            filters.push(CompiledFilter::new(name, values));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        store.materialize_due_transitions();
+
+        for instance_id in &requested_ids {
+            require_known_instance(&store, instance_id)?;
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named
+        // instance resolved: the flag asks whether the request WOULD have succeeded,
+        // so one that would have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // A set, so narrowing by `InstanceIds` costs one lookup per instance rather
+        // than a scan of the whole requested list.
+        let wanted_ids: ::std::collections::HashSet<&str> =
+            requested_ids.iter().map(String::as_str).collect();
+
+        // Reservations in launch order, each carrying only the instances that pass
+        // `InstanceIds` and every filter. A reservation none of whose instances pass
+        // is not reported at all.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstances"))
+        // Every comparison is charged to one budget, so the PRODUCT of stored
+        // instances, filters, values and value length is bounded however the caller
+        // combines them — which is also what bounds how long this holds the lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut matched: Vec<(String, Vec<String>)> = Vec::new();
+        for reservation_id in &store.reservation_order {
+            if budget.exhausted() {
+                break;
+            }
+            let Some(reservation) = store.reservations.get(reservation_id) else {
+                continue;
+            };
+            let mut instance_ids: Vec<String> = Vec::new();
+            for instance_id in &reservation.instance_ids {
+                if !wanted_ids.is_empty() && !wanted_ids.contains(instance_id.as_str()) {
+                    continue;
+                }
+                let Some(instance) = store.instances.get(instance_id) else {
+                    continue;
+                };
+                if store.instance_matches(reservation, instance, &filters, &mut budget) {
+                    instance_ids.push(instance_id.clone());
+                }
+            }
+            if !instance_ids.is_empty() {
+                matched.push((reservation_id.clone(), instance_ids));
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to
+        // report as a result: the request asked for more filtering than one call
+        // will do, and is told so.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // `@paginated` names `Reservations` as the paged items, so a page is a whole
+        // number of reservations and the token carries the id of the one to resume
+        // at, opaquely (`state::encode_page_token`), so a caller cannot assemble one.
+        // A request that names no page size gets the documented maximum rather than
+        // the whole store.
+        let page_size = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resume_at = decode_page_token(token).ok_or_else(|| {
+                    Scaffolded::invalid_parameter_value(
+                        "The NextToken value is not a token this service issued",
+                    )
+                })?;
+                matched
+                    .iter()
+                    .position(|(reservation_id, _)| *reservation_id == resume_at)
+                    .ok_or_else(|| {
+                        Scaffolded::invalid_parameter_value(
+                            "The NextToken value does not resume this result set",
+                        )
+                    })?
+            }
+        };
+        let end = start.saturating_add(page_size).min(matched.len());
+        let next_token = matched
+            .get(end)
+            .map(|(reservation_id, _)| encode_page_token(reservation_id));
+        let reservations = matched[start..end]
+            .iter()
+            .filter_map(|(reservation_id, instance_ids)| {
+                store.reservation_view(reservation_id, instance_ids)
+            })
+            .collect();
+
+        Ok(DescribeInstancesOutput {
+            reservations: Some(reservations),
+            next_token,
+        })
     }
 }

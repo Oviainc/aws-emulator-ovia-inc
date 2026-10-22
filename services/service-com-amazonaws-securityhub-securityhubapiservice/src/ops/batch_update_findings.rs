@@ -7,6 +7,10 @@
 //! finding, or that the same request already named, is reported in
 //! `UnprocessedFindings` and is NOT reported as processed.
 //!
+//! Each finding this call changes also gets a `BATCH_UPDATE_FINDINGS` change event
+//! appended to its history, listing the ASFF fields the write changed, which is what
+//! `GetFindingHistory` reports.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -220,8 +224,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // One instant for the whole call: `Note.UpdatedAt` records when this update
-        // was made, so every note it writes carries the same timestamp.
+        // was made, so every note it writes carries the same timestamp, and so does
+        // every finding-history event the call appends.
         let note_updated_at = crate::state::now_iso8601();
+        // "the ARN ... of a customer that calls BatchUpdateFindings"
+        // (`FindingHistoryUpdateSource$Identity`).
+        let caller = crate::state::caller_arn();
         let mut processed_findings: Vec<AwsSecurityFindingIdentifier> = Vec::new();
         let mut unprocessed_findings: Vec<BatchUpdateFindingsUnprocessedFinding> = Vec::new();
         let mut already_named: ::std::collections::HashSet<(String, String)> =
@@ -264,6 +272,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             };
 
+            // The change event this write appends records what it actually changed,
+            // so the stored finding is captured BEFORE the updates are applied.
+            let before = stored.finding.clone();
             let finding = &mut stored.finding;
             if let Some(note) = input.note.as_ref() {
                 finding.note = Some(Note {
@@ -310,6 +321,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 finding.related_findings = Some(related_findings.clone());
             }
             stored.updated_seq = seq;
+            let updates = crate::state::finding_changes(&before, &stored.finding);
+            // An update that leaves every ASFF field as it was changed nothing, so
+            // there is no change event to report for it.
+            if !updates.is_empty() {
+                stored.record_history(crate::state::FindingHistoryEvent {
+                    update_time: note_updated_at.clone(),
+                    finding_created: false,
+                    source_type: crate::state::HISTORY_SOURCE_BATCH_UPDATE_FINDINGS.to_string(),
+                    source_identity: caller.clone(),
+                    updates,
+                    seq,
+                });
+            }
 
             processed_findings.push(identifier);
         }

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DefineIndexField
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DefineIndexField`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stores one index field in the named domain's PENDING configuration and reports the
+//! stored entry. A MUTATION, and one that leaves the domain needing a rebuild: per the
+//! modelled `OptionStatus$State` doc, "the option's latest value will not be deployed
+//! until IndexDocuments has been called and indexing is complete", so the entry is
+//! reported `RequiresIndexDocuments` and the domain's `RequiresIndexDocuments` goes
+//! true.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DefineIndexField::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Re-defining a name updates that entry in place, keeping its `CreationDate` and
+//! bumping `UpdateVersion`.
+//!
+//! The modelled `IndexField` doc says "The supported options depend on the
+//! IndexFieldType", so a definition carrying an options structure its own type does not
+//! accept is refused with the modelled `InvalidTypeException`; the name `score`, which
+//! the modelled `IndexFieldName` doc reserves, is refused with `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +166,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DefineIndexField` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DefineIndexFieldErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DefineIndexField"))
+        // Request metadata only; the store is reached through `self.engine`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DefineIndexFieldErrorModeled::InternalException(InternalException {
+                code: None,
+                message: Some(
+                    "CloudSearch domain state is unavailable on this engine.".to_string(),
+                ),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let clock = ::std::time::Instant::now();
+        let wall = ::std::time::SystemTime::now();
+        state.advance(clock);
+
+        let field = input.index_field;
+
+        // PRECEDENCE, deliberate: the two checks below test the `IndexField` the request
+        // carries against rules that hold whatever domain it names, so they run BEFORE
+        // the domain lookup. A bad definition against an unknown domain therefore
+        // answers the input error, not `ResourceNotFoundException`. Do not reorder these
+        // past the lookup — a caller fixing one error at a time needs the input refusal
+        // to be stable.
+        if field.index_field_name == crate::state::RESERVED_FIELD_NAME {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "IndexField.IndexFieldName '{}' is reserved and cannot be used as a field name.",
+                crate::state::RESERVED_FIELD_NAME
+            )));
+        }
+
+        // One options structure per field type: the type decides which member may be
+        // set, and any other one makes the definition inconsistent with itself.
+        let mismatched = crate::state::mismatched_options_members(&field);
+        if !mismatched.is_empty() {
+            let accepted = crate::state::options_member_for_field_type(&field.index_field_type)
+                .unwrap_or("no options structure");
+            return Err(DefineIndexFieldErrorModeled::InvalidTypeException(
+                InvalidTypeException {
+                    code: None,
+                    message: Some(format!(
+                        "IndexField '{}' of type '{}' accepts only IndexField.{}; the request also \
+                         set {}.",
+                        field.index_field_name,
+                        field.index_field_type,
+                        accepted,
+                        mismatched
+                            .iter()
+                            .map(|member| format!("IndexField.{member}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(domain) = state.live_domain_mut(&input.domain_name) else {
+            return Err(DefineIndexFieldErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    code: None,
+                    message: Some(format!("Domain not found: {}", input.domain_name)),
+                },
+            )
+            .into());
+        };
+
+        let status = match domain.define_index_field(field, wall) {
+            Ok(status) => status,
+            // The domain is at its index-field cap. Nothing is evicted to make room, so
+            // the only honest answer is the limit the model already declares.
+            Err(limit) => {
+                return Err(DefineIndexFieldErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        code: None,
+                        message: Some(format!(
+                            "Cannot define another index field in domain '{}': it already holds \
+                             the maximum of {limit} index fields.",
+                            input.domain_name
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+        Ok(DefineIndexFieldOutput {
+            index_field: status,
+        })
     }
 }

@@ -3,7 +3,8 @@
 //! @op DeleteDistribution
 //!
 //! Deletes a distribution under an `If-Match` precondition, and only once its stored
-//! configuration has it disabled. After this call the distribution is gone from the
+//! configuration has it disabled AND that configuration has finished propagating (the
+//! distribution reports `Deployed`). After this call the distribution is gone from the
 //! store, so no later read reports it.
 //!
 //! ## Shape of an operation
@@ -178,14 +179,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(current) = store
             .distribution(&input.id)
-            .map(|stored| (stored.etag.clone(), stored.config.enabled))
+            .map(|stored| (stored.etag.clone(), stored.deletable()))
         else {
             return Err(DeleteDistributionErrorModeled::NoSuchDistribution(
                 crate::state::no_such_distribution(&input.id),
             )
             .into());
         };
-        let (current_etag, enabled) = current;
+        let (current_etag, deletable) = current;
 
         // The precondition is checked first, the way HTTP evaluates one: a caller
         // holding a version that is no longer current is told that before anything
@@ -218,15 +219,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The specified CloudFront distribution is not disabled. You must disable the
-        // distribution before you can delete it."
-        if enabled {
+        // distribution before you can delete it." Disabling it is not enough on its own:
+        // the disabled configuration has to have reached the edge locations, so a
+        // distribution that is still `InProgress` — whether it was never disabled, was
+        // just disabled, or was just reconfigured — is refused here and stays readable.
+        if !deletable {
             return Err(DeleteDistributionErrorModeled::DistributionNotDisabled(
                 DistributionNotDisabled {
-                    message: Some(format!(
-                        "The distribution {} is not disabled: set Enabled to false with \
-                         UpdateDistribution before deleting it",
-                        input.id
-                    )),
+                    message: Some(crate::state::DISTRIBUTION_NOT_DISABLED_MESSAGE.to_string()),
                 },
             )
             .into());

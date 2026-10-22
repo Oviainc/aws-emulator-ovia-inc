@@ -20,6 +20,9 @@ mod lens_review_answers;
 #[path = "all/lookup_error_envelopes.rs"]
 mod lookup_error_envelopes;
 
+#[path = "all/milestone_listing.rs"]
+mod milestone_listing;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

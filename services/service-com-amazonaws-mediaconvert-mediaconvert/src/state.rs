@@ -194,6 +194,33 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| FALLBACK_REGION.to_string())
 }
 
+/// How this service words a `NotFoundException`: it names the REQUEST MEMBER that
+/// pointed at the resource, not the value the caller supplied.
+///
+/// MediaConvert answers a lookup that resolves nothing with "The resource you specified
+/// in `<member>` was not found.", where `<member>` is the input member the handler read
+/// the reference from (`name` for a queue, `id` for a job, `queue` for a job's queue) —
+/// so the wording is built from the request, exactly as the other member-naming refusals
+/// in this crate are, and never from the missing resource's own name.
+pub fn not_found_message(member: &str) -> String {
+    format!("The resource you specified in {member} was not found.")
+}
+
+/// How this service refuses the deletion of a BUILT-IN resource.
+///
+/// Recorded AWS behaviour for `DeleteQueue` on the account's built-in queue — see
+/// `issues/.../mediaconvert-queue-job-control-plane-4-fidelity-divergences.md`, cause 3 —
+/// is `ForbiddenException` (403) worded "You specified an invalid value for `<member>`.
+/// You are not allowed to delete system resources.", where `<member>` is the request
+/// member that named the resource. As with [`not_found_message`], the wording is built
+/// from the request, never from the resource's own name.
+pub fn system_resource_delete_message(member: &str) -> String {
+    format!(
+        "You specified an invalid value for {member}. You are not allowed to delete \
+         system resources."
+    )
+}
+
 /// `arn:aws:mediaconvert:<region>:<account>:queues/<name>`.
 pub fn queue_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("queues/{name}"))
@@ -607,6 +634,21 @@ pub enum CancelOutcome {
     NotCancelable(String),
 }
 
+/// What the store did when asked to delete a queue.
+#[derive(Debug)]
+pub enum DeleteQueueOutcome {
+    /// The queue is gone from the store.
+    Deleted,
+    /// No queue is stored under that name.
+    NotFound,
+    /// The queue is built in. `Queue`'s `Type`: "System queues are built in. You can't
+    /// modify or delete system queues."
+    SystemQueue,
+    /// The queue still holds jobs that have not reached a terminal status, carrying how
+    /// many are `SUBMITTED` and how many `PROGRESSING`.
+    HasActiveJobs { submitted: i32, progressing: i32 },
+}
+
 /// What the store did when asked to accept a new job.
 #[derive(Debug)]
 pub enum AcceptOutcome {
@@ -813,6 +855,37 @@ impl ComAmazonawsMediaconvertMediaconvertState {
                 return candidate;
             }
         }
+    }
+
+    /// Delete a queue: "Permanently delete a queue you have created."
+    ///
+    /// Two refusals live here rather than in the handler, so the decision and the state
+    /// it is read from cannot disagree:
+    ///
+    /// * a built-in queue is not one the caller created, and `Queue`'s `Type` says
+    ///   "System queues are built in. You can't modify or delete system queues";
+    /// * a queue still holding a job in a non-terminal status conflicts with the current
+    ///   state of the resource — removing it would leave those jobs' `Queue` naming a
+    ///   queue no `GetQueue` can read.
+    ///
+    /// Nothing else is touched: the jobs a deleted queue already finished stay readable,
+    /// exactly as their `Queue` recorded them.
+    pub fn delete_queue(&mut self, name: &str) -> DeleteQueueOutcome {
+        let Some(record) = self.queues.get(name) else {
+            return DeleteQueueOutcome::NotFound;
+        };
+        if record.queue_type == QUEUE_TYPE_SYSTEM {
+            return DeleteQueueOutcome::SystemQueue;
+        }
+        let (submitted, progressing) = self.job_counts(name);
+        if submitted > 0 || progressing > 0 {
+            return DeleteQueueOutcome::HasActiveJobs {
+                submitted,
+                progressing,
+            };
+        }
+        self.queues.remove(name);
+        DeleteQueueOutcome::Deleted
     }
 
     /// The account endpoint already stored for `region`, or `None` when none has been

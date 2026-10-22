@@ -9,6 +9,10 @@
 //! constraints is reported in `FailedFindings` with the member and constraint it
 //! broke.
 //!
+//! Every stored write also appends a `BATCH_IMPORT_FINDINGS` change event to that
+//! finding's history — the creating import, and any later re-import that changes an
+//! ASFF field — which is what `GetFindingHistory` reports.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -317,25 +321,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // CSPM received a finding and begins to process it".
             finding.region = Some(region.clone());
             finding.processed_at = Some(received_at.clone());
+            // `RecordState` and `Workflow.Status` are the service-owned lifecycle
+            // members: neither is modelled on input as required, and `Workflow$Status`
+            // documents "NEW - The initial state of a finding, before it is reviewed"
+            // with Security Hub itself resetting the status, so an ingested finding
+            // that carries neither gets the service's initial values rather than
+            // reading back with the members absent.
+            if finding.record_state.is_none() {
+                finding.record_state = Some(crate::state::DEFAULT_RECORD_STATE.to_string());
+            }
+            if finding.workflow.as_ref().and_then(|w| w.status.clone()).is_none() {
+                finding.workflow = Some(Workflow {
+                    status: Some(crate::state::DEFAULT_WORKFLOW_STATUS.to_string()),
+                });
+            }
             if let Some(severity) = finding.severity.as_mut() {
                 crate::state::complete_severity(severity);
             }
 
             let seq = store.next_write_seq();
+            // "the ARN of a partner that calls BatchImportFindings"
+            // (`FindingHistoryUpdateSource$Identity`): the product the finding was
+            // submitted under is what names the importer.
+            let importer = finding.product_arn.clone();
             match store.findings.get_mut(&key) {
                 // Re-importing an identifier updates the stored finding in place.
                 Some(existing) => {
+                    // The change event records what this write actually changed, so
+                    // it is computed against the stored finding BEFORE the write.
+                    let updates = crate::state::finding_changes(&existing.finding, &finding);
                     existing.finding = finding;
                     existing.updated_seq = seq;
+                    // A re-import that leaves every ASFF field as it was changed
+                    // nothing, so there is no change event to report for it.
+                    if !updates.is_empty() {
+                        existing.record_history(crate::state::FindingHistoryEvent {
+                            update_time: received_at.clone(),
+                            finding_created: false,
+                            source_type: crate::state::HISTORY_SOURCE_BATCH_IMPORT_FINDINGS
+                                .to_string(),
+                            source_identity: importer,
+                            updates,
+                            seq,
+                        });
+                    }
                 }
                 None => {
+                    // The creating event names the fields the finding was created
+                    // with: every ASFF field the import set, each with no prior value.
+                    let updates = crate::state::finding_created_fields(&finding);
+                    let created = crate::state::FindingHistoryEvent {
+                        update_time: received_at.clone(),
+                        finding_created: true,
+                        source_type: crate::state::HISTORY_SOURCE_BATCH_IMPORT_FINDINGS
+                            .to_string(),
+                        source_identity: importer,
+                        updates,
+                        seq,
+                    };
                     store.findings.insert(
                         key,
-                        crate::state::StoredFinding {
-                            finding,
-                            imported_seq: seq,
-                            updated_seq: seq,
-                        },
+                        crate::state::StoredFinding::new(finding, seq, created),
                     );
                 }
             }

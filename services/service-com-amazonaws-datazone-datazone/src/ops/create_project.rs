@@ -12,6 +12,9 @@
 //! `ProjectStatus` has no in-progress member for creation, so a created project is
 //! `ACTIVE` at once and stays there: it owes the clock no transition.
 //!
+//! `membershipAssignments` are stored as the project's memberships, under the same
+//! rules `CreateProjectMembership` applies, so `ListProjectMemberships` reports them.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -200,17 +203,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, date_time, now_ms, Project, DOMAIN_STATUS_AVAILABLE,
+            caller_principal, date_time, membership_from_request, now_ms, Membership,
+            MembershipRefusal, Project, DOMAIN_STATUS_AVAILABLE, MAX_MEMBERSHIPS_PER_PROJECT,
             PROJECT_STATUS_ACTIVE,
         };
+        use std::collections::BTreeMap;
 
-        // Environment provisioning and membership assignment are separate resources
-        // this slice of the emulator does not serve yet. A request that asks for them
-        // is answered with the scaffold's honest "not written yet" rather than being
-        // accepted and silently dropped.
-        if input.user_parameters.is_some() || input.membership_assignments.is_some() {
+        // Environment provisioning is a separate resource this slice of the emulator
+        // does not serve yet. A request that asks for it is answered with the
+        // scaffold's honest "not written yet" rather than being accepted and silently
+        // dropped.
+        if input.user_parameters.is_some() {
             return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "CreateProject with userParameters or membershipAssignments",
+                "CreateProject with userParameters",
             ));
         }
 
@@ -258,6 +263,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The memberships the request assigns, validated by the same rules
+        // `CreateProjectMembership` applies. Two assignments naming one principal are
+        // one membership: the key is the member, so the later assignment holds.
+        let mut memberships: BTreeMap<String, Membership> = BTreeMap::new();
+        for assignment in input.membership_assignments.iter().flatten() {
+            let (key, membership) = membership_from_request(
+                &assignment.member,
+                &assignment.designation,
+                assignment.user_created_designation_id.as_deref(),
+                &input.domain_identifier,
+            )
+            .map_err(|refusal| match refusal {
+                MembershipRefusal::Invalid(message) => {
+                    CreateProjectErrorModeled::ValidationException(ValidationException { message })
+                        .into()
+                }
+                MembershipRefusal::ProfileNotFound(message) => {
+                    CreateProjectErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException { message },
+                    )
+                    .into()
+                }
+                MembershipRefusal::Unserved(what) => crate::scaffolded::Scaffolded::not_implemented(
+                    &format!("CreateProject assigning a membership with {what}"),
+                ),
+            })?;
+            memberships.insert(key, membership);
+        }
+        if memberships.len() > MAX_MEMBERSHIPS_PER_PROJECT {
+            return Err(CreateProjectErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator stores at most {MAX_MEMBERSHIPS_PER_PROJECT} memberships in one project"
+                    ),
+                },
+            )
+            .into());
+        }
+
         let id = store.mint_id(now);
         let project = Project {
             id: id.clone(),
@@ -273,6 +317,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             project_profile_id: input.project_profile_id,
             resource_tags: input.resource_tags.unwrap_or_default().into_iter().collect(),
             project_category: input.project_category,
+            memberships,
         };
         let output = CreateProjectOutput {
             domain_id: project.domain_id.clone(),

@@ -2,19 +2,23 @@
 
 //! Engine state for the com-amazonaws-marketplaceagreement-awsmpcommerceservice-v20200301 service.
 //!
-//! Two resources carry the agreement lifecycle this crate serves:
+//! Three resources carry the agreement lifecycle this crate serves:
 //!
 //! * an **agreement request** — "a quote for the terms you want to accept"
 //!   (`CreateAgreementRequest`), which captures the requested terms and the
 //!   charges they imply;
 //! * an **agreement** — what `AcceptAgreementRequest` finalises from one of
 //!   those requests, and what `DescribeAgreement`, `GetAgreementTerms`,
-//!   `SearchAgreements` and `CancelAgreement` report on and mutate.
+//!   `SearchAgreements` and `CancelAgreement` report on and mutate;
+//! * a **billing adjustment request** — what
+//!   `BatchCreateBillingAdjustmentRequest` submits against one invoice of an
+//!   agreement, and what `GetBillingAdjustmentRequest` and
+//!   `ListBillingAdjustmentRequests` report on.
 //!
 //! Every projection the model asks for (`DescribeAgreementOutput`,
-//! `AgreementViewSummary`, `ChargeSummary`, `AcceptedTerm`) is computed from
-//! these records, so the six implemented operations share exactly one copy of
-//! each resource.
+//! `AgreementViewSummary`, `ChargeSummary`, `AcceptedTerm`,
+//! `BillingAdjustmentSummary`) is computed from these records, so the
+//! implemented operations share exactly one copy of each resource.
 //!
 //! ## What this emulator does NOT know
 //!
@@ -32,14 +36,15 @@
 //! this emulator reports.
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AcceptedTerm, Acceptor, AgreementViewSummary, ByolPricingTerm, ChargeSummary,
-    ConfigurableUpfrontPricingTerm, ConflictException, DescribeAgreementOutput, EndTimeBehavior,
-    EstimatedCharges, ExpectedCharge, Filter, FixedUpfrontPricingTerm, FreeTrialPricingTerm,
+    AcceptedTerm, Acceptor, AgreementViewSummary, BatchCreateBillingAdjustmentRequestEntry,
+    BillingAdjustmentSummary, ByolPricingTerm, ChargeSummary, ConfigurableUpfrontPricingTerm,
+    ConflictException, DescribeAgreementOutput, EndTimeBehavior, EstimatedCharges, ExpectedCharge,
+    Filter, FixedUpfrontPricingTerm, FreeTrialPricingTerm, GetBillingAdjustmentRequestOutput,
     InternalServerException, ItemizedCharge, LegalTerm, NetPaymentTerm, PaymentScheduleTerm,
     ProposalSummary, Proposer, PurchaseOrder, RecurringPaymentTerm, RenewalTerm, RequestedTerm,
     RequestedTermConfiguration, ResourceNotFoundException, SupportTerm, TaxConfiguration,
@@ -86,6 +91,8 @@ pub const STATUS_REPLACED: &str = "REPLACED";
 pub const RESOURCE_TYPE_AGREEMENT: &str = "Agreement";
 /// See [`RESOURCE_TYPE_AGREEMENT`].
 pub const RESOURCE_TYPE_AGREEMENT_REQUEST: &str = "AgreementRequest";
+/// See [`RESOURCE_TYPE_AGREEMENT`].
+pub const RESOURCE_TYPE_BILLING_ADJUSTMENT_REQUEST: &str = "BillingAdjustmentRequest";
 
 /// The largest page the paginated operations serve, and the page they serve
 /// when the request names no `maxResults`: `MaxResults` is modelled
@@ -120,6 +127,68 @@ pub const SERVICE_CODE: &str = "aws-marketplace";
 /// terms set, which includes one carrying no pricing term at all (a legal term
 /// only): there too the total known amount the acceptor has to pay is zero.
 pub const ZERO_AGREEMENT_VALUE: &str = "0";
+
+// ---------------------------------------------------------------------------
+// Billing adjustment requests
+// ---------------------------------------------------------------------------
+
+/// `BillingAdjustmentStatus`'s values (`BILLING_ADJUSTMENT_STATUS_VALUES` in
+/// `types`), named where the billing-adjustment handlers branch on them.
+///
+/// `PENDING` is what a submitted request carries while AWS Marketplace is still
+/// processing it, `COMPLETED` once the adjustment has been applied, and
+/// `VALIDATION_FAILED` when the submitted adjustment did not pass validation —
+/// the one status `GetBillingAdjustmentRequestOutput$statusMessage` is
+/// "populated only when" ([`BILLING_ADJUSTMENT_VALIDATION_FAILED`]).
+pub const BILLING_ADJUSTMENT_PENDING: &str = "PENDING";
+/// See [`BILLING_ADJUSTMENT_PENDING`].
+pub const BILLING_ADJUSTMENT_COMPLETED: &str = "COMPLETED";
+/// See [`BILLING_ADJUSTMENT_PENDING`]. No stored request reaches this status:
+/// `BatchCreateBillingAdjustmentRequest` documents an `errors` list "for entries
+/// that failed validation", so an entry this emulator cannot accept is reported
+/// on that per-entry channel at submit time and no record is created for it. The
+/// checks AWS can only make later (against the invoice being adjusted) need the
+/// invoice, which this service neither models nor stores.
+pub const BILLING_ADJUSTMENT_VALIDATION_FAILED: &str = "VALIDATION_FAILED";
+
+/// How long a submitted billing adjustment request stays `PENDING` before the
+/// clock owes it its terminal `COMPLETED`.
+///
+/// AWS publishes no processing time for a billing adjustment, so this span is
+/// the emulator's OWN: it is non-zero, so a caller reading straight after the
+/// submit still sees the `PENDING` the submit reported, and short enough that a
+/// test can wait it out.
+pub const BILLING_ADJUSTMENT_SETTLEMENT: Duration = Duration::from_millis(500);
+
+/// How many entries one `BatchCreateBillingAdjustmentRequest` call accepts
+/// before it answers its modelled `ValidationException` with reason
+/// `BILLING_ADJUSTMENTS_LIMIT_EXCEEDED`.
+///
+/// `BatchCreateBillingAdjustmentRequestEntryList` carries no `@length`, and AWS
+/// publishes no public number, so the bound is the emulator's OWN bound on one
+/// batch rather than a claim about an account's quota: it is what stops one call
+/// growing state without end.
+pub const BILLING_ADJUSTMENT_BATCH_LIMIT: usize = 50;
+
+/// `BillingAdjustmentErrorCode`'s values (`BILLING_ADJUSTMENT_ERROR_CODE_VALUES`
+/// in `types`), as `BatchCreateBillingAdjustmentError$code` reports them for the
+/// entry that failed.
+pub const BILLING_ADJUSTMENT_ERROR_VALIDATION: &str = "VALIDATION_EXCEPTION";
+/// See [`BILLING_ADJUSTMENT_ERROR_VALIDATION`].
+pub const BILLING_ADJUSTMENT_ERROR_NOT_FOUND: &str = "RESOURCE_NOT_FOUND_EXCEPTION";
+/// See [`BILLING_ADJUSTMENT_ERROR_VALIDATION`].
+pub const BILLING_ADJUSTMENT_ERROR_CONFLICT: &str = "CONFLICT_EXCEPTION";
+
+/// Whether `amount` is the positive amount `PositiveAmountUpto8Decimals` is
+/// named for.
+///
+/// That shape's `^[0-9]*(\.[0-9]{0,8})?$` — which the boundary already enforced —
+/// also admits amounts that are not positive (`""`, `"0"`, `"0.00"`), so
+/// positivity is the one part of the constraint left for a handler: the value
+/// has to carry a non-zero digit.
+pub fn is_positive_amount(amount: &str) -> bool {
+    amount.chars().any(|digit| digit.is_ascii_digit() && digit != '0')
+}
 
 /// `Timing`'s values (`TIMING_VALUES` in `types`), with the meaning
 /// `ExpectedCharge$timing` documents: `ON_ACCEPTANCE` is "charged immediately
@@ -681,6 +750,116 @@ pub fn accepted_term_kind(term: &AcceptedTerm) -> &str {
     r#type.unwrap_or(DEFAULT_TERM_KIND)
 }
 
+/// One billing adjustment request: what `BatchCreateBillingAdjustmentRequest`
+/// stored for one entry, and the one record `GetBillingAdjustmentRequest` and
+/// `ListBillingAdjustmentRequests` report on.
+///
+/// `agreement_type` and `catalog` are read from the agreement the request
+/// adjusts rather than from the submitting call, which carries neither: a
+/// summary reports the agreement's own.
+#[derive(Debug, Clone)]
+pub struct BillingAdjustmentRequest {
+    /// `BillingAdjustmentRequestId`'s `^ba-[a-zA-Z0-9]+$`.
+    pub id: String,
+    pub agreement_id: String,
+    pub agreement_type: String,
+    pub catalog: String,
+    pub original_invoice_id: String,
+    pub adjustment_amount: String,
+    pub currency_code: String,
+    pub adjustment_reason_code: String,
+    pub description: Option<String>,
+    /// The entry's `clientToken`, which is what makes a replayed submit report
+    /// the request it already created.
+    pub client_token: String,
+    pub status: String,
+    /// "This field is populated only when the status is `VALIDATION_FAILED`."
+    pub status_message: Option<String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// When the `PENDING` this request was submitted in is due to become
+    /// `COMPLETED`: `created_at` plus [`BILLING_ADJUSTMENT_SETTLEMENT`]. Stored
+    /// rather than slept for, and read by [`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::settle_billing_adjustments`].
+    pub completes_at: SystemTime,
+}
+
+impl BillingAdjustmentRequest {
+    /// Whether this request is the one `entry` asks to create — every member the
+    /// entry carries beside its `clientToken` is the same.
+    ///
+    /// A submit replaying the same token with the same details reports this
+    /// request; one reusing it for different details is a conflict.
+    pub fn matches_entry(&self, entry: &BatchCreateBillingAdjustmentRequestEntry) -> bool {
+        self.agreement_id == entry.agreement_id
+            && self.original_invoice_id == entry.original_invoice_id
+            && self.adjustment_amount == entry.adjustment_amount
+            && self.currency_code == entry.currency_code
+            && self.adjustment_reason_code == entry.adjustment_reason_code
+            && self.description == entry.description
+    }
+
+    /// `BillingAdjustmentSummary`, as `ListBillingAdjustmentRequests` reports
+    /// this request.
+    pub fn to_summary(&self) -> BillingAdjustmentSummary {
+        BillingAdjustmentSummary {
+            billing_adjustment_request_id: self.id.clone(),
+            original_invoice_id: self.original_invoice_id.clone(),
+            adjustment_amount: self.adjustment_amount.clone(),
+            currency_code: self.currency_code.clone(),
+            status: self.status.clone(),
+            agreement_id: self.agreement_id.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
+            agreement_type: self.agreement_type.clone(),
+            catalog: self.catalog.clone(),
+        }
+    }
+
+    /// The whole request, as `GetBillingAdjustmentRequest` reports it.
+    pub fn to_detail(&self) -> GetBillingAdjustmentRequestOutput {
+        GetBillingAdjustmentRequestOutput {
+            billing_adjustment_request_id: self.id.clone(),
+            agreement_id: self.agreement_id.clone(),
+            adjustment_reason_code: self.adjustment_reason_code.clone(),
+            description: self.description.clone(),
+            original_invoice_id: self.original_invoice_id.clone(),
+            adjustment_amount: self.adjustment_amount.clone(),
+            currency_code: self.currency_code.clone(),
+            status: self.status.clone(),
+            status_message: self.status_message.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
+        }
+    }
+}
+
+/// The scope a `ListBillingAdjustmentRequests` page token belongs to: the whole
+/// query, so a token cannot resume a different listing.
+///
+/// Every part is length-prefixed by [`counted`], so no value a caller supplies
+/// can imitate the delimiters and make two different listings hash alike.
+pub fn billing_adjustment_scope(
+    agreement_id: Option<&str>,
+    status: Option<&str>,
+    catalog: Option<&str>,
+    agreement_type: Option<&str>,
+    created_after: Option<f64>,
+    created_before: Option<f64>,
+) -> String {
+    let instant = |bound: Option<f64>| {
+        counted(&bound.map(|secs| format!("{secs:?}")).unwrap_or_default())
+    };
+    format!(
+        "{}{}{}{}{}{}",
+        counted(agreement_id.unwrap_or_default()),
+        counted(status.unwrap_or_default()),
+        counted(catalog.unwrap_or_default()),
+        counted(agreement_type.unwrap_or_default()),
+        instant(created_after),
+        instant(created_before),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Search filters
 // ---------------------------------------------------------------------------
@@ -730,8 +909,15 @@ fn filter_instant(value: &str) -> Option<f64> {
         .map(|instant| instant.as_secs_f64())
 }
 
-/// Seconds since the epoch, for comparing a stored instant with a filter's.
-fn epoch_secs(instant: SystemTime) -> f64 {
+/// `<byte length>:<value>`, which no value can forge: the part every page-token
+/// scope is built from.
+fn counted(value: &str) -> String {
+    format!("{}:{value}", value.len())
+}
+
+/// Seconds since the epoch, for comparing a stored instant with a filter's or
+/// with a `createdAfter`/`createdBefore` bound.
+pub fn epoch_secs(instant: SystemTime) -> f64 {
     ::aws_smithy_types::DateTime::from(instant).as_secs_f64()
 }
 
@@ -884,11 +1070,6 @@ pub fn search_scope(
     sort_by: &str,
     sort_order: &str,
 ) -> String {
-    /// `<byte length>:<value>`, which no value can forge.
-    fn counted(value: &str) -> String {
-        format!("{}:{value}", value.len())
-    }
-
     let mut pairs: Vec<String> = filters
         .iter()
         .map(|filter| {
@@ -1167,6 +1348,17 @@ pub fn agreement_request_not_found(id: &str) -> ResourceNotFoundException {
     }
 }
 
+/// The `ResourceNotFoundException` for an agreement and billing adjustment
+/// request id pair that names no stored request.
+pub fn billing_adjustment_not_found(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        request_id: None,
+        message: Some(format!("billing adjustment request {id} not found")),
+        resource_id: Some(id.to_string()),
+        resource_type: Some(RESOURCE_TYPE_BILLING_ADJUSTMENT_REQUEST.to_string()),
+    }
+}
+
 /// A `ConflictException` for an operation the resource's current state refuses.
 pub fn conflict(resource_type: &str, id: &str, detail: impl Into<String>) -> ConflictException {
     ConflictException {
@@ -1216,6 +1408,11 @@ pub struct ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     /// `SearchAgreements` a stable total order to page over: ids are minted from
     /// a zero-padded counter, so they sort in creation order.
     pub agreements: BTreeMap<String, Agreement>,
+    /// Every billing adjustment request, keyed by its `^ba-[a-zA-Z0-9]+$` id.
+    /// A `BTreeMap` is what gives `ListBillingAdjustmentRequests` a stable total
+    /// order to page over: ids are minted from a zero-padded counter, so they
+    /// sort in creation order.
+    pub billing_adjustment_requests: BTreeMap<String, BillingAdjustmentRequest>,
     /// A `CreateAgreementRequest` `clientToken` to the agreement request it
     /// created, so a replayed create answers with the first request's id
     /// instead of minting a second quote.
@@ -1249,6 +1446,47 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
             let id = format!("agmt-{:016x}", self.next_sequence());
             if !self.agreements.contains_key(&id) {
                 return id;
+            }
+        }
+    }
+
+    /// Mint an unused billing adjustment request id matching
+    /// `BillingAdjustmentRequestId`'s `^ba-[a-zA-Z0-9]+$`.
+    pub fn mint_billing_adjustment_request_id(&mut self) -> String {
+        loop {
+            let id = format!("ba-{:016x}", self.next_sequence());
+            if !self.billing_adjustment_requests.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// The stored billing adjustment request submitted under `token`, if any.
+    ///
+    /// The token is held on the request itself rather than in a second index, so
+    /// there is exactly one copy of each request to read.
+    pub fn billing_adjustment_by_client_token(
+        &self,
+        token: &str,
+    ) -> Option<&BillingAdjustmentRequest> {
+        self.billing_adjustment_requests
+            .values()
+            .find(|request| request.client_token == token)
+    }
+
+    /// Materialise every billing adjustment status change the clock has already
+    /// made due by `now`.
+    ///
+    /// A request is submitted `PENDING` and AWS Marketplace processes it; the
+    /// processing is owed at `completes_at` whether or not anybody calls, so a
+    /// reporting operation materialises it before it reports. `updated_at`
+    /// becomes the instant the change was DUE, never the instant it was
+    /// observed, so repeated reads report the same value.
+    pub fn settle_billing_adjustments(&mut self, now: SystemTime) {
+        for request in self.billing_adjustment_requests.values_mut() {
+            if request.status == BILLING_ADJUSTMENT_PENDING && now >= request.completes_at {
+                request.status = BILLING_ADJUSTMENT_COMPLETED.to_string();
+                request.updated_at = request.completes_at;
             }
         }
     }

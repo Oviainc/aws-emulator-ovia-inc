@@ -34,6 +34,17 @@ pub const DOMAIN_STATUS_DELETING: &str = "DELETING";
 /// `com.amazonaws.datazone#ProjectStatus`: ACTIVE | DELETING | UPDATING | DELETE_FAILED).
 pub const PROJECT_STATUS_ACTIVE: &str = "ACTIVE";
 
+/// The one `UserDesignation` that points at a designation the caller created, rather
+/// than naming a role the service defines (model enum
+/// `com.amazonaws.datazone#UserDesignation`: PROJECT_OWNER | PROJECT_CONTRIBUTOR |
+/// PROJECT_CATALOG_VIEWER | PROJECT_CATALOG_CONSUMER | PROJECT_CATALOG_STEWARD |
+/// USER_CREATED_DESIGNATION).
+pub const DESIGNATION_USER_CREATED: &str = "USER_CREATED_DESIGNATION";
+
+/// The `SortOrder` that reverses a listing (model enum
+/// `com.amazonaws.datazone#SortOrder`: ASCENDING | DESCENDING).
+pub const SORT_ORDER_DESCENDING: &str = "DESCENDING";
+
 /// The `DomainVersion` a domain gets when the request names none (model enum
 /// `com.amazonaws.datazone#DomainVersion`: V1 | V2).
 pub const DEFAULT_DOMAIN_VERSION: &str = "V1";
@@ -145,6 +156,176 @@ pub struct Project {
     /// `ResourceTag`, so the key order is kept stable by storing it sorted.
     pub resource_tags: BTreeMap<String, String>,
     pub project_category: Option<String>,
+    /// This project's members, keyed by [`membership_key`] so one principal holds at
+    /// most one designation in the project and every listing iterates in one stable
+    /// order — the member identifier's. Bounded by [`MAX_MEMBERSHIPS_PER_PROJECT`].
+    ///
+    /// Nested in the project, so the memberships go with it when the project (or the
+    /// domain above it) is deleted.
+    pub memberships: BTreeMap<String, Membership>,
+}
+
+/// Whether a membership names a user or a group: the two arms of the modelled
+/// `Member` and `MemberDetails` unions (smithy_query shape="Member,MemberDetails").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MemberKind {
+    Group,
+    User,
+}
+
+impl MemberKind {
+    /// This arm's tag, as it is spelled inside a stored membership key.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Group => "group",
+            Self::User => "user",
+        }
+    }
+
+    /// The `Member` union member a request names this arm with, for a refusal message
+    /// that names the input member the caller has to fix.
+    pub const fn request_member(self) -> &'static str {
+        match self {
+            Self::Group => "member.groupIdentifier",
+            Self::User => "member.userIdentifier",
+        }
+    }
+}
+
+/// One stored project membership: which principal holds which designation.
+///
+/// `ProjectMember` carries no timestamp (smithy_query shape="ProjectMember"), so a
+/// membership stores nothing beyond what a listing reports.
+#[derive(Debug, Clone)]
+pub struct Membership {
+    pub kind: MemberKind,
+    pub identifier: String,
+    pub designation: String,
+}
+
+/// The separator between a member's identifier and its kind inside a membership key.
+///
+/// A control character, so the key orders by the identifier FIRST — the only name this
+/// emulator holds for a member, and so the order `sortBy=NAME` asks for — while still
+/// telling a user apart from a group that happens to share its identifier.
+const MEMBERSHIP_KEY_SEPARATOR: char = '\u{1}';
+
+/// The key one membership is stored under.
+///
+/// Injective in `(identifier, kind)`: the kind tag is always last and the two tags are
+/// distinct, so no two different members can key to the same string.
+pub fn membership_key(kind: MemberKind, identifier: &str) -> String {
+    format!("{identifier}{MEMBERSHIP_KEY_SEPARATOR}{}", kind.tag())
+}
+
+/// The principal a `Member` union value names.
+pub fn member_ref(member: &crate::ops::types::Member) -> (MemberKind, &str) {
+    match member {
+        crate::ops::types::Member::userIdentifier(id) => (MemberKind::User, id.as_str()),
+        crate::ops::types::Member::groupIdentifier(id) => (MemberKind::Group, id.as_str()),
+    }
+}
+
+/// Resolve the principal a membership names against the profiles its domain holds,
+/// answering the refusal message when the domain holds none for it.
+///
+/// A GROUP member must already have a group profile in the domain: the service
+/// resolves the profile and refuses the membership when the domain holds none, because
+/// a group profile is only created implicitly for a domain that manages its own
+/// identities. Group profiles are created by `CreateGroupProfile`, which is still a
+/// scaffold here, so a domain holds none and the refusal is the only reachable branch —
+/// the honest answer rather than a membership for a principal the domain does not
+/// know. A USER needs no profile up front: the service creates one implicitly for the
+/// principal the membership names.
+pub fn resolve_membership_principal(
+    kind: MemberKind,
+    identifier: &str,
+    domain_id: &str,
+) -> Result<(), String> {
+    if kind == MemberKind::Group {
+        return Err(format!(
+            "Group profile '{identifier}' not found for domain '{domain_id}', profile creation is only valid for implicit domain"
+        ));
+    }
+    Ok(())
+}
+
+/// Why a requested membership cannot be stored.
+#[derive(Debug)]
+pub enum MembershipRefusal {
+    /// The request breaks a rule the model documents; the string is the refusal
+    /// message, naming the member and the constraint. Answer it with the operation's
+    /// own `ValidationException`.
+    Invalid(String),
+    /// The membership names a principal the domain holds no profile for; the string is
+    /// the refusal message. Answer it with the operation's own
+    /// `ResourceNotFoundException`.
+    ProfileNotFound(String),
+    /// The membership names a resource this emulator does not serve yet; the string
+    /// says which. Answer it with the scaffold's 501, never by storing something else.
+    Unserved(String),
+}
+
+/// Validate one requested membership and turn it into the key and record to store.
+///
+/// Shared by `CreateProjectMembership` and by `CreateProject`'s
+/// `membershipAssignments`, which carry the same three members and the same rules.
+pub fn membership_from_request(
+    member: &crate::ops::types::Member,
+    designation: &str,
+    user_created_designation_id: Option<&str>,
+    domain_id: &str,
+) -> Result<(String, Membership), MembershipRefusal> {
+    let (kind, identifier) = member_ref(member);
+    // The union's arms target plain `String`, so the boundary validator accepts an
+    // empty one; a membership for no principal at all is a bad request.
+    if identifier.is_empty() {
+        return Err(MembershipRefusal::Invalid(format!(
+            "{} must name a {}, but it is empty",
+            kind.request_member(),
+            kind.tag()
+        )));
+    }
+    // The principal must be one the domain can hold a membership for.
+    resolve_membership_principal(kind, identifier, domain_id)
+        .map_err(MembershipRefusal::ProfileNotFound)?;
+    // `userCreatedDesignationId` is documented as "Required when designation is
+    // USER_CREATED_DESIGNATION; must not be provided otherwise" (smithy_query
+    // query="doc" shape="CreateProjectMembershipInput"
+    // member="userCreatedDesignationId", and the same sentence on
+    // `ProjectMembershipAssignment`).
+    match (
+        designation == DESIGNATION_USER_CREATED,
+        user_created_designation_id,
+    ) {
+        (true, None) => {
+            return Err(MembershipRefusal::Invalid(format!(
+                "userCreatedDesignationId is required when designation is {DESIGNATION_USER_CREATED}"
+            )))
+        }
+        (false, Some(id)) => {
+            return Err(MembershipRefusal::Invalid(format!(
+                "userCreatedDesignationId {id} must not be provided when designation is {designation}"
+            )))
+        }
+        // The id names a designation resource, which only `CreateDesignation` can
+        // make and that operation is still a scaffold — so no such designation can
+        // exist here, and accepting the membership would claim one does.
+        (true, Some(_)) => {
+            return Err(MembershipRefusal::Unserved(format!(
+                "designation {DESIGNATION_USER_CREATED}, which names a designation resource (CreateDesignation)"
+            )))
+        }
+        (false, None) => {}
+    }
+    Ok((
+        membership_key(kind, identifier),
+        Membership {
+            kind,
+            identifier: identifier.to_string(),
+            designation: designation.to_string(),
+        },
+    ))
 }
 
 /// One stored DataZone asset type, at one revision.
@@ -191,6 +372,13 @@ pub const MAX_DOMAINS: usize = 100;
 /// The most projects this emulator stores in one domain, for the same reason and with
 /// the same refusal (`CreateProject` models `ServiceQuotaExceededException` too).
 pub const MAX_PROJECTS_PER_DOMAIN: usize = 500;
+
+/// The most members this emulator stores in one project, for the same reason: a
+/// ceiling so an add loop cannot grow the store without bound. The refusal is each
+/// operation's own — `ServiceQuotaExceededException` where it is modelled
+/// (`CreateProject`), `ValidationException` where it is not
+/// (`CreateProjectMembership`).
+pub const MAX_MEMBERSHIPS_PER_PROJECT: usize = 200;
 
 /// The most business glossaries this emulator stores in one domain, for the same reason
 /// and with the same refusal (`CreateGlossary` models `ServiceQuotaExceededException`).

@@ -241,6 +241,18 @@ impl StoredJob {
     }
 }
 
+/// The region this request was signed for: the SigV4 credential scope is the only region
+/// a request carries.
+///
+/// An empty string when the request carries no scope to read a region from — a request
+/// this emulator cannot place in any Region, which `CreateAddress` treats as a Region
+/// with no recorded shipping area rather than as an unserviceable one.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .unwrap_or_default()
+}
+
 /// Mint an id in the `<prefix><8-4-4-4-12 lowercase hex>` form this service's modelled
 /// id patterns admit.
 ///

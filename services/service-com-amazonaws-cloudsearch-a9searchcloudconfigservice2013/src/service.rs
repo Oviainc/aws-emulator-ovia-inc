@@ -96,17 +96,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        match refusal {
+            // The framework refused a value against a rule the model declares (an
+            // absent required member, a length or pattern violation on `DomainName`
+            // or `IndexFieldName`). This service MODELS that refusal: every operation
+            // that takes caller input lists `ValidationException` (HTTP 400), and the
+            // shape carries no `awsQueryError` trait, so its wire code is the shape
+            // name. The query family's default wording answers `ValidationError`
+            // instead, which is a code no CloudSearch client branches on — so both the
+            // code and the message are replaced here, the message keeping the
+            // framework's own violation envelope so it still names the member and the
+            // constraint it failed.
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "ValidationException".to_string(),
+                message: aws_smithy_schema_server::envelope(violations)
+                    .unwrap_or_else(|| "invalid request".to_string()),
+            }),
+            // Authentication is the framework's answer to give, not this service's.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

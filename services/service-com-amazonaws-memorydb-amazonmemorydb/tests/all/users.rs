@@ -21,11 +21,12 @@
 //! * the listing pages over its whole set in name order for any `MaxResults`;
 //! * a describe is a REPORT: two identical calls answer identically.
 //!
-//! `CreateUser` is still a scaffold
-//! (`issues/things-that-do-not-work/20261022T040935Z-memorydb-createuser-stub.md`), so
-//! the only way to put more than the built-in user in the store is to write it into
-//! the same store the handler reads. That is SETUP only: every assertion below is made
-//! on a response that came back over the wire.
+//! `CreateUser` cannot produce a user in `modifying` or `deleting` status (only
+//! `UpdateUser`/`DeleteUser`, still scaffolds, move a user off `active`), so the rows
+//! covering the whole `User$Status` and `AuthenticationType` catalogs are written
+//! straight into the same store the handler reads. That is SETUP only: every assertion
+//! below is made on a response that came back over the wire, and the create path itself
+//! is driven end-to-end in `tests/all/user_lifecycle.rs`.
 
 use std::sync::Arc;
 
@@ -106,8 +107,8 @@ impl Harness {
             .collect()
     }
 
-    /// Write a user into the shared store — the setup `CreateUser` will take over once
-    /// it is implemented. The handler reads THIS store; nothing here is asserted.
+    /// Write a user into the shared store, for the statuses no create can produce.
+    /// The handler reads THIS store; nothing here is asserted.
     fn seed_user(&self, user: &Seeded) {
         self.engine
             .state::<ComAmazonawsMemorydbAmazonmemorydbState>()

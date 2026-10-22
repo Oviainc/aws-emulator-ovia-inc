@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RunInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RunInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RunInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints `MaxCount` instances in one fresh reservation, stores them in
+//! [`crate::state`], and reports them back. Every instance starts in `pending` with
+//! the `running` transition the clock owes it recorded, so a caller that describes it
+//! immediately still sees `pending`.
+//!
+//! A repeat of the same request under one `ClientToken` returns the reservation that
+//! token already minted instead of launching again. A `LaunchTemplate` is answered
+//! with a 501: it names a resource no implemented operation creates, so there is
+//! nothing to resolve the launch parameters against.
 //!
 //! ## Shape of an operation
 //!
@@ -314,18 +315,361 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RunInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RunInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RunInstances"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            architecture_for, availability_zones_in_region, private_dns_name, request_region,
+            require_service_state, validate_tag_size, InstanceRecord, InstanceStateName,
+            PendingTransition, ReservationRecord, DEFAULT_INSTANCE_TYPE, MAX_INSTANCES_PER_RUN,
+            MAX_SECURITY_GROUPS_PER_INSTANCE, MAX_STORED_BYTES, MAX_STORED_INSTANCES,
+            MAX_USER_DATA_BYTES, RUN_INSTANCES_TAGGABLE_RESOURCES,
+        };
+
+        // A launch template carries the launch parameters this handler would have to
+        // resolve, and no operation that creates one is implemented yet, so there is
+        // nothing to resolve them against.
+        if input.launch_template.is_some() {
+            return Err(Scaffolded::not_implemented(
+                "RunInstances with a LaunchTemplate",
+            ));
+        }
+        // Network interfaces are a resource this slice does not model, and these
+        // members CONTRADICT ones it does: a launch that names its subnet, groups or
+        // private address only through an interface specification must not be
+        // answered with an instance that sits somewhere else. Refused rather than
+        // accepted and discarded.
+        if input
+            .network_interfaces
+            .as_ref()
+            .is_some_and(|interfaces| !interfaces.is_empty())
+            || input
+                .secondary_interfaces
+                .as_ref()
+                .is_some_and(|interfaces| !interfaces.is_empty())
+        {
+            return Err(Scaffolded::not_implemented(
+                "RunInstances with a network interface specification",
+            ));
+        }
+        // Same: an IPv6 address comes from the subnet's IPv6 range, which is not
+        // modelled, so an instance could not report the address this asks for.
+        if input
+            .ipv6_addresses
+            .as_ref()
+            .is_some_and(|addresses| !addresses.is_empty())
+            || input.ipv6_address_count.is_some_and(|count| count > 0)
+        {
+            return Err(Scaffolded::not_implemented(
+                "RunInstances with IPv6 addresses",
+            ));
+        }
+
+        let Some(image_id) = input.image_id.clone() else {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter ImageId",
+            ));
+        };
+        if input.min_count < 1 {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for minCount. Minimum count must be at least 1",
+                input.min_count
+            )));
+        }
+        if input.max_count < input.min_count {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for maxCount. \
+                 MaxCount must be greater than or equal to MinCount",
+                input.max_count
+            )));
+        }
+        if input.private_ip_address.is_some() && input.max_count > 1 {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "PrivateIpAddress cannot be specified when launching more than one instance",
+            ));
+        }
+        // `PrivateIpAddress` is a plain String in the model, so the handler is what
+        // refuses a value that is not an IPv4 address at all.
+        if let Some(address) = input.private_ip_address.as_deref() {
+            if address.parse::<::std::net::Ipv4Addr>().is_err() {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{address}' for privateIpAddress. \
+                     It must be an IPv4 address"
+                )));
+            }
+        }
+        // `MaxCount` arrives as a plain `i32` with no modelled `@range`, so this is
+        // the only place a ceiling can exist. It must dominate the minting loop
+        // below: without it one request could ask for `i32::MAX` records and stall
+        // or exhaust the process.
+        if input.max_count > MAX_INSTANCES_PER_RUN {
+            return Err(Scaffolded::instance_limit_exceeded(format!(
+                "You requested {} instances, above the {MAX_INSTANCES_PER_RUN} \
+                 this account may launch in one request",
+                input.max_count
+            )));
+        }
+        for specification in input.tag_specifications.iter().flatten() {
+            if let Some(resource_type) = specification.resource_type.as_deref() {
+                if !RUN_INSTANCES_TAGGABLE_RESOURCES.contains(&resource_type) {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "'{resource_type}' is not a valid resource type for a \
+                         RunInstances tag specification"
+                    )));
+                }
+                // The member documents four resource types; only the instance is a
+                // resource this slice stores, so tags for the other three could
+                // never be read back. Refused rather than accepted and discarded.
+                if resource_type != "instance" {
+                    return Err(Scaffolded::not_implemented(&format!(
+                        "RunInstances tagging a '{resource_type}' on launch"
+                    )));
+                }
+            }
+            for tag in specification.tags.iter().flatten() {
+                validate_tag_size(
+                    tag.key.as_deref().unwrap_or_default(),
+                    tag.value.as_deref().unwrap_or_default(),
+                )?;
+            }
+        }
+        // Each member below is CLONED into every instance the request mints, so a
+        // count ceiling on `MaxCount` alone does not bound the BYTES one request can
+        // retain: each needs a size bound of its own.
+        if input
+            .user_data
+            .as_ref()
+            .is_some_and(|user_data| user_data.len() > MAX_USER_DATA_BYTES)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "User data accepts at most {MAX_USER_DATA_BYTES} bytes"
+            )));
+        }
+        let named_groups = input.security_group_ids.as_ref().map_or(0, Vec::len)
+            + input.security_groups.as_ref().map_or(0, Vec::len);
+        if named_groups > MAX_SECURITY_GROUPS_PER_INSTANCE {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "An instance may be launched with at most \
+                 {MAX_SECURITY_GROUPS_PER_INSTANCE} security groups, not {named_groups}"
+            )));
+        }
+
+        let region = request_region(ctx.parts());
+        // The zone an instance launches into must be one the Region has, and the
+        // naming rule for those zones lives in one place: `availability_zones_in_region`.
+        let zones = availability_zones_in_region(&region);
+        let availability_zone = match input
+            .placement
+            .as_ref()
+            .and_then(|placement| placement.availability_zone.clone())
+        {
+            Some(requested) => {
+                if !zones.iter().any(|zone| zone.zone_name == requested) {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{requested}' for availabilityZone. \
+                         Region '{region}' has no such Availability Zone"
+                    )));
+                }
+                requested
+            }
+            // AWS picks a zone when the launch names none; the first of the
+            // Region's is as good a choice as any and is stable per Region.
+            None => zones
+                .first()
+                .map(|zone| zone.zone_name.clone())
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "region '{region}' reports no Availability Zone"
+                    ))
+                })?,
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        store.materialize_due_transitions();
+
+        // Idempotency: one ClientToken names the one reservation it minted. Looked up
+        // here, answered below the DryRun check, because a replay stores nothing and
+        // so passes the ceilings a fresh launch has to clear.
+        let replayed = match input.client_token.as_deref() {
+            Some(token) => store.client_tokens.get(token).cloned(),
+            None => None,
+        };
+
+        let instance_type = input
+            .instance_type
+            .clone()
+            .unwrap_or_else(|| DEFAULT_INSTANCE_TYPE.to_string());
+        let monitoring_state = if input
+            .monitoring
+            .as_ref()
+            .is_some_and(|monitoring| monitoring.enabled)
+        {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        let security_groups: Vec<(Option<String>, Option<String>)> = input
+            .security_group_ids
+            .iter()
+            .flatten()
+            .map(|group_id| (Some(group_id.clone()), None))
+            .chain(
+                input
+                    .security_groups
+                    .iter()
+                    .flatten()
+                    .map(|group_name| (None, Some(group_name.clone()))),
+            )
+            .collect();
+        let mut tags = ::std::collections::BTreeMap::new();
+        for specification in input.tag_specifications.iter().flatten() {
+            if specification.resource_type.as_deref() != Some("instance") {
+                continue;
+            }
+            for tag in specification.tags.iter().flatten() {
+                let Some(key) = tag.key.clone() else { continue };
+                tags.insert(key, tag.value.clone().unwrap_or_default());
+            }
+        }
+
+        // Each instance retains a copy of the request's user data, tags and security
+        // groups, so the launch has a byte size as well as a count.
+        let requested = usize::try_from(input.max_count).unwrap_or(usize::MAX);
+        let per_instance_bytes = input.user_data.as_ref().map_or(0, String::len)
+            + input.client_token.as_ref().map_or(0, String::len)
+            + crate::state::tag_bytes(&tags)
+            + security_groups
+                .iter()
+                .map(|(group_id, group_name)| {
+                    group_id.as_ref().map_or(0, String::len)
+                        + group_name.as_ref().map_or(0, String::len)
+                })
+                .sum::<usize>();
+        let batch_bytes = per_instance_bytes.saturating_mul(requested);
+
+        // Every remaining check is READ-ONLY, and a replay clears them all by
+        // storing nothing.
+        if replayed.is_none() {
+            // The store keeps a terminated instance (the real service reports it for
+            // a while), so its growth is bounded here rather than by anything the
+            // clock reclaims.
+            if store.instances.len().saturating_add(requested) > MAX_STORED_INSTANCES {
+                return Err(Scaffolded::instance_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_INSTANCES} instances, \
+                     so it cannot launch {requested} more",
+                    store.instances.len()
+                )));
+            }
+            if store.would_exceed_stored_bytes(batch_bytes) {
+                return Err(Scaffolded::instance_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                     caller-supplied instance data, so it cannot store {batch_bytes} more",
+                    store.stored_bytes()
+                )));
+            }
+            // An explicit primary private address must be free: EC2 refuses a second
+            // launch onto an address another instance already holds.
+            if let Some(address) = input.private_ip_address.as_deref() {
+                if store.private_ip_in_use(address) {
+                    return Err(Scaffolded::invalid_ip_address_in_use(address));
+                }
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every read-only
+        // check made, and BEFORE the first write: the flag asks whether the request
+        // WOULD have worked, so one that would have been refused is refused with that
+        // reason instead, and one that would have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        if let Some(reservation_id) = replayed {
+            return store.whole_reservation_view(&reservation_id).ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "a client token names reservation '{reservation_id}', \
+                     which is not stored"
+                ))
+            });
+        }
+
+        // Every address is taken BEFORE the reservation is stored, so a launch that
+        // cannot be given one leaves no partial reservation behind — and the
+        // addresses it did take go straight back to the pool.
+        let mut addresses: Vec<String> = Vec::new();
+        let mut exhausted = false;
+        for _ in 0..input.max_count {
+            match input.private_ip_address.clone() {
+                Some(address) => addresses.push(address),
+                None => match store.allocate_private_ip() {
+                    Some(address) => addresses.push(address),
+                    None => {
+                        exhausted = true;
+                        break;
+                    }
+                },
+            }
+        }
+        if exhausted {
+            for address in &addresses {
+                store.release_private_ip(address);
+            }
+            return Err(Scaffolded::insufficient_free_addresses());
+        }
+
+        let reservation_id = store.mint_reservation_id();
+        store.insert_reservation(ReservationRecord {
+            reservation_id: reservation_id.clone(),
+            owner_id: ::engine::emulator_account_id().to_string(),
+            requester_id: None,
+            instance_ids: Vec::new(),
+        });
+
+        let launch_time = ::std::time::SystemTime::now();
+        for (launch_index, private_ip) in addresses.into_iter().enumerate() {
+            let instance_id = store.mint_instance_id();
+            store.insert_instance(InstanceRecord {
+                instance_id,
+                reservation_id: reservation_id.clone(),
+                image_id: Some(image_id.clone()),
+                instance_type: instance_type.clone(),
+                key_name: input.key_name.clone(),
+                subnet_id: input.subnet_id.clone(),
+                security_groups: security_groups.clone(),
+                private_dns_name: private_dns_name(&private_ip, &region),
+                private_ip,
+                // A public address comes from a default-VPC subnet or an Elastic
+                // IP, neither of which is modelled yet.
+                public_ip: None,
+                state: InstanceStateName::Pending,
+                pending_transition: Some(PendingTransition::starting_now(
+                    InstanceStateName::Running,
+                )),
+                state_transition_reason: None,
+                state_reason: None,
+                launch_time,
+                ami_launch_index: i32::try_from(launch_index).unwrap_or(i32::MAX),
+                user_data: input.user_data.clone(),
+                placement_az: availability_zone.clone(),
+                monitoring_state: monitoring_state.to_string(),
+                architecture: architecture_for(&instance_type),
+                ebs_optimized: input.ebs_optimized.unwrap_or(false),
+                hibernation_configured: input
+                    .hibernation_options
+                    .as_ref()
+                    .and_then(|options| options.configured)
+                    .unwrap_or(false),
+                disable_api_termination: input.disable_api_termination.unwrap_or(false),
+                tags: tags.clone(),
+                client_token: input.client_token.clone(),
+            });
+        }
+
+        if let Some(token) = input.client_token.clone() {
+            store.client_tokens.insert(token, reservation_id.clone());
+        }
+
+        store
+            .whole_reservation_view(&reservation_id)
+            .ok_or_else(|| Scaffolded::internal_error("the launched reservation was not stored"))
     }
 }

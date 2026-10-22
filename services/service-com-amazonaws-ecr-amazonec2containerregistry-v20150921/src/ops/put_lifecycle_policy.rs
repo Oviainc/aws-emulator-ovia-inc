@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutLifecyclePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutLifecyclePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates or replaces a repository's lifecycle policy: the document is validated
+//! against the ECR lifecycle policy template, then stored verbatim on the repository, so
+//! `GetLifecyclePolicy` reports exactly the text that was put.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutLifecyclePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A caller that only reads the policy back gets exactly this text; nothing here
+//! evaluates the policy or expires an image, so `lastEvaluatedAt` stays absent until
+//! something actually runs it.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +119,23 @@ impl From<PutLifecyclePolicyErrorModeled> for PutLifecyclePolicyError {
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors.
+fn fault_error(fault: crate::state::Fault) -> PutLifecyclePolicyErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            PutLifecyclePolicyErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException { message },
+            )
+        }
+        // Neither `ImageNotFound` nor `LifecyclePolicyNotFound` can arise here: a put
+        // resolves no image and needs no policy to already be in place.
+        _ => PutLifecyclePolicyErrorModeled::InvalidParameterException(
+            InvalidParameterException { message },
+        ),
+    }
+}
+
 /// The `PutLifecyclePolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -157,18 +172,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutLifecyclePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutLifecyclePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutLifecyclePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutLifecyclePolicyErrorModeled::ServerException(ServerException {
+                    message: Some("the ecr repository store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        let _ = ctx;
+
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+        // The document's own schema is a parameter constraint, so it is checked before
+        // the repository is resolved: a malformed policy is a bad request whichever
+        // repository it names. The check is `parse_lifecycle_policy`, the same reading of
+        // the document `StartLifecyclePolicyPreview` evaluates, so the two operations
+        // cannot disagree about which documents a policy may be; the parsed rules are not
+        // needed here, because what is stored is the document itself.
+        crate::state::parse_lifecycle_policy(&input.lifecycle_policy_text)
+            .map_err(fault_error)?;
+
+        let mut store = state.lock();
+        let repo = store
+            .repository_mut(&input.repository_name)
+            .map_err(fault_error)?;
+
+        // A put REPLACES the policy, and the text is stored VERBATIM: `GetLifecyclePolicy`
+        // reports "The JSON lifecycle policy text", so re-rendering the parsed document
+        // would make the read differ from the write over nothing but formatting.
+        // `insert` answers the document just written, which is what the response reports.
+        let written = repo
+            .lifecycle_policy
+            .insert(input.lifecycle_policy_text)
+            .clone();
+
+        Ok(PutLifecyclePolicyOutput {
+            registry_id: Some(repo.registry_id.clone()),
+            repository_name: Some(repo.name.clone()),
+            lifecycle_policy_text: Some(written),
+        })
     }
 }

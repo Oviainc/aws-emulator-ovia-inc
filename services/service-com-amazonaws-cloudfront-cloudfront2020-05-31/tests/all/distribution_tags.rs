@@ -24,8 +24,11 @@
 //! configuration table) is the lifecycle suite's, reused rather than copied.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
-use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::MAX_TAGS_PER_RESOURCE;
+use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
+    MAX_TAGS_PER_RESOURCE, PROPAGATION_DELAY,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{
@@ -475,6 +478,9 @@ async fn tags_are_read_from_the_resource_record() {
         "case deleted: expected the created distribution to carry its one tag, got {before:?}"
     );
 
+    // The distribution was created disabled, and a delete lands only once that
+    // configuration has also finished propagating, so the clock is given its span first.
+    tokio::time::sleep(PROPAGATION_DELAY + Duration::from_millis(250)).await;
     let deleted = delete_distribution(&router, &id, Some(&etag)).await;
     assert_eq!(
         deleted.status, 204,
@@ -578,13 +584,16 @@ async fn a_tag_set_no_resource_can_carry_is_refused_and_creates_nothing() {
 
 /// The create refusals are the SAME ones `CreateDistribution` answers, because both
 /// operations run the same create: a caller reference already associated with a
-/// distribution, and a list wrapper whose `Quantity` disagrees with its `Items`.
+/// distribution carrying a DIFFERENT configuration, and a list wrapper whose `Quantity`
+/// disagrees with its `Items`.
 #[tokio::test]
 async fn create_with_tags_runs_the_same_create_refusals() {
     let router = emulator();
 
     // A caller reference names at most one distribution, whichever create claimed it
-    // first — so each direction of the pair is a row.
+    // first — so each direction of the pair is a row. The second create of each pair
+    // carries a different configuration under that reference, which is what makes it a
+    // second distribution rather than the same request again.
     let first = config("shared-reference", "ref-shared-one");
     let plain = create_distribution(&router, &first.xml()).await;
     assert_eq!(
@@ -592,7 +601,12 @@ async fn create_with_tags_runs_the_same_create_refusals() {
         "case plain-then-with-tags: expected the first create to answer 201, got {} ({})",
         plain.status, plain.raw
     );
-    let conflict = create_distribution_with_tags(&router, &first, Some(&[tag("k", Some("v"))])).await;
+    let first_changed = Config {
+        comment: "a different configuration".to_string(),
+        ..first.clone()
+    };
+    let conflict =
+        create_distribution_with_tags(&router, &first_changed, Some(&[tag("k", Some("v"))])).await;
     assert_eq!(
         conflict.status, 409,
         "case plain-then-with-tags: expected 409, got {} ({})",
@@ -612,7 +626,11 @@ async fn create_with_tags_runs_the_same_create_refusals() {
         "case with-tags-then-plain: expected the first create to answer 201, got {} ({})",
         tagged.status, tagged.raw
     );
-    let reverse = create_distribution(&router, &second.xml()).await;
+    let second_changed = Config {
+        enabled: !second.enabled,
+        ..second.clone()
+    };
+    let reverse = create_distribution(&router, &second_changed.xml()).await;
     assert_eq!(
         reverse.status, 409,
         "case with-tags-then-plain: expected 409, got {} ({})",
@@ -623,6 +641,22 @@ async fn create_with_tags_runs_the_same_create_refusals() {
         "DistributionAlreadyExists",
         "case with-tags-then-plain: expected DistributionAlreadyExists, got {:?}",
         reverse.error_code()
+    );
+
+    // And the other half of that rule holds across the two operations as well: the SAME
+    // configuration under a reference already in use is the same request again, answered
+    // with the distribution that reference already names.
+    let repeat = create_distribution_with_tags(&router, &first, Some(&[tag("k", Some("v"))])).await;
+    assert_eq!(
+        repeat.status, 201,
+        "case repeat-with-tags: expected 201 for the same create again, got {} ({})",
+        repeat.status, repeat.raw
+    );
+    assert_eq!(
+        repeat.root().text_at("Id"),
+        plain.root().text_at("Id"),
+        "case repeat-with-tags: expected the distribution the first create made, got {:?}",
+        repeat.root().text_at("Id")
     );
 
     // Every CloudFront list travels in a wrapper that states its own length, and a

@@ -165,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => {
                 let akid = ::engine::extract_akid(&ctx.parts().headers);
                 match store.access_keys.get(&akid) {
-                    Some(key) => key.clone(),
+                    Some(record) => record.user_key.clone(),
                     None => {
                         // `GetUser` models only `NoSuchEntityException` and
                         // `ServiceFailureException`

@@ -3,14 +3,16 @@
 //! Engine state for the com-amazonaws-licensemanagerlinuxsubscriptions-licensemanagerlinuxsubscriptions service.
 //!
 //! One store holds every resource this service's operations share: the registered
-//! third-party subscription providers and the per-account Linux subscriptions service
-//! settings. The lookup / list / pagination helpers live here too, so the operation
-//! handlers in `ops/` all resolve a resource the same way instead of each growing its
-//! own copy.
+//! third-party subscription providers, the per-account Linux subscriptions service
+//! settings and the instances Linux subscription discovery has found. The lookup / list
+//! / filter / pagination helpers live here too, so the operation handlers in `ops/` all
+//! resolve a resource the same way instead of each growing its own copy.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use crate::ops::types::{LinuxSubscriptionsDiscoverySettings, RegisteredSubscriptionProvider};
+use crate::ops::types::{
+    Filter, LinuxSubscriptionsDiscoverySettings, RegisteredSubscriptionProvider, OPERATOR_VALUES,
+};
 
 /// `SubscriptionProviderStatus` for a provider whose access token License Manager holds
 /// and accepted (`SubscriptionProviderStatus`: ACTIVE | INVALID | PENDING).
@@ -57,6 +59,74 @@ pub struct SubscriptionProviderRecord {
     pub tags: HashMap<String, String>,
 }
 
+/// The `Status` of a discovered instance that is running, and so counts towards its
+/// subscription's `InstanceCount` (`Subscription$InstanceCount`: "The total amount of
+/// running instances using this subscription"). The member carries the EC2 instance
+/// state name, which is `running` for an instance that is up.
+pub const INSTANCE_STATUS_RUNNING: &str = "running";
+
+/// One instance Linux subscription discovery has found, with the subscription it uses.
+///
+/// Discovery reads the account's EC2 inventory in the configured source Regions; nothing
+/// in THIS service's API registers an instance, so the store below is written only by a
+/// discovery. Both `ListLinuxSubscriptionInstances` (which reports these records) and
+/// `ListLinuxSubscriptions` (which aggregates them into subscriptions) project it, so
+/// the two lists can never disagree about what was discovered.
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveredInstanceRecord {
+    /// `Instance$InstanceID` — the instance id, and the key of `discovered_instances`.
+    pub instance_id: String,
+    /// `Instance$AccountID` — the account that owns the instance.
+    pub account_id: String,
+    /// `Instance$AmiId` — the AMI the instance was launched from.
+    pub ami_id: String,
+    /// `Instance$InstanceType`.
+    pub instance_type: String,
+    /// `Instance$Status` — the instance state; [`INSTANCE_STATUS_RUNNING`] is what makes
+    /// the instance count towards its subscription.
+    pub status: String,
+    /// `Instance$Region` — the Region the instance runs in.
+    pub region: String,
+    /// `Instance$UsageOperation` — the billing usage operation the instance reports.
+    pub usage_operation: String,
+    /// `Instance$ProductCode` — the product codes on the instance's AMI.
+    pub product_codes: Vec<String>,
+    /// `Instance$LastUpdatedTime` — when discovery last refreshed this record.
+    pub last_updated_time: Option<String>,
+    /// `Instance$SubscriptionName` — the name of the subscription the instance uses, and
+    /// half of the key `ListLinuxSubscriptions` groups on.
+    pub subscription_name: String,
+    /// The `Subscription$Type` of that subscription (subscription-included with Amazon
+    /// EC2, BYOS, or from the Amazon Web Services Marketplace), the other half of that
+    /// key. Discovery records it per instance, because the same subscription name can be
+    /// licensed in more than one way.
+    pub subscription_type: String,
+    /// `Instance$OsVersion`.
+    pub os_version: Option<String>,
+    /// `Instance$SubscriptionProviderCreateTime`, set only for an instance whose
+    /// subscription comes from a registered third-party provider.
+    pub subscription_provider_create_time: Option<String>,
+    /// `Instance$SubscriptionProviderUpdateTime`, set on the same condition.
+    pub subscription_provider_update_time: Option<String>,
+    /// `Instance$DualSubscription`.
+    pub dual_subscription: Option<String>,
+    /// `Instance$RegisteredWithSubscriptionProvider`.
+    pub registered_with_subscription_provider: Option<String>,
+}
+
+/// One discovered Linux subscription: a `Subscription` as `ListLinuxSubscriptions`
+/// reports it, aggregated from the discovered instances that use it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredSubscription {
+    /// `Subscription$Name`.
+    pub name: String,
+    /// `Subscription$Type`.
+    pub subscription_type: String,
+    /// `Subscription$InstanceCount` — how many of the discovered instances using this
+    /// subscription are running.
+    pub instance_count: i64,
+}
+
 /// The per-account Linux subscriptions service settings, as `UpdateServiceSettings`
 /// persisted them.
 #[derive(Debug, Clone)]
@@ -86,6 +156,14 @@ pub struct ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscr
     pub provider_index: HashMap<(String, String), String>,
     /// The per-account settings singleton, once an update persisted one.
     pub service_settings: Option<ServiceSettingsRecord>,
+    /// The instances Linux subscription discovery has found, by `Instance$InstanceID`.
+    ///
+    /// An instance id is unique, so the map both keeps a re-discovery of the same
+    /// instance from adding a second record and gives the two list operations a stable,
+    /// pageable order. Discovery is the only writer (see [`DiscoveredInstanceRecord`]):
+    /// until one has run, the account has discovered nothing and both lists are empty,
+    /// which is exactly what an account with no instances reports.
+    pub discovered_instances: BTreeMap<String, DiscoveredInstanceRecord>,
     /// Source of the resource ids this service mints.
     pub next_id: u64,
 }
@@ -120,6 +198,40 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
         self.providers.get(arn).ok_or_else(|| {
             StateError::NotFound(format!("subscription provider {arn} is not registered"))
         })
+    }
+
+    /// The discovered instances in instance-id order.
+    pub fn discovered_instances_in_order(&self) -> Vec<DiscoveredInstanceRecord> {
+        self.discovered_instances.values().cloned().collect()
+    }
+
+    /// The discovered subscriptions: one `Subscription` per distinct (name, type) pair
+    /// the discovered instances carry, each counting the instances using it that are
+    /// running (`Subscription$InstanceCount`). A subscription that was discovered but has
+    /// no running instance left still reports, with a count of zero — the two members say
+    /// what was discovered and how much of it is running, which are different questions.
+    ///
+    /// Ordered by (name, type), a total order over the pairs, so a page is stable and a
+    /// pagination cursor keeps its meaning between calls.
+    pub fn discovered_subscriptions(&self) -> Vec<DiscoveredSubscription> {
+        let mut counts: BTreeMap<(String, String), i64> = BTreeMap::new();
+        for instance in self.discovered_instances.values() {
+            let running = i64::from(instance.status == INSTANCE_STATUS_RUNNING);
+            *counts
+                .entry((
+                    instance.subscription_name.clone(),
+                    instance.subscription_type.clone(),
+                ))
+                .or_default() += running;
+        }
+        counts
+            .into_iter()
+            .map(|((name, subscription_type), instance_count)| DiscoveredSubscription {
+                name,
+                subscription_type,
+                instance_count,
+            })
+            .collect()
     }
 
     /// The metadata tags of the resource `arn` addresses, or `None` when this account
@@ -331,11 +443,103 @@ fn decode_page_token(kind: &str, token: &str) -> Result<usize, StateError> {
 /// Every component is LENGTH-PREFIXED, so no two different selections can render to the
 /// same signature.
 pub fn source_filter_signature(sources: &[String]) -> String {
+    length_prefixed(sources.iter().cloned())
+}
+
+/// The same rendering for a `FilterList` selection, so the `Filters`-driven lists get
+/// cursors that are positions in the list THAT selection produced.
+///
+/// Each filter contributes its name, its operator and its values, every component
+/// length-prefixed, closed by the number of values it carried — so neither a different
+/// grouping of the same components nor a different operator can render the same
+/// signature.
+pub fn filter_signature(filters: &[Filter]) -> String {
     let mut signature = String::new();
-    for source in sources {
-        signature.push_str(&format!("{}.{source}", source.len()));
+    for filter in filters {
+        signature.push_str(&length_prefixed(
+            [
+                filter.name.clone().unwrap_or_default(),
+                filter.operator.clone().unwrap_or_default(),
+            ]
+            .into_iter()
+            .chain(filter.values.clone().unwrap_or_default()),
+        ));
+        signature.push_str(&format!("/{}", filter.values.as_ref().map_or(0, Vec::len)));
     }
     signature
+}
+
+/// Render `components` so that no two different sequences render alike: each is prefixed
+/// with its own length.
+fn length_prefixed(components: impl IntoIterator<Item = String>) -> String {
+    let mut rendered = String::new();
+    for component in components {
+        rendered.push_str(&format!("{}.{component}", component.len()));
+    }
+    rendered
+}
+
+/// The comparison an absent `Filter$Operator` means: `Filters` selects the results that
+/// "match one or more sets of key-value pairs that you specify", so a filter with no
+/// operator selects on equality (`Operator`: Contains | Equal | NotEqual).
+pub const OPERATOR_EQUAL: &str = "Equal";
+
+/// `Operator` for a filter that selects what does NOT equal any of its values.
+pub const OPERATOR_NOT_EQUAL: &str = "NotEqual";
+
+/// `Operator` for a filter that selects on a substring of the member's value.
+pub const OPERATOR_CONTAINS: &str = "Contains";
+
+/// Refuse a filter the list it was given to cannot apply.
+///
+/// `valid_names` is the set of `Filter$Name` values that list documents: a filter naming
+/// anything else addresses no member, so it can select nothing and is a
+/// `ValidationException` rather than a silently empty page. A filter carrying no value
+/// has nothing to compare against (the modelled `Values` list is `len 1..100`), and an
+/// operator outside the modelled `Operator` set names no comparison.
+pub fn validate_filters(filters: &[Filter], valid_names: &[&str]) -> Result<(), StateError> {
+    for filter in filters {
+        let name = filter.name.as_deref().unwrap_or_default();
+        if !valid_names.contains(&name) {
+            return Err(StateError::Validation(format!(
+                "Filters.Name must be one of {valid_names:?}, got {name:?}"
+            )));
+        }
+        if filter.values.as_ref().is_none_or(Vec::is_empty) {
+            return Err(StateError::Validation(format!(
+                "Filters.Values must carry at least one value to filter {name:?} by"
+            )));
+        }
+        if let Some(operator) = filter.operator.as_deref() {
+            if !OPERATOR_VALUES.contains(&operator) {
+                return Err(StateError::Validation(format!(
+                    "Filters.Operator must be one of {OPERATOR_VALUES:?}, got {operator:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Does one validated `filter` select a resource whose addressed member holds
+/// `member_values`?
+///
+/// `member_values` is what the member the filter's `Name` addresses holds on that
+/// resource: one value for a scalar member, several for a list member (`ProductCode`),
+/// none when the resource leaves it unset. A list member satisfies the filter when any of
+/// its values does, which is what makes `NotEqual` mean "no value of this member equals
+/// any value I named".
+pub fn filter_selects(filter: &Filter, member_values: &[String]) -> bool {
+    let values = filter.values.as_deref().unwrap_or_default();
+    let equals = member_values.iter().any(|held| values.contains(held));
+    match filter.operator.as_deref().unwrap_or(OPERATOR_EQUAL) {
+        OPERATOR_CONTAINS => member_values
+            .iter()
+            .any(|held| values.iter().any(|value| held.contains(value.as_str()))),
+        OPERATOR_NOT_EQUAL => !equals,
+        // `Equal`, and the equality an absent operator means.
+        _ => equals,
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

@@ -175,6 +175,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::registry_not_found(&input.registry_name),
                 ))
             })?;
+        // AWS owns what is in a service-owned registry, so a caller cannot delete from
+        // it.
+        if registry.scope.is_managed() {
+            return Err(DeleteSchemaErrorModeled::ForbiddenException(
+                crate::state::managed_registry_is_read_only(&input.registry_name),
+            )
+            .into());
+        }
         // Removing the schema removes every version with it: the versions live inside
         // the schema. DeleteSchemaVersion is what removes one of them.
         if registry.schemas.remove(&input.schema_name).is_none() {

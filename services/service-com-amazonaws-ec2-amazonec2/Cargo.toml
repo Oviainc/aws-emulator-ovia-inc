@@ -30,7 +30,11 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
+# The integration tests wait out a clock-owed transition with `tokio::time::sleep`,
+# which needs the timer driver on top of the workspace's tokio features.
+tokio = { workspace = true, features = ["time"] }
+# Reads the ec2Query XML responses the integration tests assert on.
+roxmltree = "0.20"
 
 [lints]
 workspace = true

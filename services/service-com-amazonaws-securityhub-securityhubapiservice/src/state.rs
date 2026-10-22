@@ -11,9 +11,11 @@
 //! finding by, and the account/Region prefix is what makes "disable removes this
 //! account's findings in this Region" expressible.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use crate::ops::types::{AwsSecurityFinding, Severity, Standard, StandardsManagedBy};
+use crate::ops::types::{
+    AwsSecurityFinding, FindingHistoryUpdate, Severity, Standard, StandardsManagedBy,
+};
 
 /// The hub resource is one per account and Region, named `hub/default`.
 pub type HubKey = (String, String);
@@ -38,6 +40,30 @@ pub struct Hub {
     pub control_finding_generator: String,
     pub enable_default_standards: bool,
     pub tags: HashMap<String, String>,
+}
+
+/// One finding change event, as `GetFindingHistory` reports it.
+///
+/// Appended by the two operations that write a finding — `BatchImportFindings` and
+/// `BatchUpdateFindings`, the two values `FindingHistoryUpdateSourceType` models — so
+/// the history is a record of writes that actually happened, never synthesized at
+/// read time.
+#[derive(Debug, Clone)]
+pub struct FindingHistoryEvent {
+    /// The instant the change was made, ISO-8601, as [`now_iso8601`] renders it.
+    pub update_time: String,
+    /// `True` only on the event that created the finding record.
+    pub finding_created: bool,
+    /// A `FindingHistoryUpdateSourceType`: which operation made the change.
+    pub source_type: String,
+    /// The identity that initiated the change: the product ARN for an import, the
+    /// signing principal for an update.
+    pub source_identity: String,
+    /// The ASFF fields this event changed, with their old and new values.
+    pub updates: Vec<FindingHistoryUpdate>,
+    /// The write sequence of the change, the deterministic tie-breaker when two
+    /// events carry the same `update_time`.
+    pub seq: u64,
 }
 
 /// A custom action target's identity: the hub it lives in, plus the `Id` the
@@ -70,6 +96,73 @@ pub struct StoredFinding {
     /// Monotonic sequence of the most recent write, used as the deterministic
     /// tie-breaker when two findings carry the same `UpdatedAt`.
     pub updated_seq: u64,
+    /// The change events this record has seen, oldest first and bounded by
+    /// [`MAX_HISTORY_EVENTS_PER_FINDING`] / [`MAX_HISTORY_BYTES_PER_FINDING`];
+    /// `GetFindingHistory` reports it. Append through
+    /// [`StoredFinding::record_history`], never by pushing, so the bound holds.
+    pub history: Vec<FindingHistoryEvent>,
+    /// The text [`StoredFinding::history`] currently holds, kept as a running total
+    /// so the byte bound costs nothing to enforce.
+    pub history_bytes: usize,
+}
+
+/// How many change events one finding's history keeps. A history is append-only and
+/// a caller may write the same finding without limit, so the store is bounded here:
+/// the oldest events are dropped once it is full, which is also how the real service
+/// ages a finding's history out. The bound is the emulator's own (AWS publishes a
+/// retention window, not a count), chosen above `MAX_RESULTS_LIMIT` so a bounded
+/// history still spans several pages.
+pub const MAX_HISTORY_EVENTS_PER_FINDING: usize = 256;
+
+/// How much event text one finding's history keeps. Each event carries the old and
+/// new text of every field a write changed, which is caller-sized, so the count bound
+/// alone does not bound memory: the oldest events are dropped until the retained text
+/// fits this budget. The most recent event is always kept, however large it is, so a
+/// write is never recorded as nothing.
+pub const MAX_HISTORY_BYTES_PER_FINDING: usize = 128 * 1024;
+
+/// The text one change event holds, as the byte bound counts it.
+fn history_event_bytes(event: &FindingHistoryEvent) -> usize {
+    let mut bytes = event.update_time.len() + event.source_type.len() + event.source_identity.len();
+    for update in &event.updates {
+        for value in [&update.updated_field, &update.old_value, &update.new_value] {
+            bytes += value.as_ref().map_or(0, String::len);
+        }
+    }
+    bytes
+}
+
+impl StoredFinding {
+    /// A finding record as its creating import stores it, with that import as the
+    /// first event of its history.
+    pub fn new(finding: AwsSecurityFinding, seq: u64, created: FindingHistoryEvent) -> Self {
+        let mut stored = Self {
+            finding,
+            imported_seq: seq,
+            updated_seq: seq,
+            history: Vec::new(),
+            history_bytes: 0,
+        };
+        stored.record_history(created);
+        stored
+    }
+
+    /// Append one change event, dropping the oldest events until the history is back
+    /// inside both of its bounds. The newest event always survives, so the store is
+    /// bounded without a write ever going unrecorded.
+    pub fn record_history(&mut self, event: FindingHistoryEvent) {
+        self.history_bytes += history_event_bytes(&event);
+        self.history.push(event);
+        while self.history.len() > 1
+            && (self.history.len() > MAX_HISTORY_EVENTS_PER_FINDING
+                || self.history_bytes > MAX_HISTORY_BYTES_PER_FINDING)
+        {
+            let dropped = self.history.remove(0);
+            self.history_bytes = self
+                .history_bytes
+                .saturating_sub(history_event_bytes(&dropped));
+        }
+    }
 }
 
 /// A standards subscription's identity: the hub it belongs to plus the ARN of the
@@ -404,6 +497,17 @@ pub fn standards_controls_updatable(standards_status: &str) -> &'static str {
 /// `SchemaVersion`).
 pub const FINDING_SCHEMA_VERSION: &str = "2018-10-08";
 
+/// The `RecordState` an ingested finding starts in: "ACTIVE - The finding must be
+/// investigated or remediated" is the live state, `ARCHIVED` the other
+/// (`smithy_query(query="shape", shape="RecordState")`). Security Hub populates it,
+/// so a provider that submits none still gets one.
+pub const DEFAULT_RECORD_STATE: &str = "ACTIVE";
+
+/// The `Workflow.Status` an ingested finding starts in: "NEW - The initial state of a
+/// finding, before it is reviewed" (`smithy_query(query="doc", shape="Workflow",
+/// member="Status")`).
+pub const DEFAULT_WORKFLOW_STATUS: &str = "NEW";
+
 /// The Region an emulated request is for: the SigV4 credential scope's Region when
 /// the request is signed, else the emulator's default Region.
 pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
@@ -477,12 +581,25 @@ pub fn now_nanos() -> i128 {
 /// Parse an ISO-8601 (RFC-3339) timestamp into whole nanoseconds since the epoch,
 /// for ordering and date filtering. `None` when the text is not a valid instant.
 pub fn parse_iso8601_nanos(text: &str) -> Option<i128> {
-    let dt = ::aws_smithy_types::DateTime::from_str(
+    Some(datetime_nanos(&parse_iso8601(text)?))
+}
+
+/// Parse an ISO-8601 (RFC-3339) timestamp into the modelled `Timestamp` type, for a
+/// response member the model types as a timestamp rather than a string. `None` when
+/// the text is not a valid instant.
+pub fn parse_iso8601(text: &str) -> Option<::aws_smithy_types::DateTime> {
+    ::aws_smithy_types::DateTime::from_str(
         text,
         ::aws_smithy_types::date_time::Format::DateTime,
     )
-    .ok()?;
-    Some(i128::from(dt.secs()) * 1_000_000_000 + i128::from(dt.subsec_nanos()))
+    .ok()
+}
+
+/// An instant in the whole nanoseconds since the epoch that [`parse_iso8601_nanos`]
+/// and [`now_nanos`] answer in, so a bound a caller sent as a modelled `Timestamp`
+/// compares against a stored timestamp in one unit.
+pub fn datetime_nanos(instant: &::aws_smithy_types::DateTime) -> i128 {
+    i128::from(instant.secs()) * 1_000_000_000 + i128::from(instant.subsec_nanos())
 }
 
 /// The greatest number of tags one Security Hub resource carries: the modelled
@@ -625,4 +742,140 @@ pub fn complete_severity(severity: &mut Severity) {
             severity.label = label_for_normalized(normalized).map(str::to_string);
         }
     }
+}
+
+/// `FindingHistoryUpdateSource.Type` for a change `BatchImportFindings` made; one of
+/// the two values `FindingHistoryUpdateSourceType` models.
+pub const HISTORY_SOURCE_BATCH_IMPORT_FINDINGS: &str = "BATCH_IMPORT_FINDINGS";
+
+/// `FindingHistoryUpdateSource.Type` for a change `BatchUpdateFindings` made.
+pub const HISTORY_SOURCE_BATCH_UPDATE_FINDINGS: &str = "BATCH_UPDATE_FINDINGS";
+
+/// The top-level `AwsSecurityFinding` members that carry a timestamp, which
+/// `GetFindingHistory` excludes from a change event: "The history includes changes
+/// made to any fields in the Amazon Web Services Security Finding Format (ASFF)
+/// except top-level timestamp fields, such as the CreatedAt and UpdatedAt fields"
+/// (`smithy_query(query="operation", operation="GetFindingHistory")` docs). These are
+/// every member of `AwsSecurityFinding` whose documentation calls it a timestamp
+/// (`smithy_query(query="shape", shape="AwsSecurityFinding")`).
+pub const HISTORY_EXCLUDED_FIELDS: [&str; 5] = [
+    "CreatedAt",
+    "UpdatedAt",
+    "FirstObservedAt",
+    "LastObservedAt",
+    "ProcessedAt",
+];
+
+/// The IAM user name the emulator attributes every signed request to, and the one
+/// `GetCallerIdentity` answers with: see `AMBIENT_USER_NAME` in
+/// `services/service-com-amazonaws-sts-awssecuritytokenservicev20110615/src/state.rs`
+/// ("The identity of the ambient caller: the IAM user whose long-term key this
+/// emulator publishes").
+pub const CALLER_USER_NAME: &str = "emulator";
+
+/// The IAM principal a request is attributed to, which is what names the customer
+/// that called `BatchUpdateFindings` in a change event's `UpdateSource.Identity`.
+///
+/// The emulator publishes ONE long-term identity for every signed request, and STS's
+/// `GetCallerIdentity` is where a caller reads it; a finding change event names the
+/// caller with that same ARN rather than minting a second principal for the one
+/// credential.
+pub fn caller_arn() -> String {
+    ::engine::emulator_arn("iam", "", &format!("user/{CALLER_USER_NAME}"))
+}
+
+/// Each top-level ASFF field of a finding, keyed by the `AwsSecurityFinding` member
+/// name, rendered as the text a change event reports for it.
+///
+/// The finding is rendered with the protocol's own JSON codec, so the keys are the
+/// modelled ASFF field names however a client sent them, and a field this emulator
+/// never special-cases is still accounted for. A change event names "The ASFF field
+/// that changed" (`smithy_query(query="doc", shape="FindingHistoryUpdate",
+/// member="UpdatedField")`), and an ASFF field is one member of the finding: a scalar
+/// renders as its own text, and a structure, list or map renders as its JSON, so one
+/// changed field is one entry whatever its shape. An absent or empty field is no entry
+/// at all: `FindingHistoryUpdate`'s `OldValue` / `NewValue` are `NonEmptyString`.
+fn finding_field_values(finding: &AwsSecurityFinding) -> BTreeMap<String, String> {
+    use ::aws_smithy_schema::codec::{Codec, FinishSerializer};
+    use ::aws_smithy_schema::serde::ShapeSerializer;
+
+    let mut serializer = ::aws_smithy_schema_server::json::JsonCodec::rest_json().create_serializer();
+    let mut values = BTreeMap::new();
+    if serializer
+        .write_struct(&AwsSecurityFinding::SCHEMA, finding)
+        .is_err()
+    {
+        return values;
+    }
+    let Ok(rendered) = ::serde_json::from_slice::<::serde_json::Value>(&serializer.finish()) else {
+        return values;
+    };
+    let ::serde_json::Value::Object(fields) = rendered else {
+        return values;
+    };
+    for (name, value) in fields {
+        match value {
+            ::serde_json::Value::Null => {}
+            ::serde_json::Value::String(text) => {
+                if !text.trim().is_empty() {
+                    values.insert(name, text);
+                }
+            }
+            other => {
+                let rendered = other.to_string();
+                // An empty list or map is no value, like an absent member: clearing a
+                // collection reads as a field that no longer has a value.
+                if rendered != "[]" && rendered != "{}" {
+                    values.insert(name, rendered);
+                }
+            }
+        }
+    }
+    values
+}
+
+/// The fields a finding was created with, as the creating event's `Updates`: one
+/// entry per ASFF field the import set, each with no prior value, with the top-level
+/// timestamp members ([`HISTORY_EXCLUDED_FIELDS`]) left out.
+pub fn finding_created_fields(finding: &AwsSecurityFinding) -> Vec<FindingHistoryUpdate> {
+    finding_field_values(finding)
+        .into_iter()
+        .filter(|(field, _)| !HISTORY_EXCLUDED_FIELDS.contains(&field.as_str()))
+        .map(|(field, value)| FindingHistoryUpdate {
+            updated_field: Some(field),
+            old_value: None,
+            new_value: Some(value),
+        })
+        .collect()
+}
+
+/// The ASFF fields that differ between a finding before and after a write, as a
+/// change event's `Updates`: one entry per field whose value changed, in field-name
+/// order, with the top-level timestamp members ([`HISTORY_EXCLUDED_FIELDS`]) left out.
+pub fn finding_changes(
+    before: &AwsSecurityFinding,
+    after: &AwsSecurityFinding,
+) -> Vec<FindingHistoryUpdate> {
+    let before_values = finding_field_values(before);
+    let after_values = finding_field_values(after);
+    let mut changes = Vec::new();
+    let mut fields: Vec<&String> = before_values.keys().chain(after_values.keys()).collect();
+    fields.sort_unstable();
+    fields.dedup();
+    for field in fields {
+        if HISTORY_EXCLUDED_FIELDS.contains(&field.as_str()) {
+            continue;
+        }
+        let old_value = before_values.get(field);
+        let new_value = after_values.get(field);
+        if old_value == new_value {
+            continue;
+        }
+        changes.push(FindingHistoryUpdate {
+            updated_field: Some(field.clone()),
+            old_value: old_value.cloned(),
+            new_value: new_value.cloned(),
+        });
+    }
+    changes
 }
