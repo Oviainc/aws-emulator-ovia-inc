@@ -187,15 +187,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // Only this application's indices: an index belongs to exactly one application.
-        let ordered: Vec<(u64, Index)> = application
+        // Paginate over the ordered records first, then build a summary only for the page
+        // that is actually returned.
+        let ordered: Vec<(u64, &crate::state::StoredIndex)> = application
             .indices_in_order()
             .into_iter()
-            .map(|index| (index.sequence, summary_of(index)))
+            .map(|index| (index.sequence, index))
             .collect();
         let page = crate::state::page_of(ordered, after, input.max_results);
 
         Ok(ListIndicesOutput {
-            indices: Some(page.items),
+            indices: Some(page.items.into_iter().map(summary_of).collect()),
             next_token: page.next_token,
         })
     }

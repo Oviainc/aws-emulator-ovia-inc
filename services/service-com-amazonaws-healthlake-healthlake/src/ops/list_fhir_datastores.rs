@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFHIRDatastores
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFHIRDatastores`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFHIRDatastores::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the persisted data stores from [`crate::state`], filtered by the
+//! request's `Filter` and paged by `MaxResults`/`NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +141,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFHIRDatastores` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFHIRDatastoresErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFHIRDatastores"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListFHIRDatastoresErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the HealthLake data store registry is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The reported status must have caught up with the clock before it is
+        // filtered on, or a store whose transition is already due would be
+        // listed under the status it has left.
+        store.settle_lifecycle();
+
+        let mut matched: Vec<&crate::state::Datastore> = store
+            .datastores
+            .values()
+            .filter(|datastore| matches_filter(datastore, input.filter.as_ref()))
+            .collect();
+        // A stable total order is what makes paging resumable: oldest first,
+        // identifier breaking a tie between two stores created in one tick.
+        matched.sort_by(|a, b| {
+            crate::state::epoch_nanos(&a.created_at)
+                .cmp(&crate::state::epoch_nanos(&b.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        // `NextToken` is the identifier of the first entry the next page
+        // returns, so resuming is a lookup in this same order.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => matched
+                .iter()
+                .position(|datastore| datastore.id == token)
+                .ok_or_else(|| {
+                    ListFHIRDatastoresError::from(
+                        ListFHIRDatastoresErrorModeled::ValidationException(ValidationException {
+                            message: Some(
+                                "NextToken does not resume a ListFHIRDatastores page".to_string(),
+                            ),
+                        }),
+                    )
+                })?,
+        };
+        // `MaxResultsInteger` is modelled 1..500, so an absent value pages at
+        // the largest page the model allows.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(0)
+            .clamp(1, usize::try_from(MAX_PAGE_SIZE).unwrap_or(usize::MAX));
+
+        let page: Vec<DatastoreProperties> = matched[start..]
+            .iter()
+            .take(page_size)
+            .map(|datastore| datastore.properties())
+            .collect();
+        // A token is emitted ONLY when entries remain after this page.
+        let next_token = matched
+            .get(start + page.len())
+            .map(|datastore| datastore.id.clone());
+
+        Ok(ListFHIRDatastoresOutput {
+            datastore_properties_list: page,
+            next_token,
+        })
     }
+}
+
+/// The largest page `MaxResultsInteger` allows (modelled range 1..500), which is
+/// also the page size a request that names none gets.
+const MAX_PAGE_SIZE: i32 = 500;
+
+/// Whether `datastore` satisfies every member the request's `DatastoreFilter`
+/// set: name and status match exactly, and `CreatedBefore`/`CreatedAfter` are
+/// the inclusive cutoffs the model documents ("all data stores created
+/// before/after the specified date are included").
+fn matches_filter(datastore: &crate::state::Datastore, filter: Option<&DatastoreFilter>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    if let Some(name) = filter.datastore_name.as_deref() {
+        if datastore.name.as_deref() != Some(name) {
+            return false;
+        }
+    }
+    if let Some(status) = filter.datastore_status.as_deref() {
+        if datastore.status.as_wire() != status {
+            return false;
+        }
+    }
+    let created_at = crate::state::epoch_nanos(&datastore.created_at);
+    if let Some(before) = filter.created_before.as_ref() {
+        if created_at > crate::state::epoch_nanos(before) {
+            return false;
+        }
+    }
+    if let Some(after) = filter.created_after.as_ref() {
+        if created_at < crate::state::epoch_nanos(after) {
+            return false;
+        }
+    }
+    true
 }

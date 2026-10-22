@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutIntent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutIntent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutIntent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the intent is written to this service's store under `$LATEST` (and, when
+//! `createVersion` is set, published as the next numbered version), and the response is
+//! read back out of the store.
 //!
 //! ## Shape of an operation
 //!
@@ -208,6 +202,113 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::{
+    bound_chars, checksum_mismatch, checksum_on_create, IntentRecord, LATEST_VERSION, MAX_INTENTS,
+    MAX_STRING_CHARS, MAX_VERSIONS,
+};
+
+/// Refuse a request whose unbounded members would grow the store without limit.
+///
+/// Every other caller-sized member of `PutIntentRequest` carries a modelled `length`
+/// (`slots` 0..100, `sampleUtterances` 0..1500, `description` 0..200, `inputContexts`
+/// 0..5, `outputContexts` 0..10, each `messages` list 1..15), so the boundary validator
+/// has already refused those before this handler runs. `checksum` and
+/// `parentIntentSignature` are plain strings in the model, so they are bounded here.
+fn bound_input(input: &PutIntentInput) -> Result<(), String> {
+    if let Some(checksum) = &input.checksum {
+        bound_chars("checksum", checksum, MAX_STRING_CHARS)?;
+    }
+    if let Some(signature) = &input.parent_intent_signature {
+        bound_chars("parentIntentSignature", signature, MAX_STRING_CHARS)?;
+    }
+    Ok(())
+}
+
+/// Publish the `$LATEST` version of the intent named `name` as the next numbered
+/// version, and answer that version's number.
+///
+/// The number comes from the intent's own `next_version` counter, so versions are handed
+/// out `1`, `2`, `3`, … per intent and a number is never reused. The snapshot is a
+/// version in its own right: it gets its own checksum and its own creation date.
+fn publish_version(
+    store: &mut crate::state::ComAmazonawsLexmodelbuildingserviceAwsdeepsensemodelbuildingserviceState,
+    name: &str,
+    now: ::aws_smithy_types::DateTime,
+) -> Result<Option<String>, PutIntentError> {
+    // `versions` counts `$LATEST` too, so `MAX_VERSIONS` numbered versions means
+    // `MAX_VERSIONS + 1` entries.
+    let versions = store.intents.get(name).map_or(0, |entry| entry.versions.len());
+    if versions > MAX_VERSIONS {
+        return Err(PutIntentErrorModeled::LimitExceededException(LimitExceededException {
+            retry_after_seconds: None,
+            message: Some(format!(
+                "Limit Exceeded: this emulator publishes at most {MAX_VERSIONS} versions of an intent"
+            )),
+        })
+        .into());
+    }
+    let number = {
+        let entry = store
+            .intents
+            .get_mut(name)
+            .ok_or_else(crate::state::state_unavailable)?;
+        entry.next_version = entry.next_version.wrapping_add(1);
+        entry.next_version.to_string()
+    };
+    let checksum = store.mint_checksum("intent", name, &number);
+    let entry = store
+        .intents
+        .get_mut(name)
+        .ok_or_else(crate::state::state_unavailable)?;
+    let mut snapshot = entry
+        .versions
+        .get(LATEST_VERSION)
+        .cloned()
+        .ok_or_else(crate::state::state_unavailable)?;
+    snapshot.version = number.clone();
+    snapshot.checksum = checksum;
+    snapshot.created_date = now;
+    snapshot.last_updated_date = now;
+    entry.versions.insert(number.clone(), snapshot);
+    Ok(Some(number))
+}
+
+impl From<&IntentRecord> for PutIntentOutput {    /// The `PutIntent` body for a stored intent revision. Every member is read off the
+    /// record, the server-computed ones (`version`, `checksum`, the two dates) included,
+    /// so the body can only report what was persisted.
+    ///
+    /// `createVersion` is set by the handler rather than here: it reports what THIS call
+    /// did, not anything about the record.
+    fn from(record: &IntentRecord) -> Self {
+        Self {
+            name: Some(record.name.clone()),
+            description: record.description.clone(),
+            slots: (!record.slots.is_empty()).then(|| record.slots.clone()),
+            sample_utterances: (!record.sample_utterances.is_empty())
+                .then(|| record.sample_utterances.clone()),
+            confirmation_prompt: record.confirmation_prompt.clone(),
+            rejection_statement: record.rejection_statement.clone(),
+            follow_up_prompt: record.follow_up_prompt.clone(),
+            conclusion_statement: record.conclusion_statement.clone(),
+            dialog_code_hook: record.dialog_code_hook.clone(),
+            fulfillment_activity: record.fulfillment_activity.clone(),
+            parent_intent_signature: record.parent_intent_signature.clone(),
+            last_updated_date: Some(record.last_updated_date),
+            created_date: Some(record.created_date),
+            version: Some(record.version.clone()),
+            checksum: Some(record.checksum.clone()),
+            create_version: Some(false),
+            kendra_configuration: record.kendra_configuration.clone(),
+            input_contexts: (!record.input_contexts.is_empty())
+                .then(|| record.input_contexts.clone()),
+            output_contexts: (!record.output_contexts.is_empty())
+                .then(|| record.output_contexts.clone()),
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -280,18 +381,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutIntent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutIntentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutIntent"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized reaches the store unchecked: the request's unbounded
+        // members are bounded first, before the store lock is taken at all.
+        bound_input(&input).map_err(|message| {
+            PutIntentErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        })?;
+
+        let now = ::aws_smithy_types::DateTime::from(SystemTime::now());
+        let name = input.name.clone();
+        let create_version = input.create_version.unwrap_or(false);
+        let mut store = state.lock();
+
+        // The conditional write `checksum` expresses: blank on a create, and the stored
+        // revision's own checksum on an update.
+        let (created_date, is_create) = {
+            let existing = store
+                .intents
+                .get(&name)
+                .and_then(|entry| entry.versions.get(LATEST_VERSION));
+            match (existing, input.checksum.as_deref()) {
+                (None, Some(_)) => {
+                    return Err(PutIntentErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(checksum_on_create("intent", &name)),
+                        },
+                    )
+                    .into());
+                }
+                (Some(record), supplied) if supplied != Some(record.checksum.as_str()) => {
+                    return Err(PutIntentErrorModeled::PreconditionFailedException(
+                        PreconditionFailedException {
+                            message: Some(checksum_mismatch("intent", &name, supplied)),
+                        },
+                    )
+                    .into());
+                }
+                _ => {}
+            }
+            // An update keeps the creation date of the record it replaces; a create
+            // stamps both dates with this instant.
+            (
+                existing.map_or(now, |record| record.created_date),
+                existing.is_none(),
+            )
+        };
+
+        if is_create && store.intents.len() >= MAX_INTENTS {
+            return Err(PutIntentErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    retry_after_seconds: None,
+                    message: Some(format!(
+                        "Limit Exceeded: this emulator stores at most {MAX_INTENTS} intents"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A write REPLACES the `$LATEST` version rather than merging into it: the fields
+        // in the request replace the existing values, and a member the request omits is
+        // removed from the record.
+        let checksum = store.mint_checksum("intent", &name, LATEST_VERSION);
+        let latest = IntentRecord {
+            name: name.clone(),
+            description: input.description,
+            slots: input.slots.unwrap_or_default(),
+            sample_utterances: input.sample_utterances.unwrap_or_default(),
+            confirmation_prompt: input.confirmation_prompt,
+            rejection_statement: input.rejection_statement,
+            follow_up_prompt: input.follow_up_prompt,
+            conclusion_statement: input.conclusion_statement,
+            dialog_code_hook: input.dialog_code_hook,
+            fulfillment_activity: input.fulfillment_activity,
+            parent_intent_signature: input.parent_intent_signature,
+            kendra_configuration: input.kendra_configuration,
+            input_contexts: input.input_contexts.unwrap_or_default(),
+            output_contexts: input.output_contexts.unwrap_or_default(),
+            version: LATEST_VERSION.to_string(),
+            checksum,
+            created_date,
+            last_updated_date: now,
+        };
+        store
+            .intents
+            .entry(name.clone())
+            .or_default()
+            .versions
+            .insert(LATEST_VERSION.to_string(), latest);
+
+        // `createVersion` publishes a numbered version of what was just written, which
+        // the model documents as the same thing `CreateIntentVersion` does. The snapshot
+        // is a version in its own right, so it carries its own checksum and its own
+        // creation date, and is read back by `GetIntent` under its number.
+        let published = if create_version {
+            publish_version(&mut store, &name, now)?
+        } else {
+            None
+        };
+
+        // Read the body back OUT of the store, so the response can only report what was
+        // persisted. The body describes `$LATEST` even when a numbered version was
+        // published: `PutIntentResponse$checksum` is documented as the "Checksum of the
+        // $LATEST version of the intent created or updated", which is also the checksum
+        // the caller needs for its next conditional write.
+        let stored = store
+            .intents
+            .get(&name)
+            .and_then(|entry| entry.versions.get(LATEST_VERSION))
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut output = PutIntentOutput::from(stored);
+        // True if a new version of the intent was created; false when `createVersion` was
+        // not specified in the request.
+        output.create_version = Some(published.is_some());
+        Ok(output)
     }
 }

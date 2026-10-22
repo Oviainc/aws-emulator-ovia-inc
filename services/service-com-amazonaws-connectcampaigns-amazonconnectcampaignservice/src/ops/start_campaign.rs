@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartCampaign
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartCampaign`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartCampaign::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves a stored campaign's run state to `Running`. A campaign that has never run
+//! (`Initialized`) or has been stopped can be started; a campaign in any other state is
+//! refused with `InvalidCampaignStateException` carrying the state it is in (a paused
+//! campaign is resumed, not started).
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +167,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartCampaign` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartCampaignErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartCampaign"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartCampaignError::from(StartCampaignErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the campaign store is unavailable".to_string(),
+                    x_amz_error_type: None,
+                },
+            ))
+        })?;
+
+        // A campaign starts from the state it has never run in, or from stopped; a
+        // paused one is resumed instead, and a running one is already running.
+        let outcome = state.lock().transition_campaign(
+            &input.id,
+            &[
+                crate::state::CampaignState::Initialized,
+                crate::state::CampaignState::Stopped,
+            ],
+            crate::state::CampaignState::Running,
+        );
+
+        match outcome {
+            Ok(now) => {
+                crate::state::audit_campaign_change(
+                    ctx.parts(),
+                    "StartCampaign",
+                    &input.id,
+                    now.as_wire(),
+                );
+                Ok(StartCampaignOutput)
+            }
+            Err(crate::state::TransitionRefused::NoSuchCampaign) => Err(
+                StartCampaignErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!("No campaign with id {} exists", input.id),
+                    x_amz_error_type: None,
+                })
+                .into(),
+            ),
+            Err(crate::state::TransitionRefused::InvalidState(current)) => Err(
+                StartCampaignErrorModeled::InvalidCampaignStateException(
+                    InvalidCampaignStateException {
+                        state: current.as_wire().to_string(),
+                        message: format!(
+                            "Campaign {} cannot be started while it is {}",
+                            input.id,
+                            current.as_wire()
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            ),
+        }
     }
 }

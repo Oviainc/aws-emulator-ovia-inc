@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEventAggregates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEventAggregates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEventAggregates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Groups the event set `DescribeEvents` would return for the same `filter` by the
+//! requested `aggregateField` and reports each group's size. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +112,13 @@ impl From<DescribeEventAggregatesErrorModeled> for DescribeEventAggregatesError 
     }
 }
 
+/// The page size used when the request names none.
+///
+/// The model documents no default for this operation's `maxResults`, so the modelled
+/// maximum of its `range` (10..100) is used: a call that does not ask for a page size
+/// gets the largest page the operation is allowed to return.
+const DEFAULT_PAGE_SIZE: usize = 100;
+
 /// The `DescribeEventAggregates` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,18 +155,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEventAggregates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEventAggregatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEventAggregates"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+
+        // `aggregateField` is a modelled enum whose only member is `eventTypeCategory`
+        // (EVENT_AGGREGATE_FIELD_VALUES), and the model declares no error for a bad
+        // value, so an unknown field is refused as a validation failure.
+        if !EVENT_AGGREGATE_FIELD_VALUES.contains(&input.aggregate_field.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "aggregateField must be one of [{}], got {}",
+                EVENT_AGGREGATE_FIELD_VALUES.join(", "),
+                input.aggregate_field
+            )));
+        }
+
+        let state = crate::state::require_state::<_, DescribeEventAggregatesErrorModeled>(
+            &*self.engine,
+            Self::NAME,
+        )?;
+
+        let request_digest = crate::state::event_filter_digest(input.filter.as_ref())
+            .scalar("aggregateField", Some(&input.aggregate_field))
+            .finish();
+
+        let paged = {
+            let store = state.lock();
+            // Grouped over exactly the event set `DescribeEvents` would return for this
+            // filter, so the counts necessarily sum to that set's size.
+            let mut counts: Vec<(String, i32)> = Vec::new();
+            for event in store.matching_events(input.filter.as_ref()) {
+                let value = &event.event_type_category;
+                match counts.iter_mut().find(|(group, _)| group == value) {
+                    Some((_, count)) => *count += 1,
+                    None => counts.push((value.clone(), 1)),
+                }
+            }
+            // Largest group first, ties broken by the aggregate value, so the sequence
+            // is total and a page boundary is stable across calls.
+            counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let aggregates: Vec<EventAggregate> = counts
+                .into_iter()
+                .map(|(aggregate_value, count)| EventAggregate {
+                    aggregate_value: Some(aggregate_value),
+                    count,
+                })
+                .collect();
+            crate::state::paginate(
+                &aggregates,
+                Self::NAME,
+                &request_digest,
+                input.next_token.as_deref(),
+                input.max_results,
+                DEFAULT_PAGE_SIZE,
+            )
+        };
+
+        let Some((event_aggregates, next_token)) = paged else {
+            return Err(DescribeEventAggregatesErrorModeled::InvalidPaginationToken(
+                InvalidPaginationToken {
+                    message: Some(
+                        "The specified pagination token (nextToken) is not valid.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeEventAggregatesOutput {
+            event_aggregates: Some(event_aggregates),
+            next_token,
+        })
     }
 }

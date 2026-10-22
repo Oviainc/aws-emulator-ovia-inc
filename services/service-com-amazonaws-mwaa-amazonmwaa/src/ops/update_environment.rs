@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges ONLY the members the request carries onto the stored environment record — an
+//! absent member leaves the stored value alone — then records the `LastUpdate` and enters
+//! `UPDATING`, which the clock settles to `AVAILABLE` one
+//! `crate::state::TRANSITION_SPAN` later.
 //!
 //! ## Shape of an operation
 //!
@@ -255,18 +251,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEnvironment"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateEnvironmentErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Amazon MWAA environment store is unavailable".to_string()),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle(now);
+
+        let stored = store.environments.get_mut(&input.name).ok_or_else(|| {
+            UpdateEnvironmentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!("Environment {} could not be found", input.name)),
+            })
+        })?;
+
+        // Merge, member by member: a member the request does not carry keeps the value the
+        // create (or an earlier update) stored for it.
+        let spec = &mut stored.spec;
+        if let Some(value) = input.execution_role_arn {
+            spec.execution_role_arn = value;
+        }
+        if let Some(value) = input.airflow_configuration_options {
+            spec.airflow_configuration_options = value.into_iter().collect();
+        }
+        if let Some(value) = input.airflow_version {
+            spec.airflow_version = value;
+        }
+        if let Some(value) = input.dag_s3_path {
+            spec.dag_s3_path = value;
+        }
+        if let Some(value) = input.environment_class {
+            spec.environment_class = Some(value);
+        }
+        if let Some(value) = input.logging_configuration.as_ref() {
+            // Per-log-type merge, for the same reason: a log type the request omits keeps
+            // the settings already stored for it.
+            spec.logging_configuration.merge(value);
+        }
+        if let Some(value) = input.max_workers {
+            spec.max_workers = Some(value);
+        }
+        if let Some(value) = input.min_workers {
+            spec.min_workers = Some(value);
+        }
+        if let Some(value) = input.max_webservers {
+            spec.max_webservers = value;
+        }
+        if let Some(value) = input.min_webservers {
+            spec.min_webservers = value;
+        }
+        if let Some(value) = input.network_configuration {
+            // `UpdateNetworkConfigurationInput` carries only `SecurityGroupIds` (its one
+            // `@required` member), so an update can replace the security groups but never
+            // the subnets the environment was placed in.
+            spec.network_configuration.security_group_ids = value.security_group_ids;
+        }
+        if let Some(value) = input.plugins_s3_path {
+            spec.plugins_s3_path = Some(value);
+        }
+        if let Some(value) = input.plugins_s3_object_version {
+            spec.plugins_s3_object_version = Some(value);
+        }
+        if let Some(value) = input.requirements_s3_path {
+            spec.requirements_s3_path = Some(value);
+        }
+        if let Some(value) = input.requirements_s3_object_version {
+            spec.requirements_s3_object_version = Some(value);
+        }
+        if let Some(value) = input.schedulers {
+            spec.schedulers = value;
+        }
+        if let Some(value) = input.source_bucket_arn {
+            spec.source_bucket_arn = value;
+        }
+        if let Some(value) = input.startup_script_s3_path {
+            spec.startup_script_s3_path = Some(value);
+        }
+        if let Some(value) = input.startup_script_s3_object_version {
+            spec.startup_script_s3_object_version = Some(value);
+        }
+        if let Some(value) = input.webserver_access_mode {
+            spec.webserver_access_mode = Some(value);
+        }
+        if let Some(value) = input.weekly_maintenance_window_start {
+            spec.weekly_maintenance_window_start = Some(value);
+        }
+
+        stored.begin_update(
+            now,
+            crate::state::UPDATE_SOURCE_API,
+            input.worker_replacement_strategy,
+        );
+
+        // The stored ARN, never a freshly minted one: the environment keeps the ARN its
+        // create recorded.
+        Ok(UpdateEnvironmentOutput {
+            arn: Some(stored.arn.clone()),
+        })
     }
 }

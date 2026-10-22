@@ -240,12 +240,13 @@ impl ComAmazonawsQbusinessExpertqState {
         if ids.is_empty() {
             return;
         }
+        let gone: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
         let Self {
             client_tokens,
             client_token_order,
             ..
         } = self;
-        client_tokens.retain(|_, id| !ids.contains(id));
+        client_tokens.retain(|_, id| !gone.contains(id.as_str()));
         client_token_order.retain(|key| client_tokens.contains_key(key));
     }
 

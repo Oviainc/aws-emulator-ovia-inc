@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBillingGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBillingGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBillingGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a stored billing group and the account associations it owned, so the
+//! next read no longer reports either.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +140,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBillingGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBillingGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteBillingGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        let group_arn = crate::state::normalize_billing_group_arn(&input.arn);
+        // One state method removes the group and everything that only existed
+        // because of it: its name-index entry, its account associations (whose
+        // accounts become UNMONITORED — they are still linked accounts of the payer
+        // account) and the idempotency entries that named it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBillingGroup"))
+        // This operation models no `ResourceNotFoundException`, so an `Arn` that
+        // names no stored group is refused with the modelled `ValidationException`
+        // and the reason the model enumerates for it.
+        if state.remove_billing_group(&group_arn).is_none() {
+            return Err(DeleteBillingGroupErrorModeled::ValidationException(
+                crate::state::validation_exception(
+                    "INVALID_BILLING_GROUP",
+                    "Arn",
+                    format!("the billing group {group_arn} does not exist"),
+                ),
+            )
+            .into());
+        }
+
+        Ok(DeleteBillingGroupOutput {
+            arn: Some(group_arn),
+        })
     }
 }

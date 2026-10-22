@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpgradeAccountPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpgradeAccountPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpgradeAccountPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves the caller's stored [`crate::state::AccountPlan`] onto the target
+//! `accountPlanType` and reports what was stored, so a following
+//! `GetAccountPlanState` reports the same plan.
+//!
+//! The scaffold's guidance follows.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +150,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpgradeAccountPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpgradeAccountPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpgradeAccountPlan"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpgradeAccountPlanErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Free Tier emulator is mounted on an engine that holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `accountPlanType` is an enum member, so the framework refuses a value
+        // outside it before `handle` runs; checking here as well keeps the
+        // refusal a 400 `ValidationException` whatever the boundary does with a
+        // value the enum does not declare.
+        let target = input.account_plan_type.as_str();
+        if !ACCOUNT_PLAN_TYPE_VALUES.contains(&target) {
+            return Err(validation(format!(
+                "accountPlanType: {target} is not an account plan type; expected one of {}",
+                ACCOUNT_PLAN_TYPE_VALUES.join(", ")
+            )));
+        }
+
+        let account_id = crate::state::caller_account_id();
+        let mut store = state.lock();
+        let plan = store.plan_mut(account_id);
+        // The plan the clock already moved is what this call starts from.
+        plan.settle(crate::state::now());
+
+        // The plan moves one way: this operation takes an account onto the paid
+        // plan, and an account already on it cannot be put back onto the free
+        // plan — the free plan is a one-off window, not a tier an account can
+        // re-enter.
+        if target == crate::state::PLAN_TYPE_FREE && plan.plan_type == crate::state::PLAN_TYPE_PAID
+        {
+            return Err(validation(
+                "accountPlanType: an account on the PAID plan cannot be moved back to the \
+                 FREE plan",
+            ));
+        }
+
+        plan.upgrade_to(target);
+
+        Ok(UpgradeAccountPlanOutput {
+            account_id: plan.account_id.clone(),
+            account_plan_type: plan.plan_type.clone(),
+            account_plan_status: plan.plan_status.clone(),
+        })
     }
+}
+
+/// Refuse the request with this operation's own modelled `ValidationException`
+/// (HTTP 400).
+fn validation(message: impl Into<String>) -> UpgradeAccountPlanError {
+    UpgradeAccountPlanErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+    })
+    .into()
 }

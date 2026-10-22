@@ -174,15 +174,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The only write a report may make: the status transition the clock already owes.
         store.settle(now);
 
-        let ordered: Vec<(u64, Application)> = store
+        // Paginate over the ordered records first, then build a summary only for the page
+        // that is actually returned.
+        let ordered: Vec<(u64, &crate::state::StoredApplication)> = store
             .applications_in_order()
             .into_iter()
-            .map(|application| (application.sequence, summary_of(application)))
+            .map(|application| (application.sequence, application))
             .collect();
         let page = crate::state::page_of(ordered, after, input.max_results);
 
         Ok(ListApplicationsOutput {
-            applications: Some(page.items),
+            applications: Some(page.items.into_iter().map(summary_of).collect()),
             next_token: page.next_token,
         })
     }

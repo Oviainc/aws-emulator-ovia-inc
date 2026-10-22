@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRelationship
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRelationship`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRelationship::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the relationship from [`crate::state`] and answers an empty
+//! body; a replayed `clientToken` replays that success instead of a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +149,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRelationship` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRelationshipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRelationship"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteRelationshipErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service is not mounted on a state-bearing engine".into(),
+                },
+            )
+            .into());
+        };
+
+        let Some(id) =
+            crate::state::resolve_identifier(&input.identifier, crate::state::RELATIONSHIP_ID_PREFIX)
+                .map(str::to_string)
+        else {
+            return Err(refusal(
+                "identifier",
+                format!(
+                    "Value '{}' at 'identifier' failed to satisfy constraint: Member must be a \
+                     relationship id or ARN",
+                    input.identifier
+                ),
+            ));
+        };
+        let Some(parent_id) = crate::state::resolve_identifier(
+            &input.program_management_account_identifier,
+            crate::state::PROGRAM_MANAGEMENT_ACCOUNT_ID_PREFIX,
+        )
+        .map(str::to_string)
+        else {
+            return Err(refusal(
+                "programManagementAccountIdentifier",
+                format!(
+                    "Value '{}' at 'programManagementAccountIdentifier' failed to satisfy \
+                     constraint: Member must be a program management account id or ARN",
+                    input.program_management_account_identifier
+                ),
+            ));
+        };
+
+        let mut probe = input.clone();
+        probe.client_token = None;
+        let request_fingerprint = crate::state::fingerprint(&probe);
+        let client_token = input.client_token.as_deref();
+
+        let mut guard = state.lock();
+        guard.advance_clock();
+
+        match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
+            crate::state::TokenOutcome::Fresh => {}
+            // A retry of the same delete: the record is already gone, and the
+            // operation is `@idempotent`, so the earlier success is replayed
+            // rather than turned into a 404.
+            crate::state::TokenOutcome::Replay(_) => return Ok(DeleteRelationshipOutput {}),
+            crate::state::TokenOutcome::ParameterMismatch
+            | crate::state::TokenOutcome::TokenInUse => {
+                return Err(DeleteRelationshipErrorModeled::ConflictException(
+                    ConflictException {
+                        message: "The specified clientToken has already been used with different \
+                                  parameters."
+                            .into(),
+                        resource_id: client_token.unwrap_or_default().to_string(),
+                        resource_type: "ClientToken".to_string(),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Addressed by (catalog, parent account, id), the same way the read is:
+        // a record that does not sit under exactly those is not found, and is not
+        // removed either.
+        let addressed = guard.relationships.get(&id).is_some_and(|relationship| {
+            relationship.catalog == input.catalog
+                && relationship.program_management_account_id == parent_id
+        });
+        if !addressed {
+            return Err(DeleteRelationshipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Relationship {id} was not found under program management account \
+                         {parent_id} in catalog {}.",
+                        input.catalog
+                    ),
+                    resource_id: Some(id.clone()),
+                    resource_type: Some(crate::state::RELATIONSHIP_RESOURCE_TYPE.into()),
+                },
+            )
+            .into());
+        }
+
+        guard.relationships.remove(&id);
+        guard.record_token(client_token, Self::NAME, &request_fingerprint, Some(id));
+
+        Ok(DeleteRelationshipOutput {})
     }
+}
+
+/// Refuse `member` with the modelled `ValidationException` (HTTP 400).
+fn refusal(member: &str, message: String) -> DeleteRelationshipError {
+    DeleteRelationshipErrorModeled::ValidationException(crate::state::validation_exception(
+        member, message,
+    ))
+    .into()
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFHIRDatastore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFHIRDatastore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFHIRDatastore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts the deletion of a persisted data store: the stored record moves to
+//! `DELETING`, and to `DELETED` once the clock makes that transition due.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +153,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFHIRDatastore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFHIRDatastoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFHIRDatastore"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteFHIRDatastoreErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the HealthLake data store registry is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.settle_lifecycle();
+
+        let Some(datastore) = store.datastores.get_mut(&input.datastore_id) else {
+            return Err(DeleteFHIRDatastoreErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Datastore with ID {} does not exist",
+                        input.datastore_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        match datastore.status {
+            // Only a settled, usable data store can be deleted.
+            crate::state::DatastoreStatus::Active => {}
+            // `ConflictException` is modelled as "the data store is in a
+            // transition state and the user requested action cannot be
+            // performed" — which is exactly `CREATING` and `DELETING`.
+            crate::state::DatastoreStatus::Creating | crate::state::DatastoreStatus::Deleting => {
+                return Err(DeleteFHIRDatastoreErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "Datastore with ID {} is in status {} and cannot be deleted",
+                            input.datastore_id,
+                            datastore.status.as_wire()
+                        )),
+                    },
+                )
+                .into());
+            }
+            // A deleted data store is not in transition — it is gone.
+            crate::state::DatastoreStatus::Deleted => {
+                return Err(DeleteFHIRDatastoreErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Datastore with ID {} does not exist",
+                            input.datastore_id
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        datastore.status = crate::state::DatastoreStatus::Deleting;
+        datastore.pending = Some((
+            ::std::time::Instant::now() + crate::state::LIFECYCLE_TRANSITION,
+            crate::state::DatastoreStatus::Deleted,
+        ));
+
+        Ok(DeleteFHIRDatastoreOutput {
+            datastore_id: datastore.id.clone(),
+            datastore_arn: datastore.arn.clone(),
+            datastore_status: datastore.status.as_wire().to_string(),
+            datastore_endpoint: datastore.endpoint.clone(),
+        })
     }
 }

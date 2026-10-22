@@ -1,11 +1,449 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-billingconductor-awsbillingconductor service.
+//!
+//! The pricing-plan / billing-group core loop is persisted here. Every record is
+//! keyed by its FULL ARN, because that is the identity the wire uses: the modeled
+//! `BillingGroupArn` / `PricingPlanArn` patterns accept either the full ARN or the
+//! bare resource id, so a handler normalises its input through
+//! [`normalize_billing_group_arn`] / [`normalize_pricing_plan_arn`] before touching
+//! the maps and two spellings of one resource cannot become two records.
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+/// This service's ARN namespace (`OPERATIONS.md`: "ARN namespace: billingconductor").
+const ARN_SERVICE: &str = "billingconductor";
+
+/// billingconductor is a global (billing) service, so its ARNs carry no region —
+/// the modeled patterns have an empty region segment
+/// (`arn:aws:billingconductor::<account>:billinggroup/...`).
+const ARN_REGION: &str = "";
+
+/// The pricing plans Amazon Web Services owns rather than the caller: the
+/// `PricingPlanFullArn` pattern enumerates them beside the 10-character
+/// customer-minted id
+/// (`.../pricingplan/(BasicPricingPlan|Passthrough|[a-zA-Z0-9]{10})`), so a billing
+/// group may name one without the caller ever having created it.
+pub const AWS_MANAGED_PRICING_PLAN_IDS: &[&str] = &["BasicPricingPlan", "Passthrough"];
+
+/// The alphabet the modeled resource-id patterns allow (`[a-zA-Z0-9]`).
+const ID_ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/// Wall-clock millis since the epoch — the unit the modeled `Instant` long carries
+/// (`CreationTime` / `LastModifiedTime`).
+pub fn now_millis() -> i64 {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// The full ARN of a pricing plan resource id.
+pub fn pricing_plan_arn(id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, ARN_REGION, &format!("pricingplan/{id}"))
+}
+
+/// The full ARN of a billing group resource id.
+pub fn billing_group_arn(id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, ARN_REGION, &format!("billinggroup/{id}"))
+}
+
+/// A `BillingGroupArn` as this service stores it: the pattern accepts the full ARN
+/// or the bare `[a-zA-Z0-9]{10,12}` id, and both name the same resource.
+pub fn normalize_billing_group_arn(value: &str) -> String {
+    if value.starts_with("arn:") {
+        value.to_string()
+    } else {
+        billing_group_arn(value)
+    }
+}
+
+/// A `PricingPlanArn` as this service stores it. See [`normalize_billing_group_arn`].
+///
+/// A bare AWS-managed id resolves to the ARN Amazon Web Services owns (account
+/// segment `aws`), not to this emulator's account: the `PricingPlanFullArn` pattern
+/// allows `(aws|[0-9]{12})` for exactly that reason.
+pub fn normalize_pricing_plan_arn(value: &str) -> String {
+    if value.starts_with("arn:") {
+        value.to_string()
+    } else if AWS_MANAGED_PRICING_PLAN_IDS.contains(&value) {
+        aws_managed_pricing_plan_arn(value)
+    } else {
+        pricing_plan_arn(value)
+    }
+}
+
+/// The ARN of an AWS-managed pricing plan: owned by Amazon Web Services, so its
+/// account segment is the literal `aws` the `PricingPlanFullArn` pattern allows
+/// beside a 12-digit account.
+fn aws_managed_pricing_plan_arn(id: &str) -> String {
+    format!("arn:aws:{ARN_SERVICE}:{ARN_REGION}:aws:pricingplan/{id}")
+}
+
+/// True when the value is one of the AWS-managed plans of
+/// [`AWS_MANAGED_PRICING_PLAN_IDS`] — the WHOLE ARN has to be the one Amazon Web
+/// Services owns, so another partition's or another account's ARN ending in the
+/// same id is not managed and must exist in state like any other plan.
+pub fn is_aws_managed_pricing_plan(arn: &str) -> bool {
+    AWS_MANAGED_PRICING_PLAN_IDS
+        .iter()
+        .any(|id| arn == *id || arn == aws_managed_pricing_plan_arn(id))
+}
+
+/// A pricing plan as `CreatePricingPlan` persisted it.
+#[derive(Debug, Clone, Default)]
+pub struct PricingPlanRecord {
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub pricing_rule_arns: Vec<String>,
+    pub tags: BTreeMap<String, String>,
+    pub creation_time_millis: i64,
+    pub last_modified_time_millis: i64,
+}
+
+/// A billing group as `CreateBillingGroup` persisted it. `Size`, `Status` and
+/// `BillingGroupType` are DERIVED (see the methods below), never stored, so they
+/// cannot drift from the membership and the preferences they are computed from.
+#[derive(Debug, Clone, Default)]
+pub struct BillingGroupRecord {
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub primary_account_id: Option<String>,
+    pub pricing_plan_arn: String,
+    pub linked_account_ids: Vec<String>,
+    pub auto_associate: Option<bool>,
+    pub responsibility_transfer_arn: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    pub creation_time_millis: i64,
+    pub last_modified_time_millis: i64,
+}
+
+impl BillingGroupRecord {
+    /// `Size`: "The number of accounts in the particular billing group."
+    pub fn size(&self) -> i64 {
+        i64::try_from(self.linked_account_ids.len()).unwrap_or(i64::MAX)
+    }
+
+    /// `BillingGroupStatus`. A group needs a billing owner: either a primary
+    /// account, or a responsibility transfer relationship — the model documents
+    /// `AccountGrouping.ResponsibilityTransferArn` as "When specified, the
+    /// PrimaryAccountId is no longer required". Without either, the group is
+    /// `PRIMARY_ACCOUNT_MISSING`.
+    pub fn status(&self) -> &'static str {
+        if self.primary_account_id.is_some() || self.responsibility_transfer_arn.is_some() {
+            "ACTIVE"
+        } else {
+            "PRIMARY_ACCOUNT_MISSING"
+        }
+    }
+
+    /// `StatusReason`: why the group is in [`status`](Self::status), absent when it
+    /// is `ACTIVE`.
+    pub fn status_reason(&self) -> Option<String> {
+        (self.status() == "PRIMARY_ACCOUNT_MISSING").then(|| {
+            "The billing group has no primary account and no responsibility transfer ARN."
+                .to_string()
+        })
+    }
+
+    /// `BillingGroupType`: a group that bills through a transfer relationship is
+    /// `TRANSFER_BILLING`, every other group is `STANDARD`.
+    pub fn billing_group_type(&self) -> &'static str {
+        if self.responsibility_transfer_arn.is_some() {
+            "TRANSFER_BILLING"
+        } else {
+            "STANDARD"
+        }
+    }
+}
 
 /// Per-service state for com-amazonaws-billingconductor-awsbillingconductor. A handler reaches it through [`service_state`].
+///
+/// The maps are ordered (`BTreeMap`/`BTreeSet`) so that the list operations page
+/// over a stable sequence: a `NextToken` handed back by one call has to name the
+/// same cut point on the next one.
+///
+/// # Growth
+///
+/// EVERY store here is bounded by an explicit maximum, because a caller decides
+/// how many requests to make:
+///
+/// * `pricing_plans` / `pricing_plan_names` hold one entry per plan, at most
+///   [`MAX_PRICING_PLANS`]; `billing_groups` / `billing_group_names` one per group,
+///   at most [`MAX_BILLING_GROUPS`]; a group's membership and its share of
+///   `account_associations` at most [`MAX_ACCOUNTS_PER_BILLING_GROUP`]. A create or
+///   an association past its cap is REFUSED with the modelled
+///   `ServiceLimitExceededException` — never by evicting a stored resource, which a
+///   later caller must still be able to read. They are written only on a success
+///   path (a replay, a name conflict, a missing pricing plan or a taken account all
+///   return before any insert), and
+///   [`remove_billing_group`](ComAmazonawsBillingconductorAwsbillingconductorState::remove_billing_group)
+///   reclaims a deleted group's share of all of them.
+/// * `unassociated_accounts` keeps the released accounts a later
+///   `ListAccountAssociations` has to report as `UNMONITORED`. Nothing deletes a
+///   linked account, so this one is capped at [`MAX_UNASSOCIATED_ACCOUNTS`] and
+///   evicts oldest-first.
+/// * the idempotency index is capped at [`MAX_IDEMPOTENCY_TOKENS`], evicts
+///   oldest-first, and additionally drops the entries that point at a deleted
+///   group.
+///
+/// A read never writes. The response side is capped too: every page is at most
+/// the request's `MaxResults`, or [`DEFAULT_PAGE_SIZE`] when it names none.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
-    // TODO: add service-specific state fields
+    /// Pricing plans by full ARN.
+    pub pricing_plans: BTreeMap<String, PricingPlanRecord>,
+    /// Pricing plan name -> ARN; the uniqueness index behind the name conflict
+    /// ("The names must be unique to each pricing plan").
+    pub pricing_plan_names: BTreeMap<String, String>,
+    /// Billing groups by full ARN.
+    pub billing_groups: BTreeMap<String, BillingGroupRecord>,
+    /// Billing group name -> ARN ("The billing group name. The names must be unique.").
+    pub billing_group_names: BTreeMap<String, String>,
+    /// Account id -> billing group ARN. The index that makes "not associated with
+    /// another billing group" decidable and the MONITORED filter computable. One
+    /// entry per account of a live billing group; a delete reclaims them.
+    pub account_associations: BTreeMap<String, String>,
+    /// The bounded tail of linked accounts that belong to no billing group: the ones
+    /// a delete released, and a primary account that is not a member of its own
+    /// group. They are what `UNMONITORED` reports. Private so the cap below cannot
+    /// be bypassed by a handler inserting directly.
+    unassociated_accounts: VecDeque<String>,
+    /// `<operation>:<ClientToken>` -> the ARN that token's first call minted, so a
+    /// retry "completes successfully without performing any further actions".
+    /// Private for the same reason as `unassociated_accounts`.
+    idempotency_tokens: BTreeMap<String, String>,
+    /// The keys of `idempotency_tokens` in insertion order, so the cap evicts the
+    /// oldest token rather than an arbitrary one.
+    idempotency_order: VecDeque<String>,
+    /// Monotonic source of the alphanumeric resource ids the ARN patterns require.
+    id_counter: u64,
+}
+
+impl ComAmazonawsBillingconductorAwsbillingconductorState {
+    /// Mint the next `width`-character `[a-zA-Z0-9]` resource id. Monotonic, so no
+    /// two resources of this service ever share an id.
+    pub fn mint_resource_id(&mut self, width: usize) -> String {
+        self.id_counter += 1;
+        let mut value = self.id_counter;
+        let mut id = vec![b'0'; width];
+        for slot in id.iter_mut().rev() {
+            let alphabet_len = u64::try_from(ID_ALPHABET.len()).unwrap_or(36);
+            *slot = ID_ALPHABET[usize::try_from(value % alphabet_len).unwrap_or(0)];
+            value /= alphabet_len;
+        }
+        String::from_utf8(id).unwrap_or_else(|_| "0".repeat(width))
+    }
+
+    /// The ARN a previous call with this `ClientToken` minted, if any.
+    pub fn replayed_idempotent_arn(&self, operation: &str, token: Option<&str>) -> Option<String> {
+        let token = token?;
+        self.idempotency_tokens
+            .get(&idempotency_key(operation, token))
+            .cloned()
+    }
+
+    /// Remember which ARN this `ClientToken` minted, evicting the oldest remembered
+    /// token once [`MAX_IDEMPOTENCY_TOKENS`] are held.
+    pub fn record_idempotent_arn(&mut self, operation: &str, token: Option<&str>, arn: &str) {
+        let Some(token) = token else { return };
+        let key = idempotency_key(operation, token);
+        if self.idempotency_tokens.insert(key.clone(), arn.to_string()).is_none() {
+            self.idempotency_order.push_back(key);
+        }
+        while self.idempotency_order.len() > MAX_IDEMPOTENCY_TOKENS {
+            if let Some(oldest) = self.idempotency_order.pop_front() {
+                self.idempotency_tokens.remove(&oldest);
+            }
+        }
+    }
+
+    /// Record a linked account that belongs to no billing group, so a later
+    /// `ListAccountAssociations` reports it as `UNMONITORED`. Capped at
+    /// [`MAX_UNASSOCIATED_ACCOUNTS`], oldest evicted first.
+    pub fn note_unassociated_account(&mut self, account_id: &str) {
+        if self
+            .unassociated_accounts
+            .iter()
+            .any(|known| known == account_id)
+        {
+            return;
+        }
+        self.unassociated_accounts.push_back(account_id.to_string());
+        while self.unassociated_accounts.len() > MAX_UNASSOCIATED_ACCOUNTS {
+            self.unassociated_accounts.pop_front();
+        }
+    }
+
+    /// Every linked account this service can report, in account-id order, each with
+    /// the billing group it is associated with (`None` when it is in none).
+    ///
+    /// The association index decides: an account that is associated is reported with
+    /// its group even if it is also in the released tail, so a re-associated account
+    /// cannot be reported twice or as `UNMONITORED`.
+    pub fn linked_accounts(&self) -> BTreeMap<String, Option<String>> {
+        let mut accounts: BTreeMap<String, Option<String>> = self
+            .unassociated_accounts
+            .iter()
+            .map(|account_id| (account_id.clone(), None))
+            .collect();
+        for (account_id, group_arn) in &self.account_associations {
+            accounts.insert(account_id.clone(), Some(group_arn.clone()));
+        }
+        accounts
+    }
+
+    /// Delete a billing group and everything that only existed because of it: its
+    /// name index entry, its account associations (whose accounts become
+    /// `UNMONITORED`) and the idempotency entries that named it. `None` when no such
+    /// group is stored.
+    pub fn remove_billing_group(&mut self, group_arn: &str) -> Option<BillingGroupRecord> {
+        let removed = self.billing_groups.remove(group_arn)?;
+        self.billing_group_names.remove(&removed.name);
+
+        let released: Vec<String> = self
+            .account_associations
+            .iter()
+            .filter(|(_, arn)| arn.as_str() == group_arn)
+            .map(|(account_id, _)| account_id.clone())
+            .collect();
+        for account_id in released {
+            self.account_associations.remove(&account_id);
+            self.note_unassociated_account(&account_id);
+        }
+
+        self.idempotency_tokens.retain(|_, arn| arn != group_arn);
+        let remaining = &self.idempotency_tokens;
+        self.idempotency_order
+            .retain(|key| remaining.contains_key(key));
+
+        Some(removed)
+    }
+
+    /// True when the pricing plan ARN can be used by a billing group: either the
+    /// caller created it, or it is one of the AWS-managed plans the
+    /// `PricingPlanFullArn` pattern names.
+    pub fn pricing_plan_exists(&self, arn: &str) -> bool {
+        is_aws_managed_pricing_plan(arn) || self.pricing_plans.contains_key(arn)
+    }
+
+    /// The group an account is already associated with, when it is not `group_arn`.
+    pub fn conflicting_association(&self, account_id: &str, group_arn: &str) -> Option<&str> {
+        self.account_associations
+            .get(account_id)
+            .map(String::as_str)
+            .filter(|existing| *existing != group_arn)
+    }
+}
+
+/// A `ClientToken` is scoped to the operation that minted it: two operations may
+/// legitimately be retried with the same token value.
+fn idempotency_key(operation: &str, token: &str) -> String {
+    format!("{operation}:{token}")
+}
+
+/// How many `ClientToken` -> ARN entries this service remembers.
+///
+/// A CHOSEN bound, not an AWS limit: AWS's own idempotency windows are finite (a
+/// client token stops being recognised after some hours), and this is the
+/// emulator's equivalent — the oldest token is forgotten once the cap is reached, so
+/// a caller replaying a token it used long ago creates a new resource instead of
+/// growing this map without limit.
+pub const MAX_IDEMPOTENCY_TOKENS: usize = 1024;
+
+/// How many released (`UNMONITORED`) linked accounts this service remembers.
+///
+/// A CHOSEN bound, not an AWS limit: nothing in this API deletes a linked account,
+/// so the set of accounts that belong to no billing group would otherwise grow with
+/// every create-and-delete. The oldest released account is forgotten first; an
+/// account that is still associated with a group is never in this tail.
+pub const MAX_UNASSOCIATED_ACCOUNTS: usize = 1024;
+
+/// How many pricing plans this emulator stores for the account.
+///
+/// A CHOSEN bound, not an AWS limit (the real service's quota is adjustable per
+/// account). It exists because nothing in this slice deletes a pricing plan, so
+/// without it one caller could grow the store with every request. A create past the
+/// cap is REFUSED with the modelled `ServiceLimitExceededException` rather than
+/// evicting someone else's resource: a stored resource must stay readable.
+pub const MAX_PRICING_PLANS: usize = 1000;
+
+/// How many billing groups this emulator stores for the account. A CHOSEN bound;
+/// see [`MAX_PRICING_PLANS`] for why it exists and how it is enforced.
+pub const MAX_BILLING_GROUPS: usize = 1000;
+
+/// How many linked accounts one billing group may hold. A CHOSEN bound; see
+/// [`MAX_PRICING_PLANS`]. The model caps one `AssociateAccounts` call at 30 account
+/// ids, which bounds a single request but not the membership it accumulates.
+pub const MAX_ACCOUNTS_PER_BILLING_GROUP: usize = 1000;
+
+/// The Service Quotas-style service code this service's limit errors carry.
+pub const SERVICE_CODE: &str = "billingconductor";
+
+/// The page size the list operations apply when the request names none.
+///
+/// `ListAccountAssociations` is `@paginated` with a `NextToken` but models no
+/// `MaxResults` at all, and `ListBillingGroups`'s `MaxResults` is optional, so in
+/// both cases the SERVER chooses. This is the upper bound the service itself models
+/// for that member (`MaxBillingGroupResults`, range 1..100), so one response is
+/// bounded however much state exists, and a caller that wants more pages the
+/// `NextToken` it already gets.
+pub const DEFAULT_PAGE_SIZE: i32 = 100;
+
+/// Cut one page out of an ordered, already-filtered sequence of `(key, element)`.
+///
+/// The `NextToken` IS the key of the first element left out, so it is a cursor
+/// rather than an offset: resuming skips every key below it. The page size is the
+/// request's `max_results` CLAMPED to 1..=[`DEFAULT_PAGE_SIZE`] — a request that
+/// names none, or names a value the modelled range does not allow, is served the
+/// default — so a page is bounded whatever reaches this helper.
+pub fn paginate<T>(
+    items: Vec<(String, T)>,
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+) -> (Vec<T>, Option<String>) {
+    let start = next_token.unwrap_or("");
+    let mut page: Vec<(String, T)> = items
+        .into_iter()
+        .filter(|(key, _)| key.as_str() >= start)
+        .collect();
+    let requested = max_results
+        .filter(|max| *max > 0)
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .min(DEFAULT_PAGE_SIZE);
+    let limit = usize::try_from(requested).unwrap_or(1);
+    let token = page.get(limit).map(|(key, _)| key.clone());
+    page.truncate(limit);
+    (page.into_iter().map(|(_, element)| element).collect(), token)
+}
+
+/// The first value that appears more than once in `values`, if any.
+pub fn first_duplicate(values: &[String]) -> Option<&String> {
+    let mut seen = BTreeSet::new();
+    values.iter().find(|value| !seen.insert(value.as_str()))
+}
+
+/// The modelled `ValidationException` this service refuses a request with: the
+/// reason (one of `ValidationExceptionReason`), the member at fault, and the text.
+///
+/// It lives in this module rather than one of its own because `src/ops/mod.rs` is
+/// GENERATED, so a helper several operations share has no other home in this crate.
+pub fn validation_exception(
+    reason: &str,
+    field: &str,
+    message: impl Into<String>,
+) -> crate::ops::types::ValidationException {
+    let message = message.into();
+    crate::ops::types::ValidationException {
+        message: message.clone(),
+        reason: Some(reason.to_string()),
+        fields: Some(vec![crate::ops::types::ValidationExceptionField {
+            name: field.to_string(),
+            message,
+        }]),
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

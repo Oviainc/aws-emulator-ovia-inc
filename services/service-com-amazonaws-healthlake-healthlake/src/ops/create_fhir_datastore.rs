@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFHIRDatastore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFHIRDatastore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFHIRDatastore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a FHIR data store and PERSISTS it in [`crate::state`], so every later
+//! `Describe`/`List`/`Tag`/`Delete` call reports what this call stored.
 //!
 //! ## Shape of an operation
 //!
@@ -169,21 +163,203 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFHIRDatastore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFHIRDatastoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFHIRDatastore"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFHIRDatastoreErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the HealthLake data store registry is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `FHIRVersion` models exactly one value, so the boundary validator has
+        // already refused anything else; this re-states the rule rather than
+        // trusting it, because a release version the service cannot host must
+        // never be recorded on a data store.
+        if !F_H_I_R_VERSION_VALUES.contains(&input.datastore_type_version.as_str()) {
+            return Err(CreateFHIRDatastoreErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "DatastoreTypeVersion must be one of {}, got '{}'",
+                        F_H_I_R_VERSION_VALUES.join(", "),
+                        input.datastore_type_version
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        store.settle_lifecycle();
+
+        // A tag set larger than one data store carries is refused rather than
+        // stored: the modelled `TagList` bound caps the request, this caps the
+        // resource. Keyed, so two requests that differ only in the order their
+        // tags arrive are the same request.
+        let tags: ::std::collections::BTreeMap<String, String> = input
+            .tags
+            .take()
+            .into_iter()
+            .flatten()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        if tags.len() > crate::state::MAX_TAGS_PER_DATASTORE {
+            return Err(CreateFHIRDatastoreErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Tags must hold at most {} distinct keys, got {}",
+                        crate::state::MAX_TAGS_PER_DATASTORE,
+                        tags.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `ClientToken` is this operation's `@idempotencyToken`: a repeat of the
+        // SAME call carrying a token already seen resolves to the data store that
+        // token minted instead of minting a second one. A token reused with a
+        // different request is a different request, and is refused rather than
+        // answered with the earlier data store.
+        let fingerprint = request_fingerprint(
+            &region,
+            input.datastore_name.as_deref(),
+            &input.datastore_type_version,
+            &tags,
+            &input,
+        );
+        if let Some(recorded) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.client_tokens.get(token))
+            .cloned()
+        {
+            if recorded.fingerprint != fingerprint {
+                return Err(CreateFHIRDatastoreErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            "ClientToken was already used for a different CreateFHIRDatastore request"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            if let Some(existing) = store.datastores.get(&recorded.datastore_id) {
+                return Ok(CreateFHIRDatastoreOutput {
+                    datastore_id: existing.id.clone(),
+                    datastore_arn: existing.arn.clone(),
+                    datastore_status: existing.status.as_wire().to_string(),
+                    datastore_endpoint: existing.endpoint.clone(),
+                });
+            }
+        }
+
+        // The store holds a bounded number of data stores. Terminal records are
+        // reaped before the refusal, so a caller that deletes what it created
+        // can always create again; only a genuinely full store is refused.
+        if store.datastores.len() >= crate::state::MAX_DATASTORES {
+            store.reap_terminal_records();
+        }
+        if store.datastores.len() >= crate::state::MAX_DATASTORES {
+            return Err(CreateFHIRDatastoreErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(format!(
+                        "The maximum number of data stores ({}) already exists",
+                        crate::state::MAX_DATASTORES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let id = store.next_datastore_id(now);
+        let datastore = crate::state::Datastore {
+            arn: crate::state::datastore_arn(&region, &id),
+            endpoint: crate::state::datastore_endpoint(&region, &id),
+            id: id.clone(),
+            name: input.datastore_name,
+            // A resource AWS returns in a non-terminal status owes the clock one
+            // transition. The due instant is stored on the record and
+            // materialised by whichever call reads it next; nothing sleeps.
+            status: crate::state::DatastoreStatus::Creating,
+            pending: Some((
+                ::std::time::Instant::now() + crate::state::LIFECYCLE_TRANSITION,
+                crate::state::DatastoreStatus::Active,
+            )),
+            reap_at: None,
+            type_version: input.datastore_type_version,
+            created_at: ::aws_smithy_types::DateTime::from(now),
+            sse_configuration: input.sse_configuration,
+            preload_data_config: input.preload_data_config,
+            identity_provider_configuration: input.identity_provider_configuration,
+            analytics_configuration: input.analytics_configuration,
+            nlp_configuration: input.nlp_configuration,
+            profile_configuration: input.profile_configuration,
+            backup_configuration: input.backup_configuration,
+            error_cause: None,
+            tags,
+        };
+
+        let output = CreateFHIRDatastoreOutput {
+            datastore_id: datastore.id.clone(),
+            datastore_arn: datastore.arn.clone(),
+            datastore_status: datastore.status.as_wire().to_string(),
+            datastore_endpoint: datastore.endpoint.clone(),
+        };
+        store.datastores.insert(id.clone(), datastore);
+        if let Some(token) = input.client_token {
+            store.record_client_token(token, &id, fingerprint);
+        }
+        Ok(output)
     }
+}
+
+/// A fingerprint of everything this request asks for, so one `ClientToken`
+/// resolves to its data store only for a repeat of the SAME request.
+///
+/// Built from the members that define the data store — never from the token
+/// itself — with tags taken keyed rather than in arrival order, and the region
+/// included because it is what the minted ARN and endpoint are built from.
+fn request_fingerprint(
+    region: &str,
+    name: Option<&str>,
+    type_version: &str,
+    tags: &::std::collections::BTreeMap<String, String>,
+    input: &CreateFHIRDatastoreInput,
+) -> String {
+    use sha2::Digest;
+
+    let mut hasher = sha2::Sha256::new();
+    for field in [
+        region.to_string(),
+        // An absent name and an empty one are different requests, so presence
+        // is part of the field rather than collapsed by a default.
+        match name {
+            Some(name) => format!("present:{name}"),
+            None => "absent".to_string(),
+        },
+        type_version.to_string(),
+        format!("{tags:?}"),
+        // The configuration shapes have no canonical string form of their own;
+        // their derived `Debug` is deterministic for a given value, which is
+        // all a fingerprint needs.
+        format!("{:?}", input.sse_configuration),
+        format!("{:?}", input.preload_data_config),
+        format!("{:?}", input.identity_provider_configuration),
+        format!("{:?}", input.analytics_configuration),
+        format!("{:?}", input.nlp_configuration),
+        format!("{:?}", input.profile_configuration),
+        format!("{:?}", input.backup_configuration),
+    ] {
+        // Length-prefixed, so two different field splits cannot hash alike.
+        hasher.update(field.len().to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    hex::encode(hasher.finalize())
 }

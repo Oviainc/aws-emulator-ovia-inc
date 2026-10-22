@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApprovalTeam
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApprovalTeam`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies the supplied `Description`, `ApprovalStrategy` and/or `Approvers` to the
+//! stored team, records a new `VersionId` and `LastUpdateTime`, and returns that new
+//! version id. A following `GetApprovalTeam` reports the updated fields and the new
+//! version.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApprovalTeam::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! * An ARN no stored team carries earns `ResourceNotFoundException` (404).
+//! * A team already in `DELETING` cannot be changed: `ConflictException` (409).
+//! * An `MofN` strategy asking for more approvals (M) than the team will have approvers
+//!   (N) earns `ValidationException` (400) — the same unsatisfiable combination
+//!   `CreateApprovalTeam` refuses, checked against the approver set the update produces.
+//!   `Approvers` naming one identity twice is refused the same way.
+//!
+//! An approver the request keeps (same `PrimaryIdentityId` from the same identity source)
+//! keeps its `ApproverId` and its invitation response; one the request adds is newly
+//! invited, so it is `PENDING` until the clock owes its response.
+//!
+//! `UpdateActions` is accepted and applied to nothing: its only value synchronises MFA
+//! devices, and this service stores none, so there is nothing to synchronise. A request
+//! that carries no field to apply leaves the team — and therefore its version — as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +174,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApprovalTeam` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApprovalTeamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApprovalTeam"))
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateApprovalTeamError::Modeled(
+                UpdateApprovalTeamErrorModeled::InternalServerException(InternalServerException {
+                    message: "the approval-team store is unavailable".to_string(),
+                }),
+            )
+        })?;
+        let mut state = store.lock();
+        let now = ::std::time::SystemTime::now();
+        state.materialize_due(now);
+
+        let not_found = || {
+            UpdateApprovalTeamError::Modeled(
+                UpdateApprovalTeamErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("No approval team found for ARN '{}'.", input.arn),
+                    },
+                ),
+            )
+        };
+
+        // Snapshot what the decision needs, so minting approver ids (which borrows the
+        // store mutably) does not overlap the borrow of the team.
+        let (existing_approvers, status, current_strategy) = {
+            let team = state.team(&input.arn).ok_or_else(not_found)?;
+            (
+                team.approvers.clone(),
+                team.status,
+                team.approval_strategy,
+            )
+        };
+
+        if status == crate::state::TeamStatus::Deleting {
+            return Err(UpdateApprovalTeamErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Approval team '{}' is being deleted and cannot be updated.",
+                    input.arn
+                ),
+            })
+            .into());
+        }
+
+        if let Some(requested) = input.approvers.as_ref() {
+            if let Some(repeated) = crate::state::repeated_identity(requested.iter().map(|a| {
+                (
+                    a.primary_identity_id.as_str(),
+                    a.primary_identity_source_arn.as_str(),
+                )
+            })) {
+                return Err(UpdateApprovalTeamErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "Approvers names the same identity more than once ({repeated}); each \
+                             approver must be a distinct identity."
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Rebuild the approver set, carrying each retained approver's id and
+        // invitation response across and inviting the ones the request adds.
+        let new_approvers = match input.approvers.as_ref() {
+            None => None,
+            Some(requested) => {
+                let mut rebuilt = Vec::with_capacity(requested.len());
+                for approver in requested {
+                    let retained = existing_approvers.iter().find(|stored| {
+                        stored.primary_identity_id == approver.primary_identity_id
+                            && stored.primary_identity_source_arn
+                                == approver.primary_identity_source_arn
+                    });
+                    match retained {
+                        Some(stored) => rebuilt.push(stored.clone()),
+                        None => {
+                            let approver_id = state.mint_approver_id();
+                            rebuilt.push(crate::state::Approver::invited(
+                                approver_id,
+                                approver.primary_identity_id.clone(),
+                                approver.primary_identity_source_arn.clone(),
+                                now,
+                            ));
+                        }
+                    }
+                }
+                Some(rebuilt)
+            }
+        };
+
+        let new_strategy = input.approval_strategy.as_ref().map(|strategy| match strategy {
+            ApprovalStrategy::MofN(mof_n) => crate::state::StoredApprovalStrategy::MofN {
+                min_approvals_required: mof_n.min_approvals_required,
+            },
+        });
+
+        // M of N is checked against the set the update PRODUCES, not the one it replaces.
+        let resulting_count = new_approvers
+            .as_ref()
+            .map_or(existing_approvers.len(), Vec::len);
+        let resulting_count = i32::try_from(resulting_count).unwrap_or(i32::MAX);
+        let resulting_min = new_strategy
+            .unwrap_or(current_strategy)
+            .min_approvals_required();
+        if resulting_min > resulting_count {
+            return Err(UpdateApprovalTeamErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "ApprovalStrategy.MofN.MinApprovalsRequired ({resulting_min}) must not exceed \
+                     the number of Approvers ({resulting_count})."
+                ),
+            })
+            .into());
+        }
+
+        let team = state.team_mut(&input.arn).ok_or_else(not_found)?;
+        let mut applied = false;
+        if let Some(description) = input.description.as_ref() {
+            team.description = description.clone();
+            applied = true;
+        }
+        if let Some(strategy) = new_strategy {
+            team.approval_strategy = strategy;
+            applied = true;
+        }
+        if let Some(approvers) = new_approvers {
+            team.approvers = approvers;
+            applied = true;
+        }
+        if applied {
+            team.bump_version(now);
+        }
+
+        Ok(UpdateApprovalTeamOutput {
+            version_id: Some(team.version_id.clone()),
+        })
     }
 }

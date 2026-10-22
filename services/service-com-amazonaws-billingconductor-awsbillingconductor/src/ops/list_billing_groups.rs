@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBillingGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBillingGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reads billing groups back out of state, applying the modelled filters and
+//! `MaxResults`/`NextToken` paging. A pure read: it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBillingGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! LIMITATION: `BillingPeriod` selects the month to report for. This emulator keeps
+//! no per-billing-period history of a group's membership or preferences, so every
+//! period reports the group's CURRENT state. A page is always bounded — by the
+//! request's `MaxResults`, or by `crate::state::DEFAULT_PAGE_SIZE` when it names
+//! none.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +119,106 @@ impl From<ListBillingGroupsErrorModeled> for ListBillingGroupsError {
     }
 }
 
+/// Refuse the request with this operation's modelled 400 `ValidationException`.
+fn validation(reason: &str, field: &str, message: String) -> ListBillingGroupsError {
+    ListBillingGroupsErrorModeled::ValidationException(crate::state::validation_exception(
+        reason, field, message,
+    ))
+    .into()
+}
+
+/// Does `group` pass every filter the request set?
+///
+/// Each member of `ListBillingGroupsFilter` is an independent predicate and an
+/// absent one filters nothing; a list member matches when the group's value is one
+/// of the listed ones.
+fn matches(
+    group: &crate::state::BillingGroupRecord,
+    filters: &ListBillingGroupsFilter,
+) -> Result<bool, ListBillingGroupsError> {
+    if let Some(arns) = &filters.arns {
+        let wanted: Vec<String> = arns
+            .iter()
+            .map(|arn| crate::state::normalize_billing_group_arn(arn))
+            .collect();
+        if !wanted.contains(&group.arn) {
+            return Ok(false);
+        }
+    }
+    if let Some(pricing_plan) = &filters.pricing_plan {
+        if crate::state::normalize_pricing_plan_arn(pricing_plan) != group.pricing_plan_arn {
+            return Ok(false);
+        }
+    }
+    if let Some(statuses) = &filters.statuses {
+        if !statuses.iter().any(|status| status == group.status()) {
+            return Ok(false);
+        }
+    }
+    if let Some(auto_associate) = filters.auto_associate {
+        if group.auto_associate.unwrap_or(false) != auto_associate {
+            return Ok(false);
+        }
+    }
+    if let Some(primary_account_ids) = &filters.primary_account_ids {
+        match &group.primary_account_id {
+            Some(primary) if primary_account_ids.contains(primary) => {}
+            _ => return Ok(false),
+        }
+    }
+    if let Some(types) = &filters.billing_group_types {
+        if !types.iter().any(|kind| kind == group.billing_group_type()) {
+            return Ok(false);
+        }
+    }
+    if let Some(transfer_arns) = &filters.responsibility_transfer_arns {
+        match &group.responsibility_transfer_arn {
+            Some(arn) if transfer_arns.contains(arn) => {}
+            _ => return Ok(false),
+        }
+    }
+    for search in filters.names.iter().flatten() {
+        // `SearchOption` models exactly one option today; any other value is a
+        // filter this service cannot apply, which is a refusal rather than a
+        // silently-ignored member.
+        if search.search_option != "STARTS_WITH" {
+            return Err(validation(
+                "INVALID_FILTER",
+                "Filters.Names.SearchOption",
+                format!("unsupported search option {}", search.search_option),
+            ));
+        }
+        if !group.name.starts_with(&search.search_value) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The modelled view of a stored group. `Size`, `Status`, `StatusReason` and
+/// `BillingGroupType` are derived from the record, never stored beside it.
+fn element(group: &crate::state::BillingGroupRecord) -> BillingGroupListElement {
+    BillingGroupListElement {
+        name: Some(group.name.clone()),
+        arn: Some(group.arn.clone()),
+        description: group.description.clone(),
+        primary_account_id: group.primary_account_id.clone(),
+        computation_preference: Some(ComputationPreference {
+            pricing_plan_arn: group.pricing_plan_arn.clone(),
+        }),
+        size: group.size(),
+        creation_time: group.creation_time_millis,
+        last_modified_time: group.last_modified_time_millis,
+        status: Some(group.status().to_string()),
+        status_reason: group.status_reason(),
+        account_grouping: Some(ListBillingGroupAccountGrouping {
+            auto_associate: group.auto_associate,
+            responsibility_transfer_arn: group.responsibility_transfer_arn.clone(),
+        }),
+        billing_group_type: Some(group.billing_group_type().to_string()),
+    }
+}
+
 /// The `ListBillingGroups` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +255,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBillingGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBillingGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBillingGroups"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListBillingGroupsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // `BillingPeriod` selects the month the report is read for. This emulator
+        // keeps no per-billing-period history of a group's membership, so every
+        // period reports the group's current state; the modelled pattern is enforced
+        // before the handler runs.
+        let filters = input.filters.unwrap_or_default();
+        let mut selected: Vec<(String, BillingGroupListElement)> = Vec::new();
+        // `billing_groups` is ordered by ARN, and an ARN carries the monotonic id
+        // this service mints, so the sequence is creation order and a `NextToken`
+        // names the same cut point on the next call.
+        for (arn, group) in &state.billing_groups {
+            if matches(group, &filters)? {
+                selected.push((arn.clone(), element(group)));
+            }
+        }
+
+        let (billing_groups, next_token) = crate::state::paginate(
+            selected,
+            input.next_token.as_deref(),
+            input.max_results,
+        );
+
+        Ok(ListBillingGroupsOutput {
+            billing_groups: Some(billing_groups),
+            next_token,
+        })
     }
 }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateAccounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateAccounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateAccounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Appends account ids to a STORED billing group's membership, so the group's
+//! `Size` and the account-association index both move with it.
 //!
 //! ## Shape of an operation
 //!
@@ -127,6 +120,14 @@ impl From<AssociateAccountsErrorModeled> for AssociateAccountsError {
     }
 }
 
+/// Refuse the request with this operation's modelled 400 `ValidationException`.
+fn validation(reason: &str, field: &str, message: String) -> AssociateAccountsError {
+    AssociateAccountsErrorModeled::ValidationException(crate::state::validation_exception(
+        reason, field, message,
+    ))
+    .into()
+}
+
 /// The `AssociateAccounts` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -163,18 +164,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateAccounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateAccountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateAccounts"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AssociateAccountsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // The `BillingGroupArn` pattern accepts the full ARN or the bare id.
+        let group_arn = crate::state::normalize_billing_group_arn(&input.arn);
+        if !state.billing_groups.contains_key(&group_arn) {
+            return Err(AssociateAccountsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: "the billing group does not exist".to_string(),
+                    resource_id: group_arn,
+                    resource_type: "billinggroup".to_string(),
+                },
+            )
+            .into());
+        }
+
+        // One request may not name the same account twice.
+        if let Some(duplicate) = crate::state::first_duplicate(&input.account_ids) {
+            return Err(validation(
+                "DUPLICATE_ACCOUNT",
+                "AccountIds",
+                format!("account {duplicate} is listed more than once"),
+            ));
+        }
+
+        // "not already associated with another billing group" — an account belongs to
+        // at most one billing group, so an account owned by a DIFFERENT group is a
+        // conflict. One already in THIS group is left as it is: the association the
+        // request asks for already holds, so the call adds nothing and changes no size.
+        for account_id in &input.account_ids {
+            if let Some(owner) = state.conflicting_association(account_id, &group_arn) {
+                let owner = owner.to_string();
+                return Err(AssociateAccountsErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "the account is already associated with billing group {owner}"
+                        ),
+                        resource_id: account_id.clone(),
+                        resource_type: "account".to_string(),
+                        // No `Reason`: none of the values `ConflictExceptionReason`
+                        // enumerates describes an account that belongs to another
+                        // billing group, and `WRITE_CONFLICT_RETRY` would promise a
+                        // retry that can never succeed — the other group's
+                        // membership has to change first. The member is optional in
+                        // the model, so the honest answer is to omit it.
+                        reason: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The accounts this call actually adds: one already in THIS group is left as
+        // it is (the association it asks for already holds), so `Size` does not
+        // double-count.
+        let members = state
+            .billing_groups
+            .get(&group_arn)
+            .map(|group| group.linked_account_ids.len())
+            .unwrap_or_default();
+        let to_add: Vec<String> = state
+            .billing_groups
+            .get(&group_arn)
+            .map(|group| {
+                input
+                    .account_ids
+                    .iter()
+                    .filter(|account_id| !group.linked_account_ids.contains(account_id))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // A group's membership is bounded by an explicit maximum: the model caps one
+        // call at 30 account ids, which bounds a request but not the membership it
+        // accumulates over many calls.
+        if members + to_add.len() > crate::state::MAX_ACCOUNTS_PER_BILLING_GROUP {
+            return Err(AssociateAccountsErrorModeled::ServiceLimitExceededException(
+                ServiceLimitExceededException {
+                    message: format!(
+                        "a billing group holds at most {} accounts",
+                        crate::state::MAX_ACCOUNTS_PER_BILLING_GROUP
+                    ),
+                    resource_id: Some(group_arn.clone()),
+                    resource_type: Some("billinggroup".to_string()),
+                    limit_code: "AccountsPerBillingGroup".to_string(),
+                    service_code: crate::state::SERVICE_CODE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let now = crate::state::now_millis();
+        if let Some(group) = state.billing_groups.get_mut(&group_arn) {
+            if !to_add.is_empty() {
+                group.linked_account_ids.extend(to_add.iter().cloned());
+                group.last_modified_time_millis = now;
+            }
+        }
+        for account_id in to_add {
+            state
+                .account_associations
+                .insert(account_id, group_arn.clone());
+        }
+
+        Ok(AssociateAccountsOutput {
+            arn: Some(group_arn),
+        })
     }
 }

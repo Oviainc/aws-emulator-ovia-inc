@@ -21,13 +21,18 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Mints opaque 32-character `DatastoreId` values (SHA-256 of the mint counter
+# and the creation instant, hex-encoded) instead of leaking either verbatim.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# The integration tests wait out a stored lifecycle due instant; no handler sleeps,
+# so the `time` feature is enabled here rather than on the shipped crate.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

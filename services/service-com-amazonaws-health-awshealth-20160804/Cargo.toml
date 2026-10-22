@@ -21,13 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Authenticates the opaque pagination tokens this service issues, and derives the
+# stable entity ids in the seeded catalog.
+sha2 = { workspace = true }
+# Renders those digests as the [a-zA-Z0-9] text the modelled nextToken pattern allows.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
