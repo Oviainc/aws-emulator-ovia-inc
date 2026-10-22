@@ -7,9 +7,11 @@
 //!
 //! ## Clock-owed transitions
 //!
-//! `CreateDeliveryStream` and `DeleteDeliveryStream` are asynchronous: the model's own
-//! documentation says a created stream starts in `CREATING` and reaches `ACTIVE` later,
-//! and that a deleted stream goes to `DELETING` and is removed later. Neither span is
+//! `CreateDeliveryStream`, `DeleteDeliveryStream` and the two encryption calls are
+//! asynchronous: the model's own documentation says a created stream starts in `CREATING`
+//! and reaches `ACTIVE` later, that a deleted stream goes to `DELETING` and is removed
+//! later, and that enabling SSE sets the encryption status to `ENABLING` "and then to
+//! ENABLED" (disabling it, `DISABLING` and then `DISABLED`). No span is
 //! documented with a value, so this emulator picks one ([`TRANSITION_DELAY`]) and stores
 //! the instant the change comes due. No operation sleeps: every handler calls
 //! [`ComAmazonawsFirehoseFirehose20150804State::materialise_due`] first, which applies
@@ -22,14 +24,16 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AmazonOpenSearchServerlessDestinationConfiguration,
     AmazonopensearchserviceDestinationConfiguration, DeliveryStreamEncryptionConfiguration,
-    ElasticsearchDestinationConfiguration, ExtendedS3DestinationConfiguration,
-    HttpEndpointDestinationConfiguration, IcebergDestinationConfiguration,
-    RedshiftDestinationConfiguration, S3DestinationConfiguration,
-    SnowflakeDestinationConfiguration, SourceDescription, SplunkDestinationConfiguration,
+    DeliveryStreamEncryptionConfigurationInput, ElasticsearchDestinationConfiguration,
+    ExtendedS3DestinationConfiguration, HttpEndpointDestinationConfiguration,
+    IcebergDestinationConfiguration, RedshiftDestinationConfiguration,
+    S3DestinationConfiguration, SnowflakeDestinationConfiguration, SourceDescription,
+    SplunkDestinationConfiguration, KEY_TYPE_VALUES,
 };
 
 /// How long after the starting call a clock-owed stream transition
-/// (`CREATING` -> `ACTIVE`, `DELETING` -> removed) comes due.
+/// (`CREATING` -> `ACTIVE`, `DELETING` -> removed, `ENABLING` -> `ENABLED`,
+/// `DISABLING` -> `DISABLED`) comes due.
 ///
 /// AWS documents neither span, so this is a CHOSEN value, kept short enough for a test
 /// to wait for it and long enough that a caller acting immediately after the starting
@@ -68,6 +72,49 @@ pub const MAX_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
 /// The most records ONE stream keeps buffered, so a flood of tiny records cannot grow
 /// the buffer (and the expiry scan over it) without bound either.
 pub const MAX_BUFFERED_RECORDS_PER_STREAM: usize = 50_000;
+
+/// The window the combined encryption-call limit is counted over.
+///
+/// Documented, not chosen: "The StartDeliveryStreamEncryption and
+/// StopDeliveryStreamEncryption operations have a combined limit of 25 calls per Firehose
+/// stream per 24 hours" (`StartDeliveryStreamEncryption`).
+pub const ENCRYPTION_CALL_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How many `StartDeliveryStreamEncryption` / `StopDeliveryStreamEncryption` calls one
+/// stream takes inside [`ENCRYPTION_CALL_WINDOW`] — the 25 of that same sentence.
+pub const MAX_ENCRYPTION_CALLS_PER_WINDOW: usize = 25;
+
+/// The `KeyType` a request that names none asks for: "The default setting is
+/// AWS_OWNED_CMK" (`DeliveryStreamEncryptionConfigurationInput$KeyType`).
+pub const DEFAULT_KEY_TYPE: &str = "AWS_OWNED_CMK";
+
+/// The `DeliveryStreamType` whose source is Direct PUT: "Provider applications access the
+/// Firehose stream directly." SSE can be enabled only on a stream of this type — "You can
+/// enable SSE for a Firehose stream only if it's a Firehose stream that uses DirectPut as
+/// its source" (`StartDeliveryStreamEncryption`).
+pub const DIRECT_PUT_STREAM_TYPE: &str = "DirectPut";
+
+/// The `DeliveryStreamEncryptionStatus` a started enable is in while it is in flight:
+/// "Firehose first sets the encryption status of the stream to ENABLING".
+pub const ENCRYPTION_ENABLING: &str = "ENABLING";
+
+/// The `DeliveryStreamEncryptionStatus` the clock owes a started enable: "and then to
+/// ENABLED".
+pub const ENCRYPTION_ENABLED: &str = "ENABLED";
+
+/// The `DeliveryStreamEncryptionStatus` a started disable is in while it is in flight:
+/// "Firehose first sets the encryption status of the stream to DISABLING".
+pub const ENCRYPTION_DISABLING: &str = "DISABLING";
+
+/// The `DeliveryStreamEncryptionStatus` the clock owes a started disable: "and then to
+/// DISABLED".
+pub const ENCRYPTION_DISABLED: &str = "DISABLED";
+
+/// The `DeliveryStreamEncryptionStatus` values that mean an SSE change is still in
+/// flight, so another encryption call on the same stream is refused.
+///
+/// Named from the two transient statuses above so the set and the pair cannot drift.
+pub const IN_FLIGHT_ENCRYPTION_STATUSES: &[&str] = &[ENCRYPTION_ENABLING, ENCRYPTION_DISABLING];
 
 /// The lifecycle states this emulator puts a stream through, as the wire enum
 /// `DeliveryStreamStatus` names them.
@@ -157,6 +204,16 @@ pub struct DeliveryStream {
     pub source: Option<SourceDescription>,
     pub destinations: Vec<Destination>,
     pub encryption: Option<DeliveryStreamEncryptionConfiguration>,
+    /// The `DeliveryStreamEncryptionStatus` the clock owes this stream's encryption
+    /// configuration, with the instant it comes due. Enabling and disabling SSE are
+    /// asynchronous, so the call that starts one leaves the transient status (`ENABLING`
+    /// / `DISABLING`) behind and the clock settles it.
+    pub pending_encryption: Option<(String, SystemTime)>,
+    /// When each `StartDeliveryStreamEncryption` / `StopDeliveryStreamEncryption` call
+    /// landed on this stream, oldest first, so their combined windowed limit is counted
+    /// from state. Entries older than [`ENCRYPTION_CALL_WINDOW`] are dropped by
+    /// [`Self::materialise_due`].
+    pub encryption_calls: Vec<SystemTime>,
     pub tags: BTreeMap<String, String>,
     pub records: Vec<StoredRecord>,
     /// The bytes [`Self::records`] holds, kept as a running total so a put checks the
@@ -178,7 +235,47 @@ impl DeliveryStream {
     fn is_encrypted(&self) -> bool {
         self.encryption
             .as_ref()
-            .is_some_and(|encryption| encryption.status.as_deref() == Some("ENABLED"))
+            .is_some_and(|encryption| encryption.status.as_deref() == Some(ENCRYPTION_ENABLED))
+    }
+
+    /// The `DeliveryStreamEncryptionStatus` this stream's SSE is in, if SSE was ever
+    /// configured on it.
+    pub fn encryption_status(&self) -> Option<&str> {
+        self.encryption
+            .as_ref()
+            .and_then(|encryption| encryption.status.as_deref())
+    }
+
+    /// Whether an SSE change this stream started has yet to settle, in which case another
+    /// encryption call on it is refused as `ResourceInUseException`.
+    pub fn encryption_change_in_flight(&self) -> bool {
+        self.encryption_status()
+            .is_some_and(|status| IN_FLIGHT_ENCRYPTION_STATUSES.contains(&status))
+    }
+
+    /// Charge one `StartDeliveryStreamEncryption` / `StopDeliveryStreamEncryption` call
+    /// against this stream's windowed budget, answering `false` — and charging nothing —
+    /// when [`MAX_ENCRYPTION_CALLS_PER_WINDOW`] have already landed inside
+    /// [`ENCRYPTION_CALL_WINDOW`].
+    pub fn charge_encryption_call(&mut self, now: SystemTime) -> bool {
+        if self.encryption_calls.len() >= MAX_ENCRYPTION_CALLS_PER_WINDOW {
+            return false;
+        }
+        self.encryption_calls.push(now);
+        true
+    }
+
+    /// Start an asynchronous SSE change: `configuration` is what a caller sees now (its
+    /// status transient) and `settled` is the status the clock owes it.
+    pub fn begin_encryption_change(
+        &mut self,
+        configuration: DeliveryStreamEncryptionConfiguration,
+        settled: &str,
+        now: SystemTime,
+    ) {
+        self.encryption = Some(configuration);
+        self.pending_encryption = Some((settled.to_string(), now + TRANSITION_DELAY));
+        self.last_update_timestamp = now;
     }
 
     /// Apply every change the clock has already made due to this stream, and report
@@ -203,13 +300,31 @@ impl DeliveryStream {
             *freed += dropped;
         }
 
+        // The windowed encryption-call budget frees up only with the clock, so dropping
+        // the calls that have aged out of the window is owed at `now` too.
+        self.encryption_calls.retain(|at| {
+            !matches!(now.duration_since(*at), Ok(age) if age >= ENCRYPTION_CALL_WINDOW)
+        });
+
+        // An SSE change that has had its span settles to the status it was owed.
+        match self.pending_encryption.as_ref() {
+            Some((settled, due)) if now >= *due => {
+                let settled = settled.clone();
+                if let Some(encryption) = self.encryption.as_mut() {
+                    encryption.status = Some(settled);
+                }
+                self.pending_encryption = None;
+            }
+            _ => {}
+        }
+
         match self.pending {
             Some((PendingTransition::Activate, due)) if now >= due => {
                 self.status = StreamStatus::Active;
                 self.pending = None;
                 if let Some(encryption) = self.encryption.as_mut() {
-                    if encryption.status.as_deref() == Some("ENABLING") {
-                        encryption.status = Some("ENABLED".to_string());
+                    if encryption.status.as_deref() == Some(ENCRYPTION_ENABLING) {
+                        encryption.status = Some(ENCRYPTION_ENABLED.to_string());
                     }
                 }
                 true
@@ -356,6 +471,78 @@ fn push_record(
         received_at: now,
     });
     Some(record_id)
+}
+
+/// Why Firehose cannot use the `DeliveryStreamEncryptionConfigurationInput` a caller
+/// supplied, as [`check_encryption_configuration_input`] judges it.
+///
+/// Each variant names the modelled error the caller reports it with:
+/// `CreateDeliveryStream` and `StartDeliveryStreamEncryption` both take this input and
+/// both model those two errors, so the rules live here, once, beside the state they are
+/// checked before writing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncryptionConfigRefusal {
+    /// The configuration itself does not hold together: `InvalidArgumentException`,
+    /// "The specified input parameter has a value that is not valid."
+    InvalidArgument(String),
+    /// KMS cannot serve the named CMK: `InvalidKMSResourceException`, whose `Code`
+    /// carries the KMS exception type Firehose relays.
+    InvalidKmsResource { code: String, message: String },
+}
+
+/// Check a requested SSE configuration against the rules Firehose documents for it, with
+/// no regard for which operation asked.
+///
+/// `region` is the Region the request was signed for — the only Region whose CMKs a
+/// stream created by it can reach.
+pub fn check_encryption_configuration_input(
+    requested: &DeliveryStreamEncryptionConfigurationInput,
+    region: &str,
+) -> Result<(), EncryptionConfigRefusal> {
+    if !KEY_TYPE_VALUES.contains(&requested.key_type.as_str()) {
+        return Err(EncryptionConfigRefusal::InvalidArgument(format!(
+            "KeyType '{}' is not valid; valid values are {}",
+            requested.key_type,
+            KEY_TYPE_VALUES.join(", ")
+        )));
+    }
+    // "If you set KeyType to CUSTOMER_MANAGED_CMK, you must specify the Amazon Resource
+    // Name (ARN) of the CMK. If you set KeyType to AWS_OWNED_CMK, Firehose uses a
+    // service-account CMK."
+    match (requested.key_type.as_str(), requested.key_arn.as_ref()) {
+        ("CUSTOMER_MANAGED_CMK", None) => {
+            return Err(EncryptionConfigRefusal::InvalidArgument(
+                "KeyARN is required when KeyType is CUSTOMER_MANAGED_CMK".to_string(),
+            ))
+        }
+        ("AWS_OWNED_CMK", Some(_)) => {
+            return Err(EncryptionConfigRefusal::InvalidArgument(
+                "KeyARN cannot be specified when KeyType is AWS_OWNED_CMK".to_string(),
+            ))
+        }
+        _ => {}
+    }
+    // A CMK is reachable only from its own Region, so one named in another Region cannot
+    // be used: KMS answers NotFoundException, which Firehose reports as
+    // `InvalidKMSResourceException` ("Firehose throws this exception when an attempt to
+    // put records or to start or stop Firehose stream encryption fails. This happens when
+    // the KMS service throws one of the following exception types: AccessDeniedException,
+    // InvalidStateException, DisabledException, or NotFoundException."). The ARN grammar
+    // itself is modelled, so the boundary has already checked it; the Region is the part
+    // this emulator can judge.
+    if let Some(key_arn) = requested.key_arn.as_ref() {
+        let key_region = key_arn.split(':').nth(3).unwrap_or_default();
+        if !key_region.is_empty() && key_region != region {
+            return Err(EncryptionConfigRefusal::InvalidKmsResource {
+                code: "NotFoundException".to_string(),
+                message: format!(
+                    "the KMS key {key_arn} is in Region {key_region} and cannot be used \
+                     by a Firehose stream in Region {region}"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The Region a request was signed for, which is the Region a minted ARN names.

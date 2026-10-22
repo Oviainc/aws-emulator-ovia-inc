@@ -22,7 +22,7 @@ use smithy_server_runtime::MultiServiceRouter;
 pub(crate) const REGION: &str = "us-west-2";
 
 /// Long enough to cover the emulator's chosen `CREATING` -> `ACTIVE` /
-/// `DELETING` -> removed span (`crate::state::TRANSITION_DELAY`).
+/// `DELETING` -> removed / `ENABLING` -> `ENABLED` span (`crate::state::TRANSITION_DELAY`).
 pub(crate) const PAST_THE_TRANSITION: Duration = Duration::from_millis(1_200);
 
 /// One emulator: the firehose service mounted on a single shared engine, plus the engine
@@ -38,6 +38,12 @@ impl Emulator {
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
         Self { router, engine }
+    }
+
+    /// The single engine every operation of this emulator shares, for a test that has to
+    /// read or seed state no modelled operation exposes.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     /// Call one operation; answer its HTTP status and JSON body.
@@ -140,7 +146,7 @@ pub(crate) fn error_code(body: &Value) -> String {
 }
 
 /// Walk a `/`-separated path of object keys.
-fn at<'v>(value: &'v Value, path: &str) -> &'v Value {
+pub(crate) fn at<'v>(value: &'v Value, path: &str) -> &'v Value {
     let mut cursor = value;
     for key in path.split('/') {
         cursor = &cursor[key];
