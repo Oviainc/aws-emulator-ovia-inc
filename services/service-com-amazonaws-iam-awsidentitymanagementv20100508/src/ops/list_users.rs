@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // error: pagination resumes from the position, and the deleted user is
         // simply no longer in the range.
         let resume_after = match &input.marker {
-            Some(marker) => match crate::state::decode_marker(marker) {
+            Some(marker) => match crate::state::decode_marker(crate::state::MARKER_SCOPE_USERS, marker) {
                 Some(key) => Some(key),
                 None => {
                     return Err(crate::scaffolded::Scaffolded::validation(
@@ -225,7 +225,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             users,
             is_truncated,
             marker: is_truncated
-                .then(|| last_key.as_deref().map(crate::state::encode_marker))
+                .then(|| {
+                    last_key.as_deref().map(|key| {
+                        crate::state::encode_marker(crate::state::MARKER_SCOPE_USERS, key)
+                    })
+                })
                 .flatten(),
         })
     }

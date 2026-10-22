@@ -100,11 +100,6 @@ const SERVICE_LINKED_ROLE_NAME_PREFIX: &str = "AWSServiceRoleFor";
 /// `^[\w+=,.@-]+$`, so a name carrying a suffix is still a legal role name.
 const CUSTOM_SUFFIX_SEPARATOR: char = '_';
 
-/// The path every service-linked role lives under. AWS reserves the
-/// `/aws-service-role/` path for them and files each one under its own service
-/// principal, so the path identifies which service the role is linked to.
-const SERVICE_LINKED_ROLE_PATH_PREFIX: &str = "/aws-service-role/";
-
 /// The IAM policy language version a generated trust policy declares. It is the
 /// current version of the policy grammar IAM documents, and the one AWS emits in
 /// the trust policy of a role it creates.
@@ -124,11 +119,16 @@ fn is_service_principal(aws_service_name: &str) -> bool {
 }
 
 /// The path a service-linked role for `service_principal` is filed under:
-/// [`SERVICE_LINKED_ROLE_PATH_PREFIX`] followed by the principal and a closing
+/// [`crate::state::SERVICE_LINKED_ROLE_PATH_PREFIX`] — the path AWS reserves for
+/// service-linked roles, shared because a role's path is what tells every
+/// operation the role is service-linked — followed by the principal and a closing
 /// `/`, which is `pathType`'s required form
 /// (`^(\u002F)|(\u002F[\u0021-\u007E]+\u002F)$`).
 fn service_linked_role_path(service_principal: &str) -> String {
-    format!("{SERVICE_LINKED_ROLE_PATH_PREFIX}{service_principal}/")
+    format!(
+        "{}{service_principal}/",
+        crate::state::SERVICE_LINKED_ROLE_PATH_PREFIX
+    )
 }
 
 /// The name of the service-linked role for `service_principal`, with

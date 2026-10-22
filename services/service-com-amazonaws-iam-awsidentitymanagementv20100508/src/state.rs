@@ -7,7 +7,7 @@
 //! opaque pagination markers). Handlers reach it through [`service_state`]; they
 //! never keep a second copy of a resource.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{Role, User};
 
@@ -67,6 +67,29 @@ pub const MAX_USERS_PER_ACCOUNT: usize = 5_000;
 /// with `LimitExceededException`.
 pub const MAX_USER_INLINE_POLICY_CHARACTERS: usize = 2_048;
 
+/// The path AWS reserves for service-linked roles: every service-linked role is
+/// filed under this prefix followed by the service principal it is linked to
+/// (`CreateServiceLinkedRole`'s handler builds the path, and
+/// [`is_service_linked_role_path`] recognises one). It is shared because a role's
+/// path is what tells an operation the role is service-linked, and
+/// `UnmodifiableEntityException`'s documentation says "only the service that
+/// depends on the service-linked role can modify or delete the role on your
+/// behalf".
+pub const SERVICE_LINKED_ROLE_PATH_PREFIX: &str = "/aws-service-role/";
+
+/// The account segment an AWS-managed policy's ARN carries
+/// (`arn:aws:iam::aws:policy/...`): AWS-managed policies are owned by AWS rather
+/// than by an account, which is what distinguishes them from the
+/// customer-managed policies an account creates.
+pub const AWS_MANAGED_POLICY_ACCOUNT: &str = "aws";
+
+/// How many managed policies one IAM role may carry. AWS's "IAM and STS quotas"
+/// page gives the quota "Managed policies attached to an IAM role: 10", and an
+/// attach past it is refused with `LimitExceededException`, whose documentation
+/// says "the error message describes the limit exceeded". It is also what stops a
+/// role's attachment set growing without end.
+pub const MAX_MANAGED_POLICIES_PER_ROLE: usize = 10;
+
 /// The tag-key prefix AWS reserves. "Tagging IAM resources" (IAM User Guide):
 /// "You cannot create tag keys that begin with `aws:` because this prefix is
 /// reserved for Amazon Web Services use."
@@ -77,8 +100,20 @@ const UNIQUE_ID_SUFFIX_LEN: usize = 17;
 
 /// What every pagination `Marker` this service issues carries, inside the encoded
 /// payload, so a token it did not issue is recognised as foreign rather than read
-/// as a position in the store.
-const MARKER_PREFIX: &str = "iam:users:";
+/// as a position in the store. The SCOPE each marker is minted with follows it
+/// (see [`encode_marker`]), so a token issued for one collection is not read as a
+/// position in another.
+const MARKER_PREFIX: &str = "iam:";
+
+/// The marker scope of the account's user collection, which `ListUsers` pages
+/// over.
+pub const MARKER_SCOPE_USERS: &str = "users";
+
+/// The marker scope of ONE role's attached managed policies, which
+/// `ListAttachedRolePolicies` pages over. The role's key follows it, so a marker
+/// issued while paging one role's attachments does not name a position in
+/// another's: see [`role_attached_policies_marker_scope`].
+pub const MARKER_SCOPE_ROLE_ATTACHED_POLICIES: &str = "role-attached-policies";
 
 /// The alphabet the suffix is drawn from: RFC 4648 base32, every character of
 /// which is an uppercase alphanumeric and so inside `idType`'s `^[\w]+$`.
@@ -124,6 +159,19 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// `UserName` resolves the caller through this map; `CreateAccessKey` (still a
     /// stub) is what will populate it.
     pub access_keys: BTreeMap<String, String>,
+    /// The managed policies attached to each role: [`name_key`] of the role name
+    /// -> the attached policies' ARNs. A `BTreeSet` because a policy is attached
+    /// to a role at most once (a repeat attach is the same attachment) and
+    /// because the total ARN order is what lets
+    /// `ListAttachedRolePolicies` hand out a resumable marker.
+    pub role_attached_policies: BTreeMap<String, BTreeSet<String>>,
+    /// The ARNs of the customer-managed policies this account holds, which is
+    /// what makes such a policy attachable: an ARN naming a policy the account
+    /// does not hold refers to no entity. AWS-managed policies
+    /// (`arn:aws:iam::aws:policy/...`) are NOT in here — they are owned by AWS,
+    /// not by the account ([`AWS_MANAGED_POLICY_ACCOUNT`]). `CreatePolicy` (still
+    /// a stub) is what will populate it.
+    pub customer_managed_policies: BTreeSet<String>,
     /// Monotonic counter feeding [`next_user_id`](Self::next_user_id).
     pub user_id_seq: u64,
     /// Monotonic counter feeding [`next_role_id`](Self::next_role_id).
@@ -209,6 +257,82 @@ pub fn now() -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_millis(since_epoch.as_millis() as i64)
 }
 
+/// Whether `path` is the path of a service-linked role — see
+/// [`SERVICE_LINKED_ROLE_PATH_PREFIX`].
+pub fn is_service_linked_role_path(path: &str) -> bool {
+    path.starts_with(SERVICE_LINKED_ROLE_PATH_PREFIX)
+}
+
+/// The marker scope of the attachment set of the role keyed by `role_key`.
+pub fn role_attached_policies_marker_scope(role_key: &str) -> String {
+    format!("{MARKER_SCOPE_ROLE_ATTACHED_POLICIES}:{role_key}")
+}
+
+/// The parts of an IAM managed-policy ARN that an operation taking one reads.
+#[derive(Debug, Clone)]
+pub struct PolicyArn {
+    /// The ARN's account segment: an account id, or
+    /// [`AWS_MANAGED_POLICY_ACCOUNT`] for an AWS-managed policy.
+    pub account: String,
+    /// The policy's path, beginning and ending with `/` — `/` for a policy at the
+    /// root, `/service-role/` for one AWS files under that path.
+    pub path: String,
+    /// The policy's friendly name: the last segment of the ARN's resource.
+    pub policy_name: String,
+}
+
+/// The parts of `arn` when it is an IAM managed-policy ARN, or `None` when it is
+/// not one — which is what makes an operation taking a `PolicyArn` refuse it as an
+/// "invalid … value … supplied for an input parameter".
+///
+/// A managed policy's ARN is `arn:<partition>:iam::<account>:policy/<path><name>`:
+/// IAM is a global service, so the region segment is EMPTY, and the resource is
+/// the `policy` type followed by the policy's path and friendly name (the form
+/// `arnType`'s documentation points at Amazon Resource Names in the AWS General
+/// Reference for). Path segments are non-empty, since `policyPathType`'s pattern
+/// (`^((/[A-Za-z0-9\.,\+@=_-]+)*)/$`) admits no empty one.
+pub fn parse_policy_arn(arn: &str) -> Option<PolicyArn> {
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    if fields.next()?.is_empty() {
+        return None;
+    }
+    if fields.next()? != "iam" {
+        return None;
+    }
+    if !fields.next()?.is_empty() {
+        return None;
+    }
+    let account = fields.next()?;
+    if account.is_empty() {
+        return None;
+    }
+    let resource = fields.next()?.strip_prefix("policy/")?;
+    // Everything before the LAST `/` is the policy's path, which is absent for a
+    // policy at the root. An empty path segment (`policy//Name`) is not a path the
+    // `policyPathType` pattern admits, so such an ARN names no policy.
+    let (path, policy_name) = match resource.rfind('/') {
+        Some(last) => {
+            let path_body = &resource[..last];
+            if path_body.split('/').any(str::is_empty) {
+                return None;
+            }
+            (format!("/{path_body}/"), &resource[last + 1..])
+        }
+        None => (DEFAULT_PATH.to_string(), resource),
+    };
+    if policy_name.is_empty() {
+        return None;
+    }
+    Some(PolicyArn {
+        account: account.to_string(),
+        path,
+        policy_name: policy_name.to_string(),
+    })
+}
+
 /// Encode a state map key as the opaque pagination `Marker` a client echoes back.
 ///
 /// The codec is `aws_smithy_types::base64` — already in this crate's dependency
@@ -217,16 +341,20 @@ pub fn now() -> ::aws_smithy_types::DateTime {
 /// `^[\u0020-\u00FF]+$` pattern and its 1..320 length for any key the entity-name
 /// constraints admit, and the token carries no structure a client could depend on
 /// beyond being echo-able.
-pub fn encode_marker(key: &str) -> String {
-    ::aws_smithy_types::base64::encode(format!("{MARKER_PREFIX}{key}"))
+pub fn encode_marker(scope: &str, key: &str) -> String {
+    ::aws_smithy_types::base64::encode(format!("{MARKER_PREFIX}{scope}:{key}"))
 }
 
-/// The state map key an opaque `Marker` names, or `None` when the token was not
-/// produced by [`encode_marker`] — which the prefix is what establishes, since a
-/// foreign token that happens to be valid base64 still does not carry it.
-pub fn decode_marker(marker: &str) -> Option<String> {
+/// The state map key an opaque `Marker` names within `scope`, or `None` when the
+/// token was not produced by [`encode_marker`] for that scope — which the prefix
+/// and the scope are what establish, since a foreign token that happens to be
+/// valid base64, or one this service issued while paging another collection, does
+/// not carry them.
+pub fn decode_marker(scope: &str, marker: &str) -> Option<String> {
     let decoded = String::from_utf8(::aws_smithy_types::base64::decode(marker).ok()?).ok()?;
-    decoded.strip_prefix(MARKER_PREFIX).map(str::to_string)
+    decoded
+        .strip_prefix(&format!("{MARKER_PREFIX}{scope}:"))
+        .map(str::to_string)
 }
 
 /// A unique entity id: `prefix` followed by [`UNIQUE_ID_SUFFIX_LEN`] base32
