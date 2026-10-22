@@ -630,10 +630,20 @@ async fn a_created_origin_endpoint_stores_every_supplied_setting_and_a_derived_u
                         );
                     }
                 } else {
-                    assert_eq!(
-                        stored, sent,
-                        "case {case:?}: {key} must be stored as sent, got {stored:?}"
-                    );
+                    // Member-wise, not whole-block: the service ALSO server-fills the
+                    // packaging members this request left unset (see
+                    // `state::apply_origin_endpoint_defaults`, covered by
+                    // `origin_endpoint_defaults.rs`), so the stored block is a SUPERSET of
+                    // the sent one. What this asserts is that nothing sent was dropped or
+                    // rewritten.
+                    for (member, value) in sent.as_object().expect("a packaging object") {
+                        assert_eq!(
+                            stored.get(member).unwrap_or(&Value::Null),
+                            value,
+                            "case {case:?}: {key}.{member} must be stored as sent, \
+                             got {stored:?}"
+                        );
+                    }
                 }
             }
             for (key, sent) in extras.as_object().expect("an extras object") {
