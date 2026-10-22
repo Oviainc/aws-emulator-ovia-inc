@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDistributionWithTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDistributionWithTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDistributionWithTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a distribution and associates a tag set with it in one call: it runs the same
+//! create as `CreateDistribution` — allocating the id, ARN, domain name and first
+//! version token, and storing the submitted `DistributionConfig` whole — and stores the
+//! submitted tags on the same record, so `ListTagsForResource` answers from it.
 //!
 //! ## Shape of an operation
 //!
@@ -208,6 +204,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -306,6 +304,51 @@ impl From<CreateDistributionWithTagsErrorModeled> for CreateDistributionWithTags
     }
 }
 
+/// Report a refusal from the shared create path as this operation's modelled error.
+///
+/// Each refusal has exactly one modelled counterpart, and the model declares every one
+/// of them for this operation — the same ones `CreateDistribution` declares, because
+/// both operations run the same create.
+fn create_refusal(refusal: crate::state::CreateRefusal) -> CreateDistributionWithTagsError {
+    match refusal {
+        crate::state::CreateRefusal::InconsistentQuantities(message) => {
+            CreateDistributionWithTagsErrorModeled::InconsistentQuantities(InconsistentQuantities {
+                message: Some(message),
+            })
+        }
+        crate::state::CreateRefusal::ConfigLimit(crate::state::ConfigLimit::CacheBehaviors(
+            message,
+        )) => CreateDistributionWithTagsErrorModeled::TooManyCacheBehaviors(TooManyCacheBehaviors {
+            message: Some(message),
+        }),
+        crate::state::CreateRefusal::ConfigLimit(crate::state::ConfigLimit::TrustedSigners(
+            message,
+        )) => CreateDistributionWithTagsErrorModeled::TooManyTrustedSigners(TooManyTrustedSigners {
+            message: Some(message),
+        }),
+        crate::state::CreateRefusal::ConfigLimit(crate::state::ConfigLimit::TrustedKeyGroups(
+            message,
+        )) => CreateDistributionWithTagsErrorModeled::TooManyKeyGroupsAssociatedToDistribution(
+            TooManyKeyGroupsAssociatedToDistribution {
+                message: Some(message),
+            },
+        ),
+        crate::state::CreateRefusal::DistributionAlreadyExists(message) => {
+            CreateDistributionWithTagsErrorModeled::DistributionAlreadyExists(
+                DistributionAlreadyExists {
+                    message: Some(message),
+                },
+            )
+        }
+        crate::state::CreateRefusal::TooManyDistributions(message) => {
+            CreateDistributionWithTagsErrorModeled::TooManyDistributions(TooManyDistributions {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
+}
+
 /// The `CreateDistributionWithTags` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -340,20 +383,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDistributionWithTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDistributionWithTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDistributionWithTags"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let DistributionConfigWithTags {
+            distribution_config,
+            tags,
+        } = input.distribution_config_with_tags;
+
+        // "The tagging specified is not valid." A tag set no resource can carry is
+        // refused before anything is claimed for the distribution, so a bad tag set
+        // creates nothing.
+        let tags = crate::state::tag_set(&tags).map_err(|reason| {
+            CreateDistributionWithTagsErrorModeled::InvalidTagging(crate::state::invalid_tagging(
+                reason,
+            ))
+        })?;
+
+        // The create itself is the shared path `CreateDistribution` runs: this operation
+        // differs only in the tag set it stores alongside the new record.
+        let created = store
+            .create_distribution(distribution_config, tags, now)
+            .map_err(create_refusal)?;
+
+        Ok(CreateDistributionWithTagsOutput {
+            distribution: Some(created.distribution),
+            // "The fully qualified URI of the new distribution resource just created."
+            location: Some(crate::state::location_uri(
+                &crate::state::distribution_path(&created.id),
+            )),
+            // "The current version of the distribution created."
+            e_tag: Some(created.etag),
+        })
     }
 }

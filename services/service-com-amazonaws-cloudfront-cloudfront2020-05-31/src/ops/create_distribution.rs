@@ -202,10 +202,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::collections::BTreeMap;
 use std::time::SystemTime;
-
-use crate::state::StoredDistribution;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -305,6 +302,48 @@ impl From<CreateDistributionErrorModeled> for CreateDistributionError {
     }
 }
 
+/// Report a refusal from the shared create path as this operation's modelled error.
+///
+/// Each refusal has exactly one modelled counterpart, and the model declares every one
+/// of them for this operation.
+fn create_refusal(refusal: crate::state::CreateRefusal) -> CreateDistributionError {
+    match refusal {
+        crate::state::CreateRefusal::InconsistentQuantities(message) => {
+            CreateDistributionErrorModeled::InconsistentQuantities(InconsistentQuantities {
+                message: Some(message),
+            })
+        }
+        crate::state::CreateRefusal::ConfigLimit(crate::state::ConfigLimit::CacheBehaviors(
+            message,
+        )) => CreateDistributionErrorModeled::TooManyCacheBehaviors(TooManyCacheBehaviors {
+            message: Some(message),
+        }),
+        crate::state::CreateRefusal::ConfigLimit(crate::state::ConfigLimit::TrustedSigners(
+            message,
+        )) => CreateDistributionErrorModeled::TooManyTrustedSigners(TooManyTrustedSigners {
+            message: Some(message),
+        }),
+        crate::state::CreateRefusal::ConfigLimit(crate::state::ConfigLimit::TrustedKeyGroups(
+            message,
+        )) => CreateDistributionErrorModeled::TooManyKeyGroupsAssociatedToDistribution(
+            TooManyKeyGroupsAssociatedToDistribution {
+                message: Some(message),
+            },
+        ),
+        crate::state::CreateRefusal::DistributionAlreadyExists(message) => {
+            CreateDistributionErrorModeled::DistributionAlreadyExists(DistributionAlreadyExists {
+                message: Some(message),
+            })
+        }
+        crate::state::CreateRefusal::TooManyDistributions(message) => {
+            CreateDistributionErrorModeled::TooManyDistributions(TooManyDistributions {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
+}
+
 /// The `CreateDistribution` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -349,120 +388,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
-        // "The value of Quantity and the size of Items don't match." A malformed
-        // configuration is refused before any id or caller reference is claimed for it.
-        if let Some(message) = crate::state::config_quantity_mismatch(&input.distribution_config) {
-            return Err(CreateDistributionErrorModeled::InconsistentQuantities(
-                InconsistentQuantities {
-                    message: Some(message),
-                },
-            )
-            .into());
-        }
-
-        // A configuration is walked on every payload that reports it, so the counts that
-        // drive that walk are bounded by CloudFront's published quotas on the way IN,
-        // each refused with the error the model names for it.
-        match crate::state::config_limit_exceeded(&input.distribution_config) {
-            None => {}
-            Some(crate::state::ConfigLimit::CacheBehaviors(message)) => {
-                return Err(CreateDistributionErrorModeled::TooManyCacheBehaviors(
-                    TooManyCacheBehaviors {
-                        message: Some(message),
-                    },
-                )
-                .into());
-            }
-            Some(crate::state::ConfigLimit::TrustedSigners(message)) => {
-                return Err(CreateDistributionErrorModeled::TooManyTrustedSigners(
-                    TooManyTrustedSigners {
-                        message: Some(message),
-                    },
-                )
-                .into());
-            }
-            Some(crate::state::ConfigLimit::TrustedKeyGroups(message)) => {
-                return Err(
-                    CreateDistributionErrorModeled::TooManyKeyGroupsAssociatedToDistribution(
-                        TooManyKeyGroupsAssociatedToDistribution {
-                            message: Some(message),
-                        },
-                    )
-                    .into(),
-                );
-            }
-        }
-
-        // "The caller reference you attempted to create the distribution with is
-        // associated with another distribution": a caller reference identifies one
-        // distribution for its whole life, so a reference the store already holds
-        // cannot name a second one.
-        let caller_reference = input.distribution_config.caller_reference.clone();
-        if let Some(existing) = store.caller_references.get(&caller_reference) {
-            return Err(CreateDistributionErrorModeled::DistributionAlreadyExists(
-                DistributionAlreadyExists {
-                    message: Some(format!(
-                        "The caller reference {caller_reference} is already associated with \
-                         distribution {existing}"
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // "Processing your request would cause you to exceed the maximum number of
-        // distributions allowed." The store grows only here and a distribution cannot be
-        // evicted (a later Get has to answer with what this create returned), so the
-        // bound is an entry count refused BEFORE any id or caller reference is claimed.
-        if store.distributions.len() >= crate::state::MAX_DISTRIBUTIONS {
-            return Err(CreateDistributionErrorModeled::TooManyDistributions(
-                TooManyDistributions {
-                    message: Some(format!(
-                        "This emulator holds at most {} distributions; delete one before \
-                         creating another",
-                        crate::state::MAX_DISTRIBUTIONS
-                    )),
-                },
-            )
-            .into());
-        }
-
-        let id = store.allocate_distribution_id();
-        // The edge domain this distribution is served on. A MULTI-TENANT distribution
-        // does not report it (see `StoredDistribution::reported_domain_name`), but it is
-        // allocated and held all the same, so the record carries one domain for its whole
-        // life and no two distributions are served on the same one.
-        let domain_name = store.allocate_domain_name();
-        let etag = store.next_etag();
-        let stored = StoredDistribution {
-            arn: crate::state::distribution_arn(&id),
-            id: id.clone(),
-            domain_name,
-            // A distribution CloudFront has just accepted is not yet propagated to the
-            // edge locations, so it reports the transient status until the clock owes
-            // it the terminal one.
-            status: crate::state::STATUS_IN_PROGRESS.to_string(),
-            deployed_due: now + crate::state::PROPAGATION_DELAY,
-            last_modified_time: now,
-            etag: etag.clone(),
-            // Stored whole, with every member the service itself supplies resolved into
-            // it: a later read answers from this record — the configuration the
-            // distribution actually runs under — never from the request being served.
-            config: crate::state::resolve_distribution_config(input.distribution_config),
-            invalidations: BTreeMap::new(),
-        };
-        let distribution = stored.to_distribution();
-        store.caller_references.insert(caller_reference, id.clone());
-        store.distributions.insert(id.clone(), stored);
+        // This operation's request carries no tag set, so the distribution it creates
+        // starts with no tags; everything else is the shared create path, which
+        // `CreateDistributionWithTags` runs too.
+        let created = store
+            .create_distribution(input.distribution_config, crate::state::TagSet::new(), now)
+            .map_err(create_refusal)?;
 
         Ok(CreateDistributionOutput {
-            distribution: Some(distribution),
+            distribution: Some(created.distribution),
             // "The fully qualified URI of the new distribution resource just created."
             location: Some(crate::state::location_uri(
-                &crate::state::distribution_path(&id),
+                &crate::state::distribution_path(&created.id),
             )),
             // "The current version of the distribution created."
-            e_tag: Some(etag),
+            e_tag: Some(created.etag),
         })
     }
 }

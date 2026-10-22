@@ -28,7 +28,8 @@
 //!
 //! The restXml bodies are read through the small element scanner below, so each
 //! assertion is about the document a client would read rather than about a substring of
-//! it.
+//! it. That scanner, the router harness and the `Config` table are `pub(crate)` so the
+//! crate's other suites read responses the same way rather than each growing a copy.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -323,7 +324,7 @@ pub(crate) async fn update_distribution(
     .await
 }
 
-async fn delete_distribution(
+pub(crate) async fn delete_distribution(
     router: &MultiServiceRouter,
     id: &str,
     if_match: Option<&str>,
@@ -390,26 +391,26 @@ async fn get_invalidation(
 /// enabled, which viewer protocol policy its default cache behaviour names, and whether
 /// it names optional members (`PriceClass`) at all.
 #[derive(Debug, Clone)]
-struct Config {
-    case: &'static str,
-    caller_reference: String,
-    comment: String,
-    enabled: bool,
+pub(crate) struct Config {
+    pub(crate) case: &'static str,
+    pub(crate) caller_reference: String,
+    pub(crate) comment: String,
+    pub(crate) enabled: bool,
     /// `(Id, DomainName)` of each origin, in order.
-    origins: Vec<(String, String)>,
+    pub(crate) origins: Vec<(String, String)>,
     /// `Aliases.Items`, the alternate domain names.
-    aliases: Vec<String>,
+    pub(crate) aliases: Vec<String>,
     /// One of `ViewerProtocolPolicy`'s values (`allow-all` | `https-only` |
     /// `redirect-to-https`), from the model's enum.
-    viewer_protocol_policy: &'static str,
+    pub(crate) viewer_protocol_policy: &'static str,
     /// One of `PriceClass`'s values, or `None` to leave the member out entirely (the
     /// service then resolves it).
-    price_class: Option<&'static str>,
+    pub(crate) price_class: Option<&'static str>,
 }
 
 impl Config {
     /// The `DistributionConfig` XML a client sends for this configuration.
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!(
             "<DistributionConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">"
@@ -462,7 +463,7 @@ impl Config {
 
     /// Assert that `config` — a `DistributionConfig` element the emulator answered with
     /// — is the configuration this row submitted.
-    fn assert_matches(&self, config: &Node, context: &str) {
+    pub(crate) fn assert_matches(&self, config: &Node, context: &str) {
         let case = self.case;
         assert_eq!(
             config.text_at("CallerReference"),
@@ -555,7 +556,7 @@ impl Config {
 }
 
 /// A configuration for `reference`, varying along the members the rules generalise over.
-fn config(case: &'static str, reference: &str) -> Config {
+pub(crate) fn config(case: &'static str, reference: &str) -> Config {
     Config {
         case,
         caller_reference: reference.to_string(),
@@ -574,7 +575,7 @@ fn config(case: &'static str, reference: &str) -> Config {
 /// The table every persistence assertion runs over: four configurations differing in
 /// origin count, alias count, enabled flag, viewer protocol policy, comment and whether
 /// the optional `PriceClass` is named at all.
-fn config_table() -> Vec<Config> {
+pub(crate) fn config_table() -> Vec<Config> {
     vec![
         config("one-origin-no-aliases", "ref-minimal"),
         Config {
@@ -630,7 +631,7 @@ fn batch_xml_with_quantity(reference: &str, paths: &[&str], quantity: i32) -> St
 /// `Distribution$Id`'s shape: `E` followed by 13 uppercase alphanumerics, checked here
 /// rather than through the crate's own predicate so a wrong predicate cannot make this
 /// test pass.
-fn is_distribution_id(value: &str) -> bool {
+pub(crate) fn is_distribution_id(value: &str) -> bool {
     match value.strip_prefix('E') {
         Some(body) => {
             body.len() == 13
@@ -657,7 +658,7 @@ fn is_invalidation_id(value: &str) -> bool {
 
 /// A version token's shape: `E` followed by 13 uppercase alphanumerics, the shape
 /// CloudFront's own `ETag` values take.
-fn is_version_token(value: &str) -> bool {
+pub(crate) fn is_version_token(value: &str) -> bool {
     is_distribution_id(value)
 }
 
