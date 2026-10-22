@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/list_tags_for_resource_bounds.rs"]
 mod list_tags_for_resource_bounds;
+#[path = "all/reserved_schedule_group.rs"]
+mod reserved_schedule_group;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/schedule_group_listing.rs"]

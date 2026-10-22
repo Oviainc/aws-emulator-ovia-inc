@@ -11,6 +11,80 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-artifact-artifact.json");
 
+// ONE MEMBER SCHEMA of one of this service's shapes, written out the way
+// `#[smithy_macros::smithy(shape = ...)]` would emit it, plus the one chain call the
+// vendored codegen never emits: `@timestampFormat`.
+//
+// WHY ANY OF THIS IS HAND-WRITTEN. Every `timestamp` member this service models targets
+// `com.amazonaws.artifact#TimestampAttribute`, which carries `@timestampFormat("date-time")`
+// (`smithy_query(query="shape",shape="TimestampAttribute",model_path="services/service-com-amazonaws-artifact-artifact/smithy-model/com-amazonaws-artifact-artifact.json")`),
+// so on restJson1 every one of them is an RFC 3339 date-time STRING on the wire. The
+// derive does not carry that trait onto the member schemas it emits (there is no
+// `timestamp_format` anywhere under `vendor/smithy-macros/`), and the JSON codec reads the
+// format off the member schema and otherwise falls back to the restJson1 default, epoch
+// seconds — a JSON NUMBER, which is not even the modelled type, so an SDK deserializing a
+// `date-time` member rejects it. The shapes whose schemas are written out below are
+// exactly this service's shapes with a timestamp member; everything else keeps the derive.
+//
+// The generator gap is filed as
+// `issues/things-that-do-not-work/20261022T000000Z-smithy-macros-drops-timestampformat-from-member-schemas.md`;
+// `vendor/` is read-only from a service crate, so the remedy available here is the
+// per-shape one that
+// `services/service-com-amazonaws-apigatewaymanagementapi-apigatewaymanagementapi/src/ops/types/get_connection_types.rs`
+// and `services/service-com-amazonaws-accessanalyzer-accessanalyzer/src/ops/types/shared_types.rs`
+// already take. Once `vendor/smithy-macros` chains `.with_timestamp_format(..)`, every
+// block below becomes a `#[smithy_macros::smithy(shape = ...)]` attribute again and this
+// macro is deleted; `tests/all/timestamp_wire_form.rs` pins the wire form, so it fails if
+// the attribute does not carry it.
+//
+// `$local` is the shape's local name, `$name` the member's (which IS its restJson1 wire
+// name — this model declares no `@jsonName`), `$ty` a `ShapeType` variant and `$index` the
+// member's position in the model's member list, as the codegen numbers them. Constraint
+// traits are deliberately absent: the validating walk runs on operation INPUTS only, and
+// every shape below is output-only, so the derive's captured constraints are inert there
+// too.
+//
+// Both macros are imported by the other `types/` modules as
+// `use crate::ops::types::shared_types::{artifact_date_time_member_schema, artifact_member_schema};`.
+// They are spelled out separately, rather than one delegating to the other, so that
+// neither depends on the other's name being in scope where it is invoked.
+macro_rules! artifact_member_schema {
+    ($local:literal, $name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.artifact#", $local, "$", $name),
+                "com.amazonaws.artifact",
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+pub(crate) use artifact_member_schema;
+
+// One `TimestampAttribute` member's schema: [`artifact_member_schema`] for a `Timestamp`
+// member, plus the `@timestampFormat("date-time")` chain call the vendored codegen omits.
+macro_rules! artifact_date_time_member_schema {
+    ($local:literal, $name:literal, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.artifact#", $local, "$", $name),
+                "com.amazonaws.artifact",
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            $name,
+            $index,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime)
+    };
+}
+
+pub(crate) use artifact_date_time_member_schema;
+
 #[smithy_macros::smithy(shape = "com.amazonaws.artifact#AccessDeniedException")]
 #[derive(Debug, Clone, Default)]
 pub struct AccessDeniedException {
@@ -80,7 +154,10 @@ pub struct ServiceQuotaExceededException {
     pub quota_code: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.artifact#InquirySummary")]
+/// `InquirySummary`, with its schema written out instead of derived: `createdAt` targets
+/// `TimestampAttribute`, so it is a date-time string on the wire (see the note above).
+/// Member set, order and nullability from
+/// `smithy_query(query="shape",shape="InquirySummary")`.
 #[derive(Debug, Clone)]
 pub struct InquirySummary {
     pub arn: String,
@@ -92,7 +169,109 @@ pub struct InquirySummary {
     pub created_at: ::aws_smithy_types::DateTime,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.artifact#ReportSummary")]
+#[allow(non_upper_case_globals)]
+impl InquirySummary {
+    pub const M_ARN: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("InquirySummary", "arn", String, 0);
+    pub const M_NAME: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("InquirySummary", "name", String, 1);
+    pub const M_ID: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("InquirySummary", "id", String, 2);
+    pub const M_STATUS: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("InquirySummary", "status", String, 3);
+    pub const M_STATUS_MESSAGE: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("InquirySummary", "statusMessage", String, 4);
+    pub const M_INPUT_SOURCE: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("InquirySummary", "inputSource", String, 5);
+    /// `TimestampAttribute`, `@timestampFormat("date-time")`.
+    pub const M_CREATED_AT: ::aws_smithy_schema::Schema =
+        artifact_date_time_member_schema!("InquirySummary", "createdAt", 6);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.artifact#InquirySummary",
+            "com.amazonaws.artifact",
+            "InquirySummary",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ARN,
+            &Self::M_NAME,
+            &Self::M_ID,
+            &Self::M_STATUS,
+            &Self::M_STATUS_MESSAGE,
+            &Self::M_INPUT_SOURCE,
+            &Self::M_CREATED_AT,
+        ],
+    );
+}
+
+pub static INQUIRY_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema = &InquirySummary::SCHEMA;
+
+// The derive's `DeserializableStruct` impl IS reproduced for every shape in this change,
+// even though all of them are output-only: the enclosing output shapes keep the derive,
+// and the reader the derive emits for THEM requires their member shapes to implement it.
+// The read path mirrors the derive's: a `@required` member absent from the wire is refused
+// by name, an optional one stays `None`.
+impl ::aws_smithy_schema::serde::SerializableStruct for InquirySummary {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        s.write_string(&Self::M_ARN, self.arn.as_str())?;
+        s.write_string(&Self::M_NAME, self.name.as_str())?;
+        s.write_string(&Self::M_ID, self.id.as_str())?;
+        s.write_string(&Self::M_STATUS, self.status.as_str())?;
+        s.write_string(&Self::M_STATUS_MESSAGE, self.status_message.as_str())?;
+        s.write_string(&Self::M_INPUT_SOURCE, self.input_source.as_str())?;
+        s.write_timestamp(&Self::M_CREATED_AT, &self.created_at)?;
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for InquirySummary {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut arn: Option<String> = None;
+        let mut name: Option<String> = None;
+        let mut id: Option<String> = None;
+        let mut status: Option<String> = None;
+        let mut status_message: Option<String> = None;
+        let mut input_source: Option<String> = None;
+        let mut created_at: Option<::aws_smithy_types::DateTime> = None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => arn = Some(d.read_string(&Self::M_ARN)?),
+                Some(1) => name = Some(d.read_string(&Self::M_NAME)?),
+                Some(2) => id = Some(d.read_string(&Self::M_ID)?),
+                Some(3) => status = Some(d.read_string(&Self::M_STATUS)?),
+                Some(4) => status_message = Some(d.read_string(&Self::M_STATUS_MESSAGE)?),
+                Some(5) => input_source = Some(d.read_string(&Self::M_INPUT_SOURCE)?),
+                Some(6) => created_at = Some(d.read_timestamp(&Self::M_CREATED_AT)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            arn: arn.ok_or_else(|| ::aws_smithy_schema_server::missing_member("arn"))?,
+            name: name.ok_or_else(|| ::aws_smithy_schema_server::missing_member("name"))?,
+            id: id.ok_or_else(|| ::aws_smithy_schema_server::missing_member("id"))?,
+            status: status.ok_or_else(|| ::aws_smithy_schema_server::missing_member("status"))?,
+            status_message: status_message
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("statusMessage"))?,
+            input_source: input_source
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("inputSource"))?,
+            created_at: created_at
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("createdAt"))?,
+        })
+    }
+}
+
+/// `ReportSummary`, with its schema written out instead of derived: `periodStart` and
+/// `periodEnd` target `TimestampAttribute`, so they are date-time strings on the wire (see
+/// the note above). Member set, order and nullability from
+/// `smithy_query(query="shape",shape="ReportSummary")`.
 #[derive(Debug, Clone, Default)]
 pub struct ReportSummary {
     pub id: Option<String>,
@@ -110,6 +289,154 @@ pub struct ReportSummary {
     pub product_name: Option<String>,
     pub status_message: Option<String>,
     pub acceptance_type: Option<String>,
+}
+
+#[allow(non_upper_case_globals)]
+impl ReportSummary {
+    pub const M_ID: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("ReportSummary", "id", String, 0);
+    pub const M_NAME: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("ReportSummary", "name", String, 1);
+    pub const M_STATE: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("ReportSummary", "state", String, 2);
+    pub const M_ARN: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("ReportSummary", "arn", String, 3);
+    pub const M_VERSION: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("ReportSummary", "version", Long, 4);
+    pub const M_UPLOAD_STATE: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("ReportSummary", "uploadState", String, 5);
+    pub const M_DESCRIPTION: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("ReportSummary", "description", String, 6);
+    /// `TimestampAttribute`, `@timestampFormat("date-time")`.
+    pub const M_PERIOD_START: ::aws_smithy_schema::Schema =
+        artifact_date_time_member_schema!("ReportSummary", "periodStart", 7);
+    /// `TimestampAttribute`, `@timestampFormat("date-time")`.
+    pub const M_PERIOD_END: ::aws_smithy_schema::Schema =
+        artifact_date_time_member_schema!("ReportSummary", "periodEnd", 8);
+    pub const M_SERIES: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("ReportSummary", "series", String, 9);
+    pub const M_CATEGORY: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("ReportSummary", "category", String, 10);
+    pub const M_COMPANY_NAME: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("ReportSummary", "companyName", String, 11);
+    pub const M_PRODUCT_NAME: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("ReportSummary", "productName", String, 12);
+    pub const M_STATUS_MESSAGE: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("ReportSummary", "statusMessage", String, 13);
+    pub const M_ACCEPTANCE_TYPE: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("ReportSummary", "acceptanceType", String, 14);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.artifact#ReportSummary",
+            "com.amazonaws.artifact",
+            "ReportSummary",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ID,
+            &Self::M_NAME,
+            &Self::M_STATE,
+            &Self::M_ARN,
+            &Self::M_VERSION,
+            &Self::M_UPLOAD_STATE,
+            &Self::M_DESCRIPTION,
+            &Self::M_PERIOD_START,
+            &Self::M_PERIOD_END,
+            &Self::M_SERIES,
+            &Self::M_CATEGORY,
+            &Self::M_COMPANY_NAME,
+            &Self::M_PRODUCT_NAME,
+            &Self::M_STATUS_MESSAGE,
+            &Self::M_ACCEPTANCE_TYPE,
+        ],
+    );
+}
+
+pub static REPORT_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema = &ReportSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ReportSummary {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.id.as_ref() {
+            s.write_string(&Self::M_ID, v.as_str())?;
+        }
+        if let Some(v) = self.name.as_ref() {
+            s.write_string(&Self::M_NAME, v.as_str())?;
+        }
+        if let Some(v) = self.state.as_ref() {
+            s.write_string(&Self::M_STATE, v.as_str())?;
+        }
+        if let Some(v) = self.arn.as_ref() {
+            s.write_string(&Self::M_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.version.as_ref() {
+            s.write_long(&Self::M_VERSION, *v)?;
+        }
+        if let Some(v) = self.upload_state.as_ref() {
+            s.write_string(&Self::M_UPLOAD_STATE, v.as_str())?;
+        }
+        if let Some(v) = self.description.as_ref() {
+            s.write_string(&Self::M_DESCRIPTION, v.as_str())?;
+        }
+        if let Some(v) = self.period_start.as_ref() {
+            s.write_timestamp(&Self::M_PERIOD_START, v)?;
+        }
+        if let Some(v) = self.period_end.as_ref() {
+            s.write_timestamp(&Self::M_PERIOD_END, v)?;
+        }
+        if let Some(v) = self.series.as_ref() {
+            s.write_string(&Self::M_SERIES, v.as_str())?;
+        }
+        if let Some(v) = self.category.as_ref() {
+            s.write_string(&Self::M_CATEGORY, v.as_str())?;
+        }
+        if let Some(v) = self.company_name.as_ref() {
+            s.write_string(&Self::M_COMPANY_NAME, v.as_str())?;
+        }
+        if let Some(v) = self.product_name.as_ref() {
+            s.write_string(&Self::M_PRODUCT_NAME, v.as_str())?;
+        }
+        if let Some(v) = self.status_message.as_ref() {
+            s.write_string(&Self::M_STATUS_MESSAGE, v.as_str())?;
+        }
+        if let Some(v) = self.acceptance_type.as_ref() {
+            s.write_string(&Self::M_ACCEPTANCE_TYPE, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for ReportSummary {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.id = Some(d.read_string(&Self::M_ID)?),
+                Some(1) => out.name = Some(d.read_string(&Self::M_NAME)?),
+                Some(2) => out.state = Some(d.read_string(&Self::M_STATE)?),
+                Some(3) => out.arn = Some(d.read_string(&Self::M_ARN)?),
+                Some(4) => out.version = Some(d.read_long(&Self::M_VERSION)?),
+                Some(5) => out.upload_state = Some(d.read_string(&Self::M_UPLOAD_STATE)?),
+                Some(6) => out.description = Some(d.read_string(&Self::M_DESCRIPTION)?),
+                Some(7) => out.period_start = Some(d.read_timestamp(&Self::M_PERIOD_START)?),
+                Some(8) => out.period_end = Some(d.read_timestamp(&Self::M_PERIOD_END)?),
+                Some(9) => out.series = Some(d.read_string(&Self::M_SERIES)?),
+                Some(10) => out.category = Some(d.read_string(&Self::M_CATEGORY)?),
+                Some(11) => out.company_name = Some(d.read_string(&Self::M_COMPANY_NAME)?),
+                Some(12) => out.product_name = Some(d.read_string(&Self::M_PRODUCT_NAME)?),
+                Some(13) => out.status_message = Some(d.read_string(&Self::M_STATUS_MESSAGE)?),
+                Some(14) => out.acceptance_type = Some(d.read_string(&Self::M_ACCEPTANCE_TYPE)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 
 /// The values `AcceptanceType` accepts on the wire.

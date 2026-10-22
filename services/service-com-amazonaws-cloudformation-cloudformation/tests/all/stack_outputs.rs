@@ -263,6 +263,28 @@ fn output_cases() -> Vec<OutputCase> {
             ]),
         },
         OutputCase {
+            // The resource types the EventBridge Scheduler issue's templates declare:
+            // neither is in the return-value catalogue, so `Ref` answers the physical
+            // name — the name the template declared — and `Fn::GetAtt` for an attribute
+            // nothing publishes is reported without a value rather than with a guess.
+            case: "an uncatalogued type: Ref is its physical name, GetAtt has no value",
+            stack_name: "scheduler",
+            template: r#"{"Resources":{
+                   "G":{"Type":"AWS::Scheduler::ScheduleGroup","Properties":{"Name":"probe-group"}},
+                   "S":{"Type":"AWS::Scheduler::Schedule","Properties":{"Name":"probe-schedule",
+                     "GroupName":{"Ref":"G"}}}},
+                 "Outputs":{"GroupName":{"Value":{"Ref":"G"}},
+                   "ScheduleName":{"Value":{"Ref":"S"}},
+                   "ScheduleArn":{"Value":{"Fn::GetAtt":["S","Arn"]}}}}"#
+                .to_string(),
+            parameters: vec![],
+            expected: vec![
+                ("GroupName", Expected::Value("probe-group".to_string())),
+                ("ScheduleName", Expected::Value("probe-schedule".to_string())),
+                ("ScheduleArn", Expected::NoValue),
+            ],
+        },
+        OutputCase {
             case: "the pseudo parameters a Ref resolves without any resource",
             stack_name: "pseudo",
             template: concat!(

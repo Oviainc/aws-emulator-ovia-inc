@@ -16,13 +16,22 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `tokio::time` drives the tests' wait past a group deletion's due instant.
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # URL-safe opaque encoding for the `ListSchedules` page token.
 hex = { workspace = true }
+# The AWS SDK for IAM, driven over the in-process callback
+# (`OperationContext::callback`): `CreateSchedule`/`UpdateSchedule` verify a
+# target's execution role with `GetRole` before persisting a schedule. Only the
+# generated client is needed — the emulator supplies the transport, so the SDK's
+# own HTTPS stack and runtime are left out.
+aws-sdk-iam = { version = "1", default-features = false }
+# Decodes the URL-encoded form IAM reports a trust-policy document in.
+percent-encoding = "2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

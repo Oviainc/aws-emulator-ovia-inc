@@ -158,12 +158,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
-        let store = state.lock();
+        let mut store = state.lock();
+        // Materialise any group removal the clock has already made due, so a
+        // group whose `DELETING` window has elapsed reads as gone.
+        store.settle(::std::time::SystemTime::now());
 
         let Some(record) = store.group_record(&region, &input.name) else {
             return Err(GetScheduleGroupErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Schedule group {} does not exist.", input.name),
+                    message: crate::state::group_does_not_exist(&input.name),
                 },
             )
             .into());
