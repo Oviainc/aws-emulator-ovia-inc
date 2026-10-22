@@ -6,13 +6,14 @@
 //! record onto a modelled shape, so each `src/ops/` handler only resolves,
 //! mutates and projects — it never re-derives an ARN, an id or a status token.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Attachment, EncryptionConfiguration, Firewall, FirewallMetadata, FirewallPolicy,
-    FirewallPolicyMetadata, FirewallPolicyResponse, FirewallStatus, PerObjectStatus, SubnetMapping,
-    SyncState, Tag,
+    Address, AnalysisResult, Attachment, EncryptionConfiguration, Firewall, FirewallMetadata,
+    FirewallPolicy, FirewallPolicyMetadata, FirewallPolicyResponse, FirewallStatus, MatchAttributes,
+    PerObjectStatus, PortRange, RuleGroup, RuleGroupResponse, SourceMetadata, SubnetMapping,
+    SummaryConfiguration, SyncState, Tag,
 };
 
 /// The ARN namespace (and SigV4 signing name) this service's ARNs carry, from the
@@ -56,6 +57,42 @@ pub const RESOURCE_ACTIVE: &str = "ACTIVE";
 /// See [`RESOURCE_ACTIVE`].
 pub const RESOURCE_DELETING: &str = "DELETING";
 
+/// `RuleGroupType` members (`smithy_query(query="shape",shape="RuleGroupType")`).
+pub const RULE_GROUP_STATELESS: &str = "STATELESS";
+/// See [`RULE_GROUP_STATELESS`].
+pub const RULE_GROUP_STATEFUL: &str = "STATEFUL";
+/// See [`RULE_GROUP_STATELESS`].
+pub const RULE_GROUP_STATEFUL_DOMAIN: &str = "STATEFUL_DOMAIN";
+
+/// `EncryptionType` members (`smithy_query(query="shape",shape="EncryptionType")`).
+pub const ENCRYPTION_AWS_OWNED_KMS_KEY: &str = "AWS_OWNED_KMS_KEY";
+
+/// `IdentifiedType` members (`smithy_query(query="shape",shape="IdentifiedType")`).
+pub const IDENTIFIED_FORWARDING_ASYMMETRICALLY: &str = "STATELESS_RULE_FORWARDING_ASYMMETRICALLY";
+/// See [`IDENTIFIED_FORWARDING_ASYMMETRICALLY`].
+pub const IDENTIFIED_CONTAINS_TCP_FLAGS: &str = "STATELESS_RULE_CONTAINS_TCP_FLAGS";
+
+/// The stateless standard actions that forward a packet on rather than dropping
+/// it, and so are the ones the stateless analyzer looks at
+/// (`RuleDefinition$Actions`: "aws:pass ... permits it to go to its intended
+/// destination", "aws:forward_to_sfe ... forwards it to the stateful rule engine").
+pub const STATELESS_FORWARDING_ACTIONS: [&str; 2] = ["aws:pass", "aws:forward_to_sfe"];
+
+/// The encryption settings a resource reports when the request named none.
+///
+/// `EncryptionConfiguration`'s own documentation states the rule: "Your data is
+/// encrypted by default with an Amazon Web Services owned key that Amazon Web
+/// Services owns and manages for you", so an absent member means the AWS-owned
+/// key and no `KeyId` — never "no encryption settings at all".
+pub fn effective_encryption_configuration(
+    requested: Option<EncryptionConfiguration>,
+) -> EncryptionConfiguration {
+    requested.unwrap_or_else(|| EncryptionConfiguration {
+        key_id: None,
+        r#type: ENCRYPTION_AWS_OWNED_KMS_KEY.to_string(),
+    })
+}
+
 /// The upper bound of `PaginationMaxResults` (`range 1..100`), and therefore the
 /// page size a request that omits `MaxResults` gets.
 pub const MAX_PAGE_SIZE: i32 = 100;
@@ -78,6 +115,20 @@ pub const MAX_STORED_FIREWALLS: usize = 1_000;
 /// How many firewall policies this emulator keeps. See [`MAX_STORED_FIREWALLS`].
 pub const MAX_STORED_FIREWALL_POLICIES: usize = 1_000;
 
+/// How many rule groups this emulator keeps. See [`MAX_STORED_FIREWALLS`].
+pub const MAX_STORED_RULE_GROUPS: usize = 1_000;
+
+/// The highest `Capacity` a rule group may be created with here.
+///
+/// CHOSEN, not an AWS quota: the model puts NO range on `RuleCapacity`, and a
+/// rule group's retained rules are bounded only by the capacity they consume
+/// (`required_capacity` must not exceed `Capacity`), so capping the capacity is
+/// what keeps one request from making a single retained record arbitrarily
+/// large. It is far above any rule group an emulator serves, and a request past
+/// it is refused with the modelled `LimitExceededException` ("Unable to perform
+/// the operation because doing so would violate a limit setting").
+pub const MAX_RULE_GROUP_CAPACITY: i32 = 30_000;
+
 /// How many entries any one list inside a retained `FirewallPolicy` document may
 /// carry.
 ///
@@ -85,7 +136,7 @@ pub const MAX_STORED_FIREWALL_POLICIES: usize = 1_000;
 /// rule-group reference, default-action or custom-action lists, so one request
 /// could otherwise make a single retained record arbitrarily large. AWS bounds
 /// the same thing by rule CAPACITY (the `Consumed*RuleCapacity` members), which
-/// this emulator cannot compute until rule groups are implemented; this entry
+/// a policy cannot total until it resolves its rule-group references; this entry
 /// count stands in for it and is far above any real policy. A request past it is
 /// refused with the modelled `LimitExceededException`.
 pub const MAX_POLICY_LIST_ENTRIES: usize = 64;
@@ -134,6 +185,73 @@ pub fn policy_document_breach(policy: &FirewallPolicy) -> Option<String> {
                  {MAX_POLICY_LIST_ENTRIES} are allowed."
             )
         })
+}
+
+/// The `RulesSource` member `group`'s rules were given in, for an error message
+/// that names the offending part of the request. `rule_group_document_breach`
+/// has already refused a document that does not set exactly one of them.
+pub fn rules_source_member(group: &RuleGroup) -> &'static str {
+    let source = &group.rules_source;
+    if source.stateless_rules_and_custom_actions.is_some() {
+        "StatelessRulesAndCustomActions"
+    } else if source.stateful_rules.is_some() {
+        "StatefulRules"
+    } else if source.rules_source_list.is_some() {
+        "RulesSourceList"
+    } else {
+        "RulesString"
+    }
+}
+
+/// Why `group` is not a rule group document of type `group_type`, or `None` when
+/// it is one.
+///
+/// Two documented rules: "Each rule group requires a single `RulesSource`. You
+/// can use an instance of this for either stateless rules or stateful rules"
+/// (`RulesSource`), so exactly one of the four `RulesSource` members is set and
+/// the one that is set must belong to the half the `Type` names; and
+/// "<RuleVariables> ... You can only use these for stateful rule groups"
+/// (`RuleGroup$RuleVariables`).
+pub fn rule_group_document_breach(group_type: &str, group: &RuleGroup) -> Option<String> {
+    let source = &group.rules_source;
+    let stateless = source.stateless_rules_and_custom_actions.is_some();
+    let members = [
+        ("RulesString", source.rules_string.is_some()),
+        ("RulesSourceList", source.rules_source_list.is_some()),
+        ("StatefulRules", source.stateful_rules.is_some()),
+        ("StatelessRulesAndCustomActions", stateless),
+    ];
+    let given: Vec<&str> = members
+        .into_iter()
+        .filter_map(|(member, present)| present.then_some(member))
+        .collect();
+    if given.len() != 1 {
+        return Some(format!(
+            "RuleGroup.RulesSource must specify exactly one of RulesString, RulesSourceList, \
+             StatefulRules or StatelessRulesAndCustomActions; this request specified {}.",
+            if given.is_empty() {
+                "none of them".to_string()
+            } else {
+                given.join(", ")
+            }
+        ));
+    }
+    if (group_type == RULE_GROUP_STATELESS) != stateless {
+        return Some(format!(
+            "A {group_type} rule group's RuleGroup.RulesSource must specify {}.",
+            if group_type == RULE_GROUP_STATELESS {
+                "StatelessRulesAndCustomActions"
+            } else {
+                "RulesString, RulesSourceList or StatefulRules"
+            }
+        ));
+    }
+    if group_type == RULE_GROUP_STATELESS && group.rule_variables.is_some() {
+        return Some(
+            "RuleGroup.RuleVariables can only be used in a stateful rule group.".to_string(),
+        );
+    }
+    None
 }
 
 /// Sixteen bytes nothing else in this process will produce again: the first half
@@ -219,6 +337,260 @@ pub fn firewall_arn(region: &str, name: &str) -> String {
 /// `arn:aws:network-firewall:<region>:<account>:firewall-policy/<name>`.
 pub fn firewall_policy_arn(region: &str, name: &str) -> String {
     emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("firewall-policy/{name}"))
+}
+
+/// The resource part of a rule group's ARN, and therefore the key its record is
+/// stored under: `stateless-rulegroup/<name>` for a `STATELESS` rule group and
+/// `stateful-rulegroup/<name>` for every stateful one.
+///
+/// The type is part of the resource path because `DescribeRuleGroup$Type` is
+/// "required for requests that do not include the `RuleGroupARN`" — the ARN
+/// alone identifies a rule group, so it must carry what the name alone does not.
+/// Two rule groups therefore collide exactly when they share this path, which is
+/// what makes a name reusable across the stateless and stateful halves of the
+/// service.
+pub fn rule_group_resource_path(group_type: &str, name: &str) -> String {
+    let kind = if group_type == RULE_GROUP_STATELESS {
+        "stateless-rulegroup"
+    } else {
+        "stateful-rulegroup"
+    };
+    format!("{kind}/{name}")
+}
+
+/// `arn:aws:network-firewall:<region>:<account>:<stateful|stateless>-rulegroup/<name>`.
+pub fn rule_group_arn(region: &str, group_type: &str, name: &str) -> String {
+    emulator_server::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &rule_group_resource_path(group_type, name),
+    )
+}
+
+/// The capacity the rules in `group` consume, by the calculation
+/// `CreateRuleGroupRequest$Capacity` documents.
+///
+/// For a stateless rule group it is "the sum of the capacity requirements of the
+/// individual rules", where one rule's requirement is the product of its match
+/// settings' values and a setting that is absent (which matches anything) counts
+/// as 1. For a stateful rule group it is "the number of individual rules": one
+/// per `StatefulRules` entry, one per rule line of a Suricata `RulesString`, or
+/// one per domain in a `RulesSourceList`.
+pub fn required_capacity(group_type: &str, group: &RuleGroup) -> i32 {
+    let source = &group.rules_source;
+    let total: i64 = if group_type == RULE_GROUP_STATELESS {
+        source
+            .stateless_rules_and_custom_actions
+            .as_ref()
+            .map(|stateless| {
+                stateless
+                    .stateless_rules
+                    .iter()
+                    .map(|rule| {
+                        let attributes = &rule.rule_definition.match_attributes;
+                        let settings = [
+                            attributes.sources.as_ref().map_or(0, Vec::len),
+                            attributes.destinations.as_ref().map_or(0, Vec::len),
+                            attributes.source_ports.as_ref().map_or(0, Vec::len),
+                            attributes.destination_ports.as_ref().map_or(0, Vec::len),
+                            attributes.protocols.as_ref().map_or(0, Vec::len),
+                            attributes.tcp_flags.as_ref().map_or(0, Vec::len),
+                        ];
+                        settings
+                            .into_iter()
+                            .map(|elements| i64::try_from(elements.max(1)).unwrap_or(i64::MAX))
+                            .fold(1i64, i64::saturating_mul)
+                    })
+                    .fold(0i64, i64::saturating_add)
+            })
+            .unwrap_or_default()
+    } else {
+        let from_rules = source.stateful_rules.as_ref().map_or(0, Vec::len);
+        let from_string = source
+            .rules_string
+            .as_deref()
+            .map_or(0, |rules| suricata_rule_lines(rules).count());
+        let from_domains = source
+            .rules_source_list
+            .as_ref()
+            .map_or(0, |list| list.targets.len());
+        i64::try_from(from_rules + from_string + from_domains).unwrap_or(i64::MAX)
+    };
+    i32::try_from(total).unwrap_or(i32::MAX)
+}
+
+/// The individual rules in a Suricata flat-format rules string: one per line,
+/// skipping blank lines and `#` comments, which carry no rule.
+pub fn suricata_rule_lines(rules: &str) -> impl Iterator<Item = &str> {
+    rules
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+}
+
+/// The stateless rule-group analyzer's findings for `group`.
+///
+/// `AnalysisResult` documents the analyzer as running over STATELESS rule groups
+/// and `IdentifiedType` documents exactly the two configurations it reports, each
+/// for rules "with the action `pass` or `forward`":
+///
+/// * `STATELESS_RULE_FORWARDING_ASYMMETRICALLY` — "the rule's set of source IP
+///   addresses or their associated port numbers, don't match the set of
+///   destination IP addresses or their associated port numbers", mitigated by
+///   there being "an existing return path". A rule is therefore reported unless
+///   some forwarding rule in the group matches the mirrored traffic (its sources
+///   and ports are this rule's destinations and ports, and vice versa); a rule
+///   that names no addresses or ports matches anything in both directions and so
+///   mirrors itself.
+/// * `STATELESS_RULE_CONTAINS_TCP_FLAGS` — a forwarding rule "contains TCP
+///   flags", whose mitigation is to "remove unnecessary TCP flag inspections
+///   from the rules".
+///
+/// `IdentifiedRuleIds` is "the priority number of the stateless rules identified
+/// in the analysis", so each finding lists the priorities it was raised for, in
+/// the order the rules were given.
+///
+/// The pass is linear in the number of rules (the return paths are indexed once)
+/// and the caller runs it OUTSIDE the state lock, so one request's analysis
+/// neither scales faster than its own input nor blocks another caller's.
+pub fn analyze_stateless_rule_group(group: &RuleGroup) -> Vec<AnalysisResult> {
+    let Some(stateless) = group.rules_source.stateless_rules_and_custom_actions.as_ref() else {
+        return Vec::new();
+    };
+    let forwarding: Vec<_> = stateless
+        .stateless_rules
+        .iter()
+        .filter(|rule| {
+            rule.rule_definition
+                .actions
+                .iter()
+                .any(|action| STATELESS_FORWARDING_ACTIONS.contains(&action.as_str()))
+        })
+        .collect();
+
+    // Indexed once, so looking a rule's return path up is a hash lookup rather
+    // than a scan of the other rules: the whole pass costs one unit of work per
+    // rule, whatever a caller sends.
+    let directions: Vec<RuleDirection> = forwarding
+        .iter()
+        .map(|rule| RuleDirection::of(&rule.rule_definition.match_attributes))
+        .collect();
+    let indexed: HashSet<&RuleDirection> = directions.iter().collect();
+
+    let mut asymmetric = Vec::new();
+    let mut with_tcp_flags = Vec::new();
+    for (rule, direction) in forwarding.iter().zip(&directions) {
+        if !indexed.contains(&direction.reversed()) {
+            asymmetric.push(rule.priority.to_string());
+        }
+        if rule
+            .rule_definition
+            .match_attributes
+            .tcp_flags
+            .as_ref()
+            .is_some_and(|flags| !flags.is_empty())
+        {
+            with_tcp_flags.push(rule.priority.to_string());
+        }
+    }
+
+    let mut results = Vec::new();
+    if !asymmetric.is_empty() {
+        results.push(AnalysisResult {
+            identified_rule_ids: Some(asymmetric),
+            identified_type: Some(IDENTIFIED_FORWARDING_ASYMMETRICALLY.to_string()),
+            analysis_detail: Some(
+                "The rule forwards traffic asymmetrically: no rule in this rule group \
+                 matches the return traffic for the addresses and ports it matches."
+                    .to_string(),
+            ),
+        });
+    }
+    if !with_tcp_flags.is_empty() {
+        results.push(AnalysisResult {
+            identified_rule_ids: Some(with_tcp_flags),
+            identified_type: Some(IDENTIFIED_CONTAINS_TCP_FLAGS.to_string()),
+            analysis_detail: Some(
+                "The rule inspects TCP flags, which are not consistent in the forward and \
+                 return directions of a connection."
+                    .to_string(),
+            ),
+        });
+    }
+    results
+}
+
+/// The traffic one stateless rule matches, as comparable sets.
+///
+/// Two rules describe the same traffic when their sets are equal whatever order
+/// the match settings were written in, and a rule's return path is this with the
+/// source and destination halves swapped.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RuleDirection {
+    /// `MatchAttributes.Sources`, as address definitions.
+    sources: Vec<String>,
+    /// `MatchAttributes.Destinations`, as address definitions.
+    destinations: Vec<String>,
+    /// `MatchAttributes.SourcePorts`, as `from:to` ranges.
+    source_ports: Vec<String>,
+    /// `MatchAttributes.DestinationPorts`, as `from:to` ranges.
+    destination_ports: Vec<String>,
+}
+
+impl RuleDirection {
+    /// The traffic `attributes` matches.
+    fn of(attributes: &MatchAttributes) -> Self {
+        Self {
+            sources: address_set(attributes.sources.as_ref()),
+            destinations: address_set(attributes.destinations.as_ref()),
+            source_ports: port_set(attributes.source_ports.as_ref()),
+            destination_ports: port_set(attributes.destination_ports.as_ref()),
+        }
+    }
+
+    /// The same traffic flowing the other way: the return path a symmetric rule
+    /// group also matches.
+    fn reversed(&self) -> Self {
+        Self {
+            sources: self.destinations.clone(),
+            destinations: self.sources.clone(),
+            source_ports: self.destination_ports.clone(),
+            destination_ports: self.source_ports.clone(),
+        }
+    }
+}
+
+/// The address definitions of a match setting as a set, so two settings compare
+/// equal when they match the same addresses whatever order they were given in.
+/// An absent setting is the empty set, which is how "matches with any address" is
+/// written.
+fn address_set(addresses: Option<&Vec<Address>>) -> Vec<String> {
+    let mut definitions: Vec<String> = addresses
+        .map(|addresses| {
+            addresses
+                .iter()
+                .map(|address| address.address_definition.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    definitions.sort();
+    definitions.dedup();
+    definitions
+}
+
+/// The port ranges of a match setting as a set. See [`address_set`].
+fn port_set(ports: Option<&Vec<PortRange>>) -> Vec<String> {
+    let mut ranges: Vec<String> = ports
+        .map(|ports| {
+            ports
+                .iter()
+                .map(|range| format!("{}:{}", range.from_port, range.to_port))
+                .collect()
+        })
+        .unwrap_or_default();
+    ranges.sort();
+    ranges.dedup();
+    ranges
 }
 
 /// The Availability Zone the firewall endpoint for the `index`-th subnet mapping
@@ -546,9 +918,10 @@ impl FirewallPolicyRecord {
             encryption_configuration: self.encryption_configuration.clone(),
             last_modified_time: Some(as_date_time(self.last_modified_time)),
             // The Consumed*Capacity members count capacity units drawn by the
-            // rule groups the policy references. Rule groups are not implemented
-            // (their operations still answer 501), so there is nothing to total
-            // and the members are left absent rather than filled with a guess.
+            // rule groups the policy references. A policy's references are not
+            // resolved against the rule-group store yet, so there is nothing to
+            // total and the members are left absent rather than filled with a
+            // guess.
             ..FirewallPolicyResponse::default()
         }
     }
@@ -558,6 +931,72 @@ impl FirewallPolicyRecord {
         FirewallPolicyMetadata {
             name: Some(self.policy_name.clone()),
             arn: Some(self.policy_arn.clone()),
+        }
+    }
+}
+
+/// A rule group, as persisted. Every member `RuleGroupResponse` reports is read
+/// back from here.
+#[derive(Debug, Clone)]
+pub struct RuleGroupRecord {
+    /// `RuleGroupResponse.RuleGroupName`.
+    pub rule_group_name: String,
+    /// `RuleGroupResponse.RuleGroupArn`.
+    pub rule_group_arn: String,
+    /// `RuleGroupResponse.RuleGroupId`.
+    pub rule_group_id: String,
+    /// `RuleGroupResponse.Type`, a `RuleGroupType` member.
+    pub rule_group_type: String,
+    /// `RuleGroupResponse.Capacity`: fixed at creation.
+    pub capacity: i32,
+    /// The rule group document itself, as `DescribeRuleGroup` returns it.
+    pub rule_group: RuleGroup,
+    /// `RuleGroupResponse.Description`.
+    pub description: Option<String>,
+    /// `RuleGroupResponse.Tags`.
+    pub tags: Option<Vec<Tag>>,
+    /// `RuleGroupResponse.EncryptionConfiguration`.
+    pub encryption_configuration: Option<EncryptionConfiguration>,
+    /// `RuleGroupResponse.SourceMetadata`.
+    pub source_metadata: Option<SourceMetadata>,
+    /// `RuleGroupResponse.SummaryConfiguration`.
+    pub summary_configuration: Option<SummaryConfiguration>,
+    /// A `ResourceStatus` member.
+    pub status: String,
+    /// How many firewall policies use this rule group.
+    pub number_of_associations: i32,
+    /// The optimistic-locking token; re-minted on every mutation.
+    pub update_token: String,
+    /// `RuleGroupResponse.LastModifiedTime`.
+    pub last_modified_time: SystemTime,
+}
+
+impl RuleGroupRecord {
+    /// The `RuleGroupResponse` shape for this record.
+    ///
+    /// `AnalysisResults` is left to the caller: the analyzer runs only when the
+    /// request sets `AnalyzeRuleGroup`, and its findings are computed from the
+    /// rules rather than stored.
+    pub fn to_response(&self) -> RuleGroupResponse {
+        RuleGroupResponse {
+            rule_group_name: self.rule_group_name.clone(),
+            rule_group_arn: self.rule_group_arn.clone(),
+            rule_group_id: self.rule_group_id.clone(),
+            r#type: Some(self.rule_group_type.clone()),
+            capacity: Some(self.capacity),
+            consumed_capacity: Some(required_capacity(&self.rule_group_type, &self.rule_group)),
+            description: self.description.clone(),
+            rule_group_status: Some(self.status.clone()),
+            tags: self.tags.clone(),
+            number_of_associations: Some(self.number_of_associations),
+            encryption_configuration: self.encryption_configuration.clone(),
+            source_metadata: self.source_metadata.clone(),
+            summary_configuration: self.summary_configuration.clone(),
+            last_modified_time: Some(as_date_time(self.last_modified_time)),
+            // `SnsTopic` records changes to a MANAGED rule group, which only
+            // Amazon Web Services and its partners publish; a rule group created
+            // through this API has no such topic, so the member stays absent.
+            ..RuleGroupResponse::default()
         }
     }
 }
@@ -573,6 +1012,12 @@ pub struct ComAmazonawsNetworkfirewallNetworkfirewall20201112State {
     pub firewall_policies: HashMap<String, FirewallPolicyRecord>,
     /// `FirewallPolicyArn` -> `FirewallPolicyName`.
     pub firewall_policy_arn_index: HashMap<String, String>,
+    /// Every created-and-not-deleted rule group, keyed by the ARN resource path
+    /// [`rule_group_resource_path`] builds, so the stateless and the stateful
+    /// half of the service each have their own name space.
+    pub rule_groups: HashMap<String, RuleGroupRecord>,
+    /// `RuleGroupArn` -> the [`rule_groups`](Self::rule_groups) key.
+    pub rule_group_arn_index: HashMap<String, String>,
 }
 
 impl ComAmazonawsNetworkfirewallNetworkfirewall20201112State {
@@ -595,6 +1040,23 @@ impl ComAmazonawsNetworkfirewallNetworkfirewall20201112State {
     ) -> Result<String, ResolveError> {
         resolve(&self.firewall_policy_arn_index, name, arn, |key| {
             self.firewall_policies.contains_key(key)
+        })
+    }
+
+    /// The [`rule_groups`](Self::rule_groups) key the given name and/or ARN
+    /// identifies.
+    ///
+    /// A name is only half of a rule group's identity, so the caller passes the
+    /// resource path [`rule_group_resource_path`] builds from the name and the
+    /// request's `Type` — a request that gives a name without a type is refused
+    /// before this, as `DescribeRuleGroup$Type` documents.
+    pub fn resolve_rule_group(
+        &self,
+        resource_path: Option<&str>,
+        arn: Option<&str>,
+    ) -> Result<String, ResolveError> {
+        resolve(&self.rule_group_arn_index, resource_path, arn, |key| {
+            self.rule_groups.contains_key(key)
         })
     }
 }

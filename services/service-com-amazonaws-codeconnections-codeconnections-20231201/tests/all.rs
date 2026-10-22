@@ -13,7 +13,11 @@
 // points it into `tests/all/`.
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
+#[path = "all/git_sync.rs"]
+mod git_sync;
 #[path = "all/host_association.rs"]
 mod host_association;
+#[path = "all/modeled_input_refusals.rs"]
+mod modeled_input_refusals;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

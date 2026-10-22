@@ -164,13 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(domain) = store.domain(&input.domain, input.domain_owner.as_deref()) else {
             return Err(DescribePackageGroupErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Domain not found. Domain '{}' owned by account '{}' does not exist.",
-                        input.domain,
-                        input
-                            .domain_owner
-                            .as_deref()
-                            .unwrap_or(::engine::emulator_account_id())
+                    message: crate::state::domain_not_found_message(
+                        &input.domain,
+                        input.domain_owner.as_deref(),
                     ),
                     resource_id: Some(input.domain.clone()),
                     resource_type: Some("domain".to_string()),
@@ -185,9 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(description) = domain.package_group_description(&input.package_group) else {
             return Err(DescribePackageGroupErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Package group not found. Package group '{}' in domain '{}' owned by account '{}' does not exist.",
-                        input.package_group, domain.name, domain.owner
+                    message: crate::state::package_group_not_found_message(
+                        &domain.name,
+                        Some(&domain.owner),
+                        &input.package_group,
                     ),
                     resource_id: Some(input.package_group.clone()),
                     resource_type: None,

@@ -240,7 +240,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy: input.firewall_policy,
             description: input.description,
             tags: input.tags,
-            encryption_configuration: input.encryption_configuration,
+            encryption_configuration: Some(crate::state::effective_encryption_configuration(
+                input.encryption_configuration,
+            )),
             status: crate::state::RESOURCE_ACTIVE.to_string(),
             number_of_associations: 0,
             update_token: crate::state::new_uuid(),

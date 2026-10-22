@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVpcConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVpcConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVpcConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the MSK VPC connection an ARN names, from the record
+//! `CreateVpcConnection` registered in this service's state
+//! ([`crate::state::VpcConnection`]). Reporting only: the one write it makes is
+//! the `CREATING` -> `AVAILABLE` transition the clock already owed that
+//! connection.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +153,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVpcConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVpcConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVpcConnection"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeVpcConnectionErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+        // An `Arn` that is not an MSK VPC-connection ARN is a request the
+        // service cannot act on, so it is refused as a bad request rather than
+        // reported as a missing resource. The message is the one Amazon MSK
+        // answers a malformed parameter with.
+        if !crate::state::is_vpc_connection_arn(&input.arn) {
+            return Err(
+                DescribeVpcConnectionErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("Arn".to_string()),
+                    message: Some(crate::state::BAD_REQUEST_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+        let mut state = state.lock();
+        // Reporting only: the one write this makes materialises the
+        // `CREATING` -> `AVAILABLE` transition the clock already owed THIS
+        // connection, which was due at the same instant even if nobody had
+        // called.
+        let Some(connection) =
+            state.settled_vpc_connection_in(&region, &input.arn, std::time::SystemTime::now())
+        else {
+            return Err(
+                DescribeVpcConnectionErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("Arn".to_string()),
+                    message: Some(format!(
+                        "No VPC connection exists in {region} with the ARN {}",
+                        input.arn
+                    )),
+                })
+                .into(),
+            );
+        };
+        Ok(DescribeVpcConnectionOutput {
+            vpc_connection_arn: Some(connection.arn.clone()),
+            target_cluster_arn: Some(connection.target_cluster_arn.clone()),
+            state: Some(connection.state.clone()),
+            authentication: Some(connection.authentication.clone()),
+            vpc_id: Some(connection.vpc_id.clone()),
+            // `DescribeVpcConnection` reports the connection's client subnets
+            // as `Subnets`; they are the same stored list `CreateVpcConnection`
+            // echoed as `ClientSubnets`.
+            subnets: Some(connection.client_subnets.clone()),
+            security_groups: Some(connection.security_groups.clone()),
+            creation_time: Some(::aws_smithy_types::DateTime::from(connection.creation_time)),
+            tags: Some(connection.tag_map()),
+        })
     }
 }

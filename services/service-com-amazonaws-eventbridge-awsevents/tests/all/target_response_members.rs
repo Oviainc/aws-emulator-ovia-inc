@@ -14,7 +14,10 @@
 //! supported".
 //!
 //! The rows differ along the count of entries, the mix of outcomes within one
-//! request, the stored target count and the page size — not along names.
+//! request, the stored target count and the page size — not along names. A
+//! request this service cannot apply at all is refused (400) instead of being
+//! reported per entry, and the second table of the `PutTargets` case covers
+//! that: it must store nothing.
 
 use std::sync::Arc;
 
@@ -129,52 +132,43 @@ async fn fill(emulator: &Emulator, rule: &str, count: usize) -> Vec<String> {
     ids
 }
 
-/// `PutTargets` always reports `FailedEntries`, and its contents are the
-/// entries that did NOT land: the rows differ along the entry count and along
-/// the mix of outcomes inside one request, including the all-success row whose
-/// list is empty.
+/// `PutTargets` always reports `FailedEntries` on a 2xx — and it is EMPTY,
+/// because a target this service cannot install refuses the whole call instead
+/// (a repeated `Id`, or an ARN-valued member holding no ARN, is answered 400
+/// `ValidationException`, which is what the recorded service answers). The rows
+/// differ along the entry count, whether the ids are new or replace stored ones,
+/// and the per-rule quota; a second table covers the refusal classes, which must
+/// store nothing rather than report a per-entry failure.
 #[tokio::test]
 async fn put_targets_always_reports_a_failed_entries_list() {
-    // (case, [(Id, the Arn is well formed)]) — an ill-formed ARN is the
-    // per-entry failure the handler reports rather than refusing the call.
-    let row = |ids: &[&str], good: &[bool]| -> Vec<(String, bool)> {
-        ids.iter()
-            .zip(good.iter().copied())
-            .map(|(id, good)| ((*id).to_string(), good))
-            .collect()
-    };
-    let cases: Vec<(&str, Vec<(String, bool)>)> = vec![
-        ("one-entry-all-good", row(&["t1"], &[true])),
-        ("two-entries-all-good", row(&["t1", "t2"], &[true, true])),
+    // (case, the ids one request installs, the ids stored before it)
+    let cases: Vec<(&str, Vec<String>, usize)> = vec![
+        ("one-entry", vec!["t1".to_string()], 0),
+        ("two-entries", vec!["t1".to_string(), "t2".to_string()], 0),
         (
-            "at-the-per-rule-quota-all-good",
+            "at-the-per-rule-quota",
             (1..=MAX_TARGETS_PER_RULE)
-                .map(|index| (format!("t{index}"), true))
+                .map(|index| format!("t{index}"))
                 .collect(),
+            0,
         ),
-        ("one-entry-failing", row(&["t1"], &[false])),
+        ("replacing-a-stored-id", vec!["t1".to_string()], 2),
         (
-            "mixed-outcomes",
-            row(&["t1", "t2", "t3"], &[true, false, true]),
+            "replacing-one-and-adding-one",
+            vec!["t2".to_string(), "t9".to_string()],
+            2,
         ),
-        ("every-entry-failing", row(&["t1", "t2"], &[false, false])),
     ];
 
-    for (case, entries) in cases {
+    for (case, ids, stored_first) in cases {
         let emulator = emulator();
         let rule = "target-report";
         put_rule(&emulator, rule).await;
+        let already = fill(&emulator, rule, stored_first).await;
 
-        let targets: Vec<Value> = entries
+        let targets: Vec<Value> = ids
             .iter()
-            .map(|(id, well_formed)| {
-                let arn = if *well_formed {
-                    target_arn(&format!("queue-{id}"))
-                } else {
-                    format!("not-an-arn-{id}")
-                };
-                json!({ "Id": id, "Arn": arn })
-            })
+            .map(|id| json!({ "Id": id, "Arn": target_arn(&format!("queue-{id}")) }))
             .collect();
         let (status, body) = call(
             &emulator,
@@ -187,47 +181,92 @@ async fn put_targets_always_reports_a_failed_entries_list() {
             "case {case:?}: PutTargets answered {status} {body}"
         );
 
-        let expected_failed: Vec<&str> = entries
-            .iter()
-            .filter(|(_, well_formed)| !well_formed)
-            .map(|(id, _)| id.as_str())
-            .collect();
         let failed = collection(&body, "FailedEntries", case);
-        let reported: Vec<&str> = failed
-            .iter()
-            .map(|entry| entry["TargetId"].as_str().unwrap_or_default())
-            .collect();
-        assert_eq!(
-            reported, expected_failed,
-            "case {case:?}: expected FailedEntries for {expected_failed:?}, got {body}"
+        assert!(
+            failed.is_empty(),
+            "case {case:?}: every entry landed, so FailedEntries is [], got {body}"
         );
         assert_eq!(
             body["FailedEntryCount"],
-            json!(expected_failed.len()),
-            "case {case:?}: expected FailedEntryCount {}, got {body}",
-            expected_failed.len()
+            json!(0),
+            "case {case:?}: expected FailedEntryCount 0, got {body}"
         );
 
-        // Round trip: exactly the entries that did not fail are the ones the
-        // reader reports, and that reader also always carries its list.
-        let expected_stored: Vec<&str> = entries
-            .iter()
-            .filter(|(_, well_formed)| *well_formed)
-            .map(|(id, _)| id.as_str())
-            .collect();
+        // Round trip: the stored list is what was already there, with a re-put
+        // id replaced in place and a new id appended — and that reader also
+        // always carries its list.
+        let mut expected_stored: Vec<String> = already.clone();
+        for id in &ids {
+            if !expected_stored.contains(id) {
+                expected_stored.push(id.clone());
+            }
+        }
         let (status, body) =
             call(&emulator, "ListTargetsByRule", &json!({ "Rule": rule })).await;
         assert_eq!(
             status, 200,
             "case {case:?}: ListTargetsByRule answered {status} {body}"
         );
-        let stored: Vec<&str> = collection(&body, "Targets", case)
+        let stored: Vec<String> = collection(&body, "Targets", case)
             .iter()
-            .map(|target| target["Id"].as_str().unwrap_or_default())
+            .map(|target| target["Id"].as_str().unwrap_or_default().to_string())
             .collect();
         assert_eq!(
             stored, expected_stored,
             "case {case:?}: expected the stored targets {expected_stored:?}, got {body}"
+        );
+    }
+
+    // The refusal classes: the call is answered 400 and NOTHING is stored, so no
+    // per-entry envelope is produced for them at all.
+    let refusals: Vec<(&str, Value)> = vec![
+        (
+            "an Arn that is not an ARN",
+            json!([{ "Id": "t1", "Arn": "not-an-arn" }]),
+        ),
+        (
+            "a well-formed entry beside one whose Arn is not an ARN",
+            json!([
+                { "Id": "t1", "Arn": target_arn("queue-t1") },
+                { "Id": "t2", "Arn": "not-an-arn" },
+            ]),
+        ),
+        (
+            "one Id named twice",
+            json!([
+                { "Id": "dup", "Arn": target_arn("queue-one") },
+                { "Id": "dup", "Arn": target_arn("queue-two") },
+            ]),
+        ),
+    ];
+
+    for (case, targets) in refusals {
+        let emulator = emulator();
+        let rule = "target-refusal";
+        put_rule(&emulator, rule).await;
+        let (status, body) = call(
+            &emulator,
+            "PutTargets",
+            &json!({ "Rule": rule, "Targets": targets }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the call to be refused, got {status} {body}"
+        );
+        assert!(
+            body.get("FailedEntries").is_none(),
+            "case {case:?}: a refused call reports no per-entry envelope, got {body}"
+        );
+        let (status, body) =
+            call(&emulator, "ListTargetsByRule", &json!({ "Rule": rule })).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: ListTargetsByRule answered {status} {body}"
+        );
+        assert!(
+            collection(&body, "Targets", case).is_empty(),
+            "case {case:?}: a refused call stores nothing, got {body}"
         );
     }
 }

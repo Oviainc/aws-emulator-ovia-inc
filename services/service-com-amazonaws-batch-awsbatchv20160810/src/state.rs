@@ -355,6 +355,16 @@ pub struct Job {
     pub next_phase_due_at: Option<i64>,
     pub is_cancelled: bool,
     pub is_terminated: bool,
+    /// The `reason` of a `CancelJob` that arrived while this job was `PENDING`, i.e.
+    /// still waiting on the jobs it depends on.
+    ///
+    /// `CancelJob`'s own doc defers that one case — "A PENDING job is cancelled after all
+    /// dependency jobs are completed. Therefore, it might take longer than expected to
+    /// cancel a job in PENDING status." — so the request is RECORDED here and
+    /// materialised by the clock, when
+    /// [`ComAmazonawsBatchAwsbatchv20160810State::advance_job`] next finds the
+    /// dependencies complete. `None` for every other job.
+    pub cancel_requested: Option<String>,
     pub parameters: Option<HashMap<String, String>>,
     pub container: Option<ContainerDetail>,
     pub node_properties: Option<NodeProperties>,
@@ -384,6 +394,27 @@ enum DependencyOutcome {
     Satisfied(i64),
     /// A dependency failed; the value is the instant it stopped.
     Failed(i64),
+}
+
+/// What a `CancelJob` call did to the job it named.
+///
+/// Every variant is a SUCCESS for the operation — AWS Batch answers `CancelJob` 200
+/// "even if no job is cancelled" — so this reports what happened to the job rather than
+/// whether the call is allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// The store holds no job with that id, so there was nothing to cancel.
+    Unknown,
+    /// The job had not progressed past `RUNNABLE`: it is now `FAILED` and `isCancelled`.
+    Cancelled,
+    /// The job is `PENDING` on the jobs it depends on, so the cancel is recorded and
+    /// falls due when they complete (see [`Job::cancel_requested`]).
+    Deferred,
+    /// The job reached `STARTING` or `RUNNING`, which `CancelJob` does not cancel: it is
+    /// left running, for `TerminateJob` to end.
+    NotCancelled,
+    /// The job is already in a terminal status, and is left exactly as it is.
+    AlreadyTerminal,
 }
 
 /// What materialising one owed transition did to a job.
@@ -668,6 +699,28 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         // out of the due index again while any of them is still running. Its due instant
         // is only a wake-up hint, set by `finish_job` when a dependency finishes.
         if job.status == JOB_PENDING {
+            // A `CancelJob` that arrived while the job was PENDING falls due with the
+            // jobs it waits on, not with the call: whatever they completed WITH, the
+            // job then ends FAILED carrying the caller's reason (`CancelJob`'s doc).
+            if job.cancel_requested.is_some() {
+                return match self.dependency_outcome(id, now) {
+                    DependencyOutcome::Waiting => {
+                        self.set_job_due(id, None);
+                        None
+                    }
+                    // Nothing the API exposes reaches this (see
+                    // `DEPENDENCY_UNRESOLVABLE_REASON`); the cancel the caller asked for
+                    // is what ends the job, so it is what the job records.
+                    DependencyOutcome::Unresolvable => {
+                        self.finish_cancelled(id, now);
+                        Some(Advanced::Terminal)
+                    }
+                    DependencyOutcome::Failed(at) | DependencyOutcome::Satisfied(at) => {
+                        self.finish_cancelled(id, at);
+                        Some(Advanced::Terminal)
+                    }
+                };
+            }
             return match self.dependency_outcome(id, now) {
                 DependencyOutcome::Waiting => {
                     self.set_job_due(id, None);
@@ -785,6 +838,55 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         }
         self.finish_job(id, JOB_FAILED, reason, now);
         true
+    }
+
+    /// Cancel `id` with `reason`, and answer what that did to the job.
+    ///
+    /// AWS Batch documents for `CancelJob`: a job in `SUBMITTED`, `PENDING` or `RUNNABLE`
+    /// is cancelled and ends `FAILED`; a job that progressed to `STARTING` or `RUNNING`
+    /// "aren't cancelled" and must be terminated instead, "However, the API operation
+    /// still succeeds, even if no job is cancelled". A job already in a terminal status is
+    /// left exactly as it is, and a `PENDING` job's cancel is deferred to the clock (see
+    /// [`Job::cancel_requested`]). Which of those happened is the answer, so the caller
+    /// never has to re-derive it; `CancelJob` itself succeeds for all of them.
+    pub fn cancel_job(&mut self, id: &str, reason: &str, now: i64) -> CancelOutcome {
+        let Some(job) = self.jobs.get(id) else {
+            return CancelOutcome::Unknown;
+        };
+        if is_terminal_status(&job.status) {
+            return CancelOutcome::AlreadyTerminal;
+        }
+        match job.status.as_str() {
+            JOB_PENDING => {
+                if let Some(job) = self.jobs.get_mut(id) {
+                    job.cancel_requested = Some(reason.to_string());
+                }
+                CancelOutcome::Deferred
+            }
+            JOB_SUBMITTED | JOB_RUNNABLE => {
+                if let Some(job) = self.jobs.get_mut(id) {
+                    job.is_cancelled = true;
+                }
+                self.finish_job(id, JOB_FAILED, reason, now);
+                CancelOutcome::Cancelled
+            }
+            // STARTING and RUNNING: cancelling does not touch them.
+            _ => CancelOutcome::NotCancelled,
+        }
+    }
+
+    /// Materialise the cancel [`Job::cancel_requested`] recorded for `id`: the job ends
+    /// `FAILED` at `stopped_at` carrying the reason the cancel named.
+    fn finish_cancelled(&mut self, id: &str, stopped_at: i64) {
+        let reason = self
+            .jobs
+            .get(id)
+            .and_then(|job| job.cancel_requested.clone())
+            .unwrap_or_default();
+        if let Some(job) = self.jobs.get_mut(id) {
+            job.is_cancelled = true;
+        }
+        self.finish_job(id, JOB_FAILED, &reason, stopped_at);
     }
 
     /// Set `id`'s status, leaving what the clock owes it alone.

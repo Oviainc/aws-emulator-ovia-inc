@@ -15,7 +15,10 @@ http = { workspace = true }
 # `validation`: the same `Schema` / `ShapeSerializer` seam, used to re-walk a built
 # input, and the `Violation` / constraint-path vocabulary the framework's own
 # constraint walk reports in. `shared_path`: `percent_decode`, which it reads a
-# percent-encoded URI path label through.
+# percent-encoded URI path label through. `claims_modeled_route`:
+# `ErasedServiceDefinition`, which it asks whether a service's own generated route table
+# binds a route for the request, and the empty `SdkBody` the request it hands that
+# service's protocol carries.
 smithy-server-runtime = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

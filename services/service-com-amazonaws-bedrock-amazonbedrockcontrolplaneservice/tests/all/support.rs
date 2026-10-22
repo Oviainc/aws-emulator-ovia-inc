@@ -19,11 +19,12 @@ pub const REGION: &str = "us-west-2";
 /// The canonical emulator account id every ARN carries.
 pub const ACCOUNT: &str = "000000000000";
 
-/// One emulator answer: the HTTP status, the parsed JSON body, and the wire error code
-/// when it is a failure.
+/// One emulator answer: the HTTP status, the `content-type` it was serialized under, the
+/// parsed JSON body, and the wire error code when it is a failure.
 #[derive(Debug)]
 pub struct Reply {
     pub status: u16,
+    pub content_type: Option<String>,
     pub body: Value,
     pub error: Option<String>,
 }
@@ -140,6 +141,11 @@ impl Emulator {
 
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let header_error = response
             .headers()
             .get("x-amzn-errortype")
@@ -157,6 +163,7 @@ impl Emulator {
         });
         Reply {
             status,
+            content_type,
             body,
             error,
         }

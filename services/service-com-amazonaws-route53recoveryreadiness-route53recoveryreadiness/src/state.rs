@@ -2,15 +2,15 @@
 
 //! Engine state for the com-amazonaws-route53recoveryreadiness-route53recoveryreadiness service.
 //!
-//! Besides the state struct this module holds the few helpers the resource-set and
-//! readiness-check handlers share — ARN construction, name validation, the
-//! record-to-modelled-shape conversions and the list cursor codec — so the eight
-//! operation files agree on one implementation of each instead of carrying eight
-//! copies that can drift apart.
+//! Besides the state struct this module holds the few helpers the resource-set,
+//! readiness-check and recovery-group handlers share — ARN construction, name
+//! validation, the record-to-modelled-shape conversions and the list cursor codec — so
+//! the operation files agree on one implementation of each instead of carrying a copy
+//! apiece that can drift apart.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::ops::types::{ReadinessCheckOutput, Resource, ResourceSetOutput};
+use crate::ops::types::{ReadinessCheckOutput, RecoveryGroupOutput, Resource, ResourceSetOutput};
 
 /// The `arnNamespace` this service's ARNs carry, from the model's `aws.api#service`
 /// trait (`smithy_query(query="service_info")`: `arnNamespace:
@@ -50,7 +50,8 @@ pub const MAX_RESULTS_MAX: i32 = 1000;
 pub const DEFAULT_MAX_RESULTS: usize = 100;
 
 /// The maximum number of records this emulator keeps in EACH of its caller-driven
-/// stores (resource sets, readiness checks, cross-account authorizations).
+/// stores (resource sets, readiness checks, cells, recovery groups, cross-account
+/// authorizations).
 ///
 /// This is NOT an AWS service quota — Route 53 Application Recovery Controller's
 /// published limits are per-account and adjustable, and nothing here claims to
@@ -251,8 +252,7 @@ pub struct ReadinessCheckRecord {
 }
 
 /// Which record an ARN belongs to, so an ARN-addressed lookup resolves back to the
-/// owning map. Readiness and architecture resources this slice does not store yet
-/// (cells, recovery groups) get their own variants when they are implemented.
+/// owning map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceKey {
     ResourceSet(String),
@@ -312,6 +312,16 @@ impl RecoveryGroupRecord {
     /// carries none.
     pub fn modeled_tags(&self) -> Option<HashMap<String, String>> {
         modeled_tags(&self.tags)
+    }
+
+    /// This record as a `ListRecoveryGroups` entry.
+    pub fn to_recovery_group_output(&self) -> RecoveryGroupOutput {
+        RecoveryGroupOutput {
+            cells: self.cell_arns.clone(),
+            recovery_group_arn: self.arn.clone(),
+            recovery_group_name: self.name.clone(),
+            tags: self.modeled_tags(),
+        }
     }
 }
 
@@ -634,6 +644,7 @@ pub fn validate_resources(resources: &[Resource]) -> Result<(), String> {
     }
     Ok(())
 }
+
 
 /// Refuse a tag map with more entries than this emulator stores per record.
 pub fn validate_tags(tags: Option<&HashMap<String, String>>) -> Result<(), String> {

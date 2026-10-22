@@ -37,3 +37,5 @@ mod state_roundtrip;
 mod storage_updates;
 #[path = "all/topic_lifecycle.rs"]
 mod topic_lifecycle;
+#[path = "all/vpc_connection_lifecycle.rs"]
+mod vpc_connection_lifecycle;

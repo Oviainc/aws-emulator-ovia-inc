@@ -210,14 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service answers WAFLimitsExceededException rather than storing the set.
         if input.addresses.len() > crate::state::MAX_IP_SET_ADDRESSES {
             return Err(CreateIPSetErrorModeled::WAFLimitsExceededException(
-                WAFLimitsExceededException {
-                    message: Some(format!(
-                        "An IPSet holds at most {} addresses; the request carries {}",
-                        crate::state::MAX_IP_SET_ADDRESSES,
-                        input.addresses.len()
-                    )),
-                    source_type: None,
-                },
+                crate::state::limits_exceeded_exception(),
             )
             .into());
         }
@@ -259,12 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "WAFDuplicateItemException",
             );
             return Err(CreateIPSetErrorModeled::WAFDuplicateItemException(
-                WAFDuplicateItemException {
-                    message: Some(format!(
-                        "An IPSet named {:?} already exists in scope {}",
-                        input.name, input.scope
-                    )),
-                },
+                crate::state::duplicate_item_exception(),
             )
             .into());
         }
@@ -278,13 +266,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "WAFLimitsExceededException",
             );
             return Err(CreateIPSetErrorModeled::WAFLimitsExceededException(
-                WAFLimitsExceededException {
-                    message: Some(format!(
-                        "You have reached the maximum of {} IPSets in scope {}",
-                        crate::state::MAX_IP_SETS_PER_SCOPE, input.scope
-                    )),
-                    source_type: None,
-                },
+                crate::state::limits_exceeded_exception(),
             )
             .into());
         }

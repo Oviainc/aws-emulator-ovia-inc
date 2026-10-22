@@ -17,7 +17,7 @@ mod apigateway_signing_name_routing;
 mod appconfig_signing_name_routing;
 #[path = "all/aws_marketplace_signing_name_routing.rs"]
 mod aws_marketplace_signing_name_routing;
-// These two sit in the SORTED block rather than being appended below, deliberately: the
+// These three sit in the SORTED block rather than being appended below, deliberately: the
 // appended region at the end of this file is where every concurrent suite lands, so a
 // line added there conflicts with every other suite in the same window. Here the
 // neighbouring lines are stable.
@@ -25,6 +25,8 @@ mod aws_marketplace_signing_name_routing;
 mod bedrock_agentcore_gateway_lambda_target;
 #[path = "all/bedrock_agentcore_signing_name_routing.rs"]
 mod bedrock_agentcore_signing_name_routing;
+#[path = "all/bedrock_signing_name_routing.rs"]
+mod bedrock_signing_name_routing;
 #[path = "all/boot_serve.rs"]
 mod boot_serve;
 #[path = "all/cloudfront_key_value_store_handshake.rs"]
@@ -96,10 +98,10 @@ mod wisdom_qconnect_signing_name_routing;
 // contended region. The suite itself is an ordinary `tests/all/<name>.rs` file.
 #[path = "all/sagemaker_signing_name_routing.rs"]
 mod sagemaker_signing_name_routing;
-#[path = "all/bedrock_signing_name_routing.rs"]
-mod bedrock_signing_name_routing;
 #[path = "all/billing_access_denied_principal_agrees_with_sts.rs"]
 mod billing_access_denied_principal_agrees_with_sts;
+#[path = "all/bedrock_modelled_route_claims.rs"]
+mod bedrock_modelled_route_claims;
 #[path = "all/connectcampaigns_signing_name_routing.rs"]
 mod connectcampaigns_signing_name_routing;
 #[path = "all/pi_data_source_ownership.rs"]

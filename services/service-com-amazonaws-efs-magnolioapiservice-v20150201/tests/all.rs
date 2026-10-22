@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/access_point_lifecycle.rs"]
 mod access_point_lifecycle;
+#[path = "all/delete_access_point.rs"]
+mod delete_access_point;
 #[path = "all/error_message_construction.rs"]
 mod error_message_construction;
 #[path = "all/file_system_lifecycle.rs"]

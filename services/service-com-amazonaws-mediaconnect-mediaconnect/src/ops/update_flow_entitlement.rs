@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFlowEntitlement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFlowEntitlement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFlowEntitlement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the members the request carries to the STORED entitlement the request pair
+//! `{FlowArn, EntitlementArn}` addresses, and answers with that stored record read back —
+//! so DescribeFlow afterwards reports exactly what this operation wrote.
+//!
+//! The operation is a PARTIAL update (`@idempotent`; every input member but the two
+//! `@httpLabel` identifiers is optional): a member the request carries replaces that
+//! setting on the stored entitlement, and a member it omits leaves the stored setting
+//! untouched — which is what the model says in so many words for the status member ("if
+//! you don't specify the entitlementStatus field in your request, MediaConnect leaves the
+//! value unchanged"). `Encryption` is the one request-only wrapper shape
+//! (`UpdateEncryption`, which mirrors `Encryption` member for member with every member
+//! optional), so it is merged member by member into the `Encryption` the entitlement
+//! holds, exactly as `update_flow` merges `UpdateFailoverConfig` / `UpdateMaintenance`.
+//!
+//! `Entitlement$Name` and `Entitlement$EntitlementArn` have no counterpart in the request
+//! shape, so an entitlement's identity is immutable: the ARN that addressed it still
+//! addresses it after the update.
+//!
+//! "If you change the subscribers, the service will remove the outputs that are used by
+//! the subscribers that are removed": those outputs live in the SUBSCRIBERS' own accounts
+//! (an entitlement is what another account builds a flow on), and this store holds only
+//! the granting account's flows — no stored record belongs to a subscriber — so there is
+//! nothing here for that sentence to remove. Nothing is invented in its place.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +111,82 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]), the one envelope this service words a
+/// refused request in.
+fn bad_request(detail: impl Into<String>) -> UpdateFlowEntitlementError {
+    UpdateFlowEntitlementErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
+/// in the request does not exist in the system" — the `identifier` the request addressed
+/// (the flow's ARN, or the entitlement's), in this service's not-found envelope
+/// ([`crate::state::not_found_message`]).
+fn not_found(identifier: &str) -> UpdateFlowEntitlementError {
+    UpdateFlowEntitlementErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
+
+/// The server-side failure for a store this handler cannot reach,
+/// `InternalServerErrorException` (HTTP 500).
+fn internal_error(message: impl Into<String>) -> UpdateFlowEntitlementError {
+    UpdateFlowEntitlementErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: message.into(),
+    })
+    .into()
+}
+
+/// The encryption the entitlement holds after `update` is applied to `stored`.
+///
+/// `UpdateEncryption` mirrors `Encryption` member for member and every member of it is
+/// optional, so this is a member-wise merge — the same merge `update_flow` performs for
+/// `UpdateFailoverConfig` and `UpdateMaintenance`: a member the request carries replaces
+/// its counterpart, one it omits keeps the stored value.
+///
+/// `Encryption$RoleArn` is REQUIRED, so an entitlement that holds no encryption yet can
+/// only be given one by a request that names the role: `None` says the merge is not
+/// expressible and the caller refuses the request with its own modelled client error.
+fn merged_encryption(stored: Option<&Encryption>, update: &UpdateEncryption) -> Option<Encryption> {
+    let role_arn = update
+        .role_arn
+        .clone()
+        .or_else(|| stored.map(|encryption| encryption.role_arn.clone()))?;
+    let mut merged = stored.cloned().unwrap_or_default();
+    merged.role_arn = role_arn;
+    if let Some(algorithm) = update.algorithm.clone() {
+        merged.algorithm = Some(algorithm);
+    }
+    if let Some(vector) = update.constant_initialization_vector.clone() {
+        merged.constant_initialization_vector = Some(vector);
+    }
+    if let Some(device_id) = update.device_id.clone() {
+        merged.device_id = Some(device_id);
+    }
+    if let Some(key_type) = update.key_type.clone() {
+        merged.key_type = Some(key_type);
+    }
+    if let Some(region) = update.region.clone() {
+        merged.region = Some(region);
+    }
+    if let Some(resource_id) = update.resource_id.clone() {
+        merged.resource_id = Some(resource_id);
+    }
+    if let Some(secret_arn) = update.secret_arn.clone() {
+        merged.secret_arn = Some(secret_arn);
+    }
+    if let Some(url) = update.url.clone() {
+        merged.url = Some(url);
+    }
+    Some(merged)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -169,18 +260,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFlowEntitlement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFlowEntitlementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFlowEntitlement"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error("the mediaconnect flow store is unavailable"));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write this operation owes beyond the request: a status change the clock
+        // had already made due was owed at that instant whether or not anybody called, so
+        // it is materialised before this call touches the flow.
+        store.settle_due_transitions(now);
+
+        // The entitlement is addressed by the PAIR of labels: the flow that holds it, and
+        // the entitlement's own ARN. Either one naming nothing is "one or more of the
+        // resources in the request does not exist".
+        let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
+            return Err(not_found(&input.flow_arn));
+        };
+        let Some(entitlement) = flow
+            .entitlements
+            .iter_mut()
+            .find(|entitlement| entitlement.entitlement_arn == input.entitlement_arn)
+        else {
+            return Err(not_found(&input.entitlement_arn));
+        };
+
+        // What the encryption becomes is resolved BEFORE anything is written, because a
+        // merge the required `Encryption$RoleArn` makes inexpressible refuses the request
+        // — and a refused request must leave the stored entitlement exactly as it was.
+        let encryption = match input.encryption.as_ref() {
+            Some(update) => {
+                let Some(merged) = merged_encryption(entitlement.encryption.as_ref(), update)
+                else {
+                    return Err(bad_request(
+                        "Encryption.RoleArn is required: this entitlement has no encryption \
+                         to update, so the request must name the role ARN that MediaConnect \
+                         assumes.",
+                    ));
+                };
+                Some(merged)
+            }
+            None => entitlement.encryption.clone(),
+        };
+
+        // A member the request carries replaces the stored setting; one it omits leaves it
+        // untouched. `Subscribers` is the whole list, so the request's list becomes the
+        // entitlement's — including an empty one, which shares the content with nobody.
+        if let Some(description) = input.description.clone() {
+            entitlement.description = Some(description);
+        }
+        if let Some(status) = input.entitlement_status.clone() {
+            entitlement.entitlement_status = Some(status);
+        }
+        if let Some(subscribers) = input.subscribers.clone() {
+            entitlement.subscribers = subscribers;
+        }
+        entitlement.encryption = encryption;
+
+        // "The new configuration of the entitlement that you updated", read back out of
+        // the STORED record rather than assembled from the request, and the ARN of the flow
+        // it belongs to.
+        Ok(UpdateFlowEntitlementOutput {
+            entitlement: Some(entitlement.clone()),
+            flow_arn: Some(input.flow_arn.clone()),
+        })
     }
 }

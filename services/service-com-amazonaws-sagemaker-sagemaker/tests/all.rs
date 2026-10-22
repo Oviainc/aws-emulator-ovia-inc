@@ -49,6 +49,8 @@ mod model_package_registry;
 mod notebook_instance_lifecycle;
 #[path = "all/notebook_lifecycle_config.rs"]
 mod notebook_lifecycle_config;
+#[path = "all/partner_apps.rs"]
+mod partner_apps;
 #[path = "all/pipeline_lifecycle.rs"]
 mod pipeline_lifecycle;
 #[path = "all/processing_job_lifecycle.rs"]

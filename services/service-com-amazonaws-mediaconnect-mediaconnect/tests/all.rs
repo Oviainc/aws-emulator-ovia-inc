@@ -37,5 +37,7 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/update_flow.rs"]
 mod update_flow;
+#[path = "all/update_flow_entitlement.rs"]
+mod update_flow_entitlement;
 #[path = "all/update_flow_output.rs"]
 mod update_flow_output;

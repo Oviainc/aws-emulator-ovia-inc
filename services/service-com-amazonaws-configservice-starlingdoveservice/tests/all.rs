@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/config_aggregator_lifecycle.rs"]
 mod config_aggregator_lifecycle;
+#[path = "all/config_compliance_by_config_rule.rs"]
+mod config_compliance_by_config_rule;
 #[path = "all/config_delivery_channel_status.rs"]
 mod config_delivery_channel_status;
 #[path = "all/config_read_shape_and_compliance.rs"]

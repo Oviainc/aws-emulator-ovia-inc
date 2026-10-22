@@ -17,6 +17,8 @@ mod arn_validation;
 mod client_error_wrappers;
 #[path = "all/error_messages.rs"]
 mod error_messages;
+#[path = "all/execution_interpreter.rs"]
+mod execution_interpreter;
 #[path = "all/execution_redrive.rs"]
 mod execution_redrive;
 #[path = "all/nested_type_discriminator.rs"]

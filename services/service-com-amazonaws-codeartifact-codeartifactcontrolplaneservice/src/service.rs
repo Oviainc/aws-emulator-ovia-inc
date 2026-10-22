@@ -41,9 +41,97 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service answers an input-constraint violation with: its own
+/// modelled `ValidationException`, which
+/// `smithy_query(query="service_info")` lists among this service's common errors with
+/// `@httpError 400`. It is also the framework's default code for a refusal, restated here
+/// because `override_refusal` replaces the code and the message together.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// A `@pattern` expression without the anchors a model spells it with.
+///
+/// A model writes `^…$` to demand that the WHOLE value match; the refusal states the
+/// expression a value has to satisfy, which is the expression itself. A `$` preceded by
+/// an odd number of backslashes is an escaped literal dollar inside the expression, not
+/// the end anchor, so it stays.
+///
+/// NOTE: this is one of the ~25 inlined copies of this rule the tree carries
+/// (`grep -rln 'fn unanchored' services/*/src`). `services/common/src/validation.rs`
+/// ("Still to migrate here") is its declared home, and says the migration is a change of
+/// its own rather than a side effect of one service's issue — so this copy is pinned by
+/// THIS service's tests (`tests/all/error_message_composition.rs`) and is to be deleted,
+/// not copied, when that migration lands.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
+    }
+}
+
+/// The clause one violation contributes to a `ValidationException` message.
+///
+/// Every violation class but `@pattern` is stated in the framework's own words
+/// ([`Violation::message`]) — this service words them identically. A `@pattern` failure
+/// is restated with [`unanchored`] applied to the expression, so the regular expression
+/// quoted back to the caller is one it can compile and compare against the member's
+/// documented constraint.
+fn constraint_clause(violation: &Violation) -> String {
+    let ViolationKind::Pattern(pattern) = &violation.kind else {
+        return violation.message();
+    };
+    let requirement = format!(
+        "Member must satisfy regular expression pattern: {}",
+        unanchored(pattern)
+    );
+    match &violation.value {
+        Some(shown) => format!(
+            "Value '{shown}' at '{}' failed to satisfy constraint: {requirement}",
+            violation.path
+        ),
+        // An absent member has no value to echo; it cannot fail a pattern either, but the
+        // subject is spelled the way the framework spells it rather than left to chance.
+        None => format!(
+            "Value null at '{}' failed to satisfy constraint: {requirement}",
+            violation.path
+        ),
+    }
+}
+
+/// The `ValidationException` message for a refusal: the AWS envelope
+/// (`N validation error(s) detected: `) over one clause per violation, joined with `; `.
+///
+/// `None` declines the refusal, which keeps the framework's own wording: a refusal with
+/// no `@pattern` violation in it is already worded the way this service words it, so
+/// there is nothing to replace.
+fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+    if !violations
+        .iter()
+        .any(|violation| matches!(violation.kind, ViolationKind::Pattern(_)))
+    {
+        return None;
+    }
+    let clauses: Vec<String> = violations.iter().map(constraint_clause).collect();
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
 
 /// The `com-amazonaws-codeartifact-codeartifactcontrolplaneservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -105,8 +193,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // for the rest. Replace BOTH the code and the message: a client branches
         // on the code, so a message without its matching code is worse than
         // leaving both alone.
-        let _ = refusal;
-        None
+        //
+        // This service restates a `@pattern` failure with the expression UNANCHORED —
+        // the `^`/`$` a model writes to demand a whole-string match are not part of the
+        // expression a value has to satisfy, and a caller that compiles or compares the
+        // quoted pattern must see the one the member's constraint publishes. Every other
+        // violation class keeps the framework's wording, and the code stays the modelled
+        // `ValidationException` (HTTP 400) the framework would have answered with.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: constraint_envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

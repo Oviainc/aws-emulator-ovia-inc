@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDeploymentGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDeploymentGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Changes a stored deployment group in place: every member the request NAMES
+//! replaces the stored one, every member it OMITS is kept, and the group keeps
+//! the `deploymentGroupId` it was created with — including across a rename.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDeploymentGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -304,18 +300,411 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDeploymentGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDeploymentGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        // Everything that can be judged from the request alone is judged here,
+        // before the store is touched, so a refused update changes nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDeploymentGroup"))
+        // A deployment group targets instances by EITHER a filter list or a tag
+        // set; naming both in one call is what the two combination errors are
+        // for.
+        if input.ec2_tag_filters.is_some() && input.ec2_tag_set.is_some() {
+            return Err(
+                UpdateDeploymentGroupErrorModeled::InvalidEC2TagCombinationException(
+                    InvalidEC2TagCombinationException {
+                        message: Some(
+                            "Only one of ec2TagFilters and ec2TagSet can be used in a single call"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        if input.on_premises_instance_tag_filters.is_some() && input.on_premises_tag_set.is_some() {
+            return Err(
+                UpdateDeploymentGroupErrorModeled::InvalidOnPremisesTagCombinationException(
+                    InvalidOnPremisesTagCombinationException {
+                        message: Some(
+                            "Only one of onPremisesInstanceTagFilters and onPremisesTagSet can be \
+                             used in a single call"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The alarm rules live in `crate::state` so that every operation
+        // accepting an alarm configuration refuses the same requests.
+        if let Some(configuration) = input.alarm_configuration.as_ref() {
+            match crate::state::validate_alarm_configuration(configuration) {
+                Ok(()) => {}
+                Err(crate::state::AlarmConfigurationRejection::TooManyAlarms(count)) => {
+                    return Err(
+                        UpdateDeploymentGroupErrorModeled::AlarmsLimitExceededException(
+                            AlarmsLimitExceededException {
+                                message: Some(format!(
+                                    "The maximum number of alarms for a deployment group ({}) was \
+                                     exceeded: {count} alarms were specified",
+                                    crate::state::MAX_ALARMS_PER_ALARM_CONFIGURATION
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                Err(crate::state::AlarmConfigurationRejection::Malformed(reason)) => {
+                    return Err(
+                        UpdateDeploymentGroupErrorModeled::InvalidAlarmConfigException(
+                            InvalidAlarmConfigException {
+                                message: Some(format!(
+                                    "The alarm configuration is invalid: {reason}"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+        // The selector lists a group may carry are BOUNDED, the same bounds
+        // `CreateDeploymentGroup` applies when the group is first set up: a
+        // stored selector list is matched against every registered on-premises
+        // instance when a deployment resolves its targets, so an unbounded one
+        // stored here would be unbounded work on each later `CreateDeployment`.
+        check_selector_counts(
+            input.ec2_tag_filters.as_deref().map(<[_]>::len),
+            input
+                .ec2_tag_set
+                .as_ref()
+                .and_then(|set| set.ec2_tag_set_list.as_ref()),
+            || {
+                UpdateDeploymentGroupErrorModeled::InvalidEC2TagException(InvalidEC2TagException {
+                    message: Some(too_many_filters_message("ec2TagFilters")),
+                })
+            },
+        )?;
+        check_selector_counts(
+            input
+                .on_premises_instance_tag_filters
+                .as_deref()
+                .map(<[_]>::len),
+            input
+                .on_premises_tag_set
+                .as_ref()
+                .and_then(|set| set.on_premises_tag_set_list.as_ref()),
+            || {
+                UpdateDeploymentGroupErrorModeled::InvalidTagException(InvalidTagException {
+                    message: Some(too_many_filters_message("onPremisesInstanceTagFilters")),
+                })
+            },
+        )?;
+        // An automatic rollback that is enabled but names no triggering event can
+        // never fire, which is one of the cases
+        // `InvalidAutoRollbackConfigException` describes — the same refusal
+        // `CreateDeploymentGroup` and `CreateDeployment` answer.
+        if input
+            .auto_rollback_configuration
+            .as_ref()
+            .is_some_and(crate::state::auto_rollback_is_enabled_without_events)
+        {
+            return Err(
+                UpdateDeploymentGroupErrorModeled::InvalidAutoRollbackConfigException(
+                    InvalidAutoRollbackConfigException {
+                        message: Some(
+                            "The automatic rollback configuration is enabled but lists no \
+                             triggering event type"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // NOTE on `ec2DeploymentOptions.autoScalingGroupProcessesToSuspend`:
+        // its member is a modelled enum, so the boundary validator already
+        // refuses a process name CodeDeploy does not know (and refuses one in
+        // the wrong case — the names are case sensitive) before this handler
+        // runs. `InvalidAutoScalingGroupProcessToSuspendException` therefore has
+        // nothing left to answer here.
+        //
+        // `serviceRoleArn` carries no modelled constraint, so a blank
+        // replacement reaches the handler; a group always has a service role, so
+        // this is a replacement in an invalid format rather than a removal.
+        if input
+            .service_role_arn
+            .as_ref()
+            .is_some_and(|arn| arn.trim().is_empty())
+        {
+            return Err(UpdateDeploymentGroupErrorModeled::InvalidRoleException(
+                InvalidRoleException {
+                    message: Some(
+                        "The service role ARN was specified in an invalid format: it is empty"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let outcome = crate::state::with_state(&*self.engine, |state| {
+            // Resolving a NAMED configuration is a read of the configuration
+            // store, so — as in `CreateDeploymentGroup` — it happens before the
+            // application is borrowed mutably.
+            let named_config = match input.deployment_config_name.as_ref() {
+                Some(name) => {
+                    if !state.deployment_configs.contains_key(name) {
+                        return Err(
+                            UpdateDeploymentGroupErrorModeled::DeploymentConfigDoesNotExistException(
+                                DeploymentConfigDoesNotExistException {
+                                    message: Some(format!(
+                                        "No deployment configuration found for name {name}"
+                                    )),
+                                },
+                            ),
+                        );
+                    }
+                    Some(name.clone())
+                }
+                None => None,
+            };
+
+            let application_name = input.application_name.clone();
+            let current_name = input.current_deployment_group_name.clone();
+            let Some(application) = state.applications.get_mut(&application_name) else {
+                return Err(
+                    UpdateDeploymentGroupErrorModeled::ApplicationDoesNotExistException(
+                        ApplicationDoesNotExistException {
+                            message: Some(format!(
+                                "No application found for name {application_name}"
+                            )),
+                        },
+                    ),
+                );
+            };
+            if !application.deployment_groups.contains_key(&current_name) {
+                return Err(
+                    UpdateDeploymentGroupErrorModeled::DeploymentGroupDoesNotExistException(
+                        DeploymentGroupDoesNotExistException {
+                            message: Some(format!(
+                                "No deployment group found for name {current_name} in application \
+                                 {application_name}"
+                            )),
+                        },
+                    ),
+                );
+            }
+            // A `newDeploymentGroupName` equal to the current one asks for no
+            // rename at all, so it is not a collision with itself.
+            let new_name = input
+                .new_deployment_group_name
+                .clone()
+                .filter(|name| *name != current_name);
+            if let Some(new_name) = new_name.as_ref() {
+                if application.deployment_groups.contains_key(new_name) {
+                    return Err(
+                        UpdateDeploymentGroupErrorModeled::DeploymentGroupAlreadyExistsException(
+                            DeploymentGroupAlreadyExistsException {
+                                message: Some(format!(
+                                    "A deployment group named {new_name} already exists for \
+                                     application {application_name}"
+                                )),
+                            },
+                        ),
+                    );
+                }
+            }
+
+            // Past here nothing can be refused, so the stored group is taken out
+            // and put back under its final name. Its `deploymentGroupId` and
+            // `createTime` are untouched: this is the SAME resource.
+            let mut group = application
+                .deployment_groups
+                .remove(&current_name)
+                .expect("the group was found above and the store is locked");
+            if let Some(new_name) = new_name.as_ref() {
+                group.deployment_group_name = new_name.clone();
+            }
+            if let Some(config) = named_config {
+                group.deployment_config_name = config;
+            }
+            if let Some(arn) = input.service_role_arn {
+                group.service_role_arn = arn;
+            }
+            // LIST members: a list the request names REPLACES the stored one, so
+            // a non-null empty list clears it, and a list the request omits is
+            // kept — which is what `autoScalingGroups` documents ("To keep the
+            // Auto Scaling groups, enter their names or do not specify this
+            // parameter. To remove Auto Scaling groups, specify a non-null empty
+            // list") and what every other replacement member follows.
+            if let Some(filters) = input.ec2_tag_filters {
+                // A group cannot be described by both forms at once — see
+                // `InvalidEC2TagCombinationException` — so naming one form
+                // replaces the other.
+                if !filters.is_empty() {
+                    group.ec2_tag_set = None;
+                }
+                group.ec2_tag_filters = filters;
+            }
+            if let Some(filters) = input.on_premises_instance_tag_filters {
+                if !filters.is_empty() {
+                    group.on_premises_tag_set = None;
+                }
+                group.on_premises_instance_tag_filters = filters;
+            }
+            if let Some(groups) = input.auto_scaling_groups {
+                group.auto_scaling_groups = groups;
+            }
+            if let Some(triggers) = input.trigger_configurations {
+                group.trigger_configurations = triggers;
+            }
+            if let Some(services) = input.ecs_services {
+                group.ecs_services = services;
+            }
+            // STRUCTURE and scalar members: named replaces, omitted keeps.
+            if let Some(configuration) = input.alarm_configuration {
+                group.alarm_configuration = Some(configuration);
+            }
+            if let Some(configuration) = input.auto_rollback_configuration {
+                // Normalised exactly as at create time: a disabled rollback
+                // listing no events carries no information, so it CLEARS the
+                // member rather than being stored and echoed back.
+                group.auto_rollback_configuration =
+                    crate::state::normalized_auto_rollback_configuration(Some(configuration));
+            }
+            if let Some(strategy) = input.outdated_instances_strategy {
+                group.outdated_instances_strategy = Some(strategy);
+            }
+            if let Some(style) = input.deployment_style {
+                group.deployment_style = Some(style);
+            }
+            if let Some(configuration) = input.blue_green_deployment_configuration {
+                group.blue_green_deployment_configuration = Some(configuration);
+            }
+            if let Some(info) = input.load_balancer_info {
+                group.load_balancer_info = Some(info);
+            }
+            if let Some(tag_set) = input.ec2_tag_set {
+                // Symmetrical with the filter-list branch above: the stored
+                // alternative form is cleared only when the named one actually
+                // describes something.
+                if tag_set
+                    .ec2_tag_set_list
+                    .as_ref()
+                    .is_some_and(|groups| !groups.is_empty())
+                {
+                    group.ec2_tag_filters.clear();
+                }
+                group.ec2_tag_set = Some(tag_set);
+            }
+            if let Some(tag_set) = input.on_premises_tag_set {
+                if tag_set
+                    .on_premises_tag_set_list
+                    .as_ref()
+                    .is_some_and(|groups| !groups.is_empty())
+                {
+                    group.on_premises_instance_tag_filters.clear();
+                }
+                group.on_premises_tag_set = Some(tag_set);
+            }
+            if let Some(options) = input.ec2_deployment_options {
+                group.ec2_deployment_options = Some(options);
+            }
+            if let Some(enabled) = input.termination_hook_enabled {
+                group.termination_hook_enabled = enabled;
+            }
+
+            let final_name = group.deployment_group_name.clone();
+            application
+                .deployment_groups
+                .insert(final_name.clone(), group);
+            // The group keeps its place in creation order, so a listing does not
+            // reorder because a group was renamed.
+            if let Some(slot) = application
+                .deployment_group_order
+                .iter_mut()
+                .find(|name| **name == current_name)
+            {
+                *slot = final_name.clone();
+            }
+
+            // A renamed group keeps its deployment history: the deployments
+            // belong to this resource, whose id did not change, and the group's
+            // `lastAttemptedDeployment` / `lastSuccessfulDeployment` are derived
+            // by matching the group's current name.
+            if final_name != current_name {
+                for deployment in state.deployments.values_mut() {
+                    if deployment.application_name == application_name
+                        && deployment.deployment_group_name.as_deref()
+                            == Some(current_name.as_str())
+                    {
+                        deployment.deployment_group_name = Some(final_name.clone());
+                    }
+                }
+            }
+            Ok(())
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+        outcome?;
+
+        Ok(UpdateDeploymentGroupOutput {
+            // `hooksNotCleanedUp` reports the Auto Scaling groups whose
+            // CodeDeploy lifecycle hooks could NOT be removed. This emulator
+            // installs no hooks on anything, so there is never one left behind,
+            // and the modelled "no data" answer is the correct one.
+            hooks_not_cleaned_up: None,
+        })
     }
+}
+
+/// Refuse an update whose instance selectors carry more than CodeDeploy accepts:
+/// more filters in one list than [`crate::state::MAX_TAG_FILTERS_PER_LIST`], or
+/// more tag groups in a tag set than [`crate::state::MAX_TAG_SET_GROUPS`].
+///
+/// The same shape as `CreateDeploymentGroup`'s check over the same two bounds —
+/// each operation maps the refusal onto its OWN error enum, hence
+/// `too_many_filters`.
+fn check_selector_counts<Filter>(
+    flat_filters: Option<usize>,
+    tag_set_groups: Option<&Vec<Vec<Filter>>>,
+    too_many_filters: impl Fn() -> UpdateDeploymentGroupErrorModeled,
+) -> Result<(), UpdateDeploymentGroupError> {
+    if flat_filters.is_some_and(|len| len > crate::state::MAX_TAG_FILTERS_PER_LIST) {
+        return Err(too_many_filters().into());
+    }
+    let Some(groups) = tag_set_groups else {
+        return Ok(());
+    };
+    if groups.len() > crate::state::MAX_TAG_SET_GROUPS {
+        return Err(
+            UpdateDeploymentGroupErrorModeled::TagSetListLimitExceededException(
+                TagSetListLimitExceededException {
+                    message: Some(format!(
+                        "The number of tag groups included in the tag set list exceeded the \
+                         maximum allowed limit of {}",
+                        crate::state::MAX_TAG_SET_GROUPS
+                    )),
+                },
+            )
+            .into(),
+        );
+    }
+    if groups
+        .iter()
+        .any(|group| group.len() > crate::state::MAX_TAG_FILTERS_PER_LIST)
+    {
+        return Err(too_many_filters().into());
+    }
+    Ok(())
+}
+
+/// The refusal message for a selector list longer than the service accepts: it
+/// names the member and the limit, which is what a caller has to fix.
+fn too_many_filters_message(member: &str) -> String {
+    format!(
+        "The number of tag filters in {member} exceeded the maximum allowed limit of {}",
+        crate::state::MAX_TAG_FILTERS_PER_LIST
+    )
 }

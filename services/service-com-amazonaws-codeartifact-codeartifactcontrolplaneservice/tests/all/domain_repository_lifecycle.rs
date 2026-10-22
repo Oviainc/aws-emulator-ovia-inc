@@ -66,6 +66,15 @@ impl Answer {
     pub(crate) fn code(&self) -> String {
         self.error_type.clone().unwrap_or_default()
     }
+
+    /// The `message` of an error body, or `""` when the body carries none.
+    pub(crate) fn message(&self) -> String {
+        self.body
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
 }
 
 /// The emulator under test: the production router with this one service mounted on a

@@ -1467,7 +1467,7 @@ async fn deleting_a_log_group_removes_everything_stored_under_it() {
         .err("DeleteLogGroup", &json!({"logGroupName": "protected"}))
         .await;
     assert_eq!(
-        code, "ValidationException",
+        code, "InvalidParameterException",
         "case deletion protection: expected the delete to be blocked, got {code}"
     );
     let still_there = logs

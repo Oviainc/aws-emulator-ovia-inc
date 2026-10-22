@@ -239,18 +239,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let Some(entry) = entry else {
+            // Whether the request named an ARN or a (Name, Scope, Id) triple, the
+            // body is the exception type's constant sentence: WAF does not echo what
+            // was looked up.
             return Err(GetWebACLErrorModeled::WAFNonexistentItemException(
-                WAFNonexistentItemException {
-                    message: Some(match input.arn.as_deref() {
-                        Some(arn) => format!("No WebACL exists with the ARN {arn}"),
-                        None => format!(
-                            "No WebACL named {:?} with id {:?} exists in scope {:?}",
-                            input.name.as_deref().unwrap_or_default(),
-                            input.id.as_deref().unwrap_or_default(),
-                            input.scope.as_deref().unwrap_or_default()
-                        ),
-                    }),
-                },
+                crate::state::nonexistent_item_exception(),
             )
             .into());
         };

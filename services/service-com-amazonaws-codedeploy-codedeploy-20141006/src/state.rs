@@ -141,6 +141,80 @@ pub const MAX_DEPLOYMENT_GROUPS_PER_APPLICATION: usize = 1_000;
 /// deployments, oldest first, so a caller cannot grow the store without limit.
 pub const MAX_DEPLOYMENT_HISTORY: usize = 500;
 
+/// How many alarms one alarm configuration may carry.
+///
+/// The model states it on `AlarmConfiguration$alarms`
+/// (`smithy_query(query="shape",shape="AlarmConfiguration")`): "A list of alarms
+/// configured for the deployment or deployment group. A maximum of 10 alarms can
+/// be added." Past it, the request is refused with
+/// `AlarmsLimitExceededException`.
+pub const MAX_ALARMS_PER_ALARM_CONFIGURATION: usize = 10;
+
+/// The longest alarm name an alarm configuration may carry, from the model's
+/// `Alarm$name` (`smithy_query(query="shape",shape="Alarm")`): "Maximum length
+/// is 255 characters. Each alarm name can be used only once in a list of
+/// alarms."
+pub const MAX_ALARM_NAME_LENGTH: usize = 255;
+
+/// Why an alarm configuration cannot be accepted, as
+/// [`validate_alarm_configuration`] answers it.
+///
+/// Two distinct refusals, because CodeDeploy models two: too many alarms is
+/// `AlarmsLimitExceededException`, anything else about the configuration's form
+/// is `InvalidAlarmConfigException`. Each caller maps these onto its OWN
+/// operation's error enum.
+#[derive(Debug)]
+pub enum AlarmConfigurationRejection {
+    /// More than [`MAX_ALARMS_PER_ALARM_CONFIGURATION`] alarms were specified;
+    /// carries how many the request asked for.
+    TooManyAlarms(usize),
+    /// Malformed in one of the ways `InvalidAlarmConfigException` documents; the
+    /// string says which, so the caller can fix the request from the message.
+    Malformed(String),
+}
+
+/// Check an alarm configuration against the rules the model and the two alarm
+/// errors state, so every operation that accepts one refuses the same requests.
+///
+/// `InvalidAlarmConfigException` documents the malformed cases: "The alarm name
+/// is empty or null or exceeds the limit of 255 characters. Two alarms with the
+/// same name have been specified. The alarm configuration is enabled, but the
+/// alarm list is empty." A DISABLED configuration with no alarms is accepted —
+/// that is how a caller turns alarm monitoring off.
+pub fn validate_alarm_configuration(
+    configuration: &AlarmConfiguration,
+) -> Result<(), AlarmConfigurationRejection> {
+    let alarms = configuration.alarms.as_deref().unwrap_or_default();
+    if alarms.len() > MAX_ALARMS_PER_ALARM_CONFIGURATION {
+        return Err(AlarmConfigurationRejection::TooManyAlarms(alarms.len()));
+    }
+    if configuration.enabled && alarms.is_empty() {
+        return Err(AlarmConfigurationRejection::Malformed(
+            "the alarm configuration is enabled but its alarm list is empty".to_string(),
+        ));
+    }
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for alarm in alarms {
+        let name = alarm.name.as_deref().unwrap_or_default();
+        if name.is_empty() {
+            return Err(AlarmConfigurationRejection::Malformed(
+                "an alarm was specified with no name".to_string(),
+            ));
+        }
+        if name.chars().count() > MAX_ALARM_NAME_LENGTH {
+            return Err(AlarmConfigurationRejection::Malformed(format!(
+                "an alarm name exceeds the maximum length of {MAX_ALARM_NAME_LENGTH} characters"
+            )));
+        }
+        if !seen.insert(name) {
+            return Err(AlarmConfigurationRejection::Malformed(format!(
+                "the alarm name {name} was specified more than once"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// How many tag groups one `ec2TagSet` / `onPremisesTagSet` may hold, the bound
 /// `TagSetListLimitExceededException` answers.
 ///

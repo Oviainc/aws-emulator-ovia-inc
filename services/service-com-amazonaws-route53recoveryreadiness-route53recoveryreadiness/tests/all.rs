@@ -19,5 +19,7 @@ mod builtin_readiness_rules;
 mod cross_account_authorizations;
 #[path = "all/readiness_check_lifecycle.rs"]
 mod readiness_check_lifecycle;
+#[path = "all/recovery_group_lifecycle.rs"]
+mod recovery_group_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

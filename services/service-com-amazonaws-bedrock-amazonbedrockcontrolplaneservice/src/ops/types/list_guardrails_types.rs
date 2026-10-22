@@ -67,4 +67,3 @@ bedrock_schema_and_codec!(
         struct_of(GuardrailCrossRegionDetails)
     ),
 );
-

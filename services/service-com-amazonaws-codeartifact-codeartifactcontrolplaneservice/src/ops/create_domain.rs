@@ -183,9 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
-        if store.domains.contains_key(&input.domain) {
+        if let Some(existing) = store.domains.get(&input.domain) {
             return Err(CreateDomainErrorModeled::ConflictException(ConflictException {
-                message: format!("Domain {} already exists.", input.domain),
+                message: crate::state::domain_already_exists_message(
+                    &input.domain,
+                    &existing.owner,
+                ),
                 resource_id: Some(input.domain.clone()),
                 resource_type: Some("domain".to_string()),
             })

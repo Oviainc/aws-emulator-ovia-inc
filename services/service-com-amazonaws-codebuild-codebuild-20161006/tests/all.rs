@@ -23,6 +23,8 @@ mod project_build_batch_lifecycle;
 mod project_build_lifecycle;
 #[path = "all/report_group_lifecycle.rs"]
 mod report_group_lifecycle;
+#[path = "all/report_group_reads.rs"]
+mod report_group_reads;
 #[path = "all/sandbox_lifecycle.rs"]
 mod sandbox_lifecycle;
 #[path = "all/sandbox_sessions.rs"]

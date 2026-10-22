@@ -56,7 +56,7 @@ pub(crate) const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/StepFunctionsR
 /// `macros`/`rt`/`rt-multi-thread`, not `time`, so `tokio::time::sleep` is not
 /// available. Each test runs on its own single-threaded runtime with no concurrent
 /// task, so blocking the thread holds nothing up.
-const PAST_THE_EXECUTION_DELAY: Duration =
+pub(crate) const PAST_THE_EXECUTION_DELAY: Duration =
     EXECUTION_SETTLE_DELAY.saturating_add(Duration::from_millis(300));
 
 /// Long enough that a started deletion has removed its state machine.
@@ -209,7 +209,7 @@ pub(crate) async fn create_machine(emulator: &Emulator, name: &str, definition: 
 }
 
 /// Start an execution that must succeed, and return its ARN.
-async fn start_execution(
+pub(crate) async fn start_execution(
     emulator: &Emulator,
     state_machine_arn: &str,
     name: &str,
@@ -224,7 +224,7 @@ async fn start_execution(
     string(&started, "executionArn")
 }
 
-async fn describe_execution(emulator: &Emulator, execution_arn: &str) -> Value {
+pub(crate) async fn describe_execution(emulator: &Emulator, execution_arn: &str) -> Value {
     emulator
         .ok(
             "DescribeExecution",
@@ -570,11 +570,12 @@ async fn create_state_machine_checks_the_definition_structure() {
         }
     }
 
-    // Valid ASL this emulator does not EXECUTE is still valid ASL: the create
-    // succeeds, and what cannot be run surfaces as a FAILED execution instead.
+    // Valid ASL is accepted whether or not this emulator EXECUTES every state it
+    // uses: the create succeeds, and what cannot be run surfaces as a FAILED
+    // execution instead.
     let accepted: Vec<(&str, &str)> = vec![
         (
-            "a Task state",
+            "a Task state, which is not executed",
             r#"{"StartAt":"A","States":{"A":{"Type":"Task","Resource":"arn:aws:lambda:us-west-2:000000000000:function:f","End":true}}}"#,
         ),
         (
@@ -633,6 +634,32 @@ async fn definition_and_payload_bounds_are_enforced_at_their_edges() {
             "a state name one character past the bound",
             format!(
                 r#"{{"StartAt":"{0}","States":{{"{0}":{{"Type":"Succeed"}}}}}}"#,
+                "n".repeat(MAX_STATE_NAME_CHARS + 1)
+            ),
+            400,
+        ),
+        (
+            // A nested state machine's state names reach the same execution history,
+            // so the same bound holds for them, at the same create-time refusal.
+            "a nested state name at the bound",
+            format!(
+                r#"{{"StartAt":"M","States":{{"M":{{"Type":"Map","ItemProcessor":{{"StartAt":"{0}","States":{{"{0}":{{"Type":"Succeed"}}}}}},"End":true}}}}}}"#,
+                "n".repeat(MAX_STATE_NAME_CHARS)
+            ),
+            200,
+        ),
+        (
+            "a nested state name one character past the bound",
+            format!(
+                r#"{{"StartAt":"M","States":{{"M":{{"Type":"Map","ItemProcessor":{{"StartAt":"{0}","States":{{"{0}":{{"Type":"Succeed"}}}}}},"End":true}}}}}}"#,
+                "n".repeat(MAX_STATE_NAME_CHARS + 1)
+            ),
+            400,
+        ),
+        (
+            "a Parallel branch's state name one character past the bound",
+            format!(
+                r#"{{"StartAt":"P","States":{{"P":{{"Type":"Parallel","Branches":[{{"StartAt":"{0}","States":{{"{0}":{{"Type":"Succeed"}}}}}}],"End":true}}}}}}"#,
                 "n".repeat(MAX_STATE_NAME_CHARS + 1)
             ),
             400,
@@ -1108,20 +1135,20 @@ async fn an_execution_runs_the_definition_to_its_own_outcome() {
             error: Some("States.Runtime"),
         },
         RunCase {
-            case: "a Choice state, which this emulator does not execute",
+            case: "a Choice state that takes a matching rule",
             definition: r#"{"StartAt":"C","States":{"C":{"Type":"Choice","Choices":[{"Variable":"$.x","NumericEquals":1,"Next":"B"}],"Default":"B"},"B":{"Type":"Succeed"}}}"#,
             input: r#"{"x":1}"#,
-            status: "FAILED",
-            output: None,
-            error: Some("States.Runtime"),
+            status: "SUCCEEDED",
+            output: Some(r#"{"x":1}"#),
+            error: None,
         },
         RunCase {
-            case: "a Pass state carrying a JSONPath member this emulator does not interpret",
-            definition: r#"{"StartAt":"A","States":{"A":{"Type":"Pass","ResultPath":"$.out","End":true}}}"#,
-            input: "{}",
-            status: "FAILED",
-            output: None,
-            error: Some("States.Runtime"),
+            case: "a Pass state whose ResultPath places its result in its input",
+            definition: r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Result":{"ok":true},"ResultPath":"$.out","End":true}}}"#,
+            input: r#"{"in":1}"#,
+            status: "SUCCEEDED",
+            output: Some(r#"{"in":1,"out":{"ok":true}}"#),
+            error: None,
         },
         RunCase {
             case: "a Next chain that is a cycle",

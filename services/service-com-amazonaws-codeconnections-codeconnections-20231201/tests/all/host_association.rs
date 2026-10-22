@@ -549,6 +549,31 @@ async fn a_host_arn_that_names_no_host_is_refused_wherever_it_is_named() {
                 .is_some_and(|kind| kind.ends_with("ResourceUnavailableException")),
             "case {label:?}: expected ResourceUnavailableException, got {body}"
         );
+
+        // The same rule where the ARN is a FILTER rather than the addressed resource:
+        // `ListConnections` resolves `HostArnFilter` against the host store too, and
+        // refuses one that names no host with the error IT models for that \u2014
+        // `ResourceNotFoundException` (404) \u2014 rather than reporting an empty page.
+        let (status, body) = call(
+            &router,
+            "ListConnections",
+            serde_json::json!({ "HostArnFilter": host_arn }),
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "case {label:?}: expected 404 from ListConnections, got {status} {body}"
+        );
+        assert!(
+            body["__type"]
+                .as_str()
+                .is_some_and(|kind| kind.ends_with("ResourceNotFoundException")),
+            "case {label:?}: expected ResourceNotFoundException, got {body}"
+        );
+        assert!(
+            body["Connections"].is_null(),
+            "case {label:?}: a refused filter reports no connections, got {body}"
+        );
     }
 
     // Every refused create persisted nothing: only the one accepted connection is there.

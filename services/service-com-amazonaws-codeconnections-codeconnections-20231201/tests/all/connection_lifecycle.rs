@@ -533,18 +533,56 @@ async fn list_filters_select_from_the_stored_set() {
         }
     }
 
-    // No connection here is associated with a host, so a host filter selects none.
+    // A host filter is RESOLVED against the host store: a host that IS there but has
+    // no connections selects none …
+    let (status, host) = call(
+        &router,
+        "CreateHost",
+        serde_json::json!({
+            "Name": "filter-host",
+            "ProviderType": "GitHubEnterpriseServer",
+            "ProviderEndpoint": "https://ghe.example.internal",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "CreateHost: expected 200, got {status} {host}");
+    let host_arn = host["HostArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateHost returned no HostArn: {host}"))
+        .to_string();
     let (status, filtered) = call(
+        &router,
+        "ListConnections",
+        serde_json::json!({ "HostArnFilter": host_arn }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "HostArnFilter: expected 200, got {status} {filtered}"
+    );
+    assert_eq!(
+        filtered["Connections"],
+        serde_json::json!([]),
+        "HostArnFilter: no stored connection has a host, got {filtered}"
+    );
+
+    // … and a host filter naming a host the store does not hold is refused with the
+    // modeled `ResourceNotFoundException` (404), not reported as an empty page.
+    let (status, body) = call(
         &router,
         "ListConnections",
         serde_json::json!({ "HostArnFilter": some_host_arn() }),
     )
     .await;
-    assert_eq!(status, 200, "HostArnFilter: expected 200, got {status} {filtered}");
     assert_eq!(
-        filtered["Connections"],
-        serde_json::json!([]),
-        "HostArnFilter: no stored connection has a host, got {filtered}"
+        status, 404,
+        "HostArnFilter naming no host: expected 404, got {status} {body}"
+    );
+    assert!(
+        body["__type"]
+            .as_str()
+            .is_some_and(|kind| kind.ends_with("ResourceNotFoundException")),
+        "HostArnFilter naming no host: expected ResourceNotFoundException, got {body}"
     );
 }
 

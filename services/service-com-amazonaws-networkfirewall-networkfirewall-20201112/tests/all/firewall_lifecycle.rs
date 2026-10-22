@@ -9,6 +9,9 @@
 //!
 //! The tests are tables: each row is one input in the class the rule covers, and
 //! every assertion names its row and the actual value.
+//!
+//! The harness and helpers below are `pub(crate)` so the other suites in this test
+//! crate drive the service through the same wire path rather than rebuilding one.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,11 +24,11 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region every request in these tests is signed for. ARNs must carry it,
 /// which is how a region other than the emulator default proves the ARN is built
 /// from the request rather than from a constant.
-const REGION: &str = "eu-west-1";
+pub(crate) const REGION: &str = "eu-west-1";
 
 /// The account segment every emulator ARN carries, sourced from the vendored
 /// constant so an ARN assertion cannot drift from it.
-const ACCOUNT: &str = emulator_server::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = emulator_server::EMULATOR_ACCOUNT_ID;
 
 /// A minimal valid `FirewallPolicy`: the two members the model marks required
 /// (`StatelessDefaultActions`, `StatelessFragmentDefaultActions`).
@@ -37,12 +40,12 @@ fn minimal_policy() -> Value {
 }
 
 /// One emulator: a single shared engine behind the router every test calls.
-struct Harness {
+pub(crate) struct Harness {
     router: MultiServiceRouter,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -51,7 +54,7 @@ impl Harness {
     }
 
     /// Send one operation and return its HTTP status and parsed JSON body.
-    async fn call(&self, target: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, target: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("https://network-firewall.eu-west-1.amazonaws.com/")
@@ -82,7 +85,7 @@ impl Harness {
     }
 
     /// Send one operation that must succeed, and return its body.
-    async fn ok(&self, target: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, target: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(target, body).await;
         assert_eq!(
             status, 200,
@@ -102,7 +105,7 @@ impl Harness {
 }
 
 /// The awsJson error code (`__type`) of an error body.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -111,7 +114,7 @@ fn error_code(body: &Value) -> String {
 
 /// Whether `value` satisfies the `ResourceId` / `UpdateToken` pattern
 /// `^([0-9a-f]{8})-([0-9a-f]{4}-){3}([0-9a-f]{12})$` (length 36).
-fn is_uuid_form(value: &str) -> bool {
+pub(crate) fn is_uuid_form(value: &str) -> bool {
     let groups: Vec<&str> = value.split('-').collect();
     let widths = [8usize, 4, 4, 4, 12];
     groups.len() == widths.len()
@@ -127,7 +130,7 @@ fn is_uuid_form(value: &str) -> bool {
 }
 
 /// Read a required string out of a response body, naming the path on failure.
-fn string_at<'a>(body: &'a Value, path: &[&str]) -> &'a str {
+pub(crate) fn string_at<'a>(body: &'a Value, path: &[&str]) -> &'a str {
     let mut cursor = body;
     for step in path {
         cursor = cursor
