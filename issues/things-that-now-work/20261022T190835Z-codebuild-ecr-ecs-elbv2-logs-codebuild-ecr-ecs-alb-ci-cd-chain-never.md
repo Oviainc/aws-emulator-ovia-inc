@@ -27,3 +27,34 @@ Expected (recorded): cicdchain-alb-body-tracks-the-latest-codebuild-image — a 
 
 ## Steps to Reproduce
 Replay the two container CI/CD-chain checks (SERVICES = codebuild, ecr, ecs, elbv2, logs): create an ECR repository, a CodeBuild project whose buildspec builds and pushes an image carrying a unique token plus CODEBUILD_BUILD_ID, an ECS/Fargate service for that image behind an ELBv2 ALB target group, run StartBuild, wait for the service to settle, then issue a plain HTTP GET to the ALB DNS name and compare the body. Against this emulator the sequence never reaches the GET assertion and is cut off at the harness timeout.
+
+## Resolution
+
+PARTIAL, and deliberately so — read this before assuming the whole chain converges.
+
+What was fixed is the cause both of this report's `Issue-Key` lines attribute the
+divergence to: `_drop_vpc#2|Timeout|time.sleep(10)`, the checks' EC2 VPC teardown. EC2's
+`CreateSubnet`, `DeleteSubnet`, `DeleteSecurityGroup` and `DeleteVpc` answered HTTP 501, so
+a VPC these checks created could never be given a subnet and could never be removed; a
+teardown that retries its delete and sleeps between attempts therefore consumed the whole
+60 s harness window and the check died inside that sleep, with no AWS-level assertion
+reached and the body's own divergence masked. Those four operations now implement the
+VPC-scoped network resource lifecycle (create into the named VPC, read back through the
+describe, delete only while nothing depends on it, `DependencyViolation` otherwise), so the
+teardown completes and a check of this chain reports its own outcome instead of a timeout.
+
+What is DECLINED, and tracked elsewhere:
+
+* The first hop — CodeBuild executing a build that bakes a token into a container image and
+  pushes it to ECR — needs a container runtime this emulator does not have. A build ends in
+  CodeBuild's own `FAULT` with a phase context saying exactly that, which is the modelled
+  failure state rather than a fabricated success. Tracked by
+  `issues/things-that-do-not-work/20261022T172625Z-codebuild-builds-never-execute-every-build-faults-at.md`.
+* Because of that, neither check's end-state assertion (the ALB serving the bytes a build
+  baked in; the rollout verdict for a revision that never ran) can pass in this emulator,
+  and the ECR / ECS / ELBv2 / Logs hops of the chain remain unverified.
+* The EC2 operations the chain's SETUP also wants still answer 501, each with its own open
+  stub issue: `DescribeNetworkInterfaces`, `ModifyVpcAttribute`, `DescribeVpcAttribute`,
+  `CreateInternetGateway` and the route-table operations — this crate models no ENI, no VPC
+  DNS attribute, no gateway and no route table at all, so a 501 ("not written yet") is the
+  honest answer for them.

@@ -190,7 +190,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             selectors.push((canonical, filter.values.as_deref().unwrap_or_default()));
         }
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // The clock-owed transition this read is allowed to apply, the same call
+        // `DescribeVpcs` makes: a subnet `CreateSubnet` answered as `pending` is `available`
+        // once its due instant has passed, whether or not anybody called, so applying it
+        // here changes nothing a later caller would not have seen anyway.
+        store.materialize_due_transitions();
 
         // "The IDs of the subnets" (`DescribeSubnetsRequest$SubnetIds`): an id that names
         // no subnet of the account is an error, not an absent row.
