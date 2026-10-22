@@ -15,6 +15,8 @@
 mod bucket_encryption;
 #[path = "all/bucket_lifecycle.rs"]
 mod bucket_lifecycle;
+#[path = "all/bucket_notification_configuration.rs"]
+mod bucket_notification_configuration;
 #[path = "all/bucket_ownership_controls.rs"]
 mod bucket_ownership_controls;
 #[path = "all/bucket_policy_and_tagging.rs"]

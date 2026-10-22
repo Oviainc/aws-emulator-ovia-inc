@@ -28,10 +28,16 @@
 //!   is modelled against, so no two services answer "does this subnet exist"
 //!   differently.
 //!
-//! Beside them, [`iot_job_executions`] is the IoT job-execution store the IoT
-//! control plane writes (a job targets a thing) and the IoT Jobs data plane reads
-//! and updates (the device polls, starts and reports) — ONE store in the shared
-//! engine, so the two services cannot hold two copies of one execution.
+//! Beside them, two SHARED STORES live here, each held once in the shared engine so
+//! the services on either side of a hand-off cannot hold two copies of one fact:
+//!
+//! * [`iot_job_executions`], the IoT job-execution store the IoT control plane writes
+//!   (a job targets a thing) and the IoT Jobs data plane reads and updates (the device
+//!   polls, starts and reports);
+//! * [`db_data_sources`], the directory of which database service minted an immutable
+//!   DB resource id — written by the database control planes when they mint one, read
+//!   by the services that monitor those resources, which cannot tell an RDS id from a
+//!   DocumentDB id by its form.
 //!
 //! # Why a shared rule
 //!
@@ -91,6 +97,7 @@
 
 pub mod arn;
 pub mod bedrock;
+pub mod db_data_sources;
 pub mod front_door;
 pub mod iot_job_executions;
 pub mod network;

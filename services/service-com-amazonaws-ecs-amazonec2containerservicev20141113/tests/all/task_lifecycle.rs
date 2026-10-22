@@ -133,8 +133,9 @@ async fn cluster_create_read_and_delete_round_trip() {
             "case {case:?}: expected the stored settings back, got {read}"
         );
 
-        // `include` gates the optional fields: "If this field is omitted, this
-        // information isn't included."
+        // `include` gates what the optional fields CARRY: "If this field is omitted,
+        // this information isn't included." The list-typed ones are still there, empty,
+        // so a client cannot mistake "not asked for" for "none stored".
         let narrow = ok(
             &router,
             "DescribeClusters",
@@ -143,13 +144,19 @@ async fn cluster_create_read_and_delete_round_trip() {
         )
         .await;
         let narrow_cluster = &list(&narrow, "clusters", case)[0];
-        for gated in ["tags", "settings", "statistics", "configuration"] {
-            assert!(
-                narrow_cluster[gated].is_null(),
-                "case {case:?}: expected {gated} to be absent without include, got \
+        for gated in ["tags", "settings", "statistics"] {
+            assert_eq!(
+                list(narrow_cluster, gated, case),
+                Vec::<Value>::new(),
+                "case {case:?}: expected an empty {gated} without include, got \
                  {narrow_cluster}"
             );
         }
+        assert!(
+            narrow_cluster["configuration"].is_null(),
+            "case {case:?}: expected configuration to be absent without include, got \
+             {narrow_cluster}"
+        );
 
         // A second create of the same name is the same cluster, not a duplicate.
         let again = ok(
@@ -178,7 +185,9 @@ async fn cluster_create_read_and_delete_round_trip() {
              {after_repeat}"
         );
 
-        // Delete reports the cluster INACTIVE and takes it out of the store.
+        // Delete reports the cluster INACTIVE and leaves that tombstone in the store:
+        // "Clusters with an INACTIVE status may remain discoverable in your account for a
+        // period of time."
         let deleted = ok(
             &router,
             "DeleteCluster",
@@ -191,33 +200,68 @@ async fn cluster_create_read_and_delete_round_trip() {
             "INACTIVE",
             "case {case:?}: expected a deleted cluster to be INACTIVE, got {deleted}"
         );
-        let gone = ok(
+        let after_delete = ok(
             &router,
             "DescribeClusters",
             json!({ "clusters": [expected_name] }),
             case,
         )
         .await;
-        let failures = list(&gone, "failures", case);
+        assert!(
+            list(&after_delete, "failures", case).is_empty(),
+            "case {case:?}: a deleted cluster is described, not MISSING, got \
+             {after_delete}"
+        );
+        let tombstone = &list(&after_delete, "clusters", case)[0];
         assert_eq!(
-            failures.len(),
-            1,
-            "case {case:?}: expected one MISSING failure after delete, got {gone}"
+            string(tombstone, "status", case),
+            "INACTIVE",
+            "case {case:?}: expected the tombstone to read INACTIVE, got {after_delete}"
         );
         assert_eq!(
-            string(&failures[0], "reason", case),
-            "MISSING",
-            "case {case:?}: expected reason MISSING, got {gone}"
-        );
-        assert_eq!(
-            string(&failures[0], "arn", case),
+            string(tombstone, "clusterArn", case),
             string(cluster, "clusterArn", case),
-            "case {case:?}: expected the failure to name the cluster ARN, got {gone}"
+            "case {case:?}: expected the tombstone to keep its ARN, got {after_delete}"
         );
-        refused(
+        // `DeleteCluster` is `@idempotent`: deleting the tombstone is the same delete.
+        let repeated = ok(
             &router,
             "DeleteCluster",
             json!({ "cluster": expected_name }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            string(&repeated["cluster"], "status", case),
+            "INACTIVE",
+            "case {case:?}: a repeated delete reports the same tombstone, got {repeated}"
+        );
+        // The name is free again: a create over a tombstone is a new, ACTIVE cluster.
+        let recreated = ok(
+            &router,
+            "CreateCluster",
+            json!({ "clusterName": expected_name }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            string(&recreated["cluster"], "status", case),
+            "ACTIVE",
+            "case {case:?}: expected a create over a tombstone to be ACTIVE, got \
+             {recreated}"
+        );
+        ok(
+            &router,
+            "DeleteCluster",
+            json!({ "cluster": expected_name }),
+            case,
+        )
+        .await;
+        // A name that names nothing at all is still refused.
+        refused(
+            &router,
+            "DeleteCluster",
+            json!({ "cluster": "a-cluster-that-was-never-created" }),
             "ClusterNotFoundException",
             case,
         )

@@ -8,11 +8,12 @@
 //! a stable, resumable offset into the same sequence a later page walks.
 //!
 //! Besides the store this module owns the small rules every cluster operation
-//! shares: the documented identifier syntax, the documented `MaxRecords` window,
+//! shares: the published engine-version catalog, the documented identifier
+//! syntax, the documented `MaxRecords` window,
 //! the derived endpoint address / namespace ARN, and the clock-owed
 //! `creating` -> `available` transitions (see [`PROVISIONING_SPAN`]).
 
-use crate::ops::types::{Cluster, Snapshot};
+use crate::ops::types::{Cluster, ClusterVersion, Snapshot};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
@@ -42,12 +43,48 @@ pub const DEFAULT_CLUSTER_VERSION: &str = "1.0";
 /// The port the Redshift database engine listens on when the request names none.
 pub const DEFAULT_PORT: i32 = 5439;
 
-/// The cluster parameter group a cluster joins when the request names none.
+/// The cluster parameter group family an engine version belongs to.
+///
+/// A Redshift family is named `redshift-<engine version>`, which is why the
+/// default parameter group of engine version 1.0 is `default.redshift-1.0`
+/// (`smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="ClusterParameterGroupName")` — "Default: The default Amazon Redshift
+/// cluster parameter group"): the default group OF the `redshift-1.0` family.
+pub fn parameter_group_family(cluster_version: &str) -> String {
+    format!("redshift-{cluster_version}")
+}
+
+/// The cluster parameter group a cluster joins when the request names none:
+/// `default.` followed by the version's [`parameter_group_family`], so engine
+/// version 1.0 joins `default.redshift-1.0`.
 ///
 /// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
 /// member="ClusterParameterGroupName")` — "Default: The default Amazon Redshift
-/// cluster parameter group", which for engine version 1.0 is this name.
-pub const DEFAULT_PARAMETER_GROUP: &str = "default.redshift-1.0";
+/// cluster parameter group".
+pub fn default_parameter_group(cluster_version: &str) -> String {
+    format!("default.{}", parameter_group_family(cluster_version))
+}
+
+/// The Amazon Redshift engine versions this service offers, in the order
+/// `DescribeClusterVersions` reports them.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="ClusterVersion")` — "Only version 1.0 is currently available. Example:
+/// 1.0" — so the published catalog holds exactly that one engine version, with the
+/// family [`parameter_group_family`] gives it. Seeded into
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::cluster_versions`]
+/// when the store is created, so the catalog a read reports and the
+/// [`DEFAULT_CLUSTER_VERSION`] a `CreateCluster` applies cannot disagree.
+pub fn published_cluster_versions() -> Vec<ClusterVersion> {
+    [DEFAULT_CLUSTER_VERSION]
+        .into_iter()
+        .map(|version| ClusterVersion {
+            cluster_version: Some(version.to_string()),
+            cluster_parameter_group_family: Some(parameter_group_family(version)),
+            description: Some(format!("Cluster version {version}")),
+        })
+        .collect()
+}
 
 /// The maintenance track a cluster joins when the request names none.
 ///
@@ -83,7 +120,8 @@ pub const MANUAL_RETENTION_INDEFINITE: i32 = -1;
 ///
 /// Source: `smithy_query(query="doc", shape="DescribeClustersMessage",
 /// member="MaxRecords")` and the identical sentence on
-/// `DescribeClusterSnapshotsMessage$MaxRecords` — "Default: 100 … Constraints:
+/// `DescribeClusterSnapshotsMessage$MaxRecords` and
+/// `DescribeClusterVersionsMessage$MaxRecords` — "Default: 100 … Constraints:
 /// minimum 20, maximum 100."
 pub const MAX_RECORDS_DEFAULT: i32 = 100;
 /// The documented minimum of the `MaxRecords` window. See [`MAX_RECORDS_DEFAULT`].
@@ -174,12 +212,28 @@ pub struct StoredSnapshot {
 }
 
 /// Per-service state for com-amazonaws-redshift-redshiftserviceversion20121201. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// Every provisioned cluster, keyed by `ClusterIdentifier`, in creation order.
     pub clusters: Vec<StoredCluster>,
     /// Every snapshot, keyed by `SnapshotIdentifier`, in creation order.
     pub snapshots: Vec<StoredSnapshot>,
+    /// The engine versions this service offers, in catalog order. Unlike the
+    /// collections above this one is SEEDED when the store is created — the
+    /// versions exist before any cluster does, which is why
+    /// `DescribeClusterVersions` can be called "even before creating any
+    /// clusters" — and no operation adds to or removes from it.
+    pub cluster_versions: Vec<ClusterVersion>,
+}
+
+impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
+    fn default() -> Self {
+        Self {
+            clusters: Vec::new(),
+            snapshots: Vec::new(),
+            cluster_versions: published_cluster_versions(),
+        }
+    }
 }
 
 impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {

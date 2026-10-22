@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccessPoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAccessPoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAccessPoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints and persists an access point of a stored file system in
+//! [`crate::state`], keyed by its `ClientToken` so a repeat of the same call answers
+//! `AccessPointAlreadyExists` with the id the first call minted rather than creating a
+//! second access point.
 //!
 //! ## Shape of an operation
 //!
@@ -211,18 +206,167 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAccessPoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAccessPointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAccessPoint"))
+        use crate::state as efs;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+        let region = efs::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // "When specifying a RootDirectory, you must provide the Path" — the member is
+        // modelled optional, so the documented requirement is enforced here. A request
+        // that names no RootDirectory at all exposes the file system root instead.
+        let root_directory = match input.root_directory.clone() {
+            Some(requested) => {
+                if requested.path.is_none() {
+                    return Err(bad_request(
+                        "RootDirectory requires a Path when it is specified",
+                    ));
+                }
+                requested
+            }
+            None => RootDirectory {
+                path: Some(efs::ROOT_DIRECTORY_DEFAULT_PATH.to_string()),
+                creation_info: None,
+            },
+        };
+
+        // "Each tag is a key-value pair, each key must be unique", and at most the
+        // published number of tags: the same construction CreateFileSystem refuses with.
+        let tags = input.tags.clone().unwrap_or_default();
+        if let Some(problem) = efs::tag_list_problem(&tags) {
+            return Err(bad_request(problem));
+        }
+
+        let mut state = state.lock();
+        state.materialize_due_transitions(now);
+
+        // The idempotency rule `ClientToken` carries: an access point minted for this
+        // token already exists, so the call is refused with the id of that one rather
+        // than minting a second access point.
+        if let Some(existing) = state.access_point_tokens.get(&input.client_token) {
+            return Err(CreateAccessPointErrorModeled::AccessPointAlreadyExists(
+                AccessPointAlreadyExists {
+                    error_code: "AccessPointAlreadyExists".to_string(),
+                    message: Some(efs::access_point_already_exists_message(
+                        existing,
+                        &input.client_token,
+                    )),
+                    access_point_id: existing.clone(),
+                },
+            )
+            .into());
+        }
+
+        // The member accepts "the ID of the EFS file system that the access point
+        // provides access to" as an id or an ARN; both name the same file system, and
+        // the message names that one.
+        let file_system_id = efs::file_system_id_of(&input.file_system_id).to_string();
+        let Some(file_system) = state.file_systems.get(&file_system_id) else {
+            return Err(CreateAccessPointErrorModeled::FileSystemNotFound(
+                FileSystemNotFound {
+                    error_code: "FileSystemNotFound".to_string(),
+                    message: Some(efs::file_system_not_found_message(&file_system_id)),
+                },
+            )
+            .into());
+        };
+        // `IncorrectFileSystemLifeCycleState`: "Returned if the file system's lifecycle
+        // state is not available."
+        if file_system.life_cycle_state != efs::LIFE_CYCLE_AVAILABLE {
+            return Err(
+                CreateAccessPointErrorModeled::IncorrectFileSystemLifeCycleState(
+                    IncorrectFileSystemLifeCycleState {
+                        error_code: "IncorrectFileSystemLifeCycleState".to_string(),
+                        message: Some(format!(
+                            "File system {} is in life cycle state {}, not {}",
+                            efs::quoted(&file_system_id),
+                            file_system.life_cycle_state,
+                            efs::LIFE_CYCLE_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "A file system can have a maximum of 10,000 access points unless you request an
+        // increase." It bounds this store too, so a repeated create cannot grow the
+        // process without limit.
+        if state.access_point_count_of(&file_system_id) >= efs::MAX_ACCESS_POINTS_PER_FILE_SYSTEM
+        {
+            return Err(CreateAccessPointErrorModeled::AccessPointLimitExceeded(
+                AccessPointLimitExceeded {
+                    error_code: "AccessPointLimitExceeded".to_string(),
+                    message: Some(format!(
+                        "File system {} already has the maximum of {} access points",
+                        efs::quoted(&file_system_id),
+                        efs::MAX_ACCESS_POINTS_PER_FILE_SYSTEM
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let ordinal = state.next_ordinal();
+        let access_point_id = format!("fsap-{}", state.mint_hex());
+        let access_point_arn = ::engine::emulator_arn(
+            "elasticfilesystem",
+            &region,
+            &format!("access-point/{access_point_id}"),
+        );
+        // "The name of the access point. This is the value of the Name tag."
+        let name = tags
+            .iter()
+            .find(|tag| tag.key == "Name")
+            .map(|tag| tag.value.clone());
+
+        let access_point = efs::AccessPoint {
+            ordinal,
+            access_point_id: access_point_id.clone(),
+            access_point_arn,
+            file_system_id,
+            owner_id: ::engine::emulator_account_id().to_string(),
+            client_token: input.client_token.clone(),
+            name,
+            // A new access point is reported while it is still being created; the clock
+            // owes it `available`.
+            life_cycle_state: efs::LIFE_CYCLE_CREATING.to_string(),
+            available_at: now + efs::CREATING_FOR,
+            posix_user: input.posix_user.clone(),
+            root_directory,
+            tags,
+        };
+
+        let description = access_point.describe();
+        // Past every refusal, so this is the first write the request makes: the token the
+        // idempotency rule reads is committed alongside the access point itself, never by
+        // a call that was turned away.
+        state
+            .access_point_tokens
+            .insert(input.client_token.clone(), access_point_id.clone());
+        state.access_points.insert(access_point_id, access_point);
+        Ok(description)
     }
+}
+
+/// A 400 `BadRequest`: "the request is malformed or contains an error such as an invalid
+/// parameter value or a missing required parameter".
+fn bad_request(message: impl Into<String>) -> CreateAccessPointError {
+    CreateAccessPointErrorModeled::BadRequest(BadRequest {
+        error_code: "BadRequest".to_string(),
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 500 `InternalServerError`, for the one case this handler cannot serve: the engine
+/// this service was mounted on holds no store for it.
+fn internal_server_error() -> CreateAccessPointError {
+    CreateAccessPointErrorModeled::InternalServerError(InternalServerError {
+        error_code: "InternalServerError".to_string(),
+        message: Some("the EFS emulator state store is unavailable".to_string()),
+    })
+    .into()
 }

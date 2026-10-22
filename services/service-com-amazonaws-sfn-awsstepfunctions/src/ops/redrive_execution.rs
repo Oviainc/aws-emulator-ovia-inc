@@ -256,11 +256,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // The ONE predicate `DescribeExecution`'s `redriveStatus` is projected
             // from, so an execution this refuses is exactly one that reports
-            // `NOT_REDRIVABLE`, with this reason.
+            // `NOT_REDRIVABLE`, with this reason — stated here with the execution
+            // the request named, so the refusal says which execution it is about.
             if let Some(reason) = store.not_redrivable_reason(execution, now) {
                 return Err(RedriveExecutionErrorModeled::ExecutionNotRedrivable(
                     ExecutionNotRedrivable {
-                        message: Some(reason.to_string()),
+                        message: Some(crate::state::not_redrivable_message(
+                            &input.execution_arn,
+                            reason,
+                        )),
                     },
                 )
                 .into());
@@ -271,7 +275,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(machine) = machine else {
                 return Err(RedriveExecutionErrorModeled::ExecutionNotRedrivable(
                     ExecutionNotRedrivable {
-                        message: Some(crate::state::NOT_REDRIVABLE_DELETING.to_string()),
+                        message: Some(crate::state::not_redrivable_message(
+                            &input.execution_arn,
+                            crate::state::NOT_REDRIVABLE_DELETING,
+                        )),
                     },
                 )
                 .into());
@@ -327,7 +334,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(reason) = store.not_redrivable_reason(execution, now) {
             return Err(RedriveExecutionErrorModeled::ExecutionNotRedrivable(
                 ExecutionNotRedrivable {
-                    message: Some(reason.to_string()),
+                    message: Some(crate::state::not_redrivable_message(
+                        &input.execution_arn,
+                        reason,
+                    )),
                 },
             )
             .into());

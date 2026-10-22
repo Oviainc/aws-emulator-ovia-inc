@@ -9,17 +9,20 @@
 //! makes an opaque `nextToken` resolve to the same place on the next call.
 //!
 //! The modelled response shapes are NOT stored. `DomainDescription`,
-//! `DomainSummary`, `RepositoryDescription` and `RepositorySummary` are all projections
-//! of the records below ([`Domain::description`] and friends), so a value that is
-//! derived — `repositoryCount` above all — can never go stale against the records it
-//! summarises.
+//! `DomainSummary`, `RepositoryDescription`, `RepositorySummary` and
+//! `PackageGroupDescription` are all projections of the records below
+//! ([`Domain::description`] and friends), so a value that is derived —
+//! `repositoryCount`, a package group's `parent` and each origin restriction's
+//! `effectiveMode` above all — can never go stale against the records it summarises.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    DomainDescription, DomainSummary, RepositoryDescription, RepositoryExternalConnectionInfo,
-    RepositorySummary, ResourcePolicy, Tag, UpstreamRepositoryInfo,
+    DomainDescription, DomainSummary, PackageGroupDescription, PackageGroupOriginConfiguration,
+    PackageGroupOriginRestriction, PackageGroupReference, RepositoryDescription,
+    RepositoryExternalConnectionInfo, RepositorySummary, ResourcePolicy, Tag,
+    UpstreamRepositoryInfo, PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES,
 };
 
 /// This service's SigV4 signing name, which is also the service segment of every ARN
@@ -107,6 +110,38 @@ pub const MAX_UPSTREAMS_PER_REPOSITORY: usize = 10;
 /// `ServiceQuotaExceededException` (402).
 pub const MAX_EXTERNAL_CONNECTIONS_PER_REPOSITORY: usize = 1;
 
+/// Maximum package groups one domain holds, counting the root group every domain is
+/// created with.
+///
+/// Unlike the ceilings above this one does NOT quote a published figure: AWS caps
+/// package groups per domain, but the number is not cited here, so treat this as the
+/// emulator's own declared bound on a growth site a caller controls. What matters for
+/// fidelity is the REFUSAL — `ServiceQuotaExceededException` (402), which
+/// `CreatePackageGroup` models — not the exact threshold.
+pub const MAX_PACKAGE_GROUPS_PER_DOMAIN: usize = 100;
+
+// ---------------------------------------------------------------------------
+// Package groups
+// ---------------------------------------------------------------------------
+
+/// The pattern of the root package group. Every domain has it from the moment it is
+/// created: it matches every package in the domain, it is the ancestor of every other
+/// package group, and it is what the origin restrictions of a group that inherits
+/// ultimately resolve against.
+pub const ROOT_PACKAGE_GROUP_PATTERN: &str = "/*";
+
+/// `PackageGroupOriginRestrictionMode$ALLOW`.
+pub const ORIGIN_MODE_ALLOW: &str = "ALLOW";
+
+/// `PackageGroupOriginRestrictionMode$ALLOW_SPECIFIC_REPOSITORIES` — the only mode that
+/// carries an allowed-repository list, and therefore the only one with a
+/// `repositoriesCount`.
+pub const ORIGIN_MODE_ALLOW_SPECIFIC_REPOSITORIES: &str = "ALLOW_SPECIFIC_REPOSITORIES";
+
+/// `PackageGroupOriginRestrictionMode$INHERIT` — the mode a newly created group carries
+/// for every restriction type, which resolves to an ancestor's mode.
+pub const ORIGIN_MODE_INHERIT: &str = "INHERIT";
+
 /// Per-service state for com-amazonaws-codeartifact-codeartifactcontrolplaneservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState {
@@ -160,6 +195,15 @@ pub struct Domain {
     /// The domain's repositories, keyed by repository name. `repositoryCount` is
     /// derived from this map's length and never stored beside it.
     pub repositories: BTreeMap<String, Repository>,
+    /// The domain's package groups, keyed by their pattern — which the model calls out
+    /// as the group's identifier (`CreatePackageGroupRequest$packageGroup`: "The pattern
+    /// is also the identifier of the package group").
+    ///
+    /// A domain always holds at least [`ROOT_PACKAGE_GROUP_PATTERN`], inserted when the
+    /// domain is created. The parent/child hierarchy is NOT stored here: it is derived
+    /// from the patterns themselves on every read ([`Domain::package_group_parent`]), so
+    /// inserting an intermediate group reparents the groups below it with no rewrite.
+    pub package_groups: BTreeMap<String, PackageGroup>,
 }
 
 impl Domain {
@@ -198,6 +242,254 @@ impl Domain {
     fn repository_count(&self) -> i32 {
         i32::try_from(self.repositories.len()).unwrap_or(i32::MAX)
     }
+
+    /// The modelled `PackageGroupDescription` of the group this domain holds under
+    /// `pattern`, or `None` when it holds no such group.
+    ///
+    /// Everything derived — the parent reference and each restriction's effective mode —
+    /// is computed from the groups the domain holds AT THIS CALL, so a description can
+    /// never disagree with the hierarchy it is part of.
+    pub fn package_group_description(&self, pattern: &str) -> Option<PackageGroupDescription> {
+        let group = self.package_groups.get(pattern)?;
+        Some(PackageGroupDescription {
+            arn: Some(group.arn.clone()),
+            pattern: Some(group.pattern.clone()),
+            domain_name: Some(group.domain_name.clone()),
+            domain_owner: Some(group.domain_owner.clone()),
+            created_time: Some(group.created_time.into()),
+            contact_info: group.contact_info.clone(),
+            description: group.description.clone(),
+            origin_configuration: Some(PackageGroupOriginConfiguration {
+                restrictions: Some(self.origin_restrictions(group)),
+            }),
+            parent: self.package_group_parent(pattern).map(PackageGroup::reference),
+        })
+    }
+
+    /// The DIRECT parent of `pattern`: the most specific group this domain holds whose
+    /// pattern covers a strict prefix of the path `pattern` covers.
+    ///
+    /// `None` only for the root group, which covers the whole domain and so has nothing
+    /// above it.
+    pub fn package_group_parent(&self, pattern: &str) -> Option<&PackageGroup> {
+        let path = covered_path(pattern);
+        self.package_groups
+            .values()
+            .filter(|candidate| covers_strictly(&candidate.pattern, &path))
+            .max_by_key(|candidate| covered_path(&candidate.pattern).len())
+    }
+
+    /// One modelled restriction per `PackageGroupOriginRestrictionType`, which is the
+    /// whole `originConfiguration` of a group: the type list is the model's own enum, so
+    /// a type added to the model shows up here without another edit.
+    fn origin_restrictions(
+        &self,
+        group: &PackageGroup,
+    ) -> HashMap<String, PackageGroupOriginRestriction> {
+        PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES
+            .iter()
+            .map(|restriction_type| {
+                (
+                    (*restriction_type).to_string(),
+                    self.origin_restriction(group, restriction_type),
+                )
+            })
+            .collect()
+    }
+
+    /// One origin restriction of `group`, resolved.
+    ///
+    /// `mode` is what the group itself carries. `effectiveMode` is the same value unless
+    /// the group inherits, in which case it is "the value of `mode` of the first parent
+    /// group which does not have a value of `INHERIT`"
+    /// (`PackageGroupOriginRestriction$effectiveMode`), and `inheritedFrom` names that
+    /// group.
+    fn origin_restriction(
+        &self,
+        group: &PackageGroup,
+        restriction_type: &str,
+    ) -> PackageGroupOriginRestriction {
+        // Walk up while the mode inherits. Each step moves to a group covering a
+        // STRICTLY shorter path, so the walk cannot cycle and ends at the root.
+        //
+        // The walk breaks at the root, whose modes never inherit as long as the root is
+        // created by `PackageGroup::root` — so `effective_mode` below is a resolved
+        // mode. An `UpdatePackageGroupOriginConfiguration` that ever let the ROOT group
+        // carry `INHERIT` would make this report `INHERIT` as the effective mode, and
+        // must refuse that instead: the root has nothing to inherit from.
+        let mut source = group;
+        let mut inherited_from = None;
+        while source.restriction_mode(restriction_type) == ORIGIN_MODE_INHERIT {
+            match self.package_group_parent(&source.pattern) {
+                Some(parent) => {
+                    source = parent;
+                    inherited_from = Some(parent.reference());
+                }
+                None => break,
+            }
+        }
+
+        let effective_mode = source.restriction_mode(restriction_type).to_string();
+        PackageGroupOriginRestriction {
+            mode: Some(group.restriction_mode(restriction_type).to_string()),
+            effective_mode: Some(effective_mode.clone()),
+            inherited_from,
+            // "The number of repositories in the allowed repository list"
+            // (`PackageGroupOriginRestriction$repositoriesCount`) — a list only an
+            // ALLOW_SPECIFIC_REPOSITORIES restriction has, counted on the group the
+            // effective mode came from.
+            repositories_count: (effective_mode == ORIGIN_MODE_ALLOW_SPECIFIC_REPOSITORIES).then(
+                || {
+                    i64::try_from(source.allowed_repositories(restriction_type).len())
+                        .unwrap_or(i64::MAX)
+                },
+            ),
+        }
+    }
+}
+
+/// A stored package group.
+///
+/// The group's place in the hierarchy is not a field: it follows from [`Self::pattern`]
+/// and the other patterns the domain holds, so it is derived where it is reported.
+#[derive(Debug, Clone)]
+pub struct PackageGroup {
+    /// The pattern, which is also the group's identifier within the domain.
+    pub pattern: String,
+    pub domain_name: String,
+    pub domain_owner: String,
+    pub arn: String,
+    pub created_time: SystemTime,
+    pub contact_info: Option<String>,
+    pub description: Option<String>,
+    /// The group's own origin restriction per `PackageGroupOriginRestrictionType`. A
+    /// type missing from the map reads as [`ORIGIN_MODE_INHERIT`].
+    pub restrictions: BTreeMap<String, OriginRestriction>,
+    pub tags: Vec<Tag>,
+}
+
+impl PackageGroup {
+    /// The root group of a domain: it has no parent, so none of its restrictions can
+    /// inherit — they are the domain's effective defaults, and CodeArtifact's root group
+    /// allows publishing and both upstream kinds.
+    pub fn root(region: &str, domain: &str, owner: &str, created_time: SystemTime) -> Self {
+        Self {
+            pattern: ROOT_PACKAGE_GROUP_PATTERN.to_string(),
+            domain_name: domain.to_string(),
+            domain_owner: owner.to_string(),
+            arn: package_group_arn(region, domain, ROOT_PACKAGE_GROUP_PATTERN),
+            created_time,
+            contact_info: None,
+            description: None,
+            restrictions: origin_restrictions_in_mode(ORIGIN_MODE_ALLOW),
+            tags: Vec::new(),
+        }
+    }
+
+    /// How this group is referred to from another group's description — as a `parent`,
+    /// or as the `inheritedFrom` of a restriction.
+    pub fn reference(&self) -> PackageGroupReference {
+        PackageGroupReference {
+            arn: Some(self.arn.clone()),
+            pattern: Some(self.pattern.clone()),
+        }
+    }
+
+    /// This group's OWN mode for `restriction_type` — not the effective one.
+    pub fn restriction_mode(&self, restriction_type: &str) -> &str {
+        self.restrictions
+            .get(restriction_type)
+            .map_or(ORIGIN_MODE_INHERIT, |restriction| {
+                restriction.mode.as_str()
+            })
+    }
+
+    /// The repositories this group's `restriction_type` allows, which is meaningful only
+    /// in [`ORIGIN_MODE_ALLOW_SPECIFIC_REPOSITORIES`].
+    pub fn allowed_repositories(&self, restriction_type: &str) -> &BTreeSet<String> {
+        /// Borrowed when the group carries no restriction of that type at all, so the
+        /// caller never has to handle a missing list.
+        static NONE: BTreeSet<String> = BTreeSet::new();
+
+        self.restrictions
+            .get(restriction_type)
+            .map_or(&NONE, |restriction| &restriction.allowed_repositories)
+    }
+}
+
+/// One stored origin restriction of a package group.
+#[derive(Debug, Clone)]
+pub struct OriginRestriction {
+    /// A `PackageGroupOriginRestrictionMode` value.
+    pub mode: String,
+    /// The repositories named by `ALLOW_SPECIFIC_REPOSITORIES`, which
+    /// `UpdatePackageGroupOriginConfiguration` adds to and removes from. A set, because
+    /// a repository is either allowed or not and the allowed list is reported as a
+    /// count.
+    pub allowed_repositories: BTreeSet<String>,
+}
+
+/// Every `PackageGroupOriginRestrictionType` in `mode`, with no allowed repositories:
+/// the restriction map a group is created with — [`ORIGIN_MODE_ALLOW`] for the root
+/// group, [`ORIGIN_MODE_INHERIT`] for every group created under it.
+pub fn origin_restrictions_in_mode(mode: &str) -> BTreeMap<String, OriginRestriction> {
+    PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES
+        .iter()
+        .map(|restriction_type| {
+            (
+                (*restriction_type).to_string(),
+                OriginRestriction {
+                    mode: mode.to_string(),
+                    allowed_repositories: BTreeSet::new(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// The package groups a freshly created domain holds: just the root group.
+pub fn initial_package_groups(
+    region: &str,
+    domain: &str,
+    owner: &str,
+    created_time: SystemTime,
+) -> BTreeMap<String, PackageGroup> {
+    BTreeMap::from([(
+        ROOT_PACKAGE_GROUP_PATTERN.to_string(),
+        PackageGroup::root(region, domain, owner, created_time),
+    )])
+}
+
+/// The path a package group pattern covers, as segments, with the pattern's terminator
+/// removed: `/*` covers nothing (the whole domain), `/npm/*` covers `npm`, and
+/// `/npm/scope/pkg$` covers `npm`, `scope`, `pkg`.
+///
+/// A pattern is a `/`-separated path whose final element either is the wildcard `*` (the
+/// group covers everything below the path before it) or names one package, optionally
+/// marked exact with a trailing `$`. Only that terminator is interpreted; the segments
+/// themselves are compared literally, which is all the hierarchy needs.
+fn covered_path(pattern: &str) -> Vec<&str> {
+    let mut segments: Vec<&str> = pattern.split('/').filter(|part| !part.is_empty()).collect();
+    if segments.last().is_some_and(|last| *last == "*") {
+        segments.pop();
+    } else if let Some(last) = segments.last_mut() {
+        let named = *last;
+        *last = named.strip_suffix('$').unwrap_or(named);
+    }
+    segments
+}
+
+/// Whether `pattern` covers a STRICT prefix of `path` — the relation that makes the
+/// group with that pattern an ANCESTOR of the group covering `path`.
+///
+/// Only a wildcard pattern covers anything below the path it names, so a pattern that
+/// names a single package is nobody's ancestor.
+fn covers_strictly(pattern: &str, path: &[&str]) -> bool {
+    if !pattern.ends_with('*') {
+        return false;
+    }
+    let ancestor = covered_path(pattern);
+    ancestor.len() < path.len() && path.starts_with(&ancestor)
 }
 
 /// A stored repository inside a domain.
@@ -287,6 +579,22 @@ pub fn repository_arn(region: &str, domain: &str, repository: &str) -> String {
         SERVICE_SIGNING_NAME,
         region,
         &format!("repository/{domain}/{repository}"),
+    )
+}
+
+/// The ARN of a package group:
+/// `arn:aws:codeartifact:<region>:<owner>:package-group/<domain><pattern>`.
+///
+/// The pattern is a path that already begins with `/`, so it joins the domain segment
+/// directly — the form CodeArtifact's `package-group` resource ARN takes. A pattern
+/// handed in without the leading `/` gets one here, so the ARN always has exactly one
+/// separator between the domain and the pattern.
+pub fn package_group_arn(region: &str, domain: &str, pattern: &str) -> String {
+    let path = pattern.strip_prefix('/').unwrap_or(pattern);
+    ::engine::emulator_arn(
+        SERVICE_SIGNING_NAME,
+        region,
+        &format!("package-group/{domain}/{path}"),
     )
 }
 

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePackageGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePackageGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePackageGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a package group in a domain and answers with the stored record's
+//! `PackageGroupDescription`. The pattern IS the group's identifier, so a repeat is a
+//! `ConflictException` (409) and an unknown domain is a `ResourceNotFoundException`
+//! (404). A created group inherits every origin restriction (`mode` `INHERIT`), so its
+//! effective modes are resolved from its ancestors — up to the root group `/*` the
+//! domain was created with.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +164,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePackageGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePackageGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePackageGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The ARN this group reports is regional, and the region comes from the request's
+        // own SigV4 scope — the same rule every other ARN in this service follows.
+        let region = crate::state::request_region(ctx.parts());
+        let pattern = input.package_group.clone();
+
+        // A pattern is a path from the domain root, so it begins with `/` — that is what
+        // makes `/*` the ancestor of `/npm/*`. `PackageGroupPattern` models only length
+        // and "no control or whitespace characters", so the boundary validator passed
+        // anything else and the shape of the identifier is checked here.
+        if !pattern.starts_with('/') {
+            return Err(CreatePackageGroupErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Invalid package group pattern '{pattern}'. A package group pattern is a path from the domain root and must begin with '/'."
+                    ),
+                    reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(CreatePackageGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Domain not found. Domain '{}' owned by account '{}' does not exist.",
+                        input.domain,
+                        input
+                            .domain_owner
+                            .as_deref()
+                            .unwrap_or(::engine::emulator_account_id())
+                    ),
+                    resource_id: Some(input.domain.clone()),
+                    resource_type: Some("domain".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The pattern is the identifier, so a second create of the same pattern is a
+        // conflict — including against the root group every domain already holds.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePackageGroup"))
+        // `resourceType` is left unset here and below: `ResourceType` models only
+        // `domain`, `repository`, `package`, `package-version` and `asset`, so there is
+        // no enum value for a package group to report.
+        if domain.package_groups.contains_key(&pattern) {
+            return Err(CreatePackageGroupErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Package group '{pattern}' in domain '{}' owned by '{}' already exists.",
+                        domain.name, domain.owner
+                    ),
+                    resource_id: Some(pattern.clone()),
+                    resource_type: None,
+                },
+            )
+            .into());
+        }
+
+        // A package group is freed only by an explicit DeletePackageGroup, so the
+        // domain's package-group ceiling is what bounds this store.
+        if domain.package_groups.len() >= crate::state::MAX_PACKAGE_GROUPS_PER_DOMAIN {
+            return Err(CreatePackageGroupErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "Cannot create package group '{pattern}': domain '{}' already holds the maximum of {} package groups.",
+                        domain.name,
+                        crate::state::MAX_PACKAGE_GROUPS_PER_DOMAIN
+                    ),
+                    resource_id: Some(pattern.clone()),
+                    resource_type: None,
+                },
+            )
+            .into());
+        }
+
+        let group = crate::state::PackageGroup {
+            pattern: pattern.clone(),
+            domain_name: domain.name.clone(),
+            domain_owner: domain.owner.clone(),
+            arn: crate::state::package_group_arn(&region, &domain.name, &pattern),
+            created_time: ::std::time::SystemTime::now(),
+            contact_info: input.contact_info.clone(),
+            description: input.description.clone(),
+            // Every restriction of a created group inherits: CreatePackageGroup takes no
+            // origin configuration, and `UpdatePackageGroupOriginConfiguration` is what
+            // moves a restriction off INHERIT.
+            restrictions: crate::state::origin_restrictions_in_mode(
+                crate::state::ORIGIN_MODE_INHERIT,
+            ),
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+        domain.package_groups.insert(pattern.clone(), group);
+
+        // Projected AFTER the insert, so the `parent` and the effective modes this
+        // answer reports are resolved against the hierarchy the new group is now part of
+        // — the same projection a later DescribePackageGroup reads.
+        let Some(description) = domain.package_group_description(&pattern) else {
+            return Err(CreatePackageGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!(
+                        "package group '{pattern}' was stored but cannot be read back"
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(CreatePackageGroupOutput {
+            package_group: Some(description),
+        })
     }
 }

@@ -16,6 +16,11 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The `X-Amz-Target` prefix this service answers (README.md / OPERATIONS.md).
 const TARGET_PREFIX: &str = "PerformanceInsightsv20180227";
 
+/// The region [`AUTHORIZATION`]'s credential scope names — and so the region the
+/// ARNs this service mints for a request of this harness sit in. Keep the two in
+/// step.
+pub const REGION: &str = "us-west-2";
+
 /// A SigV4 credential scope naming the `pi` signing name: that is the signal the
 /// router resolves a service from, because an `X-Amz-Target` prefix names the
 /// target (`PerformanceInsightsv20180227`), not the signing name. Request
@@ -26,13 +31,24 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 /// A fresh emulator holding only this service, over one shared engine.
 pub fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// The same emulator, with the engine it was built on.
+///
+/// For a suite that must seed a store ANOTHER service writes — the shared
+/// data-source directory the database control planes record a minted DB resource id
+/// in — which a one-service emulator has no operation to write.
+pub fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
-        service_com_amazonaws_pi_performanceinsightsv20180227::EmulatedService::new(engine),
+        service_com_amazonaws_pi_performanceinsightsv20180227::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
     );
-    router
+    (router, engine)
 }
 
 /// One answer off the wire: the HTTP status and the parsed JSON body.

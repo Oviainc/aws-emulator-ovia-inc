@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeClusterVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeClusterVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeClusterVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the engine-version catalog this service offers — each version, the
+//! cluster parameter group family it belongs to and its description — filtered by
+//! `ClusterVersion` and `ClusterParameterGroupFamily` and paginated through the
+//! opaque `Marker` cursor. A PURE read: the catalog is seeded into the store when
+//! the store is created, which is why this operation answers "even before creating
+//! any clusters", and it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -93,12 +91,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `DescribeClusterVersionsError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeClusterVersions")]
+// here. The model declares NO error for this operation, so
+// `DependentServiceUnavailableFault` is widened in: the service declares the shape,
+// and it is the only modelled way to say "the control-plane store could not be
+// reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeClusterVersions",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeClusterVersionsErrorModeled {
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -150,20 +153,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeClusterVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeClusterVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeClusterVersions"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeClusterVersionsErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A pure read of the seeded catalog: no transition is ever owed on it, so
+        // unlike the cluster and snapshot reads this one settles nothing and
+        // writes nothing at all.
+        let store = state.lock();
+
+        // Both filters are exact and independent, and one the request omits
+        // constrains nothing. The model declares no error for a filter that
+        // selects nothing, so an unknown version or family is an EMPTY page
+        // rather than a refusal; a family name (`redshift-1.0`) is also not an
+        // identifier of the kind `st::check_identifier` describes, so its syntax
+        // is not second-guessed either.
+        let matched: Vec<&ClusterVersion> = store
+            .cluster_versions
+            .iter()
+            .filter(|offered| {
+                input
+                    .cluster_version
+                    .as_deref()
+                    .is_none_or(|wanted| offered.cluster_version.as_deref() == Some(wanted))
+                    && input
+                        .cluster_parameter_group_family
+                        .as_deref()
+                        .is_none_or(|wanted| {
+                            offered.cluster_parameter_group_family.as_deref() == Some(wanted)
+                        })
+            })
+            .collect();
+
+        // The same `Marker`/`MaxRecords` window every paginated Redshift
+        // `Describe*` shares, so a cursor cannot mean one thing here and another
+        // there.
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(DescribeClusterVersionsOutput {
+            cluster_versions: Some(
+                matched[start..end]
+                    .iter()
+                    .map(|offered| (*offered).clone())
+                    .collect(),
+            ),
+            marker: next_marker,
+        })
     }
 }

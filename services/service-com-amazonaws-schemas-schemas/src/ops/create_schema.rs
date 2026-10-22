@@ -160,6 +160,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx.parts());
+
+        // A schema registry stores schema SOURCE, so content that is not a document of
+        // the declared type is not something this service can ever hand back as a
+        // schema. Both members this decides on — `Content` and `Type` — are modelled
+        // `required` on this operation, so the decision is a property of the REQUEST
+        // alone: it is taken here, before any resource is resolved and before the
+        // store is even reached, so a malformed body is refused on the request rather
+        // than on the store's contents, and the name it asked for is left free.
+        // `UpdateSchema` makes the same check (one helper, so the two cannot drift)
+        // but only after reading the schema: its `Type` is optional there, so the type
+        // the content is declared as is not known until the stored schema is in hand.
+        crate::state::validate_content(&input.content, &input.r#type).map_err(|refusal| {
+            CreateSchemaError::from(CreateSchemaErrorModeled::BadRequestException(refusal))
+        })?;
+
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateSchemaError::from(CreateSchemaErrorModeled::InternalServerErrorException(
                 crate::state::internal_error(),

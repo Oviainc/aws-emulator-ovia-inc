@@ -178,3 +178,26 @@ pub(crate) async fn create_cluster(
     let body = ok(router, "CreateCluster", json!({ "clusterName": name }), case).await;
     string(&body["cluster"], "clusterArn", case)
 }
+
+/// Register one revision of `family` with a single container and return its ARN. The
+/// suites that need a plain revision share this one; a suite that needs a revision of a
+/// particular SHAPE (Fargate-compatible, a named container) builds its own.
+pub(crate) async fn register_definition(
+    router: &MultiServiceRouter,
+    family: &str,
+    case: &str,
+) -> String {
+    let body = ok(
+        router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": family,
+            "containerDefinitions": [
+                crate::task_lifecycle::container("web", "public.ecr.aws/nginx/nginx:latest"),
+            ],
+        }),
+        case,
+    )
+    .await;
+    string(&body["taskDefinition"], "taskDefinitionArn", case)
+}

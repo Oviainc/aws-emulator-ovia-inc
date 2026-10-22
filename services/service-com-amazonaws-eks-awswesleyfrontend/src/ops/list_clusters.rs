@@ -6,9 +6,12 @@
 //! from the last name returned (so a token stays meaningful across creates and
 //! deletes rather than indexing a transient vector).
 //!
-//! `include` is accepted and ignored: it only WIDENS the listing to connected
-//! clusters (`RegisterCluster`, still scaffolded), of which this store holds none,
-//! so no value of it can change the answer today.
+//! `include` is the listing's PROJECTION: it "indicates whether external clusters
+//! are included in the returned list. Use 'all' to return connected clusters, or
+//! blank to return only Amazon EKS clusters. 'all' must be in lowercase otherwise
+//! an error occurs" (`ListClustersRequest$include`). So a cluster `RegisterCluster`
+//! connected is listed only for a caller that asked for it, and any other value —
+//! including `all` in another case — is refused.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -72,7 +75,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{self, DEFAULT_LIST_PAGE_SIZE};
+use crate::state::{self, DEFAULT_LIST_PAGE_SIZE, LIST_INCLUDE_ALL};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -170,6 +173,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?),
         };
 
+        // "Use 'all' to return connected clusters, or blank to return only Amazon EKS
+        // clusters. 'all' must be in lowercase otherwise an error occurs" — so the one
+        // value this member takes is `all`, and anything else (a case variant included)
+        // is a bad parameter rather than a value to ignore. No value at all, or an empty
+        // list, is "blank": only Amazon EKS clusters.
+        let include_connected = match input.include.as_deref() {
+            None => false,
+            Some(values) => {
+                // An empty value is "blank" too: a client that sends `include=` with
+                // nothing after it has named no projection.
+                let named: Vec<&str> = values
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|value| !value.is_empty())
+                    .collect();
+                if let Some(unknown) = named.iter().find(|value| **value != LIST_INCLUDE_ALL) {
+                    return Err(ListClustersError::from(
+                        ListClustersErrorModeled::InvalidParameterException(
+                            InvalidParameterException {
+                                message: Some(format!(
+                                    "include must be '{LIST_INCLUDE_ALL}' in lowercase, got \
+                                     {unknown}"
+                                )),
+                                ..Default::default()
+                            },
+                        ),
+                    ));
+                }
+                !named.is_empty()
+            }
+        };
+
         // `maxResults` is modelled 1..100, so a value outside that range is REFUSED by
         // schema validation before this handler runs — it is not coerced here, which
         // would quietly hide a future gap in that validation. Only the absent case gets
@@ -182,9 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let guard = store.lock();
         // Clusters are listed per REGION: a name identifies a cluster only within the
         // region its ARN names, so this walks only the region the request is signed
-        // for.
+        // for, under the projection `include` asked for.
         let mut remaining = guard
-            .cluster_names_in(&region)
+            .listed_cluster_names_in(&region, include_connected)
             .filter(|name| resume_after.as_deref().is_none_or(|after| *name > after));
         let clusters: Vec<String> = remaining
             .by_ref()

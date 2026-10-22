@@ -23,6 +23,8 @@ mod discovered_schema_inference;
 mod error_body_codes;
 #[path = "all/iso8601_timestamps.rs"]
 mod iso8601_timestamps;
+#[path = "all/malformed_content_and_policy_deletion.rs"]
+mod malformed_content_and_policy_deletion;
 #[path = "all/registry_schema_lifecycle.rs"]
 mod registry_schema_lifecycle;
 #[path = "all/resource_policy.rs"]

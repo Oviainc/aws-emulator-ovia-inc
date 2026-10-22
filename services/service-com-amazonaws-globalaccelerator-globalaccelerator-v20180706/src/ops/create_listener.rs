@@ -245,6 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_affinity: input
                 .client_affinity
                 .unwrap_or_else(|| crate::state::CLIENT_AFFINITY_NONE.to_string()),
+            endpoint_group_arns: Vec::new(),
         };
         let listener = record.to_wire();
 

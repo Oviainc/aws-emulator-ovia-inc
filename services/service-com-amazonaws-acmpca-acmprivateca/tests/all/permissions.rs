@@ -209,9 +209,19 @@ async fn a_granted_permission_is_listed_back_as_it_was_granted() {
             "case {case:?}: a grant made through CreatePermission names no policy, got {permission:?}"
         );
         let created_at = permission["CreatedAt"].as_f64().unwrap_or_default();
+        // The reported instant is the clock read TRUNCATED to milliseconds
+        // (`state::to_date_time` builds it with `DateTime::from_millis`), so it
+        // can sit just before `before`, which is read at full precision. What is
+        // under test is that `CreatedAt` is the instant the grant was made, not
+        // its sub-millisecond precision, so the window carries ten of those
+        // rendering steps of slack at each end.
+        const RENDERING_SLACK: f64 = 0.01;
+        let window = (before - RENDERING_SLACK)..=(after + RENDERING_SLACK);
         assert!(
-            (before..=after).contains(&created_at),
-            "case {case:?}: expected CreatedAt within [{before}, {after}], got {created_at}"
+            window.contains(&created_at),
+            "case {case:?}: expected CreatedAt within [{}, {}], got {created_at}",
+            window.start(),
+            window.end()
         );
     }
 }

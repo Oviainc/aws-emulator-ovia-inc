@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListActionTypes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListActionTypes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListActionTypes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every action type this account can use, in one total order over the
+//! `ActionTypeId` members: the action types the service provides itself
+//! ([`crate::state::BUILT_IN_ACTION_TYPES`]) overlaid with the ones registered in
+//! this account's store, narrowed by `actionOwnerFilter` and `regionFilter`, and
+//! paged with the opaque cursor [`crate::state::encode_page_token`] mints.
 //!
 //! ## Shape of an operation
 //!
@@ -111,6 +108,15 @@ impl From<ListActionTypesErrorModeled> for ListActionTypesError {
     }
 }
 
+/// The most action types `ListActionTypes` serves in one page.
+///
+/// A bound is required so the response stays bounded however many action types the
+/// account registers; the operation models no `maxResults` member, so the figure is
+/// this emulator's own rather than a documented one, and the remainder is reported
+/// through `nextToken` exactly as the model's `@paginated(inputToken: "nextToken",
+/// outputToken: "nextToken", items: "actionTypes")` trait describes.
+pub const MAX_ACTION_TYPES_PER_PAGE: usize = 50;
+
 /// The `ListActionTypes` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -147,18 +153,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListActionTypes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListActionTypesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListActionTypes"))
+        let state = crate::state::require_state(&*self.engine)?;
+
+        // Where this page starts: the first action type whose id is at or after the
+        // one the caller's cursor names. A token this listing never issued, or one
+        // that does not name four `ActionTypeId` members, is refused with the error
+        // the model declares for exactly that ("The next token was specified in an
+        // invalid format").
+        let start = match input.next_token.as_deref() {
+            None => ::std::ops::Bound::Unbounded,
+            Some(token) => {
+                let key = crate::state::decode_page_token(
+                    crate::state::CURSOR_ACTION_TYPE,
+                    token,
+                )
+                .as_deref()
+                .and_then(crate::state::ActionTypeKey::from_cursor)
+                .ok_or_else(|| {
+                    ListActionTypesError::from(
+                        ListActionTypesErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "nextToken was not issued by ListActionTypes".to_string(),
+                                ),
+                            },
+                        ),
+                    )
+                })?;
+                ::std::ops::Bound::Included(key)
+            }
+        };
+
+        // Both filters narrow the one catalog: `actionOwnerFilter` to the action
+        // types one creator owns (the member is modelled `ActionOwner`, so the
+        // boundary validator has already refused anything that is not one of its
+        // values), `regionFilter` to the ones a caller in that Region can use.
+        let owner_filter = input.action_owner_filter;
+        let region_filter = input
+            .region_filter
+            .unwrap_or_else(|| crate::state::request_region(&ctx.parts().headers));
+
+        let catalog = state.lock().action_type_catalog();
+        let mut action_types = Vec::new();
+        let mut next_token = None;
+        for (key, record) in catalog
+            .range((start, ::std::ops::Bound::Unbounded))
+            .filter(|(key, record)| {
+                owner_filter
+                    .as_deref()
+                    .is_none_or(|owner| key.owner == owner)
+                    && record.available_in(&region_filter)
+            })
+        {
+            if action_types.len() == MAX_ACTION_TYPES_PER_PAGE {
+                next_token = Some(crate::state::encode_page_token(
+                    crate::state::CURSOR_ACTION_TYPE,
+                    &key.cursor(),
+                ));
+                break;
+            }
+            action_types.push(record.to_action_type(key));
+        }
+
+        Ok(ListActionTypesOutput {
+            action_types,
+            next_token,
+        })
     }
 }

@@ -17,6 +17,15 @@
 //! `Id`. A group's `State`, `Inputs` and `Channels` are derived from the rest of
 //! the state on every read, never recorded at create time.
 //!
+//! A delete never drops a record: a deleted channel, input, input security group
+//! or SdiSource keeps its record in the terminal `DELETED` state its own state
+//! enum models, so a reader goes on reporting it there (which is what the SDK's
+//! `ChannelDeleted` / `InputDeleted` waiters poll for) instead of losing it. The
+//! `DELETING` step a channel's and an input's enum models is what the clock owes
+//! between the call and that terminal state, and a resource in `DELETED` is no
+//! longer *currently using* anything, so it leaves the derived `Inputs`,
+//! `Channels` and `AttachedChannels` lists.
+//!
 //! A channel's schedule lives on its own [`ChannelRecord`], as the
 //! [`ChannelSchedule`] of the [`schedules`] slice: the actions
 //! `BatchUpdateSchedule` created and `DeleteSchedule` clears, swept of the ones
@@ -149,6 +158,7 @@ pub mod channel_state {
     pub const RECOVERING: &str = "RECOVERING";
     pub const STOPPING: &str = "STOPPING";
     pub const DELETING: &str = "DELETING";
+    pub const DELETED: &str = "DELETED";
     pub const UPDATE_FAILED: &str = "UPDATE_FAILED";
 }
 
@@ -210,8 +220,9 @@ pub mod input_security_group_state {
 /// input that is already `DETACHED` (the recorded create carries
 /// `State=DETACHED`), so an input is returned ready and owes the clock no
 /// transition. `DELETING` and `DELETED` are the deletion half of the lifecycle,
-/// which `DeleteInput` owns: it starts `DELETING` and the clock settles it into
-/// the terminal `DELETED` ([`InputRecord::settle`]).
+/// which a delete (`DeleteInput`, `BatchDelete`) owns: it starts `DELETING` and
+/// the clock settles it into the terminal `DELETED` ([`InputRecord::settle`]),
+/// which is what the SDK's `InputDeleted` waiter polls `DescribeInput` for.
 pub mod input_state {
     pub const DETACHED: &str = "DETACHED";
     pub const ATTACHED: &str = "ATTACHED";
@@ -414,6 +425,20 @@ pub const MAX_TAG_VALUE_LEN: usize = 256;
 /// unbounded number of resources in one response.
 pub const MAX_LIST_PAGE_SIZE: usize = 50;
 
+/// The most resource ids ONE `BatchDelete` call may name, counting its
+/// `ChannelIds`, `InputIds`, `InputSecurityGroupIds` and `MultiplexIds`
+/// together.
+///
+/// A ceiling, not a guess at AWS's published quota: the model targets those
+/// members at plain `__listOf__string` with no length constraint, so nothing
+/// else bounds them, and each named id costs a derivation over the stores
+/// (`attached_channels`, `inputs_using_security_group`, …) and one entry in the
+/// response. Capping the batch caps that product — the work done under the
+/// state guard and the size of the two result lists — in one place.
+/// `BatchDelete` models `BadRequestException`, which is the refusal for a batch
+/// above this bound.
+pub const MAX_BATCH_DELETE_IDS: usize = 100;
+
 /// The state a channel's in-flight transition settles into once it comes due.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Settled {
@@ -421,8 +446,11 @@ enum Settled {
     Idle,
     /// `STARTING` and `RECOVERING` settle into `RUNNING`.
     Running,
-    /// `DELETING` settles into the channel no longer existing.
-    Gone,
+    /// `DELETING` settles into the terminal `DELETED`, which the channel keeps:
+    /// the record stays in the account, so `DescribeChannel` goes on reporting
+    /// the channel in that state instead of losing it. This is what the SDK's
+    /// `ChannelDeleted` waiter polls `DescribeChannel` for.
+    Deleted,
 }
 
 /// A transition the clock owes: the instant it becomes due and what it settles
@@ -554,9 +582,16 @@ impl ChannelRecord {
 
     /// Whether this channel is in a state `DeleteChannel` accepts: a channel is
     /// deletable once it has stopped (`IDLE`) or has failed, never while it is
-    /// creating, starting, running, stopping or already deleting.
+    /// creating, starting, running, stopping, already deleting or deleted.
     pub fn is_deletable(&self) -> bool {
         self.has_stopped()
+    }
+
+    /// Whether this channel has reached the terminal `DELETED` state, which it
+    /// then keeps: the record stays in the account, so a reader goes on
+    /// reporting the channel in that state instead of losing it.
+    pub fn is_deleted(&self) -> bool {
+        self.state == channel_state::DELETED
     }
 
     /// Put the channel into `state` as of `now` and owe `to` once
@@ -569,32 +604,30 @@ impl ChannelRecord {
         });
     }
 
-    /// Materialise the transition the clock has already made due. Returns false
-    /// when the channel is now gone (a settled `DELETING`), so the caller drops
-    /// the record.
-    fn settle(&mut self, now: SystemTime) -> bool {
+    /// Materialise the transition the clock has already made due, and answer
+    /// which one it was — `None` when nothing was owed yet, so a caller can act
+    /// on the step that happened on THIS call rather than re-scanning settled
+    /// records.
+    fn settle(&mut self, now: SystemTime) -> Option<Settled> {
         // The schedule's own clock-owed cleanup: an action whose start time is
-        // more than an hour past is no longer in the schedule.
+        // more than an hour past is no longer in the schedule. Owed whatever the
+        // channel's own transition is doing, so it runs first.
         self.schedule.settle(now);
-        match self.transition {
-            Some(transition) if now >= transition.due => match transition.to {
-                Settled::Idle => {
-                    self.state = channel_state::IDLE.to_string();
-                    self.restarting_pipelines.clear();
-                    self.transition = None;
-                    true
-                }
-                Settled::Running => {
-                    self.state = channel_state::RUNNING.to_string();
-                    // A restart that is over leaves no pipeline down.
-                    self.restarting_pipelines.clear();
-                    self.transition = None;
-                    true
-                }
-                Settled::Gone => false,
-            },
-            _ => true,
+        let transition = self.transition?;
+        if now < transition.due {
+            return None;
         }
+        // A restart that is over leaves no pipeline down, and a channel that has
+        // settled — idle, running or deleted — is restarting none.
+        self.restarting_pipelines.clear();
+        self.state = match transition.to {
+            Settled::Idle => channel_state::IDLE,
+            Settled::Running => channel_state::RUNNING,
+            Settled::Deleted => channel_state::DELETED,
+        }
+        .to_string();
+        self.transition = None;
+        Some(transition.to)
     }
 }
 
@@ -633,6 +666,26 @@ pub struct InputSecurityGroupRecord {
     /// The whitelisted IPv4 CIDRs, in the order the request listed them.
     pub whitelist_rules: Vec<String>,
     pub tags: HashMap<String, String>,
+    /// Whether this group has been deleted, which is what puts it in the
+    /// terminal `DELETED` state. The record stays in the account, so a reader
+    /// goes on reporting the group in that state instead of losing it — the
+    /// same shape [`SdiSourceRecord::is_deleted`] gives a deleted SdiSource.
+    pub deleted: bool,
+}
+
+impl InputSecurityGroupRecord {
+    /// Whether this group has reached the terminal `DELETED` state.
+    pub fn is_deleted(&self) -> bool {
+        self.deleted
+    }
+}
+
+/// Put an input security group into the terminal `DELETED` state. There is no
+/// transient step: `InputSecurityGroupState` models none between `IDLE`/`IN_USE`
+/// and `DELETED`, so the delete is done with the call. Deleting a group that is
+/// already `DELETED` changes nothing.
+pub fn delete_input_security_group(group: &mut InputSecurityGroupRecord) {
+    group.deleted = true;
 }
 
 /// Whether `cidr` is an IPv4 CIDR block, which is what
@@ -886,16 +939,20 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// applies transitions that were owed at that instant whether or not anybody
     /// called, so it never changes what a later caller would otherwise have seen.
     pub fn settle(&mut self, now: SystemTime) {
-        let mut removed: Vec<String> = Vec::new();
-        self.channels.retain(|id, channel| {
-            let survives = channel.settle(now);
-            if !survives {
-                removed.push(id.clone());
+        // Only a record that settles into `DELETED` on THIS call is collected,
+        // so the work here does not grow with the number of records that have
+        // already reached that terminal state.
+        let mut just_deleted: Vec<String> = Vec::new();
+        for (id, channel) in &mut self.channels {
+            if channel.settle(now) == Some(Settled::Deleted) {
+                just_deleted.push(id.clone());
             }
-            survives
-        });
-        // A token never outlives the channel it minted.
-        for id in removed {
+        }
+        // A token never outlives the channel it minted: once that channel has
+        // reached the terminal `DELETED` state its idempotency window is over, so
+        // a retried create mints a new channel rather than answering with a
+        // deleted one.
+        for id in just_deleted {
             self.channel_tokens.forget(&id);
         }
         for input in self.inputs.values_mut() {
@@ -909,6 +966,10 @@ impl ComAmazonawsMedialiveMedialiveState {
 
     /// Whether the store is full, so `CreateChannel` must refuse rather than mint
     /// another channel.
+    ///
+    /// A `DELETED` channel still counts: its record stays in the account, so
+    /// counting it is what keeps the store — and the emulator's heap — bounded
+    /// by [`MAX_CHANNELS`] however many creates and deletes a caller runs.
     pub fn is_full(&self) -> bool {
         self.channels.len() >= MAX_CHANNELS
     }
@@ -945,9 +1006,13 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// channels currently using this Input Security Group as their channel
     /// security group"). Derived from the channel store, so it tracks every
     /// later create and delete rather than being recorded at create time.
+    ///
+    /// A channel that has reached the terminal `DELETED` state is no longer
+    /// using anything, so it is not reported — the member says *currently*.
     pub fn channels_using_security_group(&self, group_id: &str) -> Vec<String> {
         self.channels
             .values()
+            .filter(|channel| !channel.is_deleted())
             .filter(|channel| {
                 channel
                     .channel_security_groups
@@ -961,7 +1026,8 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// The ids of the inputs currently using `group_id` as one of their input
     /// security groups — `InputSecurityGroup$Inputs` ("The list of inputs
     /// currently using this Input Security Group"). Derived from the input store
-    /// for the same reason as [`Self::channels_using_security_group`].
+    /// for the same reason as [`Self::channels_using_security_group`], and it
+    /// drops a `DELETED` input for the same reason too.
     pub fn inputs_using_security_group(&self, group_id: &str) -> Vec<String> {
         self.inputs
             .values()
@@ -982,14 +1048,17 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// The full `InputSecurityGroup` description of one stored group, or `None`
     /// when no group has that id.
     ///
-    /// `State` is derived, not stored: a group is `IN_USE` exactly while some
-    /// resource in state references it, and `IDLE` otherwise ("The current state
-    /// of the Input Security Group").
+    /// `State` is derived, not stored: a deleted group is in the terminal
+    /// `DELETED` state it keeps, a group some resource in state references is
+    /// `IN_USE`, and one nothing references is `IDLE` ("The current state of the
+    /// Input Security Group").
     pub fn input_security_group_description(&self, id: &str) -> Option<InputSecurityGroup> {
         let group = self.input_security_groups.get(id)?;
         let inputs = self.inputs_using_security_group(id);
         let channels = self.channels_using_security_group(id);
-        let state = if inputs.is_empty() && channels.is_empty() {
+        let state = if group.is_deleted() {
+            input_security_group_state::DELETED
+        } else if inputs.is_empty() && channels.is_empty() {
             input_security_group_state::IDLE
         } else {
             input_security_group_state::IN_USE
@@ -1310,21 +1379,29 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// The channels whose `InputAttachments` name this input. One predicate, so
     /// what counts as attached cannot differ between the input's reported
     /// `AttachedChannels` and the conflict its edit answers.
+    ///
+    /// A channel that has reached the terminal `DELETED` state attaches nothing
+    /// any more — its record stays in the account, but it is no longer one of
+    /// the channels the input is *currently* attached to.
     fn channels_attaching<'a>(
         &'a self,
         input_id: &'a str,
     ) -> impl Iterator<Item = &'a ChannelRecord> {
-        self.channels.values().filter(move |channel| {
-            channel
-                .input_attachments
-                .iter()
-                .any(|attachment| attachment.input_id.as_deref() == Some(input_id))
-        })
+        self.channels
+            .values()
+            .filter(|channel| !channel.is_deleted())
+            .filter(move |channel| {
+                channel
+                    .input_attachments
+                    .iter()
+                    .any(|attachment| attachment.input_id.as_deref() == Some(input_id))
+            })
     }
 
     /// An input's `AttachedChannels`: "A list of channel IDs that that input is
     /// attached to". Derived from the channels' own `InputAttachments`, so it
-    /// tracks every channel created or deleted after this input.
+    /// tracks every channel created or deleted after this input: a channel that
+    /// has reached the terminal `DELETED` state attaches nothing any more.
     pub fn attached_channels(&self, input_id: &str) -> Vec<String> {
         self.channels_attaching(input_id)
             .map(|channel| channel.id.clone())
@@ -1370,7 +1447,7 @@ impl ComAmazonawsMedialiveMedialiveState {
         partners
     }
 
-    /// The `InputState` of one stored input: the deletion `DeleteInput` started
+    /// The `InputState` of one stored input: the deletion a delete started
     /// first — `DELETING` until the clock makes it due and the terminal
     /// `DELETED` afterwards — and otherwise `ATTACHED` exactly while some
     /// channel attaches it and `DETACHED` while none does.
@@ -1435,9 +1512,11 @@ impl ComAmazonawsMedialiveMedialiveState {
 
     /// A primary channel's `FollowingChannelArns`: the ARNs of the channels
     /// whose own follower settings name this channel as their primary. Derived
-    /// from state, so it tracks every later create and delete.
+    /// from state, so it tracks every later create and delete: a channel that
+    /// has reached the terminal `DELETED` state follows nothing any more.
     fn following_channel_arns(&self, primary_arn: &str) -> Vec<String> {        self.channels
             .values()
+            .filter(|channel| !channel.is_deleted())
             .filter(|channel| {
                 channel
                     .linked_channel_settings
@@ -2192,6 +2271,29 @@ pub fn not_found_message(resource_type: &str, identifier: &str) -> String {
     format!("{resource_type} {identifier} not found")
 }
 
+/// The message a delete refused on an input a channel still attaches carries:
+/// the input, the channels that attach it, and that it cannot be deleted. One
+/// helper for the same reason as [`not_found_message`] — `DeleteInput` and
+/// `BatchDelete` refuse the same input, so they cannot word it two ways.
+pub fn attached_input_message(input_id: &str, channels: &[String]) -> String {
+    format!(
+        "Input {input_id} is attached to channel(s) {} and cannot be deleted",
+        channels.join(", ")
+    )
+}
+
+/// The message a delete refused on the resource's state carries: the resource,
+/// the state it is in, and the state a delete needs. One helper for the same
+/// reason as [`not_found_message`] — `DeleteChannel` and `BatchDelete` refuse
+/// the same channel, so they cannot word it two ways.
+pub fn not_idle_message(resource_type: &str, identifier: &str, state: &str) -> String {
+    format!(
+        "{resource_type} {identifier} is in state {state} and must be \
+         {} before it can be deleted",
+        channel_state::IDLE
+    )
+}
+
 /// One created input, as `CreateInput` stored it plus its lifecycle state.
 ///
 /// The REQUEST shapes are what is stored (`InputSourceRequest`,
@@ -2236,9 +2338,9 @@ pub struct InputRecord {
     /// The input this one was created as a partner of (`CreatePartnerInput`),
     /// which is what makes the pair name each other in `InputPartnerIds`.
     pub partner_of: Option<String>,
-    /// The instant the deletion `DeleteInput` started becomes due, so
-    /// `DELETING` settles into the terminal `DELETED`. `None` while no delete
-    /// has been accepted for this input. Stored, never slept on.
+    /// The instant the deletion a delete started becomes due, so `DELETING`
+    /// settles into the terminal `DELETED`. `None` while no delete has been
+    /// accepted for this input. Stored, never slept on.
     ///
     /// PRIVATE, so the only way in is [`begin_delete_input`] and
     /// [`InputRecord::settle`], and the only way to read it is
@@ -2597,9 +2699,10 @@ pub fn begin_stop(channel: &mut ChannelRecord, now: SystemTime) {
     channel.begin_transition(channel_state::STOPPING, Settled::Idle, now);
 }
 
-/// Move a channel into `DELETING`, owing its removal from state.
+/// Move a channel into `DELETING`, owing the terminal `DELETED` state it then
+/// keeps.
 pub fn begin_delete(channel: &mut ChannelRecord, now: SystemTime) {
-    channel.begin_transition(channel_state::DELETING, Settled::Gone, now);
+    channel.begin_transition(channel_state::DELETING, Settled::Deleted, now);
 }
 
 /// Take `pipelines` down for a restart on a running channel: it moves into

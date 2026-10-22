@@ -386,25 +386,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // "Each key must be unique." The modelled `Tags` list carries no length bound,
-        // so the published per-file-system quota is enforced first; the key scan then
-        // runs over a bounded list through a set, not a nested loop.
+        // "Each key must be unique", and at most the published number of tags: the one
+        // construction every operation of this service that accepts a tag list shares.
         let tags = input.tags.clone().unwrap_or_default();
-        if tags.len() > efs::MAX_TAGS_PER_FILE_SYSTEM {
-            return Err(bad_request(format!(
-                "Tags must hold at most {} tags; got {}",
-                efs::MAX_TAGS_PER_FILE_SYSTEM,
-                tags.len()
-            )));
-        }
-        let mut keys = ::std::collections::BTreeSet::new();
-        for tag in &tags {
-            if !keys.insert(tag.key.as_str()) {
-                return Err(bad_request(format!(
-                    "Tags must each have a unique Key; Key {} appears more than once",
-                    tag.key
-                )));
-            }
+        if let Some(problem) = efs::tag_list_problem(&tags) {
+            return Err(bad_request(problem));
         }
 
         let mut state = state.lock();

@@ -21,6 +21,8 @@ mod event_sources_config;
 mod insight_listing;
 #[path = "all/insight_reads.rs"]
 mod insight_reads;
+#[path = "all/mutation_idempotency_and_tenancy.rs"]
+mod mutation_idempotency_and_tenancy;
 #[path = "all/resource_collection_health.rs"]
 mod resource_collection_health;
 #[path = "all/state_roundtrip.rs"]

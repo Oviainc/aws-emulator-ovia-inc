@@ -161,10 +161,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let attached_to = state.attached_channels(&input.input_id);
         if !attached_to.is_empty() {
             return Err(DeleteInputErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Input {} is attached to channel(s) {} and cannot be deleted",
-                    input.input_id,
-                    attached_to.join(", ")
+                message: Some(crate::state::attached_input_message(
+                    &input.input_id,
+                    &attached_to,
                 )),
             })
             .into());

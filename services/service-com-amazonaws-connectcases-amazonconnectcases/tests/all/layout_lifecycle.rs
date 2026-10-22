@@ -23,7 +23,7 @@
 
 use serde_json::{json, Value};
 
-use crate::case_lifecycle::{domain, is_minted_id, string_at, Emulator};
+use crate::harness::{domain, is_minted_id, string_at, Emulator};
 
 /// Create a `Text` field in `domain_id` and return its id. One field is enough
 /// for a layout: a layout references a field, it does not carry its type.

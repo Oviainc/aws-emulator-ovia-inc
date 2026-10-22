@@ -263,21 +263,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.advance_clock(::std::time::SystemTime::now());
 
         // A cluster name identifies the cluster, so creating one that already exists is
-        // not a second cluster: the stored record is reported back unchanged.
+        // not a second cluster: the stored record is reported back unchanged. A DELETED
+        // cluster is only a tombstone, though ("The cluster has been deleted"), so its
+        // name is free again and this call creates a new, ACTIVE cluster over it.
         if let Some(existing) = guard.clusters.get(&name) {
-            // `CreateCluster`'s input shape models `tags`, so its answer materialises
-            // the cluster's tag set (see `cluster_mutation_view`).
-            let view = guard.cluster_mutation_view(existing, true);
-            return Ok(CreateClusterResponse {
-                payload: CreateClusterOutput {
-                    cluster: Some(view),
-                },
-                cluster_count: guard.cluster_count(),
-                member: &CLUSTER_COUNT_MEMBER,
-            });
-        }
-
-        if guard.clusters.len() >= crate::state::MAX_CLUSTERS {
+            if existing.status != crate::state::CLUSTER_INACTIVE {
+                // `CreateCluster`'s input shape models `tags`, so its answer materialises
+                // the cluster's tag set (see `cluster_mutation_view`).
+                let view = guard.cluster_mutation_view(existing, true);
+                return Ok(CreateClusterResponse {
+                    payload: CreateClusterOutput {
+                        cluster: Some(view),
+                    },
+                    cluster_count: guard.cluster_count(),
+                    member: &CLUSTER_COUNT_MEMBER,
+                });
+            }
+        } else if guard.clusters.len() >= crate::state::MAX_CLUSTERS {
             return Err(CreateClusterErrorModeled::ClientException(ClientException {
                 message: Some(format!(
                     "this emulator holds at most {} clusters; delete one before creating \

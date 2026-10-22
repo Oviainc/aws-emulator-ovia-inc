@@ -17,6 +17,8 @@ mod cluster_lifecycle;
 mod engine_versions;
 #[path = "all/parameter_groups.rs"]
 mod parameter_groups;
+#[path = "all/parameters.rs"]
+mod parameters;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/user_deletion.rs"]

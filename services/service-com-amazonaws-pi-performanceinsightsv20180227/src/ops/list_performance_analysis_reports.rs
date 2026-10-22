@@ -176,6 +176,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The listing is scoped to one data source, so authorization for it is
         // decided first: a cursor could never have been handed out for a data
         // source this account may not see.
+        if let Some(message) = crate::state::service_type_refusal(
+            &*self.engine,
+            &input.service_type,
+            &input.identifier,
+        ) {
+            // The `ServiceType` does not own the data source this `Identifier`
+            // names, so the pair addresses no data source whose reports could be
+            // listed — and an empty listing would read as "this resource has no
+            // reports". The modelled argument error instead (see
+            // [`crate::state::service_type_refusal`]).
+            return Err(
+                ListPerformanceAnalysisReportsErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
         if !crate::state::is_data_source_identifier(&input.identifier) {
             return Err(not_authorized());
         }

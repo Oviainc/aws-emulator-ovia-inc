@@ -178,7 +178,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status_reason: enrollment.status_reason,
             member_accounts_enrolled: enrollment.member_accounts_enrolled,
             last_updated_timestamp: enrollment.last_updated_timestamp,
-            number_of_member_accounts_opted_in: enrollment.number_of_member_accounts_opted_in,
+            // A COUNT is reported whatever it is: zero member accounts opted in is `0`,
+            // not an absent member, so a client reading the count unconditionally can
+            // tell "none are opted in" from "not reported".
+            number_of_member_accounts_opted_in: Some(
+                enrollment.number_of_member_accounts_opted_in,
+            ),
         })
     }
 }

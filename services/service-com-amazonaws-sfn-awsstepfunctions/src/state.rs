@@ -1562,12 +1562,33 @@ pub fn resource_not_found_message(resource_arn: &str) -> String {
 ///
 /// Errors whose subject is NOT a value of the request keep their own wording:
 /// `StateMachineLimitExceeded`, `TooManyTags` and `ExecutionLimitExceeded`
-/// report a limit, `ExecutionNotRedrivable` an eligibility reason, and
-/// `ValidationException` carries the standard validation envelope (see
-/// `crate::service`'s `validation` module). `StateMachineTypeNotSupported`
-/// carries no value at all — see [`STATE_MACHINE_TYPE_NOT_SUPPORTED`].
+/// report a limit, and `ValidationException` carries the standard validation
+/// envelope (see `crate::service`'s `validation` module).
+/// `StateMachineTypeNotSupported` carries no value at all — see
+/// [`STATE_MACHINE_TYPE_NOT_SUPPORTED`] — and `ExecutionNotRedrivable` names
+/// the execution AND a reason, which is its own construction, see
+/// [`not_redrivable_message`].
 pub fn resource_error_message(error_name: &str, arn: &str) -> String {
     format!("{error_name}: '{arn}'")
+}
+
+/// What the modelled `ExecutionNotRedrivable` says: the EXECUTION the request
+/// named, and then why that execution is not eligible for a redrive.
+///
+/// The second construction this service builds from the request, for the one
+/// refusal whose subject is a value of the request AND whose detail is a reason
+/// of its own rather than that value: the recorded service answers
+/// `Execution <executionArn> invalid for redrive as: <reason>`
+/// (`states-execution-failure-and-redrive#task#15`), so the refusal says WHICH
+/// execution it is about — what a caller redriving several of them needs to
+/// attribute the failure to one.
+///
+/// `reason` is one of the `NOT_REDRIVABLE_*` values above, the same reason
+/// [`ComAmazonawsSfnAwsstepfunctionsState::not_redrivable_reason`] gives
+/// `DescribeExecution` for `redriveStatusReason` — which that member documents
+/// on its own, with no execution named, and so carries WITHOUT this wrapper.
+pub fn not_redrivable_message(execution_arn: &str, reason: &str) -> String {
+    format!("Execution {execution_arn} invalid for redrive as: {reason}")
 }
 
 /// `StateMachineDoesNotExist`'s own name, as its message spells it. RECORDED text.
@@ -1600,6 +1621,14 @@ pub const INVALID_NAME: &str = "Invalid Name";
 /// and the quoted value is one definition diagnostic, `<code>: <detail>` (see
 /// [`asl::validate`]).
 pub const INVALID_STATE_MACHINE_DEFINITION: &str = "Invalid State Machine Definition";
+
+/// `InvalidExecutionInput`'s, for [`resource_error_message`]. RECORDED text
+/// (`states-creation-input-validation-errors#task#11` records
+/// `Invalid State Machine Execution Input: '<detail>'`): the service names the
+/// thing that is invalid — exactly as it does for a definition — and the quoted
+/// value is the diagnostic for the input document it could not read, so a parse
+/// failure is never reported as a bare parser string.
+pub const INVALID_STATE_MACHINE_EXECUTION_INPUT: &str = "Invalid State Machine Execution Input";
 
 /// What `StateMachineTypeNotSupported` says, whatever operation raises it and
 /// whatever state machine it was raised for.

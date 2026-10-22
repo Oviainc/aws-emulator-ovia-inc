@@ -465,6 +465,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let identifier = input.cluster_identifier.clone();
+        // The engine version the cluster runs, resolved BEFORE the record is
+        // built: the parameter group it joins by default is the default group of
+        // this version's family, so the two can never disagree.
+        let cluster_version = input
+            .cluster_version
+            .clone()
+            .unwrap_or_else(|| st::DEFAULT_CLUSTER_VERSION.to_string());
         let hsm_requested = input.hsm_client_certificate_identifier.is_some()
             || input.hsm_configuration_identifier.is_some();
         let cluster = Cluster {
@@ -518,7 +525,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     input
                         .cluster_parameter_group_name
                         .clone()
-                        .unwrap_or_else(|| st::DEFAULT_PARAMETER_GROUP.to_string()),
+                        .unwrap_or_else(|| st::default_parameter_group(&cluster_version)),
                 ),
                 parameter_apply_status: Some("in-sync".to_string()),
                 cluster_parameter_status_list: None,
@@ -540,12 +547,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .clone()
                     .unwrap_or_else(|| st::default_maintenance_window(&identifier)),
             ),
-            cluster_version: Some(
-                input
-                    .cluster_version
-                    .clone()
-                    .unwrap_or_else(|| st::DEFAULT_CLUSTER_VERSION.to_string()),
-            ),
+            cluster_version: Some(cluster_version),
             allow_version_upgrade: Some(input.allow_version_upgrade.unwrap_or(true)),
             number_of_nodes: Some(number_of_nodes),
             publicly_accessible: Some(input.publicly_accessible.unwrap_or(false)),

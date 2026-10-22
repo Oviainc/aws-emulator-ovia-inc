@@ -1341,3 +1341,44 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState>)
 }
+
+// ---------------------------------------------------------------------------
+// The CNAME reservation rule
+//
+// A CNAME ([`environment_cname`]) is held by at most ONE live environment, and
+// a prefix that cannot be a host name label names no CNAME at all. Both halves
+// live here, together, because `CheckDNSAvailability` reports on them and
+// `CreateEnvironment` enforces them, and the two must not disagree.
+// ---------------------------------------------------------------------------
+
+/// Whether `prefix` can be the leftmost label of an environment CNAME at all.
+///
+/// A CNAME prefix is a host name label, so it carries the label syntax every
+/// host name obeys (RFC 1123 2.1): ASCII letters, digits and hyphens only, and
+/// no leading or trailing hyphen. The model's own `CreateEnvironment$
+/// EnvironmentName` doc states the same rule for the value that becomes the
+/// prefix when the caller supplies none — "The name can contain only letters,
+/// numbers, and hyphens. It can't start or end with a hyphen." The 4..63 length
+/// bound is the `DNSCnamePrefix` length trait, which the boundary validator has
+/// already refused outside of, so it is not re-checked here.
+pub fn is_legal_cname_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && !prefix.starts_with('-')
+        && !prefix.ends_with('-')
+        && prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// The live environment in `store` that holds `cname`, if any — the one record
+/// that has that DNS name reserved. A terminated environment holds nothing, so
+/// its CNAME is free again. DNS names are case-insensitive, so the comparison
+/// is too.
+pub fn environment_holding_cname<'store>(
+    store: &'store ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState,
+    cname: &str,
+) -> Option<&'store Environment> {
+    store.environments.values().find(|environment| {
+        !environment.is_terminated() && environment.cname.eq_ignore_ascii_case(cname)
+    })
+}

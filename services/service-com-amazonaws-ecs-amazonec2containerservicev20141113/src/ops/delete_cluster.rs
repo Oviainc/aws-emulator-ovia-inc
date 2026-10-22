@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCluster
-//! Removes a stored cluster and reports it with `status: INACTIVE` — the
-//! `Cluster$status` doc: "INACTIVE: The cluster has been deleted." A cluster that still
-//! holds a task that has not stopped is refused with `ClusterContainsTasksException`,
-//! and one that still holds a service that has not been deleted with
-//! `ClusterContainsServicesException` ("You can't delete a cluster that contains
-//! services").
+//! TOMBSTONES a stored cluster: the record is KEPT with `status: INACTIVE` — the
+//! `Cluster$status` doc: "INACTIVE: The cluster has been deleted. Clusters with an
+//! INACTIVE status may remain discoverable in your account for a period of time" — so a
+//! later `DescribeClusters` reports the deleted cluster rather than a `MISSING` failure,
+//! and deleting it again is the idempotent no-op the model's `@idempotent` trait
+//! promises. A cluster that still holds a task the caller has not asked to stop is
+//! refused with `ClusterContainsTasksException`, and one that still holds an `ACTIVE`
+//! service with `ClusterContainsServicesException` ("You can't delete a cluster that
+//! contains services").
 //!
 //! ## Shape of an operation
 //!
@@ -210,17 +213,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 
-        if !guard.clusters.contains_key(&cluster_name) {
+        let Some(stored) = guard.clusters.get(&cluster_name).cloned() else {
             return Err(DeleteClusterErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
                     message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
+        };
+
+        // Deleting an already-deleted cluster is the same delete: the operation is
+        // `@idempotent`, and the tombstone it reports is what the first call left. There
+        // is nothing left to refuse on either — the resources it held went with it.
+        if stored.status == crate::state::CLUSTER_INACTIVE {
+            let view = guard.cluster_mutation_view(&stored, false);
+            return Ok(DeleteClusterResponse {
+                payload: DeleteClusterOutput {
+                    cluster: Some(view),
+                },
+                cluster_count: guard.cluster_count(),
+                member: &CLUSTER_COUNT_MEMBER,
+            });
         }
 
         // A service OWNS the tasks its scheduler placed, so it is the service that has
-        // to go first: "You can't delete a cluster that contains services."
+        // to go first: "You can't delete a cluster that contains services." Only a
+        // service the caller has NOT deleted holds the cluster open; one that is draining
+        // away or already deleted does not.
         if guard.cluster_has_active_services(&cluster_name) {
             return Err(DeleteClusterErrorModeled::ClusterContainsServicesException(
                 ClusterContainsServicesException {
@@ -230,6 +249,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Likewise for tasks: a task the caller has asked to stop is on its way out, so
+        // only one still wanted RUNNING refuses the delete.
         if guard.cluster_has_active_tasks(&cluster_name) {
             return Err(DeleteClusterErrorModeled::ClusterContainsTasksException(
                 ClusterContainsTasksException {
@@ -239,24 +260,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut record = guard
-            .clusters
-            .remove(&cluster_name)
-            .expect("the cluster was just found in the store");
-        record.status = crate::state::CLUSTER_INACTIVE.to_string();
-        // The tasks the cluster held have all stopped; they go with it, so a later
-        // ListTasks cannot report tasks of a cluster that no longer exists, and the same
-        // holds for the services it held, all of which are INACTIVE by now.
+        // The resources the cluster held go with it. Nothing still wanted can be among
+        // them: a service that is not deleted and a task still wanted RUNNING were both
+        // refused above, so what is dropped here is a service already deleted and a task
+        // already asked to stop (whose `lastStatus` may still be settling). Dropping them
+        // is what lets a cluster created over this tombstone start empty — both maps are
+        // keyed by the cluster NAME, which a new cluster of the same name reuses — and it
+        // settles the tombstone's counters at zero.
         guard.tasks.retain(|_, task| task.cluster_name != cluster_name);
         guard
             .services
             .retain(|_, service| service.cluster_name != cluster_name);
+        // The cluster itself is KEPT as a tombstone: "Clusters with an INACTIVE status
+        // may remain discoverable in your account for a period of time."
+        let record = guard
+            .clusters
+            .get_mut(&cluster_name)
+            .expect("the cluster was just found in the store");
+        record.status = crate::state::CLUSTER_INACTIVE.to_string();
+        let record = record.clone();
         // `DeleteCluster` takes neither `tags` nor an `include`, so the response reports
         // no tag set — only the cluster's own configured state and lifecycle.
         let view = guard.cluster_mutation_view(&record, false);
 
         // `clusterCount` is read AFTER the delete landed, so the cluster this call
-        // removed is no longer counted.
+        // deleted is no longer counted: a tombstone is not a live cluster.
         Ok(DeleteClusterResponse {
             payload: DeleteClusterOutput {
                 cluster: Some(view),

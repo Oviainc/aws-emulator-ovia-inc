@@ -15,6 +15,8 @@
 mod abort_environment_update;
 #[path = "all/application_versions.rs"]
 mod application_versions;
+#[path = "all/dns_availability.rs"]
+mod dns_availability;
 #[path = "all/environment_operations.rs"]
 mod environment_operations;
 // Not a suite of its own: the name the suites below import the shared harness

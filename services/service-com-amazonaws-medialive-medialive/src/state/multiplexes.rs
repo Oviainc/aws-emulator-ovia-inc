@@ -24,13 +24,15 @@ use super::{ComAmazonawsMedialiveMedialiveState, TRANSIENT_STATE_SPAN};
 /// The `MultiplexState` values this slice uses, spelled exactly as the model
 /// declares them (`smithy_query(query="shape", shape="MultiplexState")`:
 /// CREATING | CREATE_FAILED | IDLE | STARTING | RUNNING | RECOVERING | STOPPING
-/// | DELETING | DELETED). The states only a start, stop or delete can reach are
-/// not named here: those operations are still scaffold stubs, each with its own
+/// | DELETING | DELETED). The states only a start or a stop can reach are not
+/// named here: those operations are still scaffold stubs, each with its own
 /// issue, so nothing in this slice can put a multiplex into one of them.
 pub mod multiplex_state {
     pub const CREATING: &str = "CREATING";
     pub const IDLE: &str = "IDLE";
     pub const RUNNING: &str = "RUNNING";
+    pub const DELETING: &str = "DELETING";
+    pub const DELETED: &str = "DELETED";
 }
 
 /// How many availability zones a multiplex is created with:
@@ -163,6 +165,10 @@ pub struct MultiplexRecord {
     /// The instant the clock makes `IDLE` due, while the multiplex is still
     /// `CREATING`. Stored, never slept on.
     idle_due: Option<SystemTime>,
+    /// The instant the clock makes the terminal `DELETED` due, while the
+    /// multiplex is `DELETING`. Stored, never slept on, and `None` on a
+    /// multiplex nobody has deleted.
+    deleted_due: Option<SystemTime>,
     /// The names of the programs this multiplex holds, which is what
     /// `ProgramCount` counts. A set, because `CreateMultiplexProgram`'s
     /// `ProgramName` identifies a program within one multiplex.
@@ -194,12 +200,41 @@ impl MultiplexRecord {
         }
     }
 
+    /// The multiplex's current `MultiplexState`, which is stored rather than
+    /// derived so a refusal can name it.
+    pub fn state(&self) -> &str {
+        &self.state
+    }
+
+    /// Whether this multiplex is in a state a delete accepts: a multiplex is
+    /// deletable once it has stopped (`IDLE`), never while it is creating,
+    /// starting, running, stopping, already deleting or deleted.
+    pub fn is_deletable(&self) -> bool {
+        self.state == multiplex_state::IDLE
+    }
+
+    /// Move this multiplex into `DELETING`, owing the terminal `DELETED` state
+    /// it then keeps once [`TRANSIENT_STATE_SPAN`] has passed: the record stays
+    /// in the account, so a reader goes on reporting the multiplex in that state
+    /// (which is what the SDK's `MultiplexDeleted` waiter polls
+    /// `DescribeMultiplex` for) instead of losing it.
+    pub fn begin_delete(&mut self, now: SystemTime) {
+        self.state = multiplex_state::DELETING.to_string();
+        self.idle_due = None;
+        self.deleted_due = Some(now + TRANSIENT_STATE_SPAN);
+    }
+
     /// Materialise the transition the clock has already made due: a multiplex
-    /// AWS answers `CREATING` becomes `IDLE` once the span has passed.
+    /// AWS answers `CREATING` becomes `IDLE` once the span has passed, and a
+    /// `DELETING` one becomes the terminal `DELETED`.
     fn settle(&mut self, now: SystemTime) {
         if self.idle_due.is_some_and(|due| now >= due) {
             self.state = multiplex_state::IDLE.to_string();
             self.idle_due = None;
+        }
+        if self.deleted_due.is_some_and(|due| now >= due) {
+            self.state = multiplex_state::DELETED.to_string();
+            self.deleted_due = None;
         }
     }
 }
@@ -268,6 +303,7 @@ impl ComAmazonawsMedialiveMedialiveState {
                 tags,
                 state: multiplex_state::CREATING.to_string(),
                 idle_due: Some(now + TRANSIENT_STATE_SPAN),
+                deleted_due: None,
                 program_names: BTreeSet::new(),
             },
         );

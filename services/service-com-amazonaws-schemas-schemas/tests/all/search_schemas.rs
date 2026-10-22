@@ -44,7 +44,9 @@ const STORED: &[(&str, &str, &str)] = &[
         r#"{"title":"PaymentReceived","detail":"an order id"}"#,
     ),
     ("inventory", "OpenApi3", r#"{"openapi":"3.0.0"}"#),
-    ("Mixed-CASE-Name", "OpenApi3", "x"),
+    // The smallest document there is beyond `{}`: its text contributes a keyword
+    // ("object") that this schema's NAME does not carry.
+    ("Mixed-CASE-Name", "OpenApi3", r#"{"type":"object"}"#),
 ];
 
 /// `GET /v1/registries/name/{registry}/schemas/search?keywords=…`, with the few
@@ -270,9 +272,9 @@ async fn following_next_token_walks_a_search_exactly_once() {
     let mut matching: Vec<String> = Vec::new();
     for index in 0..7 {
         let name = format!("order-{index:02}");
-        create(&emulator, &name, "x").await;
+        create(&emulator, &name, r#"{"a":1}"#).await;
         matching.push(name);
-        create(&emulator, &format!("other-{index:02}"), "y").await;
+        create(&emulator, &format!("other-{index:02}"), r#"{"b":2}"#).await;
     }
     matching.sort();
 

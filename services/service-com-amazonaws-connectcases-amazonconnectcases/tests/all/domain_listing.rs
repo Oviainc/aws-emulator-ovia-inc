@@ -23,7 +23,7 @@ use std::collections::HashSet;
 
 use serde_json::{json, Value};
 
-use super::case_lifecycle::{domain, is_minted_id, string_at, Emulator};
+use super::harness::{domain, is_minted_id, string_at, Emulator};
 
 /// The ceiling the model puts on `ListDomainsRequest$maxResults`
 /// (`@range(min: 1, max: 10)`, from

@@ -187,7 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut clusters = Vec::new();
         let mut failures = Vec::new();
-        // A cluster is reported once however many times the request names it, so one
+        // The response follows the REQUEST's order: a client that zips the identifiers it
+        // sent against the clusters it got back has to pair each one with its own. A
+        // cluster is reported once however many times the request names it, so one
         // name repeated cannot multiply either the response or the scans behind it.
         let mut seen = ::std::collections::HashSet::new();
         for reference in &requested {
@@ -195,6 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !seen.insert(name.clone()) {
                 continue;
             }
+            // A DELETED cluster is still a cluster: "Clusters with an INACTIVE status may
+            // remain discoverable in your account for a period of time", so its tombstone
+            // is described rather than reported as a MISSING failure.
             match guard.clusters.get(&name) {
                 Some(cluster) => clusters.push(guard.cluster_view(cluster, fields)),
                 None => failures.push(crate::state::missing_failure(

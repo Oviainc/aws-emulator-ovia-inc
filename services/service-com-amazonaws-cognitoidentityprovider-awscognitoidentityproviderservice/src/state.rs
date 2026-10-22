@@ -165,8 +165,9 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// `client_id`, record all three, and return the modelled result.
     ///
     /// Every claim comes from stored state: the `sub` and `username` from the
-    /// stored user, `client_id` from the stored app client, the issuer from the
-    /// stored pool, and each lifetime from the app client's validity settings.
+    /// stored user, its `cognito:groups` from the groups the stored user belongs
+    /// to, `client_id` from the stored app client, the issuer from the stored
+    /// pool, and each lifetime from the app client's validity settings.
     /// `None` only when the pool, the client or the user is gone.
     ///
     /// Tokens the clock has already expired are swept first, and the oldest are
@@ -184,6 +185,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             sub,
             stored_username,
             email,
+            groups,
             access_ttl,
             id_ttl,
             refresh_ttl,
@@ -196,6 +198,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
                 sub: user.sub.clone(),
                 stored_username: user.username.clone(),
                 email: user.attributes.get("email").cloned(),
+                groups: pool.user_group_names(user),
                 access_ttl: client.access_token_ttl(),
                 id_ttl: client.id_token_ttl(),
                 refresh_ttl: client.refresh_token_ttl(),
@@ -205,7 +208,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         let issued_at = unix_seconds(now);
         let origin_jti = new_uuid();
 
-        let access_claims = serde_json::json!({
+        let mut access_claims = serde_json::json!({
             "sub": sub,
             "iss": issuer,
             "client_id": client_id,
@@ -233,6 +236,27 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         if let (Some(email), Some(members)) = (email, id_claims.as_object_mut()) {
             members.insert("email".to_string(), serde_json::Value::String(email));
         }
+
+        // `AdminAddUserToGroup`: "A user who is in a group ... populates a
+        // `cognito:groups` claim to their access and identity tokens" (this
+        // service's model), so the claim is carried by both of those two tokens
+        // and by neither the refresh token. A user in no group carries no claim
+        // rather than an empty list. The model documents no order for the list,
+        // so it is rendered in the stored order, which is stable across reads.
+        if !groups.is_empty() {
+            let claim = serde_json::Value::Array(
+                groups
+                    .iter()
+                    .map(|name| serde_json::Value::String(name.clone()))
+                    .collect(),
+            );
+            for claims in [&mut access_claims, &mut id_claims] {
+                if let Some(members) = claims.as_object_mut() {
+                    members.insert("cognito:groups".to_string(), claim.clone());
+                }
+            }
+        }
+
         let refresh_claims = serde_json::json!({
             "sub": sub,
             "iss": issuer,
@@ -403,6 +427,20 @@ impl UserPool {
             .iter()
             .find(|(_, user)| user.sub == username)
             .map(|(stored_key, _)| stored_key.clone())
+    }
+
+    /// The names of this pool's groups `user` belongs to, in stored (name) order.
+    ///
+    /// Only groups the pool still HOLDS are reported: `DeleteGroup` documents that
+    /// a deleted group "no longer contributes to users' `cognito:preferred_group`
+    /// or `cognito:groups` claims", so a membership of a group that is gone is not
+    /// rendered.
+    pub fn user_group_names(&self, user: &User) -> Vec<String> {
+        user.groups
+            .iter()
+            .filter(|name| self.groups.contains_key(*name))
+            .cloned()
+            .collect()
     }
 
     /// The stored user `username` names, mutably.
@@ -1182,6 +1220,8 @@ struct TokenInputs {
     stored_username: String,
     /// The stored `email` attribute, when the user has one.
     email: Option<String>,
+    /// The names of the pool's groups the stored user belongs to, in stored order.
+    groups: Vec<String>,
     access_ttl: Duration,
     id_ttl: Duration,
     refresh_ttl: Duration,

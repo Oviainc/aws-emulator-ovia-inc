@@ -2,7 +2,8 @@
 
 //! @op AddNotificationChannel
 //! Registers an SNS topic as a notification channel: mints the channel id and stores
-//! the submitted config against it, refusing a topic that already backs a channel.
+//! the submitted config against it. IDEMPOTENT by topic — a topic that already backs a
+//! channel is already registered, so the add returns that channel's id and mints nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -192,6 +193,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
 
+        // IDEMPOTENT BY TARGET. The topic IS the channel: registering a topic that
+        // already backs a channel asks for the registration that is already in place, so
+        // the call reports that channel's id, mints nothing and changes nothing. That is
+        // what lets a converge loop, a retry after an ambiguous timeout, or several
+        // workers running one onboarding step all end with the same single channel and
+        // the same id. Checked BEFORE the store bound, because a call that stores nothing
+        // cannot take the store past it.
+        if let Some(existing) = guard
+            .notification_channels
+            .values()
+            .find(|channel| channel.sns_topic_arn == topic_arn)
+        {
+            return Ok(AddNotificationChannelOutput {
+                id: existing.id.clone(),
+            });
+        }
+
         // STORE BOUND. A channel is reclaimed only by `RemoveNotificationChannel`, so
         // the store carries a maximum entry count; past it the add is refused with the
         // `ServiceQuotaExceededException` (HTTP 402) the model declares for exactly
@@ -208,25 +226,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
-        }
-
-        // One topic backs at most one channel, so a repeat add of the same topic is a
-        // conflict rather than a second channel for the same destination.
-        if let Some(existing) = guard
-            .notification_channels
-            .values()
-            .find(|channel| channel.sns_topic_arn == topic_arn)
-        {
-            return Err(AddNotificationChannelErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "a notification channel for Amazon SNS topic {topic_arn} already exists"
-                    ),
-                    resource_id: existing.id.clone(),
-                    resource_type: crate::state::NOTIFICATION_CHANNEL_RESOURCE_TYPE.to_string(),
-                },
-            )
-            .into());
         }
 
         // `NotificationChannelId` is a lowercase v4 UUID; it is minted here, never

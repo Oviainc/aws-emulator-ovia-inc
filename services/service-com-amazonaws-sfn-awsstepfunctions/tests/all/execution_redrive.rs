@@ -32,7 +32,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sfn_awsstepfunctions::state::{
-    EXECUTION_SETTLE_DELAY, NOT_REDRIVABLE_RUNNING, NOT_REDRIVABLE_SUCCEEDED,
+    not_redrivable_message, EXECUTION_SETTLE_DELAY, NOT_REDRIVABLE_RUNNING,
+    NOT_REDRIVABLE_SUCCEEDED,
 };
 
 use crate::state_machine_lifecycle::{
@@ -292,9 +293,13 @@ async fn redrive_refuses_what_the_projection_reports_as_not_redrivable() {
             (400, "ExecutionNotRedrivable"),
             "case {case:?}: expected 400 ExecutionNotRedrivable, got {status} {body:?}"
         );
+        // The refusal carries the reason describe reported, inside the wrapper
+        // naming the execution it refused (`tests/all/client_error_wrappers.rs`
+        // owns that construction); `redriveStatusReason` carries the reason alone.
+        let expected = not_redrivable_message(&execution, reason);
         assert_eq!(
-            message, *reason,
-            "case {case:?}: the refusal must carry the reason describe reported, got {message:?}"
+            message, expected,
+            "case {case:?}: expected message {expected:?}, got {message:?}"
         );
     }
 

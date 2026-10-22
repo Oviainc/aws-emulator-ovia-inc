@@ -12,6 +12,8 @@
 //!   by `CreateRepository`, and read back verbatim by every reporting operation);
 //! * the `sha256:` manifest digest ([`manifest_digest`]) that `PutImage` keys an image
 //!   by and `DescribeImages` / `BatchDeleteImage` resolve against;
+//! * what a manifest references ([`manifest_content`]), which is what an image's
+//!   reported size is computed over ([`StoredRepository::refresh_image_sizes`]);
 //! * the opaque pagination token ([`encode_page_token`] / [`decode_page_token`]) that
 //!   `DescribeRepositories` and `DescribeImages` must agree on.
 //!
@@ -133,6 +135,26 @@ pub struct LayerUpload {
     pub started_at: SystemTime,
 }
 
+/// How many levels of manifest list [`StoredRepository::refresh_image_sizes`] resolves
+/// when it recomputes the size of every stored image.
+///
+/// An index entry may name another index, so a list's size can rest on a chain of lists;
+/// the documents and the chain are both caller-supplied, so the resolution is bounded.
+/// Four is well past anything a registry client builds (an index over image manifests is
+/// one level).
+pub const MAX_MANIFEST_LIST_DEPTH: usize = 4;
+
+/// The most `manifests[*]` entries this service reads from one manifest list.
+///
+/// A manifest list's entries are caller-supplied and `imageManifest` is modelled
+/// `@length(1..4194304)`, so one document can name tens of thousands of children; this
+/// is the bound that, together with [`MAX_MANIFEST_LIST_DEPTH`] and
+/// [`MAX_IMAGES_PER_REPOSITORY`], caps the work of recomputing image sizes. AWS
+/// publishes no limit on the entries of an index, and real indexes carry one entry per
+/// platform (a handful), so a document that names more children than this states no size
+/// this service reports rather than being read in part.
+pub const MAX_MANIFEST_LIST_ENTRIES: usize = 100;
+
 /// One image stored under a repository: what `PutImage` persisted, and everything
 /// `DescribeImages` reports about it.
 #[derive(Debug, Clone)]
@@ -141,13 +163,21 @@ pub struct StoredImage {
     pub digest: String,
     /// The manifest document exactly as it was pushed.
     pub manifest: String,
+    /// What [`Self::manifest`] references, read ONCE when the image was stored (see
+    /// [`manifest_content`]): the layer sizes of an image manifest, or the digests a
+    /// manifest list names. Sizing an image never re-parses a manifest document.
+    pub references: ManifestContent,
+    /// `imageSizeInBytes`: the size this image reports, derived from [`Self::references`]
+    /// and, for a manifest list, from the images stored beside it. Maintained by
+    /// [`StoredRepository::refresh_image_sizes`] whenever the repository's image set
+    /// changes, so a read projects it in constant time; `None` when nothing stored
+    /// states a size for this image.
+    pub size_in_bytes: Option<i64>,
     /// The manifest's own media type: the one the request declared, else the manifest
     /// document's top-level `mediaType`.
     pub manifest_media_type: Option<String>,
     /// The artifact media type: the manifest document's `config.mediaType`.
     pub artifact_media_type: Option<String>,
-    /// `imageSizeInBytes`: the byte length of the stored manifest.
-    pub size_in_bytes: i64,
     /// When the manifest was pushed.
     pub pushed_at: SystemTime,
     /// Every tag currently pointing at this digest, in tag order.
@@ -217,10 +247,83 @@ impl StoredRepository {
             repository_name: Some(self.name.clone()),
             image_digest: Some(image.digest.clone()),
             image_tags: Some(image.tags.iter().cloned().collect()),
-            image_size_in_bytes: Some(image.size_in_bytes),
+            image_size_in_bytes: image.size_in_bytes,
             image_pushed_at: Some(as_timestamp(image.pushed_at)),
             image_manifest_media_type: image.manifest_media_type.clone(),
             artifact_media_type: image.artifact_media_type.clone(),
+        }
+    }
+
+    /// Recompute the `imageSizeInBytes` every image in this repository reports.
+    ///
+    /// `ImageDetail$imageSizeInBytes` is "the size, in bytes, of the image in the
+    /// repository", which the same doc's note pins to the layer content the client
+    /// pushed ("the Docker client compresses image layers before pushing them"): it is
+    /// the total size of the layer blobs the manifest references, never the size of the
+    /// manifest document or of the config blob. "If the image is a manifest list, this
+    /// is the max size of all manifests in the list", so a list reports the largest of
+    /// the images it references, each child's size being its own layer total.
+    ///
+    /// A list's size is a statement about other images in the repository, so it is
+    /// recomputed here whenever the image set changes — a push or a delete — rather than
+    /// frozen when the list itself arrived, and every read then projects
+    /// [`StoredImage::size_in_bytes`] in constant time. The recomputation reads no
+    /// manifest document (each one was parsed once, into [`StoredImage::references`]) and
+    /// its work is the product of three documented bounds:
+    /// [`MAX_IMAGES_PER_REPOSITORY`] entries, each resolving at most
+    /// [`MAX_MANIFEST_LIST_ENTRIES`] children, over at most [`MAX_MANIFEST_LIST_DEPTH`]
+    /// levels of nesting.
+    ///
+    /// A size is `None` for an image nothing stored states one for: the member is
+    /// neither required nor defaulted, so an unknown size is absent rather than zero.
+    /// That covers a document that references no layer or manifest array at all, a layer
+    /// descriptor that states no usable size (none at all, or one no byte count can be),
+    /// a total no `long` can represent — the addends are caller-supplied, so they are
+    /// added with checked arithmetic and never wrapped — and a list none of whose
+    /// children the repository holds. An image manifest with an EMPTY `layers` array is
+    /// a statement, not a gap: it references no layer content, so its total is `0`.
+    pub fn refresh_image_sizes(&mut self) {
+        // An image manifest's total rests on nothing but its own descriptors.
+        let mut sizes: BTreeMap<String, Option<i64>> = self
+            .images
+            .iter()
+            .map(|(digest, image)| {
+                let own = match &image.references {
+                    ManifestContent::Layers(layer_sizes) => layer_sizes
+                        .iter()
+                        .try_fold(0i64, |total, size| total.checked_add((*size)?)),
+                    ManifestContent::List(_) | ManifestContent::Opaque => None,
+                };
+                (digest.clone(), own)
+            })
+            .collect();
+
+        // A manifest list is the max over the images it names, so a list of lists
+        // settles one level per pass; a pass that changes nothing has settled.
+        for _ in 0..MAX_MANIFEST_LIST_DEPTH {
+            let mut settled = true;
+            let mut next = sizes.clone();
+            for (digest, image) in &self.images {
+                if let ManifestContent::List(children) = &image.references {
+                    let resolved = children
+                        .iter()
+                        .filter_map(|child| sizes.get(child).copied().flatten())
+                        .max();
+                    if next.insert(digest.clone(), resolved) != Some(resolved) {
+                        settled = false;
+                    }
+                }
+            }
+            sizes = next;
+            if settled {
+                break;
+            }
+        }
+
+        for (digest, size) in sizes {
+            if let Some(image) = self.images.get_mut(&digest) {
+                image.size_in_bytes = size;
+            }
         }
     }
 
@@ -522,6 +625,72 @@ pub fn manifest_digest(manifest: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(manifest.as_bytes()))
 }
 
+/// What content a stored manifest document references.
+///
+/// A registry manifest is one of two things: an image manifest, which lists the layer
+/// blobs of one image, or a manifest list / OCI index, which lists other manifests by
+/// digest. Anything else states the size of nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestContent {
+    /// An image manifest: what each of its layer descriptors states the size of its blob
+    /// to be, in manifest order — `None` for a descriptor that states no usable size.
+    Layers(Vec<Option<i64>>),
+    /// A manifest list or OCI index: the distinct digests of the manifests it
+    /// references, in digest order.
+    List(BTreeSet<String>),
+    /// A document that references neither layers nor manifests.
+    Opaque,
+}
+
+/// Read a PARSED manifest document for the content it references.
+///
+/// The push path has already parsed the document (it reads the media types from it), so
+/// this takes the `Value` rather than the text: one request parses one manifest once.
+///
+/// Both forms carry OCI content descriptors — a `mediaType`, a `digest` and a `size` —
+/// under `layers` for an image manifest and under `manifests` for a list, so this reads
+/// those two arrays and nothing else. A document that carries neither array is
+/// [`ManifestContent::Opaque`], and so is one that could not be parsed at all (the
+/// caller has no `Value` to pass for it).
+///
+/// A descriptor's `size` is the byte count of the blob it points at, so a value that is
+/// absent, not an integer, or below zero states no size at all — the document is
+/// caller-supplied, and nothing it says may be read as a byte count it did not give.
+///
+/// A list's digests are collected as a SET, so naming one child a thousand times costs
+/// what naming it once costs, and a document naming more than
+/// [`MAX_MANIFEST_LIST_ENTRIES`] children is [`ManifestContent::Opaque`] rather than
+/// read in part.
+pub fn manifest_content_of(document: &serde_json::Value) -> ManifestContent {
+    if let Some(manifests) = document.get("manifests").and_then(|m| m.as_array()) {
+        if manifests.len() > MAX_MANIFEST_LIST_ENTRIES {
+            return ManifestContent::Opaque;
+        }
+        return ManifestContent::List(
+            manifests
+                .iter()
+                .filter_map(|descriptor| descriptor.get("digest"))
+                .filter_map(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .collect(),
+        );
+    }
+    if let Some(layers) = document.get("layers").and_then(|l| l.as_array()) {
+        return ManifestContent::Layers(
+            layers
+                .iter()
+                .map(|descriptor| {
+                    descriptor
+                        .get("size")
+                        .and_then(serde_json::Value::as_i64)
+                        .filter(|size| *size >= 0)
+                })
+                .collect(),
+        );
+    }
+    ManifestContent::Opaque
+}
+
 /// A `SystemTime` as a modelled timestamp.
 pub fn as_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = at
@@ -538,16 +707,16 @@ pub fn as_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// a logo payload has been stored, and its last segment is the payload's own sha256
 /// digest — derived from the bytes, so the same logo always yields the same URL.
 /// `marketplaceCertified` is "whether the repository is certified by Amazon Web Services
-/// Marketplace", which a repository created through this API never is.
+/// Marketplace": it is neither required nor defaulted, and nothing a caller of this API
+/// can do makes a certification statement about a repository, so it stays unset and is
+/// absent from every response — `false` would claim the service had decided the
+/// repository is not certified.
 pub fn catalog_data_of(
     repository_name: &str,
     input: Option<&RepositoryCatalogDataInput>,
 ) -> RepositoryCatalogData {
     let Some(input) = input else {
-        return RepositoryCatalogData {
-            marketplace_certified: Some(false),
-            ..RepositoryCatalogData::default()
-        };
+        return RepositoryCatalogData::default();
     };
     RepositoryCatalogData {
         description: input.description.clone(),
@@ -561,7 +730,7 @@ pub fn catalog_data_of(
         }),
         about_text: input.about_text.clone(),
         usage_text: input.usage_text.clone(),
-        marketplace_certified: Some(false),
+        marketplace_certified: None,
     }
 }
 

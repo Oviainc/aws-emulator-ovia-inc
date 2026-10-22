@@ -186,16 +186,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token.as_deref() {
             if let Some(record) = state.idempotency_replay("CreatePolicyTemplate", token) {
                 if record.parameters != parameters {
+                    // Fixed message; the template the token already created is
+                    // reported in `resources`.
                     return Err(CreatePolicyTemplateErrorModeled::ConflictException(
-                        ConflictException {
-                            message: format!(
-                                "the client token {token} was already used with different parameters"
-                            ),
-                            resources: vec![ResourceConflict {
-                                resource_id: record.resource_id.clone(),
-                                resource_type: "POLICY_TEMPLATE".to_string(),
-                            }],
-                        },
+                        crate::ops::conflict([crate::ops::resource_conflict(
+                            &record.resource_id,
+                            crate::state::RESOURCE_TYPE_POLICY_TEMPLATE,
+                        )]),
                     )
                     .into());
                 }
@@ -264,16 +261,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .find(|template| template.name.as_deref() == Some(name))
             {
                 return Err(CreatePolicyTemplateErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "a policy template named {name} already exists in policy store \
-                             {store_id}"
-                        ),
-                        resources: vec![ResourceConflict {
-                            resource_id: clash.policy_template_id.clone(),
-                            resource_type: "POLICY_TEMPLATE".to_string(),
-                        }],
-                    },
+                    crate::ops::conflict([crate::ops::resource_conflict(
+                        &clash.policy_template_id,
+                        crate::state::RESOURCE_TYPE_POLICY_TEMPLATE,
+                    )]),
                 )
                 .into());
             }

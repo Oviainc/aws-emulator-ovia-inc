@@ -372,14 +372,17 @@ async fn deleting_a_cluster_that_still_holds_work_is_refused_with_one_fixed_sent
     )
     .await;
 
-    // Both sentences are the ones the error shapes themselves document (`smithy_query`
-    // query="shape" shape="ClusterContainsServicesException,ClusterContainsTasksException").
+    // The contains-services sentence is the one the wire corpus RECORDS for that refusal
+    // (the `ecs|DeleteCluster|4xx->4xx|$.message` evidence in
+    // issues/things-that-now-work/20261022T152302Z-ecs-deletecluster-refuses-valid-deletes-and-never-tombstones.md);
+    // no recording fixes the contains-tasks one, so it stays the error shape's own doc
+    // sentence. Either way the sentence is a CONSTANT of the condition.
     let rows = [
         (
             "a cluster holding a service",
             CLUSTER,
             "ClusterContainsServicesException",
-            "You can't delete a cluster that contains services.",
+            "The Cluster cannot be deleted while Services are active.",
         ),
         (
             "a cluster holding a task",

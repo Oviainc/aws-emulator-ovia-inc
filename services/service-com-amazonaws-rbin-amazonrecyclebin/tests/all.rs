@@ -19,3 +19,5 @@ mod retention_rule_lifecycle;
 mod rule_lock_transitions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_arn_label_encoding.rs"]
+mod tag_arn_label_encoding;

@@ -21,10 +21,14 @@ mod domain_listing;
 mod field_listing;
 #[path = "all/field_options.rs"]
 mod field_options;
+#[path = "all/harness.rs"]
+mod harness;
 #[path = "all/layout_lifecycle.rs"]
 mod layout_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/system_fields.rs"]
+mod system_fields;
 #[path = "all/template_listing.rs"]
 mod template_listing;
 #[path = "all/template_update.rs"]

@@ -16,6 +16,12 @@
 //! is also where the `PENDING` -> `ACTIVE` replication status a `GetTelemetryRule`
 //! reports comes from, so no operation ever has to sleep and no read has to write.
 //!
+//! The service's second resource is the **telemetry pipeline**, stored the same way:
+//! one record per pipeline, keyed by `(region, Name)`, carrying the configuration body
+//! the caller supplied and the epoch-millisecond instant at which the `CREATING` ->
+//! `ACTIVE` transition the create started comes due. A read derives the status from
+//! that instant and the clock, so again no operation sleeps and no read writes.
+//!
 //! The service's other rule resource is the **organization centralization rule**,
 //! held in [`ComAmazonawsObservabilityadminObservabilityadminState::centralization_rules`]
 //! and keyed by `(CreatedRegion, RuleName)` for the same reason: the rule is created
@@ -30,7 +36,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    CentralizationRule, CentralizationRuleSummary, RegionStatus, TelemetryRule,
+    CentralizationRule, CentralizationRuleSummary, RegionStatus, TelemetryPipeline,
+    TelemetryPipelineConfiguration, TelemetryPipelineStatusReason, TelemetryRule,
     TelemetryRuleSummary, ACTION_VALUES, DELETION_PROTECTION_VALUES, DESTINATION_TYPE_VALUES,
     ENCRYPTED_LOG_GROUP_STRATEGY_VALUES, ENCRYPTION_CONFLICT_RESOLUTION_STRATEGY_VALUES,
     ENCRYPTION_SCOPE_VALUES, ENCRYPTION_STRATEGY_VALUES, FILTER_BEHAVIOR_VALUES,
@@ -46,6 +53,10 @@ pub const ARN_SERVICE: &str = "observabilityadmin";
 /// The resource portion a telemetry-rule ARN carries before its name, so an ARN
 /// reads `arn:aws:observabilityadmin:<region>:<account>:telemetry-rule/<RuleName>`.
 pub const RULE_ARN_RESOURCE_PREFIX: &str = "telemetry-rule/";
+
+/// The resource portion a telemetry-pipeline ARN carries before its name, so an ARN
+/// reads `arn:aws:observabilityadmin:<region>:<account>:telemetry-pipeline/<Name>`.
+pub const PIPELINE_ARN_RESOURCE_PREFIX: &str = "telemetry-pipeline/";
 
 /// The resource portion an organization centralization rule's ARN carries before its
 /// name, so an ARN reads
@@ -104,6 +115,46 @@ pub const REGION_STATUS_ACTIVE: &str = "ACTIVE";
 
 /// Replication status of a spoke region the fan-out could not create the rule in.
 pub const REGION_STATUS_FAILED: &str = "FAILED";
+
+/// The most telemetry pipelines a caller may hold in ONE region.
+///
+/// Emulator resource guard, NOT an AWS quota: this service publishes no pipeline
+/// quota. It is the per-region budget; [`MAX_STORED_PIPELINE_RECORDS`] is the
+/// store-wide cap that dominates it, because the region a record is keyed by comes
+/// from the caller's own credential scope. A create past either cap is refused with
+/// the modelled `ServiceQuotaExceededException` before a record is allocated.
+pub const MAX_TELEMETRY_PIPELINES: usize = 200;
+
+/// The most telemetry pipeline records this emulator will hold ACROSS every region.
+///
+/// Emulator resource guard, NOT an AWS quota, and the bound that dominates the only
+/// growth site a request can drive: a create keys its record by the region of the
+/// caller's SigV4 credential scope ([`request_region`]), so a per-region cap alone
+/// would hand a caller a fresh budget for every distinct scope it signs with. This
+/// cap bounds the PRODUCT of regions and pipelines, which `MAX_TELEMETRY_PIPELINES`
+/// alone does not — the same reason [`MAX_STORED_RULE_RECORDS`] sits beside
+/// [`MAX_TELEMETRY_RULES`]. Each record also holds a configuration body the model
+/// bounds at 24000 characters, so this cap bounds the stored bytes too.
+pub const MAX_STORED_PIPELINE_RECORDS: usize = 2_000;
+
+/// How long after a `CreateTelemetryPipeline` the pipeline's `CREATING` -> `ACTIVE`
+/// transition comes due.
+///
+/// A CHOSEN span, not an AWS-documented duration: AWS reports a freshly created
+/// pipeline as `CREATING` and only later as `ACTIVE`, and this is the span this
+/// emulator takes to get there. It is deliberately non-zero, so a caller that reads
+/// straight after the create still observes `CREATING`.
+pub const PIPELINE_ACTIVATION_DELAY_MS: i64 = 400;
+
+/// Status of a pipeline whose creation has not come due yet. One of
+/// `TelemetryPipelineStatus`' own values (`TELEMETRY_PIPELINE_STATUS_VALUES`).
+pub const PIPELINE_STATUS_CREATING: &str = "CREATING";
+
+/// Status of a pipeline whose creation has come due.
+pub const PIPELINE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `ResourceType` this service names a pipeline by in a modelled error.
+pub const PIPELINE_RESOURCE_TYPE: &str = "telemetry-pipeline";
 
 /// How long after a `StartTelemetryEvaluation` / `StopTelemetryEvaluation` the
 /// telemetry-config feature of one region reaches its terminal status.
@@ -281,6 +332,84 @@ impl StoredTelemetryRule {
             resource_type: self.rule.resource_type.clone(),
             telemetry_type: Some(self.rule.telemetry_type.clone()),
             telemetry_source_types: self.rule.telemetry_source_types.clone(),
+        }
+    }
+}
+
+/// A stored pipeline's key: the region it lives in, then its name. A pipeline name
+/// identifies the pipeline within the account in one region, so the region is part
+/// of the key and a read only ever resolves a pipeline in the region the caller
+/// signed for.
+pub type PipelineKey = (String, String);
+
+/// One stored telemetry pipeline.
+#[derive(Debug, Clone, Default)]
+pub struct StoredTelemetryPipeline {
+    pub name: String,
+    pub region: String,
+    /// `arn:aws:observabilityadmin:<region>:<account>:telemetry-pipeline/<Name>`.
+    pub arn: String,
+    /// The configuration body exactly as the caller supplied it: the YAML document
+    /// `TelemetryPipelineConfiguration$Body` carries, stored verbatim so a read
+    /// reports back what was written rather than a re-rendering of it.
+    pub configuration_body: String,
+    /// `CreatedTimeStamp`, in epoch milliseconds.
+    pub created_timestamp_ms: i64,
+    /// `LastUpdateTimeStamp`, in epoch milliseconds.
+    pub last_update_timestamp_ms: i64,
+    /// The instant the pipeline's `CREATING` -> `ACTIVE` transition comes due. The
+    /// status a read reports is derived from this and the clock, which is why no
+    /// read has to write and no operation has to sleep.
+    pub active_at_ms: i64,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl StoredTelemetryPipeline {
+    /// This record's store key.
+    pub fn key(&self) -> PipelineKey {
+        (self.region.clone(), self.name.clone())
+    }
+
+    /// This pipeline's `Status` at `now_ms`: `CREATING` until the transition the
+    /// create started comes due, `ACTIVE` from then on.
+    pub fn status_at(&self, now_ms: i64) -> &'static str {
+        if now_ms < self.active_at_ms {
+            PIPELINE_STATUS_CREATING
+        } else {
+            PIPELINE_STATUS_ACTIVE
+        }
+    }
+
+    /// This record as the `TelemetryPipeline` a read reports, as it stands at
+    /// `now_ms`. `StatusReason` "provid[es] additional context about the current
+    /// state", so it is reported while the pipeline is still being created and
+    /// omitted once it is active and there is no further context to give.
+    pub fn as_pipeline(&self, now_ms: i64) -> TelemetryPipeline {
+        let status = self.status_at(now_ms);
+        TelemetryPipeline {
+            created_time_stamp: Some(self.created_timestamp_ms),
+            last_update_time_stamp: Some(self.last_update_timestamp_ms),
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            configuration: Some(TelemetryPipelineConfiguration {
+                body: self.configuration_body.clone(),
+            }),
+            status: Some(status.to_string()),
+            status_reason: (status == PIPELINE_STATUS_CREATING).then(|| {
+                TelemetryPipelineStatusReason {
+                    description: Some(
+                        "the pipeline configuration is being provisioned".to_string(),
+                    ),
+                }
+            }),
+            // A pipeline nobody tagged carries no `Tags` member at all, rather than an
+            // empty map: the member reports the tags the resource has.
+            tags: (!self.tags.is_empty()).then(|| {
+                self.tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
         }
     }
 }
@@ -509,6 +638,12 @@ pub struct ComAmazonawsObservabilityadminObservabilityadminState {
     /// Rule ARN -> store key, so a `RuleIdentifier` resolves as an ARN as well as
     /// as a bare name.
     pub arn_index: BTreeMap<String, RuleKey>,
+    /// Every stored pipeline, keyed by `(region, Name)`. Ordering by region then
+    /// name is what gives `ListTelemetryPipelines` a stable page sequence.
+    pub telemetry_pipelines: BTreeMap<PipelineKey, StoredTelemetryPipeline>,
+    /// Pipeline ARN -> store key, so a `PipelineIdentifier` resolves as an ARN as
+    /// well as as a bare name — the two forms its documentation names.
+    pub pipeline_arn_index: BTreeMap<String, PipelineKey>,
     /// The account's telemetry-config feature, keyed by region: the region a
     /// `StartTelemetryEvaluation` was signed for, plus every spoke region its
     /// multi-region scope named.
@@ -793,6 +928,73 @@ impl ComAmazonawsObservabilityadminObservabilityadminState {
             self.remove(replica);
         }
         self.remove(key)
+    }
+
+    /// The key of the pipeline `identifier` names for a caller signed for `region`,
+    /// accepting both forms `PipelineIdentifier`'s documentation allows ("the
+    /// identifier (name or ARN)").
+    ///
+    /// An ARN must match a stored ARN in EVERY field and name a pipeline in the
+    /// caller's own region, so an ARN for another partition, region or account
+    /// resolves to nothing rather than to the pipeline that shares its name.
+    pub fn resolve_pipeline_key(&self, region: &str, identifier: &str) -> Option<PipelineKey> {
+        if identifier.starts_with("arn:") {
+            return self
+                .pipeline_arn_index
+                .get(identifier)
+                .filter(|(pipeline_region, _)| pipeline_region == region)
+                .cloned();
+        }
+        let key = (region.to_string(), identifier.to_string());
+        self.telemetry_pipelines.contains_key(&key).then_some(key)
+    }
+
+    /// The pipeline `identifier` names in `region`.
+    pub fn pipeline(&self, region: &str, identifier: &str) -> Option<&StoredTelemetryPipeline> {
+        let key = self.resolve_pipeline_key(region, identifier)?;
+        self.telemetry_pipelines.get(&key)
+    }
+
+    /// Whether `name` is already in use by a pipeline in `region`.
+    pub fn pipeline_name_taken(&self, region: &str, name: &str) -> bool {
+        self.telemetry_pipelines
+            .contains_key(&(region.to_string(), name.to_string()))
+    }
+
+    /// How many pipelines `region` holds, which is what
+    /// [`MAX_TELEMETRY_PIPELINES`] bounds.
+    pub fn pipeline_count(&self, region: &str) -> usize {
+        self.telemetry_pipelines
+            .keys()
+            .filter(|(pipeline_region, _)| pipeline_region == region)
+            .count()
+    }
+
+    /// How many pipeline records the store holds in total, across every region,
+    /// which is what [`MAX_STORED_PIPELINE_RECORDS`] bounds.
+    pub fn pipeline_record_count(&self) -> usize {
+        self.telemetry_pipelines.len()
+    }
+
+    /// Whether storing `records` more pipelines would take the store past
+    /// [`MAX_STORED_PIPELINE_RECORDS`]. A write path asks this BEFORE it allocates,
+    /// so the refusal costs nothing — and it is the cap that dominates
+    /// [`MAX_TELEMETRY_PIPELINES`], which a caller could otherwise reset by signing
+    /// for another region.
+    pub fn would_exceed_pipeline_store(&self, records: usize) -> bool {
+        self.pipeline_record_count().saturating_add(records) > MAX_STORED_PIPELINE_RECORDS
+    }
+
+    /// Store a pipeline record and index it by ARN.
+    ///
+    /// The key is `(region, Name)`, so a caller must have established that the name
+    /// is free in that region first ([`Self::pipeline_name_taken`]) — every write
+    /// path here does — because inserting over an occupied key would replace that
+    /// record.
+    pub fn insert_pipeline(&mut self, record: StoredTelemetryPipeline) {
+        self.pipeline_arn_index
+            .insert(record.arn.clone(), record.key());
+        self.telemetry_pipelines.insert(record.key(), record);
     }
 
     /// The telemetry-config feature records of `scope`.
@@ -1484,6 +1686,15 @@ pub fn rule_arn(region: &str, name: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("{RULE_ARN_RESOURCE_PREFIX}{name}"),
+    )
+}
+
+/// The ARN of the telemetry pipeline `name` in `region`.
+pub fn pipeline_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{PIPELINE_ARN_RESOURCE_PREFIX}{name}"),
     )
 }
 

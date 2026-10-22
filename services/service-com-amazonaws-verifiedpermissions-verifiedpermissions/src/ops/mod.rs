@@ -165,6 +165,50 @@ pub fn resource_not_found(
     }
 }
 
+/// One entry of [`types::ConflictException::resources`]: the id of a resource
+/// the failed request collided with, and its `ResourceType`
+/// ([`crate::ops::types::RESOURCE_TYPE_VALUES`]).
+///
+/// Both members are required by the model, so this is the ONE place that shapes
+/// an entry and every conflict reports the collision the same way.
+pub fn resource_conflict(resource_id: &str, resource_type: &str) -> self::types::ResourceConflict {
+    self::types::ResourceConflict {
+        resource_id: resource_id.to_string(),
+        resource_type: resource_type.to_string(),
+    }
+}
+
+/// The modelled `ConflictException` for a request that collided with the
+/// resources in `resources`: the constant [`crate::state::CONFLICT_MESSAGE`],
+/// with the collision itself reported in the required `resources` list.
+///
+/// `resources` is "the list of resources referenced with this failed request"
+/// (`smithy_query(query="shape", shape="ConflictException")`), so a client
+/// learns WHICH resource it collided with by reading structured members rather
+/// than by regexing prose — and the message is therefore the exception's fixed
+/// summary, identical whatever the cause. Build each entry with
+/// [`resource_conflict`]. This is the ONE place that builds the shape, so every
+/// conflicting path of this service answers the same text.
+pub fn conflict(
+    resources: impl IntoIterator<Item = self::types::ResourceConflict>,
+) -> self::types::ConflictException {
+    self::types::ConflictException {
+        message: crate::state::CONFLICT_MESSAGE.to_string(),
+        resources: resources.into_iter().collect(),
+    }
+}
+
+/// The modelled `TooManyTagsException` for a tagging request that would take
+/// `resource_arn` past [`crate::state::MAX_TAGS_PER_RESOURCE`]: the constant
+/// [`crate::state::TOO_MANY_TAGS_MESSAGE`], with the resource at the limit in
+/// the modelled `resourceName` member rather than in the message.
+pub fn too_many_tags(resource_arn: &str) -> self::types::TooManyTagsException {
+    self::types::TooManyTagsException {
+        message: Some(crate::state::TOO_MANY_TAGS_MESSAGE.to_string()),
+        resource_name: Some(resource_arn.to_string()),
+    }
+}
+
 /// The modelled `InvalidStateException` for a policy store whose deletion
 /// protection is enabled: the constant
 /// [`crate::state::DELETION_PROTECTION_MESSAGE`], which names no resource.

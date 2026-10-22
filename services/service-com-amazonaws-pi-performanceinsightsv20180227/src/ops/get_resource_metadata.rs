@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourceMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourceMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: answers the metadata of the addressed data source — the
+//! `Identifier` it was asked about, and the features this emulator observes on it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourceMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Two gates decide whether there is anything to report, in this order: the
+//! request's `ServiceType` must be the service that OWNS the data source its
+//! `Identifier` names (the modelled `InvalidArgumentException`, see
+//! [`crate::state::service_type_refusal`]), and the identifier must address a data
+//! source this account may see at all (the modelled `NotAuthorizedException`, see
+//! [`crate::state::is_data_source_identifier`]).
+//!
+//! `Features` reports what the emulator OBSERVES on the data source. This emulator
+//! runs no DB engine and holds no per-feature state for a monitored resource, so it
+//! observes none and the map is empty — never a feature name under an invented
+//! status. (The separate issue `pi-getresourcemetadata-stub` records the SQL-digest
+//! feature a recorded unit expects; that feature catalogue is its own question.)
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +158,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourceMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourceMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourceMetadata"))
+        let _ = ctx;
+
+        // The `ServiceType` must be the service that OWNS the data source this
+        // `Identifier` names: a resource id of one service's namespace, queried
+        // under the other's, names no data source, so there is no metadata for it
+        // — the modelled argument error, not an authorization outcome.
+        if let Some(message) = crate::state::service_type_refusal(
+            &*self.engine,
+            &input.service_type,
+            &input.identifier,
+        ) {
+            return Err(GetResourceMetadataErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // The service-wide authorization gate: a value that addresses no data
+        // source this account may see is refused identically on every operation,
+        // under one message that discloses nothing.
+        if !crate::state::is_data_source_identifier(&input.identifier) {
+            return Err(GetResourceMetadataErrorModeled::NotAuthorizedException(
+                NotAuthorizedException {
+                    message: Some(crate::state::NOT_AUTHORIZED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The data source is served, so its metadata is the identifier it is
+        // addressed by and the features observed on it. Nothing in this emulator
+        // writes per-feature state for a monitored resource, so the map is EMPTY
+        // rather than carrying a feature whose status nothing measured.
+        Ok(GetResourceMetadataOutput {
+            identifier: Some(input.identifier.clone()),
+            features: Some(::std::collections::HashMap::new()),
+        })
     }
 }
