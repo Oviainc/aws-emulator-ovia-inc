@@ -192,14 +192,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A repository that still holds images is only deleted when the caller asked to
         // force it; otherwise the images would be dropped without the caller saying so.
+        // The refusal names the repository and registry the caller asked about and
+        // nothing else: how many images remain is state the caller did not ask for.
         if !repository.images.is_empty() && !input.force {
             return Err(DeleteRepositoryErrorModeled::RepositoryNotEmptyException(
                 RepositoryNotEmptyException {
                     message: Some(format!(
-                        "The repository with name '{}' in the registry with id '{registry_id}' \
-                         cannot be deleted because it still contains {} image(s)",
-                        input.repository_name,
-                        repository.images.len()
+                        "The repository with name '{}' in registry with id '{registry_id}' \
+                         cannot be deleted because it still contains images",
+                        input.repository_name
                     )),
                 },
             )
