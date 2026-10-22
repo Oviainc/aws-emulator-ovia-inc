@@ -752,6 +752,11 @@ pub const VALIDATION_REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFail
 /// resource does not support, from the same `VALIDATION_EXCEPTION_REASON_VALUES` list.
 pub const VALIDATION_REASON_NOT_SUPPORTED: &str = "notSupported";
 
+/// The `ValidationExceptionReason` for a document that could not be parsed at all, from
+/// the same `VALIDATION_EXCEPTION_REASON_VALUES` list. Shared, so the policy checks that
+/// refuse an unparseable `policyDocument` all report the same reason.
+pub const VALIDATION_REASON_CANNOT_PARSE: &str = "cannotParse";
+
 /// A `ValidationException` about ONE request member: the reason the model lists for a
 /// member that failed validation, and a `fieldList` naming it.
 ///

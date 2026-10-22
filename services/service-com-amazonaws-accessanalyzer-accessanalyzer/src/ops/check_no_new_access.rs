@@ -329,9 +329,9 @@ fn render_engine_error(error: policy::EngineError) -> CheckNoNewAccessError {
     }
 }
 
-/// The `ValidationExceptionReason` for a document that could not be parsed at all, from
-/// the model's own [`VALIDATION_EXCEPTION_REASON_VALUES`].
-const VALIDATION_REASON_CANNOT_PARSE: &str = "cannotParse";
+/// The `ValidationExceptionReason` for a document that could not be parsed at all: the
+/// service's shared constant, so this check and `CheckNoPublicAccess` report the same one.
+use crate::state::VALIDATION_REASON_CANNOT_PARSE;
 
 /// A self-contained IAM policy comparison engine: does an updated policy allow any
 /// access the existing policy does not?

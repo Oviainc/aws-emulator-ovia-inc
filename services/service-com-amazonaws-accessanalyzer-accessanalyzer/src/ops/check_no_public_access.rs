@@ -1,15 +1,51 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CheckNoPublicAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CheckNoPublicAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CheckNoPublicAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Decides, from the policy document the request carries, whether that resource policy
+//! can grant PUBLIC access — access to a caller this account never names.
+//!
+//! The answer is COMPUTED from the document. The document itself is read by the crate's
+//! SHARED IAM policy parser, [`crate::ops::check_no_new_access::policy`] — the same
+//! grammar, the same element rules and the same input ceilings `CheckNoNewAccess` uses,
+//! so the two checks cannot drift apart and this operation adds no second grammar. Each
+//! parsed statement is then examined: the operation answers `FAIL` with one
+//! [`ReasonSummary`] per statement that can grant public access, `PASS` when no statement
+//! can. A statement can grant public access when its `Effect` is `Allow`, its principal
+//! element admits every principal (`"Principal": "*"` / `{"AWS": "*"}`, or an `Allow`
+//! written with `NotPrincipal`, which admits every principal the element does not list),
+//! and no `Condition` clause binds the request to a specific principal, account,
+//! organization, calling service or network path — see [`SCOPING_CONDITION_KEYS`].
+//!
+//! The operation is `@readonly` and holds NO state: AWS evaluates the submitted document
+//! and persists nothing, so two identical calls answer identically and neither is
+//! observable by any other operation.
+//!
+//! ## What is refused rather than guessed
+//!
+//! A document the shared parser cannot read is answered with a modelled error, never with
+//! a verdict: a document that is not JSON, or not a policy of this grammar (no
+//! `Statement`, no statement, a statement without `Effect`, `Action`/`NotAction` or
+//! `Principal`/`NotPrincipal`, both of a pair, an element of the wrong shape) or one past
+//! an input ceiling is HTTP 400 `ValidationException`; a condition operator the shared
+//! engine does not model — the multivalued set operators (`ForAllValues:`/`ForAnyValue:`)
+//! and the operators it lists as unmodelled (`IpAddress`, `BinaryEquals`, …) — is HTTP
+//! 422 `UnprocessableEntityException`, because whether such a clause binds the caller is
+//! exactly what this check would have to guess.
+//!
+//! ## What the check does not reason about
+//!
+//! The verdict comes from the principal-and-condition rule above, so two things the real
+//! service's reasoning engine also weighs are left out — both in the direction `FAIL`
+//! documents (the policy MIGHT allow public access), never the permissive one:
+//!
+//! * `Deny` statements are not evaluated as restrictions on an `Allow`. A wildcard
+//!   principal pinned by a separate `Deny` is still reported, because deciding that the
+//!   `Deny` really covers the `Allow` needs the action/resource algebra below.
+//! * `Action` and `Resource` are not intersected with the actions the named
+//!   `resourceType` supports, so the verdict is the same for every supported resource
+//!   type: a statement that admits every principal is reported whatever it allows them
+//!   to do.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +123,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The crate's shared IAM policy parser: one grammar, one set of element rules and one
+/// set of input ceilings for every policy check in this service.
+use super::check_no_new_access::policy;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +200,363 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CheckNoPublicAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CheckNoPublicAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CheckNoPublicAccess"))
+        // The answer is a function of the submitted document alone: this operation is
+        // `@readonly`, holds no resource and reads no request metadata, so neither `ctx`
+        // nor the engine is consulted (see the module docs).
+        let _ = (ctx, &self.engine);
+
+        if !ACCESS_CHECK_RESOURCE_TYPE_VALUES.contains(&input.resource_type.as_str()) {
+            return Err(unsupported_resource_type(&input.resource_type).into());
+        }
+
+        // The grammar, the element rules and every input ceiling come from the crate's
+        // shared IAM policy parser — this check adds no second grammar. A resource policy:
+        // the flavor whose statements name principals.
+        let policy = policy::parse(
+            &input.policy_document,
+            POLICY_DOCUMENT_MEMBER,
+            policy::Flavor::Resource,
+        )
+        .map_err(render_engine_error)?;
+
+        // One reason per statement that can grant public access, in statement order, so a
+        // caller can map each reason back onto the document it submitted.
+        let reasons: Vec<ReasonSummary> = policy
+            .statements
+            .iter()
+            .filter_map(public_access_reason)
+            .collect();
+
+        // An access record for the call: the operation, what was evaluated and the
+        // verdict. At INFO, and never the document, which is `@sensitive`.
+        ::tracing::info!(
+            operation = Self::NAME,
+            resource_type = %input.resource_type,
+            result = if reasons.is_empty() { RESULT_PASS } else { RESULT_FAIL },
+            reasons = reasons.len(),
+            "checked a resource policy for public access"
+        );
+
+        Ok(if reasons.is_empty() {
+            CheckNoPublicAccessOutput {
+                result: Some(RESULT_PASS.to_string()),
+                message: Some(PASS_MESSAGE.to_string()),
+                // `reasons` reports why public access is granted, so a policy that grants
+                // none carries no reasons at all rather than an empty list.
+                reasons: None,
+            }
+        } else {
+            CheckNoPublicAccessOutput {
+                result: Some(RESULT_FAIL.to_string()),
+                message: Some(FAIL_MESSAGE.to_string()),
+                reasons: Some(reasons),
+            }
+        })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Public-access evaluation
+//
+// IAM Access Analyzer answers this check by reasoning over the submitted policy, so the
+// emulator reads the document with the crate's shared IAM policy parser (the one
+// `CheckNoNewAccess` also uses, which owns the grammar, the element rules and the input
+// ceilings) and applies the public-access rule below to every statement it returns. No
+// part of the answer is keyed to a particular document, principal or resource type.
+// ---------------------------------------------------------------------------
+
+/// The request member a policy refusal blames.
+const POLICY_DOCUMENT_MEMBER: &str = "policyDocument";
+
+/// The `CheckNoPublicAccessResult` values the model declares
+/// (`CHECK_NO_PUBLIC_ACCESS_RESULT_VALUES`): `PASS` when the policy does not allow public
+/// access to the resource type, `FAIL` when it might.
+const RESULT_PASS: &str = "PASS";
+const RESULT_FAIL: &str = "FAIL";
+
+/// The `message` that accompanies each result: it states the finding the `result` encodes,
+/// in the terms the modelled member documents ("The message indicating whether the
+/// specified policy allows public access to resources").
+const PASS_MESSAGE: &str = "The resource policy does not grant public access for the given resource type.";
+const FAIL_MESSAGE: &str = "The resource policy grants public access for the given resource type.";
+
+/// How an ARN condition value is read:
+/// `arn:<partition>:<service>:<region>:<account>:<resource>`, so splitting on `:` into six
+/// fields puts the account at index 4 and the whole resource part (which may itself
+/// contain `:`) at index 5.
+const ARN_PREFIX: &str = "arn:";
+const ARN_FIELD_SEPARATOR: char = ':';
+const ARN_FIELD_COUNT: usize = 6;
+const ARN_ACCOUNT_FIELD: usize = 4;
+const ARN_RESOURCE_FIELD: usize = 5;
+
+/// The `Null` operator value that demands the key be present (and therefore scopes the
+/// request); `"true"` demands the opposite and scopes nothing.
+const NULL_KEY_MUST_EXIST: &str = "false";
+
+/// Condition keys whose value is a network address, so a CIDR covering every address
+/// leaves the statement public rather than scoping it.
+///
+/// From the AWS global condition context keys documentation (`aws:SourceIp`,
+/// `aws:VpcSourceIp`).
+const NETWORK_ADDRESS_KEYS: &[&str] = &["aws:SourceIp", "aws:VpcSourceIp"];
+
+/// What separates a network address from its CIDR prefix length, and the prefix length
+/// that covers EVERY address of either family (`0.0.0.0/0`, `::/0`, `0:0:0:0:0:0:0:0/0`,
+/// …) — judged by the parsed length rather than by how the address is spelled.
+const CIDR_PREFIX_SEPARATOR: char = '/';
+const EVERY_ADDRESS_PREFIX_LENGTH: u8 = 0;
+
+/// Scoping keys whose value is a flag, with the value that actually narrows the request:
+/// the opposite polarity excludes one kind of caller and leaves every other — including
+/// the anonymous one — allowed.
+const BOOLEAN_SCOPING_KEYS: &[(&str, &str)] = &[("aws:PrincipalIsAWSService", "true")];
+
+/// Condition keys that bind a request to a specific principal, account, organization,
+/// calling service, owning account or network path — the keys that keep a wildcard
+/// principal from being public.
+///
+/// Source: the AWS global condition context keys documentation (IAM User Guide), plus the
+/// two service-owner keys AWS documents for cross-account resource policies
+/// (`kms:CallerAccount`, `s3:ResourceAccount`). Compared case-insensitively, as IAM
+/// compares condition key names.
+const SCOPING_CONDITION_KEYS: &[&str] = &[
+    // Who is calling.
+    "aws:PrincipalAccount",
+    "aws:PrincipalArn",
+    "aws:PrincipalOrgID",
+    "aws:PrincipalOrgPaths",
+    // Narrows only when true-valued; see `BOOLEAN_SCOPING_KEYS`.
+    "aws:PrincipalIsAWSService",
+    "aws:PrincipalServiceName",
+    // `aws:PrincipalType` is deliberately NOT here: `Anonymous` is one of its values, so
+    // a condition on it can pin a statement to unauthenticated callers rather than away
+    // from them.
+    "aws:userid",
+    "aws:username",
+    "aws:FederatedProvider",
+    // Which service, or which account's resource, is making the call.
+    "aws:SourceAccount",
+    "aws:SourceArn",
+    "aws:SourceOrgID",
+    "aws:SourceOrgPaths",
+    "aws:SourceOwner",
+    "kms:CallerAccount",
+    // The `aws:Resource…` family is deliberately NOT here: those keys describe the
+    // account or organization that OWNS the resource being accessed, not the caller, so a
+    // clause on one of them is satisfied for every caller, anonymous ones included.
+    // Which network path the call arrives on. A FIXED value of one of these is what AWS
+    // documents (S3 Block Public Access, "a fixed value of one of these condition keys")
+    // as keeping a wildcard-principal statement from being public.
+    "aws:SourceVpc",
+    "aws:SourceVpce",
+    "aws:SourceIp",
+    "aws:VpcSourceIp",
+];
+
+/// Scoping keys that carry a suffix naming one tag, so the whole family scopes
+/// (`aws:PrincipalTag/<tag-key>`), from the same documentation.
+const SCOPING_CONDITION_KEY_PREFIXES: &[&str] = &["aws:PrincipalTag/"];
+
+/// How a statement admits every principal, in the words the matching [`ReasonSummary`]
+/// carries. Both say the same thing a reason must say: which element opened the statement
+/// up, and that nothing scoped it back down.
+const WILDCARD_PRINCIPAL_REASON: &str = "The statement allows every principal (\"Principal\": \"*\") and carries no condition that scopes access to a known principal, account, organization, calling service or network path, so it can grant public access to the resource.";
+const NOT_PRINCIPAL_REASON: &str = "The statement allows every principal its NotPrincipal element does not list and carries no condition that scopes access to a known principal, account, organization, calling service or network path, so it can grant public access to the resource.";
+
+/// Why a parsed statement can grant public access, or `None` when it cannot.
+///
+/// The reason reports the statement's own position and `Sid`, so a caller can map it back
+/// onto the document it submitted.
+fn public_access_reason(statement: &policy::Statement) -> Option<ReasonSummary> {
+    // A `Deny` statement grants nothing, so it can never be why a policy is public.
+    if statement.effect != policy::Effect::Allow {
+        return None;
+    }
+    let principals = statement.principals.as_ref()?;
+    let description = if principals.negated {
+        // `NotPrincipal` with `Allow` admits every principal the element does not list.
+        NOT_PRINCIPAL_REASON
+    } else if principals.any {
+        // The element is `"*"`, or lists it: every caller, anonymous ones included.
+        WILDCARD_PRINCIPAL_REASON
+    } else {
+        // A statement naming only known principals grants nothing to the public,
+        // whatever its conditions say.
+        return None;
+    };
+    // The `Condition` block is a conjunction, so ONE clause that binds the caller is
+    // enough to keep the wildcard principal from reaching the public.
+    if statement.conditions.iter().any(clause_scopes_access) {
+        return None;
+    }
+    Some(ReasonSummary {
+        description: Some(description.to_string()),
+        statement_index: Some(statement.index),
+        statement_id: statement.sid.clone(),
+    })
+}
+
+/// Whether one condition clause binds the request to something the account names.
+fn clause_scopes_access(clause: &policy::ConditionClause) -> bool {
+    if !scoping_key(&clause.key) {
+        return false;
+    }
+    // A reversed operator says what the request must NOT be, and an `…IfExists` one is
+    // satisfied when the key is ABSENT — which is exactly what an anonymous caller
+    // carries — so neither binds a caller.
+    if clause.negated || clause.if_exists || clause.values.is_empty() {
+        return false;
+    }
+    if clause.operator == policy::Operator::Null {
+        // `Null` reads presence only: `"false"` demands the key be there, which binds the
+        // caller to one that carries it; `"true"` demands the opposite and binds nobody.
+        return clause
+            .values
+            .iter()
+            .all(|value| value.eq_ignore_ascii_case(NULL_KEY_MUST_EXIST));
+    }
+    // EVERY accepted value has to be a narrowing one: a clause that accepts both an
+    // account and `"*"` still accepts the public.
+    clause
+        .values
+        .iter()
+        .all(|value| value_scopes(&clause.key, value))
+}
+
+/// Whether a condition key is one of the scoping keys (or scoping-key families).
+fn scoping_key(key: &str) -> bool {
+    SCOPING_CONDITION_KEYS
+        .iter()
+        .any(|scoping| key.eq_ignore_ascii_case(scoping))
+        || SCOPING_CONDITION_KEY_PREFIXES
+            .iter()
+            .any(|prefix| key.len() > prefix.len() && starts_with_ignore_ascii_case(key, prefix))
+}
+
+/// Whether one condition value narrows access.
+///
+/// A value narrows only when it names something concrete, so a wildcard (`*` or `?`)
+/// anywhere makes it match callers the account never named. Three kinds of value are
+/// judged on their own terms: a flag key narrows only in the polarity that excludes
+/// nobody else (`BOOLEAN_SCOPING_KEYS`); a network address narrows unless its CIDR covers
+/// every address; and an ARN is judged on its ACCOUNT segment, since AWS pins a calling
+/// service's resource with an ARN whose resource part is a wildcard
+/// (`arn:aws:sns:<region>:<account>:*`) while `arn:aws:iam::*:role/*` names a principal in
+/// EVERY account, and an accountless ARN (`arn:aws:s3:::bucket`) still narrows when it
+/// names a resource.
+fn value_scopes(key: &str, value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if let Some((_, narrowing)) = BOOLEAN_SCOPING_KEYS
+        .iter()
+        .find(|(flag, _)| key.eq_ignore_ascii_case(flag))
+    {
+        return value.eq_ignore_ascii_case(narrowing);
+    }
+    if NETWORK_ADDRESS_KEYS
+        .iter()
+        .any(|network| key.eq_ignore_ascii_case(network))
+        && covers_every_address(value)
+    {
+        return false;
+    }
+    if starts_with_ignore_ascii_case(value, ARN_PREFIX) {
+        let fields: Vec<&str> = value.splitn(ARN_FIELD_COUNT, ARN_FIELD_SEPARATOR).collect();
+        let account = fields.get(ARN_ACCOUNT_FIELD).copied().unwrap_or_default();
+        let resource = fields.get(ARN_RESOURCE_FIELD).copied().unwrap_or_default();
+        return !has_wildcard(account) && !resource.is_empty();
+    }
+    !has_wildcard(value)
+}
+
+/// Whether a policy value carries either IAM wildcard character.
+fn has_wildcard(value: &str) -> bool {
+    value.contains('*') || value.contains('?')
+}
+
+/// Whether a network-address condition value covers every address, whatever spelling the
+/// document uses for the address itself: a CIDR prefix length of zero matches all of them.
+/// A value carrying no prefix length is a single address, which narrows.
+fn covers_every_address(value: &str) -> bool {
+    value
+        .rsplit_once(CIDR_PREFIX_SEPARATOR)
+        .and_then(|(_, prefix_length)| prefix_length.trim().parse::<u8>().ok())
+        .is_some_and(|prefix_length| prefix_length == EVERY_ADDRESS_PREFIX_LENGTH)
+}
+
+/// Whether `text` begins with `prefix`, compared the way IAM compares names (ASCII
+/// case-insensitively).
+///
+/// Byte-wise and length-checked rather than slicing `text`: these strings come from the
+/// caller's document, so a byte index into one could land inside a multi-byte character.
+fn starts_with_ignore_ascii_case(text: &str, prefix: &str) -> bool {
+    text.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+/// Render a parse refusal as the modelled error that says what happened, exactly as
+/// `CheckNoNewAccess` renders the same refusals: a document that is not JSON, not a policy
+/// of this grammar or past an input ceiling is a bad request member (HTTP 400
+/// `ValidationException`, with the model's own `cannotParse` / `fieldValidationFailed`
+/// reason and the member named in `fieldList`), while a document carrying a condition
+/// operator the shared engine does not model is answered with the modelled HTTP 422
+/// `UnprocessableEntityException` — "the specified entity could not be processed" — rather
+/// than with a guessed `PASS` or `FAIL`.
+fn render_engine_error(error: policy::EngineError) -> CheckNoPublicAccessError {
+    // A refusal record for the call: which member, and which kind of refusal. The details
+    // are structural (a member name, a JSON position, a budget), never document content.
+    ::tracing::info!(
+        operation = "CheckNoPublicAccess",
+        refusal = error.kind(),
+        member = error.member().unwrap_or("-"),
+        "refused a public-access check"
+    );
+    match error {
+        policy::EngineError::Unparseable { member, detail } => {
+            CheckNoPublicAccessErrorModeled::ValidationException(ValidationException {
+                message: format!("{member} is not a JSON document: {detail}"),
+                reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: member.to_string(),
+                    message: format!("not a JSON document: {detail}"),
+                }]),
+            })
+            .into()
+        }
+        policy::EngineError::Invalid { member, detail } => {
+            // The service's own one-member refusal shape, built where every other
+            // member refusal in this crate builds it.
+            CheckNoPublicAccessErrorModeled::ValidationException(
+                crate::state::field_validation_exception(
+                    member,
+                    format!("{member} is not a valid policy: {detail}"),
+                ),
+            )
+            .into()
+        }
+        policy::EngineError::Unsupported { detail } => {
+            CheckNoPublicAccessErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException { message: detail },
+            )
+            .into()
+        }
+    }
+}
+
+/// A `resourceType` outside the model's `AccessCheckResourceType` enum: "For resource
+/// types not supported as valid values, IAM Access Analyzer will return an error." ONE
+/// member is at fault, so the refusal is the service's own one-member shape — the same one
+/// `CheckNoNewAccess` answers for a `policyType` outside its enum.
+fn unsupported_resource_type(resource_type: &str) -> CheckNoPublicAccessErrorModeled {
+    CheckNoPublicAccessErrorModeled::ValidationException(crate::state::field_validation_exception(
+        "resourceType",
+        format!(
+            "resourceType must be one of {}, but was \"{resource_type}\"",
+            ACCESS_CHECK_RESOURCE_TYPE_VALUES.join(", ")
+        ),
+    ))
 }

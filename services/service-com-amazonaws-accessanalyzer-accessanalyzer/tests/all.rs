@@ -17,6 +17,8 @@ mod access_preview;
 mod analyzer_lifecycle;
 #[path = "all/archive_rule_update.rs"]
 mod archive_rule_update;
+#[path = "all/check_no_public_access.rs"]
+mod check_no_public_access;
 #[path = "all/error_payloads.rs"]
 mod error_payloads;
 #[path = "all/harness.rs"]
