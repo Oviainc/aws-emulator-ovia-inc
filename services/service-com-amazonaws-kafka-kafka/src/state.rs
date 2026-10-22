@@ -9,20 +9,27 @@
 //! predicates beside it. Keeping them next to the record is what makes the two
 //! readers agree: they render the same stored cluster the same way.
 //!
-//! The replicator registry sits beside it on the same principle: a [`Replicator`]
+//! The channel registry lives beside it, keyed by channel ARN and indexed by
+//! (cluster ARN, channel name) — a channel is a sub-resource of the cluster it
+//! streams from, so it is only ever resolved through that cluster and disappears
+//! with it.
+//!
+//! The replicator registry sits beside them on the same principle: a [`Replicator`]
 //! holds the whole replication setup, and [`Replicator::to_replicator_summary`] is
 //! the one rendering `ListReplicators` reports it through.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    BrokerNodeGroupInfo, BrokerSoftwareInfo, ClientAuthentication, ClusterInfo, ConfigurationInfo,
-    CreateClusterInput, EncryptionAtRest, EncryptionInTransit, EncryptionInfo, JmxExporter,
-    JmxExporterInfo, KafkaCluster, KafkaClusterSummary, LoggingInfo, NodeExporter,
-    NodeExporterInfo, OpenMonitoring, OpenMonitoringInfo, Prometheus, PrometheusInfo, Provisioned,
-    Rebalancing, ReplicationInfo, ReplicationInfoSummary, ReplicatorSummary,
+    BrokerNodeGroupInfo, BrokerSoftwareInfo, ChannelLoggingInfo, ClientAuthentication, ClusterInfo,
+    ConfigurationInfo, CreateChannelInput, CreateClusterInput, DescribeChannelOutput,
+    EncryptionAtRest, EncryptionConfiguration, EncryptionInTransit, EncryptionInfo,
+    IcebergDestinationConfiguration, JmxExporter, JmxExporterInfo, KafkaCluster,
+    KafkaClusterSummary, LoggingInfo, NodeExporter, NodeExporterInfo, OpenMonitoring,
+    OpenMonitoringInfo, Prometheus, PrometheusInfo, Provisioned, Rebalancing, ReplicationInfo,
+    ReplicationInfoSummary, ReplicatorSummary, S3DestinationConfiguration, TopicConfiguration,
 };
 
 /// How long after `CreateCluster` a new cluster becomes `ACTIVE`.
@@ -54,6 +61,27 @@ pub const MAX_CLUSTERS_PER_REGION: usize = 90;
 /// regions than AWS publishes, so it can only ever be reached by a caller trying
 /// to exhaust the emulator, never by a realistic client script.
 pub const MAX_CLUSTERS_IN_REGISTRY: usize = MAX_CLUSTERS_PER_REGION * 64;
+
+/// How long after `CreateChannel` a new channel becomes `ACTIVE`.
+///
+/// CHOSEN, not documented: the real service takes a while to stand a channel's
+/// delivery pipeline up. The project fixes an emulated clock-owed transition at
+/// 250–750 ms, so a caller that describes the channel immediately still observes
+/// `CREATING` while a caller that waits sees `ACTIVE`.
+pub const CHANNEL_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// Topic configurations one channel carries: `CreateChannelRequest$TopicConfigurationList`
+/// documents "Currently exactly one topic must be specified", so a list of any
+/// other length is refused with the modelled `BadRequestException`.
+pub const TOPIC_CONFIGURATIONS_PER_CHANNEL: usize = 1;
+
+/// Channels one cluster may hold.
+///
+/// CHOSEN as a process-safety backstop, not a published AWS quota: a channel
+/// record is created by a request, so without a ceiling the registry would grow
+/// with the number of calls. Sized well above what any realistic client script
+/// creates against one cluster.
+pub const MAX_CHANNELS_PER_CLUSTER: usize = 100;
 
 /// Amazon MSK provisions a three-node Apache ZooKeeper ensemble alongside a
 /// provisioned cluster, which is what `ZookeeperConnectString` enumerates.
@@ -165,6 +193,61 @@ pub struct Cluster {
     pub zookeeper_connect_string: String,
     pub zookeeper_connect_string_tls: String,
     pub brokers: Vec<BrokerNode>,
+}
+
+/// A channel streaming one cluster topic to Amazon S3 or Apache Iceberg, holding
+/// the whole submitted configuration so every reader is computed from the record
+/// rather than echoed from a request.
+#[derive(Debug, Clone)]
+pub struct Channel {
+    pub arn: String,
+    pub name: String,
+    /// The ARN of the cluster the channel reads from. A channel name is unique
+    /// WITHIN a cluster, so this is half of its registry key, and a channel is
+    /// only ever reported under the cluster that holds it.
+    pub cluster_arn: String,
+    /// The region the channel lives in: the region of the cluster that holds it,
+    /// and the region segment of its own ARN.
+    pub region: String,
+    pub creation_time: SystemTime,
+    /// The instant the clock owes this channel its `CREATING` -> `ACTIVE`
+    /// transition. Stored, never slept on.
+    pub active_due: SystemTime,
+    /// A `ChannelStatus` value.
+    pub status: String,
+    /// A `ChannelDestinationType` value, DERIVED from which destination
+    /// configuration the create carried rather than taken from the request.
+    pub destination_type: String,
+    pub encryption_configuration: Option<EncryptionConfiguration>,
+    pub iceberg_destination_configuration: Option<IcebergDestinationConfiguration>,
+    pub s3_destination_configuration: Option<S3DestinationConfiguration>,
+    pub topic_configuration_list: Vec<TopicConfiguration>,
+    pub logging_info: Option<ChannelLoggingInfo>,
+    /// Ordered so `DescribeChannel` renders a stable map.
+    pub tags: BTreeMap<String, String>,
+    /// The cluster operation that created the channel, as `CreateChannel` and
+    /// `DescribeChannel` both report it: minted once with the channel and stored,
+    /// so the two readers never disagree about it.
+    pub cluster_operation_arn: String,
+}
+
+/// The `ChannelDestinationType` value for a channel whose records land in an
+/// Apache Iceberg table.
+pub const DESTINATION_TYPE_ICEBERG: &str = "ICEBERG";
+/// The `ChannelDestinationType` value for a channel whose records land in an
+/// Amazon S3 bucket.
+pub const DESTINATION_TYPE_S3: &str = "S3";
+
+/// Why [`ComAmazonawsKafkaKafkaState::register_channel`] refused to register a
+/// channel. Every variant leaves the registry exactly as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelRejected {
+    /// The cluster already holds [`MAX_CHANNELS_PER_CLUSTER`] channels.
+    ClusterQuota,
+    /// A channel with this ARN is already registered. The registry's monotonic
+    /// ordinal makes this unreachable; it is refused rather than overwriting an
+    /// existing channel.
+    DuplicateArn,
 }
 
 /// Which clusters a cluster listing keeps, on top of the endpoint's own region.
@@ -385,6 +468,20 @@ pub struct ComAmazonawsKafkaKafkaState {
     /// Monotonic counter feeding the ARN and DNS suffixes, so each cluster gets a
     /// distinct identity and a rebuilt emulator reproduces the same ones.
     pub next_cluster_suffix: u64,
+    /// Every live channel, keyed by ARN. `BTreeMap` so `ListChannels` has one
+    /// total order to page through.
+    pub channels: BTreeMap<String, Channel>,
+    /// (cluster ARN, channel name) -> channel ARN. A channel name is unique
+    /// within a cluster — the same name under two clusters is two channels — so
+    /// the key carries the cluster as well as the name.
+    pub channel_arn_by_name: HashMap<(String, String), String>,
+    /// cluster ARN -> the ARNs of the channels it holds, so the per-cluster
+    /// quota costs a lookup and deleting a cluster drops exactly its own
+    /// channels rather than walking the whole registry.
+    pub channel_arns_by_cluster: HashMap<String, BTreeSet<String>>,
+    /// Monotonic counter feeding each channel's ARN and its create operation's
+    /// ARN, so every channel gets a distinct identity.
+    pub next_channel_suffix: u64,
     /// Every registered replicator, keyed by ARN. `BTreeMap` so
     /// `ListReplicators` has one total order to page through, the same way the
     /// cluster registry gives `ListClusters` one.
@@ -440,6 +537,11 @@ impl ComAmazonawsKafkaKafkaState {
 
     /// Remove the cluster `arn` names from every index, handing it back. The one
     /// removal path, for the same reason.
+    ///
+    /// A channel reads from a cluster, so a cluster that is gone holds no
+    /// channels: every channel registered under `arn` is dropped here too, which
+    /// is why this is also the one place that can orphan a channel — and does
+    /// not.
     pub fn unregister_cluster(&mut self, arn: &str) -> Option<Cluster> {
         let cluster = self.clusters.remove(arn)?;
         self.cluster_arn_by_name
@@ -448,6 +550,16 @@ impl ComAmazonawsKafkaKafkaState {
             *count = count.saturating_sub(1);
             if *count == 0 {
                 self.clusters_per_region.remove(&cluster.region);
+            }
+        }
+        for channel_arn in self
+            .channel_arns_by_cluster
+            .remove(arn)
+            .unwrap_or_default()
+        {
+            if let Some(channel) = self.channels.remove(&channel_arn) {
+                self.channel_arn_by_name
+                    .remove(&(channel.cluster_arn, channel.name));
             }
         }
         Some(cluster)
@@ -524,6 +636,100 @@ impl ComAmazonawsKafkaKafkaState {
         Some(cluster)
     }
 
+    /// The ARN registered for channel `name` under the cluster `cluster_arn`, if
+    /// any. This is the lookup that makes a repeated `CreateChannel` a conflict.
+    pub fn channel_arn_for_name(&self, cluster_arn: &str, name: &str) -> Option<&String> {
+        self.channel_arn_by_name
+            .get(&(cluster_arn.to_string(), name.to_string()))
+    }
+
+    /// How many channels `cluster_arn` currently holds — what the per-cluster
+    /// ceiling is checked against. O(1): the index is maintained as channels come
+    /// and go.
+    pub fn channel_count_in_cluster(&self, cluster_arn: &str) -> usize {
+        self.channel_arns_by_cluster
+            .get(cluster_arn)
+            .map_or(0, BTreeSet::len)
+    }
+
+    /// Add `channel` to every index that must know about it. The one insertion
+    /// path, so the ARN registry, the (cluster, name) index and the per-cluster
+    /// index cannot drift apart — and the one place the per-cluster ceiling is
+    /// enforced, so it holds for every caller of this module.
+    ///
+    /// Refuses, changing nothing, when the cluster is at
+    /// [`MAX_CHANNELS_PER_CLUSTER`] or when the ARN is already registered.
+    pub fn register_channel(&mut self, channel: Channel) -> Result<(), ChannelRejected> {
+        if self.channels.contains_key(&channel.arn) {
+            return Err(ChannelRejected::DuplicateArn);
+        }
+        if self.channel_count_in_cluster(&channel.cluster_arn) >= MAX_CHANNELS_PER_CLUSTER {
+            return Err(ChannelRejected::ClusterQuota);
+        }
+        self.channel_arns_by_cluster
+            .entry(channel.cluster_arn.clone())
+            .or_default()
+            .insert(channel.arn.clone());
+        self.channel_arn_by_name.insert(
+            (channel.cluster_arn.clone(), channel.name.clone()),
+            channel.arn.clone(),
+        );
+        self.channels.insert(channel.arn.clone(), channel);
+        Ok(())
+    }
+
+    /// Remove the channel `arn` names from every index, handing it back. The one
+    /// removal path, for the same reason.
+    pub fn unregister_channel(&mut self, arn: &str) -> Option<Channel> {
+        let channel = self.channels.remove(arn)?;
+        self.channel_arn_by_name
+            .remove(&(channel.cluster_arn.clone(), channel.name.clone()));
+        if let Some(arns) = self.channel_arns_by_cluster.get_mut(&channel.cluster_arn) {
+            arns.remove(arn);
+            if arns.is_empty() {
+                self.channel_arns_by_cluster.remove(&channel.cluster_arn);
+            }
+        }
+        Some(channel)
+    }
+
+    /// The channel `channel_arn` names, as an endpoint for `region` sees it, and
+    /// only when the cluster in the request's path is the one that holds it.
+    ///
+    /// A channel is addressed under its cluster, so a channel ARN presented with
+    /// another cluster's ARN resolves to `None` exactly as an absent one does —
+    /// the same way [`Self::cluster_in`] refuses another region's cluster.
+    pub fn channel_in(
+        &self,
+        region: &str,
+        cluster_arn: &str,
+        channel_arn: &str,
+    ) -> Option<&Channel> {
+        self.channels
+            .get(channel_arn)
+            .filter(|channel| channel.region == region && channel.cluster_arn == cluster_arn)
+    }
+
+    /// The same lookup, with the `CREATING` -> `ACTIVE` transition the clock
+    /// already owed THIS channel materialised.
+    ///
+    /// Scoped to the one channel being reported, for the same reason
+    /// [`Self::settled_cluster_in`] is.
+    pub fn settled_channel_in(
+        &mut self,
+        region: &str,
+        cluster_arn: &str,
+        channel_arn: &str,
+        now: SystemTime,
+    ) -> Option<&Channel> {
+        let channel = self.channels.get_mut(channel_arn)?;
+        if channel.region != region || channel.cluster_arn != cluster_arn {
+            return None;
+        }
+        channel.settle(now);
+        Some(channel)
+    }
+
     /// Choose one page of this endpoint's clusters: the keys a listing reports,
     /// plus its `NextToken`.
     ///
@@ -586,6 +792,110 @@ pub fn decode_cluster_page_token(token: &str) -> Option<String> {
     decoded
         .strip_prefix(CLUSTER_PAGE_TOKEN_PREFIX)
         .map(ToString::to_string)
+}
+
+impl Channel {
+    /// Mint a channel of `cluster`: derive its identity from `suffix` (the
+    /// registry's monotonic counter) and the cluster that holds it, and keep the
+    /// submitted configuration whole.
+    ///
+    /// `now` is the creation instant and `input` the submitted configuration as
+    /// `CreateChannel` deserialized it. The destination type is DERIVED from
+    /// which destination configuration the request carried; the handler has
+    /// already refused a request that carried both or neither, so a record can
+    /// never describe a destination it does not hold.
+    pub fn streaming(
+        cluster: &Cluster,
+        suffix: u64,
+        now: SystemTime,
+        input: CreateChannelInput,
+    ) -> Self {
+        let name = input.channel_name.as_str();
+        // The registry's counter, as a 1-based ordinal; the SAME value seeds both
+        // digests below, so a channel's id and its create operation's id follow
+        // from one number.
+        let ordinal = suffix + 1;
+        let channel_id = uuid_v4_shaped_from_digest(&stable_digest(&format!(
+            "{}:{}:channel:{name}:{ordinal}",
+            ::engine::emulator_account_id(),
+            cluster.arn
+        )));
+        let operation_id = uuid_v4_shaped_from_digest(&stable_digest(&format!(
+            "{}:{}:channel-operation:{name}:{ordinal}",
+            ::engine::emulator_account_id(),
+            cluster.arn
+        )));
+        // The cluster's own resource id, so a channel ARN names the cluster it
+        // belongs to the way an MSK sub-resource ARN does.
+        let cluster_id = cluster.arn.split('/').next_back().unwrap_or_default();
+        let destination_type = if input.iceberg_destination_configuration.is_some() {
+            DESTINATION_TYPE_ICEBERG
+        } else {
+            DESTINATION_TYPE_S3
+        };
+
+        Self {
+            arn: ::engine::emulator_arn(
+                "kafka",
+                &cluster.region,
+                &format!("channel/{}/{cluster_id}/{name}/{channel_id}", cluster.name),
+            ),
+            name: input.channel_name,
+            cluster_arn: cluster.arn.clone(),
+            region: cluster.region.clone(),
+            creation_time: now,
+            active_due: now + CHANNEL_ACTIVATION_DELAY,
+            status: "CREATING".to_string(),
+            destination_type: destination_type.to_string(),
+            encryption_configuration: input.encryption_configuration,
+            iceberg_destination_configuration: input.iceberg_destination_configuration,
+            s3_destination_configuration: input.s3_destination_configuration,
+            topic_configuration_list: input.topic_configuration_list,
+            logging_info: input.logging_info,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            cluster_operation_arn: ::engine::emulator_arn(
+                "kafka",
+                &cluster.region,
+                &format!(
+                    "cluster-operation/{}/{cluster_id}/{operation_id}",
+                    cluster.name
+                ),
+            ),
+        }
+    }
+
+    /// Apply the `CREATING` -> `ACTIVE` transition once `now` has reached
+    /// [`Self::active_due`]. Idempotent, and a no-op for every other status: only
+    /// a transition the clock already owed is materialised here.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.status == "CREATING" && now >= self.active_due {
+            self.status = "ACTIVE".to_string();
+        }
+    }
+
+    /// The channel as `DescribeChannel` reports it. Kept next to the record for
+    /// the same reason [`Cluster::to_cluster_info`] is: every reader of a channel
+    /// renders the one stored record the same way.
+    pub fn to_describe_output(&self) -> DescribeChannelOutput {
+        DescribeChannelOutput {
+            channel_arn: self.arn.clone(),
+            channel_name: self.name.clone(),
+            encryption_configuration: self.encryption_configuration.clone(),
+            iceberg_destination_configuration: self.iceberg_destination_configuration.clone(),
+            s3_destination_configuration: self.s3_destination_configuration.clone(),
+            status: self.status.clone(),
+            destination_type: self.destination_type.clone(),
+            creation_time: ::aws_smithy_types::DateTime::from(self.creation_time),
+            topic_configuration_list: self.topic_configuration_list.clone(),
+            logging_info: self.logging_info.clone(),
+            // `ChannelStateInfo` reports why a channel is in a state that needs
+            // explaining; nothing has gone wrong with a channel this emulator
+            // creates, so there is none to report.
+            state_info: None,
+            cluster_operation_arn: Some(self.cluster_operation_arn.clone()),
+            tags: Some(self.tags.clone().into_iter().collect()),
+        }
+    }
 }
 
 impl Cluster {
@@ -1087,6 +1397,63 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// well-formed ARN no live cluster holds: that is the distinction the real
 /// service draws between a request it cannot parse and a resource it cannot find.
 pub fn is_cluster_arn(value: &str) -> bool {
+    let Some(resource) = kafka_arn_resource(value) else {
+        return false;
+    };
+    let mut segments = resource.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next()
+        ),
+        (Some("cluster"), Some(name), Some(id), None) if !name.is_empty() && !id.is_empty()
+    )
+}
+
+/// Whether `value` is shaped like an MSK channel ARN —
+/// `arn:<partition>:kafka:<region>:<account>:channel/<cluster>/<cluster-id>/<name>/<id>`,
+/// the form [`Channel::streaming`] mints: a channel is a sub-resource of the
+/// cluster it reads from, so its ARN names that cluster.
+///
+/// Same division of labour as [`is_cluster_arn`]: a value that is not an ARN of
+/// this kind is a `BadRequestException`, and `NotFoundException` is reserved for
+/// a well-formed ARN no live channel holds.
+pub fn is_channel_arn(value: &str) -> bool {
+    let Some(resource) = kafka_arn_resource(value) else {
+        return false;
+    };
+    let mut segments = resource.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next()
+        ),
+        (
+            Some("channel"),
+            Some(cluster),
+            Some(cluster_id),
+            Some(name),
+            Some(id),
+            None,
+        ) if !cluster.is_empty()
+            && !cluster_id.is_empty()
+            && !name.is_empty()
+            && !id.is_empty()
+    )
+}
+
+/// The resource part of `value` when it is an ARN of THIS service in some
+/// partition, region and account — `arn:<partition>:kafka:<region>:<account>:`
+/// followed by the resource — and `None` otherwise. The one ARN parse the
+/// `is_*_arn` predicates share, so they cannot disagree about the five fields in
+/// front of the resource.
+fn kafka_arn_resource(value: &str) -> Option<&str> {
     let mut fields = value.splitn(6, ':');
     let (
         Some("arn"),
@@ -1104,19 +1471,10 @@ pub fn is_cluster_arn(value: &str) -> bool {
         fields.next(),
     )
     else {
-        return false;
+        return None;
     };
     if partition.is_empty() || region.is_empty() || account.is_empty() {
-        return false;
+        return None;
     }
-    let mut segments = resource.split('/');
-    matches!(
-        (
-            segments.next(),
-            segments.next(),
-            segments.next(),
-            segments.next()
-        ),
-        (Some("cluster"), Some(name), Some(id), None) if !name.is_empty() && !id.is_empty()
-    )
+    Some(resource)
 }

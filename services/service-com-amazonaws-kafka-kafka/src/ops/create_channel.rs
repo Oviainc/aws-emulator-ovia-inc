@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a channel that streams one cluster topic to Amazon S3 or Apache Iceberg and
+//! registers it in [`crate::state::ComAmazonawsKafkaKafkaState`]. A channel is a
+//! sub-resource of the cluster named in the request path, so a cluster this endpoint's
+//! region does not hold is a `NotFoundException`, and a channel name already taken
+//! within that cluster is a `ConflictException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The documented request rules this refuses with `BadRequestException`: exactly one
+//! topic configuration (`CreateChannelRequest$TopicConfigurationList` — "Currently
+//! exactly one topic must be specified") and exactly one destination
+//! (`s3DestinationConfiguration` and `icebergDestinationConfiguration` are documented
+//! as mutually exclusive, and a channel has to deliver somewhere).
+//!
+//! Authentication and authorization are NOT this handler's business: the emulator
+//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
+//! constructed here.
+//!
+//! The scaffold notes below describe the framework; they are kept because they document
+//! the seams this handler uses.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +176,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChannel"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateChannelErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // Request-only checks first: they depend on nothing in the registry, so
+        // the state lock below is held only for the state-dependent work.
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(
+                CreateChannelErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK cluster ARN.",
+                        input.cluster_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+        // "Currently exactly one topic must be specified" — the model's own
+        // documentation of this member.
+        if input.topic_configuration_list.len() != crate::state::TOPIC_CONFIGURATIONS_PER_CHANNEL {
+            return Err(
+                CreateChannelErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("TopicConfigurationList".to_string()),
+                    message: Some(format!(
+                        "Exactly {} topic configuration must be specified, not {}.",
+                        crate::state::TOPIC_CONFIGURATIONS_PER_CHANNEL,
+                        input.topic_configuration_list.len()
+                    )),
+                })
+                .into(),
+            );
+        }
+        // The two destination configurations are documented as mutually
+        // exclusive, and a channel has to deliver somewhere: exactly one.
+        let destinations = usize::from(input.s3_destination_configuration.is_some())
+            + usize::from(input.iceberg_destination_configuration.is_some());
+        if destinations != 1 {
+            return Err(
+                CreateChannelErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("S3DestinationConfiguration".to_string()),
+                    message: Some(format!(
+                        "Exactly one of s3DestinationConfiguration and \
+                         icebergDestinationConfiguration must be specified, not {destinations}."
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        let mut state = state.lock();
+
+        // A channel reads from a cluster, so the cluster in the request path has
+        // to be one this endpoint's region holds before anything is minted.
+        // The message is informative, not contractual: AWS neither documents nor
+        // models the text of this error, so this handler says what a caller can
+        // act on (which region looked, and for which ARN) rather than copying any
+        // one recorded phrasing.
+        let Some(cluster) = state.cluster_in(&region, &input.cluster_arn) else {
+            return Err(
+                CreateChannelErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "No cluster exists in {region} with the ARN {}",
+                        input.cluster_arn
+                    )),
+                })
+                .into(),
+            );
+        };
+
+        // A channel name identifies a channel WITHIN a cluster, so a name already
+        // in use under THIS cluster is a conflict; the same name under another
+        // cluster is a different channel.
+        if let Some(existing) =
+            state.channel_arn_for_name(&input.cluster_arn, &input.channel_name)
+        {
+            return Err(
+                CreateChannelErrorModeled::ConflictException(ConflictException {
+                    invalid_parameter: Some("ChannelName".to_string()),
+                    message: Some(format!(
+                        "A channel with the name '{}' already exists: {existing}",
+                        input.channel_name
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The monotonic counter is what makes each channel's ARN and its create
+        // operation's ARN distinct; it advances whether or not anything else
+        // about the request repeats an earlier one.
+        let suffix = state.next_channel_suffix;
+        let channel =
+            crate::state::Channel::streaming(cluster, suffix, std::time::SystemTime::now(), input);
+        let output = CreateChannelOutput {
+            channel_arn: channel.arn.clone(),
+            cluster_operation_arn: Some(channel.cluster_operation_arn.clone()),
+        };
+        // The registry enforces its own per-cluster ceiling on the one insertion
+        // path, so a create past it is refused there rather than growing the
+        // store by one more call. A refused create registers nothing, so the
+        // ordinal it would have taken is left unspent: the counter counts
+        // channels ever registered, not calls ever made.
+        if let Err(rejected) = state.register_channel(channel) {
+            return Err(match rejected {
+                crate::state::ChannelRejected::ClusterQuota => {
+                    CreateChannelErrorModeled::TooManyRequestsException(TooManyRequestsException {
+                        invalid_parameter: Some("ChannelName".to_string()),
+                        message: Some(format!(
+                            "This emulator holds its maximum of {} channels for one cluster.",
+                            crate::state::MAX_CHANNELS_PER_CLUSTER
+                        )),
+                    })
+                    .into()
+                }
+                // Unreachable: the ordinal above is monotonic, so the ARN it
+                // mints is new. Reported as a server fault rather than
+                // overwriting a channel.
+                crate::state::ChannelRejected::DuplicateArn => {
+                    CreateChannelErrorModeled::InternalServerErrorException(
+                        InternalServerErrorException {
+                            invalid_parameter: None,
+                            message: Some(
+                                "the minted channel ARN is already registered".to_string(),
+                            ),
+                        },
+                    )
+                    .into()
+                }
+            });
+        }
+        state.next_channel_suffix = suffix + 1;
+        Ok(output)
     }
 }
