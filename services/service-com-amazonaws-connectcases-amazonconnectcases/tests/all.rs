@@ -19,3 +19,5 @@ mod case_lifecycle;
 mod layout_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/template_listing.rs"]
+mod template_listing;

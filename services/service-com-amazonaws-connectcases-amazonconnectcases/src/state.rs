@@ -28,6 +28,11 @@
 //! refused on the WRITE paths only ([`duplicate_ids`]), where two values for one
 //! id is ambiguous; a read answers one entry per occurrence, since the model
 //! declares no distinctness constraint and the caps already bound the response.
+//!
+//! A listing's answer is bounded the same way: [`page`] cuts it at
+//! [`MAX_PAGE_SIZE`] even when the request names no `maxResults`, and hands back
+//! an opaque `nextToken` for the rest, so no single response grows with the
+//! store.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -42,7 +47,7 @@ use crate::ops::types::{
     BasicLayout, EventBridgeConfiguration, FieldAttributes, FieldValueUnion,
     InternalServerException, LayoutConfiguration, LayoutContent, LayoutSections, RequiredField,
     ResourceNotFoundException, Section, ServiceQuotaExceededException, TagPropagationConfiguration,
-    UserUnion,
+    UserUnion, ValidationException,
 };
 
 /// The ARN namespace (and SigV4 signing name / endpoint prefix) of this service,
@@ -338,6 +343,27 @@ impl Domain {
             .ok_or_else(|| not_found("Template", template_id))
     }
 
+    /// Every template this domain still holds, in creation order and each
+    /// paired with the key [`order_key`] builds for it, with the deleted ones
+    /// left out: what a listing of templates reports before the request's own
+    /// filters narrow it. A deleted template is gone as far as a reader is
+    /// concerned, exactly as in [`Self::template`].
+    pub fn live_templates(&self) -> Vec<(String, &Template)> {
+        let mut templates: Vec<(String, &Template)> = self
+            .templates
+            .values()
+            .filter(|template| !template.deleted)
+            .map(|template| {
+                (
+                    order_key(template.created_time, &template.template_id),
+                    template,
+                )
+            })
+            .collect();
+        templates.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        templates
+    }
+
     /// Refuse a new field once the domain holds [`MAX_FIELDS_PER_DOMAIN`].
     pub fn field_capacity(&self) -> Result<(), ServiceQuotaExceededException> {
         capacity(
@@ -547,6 +573,184 @@ pub fn name_ids(ids: &[String]) -> String {
         )
     }
 }
+
+/// Most entries one page of a listing holds. The model's own cap, stated twice
+/// for every paginated listing in this service: `MaxResults` is `@range(1..100)`
+/// and the summary list a response carries is `@length(max: 100)`
+/// (`smithy_query(query="operation", operation="ListTemplates")`). A request
+/// that names no `maxResults` therefore gets at most this many entries and a
+/// `nextToken` for the rest, never the whole store in one answer.
+pub const MAX_PAGE_SIZE: i32 = 100;
+
+/// One page of a listing: the entries on it, and the token that resumes after
+/// them (`None` when nothing remains).
+#[derive(Debug)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_token: Option<String>,
+}
+
+/// Why a listing refused its paging arguments.
+#[derive(Debug)]
+pub enum PageError {
+    /// `nextToken` was not a token this service issued.
+    InvalidToken(String),
+    /// `maxResults` was not a page size in the modelled range.
+    InvalidMaxResults(i32),
+}
+
+/// Take one page out of an ORDERED listing.
+///
+/// `all` is every entry that matches the request, each paired with the key the
+/// listing is ordered by (see [`order_key`]) and already sorted by it. The page
+/// holds at most `max_results` entries starting at `next_token`, and carries a
+/// token only when further entries remain — so a caller that follows tokens to
+/// exhaustion sees every entry exactly once, and a page that is not full is the
+/// last one.
+///
+/// `scope` identifies the LISTING: the operation, the container it reports and
+/// the filters that narrowed it (see [`page_scope`]). It is stamped into the
+/// token, and a token presented to a different listing is refused rather than
+/// resumed from — resuming one listing from another listing's cursor would
+/// answer a page of unrelated entries, starting at an arbitrary offset.
+///
+/// The token names the first entry NOT on the page rather than a server-side
+/// cursor, so paging holds no per-caller state and nothing a listing hands out
+/// has to be remembered.
+pub fn page<T>(
+    scope: &str,
+    all: Vec<(String, T)>,
+    max_results: Option<i32>,
+    next_token: Option<&str>,
+) -> Result<Page<T>, PageError> {
+    // `maxResults` first: a request that is wrong in both arguments is told
+    // about the page size, which is the one it can fix without another call.
+    let limit = match max_results {
+        None => MAX_PAGE_SIZE as usize,
+        // The modelled range is enforced in both directions: a page size the
+        // model does not admit is refused, never quietly clamped to one it does.
+        Some(requested) if (1..=MAX_PAGE_SIZE).contains(&requested) => requested as usize,
+        Some(requested) => return Err(PageError::InvalidMaxResults(requested)),
+    };
+    // An empty `nextToken` is a value the model's `@length(0..9000)` admits and
+    // means "from the start", the same as not sending one.
+    let start = match next_token.filter(|token| !token.is_empty()) {
+        None => None,
+        Some(token) => Some(
+            decode_page_token(scope, token)
+                .ok_or_else(|| PageError::InvalidToken(token.to_string()))?,
+        ),
+    };
+
+    let mut rest = all
+        .into_iter()
+        .skip_while(|(key, _)| start.as_deref().is_some_and(|from| key.as_str() < from));
+    let items: Vec<T> = rest.by_ref().take(limit).map(|(_, item)| item).collect();
+    let next_token = rest.next().map(|(key, _)| encode_page_token(scope, &key));
+    Ok(Page { items, next_token })
+}
+
+/// The scope of one listing, for [`page`]: the operation, the container whose
+/// resources it reports, and the filter values that narrowed it, in a form two
+/// calls of the SAME listing agree on — the filters are sorted, so naming the
+/// same values in another order is the same listing. The components are joined
+/// for readability only: a token stamps a DIGEST of the whole scope
+/// ([`encode_page_token`]), so two different scopes cannot collide by how their
+/// components happen to be punctuated.
+pub fn page_scope(operation: &str, container: &str, filters: &[String]) -> String {
+    let mut filters: Vec<&str> = filters.iter().map(String::as_str).collect();
+    filters.sort_unstable();
+    format!("{operation}/{container}/{}", filters.join(","))
+}
+
+/// The modelled 400 for paging arguments a listing cannot honour, naming the
+/// member a client has to fix.
+pub fn page_validation_exception(error: &PageError) -> ValidationException {
+    let message = match error {
+        // The token is named, but only its leading characters: the model admits a
+        // `nextToken` of up to 9000 characters, and a refusal does not echo a
+        // whole request member back — the same discipline [`name_ids`] applies.
+        PageError::InvalidToken(token) => format!(
+            "nextToken {} is not a pagination token this service issued for this listing",
+            abbreviate(token)
+        ),
+        PageError::InvalidMaxResults(requested) => format!(
+            "maxResults must be between 1 and {MAX_PAGE_SIZE}, but was {requested}"
+        ),
+    };
+    ValidationException { message }
+}
+
+/// Most characters of a caller-supplied token a refusal repeats, so a refusal
+/// over a long member cannot be amplified into a long response.
+pub const MAX_TOKEN_CHARS_IN_A_REFUSAL: usize = 24;
+
+/// `value` as a refusal names it: itself when short, else its first
+/// [`MAX_TOKEN_CHARS_IN_A_REFUSAL`] characters and the length of the rest.
+fn abbreviate(value: &str) -> String {
+    if value.chars().count() <= MAX_TOKEN_CHARS_IN_A_REFUSAL {
+        value.to_string()
+    } else {
+        let head: String = value.chars().take(MAX_TOKEN_CHARS_IN_A_REFUSAL).collect();
+        format!(
+            "{head}... ({} characters in all)",
+            value.chars().count()
+        )
+    }
+}
+
+/// The key a listing of resources created in one container is ordered by:
+/// creation instant first, the resource's own id to break a tie between two
+/// created in the same instant. Lexicographic order over this key is creation
+/// order, which is what makes a page boundary stable — a listing has to iterate
+/// in the same order for the call that hands out a `nextToken` and the call that
+/// resumes from it, and the store keeps its resources in a hash map.
+pub fn order_key(created_time: SystemTime, id: &str) -> String {
+    let nanos = created_time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{nanos:039}#{id}")
+}
+
+/// Encode a listing key as an opaque continuation token.
+///
+/// The key is prefixed with a version marker and a FIXED-WIDTH digest of the
+/// listing's own `scope` before hex-encoding, so the token is opaque to a client
+/// (it is not the key it was built from) AND a value this service did not issue
+/// FOR THIS LISTING is refused rather than resumed from: hex alone would accept
+/// any even-length hex string as a cursor, and a service-wide marker alone would
+/// let one listing's token resume another. The digest is what makes the scope /
+/// key boundary unambiguous whatever the scope's components contain, so no
+/// separator convention has to hold for a token to decode to the right listing.
+/// It stays a pure function of the scope and the key, so the token is stable and
+/// carries no server-side cursor state.
+fn encode_page_token(scope: &str, key: &str) -> String {
+    ::hex::encode(format!("{PAGE_TOKEN_PREFIX}{}{key}", scope_digest(scope)))
+}
+
+/// The inverse of [`encode_page_token`]; `None` for anything this service did
+/// not issue for the listing `scope` names.
+fn decode_page_token(scope: &str, token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    decoded
+        .strip_prefix(&format!("{PAGE_TOKEN_PREFIX}{}", scope_digest(scope)))
+        .map(str::to_string)
+}
+
+/// `scope` as a fixed-width hex digest, so a token's scope stamp occupies the
+/// same number of characters for every listing and cannot run into the order key
+/// after it. SHA-256 from `sha2`, as the ids are minted ([`new_id`]); this crate
+/// implements no hash of its own.
+fn scope_digest(scope: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(scope.as_bytes());
+    ::hex::encode(hasher.finalize())
+}
+
+/// Marks a continuation token as this service's, and at which version it was
+/// issued.
+const PAGE_TOKEN_PREFIX: &str = "connectcases:v1:";
 
 /// A fresh opaque resource id, in the textual form the real service's ids take
 /// (a hyphenated, version-4 UUID): SHA-256 over this process's OS-seeded
