@@ -13,8 +13,8 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    assert_members, is_modelled_key_id, is_modelled_server_id, member_of, Emulator, ACCOUNT,
-    PAST_START_SPAN, REGION, ROLE, SSH_KEY,
+    assert_members, drain_pages, is_modelled_key_id, is_modelled_server_id, member_of, Emulator,
+    ACCOUNT, PAST_START_SPAN, REGION, ROLE, SSH_KEY,
 };
 
 // ---------------------------------------------------------------------------
@@ -565,61 +565,6 @@ async fn listed_ssh_public_key_count_matches_the_stored_keys() {
 // ---------------------------------------------------------------------------
 // Pagination.
 // ---------------------------------------------------------------------------
-
-/// Drain every page of a `List*` operation, returning the per-page item counts and the
-/// concatenated item key at `key_member`.
-async fn drain_pages(
-    emulator: &Emulator,
-    op: &str,
-    base: &Value,
-    items_member: &str,
-    key_member: &str,
-    max_results: Option<i64>,
-) -> (Vec<usize>, Vec<String>) {
-    let mut page_sizes = Vec::new();
-    let mut keys = Vec::new();
-    let mut next: Option<String> = None;
-
-    loop {
-        let mut request = base.clone();
-        if let Some(limit) = max_results {
-            request["MaxResults"] = json!(limit);
-        }
-        if let Some(token) = &next {
-            request["NextToken"] = json!(token);
-        }
-        let answer = emulator.call(op, request).await;
-        assert_eq!(
-            answer.status, 200,
-            "{op} (MaxResults {max_results:?}): expected 200, got {} with body {}",
-            answer.status, answer.body
-        );
-        let items = answer
-            .get(items_member)
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        page_sizes.push(items.len());
-        for item in &items {
-            keys.push(
-                item.get(key_member)
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            );
-        }
-        match answer.get("NextToken").as_str() {
-            Some(token) => next = Some(token.to_string()),
-            None => break,
-        }
-        assert!(
-            page_sizes.len() < 64,
-            "{op} (MaxResults {max_results:?}): paging did not terminate"
-        );
-    }
-
-    (page_sizes, keys)
-}
 
 /// RULE: a `List*` call returns at most `MaxResults` items, hands back a `NextToken`
 /// only while more remain, and resuming from that token walks the full set exactly once
