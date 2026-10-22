@@ -23,10 +23,14 @@ pub struct GetPolicyStoreInput {
     pub tags: bool,
 }
 
-#[smithy_macros::smithy(
-    shape = "com.amazonaws.verifiedpermissions#GetPolicyStoreOutput",
-    unsupported = ["encryptionState"]
-)]
+/// `createdDate`/`lastUpdatedDate` target `TimestampFormat`
+/// (`@timestampFormat("date-time")`), so this shape's schema comes from
+/// `vp_schema_and_codec!` rather than `#[smithy_macros::smithy(shape = ...)]` — see
+/// `types/date_time_wire.rs`. Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="GetPolicyStoreOutput")`; `encryptionState` is the
+/// one member this slice does not serve, and — exactly as the attribute's `unsupported`
+/// list does — it takes no member index, so `cedarVersion` and `tags` follow
+/// `deletionProtection` directly.
 #[derive(Debug, Clone)]
 pub struct GetPolicyStoreOutput {
     pub policy_store_id: String,
@@ -39,3 +43,27 @@ pub struct GetPolicyStoreOutput {
     pub cedar_version: Option<String>,
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
+
+vp_schema_and_codec!(
+    GetPolicyStoreOutput,
+    GET_POLICY_STORE_OUTPUT_SCHEMA,
+    "com.amazonaws.verifiedpermissions#GetPolicyStoreOutput",
+    "com.amazonaws.verifiedpermissions",
+    "GetPolicyStoreOutput",
+    (M_POLICY_STORE_ID, policy_store_id, "policyStoreId", 0, req, string),
+    (M_ARN, arn, "arn", 1, req, string),
+    (
+        M_VALIDATION_SETTINGS,
+        validation_settings,
+        "validationSettings",
+        2,
+        req,
+        struct_of(ValidationSettings)
+    ),
+    (M_CREATED_DATE, created_date, "createdDate", 3, req, date_time),
+    (M_LAST_UPDATED_DATE, last_updated_date, "lastUpdatedDate", 4, req, date_time),
+    (M_DESCRIPTION, description, "description", 5, opt, string),
+    (M_DELETION_PROTECTION, deletion_protection, "deletionProtection", 6, opt, string),
+    (M_CEDAR_VERSION, cedar_version, "cedarVersion", 7, opt, string),
+    (M_TAGS, tags, "tags", 8, opt, map_of_string),
+);

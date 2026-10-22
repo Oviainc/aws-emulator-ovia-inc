@@ -31,7 +31,11 @@ pub struct BatchGetPolicyOutput {
     pub errors: Vec<BatchGetPolicyErrorItem>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.verifiedpermissions#BatchGetPolicyOutputItem")]
+/// `createdDate`/`lastUpdatedDate` target `TimestampFormat`
+/// (`@timestampFormat("date-time")`), so this shape's schema comes from
+/// `vp_schema_and_codec!` rather than `#[smithy_macros::smithy(shape = ...)]` — see
+/// `types/date_time_wire.rs`. Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="BatchGetPolicyOutputItem")`.
 #[derive(Debug, Clone)]
 pub struct BatchGetPolicyOutputItem {
     pub policy_store_id: String,
@@ -42,6 +46,21 @@ pub struct BatchGetPolicyOutputItem {
     pub last_updated_date: ::aws_smithy_types::DateTime,
     pub name: Option<String>,
 }
+
+vp_schema_and_codec!(
+    BatchGetPolicyOutputItem,
+    BATCH_GET_POLICY_OUTPUT_ITEM_SCHEMA,
+    "com.amazonaws.verifiedpermissions#BatchGetPolicyOutputItem",
+    "com.amazonaws.verifiedpermissions",
+    "BatchGetPolicyOutputItem",
+    (M_POLICY_STORE_ID, policy_store_id, "policyStoreId", 0, req, string),
+    (M_POLICY_ID, policy_id, "policyId", 1, req, string),
+    (M_POLICY_TYPE, policy_type, "policyType", 2, req, string),
+    (M_DEFINITION, definition, "definition", 3, req, union_of(PolicyDefinitionDetail)),
+    (M_CREATED_DATE, created_date, "createdDate", 4, req, date_time),
+    (M_LAST_UPDATED_DATE, last_updated_date, "lastUpdatedDate", 5, req, date_time),
+    (M_NAME, name, "name", 6, opt, string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.verifiedpermissions#BatchGetPolicyErrorItem")]
 #[derive(Debug, Clone, Default)]

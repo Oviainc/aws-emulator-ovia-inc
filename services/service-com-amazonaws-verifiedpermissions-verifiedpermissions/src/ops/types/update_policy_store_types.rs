@@ -26,7 +26,11 @@ pub struct ValidationSettings {
     pub mode: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.verifiedpermissions#UpdatePolicyStoreOutput")]
+/// `createdDate`/`lastUpdatedDate` target `TimestampFormat`
+/// (`@timestampFormat("date-time")`), so this shape's schema comes from
+/// `vp_schema_and_codec!` rather than `#[smithy_macros::smithy(shape = ...)]` — see
+/// `types/date_time_wire.rs`. Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="UpdatePolicyStoreOutput")`.
 #[derive(Debug, Clone)]
 pub struct UpdatePolicyStoreOutput {
     pub policy_store_id: String,
@@ -34,4 +38,16 @@ pub struct UpdatePolicyStoreOutput {
     pub created_date: ::aws_smithy_types::DateTime,
     pub last_updated_date: ::aws_smithy_types::DateTime,
 }
+
+vp_schema_and_codec!(
+    UpdatePolicyStoreOutput,
+    UPDATE_POLICY_STORE_OUTPUT_SCHEMA,
+    "com.amazonaws.verifiedpermissions#UpdatePolicyStoreOutput",
+    "com.amazonaws.verifiedpermissions",
+    "UpdatePolicyStoreOutput",
+    (M_POLICY_STORE_ID, policy_store_id, "policyStoreId", 0, req, string),
+    (M_ARN, arn, "arn", 1, req, string),
+    (M_CREATED_DATE, created_date, "createdDate", 2, req, date_time),
+    (M_LAST_UPDATED_DATE, last_updated_date, "lastUpdatedDate", 3, req, date_time),
+);
 

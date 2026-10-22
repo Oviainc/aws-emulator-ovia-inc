@@ -32,7 +32,10 @@ pub struct ListPolicyStoreAliasesOutput {
     pub policy_store_aliases: Vec<PolicyStoreAliasItem>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.verifiedpermissions#PolicyStoreAliasItem")]
+/// `createdAt` targets `TimestampFormat` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `vp_schema_and_codec!` rather than
+/// `#[smithy_macros::smithy(shape = ...)]` — see `types/date_time_wire.rs`. Member set,
+/// order and requiredness from `smithy_query(query="shape", shape="PolicyStoreAliasItem")`.
 #[derive(Debug, Clone)]
 pub struct PolicyStoreAliasItem {
     pub alias_name: String,
@@ -41,4 +44,17 @@ pub struct PolicyStoreAliasItem {
     pub created_at: ::aws_smithy_types::DateTime,
     pub state: String,
 }
+
+vp_schema_and_codec!(
+    PolicyStoreAliasItem,
+    POLICY_STORE_ALIAS_ITEM_SCHEMA,
+    "com.amazonaws.verifiedpermissions#PolicyStoreAliasItem",
+    "com.amazonaws.verifiedpermissions",
+    "PolicyStoreAliasItem",
+    (M_ALIAS_NAME, alias_name, "aliasName", 0, req, string),
+    (M_POLICY_STORE_ID, policy_store_id, "policyStoreId", 1, req, string),
+    (M_ALIAS_ARN, alias_arn, "aliasArn", 2, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 3, req, date_time),
+    (M_STATE, state, "state", 4, req, string),
+);
 
