@@ -72,9 +72,9 @@ pub(crate) fn is_next_token(value: &str) -> bool {
 /// One emulator: a router carrying only this service, over one shared engine.
 ///
 /// `pub(crate)` because the suites beside this one (the billing-adjustment,
-/// payment-request, `validation_messages` and agreement-cancellation-request
-/// ones) drive the same emulator over the same wire helpers rather than building
-/// a second harness.
+/// payment-request, `validation_messages`, agreement-cancellation-request,
+/// unknown-id and refusal-class ones) drive the same emulator over the same wire
+/// helpers rather than building a second harness.
 pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -149,11 +149,11 @@ async fn call_as(
     Answer { status, body }
 }
 
-async fn create(router: &MultiServiceRouter, request: Value) -> Answer {
+pub(crate) async fn create(router: &MultiServiceRouter, request: Value) -> Answer {
     call(router, "CreateAgreementRequest", request).await
 }
 
-async fn accept(router: &MultiServiceRouter, request: Value) -> Answer {
+pub(crate) async fn accept(router: &MultiServiceRouter, request: Value) -> Answer {
     call(router, "AcceptAgreementRequest", request).await
 }
 
@@ -525,7 +525,13 @@ struct IntentCase {
     /// agreement created by the test, or an id naming no agreement.
     source: Option<&'static str>,
     status: u16,
-    /// The `ValidationExceptionReason` / error code expected on a refusal.
+    /// The wire error code expected on a refusal: this service's refusals carry
+    /// the shape that describes them, so a cross-member rule answers
+    /// `ValidationException` while a lookup that found nothing answers
+    /// `ResourceNotFoundException`.
+    code: &'static str,
+    /// The `ValidationExceptionReason` expected on a `ValidationException`, and
+    /// empty for every other answer.
     reason: &'static str,
 }
 
@@ -546,6 +552,7 @@ async fn the_intent_decides_which_identifiers_a_request_needs() {
             proposal: true,
             source: None,
             status: 200,
+            code: "",
             reason: "",
         },
         IntentCase {
@@ -554,6 +561,7 @@ async fn the_intent_decides_which_identifiers_a_request_needs() {
             proposal: false,
             source: None,
             status: 400,
+            code: "ValidationException",
             reason: "MISSING_AGREEMENT_PROPOSAL_IDENTIFIER",
         },
         IntentCase {
@@ -562,6 +570,7 @@ async fn the_intent_decides_which_identifiers_a_request_needs() {
             proposal: true,
             source: Some("stored"),
             status: 400,
+            code: "ValidationException",
             reason: "INVALID_SOURCE_AGREEMENT_IDENTIFIER",
         },
         IntentCase {
@@ -570,6 +579,7 @@ async fn the_intent_decides_which_identifiers_a_request_needs() {
             proposal: true,
             source: Some("stored"),
             status: 200,
+            code: "",
             reason: "",
         },
         IntentCase {
@@ -578,6 +588,7 @@ async fn the_intent_decides_which_identifiers_a_request_needs() {
             proposal: true,
             source: None,
             status: 400,
+            code: "ValidationException",
             reason: "MISSING_SOURCE_AGREEMENT_IDENTIFIER",
         },
         IntentCase {
@@ -586,6 +597,7 @@ async fn the_intent_decides_which_identifiers_a_request_needs() {
             proposal: false,
             source: Some("stored"),
             status: 400,
+            code: "ValidationException",
             reason: "MISSING_AGREEMENT_PROPOSAL_IDENTIFIER",
         },
         IntentCase {
@@ -594,6 +606,7 @@ async fn the_intent_decides_which_identifiers_a_request_needs() {
             proposal: false,
             source: Some("stored"),
             status: 200,
+            code: "",
             reason: "",
         },
         IntentCase {
@@ -602,6 +615,7 @@ async fn the_intent_decides_which_identifiers_a_request_needs() {
             proposal: false,
             source: None,
             status: 400,
+            code: "ValidationException",
             reason: "MISSING_SOURCE_AGREEMENT_IDENTIFIER",
         },
         IntentCase {
@@ -609,8 +623,9 @@ async fn the_intent_decides_which_identifiers_a_request_needs() {
             intent: "AMEND",
             proposal: false,
             source: Some("agmt-0000000000000000"),
-            status: 404,
-            reason: "ResourceNotFoundException",
+            status: 400,
+            code: "ResourceNotFoundException",
+            reason: "",
         },
     ];
 
@@ -646,9 +661,10 @@ async fn the_intent_decides_which_identifiers_a_request_needs() {
             400 => {
                 assert_eq!(
                     answer.error_code(),
-                    "ValidationException",
-                    "case {:?}: expected ValidationException, got {:?}",
+                    case.code,
+                    "case {:?}: expected {}, got {:?}",
                     case.case,
+                    case.code,
                     answer.body
                 );
                 assert_eq!(
@@ -660,13 +676,12 @@ async fn the_intent_decides_which_identifiers_a_request_needs() {
                     answer.body
                 );
             }
-            _ => assert_eq!(
-                answer.error_code(),
-                case.reason,
-                "case {:?}: expected {}, got {:?}",
-                case.case,
-                case.reason,
-                answer.body
+            // Every row of this table is served or refused with 400; a row that
+            // expects any other status is a row this table cannot check, not one
+            // to wave through.
+            status => panic!(
+                "case {:?}: this table states only 200 and 400 rows, not {status}",
+                case.case
             ),
         }
     }
@@ -856,34 +871,52 @@ async fn an_accepted_request_is_described_from_what_was_stored() {
     }
 }
 
-/// An id naming no resource is a 404 from every operation that reads one — not a
-/// 501 and not an empty success.
+/// An id naming no resource is refused by every operation that reads or acts
+/// upon one — HTTP 400 carrying the modelled `ResourceNotFoundException` body,
+/// and never a 404, a 501 or an empty success. The same rule is spanned over id
+/// forms, members and stored-vs-unknown ids in `tests/all/unknown_ids.rs`.
 #[tokio::test]
 async fn an_unknown_id_is_refused_as_not_found() {
     let router = emulator();
     let unknown_agreement = "agmt-ffffffffffffffff";
 
-    for (operation, answer) in [
-        ("DescribeAgreement", describe(&router, unknown_agreement).await),
-        ("CancelAgreement", cancel(&router, unknown_agreement).await),
+    for (operation, resource_type, answer) in [
+        (
+            "DescribeAgreement",
+            "Agreement",
+            describe(&router, unknown_agreement).await,
+        ),
+        (
+            "CancelAgreement",
+            "Agreement",
+            cancel(&router, unknown_agreement).await,
+        ),
         (
             "GetAgreementTerms",
+            "Agreement",
             terms(&router, json!({"agreementId": unknown_agreement})).await,
         ),
         (
             "AcceptAgreementRequest",
+            "AgreementRequest",
             accept(&router, json!({"agreementRequestId": "ar-ffffffffffffffff"})).await,
         ),
     ] {
         assert_eq!(
-            answer.status, 404,
-            "{operation} on an unknown id must answer 404, got {} with {:?}",
+            answer.status, 400,
+            "{operation} on an unknown id must answer 400, got {} with {:?}",
             answer.status, answer.body
         );
         assert_eq!(
             answer.error_code(),
             "ResourceNotFoundException",
             "{operation} expected ResourceNotFoundException, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.str_at("/resourceType"),
+            resource_type,
+            "{operation} must report the resource kind it looked for, got {:?}",
             answer.body
         );
     }

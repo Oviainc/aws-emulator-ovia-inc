@@ -191,10 +191,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.billing_adjustment_request_id)
             .filter(|request| request.agreement_id == input.agreement_id);
         let Some(request) = found else {
-            return Err(GetBillingAdjustmentRequestErrorModeled::ResourceNotFoundException(
-                crate::state::billing_adjustment_not_found(&input.billing_adjustment_request_id),
-            )
-            .into());
+            // The lookup found nothing: the modelled not-found body, at the
+            // status this service answers it with (`state::NOT_FOUND_STATUS`).
+            return Err(crate::state::not_found(
+                GetBillingAdjustmentRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::billing_adjustment_not_found(
+                        &input.billing_adjustment_request_id,
+                    ),
+                ),
+            ));
         };
 
         Ok(request.to_detail())

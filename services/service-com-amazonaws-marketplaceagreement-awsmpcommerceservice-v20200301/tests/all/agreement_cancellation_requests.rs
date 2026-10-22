@@ -764,8 +764,10 @@ async fn the_store_stops_growing_at_its_ceiling() {
 }
 
 /// Sending a cancellation request for an agreement the store does not hold is a
-/// 404, and for one that is no longer active a 400 — and neither stores
-/// anything, so the listing is unchanged.
+/// not-found refusal, and for one that is no longer active a validation one —
+/// both HTTP 400, as this service answers every client error of these classes
+/// (`crate::state::NOT_FOUND_STATUS`) — and neither stores anything, so the
+/// listing is unchanged.
 #[tokio::test]
 async fn a_cancellation_request_needs_an_active_agreement() {
     let router = emulator();
@@ -777,8 +779,8 @@ async fn a_cancellation_request_needs_an_active_agreement() {
     )
     .await;
     assert_eq!(
-        unknown.status, 404,
-        "case unknown agreement: expected 404, got {} with {:?}",
+        unknown.status, 400,
+        "case unknown agreement: expected 400, got {} with {:?}",
         unknown.status, unknown.body
     );
     assert_eq!(

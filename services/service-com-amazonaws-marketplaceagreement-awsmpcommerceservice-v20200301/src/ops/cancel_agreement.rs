@@ -149,10 +149,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let Some(agreement) = store.agreements.get_mut(&input.agreement_id) else {
-            return Err(CancelAgreementErrorModeled::ResourceNotFoundException(
-                crate::state::agreement_not_found(&input.agreement_id),
-            )
-            .into());
+            // The lookup found nothing: the modelled not-found body, at the
+            // status this service answers it with (`state::NOT_FOUND_STATUS`).
+            return Err(crate::state::not_found(
+                CancelAgreementErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_not_found(&input.agreement_id),
+                ),
+            ));
         };
 
         // "Allows an acceptor to cancel an active agreement. Not all agreements

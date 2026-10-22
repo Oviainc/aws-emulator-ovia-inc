@@ -181,10 +181,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The two cross-member rules the model states but cannot express.
+        // The two cross-member rules the model states but cannot express. Both
+        // are stated in this service's modelled `ValidationException` the same
+        // way a boundary refusal of the same member is
+        // (`crate::state::validation_exception`), so one refused member reads
+        // alike wherever it was found. The rule each enforces is quoted above
+        // it, where a reader of the code needs it.
         //
         // `agreementProposalIdentifier`: "This parameter is required if the
-        // intent is not AMEND."
+        // intent is not AMEND" — every other intent has no source agreement to
+        // take its terms from.
         if input.intent != crate::state::INTENT_AMEND
             && input.agreement_proposal_identifier.is_none()
         {
@@ -245,12 +251,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // against.
         if let Some(source) = input.source_agreement_identifier.as_deref() {
             if !store.agreements.contains_key(source) {
-                return Err(
+                // The lookup found nothing: the modelled not-found body, at the
+                // status this service answers it with
+                // (`state::NOT_FOUND_STATUS`).
+                return Err(crate::state::not_found(
                     CreateAgreementRequestErrorModeled::ResourceNotFoundException(
                         crate::state::agreement_not_found(source),
-                    )
-                    .into(),
-                );
+                    ),
+                ));
             }
         }
 
