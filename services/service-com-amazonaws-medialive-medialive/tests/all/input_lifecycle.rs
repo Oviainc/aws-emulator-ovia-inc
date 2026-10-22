@@ -265,8 +265,8 @@ async fn a_created_input_reports_the_class_and_source_type_its_endpoints_give_it
             described["mediaConnectFlows"]
         );
         // A PULL input reports its sources verbatim; a PUSH input's destinations
-        // report only what the request supplied, since the endpoint's address is
-        // allocated by infrastructure this emulator does not run.
+        // report the ingest endpoint the service allocated for each of them (the
+        // per-protocol table lives in `input_push_endpoints.rs`).
         assert_eq!(
             described["sources"],
             request.get("sources").cloned().unwrap_or_else(|| json!([])),
@@ -283,10 +283,20 @@ async fn a_created_input_reports_the_class_and_source_type_its_endpoints_give_it
             "case {case:?}: expected one destination per requested destination, got {destinations:?}"
         );
         for destination in &destinations {
+            assert!(
+                destination["ip"]
+                    .as_str()
+                    .is_some_and(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok()),
+                "case {case:?}: expected a system-generated ingest address, got {destination:?}"
+            );
+            assert!(
+                destination["url"].as_str().is_some_and(|url| !url.is_empty()),
+                "case {case:?}: expected the allocated push ingest URL, got {destination:?}"
+            );
             assert_eq!(
-                destination.get("url"),
-                None,
-                "case {case:?}: a push endpoint URL is allocated infrastructure, so none may be claimed: {destination:?}"
+                destination["networkRoutes"],
+                json!([]),
+                "case {case:?}: expected an empty route list on a destination with no routes, got {destination:?}"
             );
         }
     }
