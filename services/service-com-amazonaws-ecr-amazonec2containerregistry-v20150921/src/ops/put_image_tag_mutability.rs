@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutImageTagMutability
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutImageTagMutability`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutImageTagMutability::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the stored tag-mutability configuration of one repository: the setting and
+//! the exclusion filters the request carries become the repository's, and the response
+//! is read back out of the updated record. Every later `PutImage` decides whether a tag
+//! may be overwritten from exactly what this call stored.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +125,22 @@ impl From<PutImageTagMutabilityErrorModeled> for PutImageTagMutabilityError {
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors.
+fn fault_error(fault: crate::state::Fault) -> PutImageTagMutabilityErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            PutImageTagMutabilityErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException { message },
+            )
+        }
+        // `ImageNotFound` cannot arise here: this call resolves no image.
+        _ => PutImageTagMutabilityErrorModeled::InvalidParameterException(
+            InvalidParameterException { message },
+        ),
+    }
+}
+
 /// The `PutImageTagMutability` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,18 +177,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutImageTagMutability` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutImageTagMutabilityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutImageTagMutability"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutImageTagMutabilityErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr repository store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // `registryId` names the registry holding the repository; this emulator serves
+        // exactly one registry — its own account's.
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        // A value outside `ImageTagMutability`, and a filter list outside
+        // `@length(1..5)` or the filter alphabet, were already refused at the boundary.
+        let filters = input
+            .image_tag_mutability_exclusion_filters
+            .unwrap_or_default();
+        // Exclusion filters have nothing to exclude from under the two plain settings,
+        // which apply to every image tag in the repository: one shared rule decides it
+        // for this operation and for the create that writes the same configuration.
+        crate::state::check_exclusion_filters(&input.image_tag_mutability, &filters)
+            .map_err(fault_error)?;
+
+        let mut store = state.lock();
+        let repo = store
+            .repository_mut(&input.repository_name)
+            .map_err(fault_error)?;
+
+        // A put REPLACES the configuration: the setting and the filters this request
+        // carries are the repository's from here on, and filters it omits are gone.
+        let previous =
+            ::std::mem::replace(&mut repo.image_tag_mutability, input.image_tag_mutability);
+        repo.image_tag_mutability_exclusion_filters = filters;
+
+        // This call rewrites whether a later push may overwrite a tag, so the change is
+        // recorded: the repository it was made on, the region it was signed for, and
+        // the setting it replaced.
+        ::tracing::info!(
+            target: "ecr.audit",
+            operation = Self::NAME,
+            repository = %repo.name,
+            registry_id = %repo.registry_id,
+            region = %crate::state::request_region(ctx.parts()),
+            previous_image_tag_mutability = %previous,
+            image_tag_mutability = %repo.image_tag_mutability,
+            exclusion_filters = repo.image_tag_mutability_exclusion_filters.len(),
+            "the image tag mutability configuration of a repository was replaced"
+        );
+
+        // The answer is the stored record, not the request echoed back.
+        Ok(PutImageTagMutabilityOutput {
+            registry_id: Some(repo.registry_id.clone()),
+            repository_name: Some(repo.name.clone()),
+            image_tag_mutability: Some(repo.image_tag_mutability.clone()),
+            // ECR omits the member rather than reporting [] when nothing is excluded.
+            image_tag_mutability_exclusion_filters: if repo
+                .image_tag_mutability_exclusion_filters
+                .is_empty()
+            {
+                None
+            } else {
+                Some(repo.image_tag_mutability_exclusion_filters.clone())
+            },
+        })
     }
 }

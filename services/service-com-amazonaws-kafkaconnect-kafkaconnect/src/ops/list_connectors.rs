@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConnectors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConnectors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConnectors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `ConnectorSummary` per stored connector, filtered by `connectorNamePrefix`,
+//! paged by `maxResults` with an opaque `nextToken`, so paging through the connectors
+//! returns each one exactly once. A token this service did not emit is a
+//! `BadRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +159,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConnectors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConnectorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConnectors"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListConnectorsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the kafkaconnect store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+        let mut state = store.lock();
+        state.settle_due();
+
+        let prefix = input.connector_name_prefix.unwrap_or_default();
+        // Keyed by ARN and paged BEFORE the summaries are built, so a page costs
+        // one `ConnectorSummary` per connector it returns rather than one per
+        // connector stored.
+        let keyed: Vec<(String, &crate::state::ConnectorRecord)> = state
+            .connectors
+            .values()
+            .filter(|connector| connector.name.starts_with(&prefix))
+            .map(|connector| (connector.arn.clone(), connector))
+            .collect();
+
+        let Ok(page) = crate::state::page(keyed, input.max_results, input.next_token.as_deref())
+        else {
+            return Err(ListConnectorsErrorModeled::BadRequestException(BadRequestException {
+                message: Some(
+                    "The nextToken is not one this service issued. Correct your request and then retry it."
+                        .to_string(),
+                ),
+            })
+            .into());
+        };
+
+        Ok(ListConnectorsOutput {
+            connectors: Some(
+                page.items
+                    .into_iter()
+                    .map(crate::state::ConnectorRecord::summary)
+                    .collect(),
+            ),
+            next_token: page.next_token,
+        })
     }
 }

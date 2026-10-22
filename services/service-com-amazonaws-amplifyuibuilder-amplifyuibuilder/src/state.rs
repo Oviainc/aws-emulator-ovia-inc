@@ -75,10 +75,15 @@ pub struct StoredComponent {
     pub events: Option<HashMap<String, ComponentEvent>>,
     pub source_id: Option<String>,
     pub schema_version: Option<String>,
-    pub tags: Option<HashMap<String, String>>,
+    /// `Component$tags` is reported for every component, so the tags a create
+    /// supplied are held as a map rather than as an absence: a component created
+    /// with no tags carries an empty one and reports `{}`.
+    pub tags: HashMap<String, String>,
     pub created_at: SystemTime,
-    /// Set by `UpdateComponent`; unset until the component is first updated.
-    pub modified_at: Option<SystemTime>,
+    /// When the component last changed. Creating it is the change that first set
+    /// it, so it starts at [`StoredComponent::created_at`] and is moved by every
+    /// `UpdateComponent` that merges into the record.
+    pub modified_at: SystemTime,
     /// The position this component holds in its environment's creation order.
     ///
     /// It is what a `ListComponents` page token indexes into: it never changes
@@ -104,8 +109,8 @@ impl StoredComponent {
             binding_properties: self.binding_properties.clone(),
             collection_properties: self.collection_properties.clone(),
             created_at: ::aws_smithy_types::DateTime::from(self.created_at),
-            modified_at: self.modified_at.map(::aws_smithy_types::DateTime::from),
-            tags: self.tags.clone(),
+            modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+            tags: Some(self.tags.clone()),
             events: self.events.clone(),
             schema_version: self.schema_version.clone(),
         }

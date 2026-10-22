@@ -281,7 +281,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if patch.schema_version.is_some() {
             component.schema_version = patch.schema_version;
         }
-        component.modified_at = Some(now);
+        component.modified_at = now;
 
         Ok(UpdateComponentOutput {
             entity: Some(component.to_component()),

@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The wire harness every suite in this crate shares: a router over a fresh engine and
-//! the awsJson1_1 call/assert helpers.
+//! The wire harness every suite in this test target shares: a router over this one
+//! service, the awsJson1_1 call/assert helpers, and the change-token protocol a
+//! mutating AWS WAF Classic call needs.
 //!
 //! Each call goes through the real `MultiServiceRouter` (`POST /` with
 //! `X-Amz-Target: AWSWAF_Regional_20161128.<Op>`), so what a suite asserts is what an
-//! SDK client sees.
+//! SDK client sees: each response is built from the persisted record, not from the
+//! request.
 
 use std::sync::Arc;
 
@@ -15,14 +17,19 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_wafregional_awswaf_regional_20161128::EmulatedService;
 
-/// A router serving this one service over a fresh engine, as `build_router` does in
-/// production.
-pub fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+/// A router serving this one service over `engine`, as `build_router` does in
+/// production. Hold on to the same `engine` to inspect the persisted state a call
+/// wrote.
+pub fn router_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine));
     router
+}
+
+/// A router serving this one service over a fresh engine.
+pub fn router() -> MultiServiceRouter {
+    router_on(Arc::new(engine::InMemoryEngine::new()))
 }
 
 /// Call one operation and return `(http status, parsed body)`.
@@ -83,6 +90,15 @@ pub fn error_code(body: &Value) -> String {
         .to_string()
 }
 
+/// The `message` member of an error body, however the protocol cased it.
+pub fn error_message(body: &Value) -> String {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or("<no message>")
+        .to_string()
+}
+
 /// Assert `operation` refused `request` with HTTP 400 and the named modelled error.
 pub async fn expect_error(
     router: &MultiServiceRouter,
@@ -105,12 +121,26 @@ pub async fn expect_error(
 }
 
 /// The change token a mutating call must carry. Each one is consumed by exactly one
-/// mutating call, so every caller below asks for its own.
+/// mutating call, so every caller asks for its own.
 pub async fn change_token(router: &MultiServiceRouter) -> String {
     let body = ok_call(router, "GetChangeToken", &json!({})).await;
     body["ChangeToken"]
         .as_str()
         .unwrap_or_else(|| panic!("GetChangeToken returned no ChangeToken: {body}"))
+        .to_string()
+}
+
+/// The reported status of `token`.
+pub async fn token_status(router: &MultiServiceRouter, token: &str) -> String {
+    let body = ok_call(
+        router,
+        "GetChangeTokenStatus",
+        &json!({"ChangeToken": token}),
+    )
+    .await;
+    body["ChangeTokenStatus"]
+        .as_str()
+        .unwrap_or_else(|| panic!("GetChangeTokenStatus returned no status: {body}"))
         .to_string()
 }
 

@@ -35,19 +35,22 @@ const AWS_LOG_SOURCE_NAMES: &[&str] = &[
 ];
 
 /// One response, as a test reads it.
-struct Reply {
-    status: u16,
-    error_type: Option<String>,
-    body: Value,
+///
+/// `pub(crate)` so the suites beside this one in `tests/all/` drive the service through
+/// the SAME harness instead of each growing its own copy.
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_type: Option<String>,
+    pub(crate) body: Value,
 }
 
 /// The emulator under test: this one service mounted on the production router.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Request signatures are verified by the emulator, not by the service; these
@@ -60,7 +63,13 @@ impl Emulator {
         Self { router }
     }
 
-    async fn send(&self, method: &str, path: &str, region: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        region: &str,
+        body: Option<Value>,
+    ) -> Reply {
         // The SigV4 credential scope is what names both the service and the Region.
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDTESTTESTTEST/20260101/{region}/securitylake/aws4_request, \
@@ -93,7 +102,7 @@ impl Emulator {
         }
     }
 
-    async fn create_data_lake(&self, region: &str, configuration: Value) -> Reply {
+    pub(crate) async fn create_data_lake(&self, region: &str, configuration: Value) -> Reply {
         self.send(
             "POST",
             "/v1/datalake",
@@ -106,16 +115,16 @@ impl Emulator {
         .await
     }
 
-    async fn list_data_lakes(&self, region: &str, query: &str) -> Reply {
+    pub(crate) async fn list_data_lakes(&self, region: &str, query: &str) -> Reply {
         self.send("GET", &format!("/v1/datalakes{query}"), region, None)
             .await
     }
 
-    async fn create_subscriber(&self, region: &str, body: Value) -> Reply {
+    pub(crate) async fn create_subscriber(&self, region: &str, body: Value) -> Reply {
         self.send("POST", "/v1/subscribers", region, Some(body)).await
     }
 
-    async fn get_subscriber(&self, region: &str, subscriber_id: &str) -> Reply {
+    pub(crate) async fn get_subscriber(&self, region: &str, subscriber_id: &str) -> Reply {
         self.send(
             "GET",
             &format!("/v1/subscribers/{subscriber_id}"),
@@ -125,12 +134,12 @@ impl Emulator {
         .await
     }
 
-    async fn list_subscribers(&self, region: &str, query: &str) -> Reply {
+    pub(crate) async fn list_subscribers(&self, region: &str, query: &str) -> Reply {
         self.send("GET", &format!("/v1/subscribers{query}"), region, None)
             .await
     }
 
-    async fn delete_subscriber(&self, region: &str, subscriber_id: &str) -> Reply {
+    pub(crate) async fn delete_subscriber(&self, region: &str, subscriber_id: &str) -> Reply {
         self.send(
             "DELETE",
             &format!("/v1/subscribers/{subscriber_id}"),
@@ -140,7 +149,7 @@ impl Emulator {
         .await
     }
 
-    async fn delete_data_lake(&self, region: &str, regions: &[&str]) -> Reply {
+    pub(crate) async fn delete_data_lake(&self, region: &str, regions: &[&str]) -> Reply {
         self.send(
             "POST",
             "/v1/datalake/delete",
@@ -165,13 +174,13 @@ fn is_model_uuid(candidate: &str) -> bool {
             .all(|group| group.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')))
 }
 
-fn array<'a>(reply: &'a Reply, member: &str, case: &str) -> &'a Vec<Value> {
+pub(crate) fn array<'a>(reply: &'a Reply, member: &str, case: &str) -> &'a Vec<Value> {
     reply.body[member]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected `{member}` to be a list, got {:?}", reply.body))
 }
 
-fn text<'a>(value: &'a Value, member: &str, case: &str) -> &'a str {
+pub(crate) fn text<'a>(value: &'a Value, member: &str, case: &str) -> &'a str {
     value[member]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected `{member}` to be a string, got {value:?}"))

@@ -15,3 +15,5 @@
 mod data_lake_and_subscriber_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/subscriber_calls_require_enablement.rs"]
+mod subscriber_calls_require_enablement;

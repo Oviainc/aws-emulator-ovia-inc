@@ -4,9 +4,8 @@
 //! `GetChangeToken`, `GetChangeTokenStatus`, `CreateIPSet`, `UpdateIPSet`, `GetIPSet`,
 //! `ListIPSets`, `DeleteIPSet`.
 //!
-//! Every call goes through the real router (`POST /` with
-//! `X-Amz-Target: AWSWAF_Regional_20161128.<Op>`, awsJson1_1), so what these tests
-//! assert is what an SDK client sees: each response is built from the persisted
+//! Every call goes through the real router (see `tests/all/wire.rs`), so what these
+//! tests assert is what an SDK client sees: each response is built from the persisted
 //! record, not from the request.
 
 use std::collections::BTreeSet;
@@ -20,21 +19,9 @@ use service_com_amazonaws_wafregional_awswaf_regional_20161128::state::{
 };
 
 // The wire harness is shared with the other suites in this crate.
-use crate::wire::{call, change_token, error_code, expect_error, is_resource_id, ok_call, router};
-
-/// The reported status of `token`.
-async fn token_status(router: &MultiServiceRouter, token: &str) -> String {
-    let body = ok_call(
-        router,
-        "GetChangeTokenStatus",
-        &json!({"ChangeToken": token}),
-    )
-    .await;
-    body["ChangeTokenStatus"]
-        .as_str()
-        .unwrap_or_else(|| panic!("GetChangeTokenStatus returned no status: {body}"))
-        .to_string()
-}
+use crate::wire::{
+    call, change_token, error_code, expect_error, is_resource_id, ok_call, router, token_status,
+};
 
 /// Create an IPSet named `name` and return its `IPSetId`.
 async fn create_ip_set(router: &MultiServiceRouter, name: &str) -> String {

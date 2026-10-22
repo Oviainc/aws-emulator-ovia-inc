@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the stored session addressed by the four `@httpLabel` values and
+//! echoes the four back. A later `GetSession` for that key is a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +83,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::SessionKey;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -163,18 +159,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSession"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteSessionErrorModeled::InternalServerException(InternalServerException {
+                message: "the Lex V2 runtime session store is unavailable".to_string(),
+            })
+        })?;
+
+        let key = SessionKey::new(
+            &input.bot_id,
+            &input.bot_alias_id,
+            &input.locale_id,
+            &input.session_id,
+        );
+
+        // Deleting a session that is not there — or one the clock has already
+        // expired — removes nothing, so it is the modelled 404 rather than a
+        // success that claims a removal.
+        if state
+            .lock()
+            .remove_session(&key, SystemTime::now())
+            .is_none()
+        {
+            return Err(DeleteSessionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no session {} for bot {} alias {} locale {}",
+                        input.session_id, input.bot_id, input.bot_alias_id, input.locale_id
+                    ),
+                },
+            )
+            .into());
+        }
+
+        Ok(DeleteSessionOutput {
+            bot_id: Some(input.bot_id),
+            bot_alias_id: Some(input.bot_alias_id),
+            locale_id: Some(input.locale_id),
+            session_id: Some(input.session_id),
+        })
     }
 }
