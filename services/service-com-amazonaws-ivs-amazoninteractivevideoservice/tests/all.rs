@@ -31,3 +31,5 @@ mod state_roundtrip;
 mod stream_key_lifecycle;
 #[path = "all/stream_key_read.rs"]
 mod stream_key_read;
+#[path = "all/viewer_session_revocation.rs"]
+mod viewer_session_revocation;
