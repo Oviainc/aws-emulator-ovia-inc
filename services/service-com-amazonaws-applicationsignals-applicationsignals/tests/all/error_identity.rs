@@ -346,14 +346,15 @@ async fn a_constraint_violation_names_the_member_and_the_requirement_only() {
                       constraint: Member must have value less than or equal to 50"
                 .to_string(),
         },
-        // An absent @required member: stated as the null it was.
+        // An absent @required member: stated by the member and the requirement alone, with
+        // nothing where a value would go, as the recorded absent-member refusal reads.
         Case {
             label: "CreateServiceLevelObjective without Name",
             method: "POST",
             uri: "/slo".to_string(),
             body: Some(json!({ "Description": "no name at all" })),
             rejected: None,
-            message: "1 validation error detected: Value null at 'name' failed to satisfy \
+            message: "1 validation error detected: Value at 'name' failed to satisfy \
                       constraint: Member must not be null"
                 .to_string(),
         },
