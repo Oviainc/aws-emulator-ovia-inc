@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLoadBalancers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLoadBalancers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeLoadBalancers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: projects the stored load balancer records into
+//! `LoadBalancerDescription`s, filtered by name and paginated by `Marker`/`PageSize`.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +139,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLoadBalancers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLoadBalancersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLoadBalancers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This service's model declares no server-fault error, and a 501 would
+            // claim "not implemented", so an unreachable store is refused instead.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the Elastic Load Balancing store is unavailable",
+            ));
+        };
+
+        // "The maximum number of results to return with this call (a number from 1 to
+        // 400). The default is 400." The model declares that range, so the boundary
+        // validator refuses a value outside it before this handler runs; a value that
+        // somehow reaches here is refused rather than silently rewritten.
+        let requested_page_size = input.page_size.unwrap_or(DEFAULT_PAGE_SIZE);
+        if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&requested_page_size) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "PageSize must be between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}; \
+                 got {requested_page_size}"
+            )));
+        }
+        let page_size = requested_page_size as usize;
+
+        // `LoadBalancerNames` is caller-sized, so it is walked ONCE into a set: the
+        // names are deduplicated before anything is looked up, and the DISTINCT names
+        // are what the bound below applies to. Repeating a name is not an error — AWS
+        // accepts it — so no valid request is refused by a bound this emulator chose.
+        let requested_names = input.load_balancer_names.as_deref().unwrap_or_default();
+        let wanted: ::std::collections::BTreeSet<&str> =
+            requested_names.iter().map(String::as_str).collect();
+
+        let region = crate::state::region_from_request(ctx.parts());
+        let guard = state.lock();
+        // A load balancer is a regional resource, so a describe sees only the records of
+        // the region this request is signed for.
+        let records = guard.load_balancers_in(&region);
+
+        // The candidate set, in the store's own (name) order so a `Marker` resumes the
+        // same sequence a later call walks.
+        let selected: Vec<&crate::state::LoadBalancer> = if wanted.is_empty() {
+            // "If no load balancers are specified, the call describes all of your load
+            // balancers."
+            records
+                .map(|held| held.values().collect())
+                .unwrap_or_default()
+        } else {
+            for name in &wanted {
+                if records.is_none_or(|held| !held.contains_key(*name)) {
+                    return Err(
+                        DescribeLoadBalancersErrorModeled::AccessPointNotFoundException(
+                            AccessPointNotFoundException {
+                                message: Some(format!(
+                                    "There is no ACTIVE Load Balancer named '{name}'"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+            // A backstop on the work one request can ask for, reached only AFTER every
+            // named load balancer is known to exist — and a region holds at most this
+            // many, so a request whose names all exist never trips it.
+            if wanted.len() > crate::state::MAX_LOAD_BALANCER_NAMES_PER_REQUEST {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "LoadBalancerNames must name at most {} distinct load balancers; got {}",
+                    crate::state::MAX_LOAD_BALANCER_NAMES_PER_REQUEST,
+                    wanted.len()
+                )));
+            }
+            // The filter is answered from the same set, so selecting the page costs
+            // O(records x log names) rather than one scan of the list per record.
+            records
+                .map(|held| {
+                    held.values()
+                        .filter(|record| wanted.contains(record.name.as_str()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        // `Marker` is the name the previous page stopped before, so the next page starts
+        // at the first record at or after it.
+        let start = match input.marker.as_deref().filter(|marker| !marker.is_empty()) {
+            Some(marker) => selected
+                .iter()
+                .position(|record| record.name.as_str() >= marker)
+                .unwrap_or(selected.len()),
+            None => 0,
+        };
+        let page = &selected[start..selected.len().min(start + page_size)];
+        let next_marker = selected
+            .get(start + page.len())
+            .map(|record| record.name.clone());
+
+        Ok(DescribeLoadBalancersOutput {
+            load_balancer_descriptions: Some(page.iter().map(|record| describe(record)).collect()),
+            next_marker,
+        })
+    }
+}
+
+/// `PageSize`'s modelled maximum: "a number from 1 to 400".
+const MAX_PAGE_SIZE: i32 = 400;
+
+/// `PageSize`'s modelled minimum, from the same sentence as [`MAX_PAGE_SIZE`].
+const MIN_PAGE_SIZE: i32 = 1;
+
+/// `PageSize`'s documented default — "The default is 400" — which today coincides with
+/// [`MAX_PAGE_SIZE`] but is a separate rule: one is what an absent member means, the
+/// other what the member may carry.
+const DEFAULT_PAGE_SIZE: i32 = 400;
+
+/// Project one stored record into the modelled `LoadBalancerDescription`.
+fn describe(record: &crate::state::LoadBalancer) -> LoadBalancerDescription {
+    LoadBalancerDescription {
+        load_balancer_name: Some(record.name.clone()),
+        dns_name: Some(record.dns_name.clone()),
+        canonical_hosted_zone_name: Some(record.canonical_hosted_zone_name.clone()),
+        canonical_hosted_zone_name_id: Some(record.canonical_hosted_zone_name_id.clone()),
+        listener_descriptions: Some(
+            record
+                .listeners
+                .iter()
+                .map(|listener| ListenerDescription {
+                    listener: Some(Listener {
+                        protocol: listener.protocol.clone(),
+                        load_balancer_port: listener.load_balancer_port,
+                        instance_protocol: Some(listener.instance_protocol.clone()),
+                        instance_port: listener.instance_port,
+                        ssl_certificate_id: listener.ssl_certificate_id.clone(),
+                    }),
+                    policy_names: Some(listener.policy_names.clone()),
+                })
+                .collect(),
+        ),
+        // No policy or backend-server operation is implemented yet, so a record carries
+        // none of either; the members are still reported, as empty sets.
+        policies: Some(Policies {
+            app_cookie_stickiness_policies: Some(Vec::new()),
+            lb_cookie_stickiness_policies: Some(Vec::new()),
+            other_policies: Some(Vec::new()),
+        }),
+        backend_server_descriptions: Some(Vec::new()),
+        availability_zones: Some(record.availability_zones.clone()),
+        subnets: Some(record.subnets.clone()),
+        vpc_id: record.vpc_id.clone(),
+        instances: Some(
+            record
+                .instances
+                .iter()
+                .map(|instance_id| Instance {
+                    instance_id: Some(instance_id.clone()),
+                })
+                .collect(),
+        ),
+        health_check: Some(HealthCheck {
+            target: record.health_check.target.clone(),
+            interval: record.health_check.interval,
+            timeout: record.health_check.timeout,
+            unhealthy_threshold: record.health_check.unhealthy_threshold,
+            healthy_threshold: record.health_check.healthy_threshold,
+        }),
+        // Elastic Load Balancing reports the source security group it created for the
+        // load balancer; no operation of this emulator creates one yet.
+        source_security_group: None,
+        security_groups: Some(record.security_groups.clone()),
+        created_time: Some(::aws_smithy_types::DateTime::from(record.created_time)),
+        scheme: Some(record.scheme.clone()),
     }
 }

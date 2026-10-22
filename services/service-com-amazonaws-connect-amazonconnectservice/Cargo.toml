@@ -21,13 +21,19 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque pagination cursors: the last-returned key, hex-encoded.
+hex = { workspace = true }
+# SHA-256: the minted instance and queue identifiers are a digest of the store's
+# mint counter, laid out in the v4-UUID form the model's id members carry.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# `time` for `tokio::time::sleep`: the lifecycle test waits past the clock-owed
+# CREATION_IN_PROGRESS -> ACTIVE instant without blocking the test's worker.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

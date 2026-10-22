@@ -25,7 +25,12 @@ pub struct ListInvitationsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchain#Invitation")]
+// `Invitation`'s schema is written out by hand for the same single reason as `Network`'s
+// and `NetworkSummary`'s — `@timestampFormat("date-time")` on the `Timestamp` its
+// `CreationDate` and `ExpirationDate` target, which the vendored codegen does not emit, so
+// a macro-built member schema makes the restJson1 codec fall back to epoch seconds (a
+// NUMBER where the model requires an ISO-8601 string). See the note above `Network` in
+// `get_network_types.rs`; everything else mirrors the macro's output.
 #[derive(Debug, Clone, Default)]
 pub struct Invitation {
     pub invitation_id: Option<String>,
@@ -34,5 +39,149 @@ pub struct Invitation {
     pub status: Option<String>,
     pub network_summary: Option<NetworkSummary>,
     pub arn: Option<String>,
+}
+
+#[allow(non_upper_case_globals)]
+impl Invitation {
+    const SHAPE_ID: &'static str = "com.amazonaws.managedblockchain#Invitation";
+    const NAMESPACE: &'static str = "com.amazonaws.managedblockchain";
+
+    pub const M_INVITATION_ID: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#Invitation$InvitationId",
+                Self::NAMESPACE,
+                "InvitationId",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "InvitationId",
+            0,
+        );
+    /// `@timestampFormat("date-time")` from `Timestamp` — the chain the macro cannot
+    /// emit.
+    pub const M_CREATION_DATE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#Invitation$CreationDate",
+                Self::NAMESPACE,
+                "CreationDate",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "CreationDate",
+            1,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    /// `@timestampFormat("date-time")`, as for `CreationDate` above.
+    pub const M_EXPIRATION_DATE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#Invitation$ExpirationDate",
+                Self::NAMESPACE,
+                "ExpirationDate",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "ExpirationDate",
+            2,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    pub const M_STATUS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#Invitation$Status",
+            Self::NAMESPACE,
+            "Status",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Status",
+        3,
+    );
+    pub const M_NETWORK_SUMMARY: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#Invitation$NetworkSummary",
+                Self::NAMESPACE,
+                "NetworkSummary",
+            ),
+            ::aws_smithy_schema::ShapeType::Structure,
+            "NetworkSummary",
+            4,
+        );
+    pub const M_ARN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#Invitation$Arn",
+            Self::NAMESPACE,
+            "Arn",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Arn",
+        5,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(Self::SHAPE_ID, Self::NAMESPACE, "Invitation"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_INVITATION_ID,
+            &Self::M_CREATION_DATE,
+            &Self::M_EXPIRATION_DATE,
+            &Self::M_STATUS,
+            &Self::M_NETWORK_SUMMARY,
+            &Self::M_ARN,
+        ],
+    );
+}
+
+pub static INVITATION_SCHEMA: &::aws_smithy_schema::Schema = &Invitation::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for Invitation {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.invitation_id.as_ref() {
+            s.write_string(&Self::M_INVITATION_ID, v.as_str())?;
+        }
+        if let Some(v) = self.creation_date.as_ref() {
+            s.write_timestamp(&Self::M_CREATION_DATE, v)?;
+        }
+        if let Some(v) = self.expiration_date.as_ref() {
+            s.write_timestamp(&Self::M_EXPIRATION_DATE, v)?;
+        }
+        if let Some(v) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, v.as_str())?;
+        }
+        if let Some(v) = self.network_summary.as_ref() {
+            s.write_struct(&Self::M_NETWORK_SUMMARY, v)?;
+        }
+        if let Some(v) = self.arn.as_ref() {
+            s.write_string(&Self::M_ARN, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for Invitation {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.invitation_id = Some(d.read_string(&Self::M_INVITATION_ID)?),
+                Some(1) => out.creation_date = Some(d.read_timestamp(&Self::M_CREATION_DATE)?),
+                Some(2) => {
+                    out.expiration_date = Some(d.read_timestamp(&Self::M_EXPIRATION_DATE)?)
+                }
+                Some(3) => out.status = Some(d.read_string(&Self::M_STATUS)?),
+                Some(4) => {
+                    out.network_summary = Some(<NetworkSummary as
+                        ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?)
+                }
+                Some(5) => out.arn = Some(d.read_string(&Self::M_ARN)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 

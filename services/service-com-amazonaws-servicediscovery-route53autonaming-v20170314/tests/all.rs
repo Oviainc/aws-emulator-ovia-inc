@@ -17,5 +17,7 @@ mod cloud_map_core;
 mod delete_namespace;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tagging.rs"]
+mod tagging;
 #[path = "all/update_http_namespace.rs"]
 mod update_http_namespace;

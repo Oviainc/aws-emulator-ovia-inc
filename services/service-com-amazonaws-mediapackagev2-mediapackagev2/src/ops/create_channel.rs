@@ -326,6 +326,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             reset_at: None,
             etag,
             tags,
+            // No resource policy is attached until `PutChannelPolicy` attaches one.
+            policy: None,
             origin_endpoints: ::std::collections::BTreeMap::new(),
         };
         group.channels.insert(name.clone(), channel);

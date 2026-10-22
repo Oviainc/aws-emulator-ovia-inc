@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the account-wide Bring Your Own License (BYOL)
+//! configuration this service has persisted — the one `ModifyAccount` writes and
+//! `crate::state::AccountByolConfig` holds. Purely reporting: it changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -85,10 +80,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-workspaces-workspacesse
 // here — hence the `DescribeAccountError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.workspaces#DescribeAccount")]
+// `InternalServerException` is widened in with `extra_errors`: the service models it
+// ("Unexpected server error occured.") but does not list it on this operation, and it
+// is the only shape that can carry the one fault this handler can hit — the engine not
+// being the in-memory engine this service's store lives in.
+#[smithy_macros::operation_error(
+    "com.amazonaws.workspaces#DescribeAccount",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DescribeAccountErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -142,18 +145,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAccount"))
+        // `DescribeAccountRequest` carries no members, and this operation only
+        // reports, so neither the input nor the request metadata decides anything.
+        let _ = (&input, ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAccountErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the WorkSpaces state store is unavailable".to_string()),
+            })
+        })?;
+        // A read: the guard is taken but nothing is written through it, so two
+        // DescribeAccount calls with no ModifyAccount between them report the same
+        // configuration.
+        let byol = state.lock().byol().clone();
+
+        Ok(DescribeAccountOutput {
+            // `DISABLED` until a `ModifyAccount` call turns BYOL on, then `ENABLED`
+            // — the two values of `DedicatedTenancySupportResultEnum`.
+            dedicated_tenancy_support: Some(byol.dedicated_tenancy_support().to_string()),
+            // Absent until a `ModifyAccount` call configures a management network
+            // CIDR range; reported exactly as it was stored once one is.
+            dedicated_tenancy_management_cidr_range: byol
+                .management_cidr_range()
+                .map(str::to_string),
+            // `DedicatedTenancyAccountType` is "The type of linked account"
+            // (`SOURCE_ACCOUNT | TARGET_ACCOUNT`), which only an account link
+            // decides. Nothing in this emulator models account links yet — the
+            // `CreateAccountLinkInvitation` / `GetAccountLink` family is still
+            // scaffolded — so there is no state to report it from, and it stays
+            // absent rather than being invented.
+            dedicated_tenancy_account_type: None,
+            // "The text message to describe the status of BYOL", computed from the
+            // stored configuration.
+            message: Some(byol.status_message()),
+        })
     }
 }

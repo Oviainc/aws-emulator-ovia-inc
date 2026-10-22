@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSnapshotBlocks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSnapshotBlocks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSnapshotBlocks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: enumerates the blocks actually persisted for the stored snapshot,
+//! ascending by `BlockIndex`, paging with a derived opaque `NextToken`.
+//!
+//! EMULATOR DEFAULT, not modelled behaviour: a request that names no `MaxResults` is
+//! paginated at [`DEFAULT_MAX_RESULTS`] (the model declares bounds for `MaxResults` but
+//! no default), so a caller that omits it can still receive a `NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -99,6 +97,17 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::{decode_page_token, encode_page_token};
+
+/// The page size used when the request names no `MaxResults`.
+///
+/// The model bounds `MaxResults` at `range 100..10000` and documents no default, so the
+/// smallest page a caller may ask for is what an unasked-for page carries: it keeps the
+/// response bounded without inventing a larger limit than the model names anywhere.
+const DEFAULT_MAX_RESULTS: i32 = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -172,18 +181,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSnapshotBlocks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSnapshotBlocksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        // The only write a listing performs: materialising a `Timeout` the clock had
+        // already made due, which was owed whether or not anybody listed.
+        store.expire_due_snapshots(now);
+
+        let page_size = usize::try_from(input.max_results.unwrap_or(DEFAULT_MAX_RESULTS))
+            .unwrap_or(0);
+
+        let Some(snapshot) = store.snapshots.get(&input.snapshot_id) else {
+            return Err(not_found(format!(
+                "snapshot {} does not exist",
+                input.snapshot_id
+            )));
+        };
+
+        // `NextToken` wins over `StartingBlockIndex`: "If you specify NextToken, then
+        // StartingBlockIndex is ignored."
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSnapshotBlocks"))
+        // A `NextToken` this service issued always names a block the snapshot holds (it
+        // is minted from the first block the previous page did not report), so the token
+        // is checked against the stored blocks, not merely decoded: a value that names
+        // another snapshot, or an index this snapshot has no block at, is refused.
+        let starting_block_index = match input.next_token.as_deref() {
+            Some(token) => decode_page_token(token)
+                .filter(|(token_snapshot_id, next_index)| {
+                    *token_snapshot_id == input.snapshot_id
+                        && snapshot.blocks.contains_key(next_index)
+                })
+                .map(|(_, next_index)| next_index)
+                .ok_or_else(|| {
+                    validation(
+                        "INVALID_PAGE_TOKEN",
+                        format!(
+                            "NextToken is not a page token this service issued for snapshot {}",
+                            input.snapshot_id
+                        ),
+                    )
+                })?,
+            None => input.starting_block_index.unwrap_or(0),
+        };
+
+        // `blocks` is a `BTreeMap` keyed by `BlockIndex`, so `range` already yields the
+        // ascending order the response promises and skips every lower index.
+        let mut remaining = snapshot.blocks.range(starting_block_index..);
+        let blocks: Vec<Block> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(block_index, entry)| Block {
+                block_index: Some(*block_index),
+                block_token: Some(entry.block_token.clone()),
+            })
+            .collect();
+        // A `NextToken` only when a further block really remains. It carries the next
+        // block INDEX, not a page cursor, so a client that changes `MaxResults` midway
+        // through pagination still resumes exactly where the previous page stopped.
+        let next_token = remaining
+            .next()
+            .map(|(block_index, _)| encode_page_token(&snapshot.snapshot_id, *block_index));
+
+        Ok(ListSnapshotBlocksOutput {
+            blocks: Some(blocks),
+            expiry_time: Some(::aws_smithy_types::DateTime::from(snapshot.expiry_time)),
+            volume_size: Some(snapshot.volume_size),
+            block_size: Some(snapshot.block_size),
+            next_token,
+        })
     }
+}
+
+/// The modelled server error for an engine that holds no state for this service.
+fn no_state() -> ListSnapshotBlocksError {
+    ListSnapshotBlocksErrorModeled::InternalServerException(InternalServerException {
+        message: Some(
+            "the com-amazonaws-ebs-ebs service is mounted on an engine that holds no state"
+                .to_string(),
+        ),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400) with one of `ValidationExceptionReason`'s
+/// values.
+fn validation(reason: &str, message: String) -> ListSnapshotBlocksError {
+    ListSnapshotBlocksErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+        reason: Some(reason.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) for an absent snapshot.
+fn not_found(message: String) -> ListSnapshotBlocksError {
+    ListSnapshotBlocksErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        reason: Some("SNAPSHOT_NOT_FOUND".to_string()),
+    })
+    .into()
 }

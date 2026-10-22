@@ -3,18 +3,20 @@
 //! Engine state for the com-amazonaws-managedblockchain-taigawebservice service.
 //!
 //! The service's primary resource is the blockchain **network**, which owns the
-//! **members** that joined it and the **nodes** that run on it. Every implemented
-//! operation answers from the records below: ids, ARNs, endpoints and creation dates
-//! are minted once by the create call and stored, never recomputed on a read.
+//! **members** that joined it and the **nodes** that run on it. Beside the networks sit
+//! the **invitations** this account holds — one per approved `InviteAction`, each naming
+//! the network its invitee may join. Every implemented operation answers from the records
+//! below: ids, ARNs, endpoints and creation dates are minted once by the call that
+//! creates the record and stored, never recomputed on a read.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Member, MemberFabricAttributes, MemberFrameworkAttributes, MemberLogPublishingConfiguration,
-    Network, NetworkFabricAttributes, NetworkFrameworkAttributes, NetworkSummary, Node,
-    NodeFabricAttributes, NodeFrameworkAttributes, NodeLogPublishingConfiguration, NodeSummary,
-    VotingPolicy,
+    Invitation, Member, MemberFabricAttributes, MemberFrameworkAttributes,
+    MemberLogPublishingConfiguration, Network, NetworkFabricAttributes,
+    NetworkFrameworkAttributes, NetworkSummary, Node, NodeFabricAttributes,
+    NodeFrameworkAttributes, NodeLogPublishingConfiguration, NodeSummary, VotingPolicy,
 };
 
 /// The signing name, endpoint prefix and ARN namespace of this service (the model's
@@ -50,6 +52,30 @@ pub const STATUS_CREATING: &str = "CREATING";
 /// The settled status the clock owes a created network, member or node.
 pub const STATUS_AVAILABLE: &str = "AVAILABLE";
 
+/// The `InvitationStatus` a minted invitation starts in: "`PENDING` - The invitee hasn't
+/// created a member to join the network, and the invitation hasn't yet expired"
+/// (`Invitation$Status`).
+pub const INVITATION_STATUS_PENDING: &str = "PENDING";
+
+/// The `InvitationStatus` of an invitation its invitee turned down: "`REJECTED` - The
+/// invitee rejected the invitation" (`Invitation$Status`).
+pub const INVITATION_STATUS_REJECTED: &str = "REJECTED";
+
+/// The `InvitationStatus` the clock owes an invitation nobody acted on: "`EXPIRED` - The
+/// invitee neither created a member nor rejected the invitation before the
+/// `ExpirationDate`" (`Invitation$Status`).
+pub const INVITATION_STATUS_EXPIRED: &str = "EXPIRED";
+
+/// The proposal duration an invitation's expiry falls back on when the inviting network's
+/// voting policy names no `ApprovalThresholdPolicy$ProposalDurationInHours`.
+///
+/// `Invitation$ExpirationDate` is documented as "the `CreationDate` plus the
+/// `ProposalDurationInHours` that is specified in the `ProposalThresholdPolicy`", so the
+/// span comes from the network's own policy wherever it names one. Nothing in this
+/// service's model fixes a default for a policy that omits it, so THIS number is the
+/// emulator's own choice; it sits inside `ProposalDurationInt`'s `@range(1, 168)`.
+pub const DEFAULT_PROPOSAL_DURATION_IN_HOURS: i32 = 24;
+
 /// `NodeConfiguration$StateDB`'s documented default: "When using an Amazon Managed
 /// Blockchain network with Hyperledger Fabric version 1.4 or later, the default is
 /// `CouchDB`."
@@ -68,6 +94,10 @@ pub const NETWORK_MAX_RESULTS: i32 = 10;
 /// used when a caller names none.
 pub const NODE_MAX_RESULTS: i32 = 20;
 
+/// `ListInvitations`'s `MaxResults` upper bound, from its `@range(1, 100)`. Also the page
+/// size used when a caller names none.
+pub const INVITATION_MAX_RESULTS: i32 = 100;
+
 /// How many networks this emulator will hold.
 ///
 /// The real service caps networks per account per Region with a service quota, and
@@ -80,6 +110,11 @@ pub const MAX_NETWORKS: usize = 1_000;
 /// How many nodes this emulator will hold on one network, for the same reason as
 /// [`MAX_NETWORKS`]; `CreateNode` models `ResourceLimitExceededException` for it.
 pub const MAX_NODES_PER_NETWORK: usize = 1_000;
+
+/// How many invitations this emulator will hold, for the same reason as [`MAX_NETWORKS`]:
+/// an invitation record is minted per approved `InviteAction` and outlives the proposal
+/// that minted it, so the store needs a ceiling of its own.
+pub const MAX_INVITATIONS: usize = 1_000;
 
 /// How many `ClientRequestToken` records the idempotency ledger keeps.
 ///
@@ -316,12 +351,56 @@ impl StoredNode {
     }
 }
 
+/// One invitation an approved `InviteAction` minted: "An invitation to an Amazon Web
+/// Services account to create a member and join the network."
+#[derive(Debug, Clone)]
+pub struct StoredInvitation {
+    pub id: String,
+    /// The account the `InviteAction` named (`InviteAction$Principal`). `ListInvitations`
+    /// reports "all invitations for the current Amazon Web Services account", so this is
+    /// what a listing selects on.
+    pub principal: String,
+    /// The network the invitee may join; its [`StoredNetwork::to_summary`] is what
+    /// `Invitation$NetworkSummary` reports.
+    pub network_id: String,
+    /// An `InvitationStatus` value.
+    pub status: String,
+    pub creation_date: SystemTime,
+    /// `Invitation$ExpirationDate`: "This is the `CreationDate` plus the
+    /// `ProposalDurationInHours` that is specified in the `ProposalThresholdPolicy`."
+    /// When it passes, a still-`PENDING` invitation is owed `EXPIRED` — see
+    /// [`ComAmazonawsManagedblockchainTaigawebserviceState::settle`].
+    pub expiration_date: SystemTime,
+    pub arn: String,
+}
+
+impl StoredInvitation {
+    /// The modelled `Invitation` for this record, as `ListInvitations` returns it.
+    ///
+    /// `network` is the stored network this invitation is onto, which the caller looks up
+    /// by [`Self::network_id`]; `None` when nothing holds it any more, in which case there
+    /// is no summary to report.
+    pub fn to_invitation(&self, network: Option<&StoredNetwork>) -> Invitation {
+        Invitation {
+            invitation_id: Some(self.id.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
+            expiration_date: Some(::aws_smithy_types::DateTime::from(self.expiration_date)),
+            status: Some(self.status.clone()),
+            network_summary: network.map(StoredNetwork::to_summary),
+            arn: Some(self.arn.clone()),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-managedblockchain-taigawebservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsManagedblockchainTaigawebserviceState {
     /// Every created network, keyed by its minted id — which also orders the listings,
     /// so a page cursor keys on the ordering itself.
     pub networks: BTreeMap<String, StoredNetwork>,
+    /// Every invitation this account holds, keyed by its minted id — which, as for the
+    /// networks above, is also the listing order a page cursor keys on.
+    pub invitations: BTreeMap<String, StoredInvitation>,
     /// The ids each `ClientRequestToken` already minted, so a repeated token replays its
     /// original result instead of creating a second resource.
     ///
@@ -344,6 +423,13 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
     pub fn settle(&mut self, now: SystemTime) {
         for network in self.networks.values_mut() {
             network.settle(now);
+        }
+        // An invitation nobody acted on before its `ExpirationDate` is `EXPIRED` — a
+        // transition the CLOCK owes, due at that instant whether or not anybody calls.
+        for invitation in self.invitations.values_mut() {
+            if invitation.status == INVITATION_STATUS_PENDING && now >= invitation.expiration_date {
+                invitation.status = INVITATION_STATUS_EXPIRED.to_string();
+            }
         }
     }
 
@@ -400,7 +486,8 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
 
     /// Mint a fresh resource id: `prefix`, a hyphen, then 26 characters of the base-32
     /// alphabet, the shape every Managed Blockchain id takes (`n-` for a network, `m-`
-    /// for a member, `nd-` for a node), and within `ResourceIdString`'s `@length(1, 32)`.
+    /// for a member, `nd-` for a node, `i-` for an invitation), and within
+    /// `ResourceIdString`'s `@length(1, 32)`.
     ///
     /// Drawn from a counter the state advances (seeded from the clock on first use),
     /// never from the request, so two identical creates mint two different ids.
@@ -425,6 +512,64 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
                 return id;
             }
         }
+    }
+
+    /// Mint an invitation id no stored invitation holds.
+    pub fn mint_invitation_id(&mut self) -> String {
+        loop {
+            let id = self.mint_id("i");
+            if !self.invitations.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// Record the invitation an `InviteAction` owes `principal` once its proposal is
+    /// approved: "The `InviteAction` is carried out when a `Proposal` is `APPROVED`"
+    /// (`InviteAction`). This is where an invitation enters the store, and the only
+    /// place: `ListInvitations` and `RejectInvitation` report and settle what is here.
+    ///
+    /// The record expires at `now` plus the inviting network's
+    /// `ApprovalThresholdPolicy$ProposalDurationInHours` (defaulting to
+    /// [`DEFAULT_PROPOSAL_DURATION_IN_HOURS`]), as `Invitation$ExpirationDate` documents.
+    ///
+    /// Answers the minted invitation id, or `None` when `network_id` names no stored
+    /// network (there is nothing to be invited onto) or the store is already holding
+    /// [`MAX_INVITATIONS`] records.
+    pub fn record_invitation(
+        &mut self,
+        network_id: &str,
+        principal: &str,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<String> {
+        if self.invitations.len() >= MAX_INVITATIONS {
+            return None;
+        }
+        let hours = self
+            .networks
+            .get(network_id)?
+            .voting_policy
+            .approval_threshold_policy
+            .as_ref()
+            .and_then(|policy| policy.proposal_duration_in_hours)
+            .unwrap_or(DEFAULT_PROPOSAL_DURATION_IN_HOURS)
+            // `ProposalDurationInt` is `@range(1, 168)`, which the boundary validator
+            // already enforced on the create; the clamp keeps the arithmetic below sound
+            // whatever a stored record holds.
+            .clamp(1, 168) as u64;
+        let id = self.mint_invitation_id();
+        let invitation = StoredInvitation {
+            arn: invitation_arn(region, &id),
+            id: id.clone(),
+            principal: principal.to_string(),
+            network_id: network_id.to_string(),
+            status: INVITATION_STATUS_PENDING.to_string(),
+            creation_date: now,
+            expiration_date: now + Duration::from_secs(hours * 3_600),
+        };
+        self.invitations.insert(id.clone(), invitation);
+        Some(id)
     }
 }
 
@@ -460,6 +605,17 @@ pub fn member_arn(region: &str, member_id: &str) -> String {
 /// The ARN of a node: `arn:aws:managedblockchain:<region>:<account>:nodes/<id>`.
 pub fn node_arn(region: &str, node_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("nodes/{node_id}"))
+}
+
+/// The ARN of an invitation
+/// (`arn:aws:managedblockchain:<region>:<account>:invitations/<id>`), which satisfies
+/// `ArnString`'s pattern `^arn:.+:.+:.+:.+:.+$`.
+pub fn invitation_arn(region: &str, invitation_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("invitations/{invitation_id}"),
+    )
 }
 
 /// The VPC endpoint service name members use to reach a network's resources

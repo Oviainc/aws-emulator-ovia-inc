@@ -17,3 +17,5 @@ mod state_roundtrip;
 mod supported_resource_types;
 #[path = "all/vault_and_backup_job.rs"]
 mod vault_and_backup_job;
+#[path = "all/vault_read_projection.rs"]
+mod vault_read_projection;

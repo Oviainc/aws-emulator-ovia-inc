@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTranscript
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTranscript`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Returns the transcript of the session the `ConnectionToken` header
+//! authenticates, as the items that were actually sent on it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTranscript::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `ScanDirection` picks which items the scan reaches and in which traversal order
+//! (so it decides what lands on each page), `MaxResults` slices that scan into pages,
+//! and `SortOrder` orders the page that is returned. A `NextToken` carries the resolved
+//! scan and how much of it has been consumed, so feeding it back continues exactly
+//! where the previous page stopped: on a continuation the cursor's `SortOrder`,
+//! `ScanDirection` and start position win over any supplied alongside the token, while
+//! `MaxResults` is taken from the continuation request, so a caller may re-page the same
+//! scan at a different page size. This operation only reads state.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +174,361 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTranscript` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTranscriptErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTranscript"))
+        let _ = ctx;
+        let now = std::time::SystemTime::now();
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(GetTranscriptErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the connectparticipant store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let state = store.lock();
+
+        let Some(session) = state.session_for_connection_token(&input.connection_token, now)
+        else {
+            return Err(GetTranscriptErrorModeled::AccessDeniedException(AccessDeniedException {
+                message: "the connection token does not name a connected chat participant"
+                    .to_string(),
+            })
+            .into());
+        };
+
+        // `ContactId` selects a contact of the connection's own chain; it may not reach
+        // another participant's transcript.
+        if let Some(contact_id) = input.contact_id.as_deref() {
+            if contact_id != session.contact_id && contact_id != session.initial_contact_id {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "ContactId '{contact_id}' is not a contact of this connection"
+                )));
+            }
+        }
+
+        let total = session.transcript.len();
+
+        // A continuation resumes the scan the token records; a first page resolves one
+        // from `SortOrder`, `ScanDirection` and `StartPosition`.
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = TranscriptCursor::decode(token) else {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "NextToken is not a transcript pagination token this service issued",
+                    ));
+                };
+                if cursor.contact_id != session.contact_id {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "NextToken was issued for a different contact",
+                    ));
+                }
+                cursor
+            }
+            None => {
+                let sort_order = match input.sort_order.as_deref() {
+                    // `GetTranscriptRequest$SortOrder` doc: "Default: DESCENDING."
+                    None => SORT_DESCENDING,
+                    Some(value) if value == SORT_ASCENDING => SORT_ASCENDING,
+                    Some(value) if value == SORT_DESCENDING => SORT_DESCENDING,
+                    Some(value) => {
+                        return Err(crate::scaffolded::Scaffolded::validation(format!(
+                            "SortOrder '{value}' is not a SortKey; expected one of [{}]",
+                            SORT_KEY_VALUES.join(", ")
+                        )))
+                    }
+                };
+                let scan_direction = match input.scan_direction.as_deref() {
+                    // `GetTranscriptRequest$ScanDirection` doc: "Default: BACKWARD when no
+                    // StartPosition is provided, FORWARD with StartPosition."
+                    None => {
+                        if input.start_position.is_some() {
+                            SCAN_FORWARD
+                        } else {
+                            SCAN_BACKWARD
+                        }
+                    }
+                    Some(value) if value == SCAN_FORWARD => SCAN_FORWARD,
+                    Some(value) if value == SCAN_BACKWARD => SCAN_BACKWARD,
+                    Some(value) => {
+                        return Err(crate::scaffolded::Scaffolded::validation(format!(
+                            "ScanDirection '{value}' is not a ScanDirection; expected one of [{}]",
+                            SCAN_DIRECTION_VALUES.join(", ")
+                        )))
+                    }
+                };
+                let start = match resolve_start(
+                    &session.transcript,
+                    input.start_position.as_ref(),
+                    scan_direction,
+                ) {
+                    Ok(start) => start,
+                    Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+                };
+                let start_index = match start {
+                    ScanStart::Nothing => None,
+                    ScanStart::Index(index) => Some(index),
+                    ScanStart::Default if total == 0 => None,
+                    ScanStart::Default if scan_direction == SCAN_FORWARD => Some(0),
+                    ScanStart::Default => Some(total - 1),
+                };
+                TranscriptCursor {
+                    contact_id: session.contact_id.clone(),
+                    // An empty scan is recorded as a start past the end, which yields no
+                    // items for any `total`.
+                    start: start_index.unwrap_or(total),
+                    scan_direction: scan_direction.to_string(),
+                    sort_order: sort_order.to_string(),
+                    consumed: 0,
+                    empty: start_index.is_none(),
+                }
+            }
+        };
+
+        let scan = cursor.scan_order(total);
+        let max_results = match input.max_results {
+            // `MaxResults` is modelled with range 0..100, so an explicit 0 is a valid
+            // page size and is honoured as one: the page holds nothing.
+            Some(requested) if requested >= 0 => (requested as usize).min(MAX_RESULTS_CEILING),
+            // `GetTranscriptRequest$MaxResults` doc: "Default: 10." — for an ABSENT
+            // member. (A negative value is refused by the model's own range before this
+            // handler runs.)
+            _ => DEFAULT_MAX_RESULTS,
+        };
+        let consumed = cursor.consumed.min(scan.len());
+        let page_end = consumed.saturating_add(max_results).min(scan.len());
+        let mut page: Vec<usize> = scan[consumed..page_end].to_vec();
+        if cursor.sort_order == SORT_ASCENDING {
+            page.sort_unstable();
+        } else {
+            page.sort_unstable_by(|left, right| right.cmp(left));
+        }
+
+        let transcript: Vec<Item> = page
+            .iter()
+            .map(|&index| transcript_item(&session.transcript[index]))
+            .collect();
+        // A continuation is reported only when the next page would make progress: a page
+        // size of 0 consumes nothing, so it reports no `NextToken` rather than a token
+        // that would hand back the same empty page for ever.
+        let next_token =
+            (max_results > 0 && page_end < scan.len()).then(|| cursor.at(page_end).encode());
+
+        Ok(GetTranscriptOutput {
+            initial_contact_id: Some(session.initial_contact_id.clone()),
+            transcript: Some(transcript),
+            next_token,
+        })
+    }
+}
+
+/// `SortKey$ASCENDING`, from `SORT_KEY_VALUES`.
+const SORT_ASCENDING: &str = "ASCENDING";
+/// `SortKey$DESCENDING`, from `SORT_KEY_VALUES`.
+const SORT_DESCENDING: &str = "DESCENDING";
+/// `ScanDirection$FORWARD`, from `SCAN_DIRECTION_VALUES`.
+const SCAN_FORWARD: &str = "FORWARD";
+/// `ScanDirection$BACKWARD`, from `SCAN_DIRECTION_VALUES`.
+const SCAN_BACKWARD: &str = "BACKWARD";
+
+/// `GetTranscriptRequest$MaxResults` doc: "The maximum number of results to return in
+/// the page. Default: 10."
+const DEFAULT_MAX_RESULTS: usize = 10;
+
+/// `MaxResults`'s modelled range is 0..100; the boundary validator already refuses
+/// anything above it, and this keeps a page bounded if it ever does not.
+const MAX_RESULTS_CEILING: usize = 100;
+
+/// The longest `NextToken` this service can have issued: a cursor's JSON is a fixed set
+/// of members (a UUID contact id, two enum values, two indices and a flag), hex-encoded,
+/// so 512 characters is well above any cursor and well below `NextToken`'s modelled
+/// maximum of 1000. Anything longer is refused without decoding.
+const MAX_NEXT_TOKEN_LEN: usize = 512;
+
+/// Where a transcript scan begins.
+#[derive(Debug, Clone, Copy)]
+enum ScanStart {
+    /// No `StartPosition` was given: begin at whichever end `ScanDirection` reads from.
+    Default,
+    /// The transcript index the `StartPosition` resolved to.
+    Index(usize),
+    /// The `StartPosition` resolved to no item at all, so the scan is empty.
+    Nothing,
+}
+
+/// Resolve `StartPosition` against the stored transcript.
+///
+/// Exactly one of `Id`, `AbsoluteTime` and `MostRecent` selects a position; `MostRecent`
+/// counts back from the newest item ("if you sent 100 messages, start with message 50").
+/// `Err` carries the `ValidationException` message for a start position that cannot be
+/// resolved at all.
+fn resolve_start(
+    transcript: &[crate::state::TranscriptItem],
+    start_position: Option<&StartPosition>,
+    scan_direction: &str,
+) -> Result<ScanStart, String> {
+    let Some(start_position) = start_position else {
+        return Ok(ScanStart::Default);
+    };
+    let total = transcript.len();
+    let selectors = [
+        start_position.id.is_some(),
+        start_position.absolute_time.is_some(),
+        start_position.most_recent > 0,
+    ]
+    .into_iter()
+    .filter(|set| *set)
+    .count();
+    if selectors > 1 {
+        return Err(
+            "StartPosition accepts at most one of Id, AbsoluteTime and MostRecent".to_string(),
+        );
+    }
+    if let Some(id) = start_position.id.as_deref() {
+        let Some(index) = transcript.iter().position(|item| item.id == id) else {
+            return Err(format!(
+                "StartPosition.Id '{id}' is not an item of this transcript"
+            ));
+        };
+        return Ok(ScanStart::Index(index));
+    }
+    if let Some(supplied) = start_position.absolute_time.as_deref() {
+        let Some(absolute_time) = crate::state::normalise_instant(supplied) else {
+            return Err(format!(
+                "StartPosition.AbsoluteTime '{supplied}' is not an ISO 8601 timestamp of \
+                 the form yyyy-MM-ddThh:mm:ss.SSSZ"
+            ));
+        };
+        // Normalised to the documented precision, `Instant` values compare
+        // lexicographically in chronological order.
+        let absolute_time = absolute_time.as_str();
+        let found = if scan_direction == SCAN_FORWARD {
+            transcript
+                .iter()
+                .position(|item| item.absolute_time.as_str() >= absolute_time)
+        } else {
+            transcript
+                .iter()
+                .rposition(|item| item.absolute_time.as_str() <= absolute_time)
+        };
+        return Ok(found.map_or(ScanStart::Nothing, ScanStart::Index));
+    }
+    if start_position.most_recent > 0 {
+        if total == 0 {
+            return Ok(ScanStart::Nothing);
+        }
+        let back = (start_position.most_recent as usize).min(total);
+        return Ok(ScanStart::Index(total - back));
+    }
+    Ok(ScanStart::Default)
+}
+
+/// The resolved scan a `NextToken` carries: which contact, where the scan starts, how it
+/// traverses, how the page is sorted, and how many scanned items are already served.
+///
+/// It is carried IN the token rather than stored, so `GetTranscript` only reads state.
+#[derive(Debug, Clone)]
+struct TranscriptCursor {
+    contact_id: String,
+    start: usize,
+    scan_direction: String,
+    sort_order: String,
+    consumed: usize,
+    empty: bool,
+}
+
+impl TranscriptCursor {
+    /// The transcript indices this scan visits, in traversal order.
+    fn scan_order(&self, total: usize) -> Vec<usize> {
+        if self.empty || total == 0 {
+            return Vec::new();
+        }
+        if self.scan_direction == SCAN_FORWARD {
+            // A forward scan runs from its anchor to the newest item, so items appended
+            // between pages are reached by a later page rather than dropped.
+            if self.start >= total {
+                Vec::new()
+            } else {
+                (self.start..total).collect()
+            }
+        } else {
+            // A backward scan runs from its anchor to the oldest item.
+            let anchor = self.start.min(total - 1);
+            (0..=anchor).rev().collect()
+        }
+    }
+
+    /// This cursor advanced to `consumed` scanned items.
+    fn at(&self, consumed: usize) -> Self {
+        Self {
+            consumed,
+            ..self.clone()
+        }
+    }
+
+    /// The cursor as an opaque `NextToken`.
+    fn encode(&self) -> String {
+        let value = serde_json::json!({
+            "c": self.contact_id,
+            "s": self.start,
+            "d": self.scan_direction,
+            "o": self.sort_order,
+            "n": self.consumed,
+            "e": self.empty,
+        });
+        hex::encode(
+            // Every member is a String, a usize or a bool, so this object always serializes.
+            serde_json::to_vec(&value).expect("a transcript cursor always serializes"),
+        )
+    }
+
+    /// The cursor a `NextToken` carries, or `None` when the token is not one of ours.
+    ///
+    /// The scan direction and sort order are checked against the modelled value sets, so
+    /// a forged token is refused the same way a first-page request naming an unmodelled
+    /// value is, rather than silently selecting a scan the caller did not ask for.
+    fn decode(token: &str) -> Option<Self> {
+        // The cursors this service issues are a fixed shape, so a token longer than this
+        // is not one of ours and is refused before any decoding work.
+        if token.len() > MAX_NEXT_TOKEN_LEN {
+            return None;
+        }
+        let bytes = hex::decode(token).ok()?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let scan_direction = value.get("d")?.as_str()?;
+        let sort_order = value.get("o")?.as_str()?;
+        if !SCAN_DIRECTION_VALUES.contains(&scan_direction)
+            || !SORT_KEY_VALUES.contains(&sort_order)
+        {
+            return None;
+        }
+        Some(Self {
+            contact_id: value.get("c")?.as_str()?.to_string(),
+            start: usize::try_from(value.get("s")?.as_u64()?).ok()?,
+            scan_direction: scan_direction.to_string(),
+            sort_order: sort_order.to_string(),
+            consumed: usize::try_from(value.get("n")?.as_u64()?).ok()?,
+            empty: value.get("e")?.as_bool()?,
+        })
+    }
+}
+
+/// One stored transcript item as the modelled `Item`.
+fn transcript_item(stored: &crate::state::TranscriptItem) -> Item {
+    Item {
+        absolute_time: Some(stored.absolute_time.clone()),
+        content: stored.content.clone(),
+        content_type: Some(stored.content_type.clone()),
+        id: Some(stored.id.clone()),
+        r#type: Some(stored.item_type.clone()),
+        participant_id: Some(stored.participant_id.clone()),
+        display_name: stored.display_name.clone(),
+        participant_role: Some(stored.participant_role.clone()),
+        // Attachments and message receipts belong to the attachment and receipt
+        // operations, which are still their own gap issues.
+        attachments: None,
+        message_metadata: None,
+        // Only populated for a persistent chat whose item came from an earlier session.
+        related_contact_id: None,
+        contact_id: Some(stored.contact_id.clone()),
     }
 }

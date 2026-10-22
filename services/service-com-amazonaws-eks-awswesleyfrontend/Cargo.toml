@@ -21,13 +21,21 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Derives each cluster's stable 32-hex resource id (endpoint host, OIDC issuer)
+# from its ARN, in `src/state.rs`.
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+# The clock-owed `CREATING` -> `ACTIVE` test waits with `tokio::time::sleep`, so
+# this target declares tokio's `time` feature rather than inheriting it
+# transitively from another crate's feature set. Nothing else is added here: a
+# new dependency would mean a Cargo.lock entry, and this crate's fix must not
+# touch the one file every concurrent fix also edits.
+tokio = { workspace = true, features = ["time"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

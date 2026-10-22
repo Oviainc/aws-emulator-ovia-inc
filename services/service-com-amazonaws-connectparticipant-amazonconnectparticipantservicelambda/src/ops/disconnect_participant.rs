@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisconnectParticipant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisconnectParticipant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisconnectParticipant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Marks the chat session the `ConnectionToken` header authenticates as
+//! disconnected and answers an empty 200. Every later call presenting a token for that
+//! session — this one included — is refused with `AccessDeniedException` (HTTP 403).
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +141,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisconnectParticipant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisconnectParticipantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisconnectParticipant"))
+        let _ = ctx;
+        let now = std::time::SystemTime::now();
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DisconnectParticipantErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the connectparticipant store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+        // Reclaim what the clock has already retired.
+        state.prune_expired(now);
+
+        let Some(session) =
+            state.session_for_connection_token_mut(&input.connection_token, now)
+        else {
+            return Err(DisconnectParticipantErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: "the connection token does not name a connected chat participant"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        session.connected = false;
+        let contact_id = session.contact_id.clone();
+        // The participant's connection tokens can never serve another request, so they
+        // are released rather than kept. `ClientToken` therefore records nothing: the
+        // token a retry would present is already gone, so the retry is the 403 above
+        // rather than a repeat of this result.
+        state.drop_connections(&contact_id);
+        Ok(DisconnectParticipantOutput {})
     }
 }

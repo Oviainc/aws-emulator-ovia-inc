@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInvitations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInvitations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInvitations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: pages the `Invitation` records [`crate::state`] holds for the calling
+//! account, settling the `PENDING` -> `EXPIRED` transition the clock already owed each
+//! one.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +153,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInvitations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInvitationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInvitations"))
+        // A reporting operation: the page is cut from stored state, and the one write it
+        // makes is materialising the status transitions the clock already owed (an
+        // invitation past its `ExpirationDate` is `EXPIRED`), each of which was due at
+        // this instant whether or not anybody called.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListInvitationsErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+
+        let after = match crate::state::decode_cursor(input.next_token.as_deref()) {
+            Ok(after) => after,
+            Err(crate::state::MalformedCursor) => {
+                return Err(ListInvitationsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "NextToken is not a pagination token this operation issued"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let mut guard = state.lock();
+        guard.settle(::std::time::SystemTime::now());
+
+        // "Returns a list of all invitations for the current Amazon Web Services
+        // account": an invitation is reported to the account its `InviteAction` named,
+        // never to anybody else. The summary comes from the invited network's own stored
+        // record, so it reports that network's current configuration and status.
+        let account = ::engine::emulator_account_id();
+        let selected: Vec<(String, Invitation)> = guard
+            .invitations
+            .values()
+            .filter(|invitation| invitation.principal == account)
+            .map(|invitation| {
+                (
+                    invitation.id.clone(),
+                    invitation.to_invitation(guard.networks.get(&invitation.network_id)),
+                )
+            })
+            .collect();
+
+        let page = crate::state::page_of(
+            selected,
+            after.as_deref(),
+            input.max_results,
+            crate::state::INVITATION_MAX_RESULTS,
+        );
+
+        Ok(ListInvitationsOutput {
+            invitations: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

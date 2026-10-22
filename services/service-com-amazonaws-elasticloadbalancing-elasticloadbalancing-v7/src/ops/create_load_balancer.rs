@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLoadBalancer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLoadBalancer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLoadBalancer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: persists a new load balancer record keyed by `LoadBalancerName` and
+//! answers the generated `DNSName` that record keeps for its lifetime. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +192,284 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLoadBalancer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLoadBalancerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLoadBalancer"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This service's model declares no server-fault error, and a 501 would
+            // claim "not implemented", so an unreachable store is refused instead.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the Elastic Load Balancing store is unavailable",
+            ));
+        };
+        let region = crate::state::region_from_request(ctx.parts());
+
+        // `Scheme` has exactly two documented values; anything else is InvalidScheme.
+        let scheme = match input.scheme.as_deref() {
+            None => crate::state::SCHEME_INTERNET_FACING.to_string(),
+            Some(value)
+                if value == crate::state::SCHEME_INTERNET_FACING
+                    || value == crate::state::SCHEME_INTERNAL =>
+            {
+                value.to_string()
+            }
+            Some(other) => {
+                return Err(CreateLoadBalancerErrorModeled::InvalidSchemeException(
+                    InvalidSchemeException {
+                        message: Some(format!(
+                            "Scheme must be one of '{}' or '{}'; got '{other}'",
+                            crate::state::SCHEME_INTERNET_FACING,
+                            crate::state::SCHEME_INTERNAL,
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // A load balancer is placed either by Availability Zone or by subnet, and a
+        // caller-sized list of either is bounded before it reaches the store.
+        // The two placement members are specified TOGETHER for a VPC load balancer:
+        // `Subnets` is documented as "The IDs of the subnets in your VPC to attach to the
+        // load balancer. Specify one subnet per Availability Zone specified in
+        // AvailabilityZones", so a request naming both is accepted and both lists are
+        // stored as given. Only a request that places the load balancer NOWHERE is
+        // refused: "You must specify at least one Availability Zone".
+        let availability_zones = input.availability_zones.unwrap_or_default();
+        let subnets = input.subnets.unwrap_or_default();
+        if availability_zones.is_empty() && subnets.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "at least one of AvailabilityZones or Subnets must be specified",
+            ));
+        }
+        for (member, len) in [
+            ("AvailabilityZones", availability_zones.len()),
+            ("Subnets", subnets.len()),
+        ] {
+            if len > crate::state::MAX_PLACEMENTS_PER_LOAD_BALANCER {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "{member} must carry at most {} entries; got {len}",
+                    crate::state::MAX_PLACEMENTS_PER_LOAD_BALANCER
+                )));
+            }
+        }
+        let security_groups = input.security_groups.unwrap_or_default();
+        if security_groups.len() > crate::state::MAX_SECURITY_GROUPS_PER_LOAD_BALANCER {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SecurityGroups must carry at most {} entries; got {}",
+                crate::state::MAX_SECURITY_GROUPS_PER_LOAD_BALANCER,
+                security_groups.len()
+            )));
+        }
+
+        let listeners = build_listeners(&input.listeners)?;
+        if listeners.is_empty() {
+            // A load balancer with no listener routes nothing; the model requires the
+            // member but cannot require the list to be non-empty.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Listeners must carry at least one listener",
+            ));
+        }
+        let tags = collect_tags(input.tags.as_deref())?;
+
+        let mut guard = state.lock();
+        // A load balancer is a regional resource: the name must be unique, and the
+        // quota is counted, within THIS request's region. The checks READ the region's
+        // records; nothing is stored until the request is known to be acceptable, so a
+        // refusal leaves the store exactly as it found it.
+        let held = guard.load_balancers_in(&region);
+        if held.is_some_and(|records| records.contains_key(&input.load_balancer_name)) {
+            return Err(
+                CreateLoadBalancerErrorModeled::DuplicateAccessPointNameException(
+                    DuplicateAccessPointNameException {
+                        message: Some(format!(
+                            "Load balancer named {} already exists",
+                            input.load_balancer_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if held.is_some_and(|records| {
+            records.len() >= crate::state::MAX_LOAD_BALANCERS_PER_REGION
+        }) {
+            return Err(CreateLoadBalancerErrorModeled::TooManyAccessPointsException(
+                TooManyAccessPointsException {
+                    message: Some(format!(
+                        "Quota of {} load balancers reached",
+                        crate::state::MAX_LOAD_BALANCERS_PER_REGION
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let dns_name = crate::state::dns_name(&region, &input.load_balancer_name, &scheme);
+        // The default health check targets the instance port of the first listener.
+        let health_check = crate::state::HealthCheckConfig::default_for_instance_port(
+            listeners
+                .first()
+                .map_or(0, |listener| listener.instance_port),
+        );
+        let record = crate::state::LoadBalancer {
+            name: input.load_balancer_name.clone(),
+            // `CanonicalHostedZoneName` is documented as "The DNS name of the load
+            // balancer", so it is that same name rather than a second one.
+            canonical_hosted_zone_name: dns_name.clone(),
+            canonical_hosted_zone_name_id: crate::state::hosted_zone_id(&region),
+            dns_name: dns_name.clone(),
+            scheme,
+            created_time: ::std::time::SystemTime::now(),
+            listeners,
+            availability_zones,
+            subnets,
+            security_groups,
+            // No VPC topology is modelled, so a subnet-placed load balancer has no VPC
+            // to report: `DescribeLoadBalancers` leaves `VPCId` absent rather than
+            // inventing an id for a VPC nothing created. A later slice that models
+            // subnets and their VPCs fills this in.
+            vpc_id: None,
+            instances: crate::state::InstanceSet::default(),
+            health_check,
+            tags,
+        };
+        // The region's map is created only now, on the success path, and only while the
+        // store holds fewer regions than it will keep records for.
+        let Some(records) = guard.region_entry(&region) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "this emulator holds load balancers for at most {} regions",
+                crate::state::MAX_REGIONS
+            )));
+        };
+        records.insert(record.name.clone(), record);
+
+        Ok(CreateLoadBalancerOutput {
+            dns_name: Some(dns_name),
+        })
     }
+}
+
+/// Project the requested listeners onto stored [`crate::state::ListenerEntry`] values,
+/// refusing the configurations the model rules out.
+fn build_listeners(
+    requested: &[Listener],
+) -> Result<Vec<crate::state::ListenerEntry>, CreateLoadBalancerError> {
+    // Bound the caller-driven work before any of it runs: one load balancer holds at
+    // most this many listeners, so a longer list cannot be satisfied anyway.
+    if requested.len() > crate::state::MAX_LISTENERS_PER_LOAD_BALANCER {
+        return Err(crate::scaffolded::Scaffolded::validation(format!(
+            "Listeners must carry at most {} listeners; got {}",
+            crate::state::MAX_LISTENERS_PER_LOAD_BALANCER,
+            requested.len()
+        )));
+    }
+
+    let mut claimed_ports: ::std::collections::BTreeSet<i32> = ::std::collections::BTreeSet::new();
+    let mut entries: Vec<crate::state::ListenerEntry> = Vec::with_capacity(requested.len());
+    for listener in requested {
+        let protocol = listener.protocol.to_ascii_uppercase();
+        // `InstanceProtocol` defaults to the front-end protocol.
+        let instance_protocol = listener
+            .instance_protocol
+            .as_deref()
+            .map_or_else(|| protocol.clone(), str::to_ascii_uppercase);
+
+        for candidate in [&protocol, &instance_protocol] {
+            if !crate::state::LISTENER_PROTOCOLS.contains(&candidate.as_str()) {
+                return Err(CreateLoadBalancerErrorModeled::UnsupportedProtocolException(
+                    UnsupportedProtocolException {
+                        message: Some(format!(
+                            "Protocol must be one of {:?}; got '{candidate}'",
+                            crate::state::LISTENER_PROTOCOLS
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // From `Listener$InstanceProtocol`: a TCP/SSL front end requires a TCP/SSL back
+        // end, and an HTTP/HTTPS front end requires an HTTP/HTTPS back end.
+        if transport_family(&protocol) != transport_family(&instance_protocol) {
+            return Err(
+                CreateLoadBalancerErrorModeled::InvalidConfigurationRequestException(
+                    InvalidConfigurationRequestException {
+                        message: Some(format!(
+                            "InstanceProtocol '{instance_protocol}' is not compatible with \
+                             Protocol '{protocol}'"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A listener is keyed by its load balancer port, so one port cannot be claimed
+        // twice in one configuration. The claimed ports are held in a set, so the check
+        // costs O(log n) per listener rather than a scan of the ones already built.
+        if !claimed_ports.insert(listener.load_balancer_port) {
+            return Err(
+                CreateLoadBalancerErrorModeled::InvalidConfigurationRequestException(
+                    InvalidConfigurationRequestException {
+                        message: Some(format!(
+                            "LoadBalancerPort {} is claimed by more than one listener",
+                            listener.load_balancer_port
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        entries.push(crate::state::ListenerEntry {
+            protocol,
+            load_balancer_port: listener.load_balancer_port,
+            instance_protocol,
+            instance_port: listener.instance_port,
+            ssl_certificate_id: listener.ssl_certificate_id.clone(),
+            policy_names: Vec::new(),
+        });
+    }
+    Ok(entries)
+}
+
+/// `HTTP`/`HTTPS` and `TCP`/`SSL` are the two families the model's compatibility rule
+/// is stated over; a secure protocol belongs to the same family as its plain peer.
+fn transport_family(protocol: &str) -> &'static str {
+    match protocol {
+        "HTTP" | "HTTPS" => "http",
+        _ => "tcp",
+    }
+}
+
+/// Collect the requested tags, refusing a key given more than once and a list longer
+/// than the published per-load-balancer tag quota.
+fn collect_tags(
+    requested: Option<&[Tag]>,
+) -> Result<::std::collections::BTreeMap<String, String>, CreateLoadBalancerError> {
+    let requested = requested.unwrap_or_default();
+    if requested.len() > crate::state::MAX_TAGS_PER_LOAD_BALANCER {
+        return Err(CreateLoadBalancerErrorModeled::TooManyTagsException(
+            TooManyTagsException {
+                message: Some(format!(
+                    "Quota of {} tags per load balancer reached",
+                    crate::state::MAX_TAGS_PER_LOAD_BALANCER
+                )),
+            },
+        )
+        .into());
+    }
+    let mut tags = ::std::collections::BTreeMap::new();
+    for tag in requested {
+        if tags
+            .insert(tag.key.clone(), tag.value.clone().unwrap_or_default())
+            .is_some()
+        {
+            return Err(CreateLoadBalancerErrorModeled::DuplicateTagKeysException(
+                DuplicateTagKeysException {
+                    message: Some(format!("Tag key '{}' was specified more than once", tag.key)),
+                },
+            )
+            .into());
+        }
+    }
+    Ok(tags)
 }

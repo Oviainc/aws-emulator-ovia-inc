@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetChannelPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetChannelPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Reports the resource policy `PutChannelPolicy` last stored on the
+//! addressed channel, exactly as it was stored. Purely reporting: it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetChannelPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The policy is a sub-resource of the channel, so three distinct absences all answer
+//! `ResourceNotFoundException` (404): the channel group, the channel, and a channel that
+//! exists but has never had a policy attached.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +88,27 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The sentence MediaPackage answers with when a channel group cannot be resolved.
+///
+/// Fixed per resource type and per rejection class: the service's not-found text names
+/// the KIND of resource and echoes none of the caller's identifiers.
+const CHANNEL_GROUP_NOT_FOUND: &str = "MediaPackage can't process your request because \
+    we can't find your channel group. Verify your channel group name or add a channel \
+    group and then try again";
+
+/// The same fixed sentence at channel scope.
+const CHANNEL_NOT_FOUND: &str = "MediaPackage can't process your request because we \
+    can't find your channel. Verify your channel name or add a channel and then try \
+    again";
+
+/// The not-found text for a channel that exists with no policy attached.
+///
+/// AWS publishes no wording for this case, so the text is an example; what the service
+/// requires is the 404 and the `ResourceNotFoundException` code. It follows the same
+/// rule as the two above: request-independent, naming only the kind of resource.
+const CHANNEL_POLICY_NOT_FOUND: &str = "MediaPackage can't process your request because \
+    we can't find a policy on your channel. Attach a channel policy and then try again";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -163,18 +181,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetChannelPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetChannelPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetChannelPolicy"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetChannelPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        let Some(group) = store.channel_groups.get(&input.channel_group_name) else {
+            return Err(GetChannelPolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(CHANNEL_GROUP_NOT_FOUND.to_string()),
+                    resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
+                },
+            )
+            .into());
+        };
+        let Some(channel) = group.channels.get(&input.channel_name) else {
+            return Err(GetChannelPolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(CHANNEL_NOT_FOUND.to_string()),
+                    resource_type_not_found: Some("CHANNEL".to_string()),
+                },
+            )
+            .into());
+        };
+        // The channel resolves, but a policy is optional on it: with none attached there
+        // is no policy resource to report, and `Policy` is a REQUIRED output member, so
+        // the only answer the model leaves is the not-found one.
+        let Some(policy) = channel.policy.clone() else {
+            return Err(GetChannelPolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(CHANNEL_POLICY_NOT_FOUND.to_string()),
+                    // `ResourceTypeNotFound` enumerates CHANNEL_GROUP | CHANNEL |
+                    // ORIGIN_ENDPOINT | HARVEST_JOB — no member names a policy, and the
+                    // channel itself is NOT missing, so the discriminator is left unset
+                    // rather than claiming a resource type that is present.
+                    resource_type_not_found: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(GetChannelPolicyOutput {
+            channel_group_name: channel.group_name.clone(),
+            channel_name: channel.name.clone(),
+            policy,
+        })
     }
 }

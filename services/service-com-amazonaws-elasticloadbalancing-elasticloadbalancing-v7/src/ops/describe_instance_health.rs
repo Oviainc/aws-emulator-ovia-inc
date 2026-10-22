@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceHealth
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstanceHealth`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: derives one `InstanceState` per instance from the stored registration
+//! set. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstanceHealth::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registration is the only health state this emulator holds: no health-check engine
+//! probes an instance, so a registered instance reports `InService` / `N/A` and an
+//! unregistered one the documented `OutOfService` / `ELB`. A later slice that serves
+//! `ConfigureHealthCheck` and actually evaluates a target replaces that first branch —
+//! it is a placeholder for a probe, not a rule the model states.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +140,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstanceHealth` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstanceHealthErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstanceHealth"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This service's model declares no server-fault error, and a 501 would
+            // claim "not implemented", so an unreachable store is refused instead.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the Elastic Load Balancing store is unavailable",
+            ));
+        };
+
+        let mut requested: Vec<String> = Vec::new();
+        let instances = input.instances.as_deref().unwrap_or_default();
+        // Bound the batch before reading it, so the work below is bounded by a constant
+        // rather than by the caller.
+        if instances.len() > crate::state::MAX_INSTANCES_PER_REQUEST {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Instances must carry at most {} instances; got {}",
+                crate::state::MAX_INSTANCES_PER_REQUEST,
+                instances.len()
+            )));
+        }
+        for instance in instances {
+            match instance.instance_id.as_deref() {
+                Some(id) if !id.is_empty() => requested.push(id.to_string()),
+                _ => {
+                    return Err(DescribeInstanceHealthErrorModeled::InvalidEndPointException(
+                        InvalidEndPointException {
+                            message: Some(
+                                "Instances.member.InstanceId must be a non-empty instance ID"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let region = crate::state::region_from_request(ctx.parts());
+        let guard = state.lock();
+        let Some(record) = guard
+            .load_balancers_in(&region)
+            .and_then(|records| records.get(&input.load_balancer_name))
+        else {
+            return Err(
+                DescribeInstanceHealthErrorModeled::AccessPointNotFoundException(
+                    AccessPointNotFoundException {
+                        message: Some(format!(
+                            "There is no ACTIVE Load Balancer named '{}'",
+                            input.load_balancer_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "If no instances are specified, the call describes the state of all instances
+        // that are currently registered with the load balancer. If instances are
+        // specified, their state is returned even if they are no longer registered."
+        let described: Vec<String> = if requested.is_empty() {
+            record.instances.iter().cloned().collect()
+        } else {
+            requested
+        };
+
+        let instance_states = described
+            .into_iter()
+            .map(|instance_id| {
+                if record.has_instance(&instance_id) {
+                    InstanceState {
+                        instance_id: Some(instance_id),
+                        state: Some(STATE_IN_SERVICE.to_string()),
+                        reason_code: Some(REASON_CODE_NOT_APPLICABLE.to_string()),
+                        description: Some(REASON_CODE_NOT_APPLICABLE.to_string()),
+                    }
+                } else {
+                    InstanceState {
+                        instance_id: Some(instance_id),
+                        state: Some(STATE_OUT_OF_SERVICE.to_string()),
+                        reason_code: Some(REASON_CODE_ELB.to_string()),
+                        description: Some(DESCRIPTION_NOT_REGISTERED.to_string()),
+                    }
+                }
+            })
+            .collect();
+
+        Ok(DescribeInstanceHealthOutput {
+            instance_states: Some(instance_states),
+        })
     }
 }
+
+/// `InstanceState$State`, from that member's documented valid values
+/// (`InService` | `OutOfService` | `Unknown`).
+const STATE_IN_SERVICE: &str = "InService";
+const STATE_OUT_OF_SERVICE: &str = "OutOfService";
+
+/// `InstanceState$ReasonCode`, from that member's documented valid values
+/// (`ELB` | `Instance` | `N/A`).
+const REASON_CODE_ELB: &str = "ELB";
+const REASON_CODE_NOT_APPLICABLE: &str = "N/A";
+
+/// One of the descriptions `InstanceState$Description` documents, the one that states
+/// the instance is not registered with this load balancer.
+const DESCRIPTION_NOT_REGISTERED: &str = "Instance is not currently registered with the LoadBalancer.";
