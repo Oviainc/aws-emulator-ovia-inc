@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeImages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeImages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeImages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the images `PutImage` stored under a repository, in `imageDigest` order, and
+//! writes nothing: it is purely a reporting operation.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +169,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeImages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeImagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeImages"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeImagesErrorModeled::ServerException(ServerException {
+                message: Some(
+                    "The ECR Public emulator could not reach its state store.".to_string(),
+                ),
+            })
+            .into());
+        };
+
+        let resume_after = match crate::state::decode_page_token(input.next_token.as_deref()) {
+            Ok(resume_after) => resume_after,
+            Err(message) => return Err(invalid_parameter(message)),
+        };
+        let page_size = crate::state::page_size(input.max_results);
+
+        let store = state.lock();
+        if let Some(registry_id) = input.registry_id.as_deref() {
+            if !store.is_this_registry(registry_id) {
+                return Err(invalid_parameter(format!(
+                    "Invalid parameter at 'registryId' failed to satisfy constraint: 'Member \
+                     must name the public registry of this account ({})'",
+                    store.registry_id
+                )));
+            }
+        }
+        let Some(repository) = store.repositories.get(&input.repository_name) else {
+            return Err(DescribeImagesErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException {
+                    message: Some(format!(
+                        "The repository with name '{}' does not exist in the registry with id \
+                         '{}'",
+                        input.repository_name, store.registry_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Absent `imageIds` means every image in the repository; present, it means
+        // exactly the images those identifiers resolve to, and an identifier that
+        // resolves to nothing is not found. Either way the walk is in `imageDigest`
+        // order, which is what makes the page token resumable.
+        let selected: Vec<(String, ImageDetail)> = match input.image_ids.as_ref() {
+            None => repository
+                .images
+                .iter()
+                .map(|(digest, image)| (digest.clone(), repository.image_detail(image)))
+                .collect(),
+            Some(ids) => {
+                let mut selected = ::std::collections::BTreeMap::new();
+                for id in ids {
+                    let image = match repository.resolve_identifier(id) {
+                        Ok(image) => image,
+                        Err(crate::state::IdentifierProblem::MissingDigestAndTag) => {
+                            return Err(invalid_parameter(
+                                "Invalid parameter at 'imageIds' failed to satisfy constraint: \
+                                 'Member must specify either imageDigest or imageTag'"
+                                    .to_string(),
+                            ))
+                        }
+                        Err(_) => {
+                            return Err(DescribeImagesErrorModeled::ImageNotFoundException(
+                                ImageNotFoundException {
+                                    message: Some(format!(
+                                        "The image with digest '{}' and tag '{}' does not exist \
+                                         within the repository with name '{}'",
+                                        id.image_digest.as_deref().unwrap_or("null"),
+                                        id.image_tag.as_deref().unwrap_or("null"),
+                                        repository.name
+                                    )),
+                                },
+                            )
+                            .into())
+                        }
+                    };
+                    selected.insert(image.digest.clone(), repository.image_detail(image));
+                }
+                selected.into_iter().collect()
+            }
+        };
+        drop(store);
+
+        let page = crate::state::page(selected, resume_after.as_deref(), page_size);
+        Ok(DescribeImagesOutput {
+            image_details: Some(page.items),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// Refuse a parameter this operation cannot serve, with the one client-input error every
+/// ECR Public operation declares.
+fn invalid_parameter(message: String) -> DescribeImagesError {
+    DescribeImagesErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
 }
