@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApplications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApplications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's stored applications in creation order, filtered by the
+//! request's `filters`, one `maxResults`-sized page at a time; `nextToken` is a
+//! resume-after key naming the `applicationID` the previous page ended on.
+//! `@readonly`: it writes nothing, so what a caller sees is exactly what the writes
+//! left.
 //!
 //! ## Shape of an operation
 //!
@@ -82,10 +78,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mgn-applicationmigratio
 // here — hence the `ListApplicationsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mgn#ListApplications")]
+// `extra_errors` widens the accepted set with a shape the SERVICE models but this
+// operation does not list: `InternalServerException` (HTTP 500) is the only honest
+// answer when the engine carries no store for this service.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mgn#ListApplications",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListApplicationsErrorModeled {
     UninitializedAccountException(UninitializedAccountException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -139,18 +142,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApplications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApplicationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApplications"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListApplicationsErrorModeled::InternalServerException(crate::state::state_unavailable())
+        })?;
+        let account = crate::state::account_key(input.account_id.as_deref());
+
+        // `nextToken` is this service's own cursor, and only a string this service
+        // issued is a token: the marker below plus the `applicationID` the previous
+        // page ended on. A resume-after key rather than a positional offset, so the
+        // cursor keeps its meaning when the selection changes between pages.
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                token
+                    .strip_prefix(PAGE_TOKEN_PREFIX)
+                    .ok_or_else(|| unresumable_token(token))?,
+            ),
+        };
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            // Defensive only: the modelled `MaxResultsType` range 1..1000 is already
+            // refused at the boundary, so no out-of-range value reaches this handler.
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let store = state.lock();
+        if !store.is_initialized(&account) {
+            return Err(ListApplicationsErrorModeled::UninitializedAccountException(
+                crate::state::uninitialized_account(&account),
+            )
+            .into());
+        }
+
+        let matching: Vec<&crate::state::Application> = store
+            .applications_of(&account)
+            .into_iter()
+            .filter(|app| matches_filters(app, input.filters.as_ref()))
+            .collect();
+        // The page starts after the application the token names. A token naming an
+        // application this selection does not hold cannot be resumed — it is a token
+        // for a selection that no longer exists — so it is refused rather than served
+        // as some other page.
+        let start = match resume_after {
+            None => 0usize,
+            Some(last_returned) => matching
+                .iter()
+                .position(|app| app.application_id == last_returned)
+                .map(|index| index.saturating_add(1))
+                .ok_or_else(|| {
+                    unresumable_token(input.next_token.as_deref().unwrap_or_default())
+                })?,
+        };
+        let page: Vec<&crate::state::Application> =
+            matching.iter().copied().skip(start).take(page_size).collect();
+        // A token only when applications remain after this page, so a caller that
+        // follows tokens sees every application exactly once.
+        let next_token = if start.saturating_add(page.len()) < matching.len() {
+            page.last()
+                .map(|app| format!("{PAGE_TOKEN_PREFIX}{}", app.application_id))
+        } else {
+            None
+        };
+        let items: Vec<CreateApplicationOutput> =
+            page.iter().map(|app| app.to_shape()).collect();
+
+        Ok(ListApplicationsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
+}
+
+/// The largest page `maxResults` can ask for, and the page size used when the request
+/// names none: the model's `MaxResultsType` range is 1..1000.
+const MAX_PAGE_SIZE: i32 = 1000;
+
+/// The marker every `nextToken` this operation issues carries, ahead of the
+/// `applicationID` the page ended on, so a string the service never issued cannot be
+/// mistaken for a cursor.
+const PAGE_TOKEN_PREFIX: &str = "mgn-applications-";
+
+/// The refusal for a `nextToken` this operation cannot resume from: a string it never
+/// issued, or one whose anchor application the current selection no longer holds.
+/// `ListApplications` models no client-input error, so this is the service's own 400
+/// `ValidationException`.
+fn unresumable_token(token: &str) -> ListApplicationsError {
+    crate::scaffolded::Scaffolded::validation(format!(
+        "nextToken '{token}' cannot be resumed: it is not a token this service issued, or the application it continues from is no longer in this selection"
+    ))
+}
+
+/// Whether `app` satisfies every filter the request set. An absent filter, and a
+/// present-but-empty id list, select everything.
+fn matches_filters(
+    app: &crate::state::Application,
+    filters: Option<&ListApplicationsRequestFilters>,
+) -> bool {
+    let Some(filters) = filters else {
+        return true;
+    };
+    if let Some(ids) = filters.application_i_ds.as_ref() {
+        if !ids.is_empty() && !ids.contains(&app.application_id) {
+            return false;
+        }
+    }
+    if let Some(is_archived) = filters.is_archived {
+        if is_archived != app.is_archived {
+            return false;
+        }
+    }
+    if let Some(wave_ids) = filters.wave_i_ds.as_ref() {
+        if !wave_ids.is_empty()
+            && app
+                .wave_id
+                .as_ref()
+                .is_none_or(|wave_id| !wave_ids.contains(wave_id))
+        {
+            return false;
+        }
+    }
+    true
 }

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints an `applicationID` and an ARN, stores the application in this service's state
+//! and returns the stored record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An application name identifies an application within its account, and the operation
+//! models no idempotency token, so the name is what decides between the two answers a
+//! repeat can get: a request every member of which matches a stored application is an
+//! `@idempotent` replay and answers that application, while a request whose name is
+//! taken but whose other members differ is the modelled `ConflictException` (409). An
+//! account therefore cannot hold two applications under one name — a narrowing stated
+//! here because the model cannot express it.
+//!
+//! The store is bounded by `crate::state::APPLICATION_QUOTA` and refuses past it with
+//! the modelled `ServiceQuotaExceededException` (402), so a caller cannot grow the
+//! emulator's heap without end.
 //!
 //! ## Shape of an operation
 //!
@@ -103,12 +108,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mgn-applicationmigratio
 // here — hence the `CreateApplicationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mgn#CreateApplication")]
+// `extra_errors` widens the accepted set with a shape the SERVICE models but this
+// operation does not list: `InternalServerException` (HTTP 500) is the only honest
+// answer when the engine carries no store for this service.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mgn#CreateApplication",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateApplicationErrorModeled {
     ConflictException(ConflictException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     UninitializedAccountException(UninitializedAccountException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -162,18 +174,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplication"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateApplicationErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        let account = crate::state::account_key(input.account_id.as_deref());
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        if !store.is_initialized(&account) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &input.name,
+                "refused: UninitializedAccountException",
+            );
+            return Err(CreateApplicationErrorModeled::UninitializedAccountException(
+                crate::state::uninitialized_account(&account),
+            )
+            .into());
+        }
+
+        // Stored sorted, so the tags a read reports are in one stable order.
+        let tags: std::collections::BTreeMap<String, String> = input
+            .tags
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
+        // An application name identifies an application within its account, so the
+        // name decides between the two answers a repeat can get:
+        //   * every member matches the stored record -> `@idempotent` replay, answer it;
+        //   * the name is taken but something else differs -> the modelled conflict.
+        if let Some(existing) = store
+            .applications_of(&account)
+            .into_iter()
+            .find(|app| app.name == input.name)
+        {
+            if existing.description == input.description && existing.tags == tags {
+                crate::state::audit(
+                    ctx.parts(),
+                    Self::NAME,
+                    &account,
+                    &existing.application_id,
+                    "replayed",
+                );
+                return Ok(existing.to_shape());
+            }
+            let conflict =
+                crate::state::application_name_in_use(&input.name, &existing.application_id);
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &existing.application_id,
+                "refused: ConflictException",
+            );
+            return Err(CreateApplicationErrorModeled::ConflictException(conflict).into());
+        }
+
+        // The store is bounded per account AND in total: see
+        // `crate::state::APPLICATION_QUOTA`.
+        if store.application_store_is_full(&account) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &input.name,
+                "refused: ServiceQuotaExceededException",
+            );
+            return Err(CreateApplicationErrorModeled::ServiceQuotaExceededException(
+                crate::state::application_quota_exceeded(&account),
+            )
+            .into());
+        }
+
+        let now = crate::state::now_iso8601();
+        let application_id = store.mint_application_id();
+        let account_for_audit = account.clone();
+        let application = crate::state::Application {
+            arn: crate::state::application_arn(&region, &application_id),
+            application_id,
+            name: input.name.clone(),
+            description: input.description.clone(),
+            is_archived: false,
+            aggregated_status: crate::state::AggregatedStatus {
+                last_update_date_time: now.clone(),
+                // Nothing is migrating yet, and with no source server there is no
+                // health to report.
+                health_status: None,
+                progress_status: Some(crate::state::PROGRESS_NOT_STARTED.to_string()),
+            },
+            creation_date_time: now.clone(),
+            last_modified_date_time: now,
+            tags,
+            wave_id: None,
+            account_id: account,
+            source_server_ids: std::collections::BTreeSet::new(),
+        };
+
+        let created = application.to_shape();
+        let stored = store.insert_application(application);
+        debug_assert!(stored, "the store bound is checked above this insert");
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &account_for_audit,
+            created.application_id.as_deref().unwrap_or_default(),
+            "created",
+        );
+        Ok(created)
     }
 }
