@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceTypeOfferings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstanceTypeOfferings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstanceTypeOfferings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports which instance types are offered in which locations of the Region this
+//! request was signed for.
+//!
+//! An offering is a fact of a location, not a resource a caller creates: no EC2
+//! operation adds or withdraws one. So the offerings are derived by
+//! [`crate::state::instance_type_offerings`] from the Region and the modelled
+//! `InstanceType` catalog, and this handler writes NOTHING: two calls in one Region
+//! answer the same offerings.
+//!
+//! What the request chooses is which offerings are reported, and how many at a time:
+//!
+//! * `LocationType` picks the form of location the offerings are reported per: the
+//!   Region itself, its Availability Zones, their AZ IDs, or its Outposts (of which
+//!   this emulator has none, so that location type offers nothing). A request naming
+//!   none asks about the current Region, as the operation's own doc says.
+//! * `Filters` (`instance-type`, `location`) are ANDed with each other and ORed over
+//!   each filter's values, with EC2's `*` / `?` wildcards; a filter this operation
+//!   does not document is refused with `InvalidParameterValue`.
+//! * `MaxResults` and `NextToken` page the matching offerings in a stable order: the
+//!   token is the opaque cursor `crate::state::encode_page_token` mints, naming the
+//!   offering the next page starts at, and the last page carries no token. A request
+//!   naming no `MaxResults` gets the largest page the model publishes.
+//! * `DryRun` performs nothing and answers 412 `DryRunOperation`, the answer the real
+//!   service gives a caller that holds the action's permissions.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +169,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstanceTypeOfferings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstanceTypeOfferingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstanceTypeOfferings"))
+        // This operation reports a Region's offerings and persists nothing, so it
+        // never reaches the engine on `self`.
+        let _ = &self.engine;
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request... If you have the required permissions, the
+        // error response is DryRunOperation." Every caller of this emulator holds
+        // them, so the describe below does not run at all.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        // "The token returned from a previous paginated request" — anything else is
+        // refused rather than read as a cursor, and it is refused before any member
+        // that selects what to report is looked at, so whether a bogus token is caught
+        // never depends on the rest of the request. (A dry run above answers before
+        // this: it performs nothing at all, so it reads no parameter either.)
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(crate::state::invalid_pagination_token)?,
+            ),
+        };
+
+        // "If no location is specified, the default is to list the instance types that
+        // are offered in the current Region", so an absent `LocationType` is `region`.
+        // The modelled `LocationType` enum is already enforced at the boundary, so a
+        // value outside it does not reach here; mapping the request's text onto one of
+        // the enum's own values keeps it that way, rather than letting an unknown
+        // value read as the default.
+        let requested_location_type = input.location_type.as_deref();
+        let location_type = crate::state::location_type(requested_location_type).ok_or_else(|| {
+            crate::state::invalid_parameter_value(format!(
+                "Invalid value '{}' for LocationType",
+                requested_location_type.unwrap_or_default()
+            ))
+        })?;
+
+        // EC2 is a regional service reached through a regional endpoint: the Region the
+        // caller signed for is the Region whose offerings it is asking about.
+        let region = crate::state::request_region(ctx.parts());
+
+        // "If you specify multiple filters, the filters are joined with an AND"; and
+        // within one filter, "If you specify multiple values for a filter, the values
+        // are joined with an OR" (the `Filter` shape's own doc). A filter whose name
+        // this operation does not document is refused rather than ignored, so a
+        // misspelled filter cannot read as "everything matched".
+        let filters = input.filters.as_deref().unwrap_or_default();
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !crate::state::INSTANCE_TYPE_OFFERING_FILTERS.contains(&name) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+        }
+
+        // Each documented filter compares against ONE field of an offering, so the
+        // field each one names is narrowed before any offering is built: a filter value
+        // is compiled once and compared against the locations or the catalog, never
+        // against every location-and-type pair. That is the same answer as testing each
+        // built offering, at a cost proportional to locations + instance types rather
+        // than to their product, and it bounds the work a request's filter values can
+        // ask for by the size of this Region's candidate sets.
+        let compiled: Vec<(&str, Vec<crate::state::FilterPattern>)> = filters
+            .iter()
+            .map(|filter| {
+                let patterns = filter
+                    .values
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|wanted| crate::state::FilterPattern::compile(wanted))
+                    .collect();
+                (filter.name.as_deref().unwrap_or_default(), patterns)
+            })
+            .collect();
+        let admitted = |field: &str, candidate: &str| {
+            compiled
+                .iter()
+                .filter(|(name, _)| *name == field)
+                .all(|(_, patterns)| patterns.iter().any(|pattern| pattern.matches(candidate)))
+        };
+        let locations: Vec<String> = crate::state::locations_of_type(&region, location_type)
+            .into_iter()
+            .filter(|location| admitted("location", location))
+            .collect();
+        let instance_types: Vec<&'static str> = crate::state::offered_instance_types()
+            .iter()
+            .copied()
+            .filter(|instance_type| admitted("instance-type", instance_type))
+            .collect();
+        let matching =
+            crate::state::instance_type_offerings(&locations, &instance_types, location_type);
+
+        // `MaxResults` bounds one page of THAT set, and the cursor names the offering
+        // the next page starts at, so a token always advances in the cursor order
+        // `instance_type_offerings` reports in. The model's `range 5..1000` on
+        // `MaxResults` has already refused anything outside it, so the only value that
+        // cannot convert is one the boundary validator would have rejected.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => matching.partition_point(|offering| {
+                crate::state::offering_page_cursor(offering).as_str() < cursor
+            }),
+        };
+        let page = matching.get(from..).unwrap_or_default();
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        // "This value is null when there are no more items to return"
+        // (`DescribeInstanceTypeOfferingsResult$NextToken`): a token only when an
+        // offering follows this page.
+        let next_token = page
+            .get(limit)
+            .map(|offering| {
+                crate::state::encode_page_token(&crate::state::offering_page_cursor(offering))
+            });
+
+        Ok(DescribeInstanceTypeOfferingsOutput {
+            instance_type_offerings: Some(
+                page.iter()
+                    .take(limit)
+                    .map(crate::state::InstanceTypeOfferingRecord::to_instance_type_offering)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
+
+/// The page size a request that names no `MaxResults` gets: the largest the model
+/// publishes for this operation (`DITOMaxResults`, `range 5..1000`), which is also the
+/// most EC2 returns in one page.
+const DEFAULT_MAX_RESULTS: usize = 1000;
