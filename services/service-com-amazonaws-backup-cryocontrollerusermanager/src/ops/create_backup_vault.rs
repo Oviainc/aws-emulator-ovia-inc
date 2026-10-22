@@ -7,6 +7,11 @@
 //! stored `CreatorRequestId` and the rest of the stored creation parameters; any
 //! other repeat is refused with `AlreadyExistsException`.
 //!
+//! A request that names no `EncryptionKeyArn` still gets a key: the model
+//! documents that "if you do not specify a key, Backup creates a KMS key for you
+//! by default", so the vault records this service's default key for the region
+//! and every later read of the vault reports it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -210,12 +215,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         if let Some(existing) = store.vaults.get(&input.backup_vault_name) {
+            let named_key = existing.named_encryption_key_arn().map(ToString::to_string);
             // A repeat create is a retry of the ORIGINAL request only when it
             // carries the same idempotency token and the same creation
             // parameters; a request with no token is not a retry of anything.
             let is_retry = input.creator_request_id.is_some()
                 && existing.creator_request_id == input.creator_request_id
-                && existing.encryption_key_arn == input.encryption_key_arn
+                && named_key == input.encryption_key_arn
                 && existing.tags == tags;
             if !is_retry {
                 return Err(CreateBackupVaultErrorModeled::AlreadyExistsException(
@@ -254,18 +260,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Every vault is encrypted by a KMS key: the one this request named,
+        // or — "if you do not specify a key, Backup creates a KMS key for you
+        // by default" (model doc for `EncryptionKeyArn`) — this service's own
+        // default key for the region, so a read always has a key to report.
+        let customer_managed_key = input.encryption_key_arn.is_some();
+        let encryption_key_arn = match input.encryption_key_arn {
+            Some(arn) => arn,
+            None => store.default_encryption_key_arn(&region, now),
+        };
         let vault = crate::state::BackupVault {
             name: input.backup_vault_name.clone(),
             arn: crate::state::backup_vault_arn(&region, &input.backup_vault_name),
-            encryption_key_arn: input.encryption_key_arn,
+            encryption_key_arn,
+            customer_managed_key,
+            // AWS reports neither `EncryptionKeyType` nor `VaultState` for a
+            // standard `BACKUP_VAULT`, so this create records neither rather
+            // than having the read project an enum value nobody set.
+            encryption_key_type: None,
             creator_request_id: input.creator_request_id,
             creation_date: now,
             vault_type: crate::state::VAULT_TYPE_BACKUP_VAULT.to_string(),
-            vault_state: crate::state::VAULT_STATE_AVAILABLE.to_string(),
+            vault_state: None,
             tags,
-            locked: false,
-            min_retention_days: None,
-            max_retention_days: None,
+            lock: None,
         };
         let output = CreateBackupVaultOutput {
             backup_vault_name: Some(vault.name.clone()),

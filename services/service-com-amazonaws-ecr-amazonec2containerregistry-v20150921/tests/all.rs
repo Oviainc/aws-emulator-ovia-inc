@@ -17,6 +17,8 @@ mod layer_availability;
 mod pull_time_update_exclusions;
 #[path = "all/registry_policy.rs"]
 mod registry_policy;
+#[path = "all/registry_replication_configuration.rs"]
+mod registry_replication_configuration;
 #[path = "all/repository_image_lifecycle.rs"]
 mod repository_image_lifecycle;
 #[path = "all/resource_tag_mutations.rs"]
