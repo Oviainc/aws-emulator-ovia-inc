@@ -190,14 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match ::serde_json::from_str::<::serde_json::Value>(&policy) {
             Ok(::serde_json::Value::Object(_)) => {}
             Ok(other) => {
-                let kind = match other {
-                    ::serde_json::Value::Null => "null",
-                    ::serde_json::Value::Bool(_) => "a boolean",
-                    ::serde_json::Value::Number(_) => "a number",
-                    ::serde_json::Value::String(_) => "a string",
-                    ::serde_json::Value::Array(_) => "an array",
-                    ::serde_json::Value::Object(_) => "an object",
-                };
+                let kind = crate::state::json_type_name(&other);
                 return Err(PutResourcePolicyErrorModeled::BadRequestException(
                     crate::state::policy_not_json(&format!("the value sent is {kind}")),
                 )

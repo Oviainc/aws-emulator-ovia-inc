@@ -684,3 +684,82 @@ async fn share_requests_that_cannot_be_served_are_refused_with_the_modelled_erro
         "case \"delete\": the shares of a deleted workload must not resolve, got {orphans:?}"
     );
 }
+
+/// Rule 4, the published bounds of the list's OWN members: `MaxResults` is
+/// `@range(min: 1, max: 50)` and `SharedWithPrefix` `@length(max: 100)`
+/// (`smithy_query(query="operation", operation="ListWorkloadShares")`), so each bound is
+/// served and one step outside it is a 400 `ValidationException` — a page size outside
+/// the published range is refused, never quietly clamped into it.
+#[tokio::test]
+async fn the_lists_own_members_are_served_on_each_bound_and_refused_outside_it() {
+    let client = Client::new();
+    let workload_id = created_id(
+        &client
+            .create(minimal_create("share-bounds-host", "tok-bounds"))
+            .await,
+        "host",
+    );
+    // Two shares, so the minimum page size serves strictly fewer than all of them and
+    // the bound is load-bearing rather than trivially satisfied.
+    for (index, shared_with) in ["111122223333", "o-abcde12345"].iter().enumerate() {
+        let created = client
+            .create_share(
+                &workload_id,
+                share_request(shared_with, "READONLY", &format!("tok-bounds-{index}")),
+            )
+            .await;
+        created_share_id(&created, shared_with);
+    }
+
+    let longest_prefix = "1".repeat(100);
+    let overlong_prefix = "1".repeat(101);
+
+    // (case, query, shares the page must carry, whether more are owed after it)
+    for (case, query, expected, more_owed) in [
+        ("max-results-at-the-minimum", "MaxResults=1".to_string(), 1, true),
+        ("max-results-at-the-maximum", "MaxResults=50".to_string(), 2, false),
+        // No principal of this workload is a hundred characters long, so the prefix at
+        // its published bound selects an empty page rather than failing.
+        (
+            "prefix-at-the-maximum-length",
+            format!("SharedWithPrefix={longest_prefix}"),
+            0,
+            false,
+        ),
+    ] {
+        let listed = client.list_shares(&workload_id, &query).await;
+        assert_eq!(
+            listed.status, 200,
+            "case {case:?}: a value on the published bound must be served, got {listed:?}"
+        );
+        assert_eq!(
+            summaries(&listed, case).len(),
+            expected,
+            "case {case:?}: expected {expected} share(s) on this page, got {listed:?}"
+        );
+        assert_eq!(
+            listed.body.get("NextToken").and_then(Value::as_str).is_some(),
+            more_owed,
+            "case {case:?}: NextToken must be present only while shares remain, got {listed:?}"
+        );
+    }
+
+    for (case, query) in [
+        ("max-results-below-the-range", "MaxResults=0".to_string()),
+        ("max-results-above-the-range", "MaxResults=51".to_string()),
+        (
+            "prefix-past-the-maximum-length",
+            format!("SharedWithPrefix={overlong_prefix}"),
+        ),
+    ] {
+        let refused = client.list_shares(&workload_id, &query).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected HTTP 400 outside the published bound, got {refused:?}"
+        );
+        assert_eq!(
+            refused.error_code, "ValidationException",
+            "case {case:?}: expected ValidationException, got {refused:?}"
+        );
+    }
+}

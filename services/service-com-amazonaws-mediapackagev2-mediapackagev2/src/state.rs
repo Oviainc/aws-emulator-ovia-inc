@@ -6,8 +6,9 @@
 //! -> origin endpoint — so the store nests the same way: a channel cannot exist
 //! without its group, and deleting a parent that still has children is refused. Every
 //! derived value a response carries (ARN, egress domain, ingest URL, manifest URL,
-//! ETag, timestamps) is computed ONCE, when the resource is created, and persisted, so
-//! a later read reproduces it byte for byte.
+//! ETag, timestamps) is computed by the call that WRITES the record \u2014 a create, or an
+//! update \u2014 and persisted, so every later read reproduces it byte for byte and no
+//! response computes a value of its own while being serialized.
 //!
 //! The maps are [`BTreeMap`]s: `ListOriginEndpoints` pages in name order, and an
 //! ordered map makes that order a property of the store rather than of each read.
@@ -2799,6 +2800,241 @@ mod tests {
                 "ingest url {url} must share the group's DNS suffix {suffix}"
             );
         }
+    }
+
+    /// One row of the input-type restriction table: which member a request carries, the
+    /// channel's input type, and the `ValidationExceptionType` the combination is refused
+    /// with (`None` when the input type may carry it).
+    type RestrictionCase = (
+        &'static str,
+        &'static str,
+        fn(&mut SubmittedChannelMembers),
+        Option<&'static str>,
+    );
+
+    /// A member the model restricts to particular `InputType`s is refused on every other
+    /// input type, with that member's own discriminator — and `CreateChannel` and
+    /// `UpdateChannel` read the SAME table, so the two cannot disagree about it.
+    ///
+    /// One row per restriction the model states, on an input type that forbids it and on
+    /// one that allows it.
+    #[test]
+    fn a_member_is_refused_on_an_input_type_that_may_not_carry_it() {
+        let cases: &[RestrictionCase] = &[
+            (
+                "output locking mode on HLS",
+                "HLS",
+                |present| present.output_locking_mode = true,
+                Some("ONLY_CMAF_INPUT_TYPE_ALLOW_OUTPUT_LOCKING_MODE"),
+            ),
+            (
+                "output locking mode on CMAF",
+                "CMAF",
+                |present| present.output_locking_mode = true,
+                None,
+            ),
+            (
+                "output locking mode on MULTIVIEW",
+                "MULTIVIEW",
+                |present| present.output_locking_mode = true,
+                None,
+            ),
+            (
+                "MQCS switching on HLS",
+                "HLS",
+                |present| present.mqcs_input_switching = true,
+                Some("ONLY_CMAF_INPUT_TYPE_ALLOW_MQCS_INPUT_SWITCHING"),
+            ),
+            (
+                "MQCS switching on CMAF",
+                "CMAF",
+                |present| present.mqcs_input_switching = true,
+                None,
+            ),
+            (
+                "preferred input on MULTIVIEW",
+                "MULTIVIEW",
+                |present| present.preferred_input = true,
+                Some("ONLY_CMAF_INPUT_TYPE_ALLOW_PREFERRED_INPUT_CONFIGURATION"),
+            ),
+            (
+                "CMSD publication on HLS",
+                "HLS",
+                |present| present.publish_mqcs = true,
+                Some("ONLY_CMAF_INPUT_TYPE_ALLOW_MQCS_OUTPUT_CONFIGURATION"),
+            ),
+            (
+                "multiview configuration on CMAF",
+                "CMAF",
+                |present| present.multiview_configuration = true,
+                Some("MULTIVIEW_CONFIGURATION_NOT_ALLOWED"),
+            ),
+            (
+                "multiview configuration on MULTIVIEW",
+                "MULTIVIEW",
+                |present| present.multiview_configuration = true,
+                None,
+            ),
+            (
+                "no restricted member at all on HLS",
+                "HLS",
+                |_| {},
+                None,
+            ),
+        ];
+
+        for (label, input_type, carry, expected) in cases {
+            let mut submitted = SubmittedChannelMembers::default();
+            carry(&mut submitted);
+            let violation = channel_input_type_violation(submitted, input_type);
+            match expected {
+                Some(expected) => {
+                    let violation = violation.unwrap_or_else(|| {
+                        panic!("case {label:?}: expected a refusal, got none")
+                    });
+                    assert_eq!(
+                        violation.validation_exception_type.as_deref(),
+                        Some(*expected),
+                        "case {label:?}: expected {expected}, got {violation:?}"
+                    );
+                    assert!(
+                        violation
+                            .message
+                            .as_deref()
+                            .unwrap_or_default()
+                            .starts_with("Validation error encountered at request"),
+                        "case {label:?}: expected this service's message form, got {:?}",
+                        violation.message
+                    );
+                }
+                None => assert!(
+                    violation.is_none(),
+                    "case {label:?}: expected no refusal, got {violation:?}"
+                ),
+            }
+        }
+    }
+
+    /// A stored origin-endpoint record, as the baseline of the table below.
+    fn sample_endpoint() -> OriginEndpoint {
+        let at = now();
+        OriginEndpoint {
+            name: "endpoint".to_string(),
+            channel_name: "channel".to_string(),
+            group_name: "group".to_string(),
+            arn: origin_endpoint_arn("us-west-2", "group", "channel", "endpoint"),
+            container_type: "TS".to_string(),
+            segment: materialized_segment(None),
+            description: None,
+            startover_window_seconds: materialized_startover_window_seconds(None),
+            hls_manifests: Vec::new(),
+            low_latency_hls_manifests: Vec::new(),
+            dash_manifests: Vec::new(),
+            mss_manifests: Vec::new(),
+            force_endpoint_error_configuration: None,
+            uri_separator: materialized_uri_separator(None),
+            stream_name_output_mode: materialized_stream_name_output_mode(None),
+            created_at: at,
+            modified_at: at,
+            reset_at: None,
+            version: 1,
+            etag: String::new(),
+            tags: HashMap::new(),
+            client_token: None,
+            fingerprint: String::new(),
+            policy: None,
+            harvest_jobs: BTreeMap::new(),
+        }
+    }
+
+    /// One row of the per-member ETag table: the member's name, and the mutation that
+    /// changes it on an origin-endpoint record. A `fn` pointer rather than a closure, so
+    /// a row carries no captured state.
+    type EndpointMutation = (&'static str, fn(&mut OriginEndpoint));
+
+    /// One row per member an `Update*` or a `Create*` writes on an origin endpoint.
+    #[test]
+    fn a_change_to_any_member_of_an_origin_endpoint_moves_its_entity_tag() {
+        let baseline = sample_endpoint();
+        let mutations: [EndpointMutation; 11] = [
+            ("container_type", |e| {
+                e.container_type = "CMAF".to_string()
+            }),
+            ("description", |e| e.description = Some("a".to_string())),
+            ("startover_window_seconds", |e| {
+                e.startover_window_seconds = 1
+            }),
+            ("segment", |e| {
+                e.segment = Segment {
+                    segment_duration_seconds: Some(6),
+                    ..Segment::default()
+                }
+            }),
+            ("hls_manifests", |e| {
+                e.hls_manifests = vec![stored_hls_manifest(
+                    CreateHlsManifestConfiguration {
+                        manifest_name: "m".to_string(),
+                        ..CreateHlsManifestConfiguration::default()
+                    },
+                    ManifestLocation {
+                        egress_domain: "host.example",
+                        group: "group",
+                        channel: "channel",
+                        endpoint: "endpoint",
+                    },
+                )]
+            }),
+            ("low_latency_hls_manifests", |e| {
+                e.low_latency_hls_manifests = vec![GetLowLatencyHlsManifestConfiguration {
+                    manifest_name: "m".to_string(),
+                    ..GetLowLatencyHlsManifestConfiguration::default()
+                }]
+            }),
+            ("dash_manifests", |e| {
+                e.dash_manifests = vec![GetDashManifestConfiguration {
+                    manifest_name: "m".to_string(),
+                    ..GetDashManifestConfiguration::default()
+                }]
+            }),
+            ("mss_manifests", |e| {
+                e.mss_manifests = vec![GetMssManifestConfiguration {
+                    manifest_name: "m".to_string(),
+                    ..GetMssManifestConfiguration::default()
+                }]
+            }),
+            ("force_endpoint_error_configuration", |e| {
+                e.force_endpoint_error_configuration = Some(ForceEndpointErrorConfiguration {
+                    endpoint_error_conditions: Some(vec!["STALE_MANIFEST".to_string()]),
+                })
+            }),
+            ("uri_separator", |e| {
+                e.uri_separator = "HYPHEN".to_string()
+            }),
+            ("stream_name_output_mode", |e| {
+                e.stream_name_output_mode = "PASSTHROUGH_NAME".to_string()
+            }),
+        ];
+        for (member, mutate) in mutations {
+            let mut mutated = baseline.clone();
+            mutate(&mut mutated);
+            assert_ne!(
+                origin_endpoint_etag(&baseline),
+                origin_endpoint_etag(&mutated),
+                "case {member:?}: changing an endpoint's {member} must move its entity tag"
+            );
+        }
+        // The tag is a function of the CONTENT: the same content, built again, hashes
+        // the same, so a create and a later update of an unchanged record agree on it.
+        let twin = OriginEndpoint {
+            created_at: baseline.created_at,
+            modified_at: baseline.modified_at,
+            ..sample_endpoint()
+        };
+        assert_eq!(
+            origin_endpoint_etag(&baseline),
+            origin_endpoint_etag(&twin),
+            "a record rebuilt with the same content must keep its entity tag"
+        );
     }
 
     #[test]

@@ -98,15 +98,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        match refusal {
+            // EC2 Instance Connect states a request whose values break the model's own
+            // rules as its modelled `InvalidArgsException` ("One of the parameters is not
+            // valid.", HTTP 400) — the same error its handlers raise for a constraint they
+            // enforce themselves — so WHICH layer caught the violation cannot change the
+            // code a client branches on. Both the code and the message are replaced: the
+            // message is the framework's own validation envelope, which is the wording the
+            // recorded answer carries ("1 validation error detected: Value '…' at '…'
+            // failed to satisfy constraint: …").
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "InvalidArgsException".to_string(),
+                message: crate::state::invalid_args_message(violations)
+                    .unwrap_or_else(|| "One of the parameters is not valid.".to_string()),
+            }),
+            // Authentication is the framework's own refusal, and this service models no
+            // error that restates it: keep the framework's wording and its 403.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

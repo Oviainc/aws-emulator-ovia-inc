@@ -12,8 +12,8 @@
 //!
 //! The tests are tables: each row is one input along the axis the rule under test
 //! generalises over (catalog, connection type, message and name form, receiver
-//! identifier form, page size, filter, signing region), and the `partner-123` case
-//! from the bootstrap issue is only one row.
+//! identifier form, page size, filter, signing region), and the case from the
+//! bootstrap issue is only one row.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -32,7 +32,7 @@ use service_com_amazonaws_partnercentralaccount_partnercentralaccount::state::{
 use service_com_amazonaws_partnercentralaccount_partnercentralaccount::EmulatedService;
 
 /// The region every test signs with unless it is exercising the region rule itself.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The account id every emulated resource presents (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = "000000000000";
@@ -42,16 +42,36 @@ const ACCOUNT: &str = "000000000000";
 const MAX_RESULTS_MIN: i64 = 1;
 const MAX_RESULTS_MAX: i64 = 100;
 
+/// A `ReceiverIdentifier` an `OPPORTUNITY_COLLABORATION` invitation can be addressed
+/// to: a `PartnerProfileId` (`^pprofile-[A-Za-z0-9]{13}$`, source
+/// `smithy_query(query="shape",shape="PartnerProfileSummary")`).
+pub(crate) const RECEIVER_PROFILE: &str = "pprofile-ABCDEFGHIJKLM";
+
+/// A `ReceiverIdentifier` a `SUBSIDIARY` invitation can be addressed to: an
+/// `AwsAccountId` (`^[0-9]{12}$`, source
+/// `smithy_query(query="shape",shape="AwsAccountId")`).
+pub(crate) const RECEIVER_ACCOUNT: &str = "000000000001";
+
+/// A receiver this service accepts for `connection_type`, so a table that varies the
+/// connection type does not have to vary the receiver by hand.
+pub(crate) fn receiver_for(connection_type: &str) -> &'static str {
+    if connection_type == "SUBSIDIARY" {
+        RECEIVER_ACCOUNT
+    } else {
+        RECEIVER_PROFILE
+    }
+}
+
 /// An emulator with just this service mounted on a fresh engine, driven in-process
 /// through the production router. The engine handle is kept so a test can move the
 /// stored clock (there is no other way to reach an instant 30 days out).
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signatures are not what these tests are about; the router still routes by
@@ -63,7 +83,7 @@ impl Emulator {
     }
 
     /// Call one operation in `region` and return `(http status, parsed body)`.
-    async fn call_in(&self, region: &str, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call_in(&self, region: &str, operation: &str, body: &Value) -> (u16, Value) {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/partnercentral-account/aws4_request, \
              SignedHeaders=host;x-amz-target, Signature=0000"
@@ -109,12 +129,12 @@ impl Emulator {
         (status, parsed)
     }
 
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         self.call_in(REGION, operation, body).await
     }
 
     /// Succeed-or-explain: the call must answer 200.
-    async fn ok(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -126,7 +146,7 @@ impl Emulator {
 
 /// The wire error code of an error body: the `__type` of the awsJson envelope (or
 /// the `x-amzn-errortype` the boundary validator sets, folded in above).
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -134,7 +154,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// A failure's status and code, checked together: a client branches on both.
-fn assert_error(case: &str, got: (u16, Value), status: u16, code: &str) {
+pub(crate) fn assert_error(case: &str, got: (u16, Value), status: u16, code: &str) {
     let (actual_status, body) = got;
     assert_eq!(
         actual_status, status,
@@ -198,7 +218,7 @@ fn connection_arn(region: &str, catalog: &str, id: &str) -> String {
 }
 
 /// A required string member of a response.
-fn string(body: &Value, member: &str, case: &str) -> String {
+pub(crate) fn string(body: &Value, member: &str, case: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: {member} is not a string: {body}"))
@@ -262,7 +282,7 @@ fn invitation_cases() -> Vec<InvitationCase> {
             email: "inviter@example.com",
             message: "hello".to_string(),
             name: "Inviter",
-            receiver: "partner-123".to_string(),
+            receiver: RECEIVER_PROFILE.to_string(),
         },
         InvitationCase {
             label: "subsidiary connection in the Sandbox catalog",
@@ -271,7 +291,7 @@ fn invitation_cases() -> Vec<InvitationCase> {
             email: "ops.team+subsidiary@partner.example.co.uk",
             message: "first line\nsecond line".to_string(),
             name: "Ops Team",
-            receiver: "pprofile-ABCDEFGHIJKLM".to_string(),
+            receiver: RECEIVER_ACCOUNT.to_string(),
         },
         InvitationCase {
             label: "longest message the compiled schema allows",
@@ -282,16 +302,16 @@ fn invitation_cases() -> Vec<InvitationCase> {
             message: "m".repeat(80),
             email: "a@b.co",
             name: "Ünicode Nâme",
-            receiver: "r".repeat(100),
+            receiver: "pprofile-0123456789abc".to_string(),
         },
         InvitationCase {
-            label: "single-character receiver and shortest message",
+            label: "another subsidiary account and the shortest message",
             catalog: "AWS",
             connection_type: "SUBSIDIARY",
             email: "x@y.io",
             message: "m".to_string(),
             name: "A",
-            receiver: "r".to_string(),
+            receiver: "999999999999".to_string(),
         },
     ]
 }
@@ -428,7 +448,7 @@ async fn create_is_idempotent_per_client_token() {
         email: "inviter@example.com",
         message: "hello".to_string(),
         name: "Inviter",
-        receiver: "partner-123".to_string(),
+        receiver: RECEIVER_PROFILE.to_string(),
     };
 
     let first = emulator
@@ -468,7 +488,10 @@ async fn create_is_idempotent_per_client_token() {
         "the single stored invitation is the one the first call minted: {listed}"
     );
 
-    // Each row changes exactly one member the token was first used with.
+    // Each row changes exactly one member the token was first used with. A row's
+    // change is detected as a replay of the SAME token with a DIFFERENT request
+    // before the request's own members are validated, so a row that also makes the
+    // (ConnectionType, ReceiverIdentifier) pair unaddressable is still the conflict.
     let mut changed = vec![
         ("Email", base.request("tok-1")),
         ("Message", base.request("tok-1")),
@@ -481,7 +504,7 @@ async fn create_is_idempotent_per_client_token() {
     changed[1].1["Message"] = json!("a different message");
     changed[2].1["ConnectionType"] = json!("SUBSIDIARY");
     changed[3].1["Name"] = json!("Another Inviter");
-    changed[4].1["ReceiverIdentifier"] = json!("partner-456");
+    changed[4].1["ReceiverIdentifier"] = json!("pprofile-NOPQRSTUVWXYZ");
     changed[5].1["Catalog"] = json!("Sandbox");
 
     for (member, request) in changed {
@@ -491,7 +514,7 @@ async fn create_is_idempotent_per_client_token() {
 }
 
 /// An identifier this service never minted, or one minted in another catalog, is a
-/// 404 — never a 501 and never an empty success.
+/// `ResourceNotFoundException` — never a 501 and never an empty success.
 #[tokio::test]
 async fn get_connection_invitation_refuses_an_unknown_identifier() {
     let emulator = Emulator::new();
@@ -505,25 +528,27 @@ async fn get_connection_invitation_refuses_an_unknown_identifier() {
                 "Email": "inviter@example.com",
                 "Message": "hello",
                 "Name": "Inviter",
-                "ReceiverIdentifier": "partner-123",
+                "ReceiverIdentifier": RECEIVER_PROFILE,
             }),
         )
         .await;
     let id = string(&created, "Id", "known invitation");
 
     // Rows: a well-formed id nobody minted, the stored id read in another catalog,
-    // and ids the modelled `@pattern` itself refuses (too short, wrong prefix).
+    // and ids the modelled `@pattern` itself refuses (too short, wrong prefix). A
+    // lookup that finds nothing is HTTP 400 — the status this service's frontend
+    // serializes its `ResourceNotFoundException` at.
     let cases: Vec<(&str, Value, u16, &str)> = vec![
         (
             "never minted",
             json!({ "Catalog": "AWS", "Identifier": "pacinv-0000000000000" }),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (
             "minted in another catalog",
             json!({ "Catalog": "Sandbox", "Identifier": id }),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (
@@ -542,7 +567,7 @@ async fn get_connection_invitation_refuses_an_unknown_identifier() {
 
     for (label, request, status, code) in cases {
         let answer = emulator.call("GetConnectionInvitation", &request).await;
-        if status == 404 {
+        if code == "ResourceNotFoundException" {
             assert_eq!(
                 answer.1.get("Reason").and_then(Value::as_str),
                 Some("CONNECTION_INVITATION_NOT_FOUND"),
@@ -562,13 +587,16 @@ async fn list_connection_invitations_filters_and_pages() {
     let emulator = Emulator::new();
 
     // Five invitations in the AWS catalog differing in type and receiver, plus one in
-    // another catalog that must never appear.
+    // another catalog that must never appear. Each receiver is a form the invitation's
+    // connection type can be addressed to (`receiver_for`), and the last row repeats
+    // the first row's receiver so a filter can select two invitations by one
+    // identifier.
     let seeds: Vec<(&str, &str)> = vec![
-        ("OPPORTUNITY_COLLABORATION", "partner-1"),
-        ("SUBSIDIARY", "partner-2"),
-        ("OPPORTUNITY_COLLABORATION", "partner-3"),
-        ("SUBSIDIARY", "partner-1"),
-        ("OPPORTUNITY_COLLABORATION", "partner-4"),
+        ("OPPORTUNITY_COLLABORATION", "pprofile-0000000000001"),
+        ("SUBSIDIARY", "000000000002"),
+        ("OPPORTUNITY_COLLABORATION", "pprofile-0000000000003"),
+        ("SUBSIDIARY", "000000000004"),
+        ("OPPORTUNITY_COLLABORATION", "pprofile-0000000000001"),
     ];
     let mut created_order: Vec<String> = Vec::new();
     for (index, (connection_type, receiver)) in seeds.iter().enumerate() {
@@ -598,7 +626,7 @@ async fn list_connection_invitations_filters_and_pages() {
                 "Email": "inviter@example.com",
                 "Message": "other catalog",
                 "Name": "Inviter",
-                "ReceiverIdentifier": "partner-9",
+                "ReceiverIdentifier": RECEIVER_ACCOUNT,
             }),
         )
         .await;
@@ -656,22 +684,22 @@ async fn list_connection_invitations_filters_and_pages() {
         ),
         (
             "one OtherParticipantIdentifier",
-            json!({ "OtherParticipantIdentifiers": ["partner-3"] }),
+            json!({ "OtherParticipantIdentifiers": ["pprofile-0000000000003"] }),
             vec![2],
         ),
         (
             "several OtherParticipantIdentifiers",
-            json!({ "OtherParticipantIdentifiers": ["partner-1", "partner-4"] }),
+            json!({ "OtherParticipantIdentifiers": ["pprofile-0000000000001", "000000000004"] }),
             vec![0, 3, 4],
         ),
         (
             "an identifier nothing was sent to",
-            json!({ "OtherParticipantIdentifiers": ["partner-absent"] }),
+            json!({ "OtherParticipantIdentifiers": ["pprofile-0000000000009"] }),
             vec![],
         ),
         (
             "two filters together",
-            json!({ "ConnectionType": "SUBSIDIARY", "OtherParticipantIdentifiers": ["partner-1"] }),
+            json!({ "ConnectionType": "SUBSIDIARY", "OtherParticipantIdentifiers": ["000000000004"] }),
             vec![3],
         ),
     ];
@@ -737,7 +765,7 @@ async fn list_connection_invitations_filters_and_pages() {
     // member's modelled maximum is refused before any invitation is scanned.
     let at_the_filter_maximum: Vec<String> = (0..MAX_FILTER_IDENTIFIERS - 1)
         .map(|index| format!("absent-{index}"))
-        .chain(std::iter::once("partner-3".to_string()))
+        .chain(std::iter::once("pprofile-0000000000003".to_string()))
         .collect();
     let past_the_filter_maximum: Vec<String> = (0..=MAX_FILTER_IDENTIFIERS)
         .map(|index| format!("absent-{index}"))
@@ -798,8 +826,9 @@ async fn accept_connection_invitation_creates_and_links_the_connection() {
 
     // The `Participant` variant each receiver-identifier form must be reported as,
     // from the model's own id constraints: `PartnerProfileSummary$Id` is
-    // `^pprofile-[A-Za-z0-9]{13}$`, `SellerProfileSummary$Id` is `^[a-zA-Z0-9-]+$`
-    // with length 1..50, and a longer identifier fits neither.
+    // `^pprofile-[A-Za-z0-9]{13}$` and `AwsAccountId` is `^[0-9]{12}$` — the two forms
+    // a receiver is addressable under (`OPPORTUNITY_COLLABORATION` joins two partner
+    // profiles, `SUBSIDIARY` joins a subsidiary's AWS account).
     let cases: Vec<(&str, &str, &str, &str)> = vec![
         (
             "a partner profile id",
@@ -808,21 +837,21 @@ async fn accept_connection_invitation_creates_and_links_the_connection() {
             "PartnerProfile",
         ),
         (
-            "a plain participant identifier",
+            "an AWS account id",
             "SUBSIDIARY",
-            "partner-123",
-            "SellerProfile",
+            "000000000001",
+            "Account",
         ),
         (
-            "the longest identifier a profile id can carry",
+            "another partner profile id",
             "OPPORTUNITY_COLLABORATION",
-            "0123456789012345678901234567890123456789012345678",
-            "SellerProfile",
+            "pprofile-0000000000000",
+            "PartnerProfile",
         ),
         (
-            "one character past that",
+            "the highest AWS account id",
             "SUBSIDIARY",
-            "01234567890123456789012345678901234567890123456789a",
+            "999999999999",
             "Account",
         ),
     ];
@@ -870,9 +899,13 @@ async fn accept_connection_invitation_creates_and_links_the_connection() {
             connection_arn(REGION, "AWS", &connection_id),
             "case {label:?}: Arn must name the catalog and the minted connection id"
         );
+        // A receiver that IS an AWS account id names the counterparty's account; a
+        // profile receiver carries no account, so the counterparty presents the
+        // account every emulated participant does.
+        let expected_account = if variant == "Account" { receiver } else { ACCOUNT };
         assert_eq!(
             string(&connection, "OtherParticipantAccountId", label),
-            ACCOUNT,
+            expected_account,
             "case {label:?}: OtherParticipantAccountId is a 12-digit account id"
         );
 
@@ -909,7 +942,7 @@ async fn accept_connection_invitation_creates_and_links_the_connection() {
         if variant == "Account" {
             assert_eq!(
                 string(&participant, "Name", label),
-                ACCOUNT,
+                expected_account,
                 "case {label:?}: an account participant is named by the account the connection carries"
             );
         } else {
@@ -1023,7 +1056,7 @@ async fn accept_connection_invitation_creates_and_links_the_connection() {
     ];
     for (label, request) in refused {
         let answer = emulator.call("AcceptConnectionInvitation", &request).await;
-        assert_error(label, answer, 404, "ResourceNotFoundException");
+        assert_error(label, answer, 400, "ResourceNotFoundException");
     }
 }
 
@@ -1049,7 +1082,7 @@ async fn cancel_connection_records_the_cancellation() {
                     "Email": "inviter@example.com",
                     "Message": "please connect",
                     "Name": "Inviter",
-                    "ReceiverIdentifier": "partner-123",
+                    "ReceiverIdentifier": receiver_for(connection_type),
                 }),
             )
             .await;
@@ -1208,7 +1241,7 @@ async fn cancel_connection_records_the_cancellation() {
     ];
     for (label, request) in refused {
         let answer = emulator.call("CancelConnection", &request).await;
-        assert_error(label, answer, 404, "ResourceNotFoundException");
+        assert_error(label, answer, 400, "ResourceNotFoundException");
     }
 
     let answer = emulator
@@ -1223,7 +1256,7 @@ async fn cancel_connection_records_the_cancellation() {
         "a missing connection names its reason: {}",
         answer.1
     );
-    assert_error("get a connection nobody created", answer, 404, "ResourceNotFoundException");
+    assert_error("get a connection nobody created", answer, 400, "ResourceNotFoundException");
 }
 
 /// An invitation nobody answered before its `ExpiresAt` is `EXPIRED` from that
@@ -1242,7 +1275,7 @@ async fn an_invitation_expires_when_its_expiry_falls_due() {
                 "Email": "inviter@example.com",
                 "Message": "please connect",
                 "Name": "Inviter",
-                "ReceiverIdentifier": "partner-123",
+                "ReceiverIdentifier": RECEIVER_PROFILE,
             }),
         )
         .await;
@@ -1339,7 +1372,7 @@ async fn the_arn_region_follows_the_signing_region() {
                     "Email": "inviter@example.com",
                     "Message": "please connect",
                     "Name": "Inviter",
-                    "ReceiverIdentifier": "partner-123",
+                    "ReceiverIdentifier": RECEIVER_PROFILE,
                 }),
             )
             .await;
@@ -1400,7 +1433,7 @@ async fn a_catalog_no_arn_can_spell_is_refused() {
                     "Email": "inviter@example.com",
                     "Message": "please connect",
                     "Name": "Inviter",
-                    "ReceiverIdentifier": "partner-123",
+                    "ReceiverIdentifier": RECEIVER_PROFILE,
                 }),
             )
             .await;
@@ -1427,7 +1460,9 @@ async fn a_catalog_no_arn_can_spell_is_refused() {
 async fn the_resource_stores_are_bounded() {
     let emulator = Emulator::new();
 
-    /// One create request, with the token and receiver of row `index`.
+    /// One create request, with the token and receiver of row `index`. Every receiver
+    /// is a distinct `PartnerProfileId`, the form an `OPPORTUNITY_COLLABORATION`
+    /// invitation is addressed to.
     fn invite(index: usize) -> Value {
         json!({
             "Catalog": "AWS",
@@ -1436,7 +1471,7 @@ async fn the_resource_stores_are_bounded() {
             "Email": "inviter@example.com",
             "Message": "please connect",
             "Name": "Inviter",
-            "ReceiverIdentifier": format!("partner-{index}"),
+            "ReceiverIdentifier": format!("pprofile-{index:013}"),
         })
     }
 
@@ -1541,7 +1576,7 @@ async fn the_idempotency_store_evicts_its_oldest_record() {
             "Email": "inviter@example.com",
             "Message": "please connect",
             "Name": "Inviter",
-            "ReceiverIdentifier": "partner-123",
+            "ReceiverIdentifier": RECEIVER_PROFILE,
         })
     }
 

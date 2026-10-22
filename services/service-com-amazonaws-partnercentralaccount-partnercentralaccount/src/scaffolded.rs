@@ -177,6 +177,30 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The wire name of the modelled error whose status this service's frontend does not
+/// take from the model (`smithy_query(query="shape",
+/// shape="ResourceNotFoundException")`: `@httpError 404`).
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
+/// The status THIS service serializes the modelled error `shape_name` at, given the
+/// `modelled` status its `@httpError` declares.
+///
+/// PartnerCentral Account's frontend answers a `ResourceNotFoundException` with HTTP
+/// **400**, not the 404 the shape's `@httpError` declares: recorded behaviour, seen
+/// across four operations (`GetConnectionInvitation`, `AcceptConnectionInvitation`,
+/// `GetConnection`, `CancelConnection`) and three fixtures, with the body's `__type`
+/// and `Reason` exactly as modelled — so the error identity is the model's and only
+/// the status is the frontend's. It is a per-SERVICE rule, applied here (the one place
+/// every operation's error is serialized through) rather than per handler, so an
+/// operation that raises the error later cannot answer a different status for it.
+/// Every other modelled error keeps the status its own `@httpError` declares.
+fn frontend_status(shape_name: &str, modelled: u16) -> u16 {
+    match shape_name {
+        RESOURCE_NOT_FOUND_EXCEPTION => 400,
+        _ => modelled,
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -282,10 +306,14 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     ///
     /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
     /// retryable, so a client would retry an operation that can never succeed.
+    ///
+    /// A modeled error takes the status THIS SERVICE's frontend serializes it at
+    /// ([`frontend_status`]), which is the model's `@httpError` for every error but
+    /// `ResourceNotFoundException`.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
+            Self::Modeled(e) => frontend_status(e.shape_name(), e.http_status()),
             Self::ValidationException(_) => 400,
         }
     }

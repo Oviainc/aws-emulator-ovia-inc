@@ -472,15 +472,12 @@ fn document(root: &Observed, dialect: Dialect) -> Value {
 
 /// The JSON type of a sampled value, for the refusal of an event that is not an
 /// object. Names the type, never the value: the value is the caller's data.
+///
+/// One wording for the whole service, in `state.rs` beside the other shared refusal
+/// helpers, so this refusal and `UpdateSchema`'s and `PutResourcePolicy`'s cannot
+/// drift apart.
 fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
-    }
+    crate::state::json_type_name(value)
 }
 
 /// The `GetDiscoveredSchema` operation.

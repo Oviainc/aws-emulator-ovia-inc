@@ -2,362 +2,232 @@
 
 //! Engine state for the com-amazonaws-ssm-amazonssm service.
 //!
-//! Besides the state struct itself this module holds the Parameter Store rules the
-//! parameter handlers share — the naming constraints, the tier and content-size
-//! rules, ARN construction, version retention and the record-to-modelled-shape
-//! conversion — so every operation that touches a parameter agrees on one
-//! implementation of each instead of carrying copies that can drift apart.
+//! The slice modelled here is **Parameter Store**: `PutParameter` creates or updates a
+//! parameter and `GetParameter` reads one back. Both reach the one store below, so
+//! whatever a put persisted is what a later get reports.
 //!
-//! Every constant below cites the model sentence it comes from; ask the model for
-//! the full text with
-//! `smithy_query(query="doc",shape="PutParameterRequest",member="<Member>",model_path="services/service-com-amazonaws-ssm-amazonssm/smithy-model/com-amazonaws-ssm-amazonssm.json")`.
+//! A parameter lives at a name that is unique *within a Region* (the `PutParameter`
+//! `Name` doc: "A parameter name must be unique within an Amazon Web Services Region"),
+//! so the store is keyed by `(region, canonical name)`. Each parameter holds its
+//! **versions**, oldest first: a put that overwrites an existing name appends a new
+//! version rather than replacing the old one, which is what lets a `name:version`
+//! selector resolve an earlier value.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
-use crate::ops::types::Parameter;
+use crate::ops::types::{Parameter, Tag};
 
-/// The region an emulated request is treated as having been made in when its
-/// SigV4 credential scope does not name one (an unsigned or anonymous request).
+/// The signing name, endpoint prefix and ARN namespace of this service, all three
+/// `ssm` (the model's `aws.auth#sigv4` / `aws.api#service` traits).
+pub const ARN_SERVICE: &str = "ssm";
+
+/// Region used when a request carries no SigV4 credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// The `arnNamespace` / `endpointPrefix` this service's ARNs carry, from the
-/// model's `aws.api#service` trait (`smithy_query(query="service_info")`:
-/// `arnNamespace: ssm`).
-pub const ARN_NAMESPACE: &str = "ssm";
+/// The resource portion a parameter ARN carries before the parameter's path, e.g.
+/// `arn:aws:ssm:us-east-2:111122223333:parameter/Dev/DBServer` (the `PutParameter`
+/// `Name` doc quotes the same prefix).
+pub const ARN_RESOURCE_PREFIX: &str = "parameter/";
 
-/// `ParameterTier` values, from the model's enum (`Standard`, `Advanced`,
-/// `Intelligent-Tiering`).
-pub const TIER_STANDARD: &str = "Standard";
-/// See [`TIER_STANDARD`].
-pub const TIER_ADVANCED: &str = "Advanced";
-/// See [`TIER_STANDARD`].
-pub const TIER_INTELLIGENT: &str = "Intelligent-Tiering";
+/// What every ARN starts with, and therefore how `GetParameter` tells a full ARN from
+/// a bare parameter name.
+pub const ARN_PREFIX: &str = "arn:";
 
-/// The `ParameterType` value whose values Parameter Store encrypts with a KMS key.
+/// `ParameterType` values, from the modelled enum
+/// (`crate::ops::types::PARAMETER_TYPE_VALUES`).
 pub const TYPE_SECURE_STRING: &str = "SecureString";
 
-/// A standard parameter's content size limit (`PutParameterRequest$Tier`:
-/// "Standard parameters have a content size limit of 4 KB").
+/// `ParameterTier` values, from the modelled enum
+/// (`crate::ops::types::PARAMETER_TIER_VALUES`).
+pub const TIER_STANDARD: &str = "Standard";
+
+/// See [`TIER_STANDARD`].
+pub const TIER_ADVANCED: &str = "Advanced";
+
+/// See [`TIER_STANDARD`].
+pub const TIER_INTELLIGENT_TIERING: &str = "Intelligent-Tiering";
+
+/// Content size a standard parameter holds: "Standard parameters have a content size
+/// limit of 4 KB" (`PutParameter`'s `Tier` doc).
 pub const STANDARD_VALUE_LIMIT: usize = 4 * 1024;
 
-/// An advanced parameter's content size limit (`PutParameterRequest$Tier`:
-/// "Advanced parameters have a content size limit of 8 KB").
+/// Content size an advanced parameter holds: "Advanced parameters have a content size
+/// limit of 8 KB" (same doc).
 pub const ADVANCED_VALUE_LIMIT: usize = 8 * 1024;
 
-/// The number of parameters past which `Intelligent-Tiering` creates advanced
-/// parameters (`PutParameterRequest$Tier`, the options that require an advanced
-/// parameter: "More than 10,000 parameters already exist in your Amazon Web
-/// Services account in the current Amazon Web Services Region").
-pub const STANDARD_PARAMETER_COUNT_LIMIT: usize = 10_000;
-
-/// The deepest hierarchy a parameter name may describe
-/// (`PutParameterRequest$Name`: "Parameter hierarchies are limited to a maximum
-/// depth of fifteen levels", and `HierarchyLevelLimitExceededException`: "A
-/// hierarchy can have a maximum of 15 levels").
+/// How deep a parameter hierarchy may go: "Parameter hierarchies are limited to a
+/// maximum depth of fifteen levels" (`PutParameter`'s `Name` doc), which is what
+/// `HierarchyLevelLimitExceededException` reports.
 pub const MAX_HIERARCHY_LEVELS: usize = 15;
 
-/// How many versions of one parameter Parameter Store keeps
-/// (`ParameterMaxVersionLimitExceeded`: "Parameter Store retains the 100 most
-/// recently created versions of a parameter … Parameter Store deletes the oldest
-/// version when a new one is created").
+/// How many versions of one parameter are retained: "Parameter Store retains the 100
+/// most recently created versions of a parameter. After this number of versions has
+/// been created, Parameter Store deletes the oldest version when a new one is
+/// created" (the `ParameterMaxVersionLimitExceeded` doc).
 pub const MAX_VERSIONS_RETAINED: usize = 100;
 
-/// The `DataType` values Parameter Store supports
-/// (`PutParameterRequest$DataType`: "The following data type values are
-/// supported. text aws:ec2:image aws:ssm:integration").
-pub const DATA_TYPES: &[&str] = &["text", "aws:ec2:image", "aws:ssm:integration"];
+/// How many parameters one Region holds: "You can create a maximum of 10,000 standard
+/// parameters for each Region in an Amazon Web Services account" (`PutParameter`'s
+/// `Tier` doc). The advanced tier's published quota is ten times this; this emulator
+/// applies the standard quota to both and reports a create past it as
+/// `ParameterLimitExceeded`.
+pub const MAX_PARAMETERS_PER_REGION: usize = 10_000;
 
-/// The data type of a parameter whose request names none (`Parameter$DataType`:
-/// "The data type of the parameter, such as text or aws:ec2:image. The default is
-/// text").
+/// How many parameters this store holds in TOTAL, across every Region.
+///
+/// Emulator resource guard, NOT a published AWS quota, and the bound that actually
+/// keeps this process finite: the Region a parameter is stored under comes from the
+/// request's own credential scope ([`request_region`]), so the per-Region quota alone
+/// would be one quota per caller-chosen partition of the key space and the store could
+/// grow without bound. A create past this total is refused with the same modelled
+/// `ParameterLimitExceeded` as one past the per-Region quota.
+pub const MAX_PARAMETERS_TOTAL: usize = MAX_PARAMETERS_PER_REGION;
+
+/// The policy types a parameter may carry: "Parameter Store supports the following
+/// policy types: Expiration, ExpirationNotification, and NoChangeNotification" (the
+/// `InvalidPolicyTypeException` doc).
+pub const POLICY_TYPES: &[&str] = &[
+    "Expiration",
+    "ExpirationNotification",
+    "NoChangeNotification",
+];
+
+/// How many policies one parameter may carry: "You specified more than the maximum
+/// number of allowed policies for the parameter. The maximum is 10" (the
+/// `PoliciesLimitExceededException` doc).
+pub const MAX_POLICIES: usize = 10;
+
+/// The `DataType` values Parameter Store supports: "The following data type values are
+/// supported. text aws:ec2:image aws:ssm:integration" (`PutParameter`'s `DataType`
+/// doc).
+pub const PARAMETER_DATA_TYPES: &[&str] = &["text", "aws:ec2:image", "aws:ssm:integration"];
+
+/// The `DataType` a parameter carries when the request names none: "The data type of
+/// the parameter, such as text or aws:ec2:image. The default is text" (the
+/// `Parameter$DataType` doc).
 pub const DEFAULT_DATA_TYPE: &str = "text";
 
-/// The key a `SecureString` parameter is encrypted with when the request names
-/// none (`PutParameterRequest$KeyId`: "If you don't specify a key ID, the system
-/// uses the default key associated with your Amazon Web Services account").
+/// The key a `SecureString` is encrypted under when the request names no `KeyId`: "If
+/// you don't specify a key ID, the system uses the default key associated with your
+/// Amazon Web Services account" (`PutParameter`'s `KeyId` doc), which Parameter Store
+/// reaches through this alias.
 pub const DEFAULT_SECURE_STRING_KEY_ID: &str = "alias/aws/ssm";
 
-/// The most parameters this store holds: the larger of the two account quotas the
-/// model documents (`PutParameterRequest$Tier`: "You can create a maximum of
-/// 100,000 advanced parameters for each Region in an Amazon Web Services
-/// account"). It is also what keeps the map bounded, so a caller cannot grow the
-/// process's memory without limit: a create past it is refused with the modelled
-/// `ParameterLimitExceeded`.
-pub const MAX_PARAMETERS: usize = 100_000;
+/// The characters a parameter name may carry: "Parameter names can include only the
+/// following symbols and letters: a-zA-Z0-9_.-" plus the `/` hierarchy separator
+/// (`PutParameter`'s `Name` doc).
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '/')
+}
 
-/// The longest `AllowedPattern` this service compiles. The model constrains
-/// `AllowedPattern` to `len 0..1024`, so the boundary validator already refuses a
-/// longer one; the bound is restated here so the one the compile relies on is its
-/// own rather than a constraint elsewhere.
-pub const MAX_ALLOWED_PATTERN_LEN: usize = 1024;
+/// The prefixes a parameter name may not start with: "A parameter name can't be
+/// prefixed with "aws" or "ssm" (case-insensitive)" (`PutParameter`'s `Name` doc).
+pub const RESERVED_NAME_PREFIXES: &[&str] = &["aws", "ssm"];
 
-/// The compiled-program budget an `AllowedPattern` has to fit, so the work one
-/// request's pattern can cost is bounded by this code rather than by the regex
-/// crate's much larger default.
-pub const ALLOWED_PATTERN_SIZE_LIMIT: usize = 64 * 1024;
-
-/// The lazy-DFA cache budget an `AllowedPattern` match runs under, bounding the
-/// memory one match can occupy. See [`ALLOWED_PATTERN_SIZE_LIMIT`].
-pub const ALLOWED_PATTERN_DFA_SIZE_LIMIT: usize = 256 * 1024;
-
-/// Compile an `AllowedPattern` under the explicit length and program-size budgets
-/// above, or say why it was refused.
+/// The store key for a parameter name: the name without its leading `/`.
 ///
-/// The refusal text is the message of the `InvalidAllowedPatternException` the
-/// caller gets: it names the member and the bound it broke, so the request can be
-/// fixed from that text alone.
-pub fn compile_allowed_pattern(pattern: &str) -> Result<::regex::Regex, String> {
-    if pattern.len() > MAX_ALLOWED_PATTERN_LEN {
+/// A hierarchical name must carry the leading separator and a top-level one may
+/// ("For parameters in a hierarchy, you must include a leading forward slash
+/// character (/) when you create or reference a parameter"), so dropping it is what
+/// makes `MyParameter` and `/MyParameter` the one parameter they are, while
+/// `/Dev/DBServer` keeps its whole path.
+pub fn canonical_name(name: &str) -> &str {
+    name.strip_prefix('/').unwrap_or(name)
+}
+
+/// The name a request carries, with the spaces rule applied, or the reason it is
+/// refused.
+///
+/// "Parameter names can't contain spaces. The service removes any spaces specified for
+/// the beginning or end of a parameter name. If the specified name for a parameter
+/// contains spaces between characters, the request fails with a `ValidationException`
+/// error" (`PutParameter`'s `Name` doc; `GetParameter`'s own doc repeats it). So the
+/// name is trimmed, and a trimmed name that still carries whitespace is refused with a
+/// message naming the member and the constraint.
+pub fn trimmed_name(name: &str) -> Result<&str, String> {
+    let trimmed = name.trim();
+    if trimmed.chars().any(char::is_whitespace) {
         return Err(format!(
-            "AllowedPattern is {} characters long, which exceeds the maximum of \
-             {MAX_ALLOWED_PATTERN_LEN}.",
-            pattern.len()
+            "Name '{name}' contains spaces between characters: a parameter name can't contain spaces"
         ));
     }
-    ::regex::RegexBuilder::new(pattern)
-        .size_limit(ALLOWED_PATTERN_SIZE_LIMIT)
-        .dfa_size_limit(ALLOWED_PATTERN_DFA_SIZE_LIMIT)
-        .build()
-        .map_err(|error| {
-            format!("AllowedPattern {pattern:?} isn't a usable regular expression: {error}")
-        })
+    Ok(trimmed)
 }
 
-/// One version of a parameter: the definition a single `PutParameter` call wrote.
-///
-/// A parameter's value, type and metadata belong to the version rather than to the
-/// parameter, because `GetParameter` can ask for an earlier one by selector and
-/// must answer with what that call stored.
-#[derive(Debug, Clone)]
-pub struct ParameterVersion {
-    /// The version number this call was assigned: 1 for a created parameter, one
-    /// more than the previous version for every overwrite.
-    pub version: i64,
-    pub value: String,
-    /// The `ParameterType` of this version (`String`, `StringList` or
-    /// `SecureString`).
-    pub r#type: String,
-    pub description: Option<String>,
-    /// The KMS key id a `SecureString` version is encrypted with, defaulted to
-    /// [`DEFAULT_SECURE_STRING_KEY_ID`]; whatever the request named otherwise.
-    pub key_id: Option<String>,
-    pub allowed_pattern: Option<String>,
-    pub policies: Option<String>,
-    pub data_type: String,
-    /// The tier Parameter Store assigned this version, which is what
-    /// `PutParameter` reports back.
-    pub tier: String,
-    pub last_modified_date: SystemTime,
-}
-
-/// One stored parameter: its identity (name, ARN and tags) plus its versions.
-#[derive(Debug, Clone)]
-pub struct ParameterRecord {
-    /// The name the parameter was created under — the key it is stored by.
-    pub name: String,
-    /// The ARN the service minted for it, so every reader reports the identical
-    /// value instead of recomputing it.
-    pub arn: String,
-    pub tags: BTreeMap<String, String>,
-    /// The version a read with no selector answers with: the most recent one.
-    pub current: ParameterVersion,
-    /// The retained earlier versions, oldest first and at most
-    /// [`MAX_VERSIONS_RETAINED`] - 1 of them.
-    pub superseded: Vec<ParameterVersion>,
-}
-
-impl ParameterRecord {
-    /// The named version, whether it is the current one or a retained earlier one.
-    pub fn version(&self, version: i64) -> Option<&ParameterVersion> {
-        if self.current.version == version {
-            return Some(&self.current);
-        }
-        self.superseded.iter().find(|v| v.version == version)
-    }
-
-    /// Make `next` the current version, retaining the one it replaces and dropping
-    /// the oldest once [`MAX_VERSIONS_RETAINED`] versions are held.
-    pub fn push_version(&mut self, next: ParameterVersion) {
-        let replaced = std::mem::replace(&mut self.current, next);
-        self.superseded.push(replaced);
-        while self.superseded.len() + 1 > MAX_VERSIONS_RETAINED {
-            self.superseded.remove(0);
-        }
-    }
-
-    /// This record's `version` as the modelled `Parameter` shape. `selector` is the
-    /// text the caller addressed the version with, which `Parameter$Selector`
-    /// reports back ("Either the version number or the label used to retrieve the
-    /// parameter value"), and is absent when the caller named no selector.
-    pub fn to_modeled(&self, version: &ParameterVersion, selector: Option<String>) -> Parameter {
-        Parameter {
-            name: Some(self.name.clone()),
-            r#type: Some(version.r#type.clone()),
-            value: Some(version.value.clone()),
-            version: version.version,
-            selector,
-            // Only a parameter that references another service's data carries a
-            // source result; a Parameter Store parameter holds its own value.
-            source_result: None,
-            last_modified_date: Some(::aws_smithy_types::DateTime::from(
-                version.last_modified_date,
-            )),
-            arn: Some(self.arn.clone()),
-            data_type: Some(version.data_type.clone()),
-        }
-    }
-}
-
-/// Per-service state for com-amazonaws-ssm-amazonssm. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
-pub struct ComAmazonawsSsmAmazonssmState {
-    /// Every stored parameter, keyed by the name it was created under — a
-    /// parameter's identity in this API. A `BTreeMap` so hierarchy walks and list
-    /// order are deterministic.
-    pub parameters: BTreeMap<String, ParameterRecord>,
-}
-
-impl ComAmazonawsSsmAmazonssmState {
-    /// The parameter a `Name` addresses, which may be the parameter's name or its
-    /// full ARN (`GetParameterRequest$Name`: "The name or Amazon Resource Name
-    /// (ARN) of the parameter that you want to query").
-    pub fn parameter(&self, name: &str) -> Option<&ParameterRecord> {
-        for candidate in name_candidates(name) {
-            if let Some(record) = self.parameters.get(&candidate) {
-                return Some(record);
-            }
-        }
-        None
-    }
-}
-
-/// The stored names a `Name` can address: itself, plus — when it is a parameter
-/// ARN — the name the ARN's resource part spells, with and without the leading
-/// `/` that a hierarchical name carries.
-pub fn name_candidates(name: &str) -> Vec<String> {
-    if !name.starts_with("arn:") {
-        return vec![name.to_string()];
-    }
-    match name.split_once(":parameter/") {
-        Some((_, resource)) => vec![resource.to_string(), format!("/{resource}")],
-        None => vec![name.to_string()],
-    }
-}
-
-/// Split a read's `Name` into the parameter name and the version-or-label
-/// selector after it (`GetParameterRequest$Name`: "To query by parameter label,
-/// use "Name": "name:label". To query by parameter version, use "Name":
-/// "name:version"").
-///
-/// A parameter name cannot contain `:` ([`check_parameter_name`]), so the first
-/// one separates the selector — except in a full ARN, whose own fields are
-/// colon-separated and which therefore carries no selector.
-pub fn split_selector(name: &str) -> (&str, Option<&str>) {
-    if name.starts_with("arn:") {
-        return (name, None);
-    }
-    match name.split_once(':') {
-        Some((base, selector)) => (base, Some(selector)),
-        None => (name, None),
-    }
-}
-
-/// Why a parameter name cannot be used.
+/// Why a name is not one `PutParameter` accepts. Each variant maps to the modelled
+/// error that reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NameProblem {
-    /// A space between characters (`PutParameterRequest$Name`: "If the specified
-    /// name for a parameter contains spaces between characters, the request fails
-    /// with a `ValidationException` error").
-    ContainsSpace,
-    /// Prefixed with `aws` or `ssm` (`PutParameterRequest$Name`: "A parameter name
-    /// can't be prefixed with "aws" or "ssm" (case-insensitive)").
-    ///
-    /// Read literally, as the model words it: the letters at the start of the name,
-    /// with no segment or word boundary after them, so `awsome-thing` is refused
-    /// along with `/aws/thing`. The model states no boundary, and the narrower
-    /// reading would accept names the reserved prefix is meant to keep free.
-    ReservedPrefix,
-    /// A character outside `a-zA-Z0-9_.-` and the hierarchy separator `/`
-    /// (`PutParameterRequest$Name`: "Parameter names can include only the
-    /// following symbols and letters: a-zA-Z0-9_.-").
-    InvalidCharacter(char),
-    /// Deeper than [`MAX_HIERARCHY_LEVELS`], carrying the depth asked for.
-    TooManyLevels(usize),
+pub enum NameRejection {
+    /// The name is not shaped like a parameter name:
+    /// `ParameterPatternMismatchException`.
+    Pattern(String),
+    /// The name is nested deeper than Parameter Store allows:
+    /// `HierarchyLevelLimitExceededException`.
+    Depth(String),
 }
 
-/// The name Parameter Store stores a requested one under: the same name without
-/// the spaces around it (`PutParameterRequest$Name`: "The service removes any
-/// spaces specified for the beginning or end of a parameter name").
-pub fn canonical_name(name: &str) -> &str {
-    name.trim()
-}
-
-/// How many hierarchy levels a name describes: its `/`-separated segments, so a
-/// name with no separator at all is one level.
-pub fn hierarchy_levels(name: &str) -> usize {
-    name.split('/').filter(|segment| !segment.is_empty()).count().max(1)
-}
-
-/// Check a [`canonical_name`] against Parameter Store's naming constraints.
-pub fn check_parameter_name(name: &str) -> Result<(), NameProblem> {
-    if name.chars().any(char::is_whitespace) {
-        return Err(NameProblem::ContainsSpace);
-    }
-    if let Some(bad) = name
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '/')))
-    {
-        return Err(NameProblem::InvalidCharacter(bad));
-    }
-    let bare = name.trim_start_matches('/').to_ascii_lowercase();
-    if bare.starts_with("aws") || bare.starts_with("ssm") {
-        return Err(NameProblem::ReservedPrefix);
-    }
-    let levels = hierarchy_levels(name);
-    if levels > MAX_HIERARCHY_LEVELS {
-        return Err(NameProblem::TooManyLevels(levels));
-    }
-    Ok(())
-}
-
-/// Whether a request carries an option that only an advanced parameter supports
-/// (`PutParameterRequest$Tier`, "Options that require an advanced parameter":
-/// content larger than 4 KB, a parameter policy, or more than 10,000 parameters
-/// already in this account and Region).
-pub fn requires_advanced_tier(value_len: usize, has_policies: bool, existing: usize) -> bool {
-    value_len > STANDARD_VALUE_LIMIT || has_policies || existing > STANDARD_PARAMETER_COUNT_LIMIT
-}
-
-/// The tier Parameter Store assigns a request.
+/// Why `name` is not a parameter name this service accepts, or `None` when it is.
 ///
-/// A request that names a tier gets that tier ("Whenever you specify a tier in the
-/// request, Parameter Store creates or updates the parameter according to that
-/// request"), except `Intelligent-Tiering`, which "evaluates each request to
-/// determine if the parameter is standard or advanced". A request that names none
-/// gets the account's default tier, which is the standard tier until
-/// `UpdateServiceSetting` changes it ("The default tier when you begin using
-/// Parameter Store is the standard-parameter tier").
-pub fn resolve_tier(
-    requested: Option<&str>,
-    value_len: usize,
-    has_policies: bool,
-    existing: usize,
-) -> String {
-    match requested {
-        Some(TIER_ADVANCED) => TIER_ADVANCED.to_string(),
-        Some(TIER_INTELLIGENT) => {
-            if requires_advanced_tier(value_len, has_policies, existing) {
-                TIER_ADVANCED.to_string()
-            } else {
-                TIER_STANDARD.to_string()
-            }
-        }
-        _ => TIER_STANDARD.to_string(),
+/// Every rule here is one of the naming constraints `PutParameter`'s `Name` doc lists;
+/// the modelled `PSParameterName` carries only a length, so none of them is refused by
+/// the boundary walk.
+pub fn name_rejection(name: &str) -> Option<NameRejection> {
+    if name.starts_with(ARN_PREFIX) {
+        return Some(NameRejection::Pattern(format!(
+            "Name '{name}' is an ARN: you can't enter the Amazon Resource Name (ARN) for a \
+             parameter, only the parameter name itself"
+        )));
     }
+    let path = canonical_name(name);
+    if path.is_empty() {
+        return Some(NameRejection::Pattern(
+            "Name carries no parameter name at all".to_string(),
+        ));
+    }
+    if let Some(bad) = path.chars().find(|c| !is_name_char(*c)) {
+        return Some(NameRejection::Pattern(format!(
+            "Name '{name}' carries '{bad}': parameter names can include only the symbols and \
+             letters a-zA-Z0-9_.- and the / hierarchy separator"
+        )));
+    }
+    if path.split('/').any(str::is_empty) {
+        return Some(NameRejection::Pattern(format!(
+            "Name '{name}' carries an empty hierarchy level"
+        )));
+    }
+    // The hierarchy rule: anything below the top level must carry the leading
+    // separator, so `Dev/DBServer` is not a name Parameter Store accepts.
+    if path.contains('/') && !name.starts_with('/') {
+        return Some(NameRejection::Pattern(format!(
+            "Name '{name}' is hierarchical and must include a leading forward slash character (/)"
+        )));
+    }
+    if let Some(reserved) = RESERVED_NAME_PREFIXES.iter().find(|prefix| {
+        // Case-insensitive, compared against the head of the path rather than a
+        // lowercased copy of it, so matching allocates nothing. Every character of the
+        // path has already been checked to be ASCII above, so the slice is on a
+        // character boundary.
+        path.len() >= prefix.len() && path[..prefix.len()].eq_ignore_ascii_case(prefix)
+    }) {
+        return Some(NameRejection::Pattern(format!(
+            "Name '{name}' is prefixed with '{reserved}': a parameter name can't be prefixed with \
+             {} (case-insensitive)",
+            RESERVED_NAME_PREFIXES.join(" or ")
+        )));
+    }
+    let levels = path.split('/').count();
+    if levels > MAX_HIERARCHY_LEVELS {
+        return Some(NameRejection::Depth(format!(
+            "Name '{name}' is {levels} levels deep: a parameter hierarchy is limited to a maximum \
+             depth of {MAX_HIERARCHY_LEVELS} levels"
+        )));
+    }
+    None
 }
 
-/// The content size limit of `tier`.
+/// The content size limit a parameter of `tier` holds (see [`STANDARD_VALUE_LIMIT`]
+/// and [`ADVANCED_VALUE_LIMIT`]).
 pub fn value_limit(tier: &str) -> usize {
     if tier == TIER_ADVANCED {
         ADVANCED_VALUE_LIMIT
@@ -366,24 +236,296 @@ pub fn value_limit(tier: &str) -> usize {
     }
 }
 
-/// The region of the request being served: the third field of its SigV4
-/// credential scope, falling back to [`DEFAULT_REGION`] for a request that is
-/// not signed.
+/// The tier a put serves the parameter in.
+///
+/// Straight from `PutParameter`'s `Tier` doc: a request that names a tier is served in
+/// that tier; one that names none keeps the tier the parameter already has, or — for a
+/// parameter being created — gets the default tier configuration, which is the standard
+/// tier ("The default tier when you begin using Parameter Store is the
+/// standard-parameter tier", and `UpdateServiceSetting` — the operation that changes
+/// it — is still a scaffold, so this emulator never leaves that default). Under
+/// `Intelligent-Tiering` the request is evaluated against the three options the same
+/// doc says require an advanced parameter: content over 4 KB, a parameter policy, or
+/// more than 10,000 parameters already in the Region.
+///
+/// `stored` is the tier the parameter is in today, so an update that only changes a
+/// value stays in its own tier: the no-revert rule the caller then faces fires only
+/// when the request ASKS for a lower tier.
+pub fn resolve_tier(
+    requested: Option<&str>,
+    stored: Option<&str>,
+    value_len: usize,
+    has_policies: bool,
+    parameters_in_region: usize,
+) -> String {
+    match requested.or(stored) {
+        None => TIER_STANDARD.to_string(),
+        Some(TIER_INTELLIGENT_TIERING) => {
+            // An advanced parameter can never be reverted, so evaluating a request
+            // against the options keeps it advanced whatever this request carries. The
+            // parameter-count option is stated for completeness and cannot fire while
+            // the quota guard stands: `PutParameter` refuses a create once a Region
+            // holds `MAX_PARAMETERS_PER_REGION` parameters, so the store never gets
+            // past it.
+            let needs_advanced = value_len > STANDARD_VALUE_LIMIT
+                || has_policies
+                || stored == Some(TIER_ADVANCED)
+                || parameters_in_region > MAX_PARAMETERS_PER_REGION;
+            if needs_advanced {
+                TIER_ADVANCED.to_string()
+            } else {
+                TIER_STANDARD.to_string()
+            }
+        }
+        Some(tier) => tier.to_string(),
+    }
+}
+
+/// One stored version of one parameter: the value a put persisted, and everything the
+/// service recorded alongside it.
+#[derive(Debug, Clone)]
+pub struct ParameterVersionRecord {
+    /// This version's number, counting from 1 for a parameter's first version.
+    pub version: i64,
+    pub value: String,
+    /// A `ParameterType` value.
+    pub type_: String,
+    /// A `ParameterDataType` value (see [`PARAMETER_DATA_TYPES`]).
+    pub data_type: String,
+    /// A `ParameterTier` value, already resolved (see [`resolve_tier`]).
+    pub tier: String,
+    pub description: Option<String>,
+    pub allowed_pattern: Option<String>,
+    pub key_id: Option<String>,
+    pub policies: Option<String>,
+    pub last_modified_date: SystemTime,
+    /// The labels that point at THIS version. `LabelParameterVersion` is what writes
+    /// them and is still a scaffold, so the set is empty today — but a `name:label`
+    /// selector resolves against it rather than against anything invented, so a label
+    /// nothing created resolves to nothing.
+    pub labels: BTreeSet<String>,
+}
+
+impl ParameterVersionRecord {
+    /// The modelled `Parameter` for this version of `record`.
+    ///
+    /// `selector` is the `name:selector` suffix the read carried, which is what the
+    /// `Parameter$Selector` doc describes: "Either the version number or the label used
+    /// to retrieve the parameter value".
+    pub fn to_parameter(&self, record: &ParameterRecord, selector: Option<&str>) -> Parameter {
+        Parameter {
+            name: Some(record.name.clone()),
+            r#type: Some(self.type_.clone()),
+            value: Some(self.value.clone()),
+            version: self.version,
+            selector: selector.map(str::to_string),
+            // `SourceResult` is "the raw result or response from the source" for a
+            // parameter that references another Amazon Web Services service. Nothing
+            // in this store references one, so there is no source result to report.
+            source_result: None,
+            last_modified_date: Some(::aws_smithy_types::DateTime::from(self.last_modified_date)),
+            arn: Some(record.arn()),
+            data_type: Some(self.data_type.clone()),
+        }
+    }
+}
+
+/// One stored parameter: its name, where it lives, its tags, and every version of it
+/// the store still retains.
+#[derive(Debug, Clone)]
+pub struct ParameterRecord {
+    /// The name as the create supplied it (trimmed), which is what a read reports.
+    pub name: String,
+    /// The Region the parameter was created in; part of its store key and of its ARN.
+    pub region: String,
+    pub tags: BTreeMap<String, String>,
+    /// Every retained version, oldest first and the newest last. Never empty for a
+    /// record that is in the store.
+    pub versions: Vec<ParameterVersionRecord>,
+}
+
+impl ParameterRecord {
+    /// The newest version, which is what a read with no selector answers with:
+    /// "By default, if you don't specify a specific version, the system returns the
+    /// latest parameter value when a parameter is called" (`PutParameter`'s `Version`
+    /// doc).
+    pub fn latest(&self) -> Option<&ParameterVersionRecord> {
+        self.versions.last()
+    }
+
+    /// The oldest retained version, the one a new version displaces once the store
+    /// holds [`MAX_VERSIONS_RETAINED`] of them.
+    pub fn oldest(&self) -> Option<&ParameterVersionRecord> {
+        self.versions.first()
+    }
+
+    /// The version a `name:selector` read resolves to, or `None` when this parameter
+    /// has no such version or label.
+    ///
+    /// A selector is "either the version number or the label used to retrieve the
+    /// parameter value" (`Parameter$Selector`), so an all-digit selector names a
+    /// version and anything else names a label.
+    pub fn select(&self, selector: Option<&str>) -> Option<&ParameterVersionRecord> {
+        match selector {
+            None => self.latest(),
+            Some(selector) => match selector.parse::<i64>() {
+                Ok(version) => self.versions.iter().find(|held| held.version == version),
+                Err(_) => self
+                    .versions
+                    .iter()
+                    .find(|held| held.labels.contains(selector)),
+            },
+        }
+    }
+
+    /// The number the next version of this parameter carries.
+    pub fn next_version(&self) -> i64 {
+        self.latest()
+            .map_or(1, |latest| latest.version.saturating_add(1))
+    }
+
+    /// Append `version`, dropping the oldest retained version once more than
+    /// [`MAX_VERSIONS_RETAINED`] are held — "Parameter Store deletes the oldest
+    /// version when a new one is created".
+    pub fn push_version(&mut self, version: ParameterVersionRecord) {
+        self.versions.push(version);
+        while self.versions.len() > MAX_VERSIONS_RETAINED {
+            self.versions.remove(0);
+        }
+    }
+
+    /// This parameter's ARN. A hierarchical name keeps its whole path after the
+    /// `parameter/` prefix: `arn:aws:ssm:<region>:<account>:parameter/Dev/DBServer`.
+    pub fn arn(&self) -> String {
+        ::engine::emulator_arn(
+            ARN_SERVICE,
+            &self.region,
+            &format!("{ARN_RESOURCE_PREFIX}{}", canonical_name(&self.name)),
+        )
+    }
+}
+
+/// What a read's `Name` names: which parameter, in which Region and account, and the
+/// selector that chose a version or a label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParameterQuery<'a> {
+    /// The canonical name (no leading `/`) to look the parameter up by.
+    pub name: &'a str,
+    /// The `name:selector` suffix the request carried, without the colon, or `None`
+    /// when it named none.
+    pub selector: Option<&'a str>,
+    /// The Region a full ARN named, or `None` when the request named a bare name.
+    pub region: Option<&'a str>,
+    /// The account a full ARN named.
+    pub account: Option<&'a str>,
+}
+
+/// What `name` names, or `None` when it is an ARN that names no `ssm` parameter.
+///
+/// `GetParameter` takes "the name or Amazon Resource Name (ARN) of the parameter that
+/// you want to query", and either form may carry a selector ("To query by parameter
+/// label, use "Name": "name:label". To query by parameter version, use "Name":
+/// "name:version""). An ARN is split on its six fields first, so the colons inside it
+/// are never mistaken for a selector; a parameter name itself can carry no colon.
+pub fn parse_parameter_query(name: &str) -> Option<ParameterQuery<'_>> {
+    let (region, account, rest) = if name.starts_with(ARN_PREFIX) {
+        let mut fields = name.splitn(6, ':');
+        // arn : partition : service : region : account : resource
+        let (_arn, _partition) = (fields.next()?, fields.next()?);
+        let service = fields.next()?;
+        let region = fields.next()?;
+        let account = fields.next()?;
+        let resource = fields.next()?;
+        if service != ARN_SERVICE {
+            return None;
+        }
+        (
+            Some(region),
+            Some(account),
+            resource.strip_prefix(ARN_RESOURCE_PREFIX)?,
+        )
+    } else {
+        (None, None, name)
+    };
+    let (path, selector) = match rest.rsplit_once(':') {
+        Some((before, after)) if !before.is_empty() => (before, Some(after)),
+        _ => (rest, None),
+    };
+    Some(ParameterQuery {
+        name: canonical_name(path),
+        selector,
+        region,
+        account,
+    })
+}
+
+/// Per-service state for com-amazonaws-ssm-amazonssm. A handler reaches it through [`service_state`].
+#[derive(Debug, Default)]
+pub struct ComAmazonawsSsmAmazonssmState {
+    /// Every parameter, keyed by `(region, canonical name)`: "A parameter name must be
+    /// unique within an Amazon Web Services Region". A `BTreeMap` so a listing walks a
+    /// stable, total order.
+    pub parameters: BTreeMap<(String, String), ParameterRecord>,
+}
+
+impl ComAmazonawsSsmAmazonssmState {
+    /// The parameter `name` names in `region`, or `None` when that Region holds none.
+    pub fn parameter(&self, region: &str, name: &str) -> Option<&ParameterRecord> {
+        self.parameters
+            .get(&(region.to_string(), canonical_name(name).to_string()))
+    }
+
+    /// The same record, to append a version or replace its tags.
+    pub fn parameter_mut(&mut self, region: &str, name: &str) -> Option<&mut ParameterRecord> {
+        self.parameters
+            .get_mut(&(region.to_string(), canonical_name(name).to_string()))
+    }
+
+    /// Store `record` as `region`'s parameter of that name.
+    pub fn insert_parameter(&mut self, record: ParameterRecord) {
+        let key = (
+            record.region.clone(),
+            canonical_name(&record.name).to_string(),
+        );
+        self.parameters.insert(key, record);
+    }
+
+    /// How many parameters `region` holds, which is what the per-Region quota and the
+    /// `Intelligent-Tiering` evaluation are measured against.
+    pub fn parameters_in_region(&self, region: &str) -> usize {
+        self.parameters
+            .keys()
+            .filter(|(held, _)| held == region)
+            .count()
+    }
+}
+
+/// A modelled `TagList` as the store holds it: ordered, so two reads of one record
+/// report its tags in the same order.
+pub fn to_btree_map(tags: Option<Vec<Tag>>) -> BTreeMap<String, String> {
+    tags.unwrap_or_default()
+        .into_iter()
+        .map(|tag| (tag.key, tag.value))
+        .collect()
+}
+
+/// The region this request was signed for, from its SigV4 credential scope; the
+/// emulator's default region when it carries none.
+///
+/// The scope is caller-controlled text and the value lands inside an ARN and in a
+/// store key, so anything outside `[A-Za-z0-9-]` is refused here and the default used
+/// instead: a generated ARN can never carry text an ARN may not hold.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
+        .filter(|region| {
+            !region.is_empty()
+                && region.len() <= 64
+                && region
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
-}
-
-/// The ARN of a parameter in `region`:
-/// `arn:aws:ssm:<region>:<account>:parameter/<name>`, where the name's leading
-/// hierarchy slash is the one the ARN's `parameter/` already carries.
-pub fn parameter_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn(
-        ARN_NAMESPACE,
-        region,
-        &format!("parameter/{}", name.trim_start_matches('/')),
-    )
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

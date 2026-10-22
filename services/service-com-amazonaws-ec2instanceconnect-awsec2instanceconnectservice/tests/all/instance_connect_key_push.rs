@@ -28,8 +28,9 @@ use ec2ic::state::{
 
 /// The `X-Amz-Target` values from this service's wire protocol (`OPERATIONS.md`:
 /// `AWSEC2InstanceConnectService.<OperationName>`).
-const SEND_SSH: &str = "AWSEC2InstanceConnectService.SendSSHPublicKey";
-const SEND_SERIAL: &str = "AWSEC2InstanceConnectService.SendSerialConsoleSSHPublicKey";
+pub(crate) const SEND_SSH: &str = "AWSEC2InstanceConnectService.SendSSHPublicKey";
+pub(crate) const SEND_SERIAL: &str =
+    "AWSEC2InstanceConnectService.SendSerialConsoleSSHPublicKey";
 
 /// A SigV4 credential scope naming this service's signing name (`ec2-instance-connect`),
 /// which is how the router picks the service out (`resolve_route_key` reads the scope's
@@ -41,7 +42,7 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 /// Key material satisfying the modelled `SSHPublicKey` length (80..4096); `tag` makes each
 /// one distinct, so a replacement is visible in state.
-fn ssh_key(tag: &str) -> String {
+pub(crate) fn ssh_key(tag: &str) -> String {
     format!("ssh-ed25519 {} {tag}@emulator", "A".repeat(80))
 }
 
@@ -54,7 +55,7 @@ fn is_uuid(value: &str) -> bool {
 
 /// The error code an awsJson1_1 error envelope carries in `__type`, or `""` for a body with
 /// no `__type` (a success).
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -65,13 +66,13 @@ fn error_code(body: &Value) -> String {
 }
 
 /// One emulator: a shared engine, and the router with only this service mounted.
-struct Emulator {
+pub(crate) struct Emulator {
     engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -80,16 +81,24 @@ impl Emulator {
     }
 
     /// This service's store in the shared engine — reached exactly as a handler reaches it.
-    fn state(&self) -> engine::ServiceState<IcState> {
+    pub(crate) fn state(&self) -> engine::ServiceState<IcState> {
         ec2ic::state::service_state(&*self.engine).expect("the service state must be reachable")
     }
 
-    fn register(&self, instance: Instance) {
+    pub(crate) fn register(&self, instance: Instance) {
         self.state().lock().register_instance(instance);
     }
 
+    /// Grant the account serial-console access, which is what EC2's
+    /// `EnableSerialConsoleAccess` does. A fresh account has none (see
+    /// `IcState::serial_console_access_enabled`), so every serial-console case that is not
+    /// about the toggle itself turns it on first.
+    pub(crate) fn enable_serial_console(&self) {
+        self.state().lock().serial_console_access_enabled = true;
+    }
+
     /// `POST /` with `X-Amz-Target: <target>` and a JSON body, through the router.
-    async fn call(&self, target: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, target: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -111,7 +120,7 @@ impl Emulator {
         (status, parsed)
     }
 
-    async fn push_ssh(&self, instance_id: &str, os_user: &str, key: &str) -> (u16, Value) {
+    pub(crate) async fn push_ssh(&self, instance_id: &str, os_user: &str, key: &str) -> (u16, Value) {
         self.call(
             SEND_SSH,
             &json!({
@@ -123,7 +132,7 @@ impl Emulator {
         .await
     }
 
-    async fn push_serial(&self, instance_id: &str, key: &str) -> (u16, Value) {
+    pub(crate) async fn push_serial(&self, instance_id: &str, key: &str) -> (u16, Value) {
         self.call(
             SEND_SERIAL,
             &json!({
@@ -136,7 +145,7 @@ impl Emulator {
     }
 
     /// How many keys of either kind are stored right now, expiry ignored.
-    fn stored_key_count(&self) -> usize {
+    pub(crate) fn stored_key_count(&self) -> usize {
         let state = self.state();
         let guard = state.lock();
         guard.pushed_keys.len() + guard.serial_console_keys.len()
@@ -144,7 +153,7 @@ impl Emulator {
 }
 
 /// A running Nitro instance a case can push to.
-fn running_instance(instance_id: &str, zone: &str) -> Instance {
+pub(crate) fn running_instance(instance_id: &str, zone: &str) -> Instance {
     Instance::new(
         instance_id,
         zone,
@@ -308,6 +317,7 @@ async fn the_instance_lifecycle_state_decides_the_outcome_of_both_operations() {
         for target in [SEND_SSH, SEND_SERIAL] {
             let case = format!("{} on a {} instance", target, state.as_str());
             let emulator = Emulator::new();
+            emulator.enable_serial_console();
             let instance_id = "i-0fedcba987654321";
             emulator.register(
                 running_instance(instance_id, "eu-west-1b").in_state(state),
@@ -416,6 +426,9 @@ async fn a_push_to_an_unregistered_instance_is_not_found() {
         for target in [SEND_SSH, SEND_SERIAL] {
             let case = format!("{target} for {instance_id}");
             let emulator = Emulator::new();
+            // Granted, so the not-found answer is what the registry decides rather than
+            // the account's serial-console grant.
+            emulator.enable_serial_console();
             // The seeded fleet must not contain it, or the case would prove nothing.
             assert!(
                 emulator.state().lock().instance(instance_id).is_none(),
@@ -430,8 +443,8 @@ async fn a_push_to_an_unregistered_instance_is_not_found() {
             };
 
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected HTTP 404, got {status} ({body})"
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status} ({body})"
             );
             assert_eq!(
                 error_code(&body),
@@ -450,6 +463,7 @@ async fn a_push_to_an_unregistered_instance_is_not_found() {
 #[tokio::test]
 async fn a_pushed_key_lives_for_its_ttl_and_then_reads_as_absent() {
     let emulator = Emulator::new();
+    emulator.enable_serial_console();
     let instance_id = "i-0aaaabbbbccccdddd";
     emulator.register(running_instance(instance_id, "us-east-1a"));
 
@@ -556,7 +570,7 @@ async fn the_serial_console_push_reads_the_account_toggle_and_the_instance_type(
         (
             false,
             true,
-            403,
+            400,
             "SerialConsoleAccessDisabledException",
         ),
         // Access disabled is decided before the instance type, so it is what a caller sees
@@ -564,7 +578,7 @@ async fn the_serial_console_push_reads_the_account_toggle_and_the_instance_type(
         (
             false,
             false,
-            403,
+            400,
             "SerialConsoleAccessDisabledException",
         ),
     ];
@@ -639,6 +653,7 @@ async fn the_serial_console_push_reads_the_account_toggle_and_the_instance_type(
 #[tokio::test]
 async fn every_call_gets_its_own_request_id_and_is_recorded() {
     let emulator = Emulator::new();
+    emulator.enable_serial_console();
     let instance_id = "i-0f0f0f0f0f0f0f0f";
     emulator.register(running_instance(instance_id, "us-east-1a"));
 
@@ -703,8 +718,10 @@ async fn every_call_gets_its_own_request_id_and_is_recorded() {
 
 #[tokio::test]
 async fn the_modelled_input_constraints_are_refused_before_anything_is_stored() {
-    // Each row violates one modelled constraint, so the boundary validator refuses it and no
-    // handler runs. Source: `OPERATIONS.md` — `InstanceId` (len 10..32, pattern
+    // Each row violates one modelled constraint. The boundary validator catches these, and
+    // this service words its refusal as the error it models for a bad parameter
+    // (`InvalidArgsException`), so a caller sees the same code wherever the violation was
+    // found. Source: `OPERATIONS.md` — `InstanceId` (len 10..32, pattern
     // ^i-[a-f0-9]+$), `InstanceOSUser` (len 1..32), `SSHPublicKey` (len 80..4096),
     // `SerialPort` (range 0..0).
     let valid_key = ssh_key("constraint");
@@ -753,8 +770,8 @@ async fn the_modelled_input_constraints_are_refused_before_anything_is_stored() 
         );
         assert_eq!(
             error_code(&response),
-            "ValidationException",
-            "case {case:?}: expected the boundary validator's ValidationException, got {response}"
+            "InvalidArgsException",
+            "case {case:?}: expected the modelled InvalidArgsException, got {response}"
         );
         assert_eq!(
             emulator.stored_key_count(),
@@ -767,6 +784,7 @@ async fn the_modelled_input_constraints_are_refused_before_anything_is_stored() 
 #[tokio::test]
 async fn the_seeded_registry_serves_a_push_with_no_test_setup() {
     let emulator = Emulator::new();
+    emulator.enable_serial_console();
     let seeded = ec2ic::state::seed_instances();
 
     // The seed exists so a client that never touched state can still reach an instance.

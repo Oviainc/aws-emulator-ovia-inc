@@ -227,9 +227,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let record = state.connections.get(&key).ok_or_else(|| {
             CancelConnectionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "Connection {} was not found in catalog {}.",
-                    input.identifier, input.catalog
+                message: crate::state::not_found_message(
+                    crate::state::RESOURCE_CONNECTION,
+                    &input.catalog,
+                    &input.identifier,
                 ),
                 reason: crate::state::REASON_CONNECTION_NOT_FOUND.to_string(),
             })

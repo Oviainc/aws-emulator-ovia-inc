@@ -41,3 +41,5 @@ mod server_materialised_members;
 mod state_roundtrip;
 #[path = "all/update_origin_endpoint.rs"]
 mod update_origin_endpoint;
+#[path = "all/update_roundtrip.rs"]
+mod update_roundtrip;

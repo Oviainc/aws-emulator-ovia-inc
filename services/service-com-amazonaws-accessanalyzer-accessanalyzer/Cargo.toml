@@ -31,5 +31,11 @@ sha2 = { workspace = true }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# Percent-encodes an ARN into the `{resourceArn}` httpLabel of the tagging operations,
+# the way an SDK encodes a label value. Pinned here rather than referenced from the
+# root `[workspace.dependencies]`, which this project does not allow editing.
+percent-encoding = "2.3"
+
 [lints]
 workspace = true

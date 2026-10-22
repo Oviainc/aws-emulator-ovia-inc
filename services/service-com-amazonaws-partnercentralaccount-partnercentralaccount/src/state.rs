@@ -45,6 +45,12 @@ pub const INVITATION_EXPIRED: &str = "EXPIRED";
 /// sending it (`PARTICIPANT_TYPE_VALUES`: RECEIVER | SENDER).
 pub const PARTICIPANT_SENDER: &str = "SENDER";
 
+/// `ConnectionType` values (`CONNECTION_TYPE_VALUES`): a collaboration between two
+/// Partner Central partner profiles.
+pub const CONNECTION_TYPE_OPPORTUNITY_COLLABORATION: &str = "OPPORTUNITY_COLLABORATION";
+/// `ConnectionType` value for a connection to a subsidiary's AWS account.
+pub const CONNECTION_TYPE_SUBSIDIARY: &str = "SUBSIDIARY";
+
 /// `ConnectionTypeStatus` values (`CONNECTION_TYPE_STATUS_VALUES`).
 pub const CONNECTION_TYPE_ACTIVE: &str = "ACTIVE";
 /// The status a cancelled connection type carries.
@@ -82,6 +88,18 @@ pub const FIELD_CODE_INVALID_VALUE: &str = "INVALID_VALUE";
 pub const FIELD_CODE_INVALID_STRING_FORMAT: &str = "INVALID_STRING_FORMAT";
 /// `FieldValidationError$Code` for a list member carrying more entries than it may.
 pub const FIELD_CODE_TOO_MANY_VALUES: &str = "TOO_MANY_VALUES";
+
+/// The resource a `ResourceNotFoundException` of an invitation lookup names, for
+/// [`not_found_message`].
+pub const RESOURCE_CONNECTION_INVITATION: &str = "Connection invitation";
+/// The resource a `ResourceNotFoundException` of a connection lookup names.
+pub const RESOURCE_CONNECTION: &str = "Connection";
+
+/// The prefix of a `PartnerProfileId` (`^pprofile-[A-Za-z0-9]{13}$`).
+pub const PARTNER_PROFILE_ID_PREFIX: &str = "pprofile-";
+
+/// Characters in an `AwsAccountId` (`^[0-9]{12}$`).
+const ACCOUNT_ID_LEN: usize = 12;
 
 /// How long a connection invitation stays answerable before it expires.
 ///
@@ -446,6 +464,48 @@ pub fn is_invitation_id(value: &str) -> bool {
     has_id_shape(value, INVITATION_ID_PREFIX)
 }
 
+/// Whether `value` has the form of a `PartnerProfileId`
+/// (`PartnerProfileSummary$Id`: `^pprofile-[A-Za-z0-9]{13}$`).
+pub fn is_partner_profile_id(value: &str) -> bool {
+    has_id_shape(value, PARTNER_PROFILE_ID_PREFIX)
+}
+
+/// Whether `value` has the form of an `AwsAccountId` (`^[0-9]{12}$`), the shape this
+/// service's `CanceledBy` and `OtherParticipantAccountId` members carry.
+pub fn is_aws_account_id(value: &str) -> bool {
+    value.len() == ACCOUNT_ID_LEN && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Whether `receiver` names a participant an invitation of `connection_type` can be
+/// addressed to.
+///
+/// A connection joins two participants of a particular KIND, and each kind has its own
+/// identifier form in the model's `Participant` union: an
+/// `OPPORTUNITY_COLLABORATION` joins two Partner Central partner profiles, which are
+/// identified by a `PartnerProfileId` (`^pprofile-[A-Za-z0-9]{13}$`), while a
+/// `SUBSIDIARY` connection joins the caller to a subsidiary's AWS account, identified
+/// by an `AwsAccountId` (`^[0-9]{12}$`). `ParticipantIdentifier`'s own pattern
+/// (`^[a-zA-Z0-9-]+$`) is wide enough to spell either and much else besides, so the
+/// pair is what decides whether a receiver is addressable at all.
+pub fn receiver_is_addressable(connection_type: &str, receiver: &str) -> bool {
+    match connection_type {
+        CONNECTION_TYPE_OPPORTUNITY_COLLABORATION => is_partner_profile_id(receiver),
+        CONNECTION_TYPE_SUBSIDIARY => is_aws_account_id(receiver),
+        // A `ConnectionType` the model does not declare never reaches a handler (the
+        // boundary refuses it), and nothing is addressable under it.
+        _ => false,
+    }
+}
+
+/// The message a lookup that found nothing states: the kind of resource, then the
+/// catalog and the identifier the request named it by.
+///
+/// One rule for every lookup in this service, so the four handlers that raise
+/// `ResourceNotFoundException` cannot word the same condition differently.
+pub fn not_found_message(resource: &str, catalog: &str, identifier: &str) -> String {
+    format!("{resource} not found with catalog: {catalog} and identifier: {identifier}.")
+}
+
 /// The region of the request being served: the third field of its SigV4 credential
 /// scope, falling back to [`DEFAULT_REGION`] for a request that is not signed or
 /// whose scope names a region the ARN's region segment (`[a-z0-9\-]*`) cannot carry.
@@ -529,6 +589,10 @@ pub fn connection_arn(region: &str, catalog: &str, id: &str) -> String {
 ///
 /// * `PartnerProfileSummary$Id` is `^pprofile-[A-Za-z0-9]{13}$`, so an identifier of
 ///   that form names a partner profile;
+/// * `AwsAccountId` is `^[0-9]{12}$`, so an identifier of that form names an AWS
+///   account — the form a `SUBSIDIARY` receiver carries
+///   ([`receiver_is_addressable`]), and the same value the connection's
+///   `OtherParticipantAccountId` reports;
 /// * `SellerProfileSummary$Id` is `^[a-zA-Z0-9-]+$` with length 1..50, which every
 ///   other identifier of at most 50 characters satisfies;
 /// * a longer identifier fits neither profile id, so the counterparty is reported as
@@ -538,10 +602,15 @@ pub fn connection_arn(region: &str, catalog: &str, id: &str) -> String {
 /// for a participant until the partner-profile operations are implemented, and
 /// inventing one would report a value no call ever supplied.
 pub fn participant_for(identifier: &str, other_participant_account_id: &str) -> Participant {
-    if has_id_shape(identifier, "pprofile-") {
+    if is_partner_profile_id(identifier) {
         return Participant::PartnerProfile(PartnerProfileSummary {
             id: identifier.to_string(),
             name: identifier.to_string(),
+        });
+    }
+    if is_aws_account_id(identifier) {
+        return Participant::Account(AccountSummary {
+            name: other_participant_account_id.to_string(),
         });
     }
     if identifier.len() <= 50 {
