@@ -185,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let principal = crate::state::request_principal(ctx);
+        let principal = crate::state::request_principal();
         let record = crate::state::DatasetRecord {
             name: input.name.clone(),
             format: input.format.clone(),
@@ -199,16 +199,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "dataset",
                 &input.name,
             ),
-            create_date: now,
-            created_by: principal.clone(),
-            last_modified_date: now,
-            last_modified_by: principal,
+            // A dataset that has only been created has no modification to report, so
+            // the audit's last-modified pair stays unset until an update runs.
+            audit: crate::state::Audit::created(now, principal),
         };
 
         let mut store = state.lock();
         if store.datasets.contains_key(&input.name) {
             return Err(CreateDatasetErrorModeled::ConflictException(ConflictException {
-                message: Some(format!("The dataset {} already exists.", input.name)),
+                message: Some(crate::state::already_exists_message("Dataset", &input.name)),
             })
             .into());
         }

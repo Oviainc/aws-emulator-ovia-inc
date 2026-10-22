@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDataset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the request's definition onto the dataset record `CreateDataset` stored,
+//! keyed by `Name`, and stamps the record's last-modified audit pair, so a later
+//! `DescribeDataset`/`ListDatasets` serves what this call wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -89,10 +84,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-databrew-awsgluedatabre
 // here — hence the `UpdateDatasetError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.databrew#UpdateDataset")]
+// `InternalServerException` (HTTP 500) is widened in: the service models it, this
+// operation does not list it, and it is the only honest answer for an engine that
+// holds no state — a mounting fault, never a client error.
+#[smithy_macros::operation_error(
+    "com.amazonaws.databrew#UpdateDataset",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum UpdateDatasetErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
 }
@@ -146,20 +148,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDatasetErrorModeled::InternalServerException(InternalServerException {
+                message: Some("DataBrew is mounted on an engine that holds no state".to_string()),
+            })
+        })?;
+
+        // `Name` carries only the modelled length bounds here, which are enforced
+        // before this handler runs: the documented character set is `CreateDataset`'s
+        // rule for the name it MINTS ("The name of the dataset to be created. Valid
+        // characters are ..."), and a name no dataset holds is answered by the lookup
+        // below with the modelled 404, not with a validation error.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDataset"))
+        // `Source` is the input definition the request carries, so an `Input` that
+        // carries none of them describes no readable data — the same refusal
+        // `CreateDataset` makes, because the stored record has the same invariant.
+        if crate::state::source_of(&input.input).is_none() {
+            return Err(UpdateDatasetErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "Input must specify one of S3InputDefinition, \
+                     DataCatalogInputDefinition or DatabaseInputDefinition"
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let principal = crate::state::request_principal();
+
+        let mut store = state.lock();
+        let Some(record) = store.datasets.get_mut(&input.name) else {
+            return Err(UpdateDatasetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        record.apply_update(
+            input.format.clone(),
+            input.format_options.clone(),
+            input.input.clone(),
+            input.path_options.clone(),
+            now,
+            principal,
+        );
+
+        Ok(UpdateDatasetOutput { name: input.name })
     }
 }

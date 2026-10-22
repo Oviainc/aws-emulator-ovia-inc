@@ -19,6 +19,22 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{Dataset, FormatOptions, Input, JobRun, Output, PathOptions, RecipeReference};
 
+/// The message DataBrew answers a `ResourceNotFoundException` with.
+///
+/// The model documents the error's message for this service (`smithy_query(
+/// query="shape", shape="ResourceNotFoundException")`: "One or more resources can't be
+/// found."), so that sentence IS the message, for every resource kind and every
+/// operation that answers the error. The name that was not found is the caller's own
+/// request, so the service does not append it.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "One or more resources can't be found.";
+
+/// The message DataBrew answers a `ConflictException` with when a create names a
+/// resource that already exists: the resource kind, capitalised, and the name the
+/// request carried, so the message states which resource conflicted.
+pub fn already_exists_message(kind: &str, name: &str) -> String {
+    format!("{kind} {name} already exists.")
+}
+
 /// The region an ARN carries when the request's SigV4 scope names none.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
@@ -61,8 +77,54 @@ const RUN_RUNNING_DUE_AFTER: Duration = Duration::from_millis(300);
 /// Chosen for the same reason as [`RUN_RUNNING_DUE_AFTER`].
 const RUN_TERMINAL_DUE_AFTER: Duration = Duration::from_millis(600);
 
-/// A stored DataBrew dataset. `Source`, the ARN and every `*By`/`*Date` member are
-/// server-derived at create time, never client-supplied.
+/// The create/modify audit a named DataBrew resource carries, as the modelled
+/// `CreateDate`/`CreatedBy`/`LastModifiedDate`/`LastModifiedBy` members report it.
+///
+/// The create pair is set once, when the resource is minted. The last-modified pair
+/// is `None` until an operation that MODIFIES the resource runs: the modelled members
+/// are optional (model: only `Name` and `Input` are required on
+/// `DescribeDatasetResponse`), and a resource that has never been modified has no
+/// modification to report, so both members are absent from the response. That is what
+/// lets a client tell a freshly created resource from an edited one.
+#[derive(Debug, Clone)]
+pub struct Audit {
+    pub create_date: SystemTime,
+    pub created_by: String,
+    pub last_modified_date: Option<SystemTime>,
+    pub last_modified_by: Option<String>,
+}
+
+impl Audit {
+    /// The audit of a resource `principal` created at `at`: created, never modified.
+    pub fn created(at: SystemTime, principal: String) -> Self {
+        Self {
+            create_date: at,
+            created_by: principal,
+            last_modified_date: None,
+            last_modified_by: None,
+        }
+    }
+
+    /// Record that `principal` modified the resource at `at`. Called ONLY from an
+    /// operation the spec says mutates the resource — never from a read.
+    pub fn modified(&mut self, at: SystemTime, principal: String) {
+        self.last_modified_date = Some(at);
+        self.last_modified_by = Some(principal);
+    }
+
+    /// `LastModifiedDate` as the wire member: absent while the resource is unmodified.
+    pub fn wire_last_modified_date(&self) -> Option<::aws_smithy_types::DateTime> {
+        self.last_modified_date.map(wire_date)
+    }
+
+    /// `LastModifiedBy` as the wire member: absent while the resource is unmodified.
+    pub fn wire_last_modified_by(&self) -> Option<String> {
+        self.last_modified_by.clone()
+    }
+}
+
+/// A stored DataBrew dataset. `Source`, the ARN and the [`Audit`] are server-derived,
+/// never client-supplied.
 #[derive(Debug, Clone)]
 pub struct DatasetRecord {
     pub name: String,
@@ -73,10 +135,7 @@ pub struct DatasetRecord {
     pub source: Option<String>,
     pub tags: BTreeMap<String, String>,
     pub resource_arn: String,
-    pub create_date: SystemTime,
-    pub created_by: String,
-    pub last_modified_date: SystemTime,
-    pub last_modified_by: String,
+    pub audit: Audit,
 }
 
 /// A stored DataBrew job. `job_type` is the modelled `JobType` (`RECIPE` for a job
@@ -98,10 +157,7 @@ pub struct JobRecord {
     pub log_subscription: Option<String>,
     pub tags: BTreeMap<String, String>,
     pub resource_arn: String,
-    pub create_date: SystemTime,
-    pub created_by: String,
-    pub last_modified_date: SystemTime,
-    pub last_modified_by: String,
+    pub audit: Audit,
 }
 
 /// A stored run of a job: what `StartJobRun` minted plus the job's shape copied at
@@ -237,18 +293,44 @@ impl ComAmazonawsDatabrewAwsgluedatabrewState {
 }
 
 impl DatasetRecord {
+    /// Apply an `UpdateDataset` request's definition onto this record and stamp the
+    /// audit's last-modified pair, so a later read serves what the update wrote.
+    ///
+    /// `UpdateDataset` is a PUT that carries the dataset's whole definition (model:
+    /// `UpdateDataset` `PUT /datasets/{Name}` with `Input` required), so each
+    /// definition member is REPLACED by what the request carries: an optional member
+    /// the request omits is cleared, not kept. `Source` is re-derived from the new
+    /// `Input`, and `Name`, the ARN, the tags and the create pair are not the
+    /// operation's to change.
+    pub fn apply_update(
+        &mut self,
+        format: Option<String>,
+        format_options: Option<FormatOptions>,
+        input: Input,
+        path_options: Option<PathOptions>,
+        at: SystemTime,
+        principal: String,
+    ) {
+        self.source = source_of(&input).map(str::to_string);
+        self.format = format;
+        self.format_options = format_options;
+        self.input = input;
+        self.path_options = path_options;
+        self.audit.modified(at, principal);
+    }
+
     /// This record as the modelled `Dataset` that `ListDatasets` returns.
     pub fn to_wire(&self) -> Dataset {
         Dataset {
             account_id: Some(::engine::emulator_account_id().to_string()),
-            created_by: Some(self.created_by.clone()),
-            create_date: Some(wire_date(self.create_date)),
+            created_by: Some(self.audit.created_by.clone()),
+            create_date: Some(wire_date(self.audit.create_date)),
             name: self.name.clone(),
             format: self.format.clone(),
             format_options: self.format_options.clone(),
             input: self.input.clone(),
-            last_modified_date: Some(wire_date(self.last_modified_date)),
-            last_modified_by: Some(self.last_modified_by.clone()),
+            last_modified_date: self.audit.wire_last_modified_date(),
+            last_modified_by: self.audit.wire_last_modified_by(),
             source: self.source.clone(),
             path_options: self.path_options.clone(),
             tags: wire_tags(&self.tags),
@@ -346,12 +428,26 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// The IAM user name of the identity this emulator's long-term credentials speak for.
+///
+/// The emulator publishes exactly ONE long-term identity, and STS is what defines it:
+/// `GetCallerIdentity` answers `arn:aws:iam::<account>:user/emulator` for every request
+/// whose access key id names no session (`AMBIENT_USER_NAME` in
+/// `services/service-com-amazonaws-sts-awssecuritytokenservicev20110615/src/state.rs`).
+const AMBIENT_USER_NAME: &str = "emulator";
+
 /// The principal that made this request, as the ARN DataBrew reports in
-/// `CreatedBy`/`LastModifiedBy`/`StartedBy`. Server-derived from the caller's
-/// credentials — never read from the request body.
-pub fn request_principal(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
-    let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
-    ::engine::emulator_arn("iam", "", &format!("user/{akid}"))
+/// `CreatedBy`/`LastModifiedBy`/`StartedBy` (model: `DescribeRulesetResponse$CreatedBy`
+/// — "The Amazon Resource Name (ARN) of the user who created the ...").
+///
+/// Server-derived from the emulator's own identity contract, never from the request:
+/// it is the ARN of the identity a request signed with this emulator's credentials
+/// speaks for, which is the one [`AMBIENT_USER_NAME`] names. An access key id is a
+/// credential id, not a user name, so it is never rendered into an IAM ARN — a thing
+/// no AWS rule produces. The value is therefore the same on every call and across
+/// restarts, exactly as the IAM identity behind one set of credentials is.
+pub fn request_principal() -> String {
+    ::engine::emulator_arn("iam", "", &format!("user/{AMBIENT_USER_NAME}"))
 }
 
 /// The ARN of a DataBrew resource of `kind` (`dataset`, `job`, `recipe`, ...).
