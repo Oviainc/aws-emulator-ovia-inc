@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAttendees
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAttendees`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAttendees::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the attendees PERSISTED under one meeting, in the stable `AttendeeId`
+//! order the store keeps them in, honouring `max-results` and round-tripping
+//! `next-token` so a paging client sees each attendee exactly once.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +153,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAttendees` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAttendeesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAttendees"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAttendeesErrorModeled::ServiceFailureException(crate::state::store_unavailable())
+        })?;
+
+        // `NextToken` is modelled `length 0..4096`, so the empty string is a legal value
+        // and means the same as an absent one: start at the beginning.
+        let requested_token = input
+            .next_token
+            .as_deref()
+            .filter(|token| !token.is_empty());
+        let resume_at = match requested_token {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(attendee_id) => Some(attendee_id),
+                // A token this service did not issue carries no page boundary, so the
+                // request cannot be served: refuse it rather than silently restarting.
+                None => {
+                    return Err(ListAttendeesErrorModeled::BadRequestException(
+                        crate::state::bad_request(
+                            "NextToken is not a token this service issued",
+                        ),
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // A pure read: it returns stored records and changes nothing.
+        let store = state.lock();
+        let Some(meeting) = store.meetings.get(&input.meeting_id) else {
+            return Err(ListAttendeesErrorModeled::NotFoundException(
+                crate::state::meeting_not_found(&input.meeting_id),
+            )
+            .into());
+        };
+        let (attendees, next_token) = crate::state::page(
+            meeting.attendees.iter(),
+            resume_at.as_deref(),
+            crate::state::page_size(input.max_results),
+        );
+        Ok(ListAttendeesOutput {
+            attendees: Some(attendees),
+            next_token,
+        })
     }
 }
