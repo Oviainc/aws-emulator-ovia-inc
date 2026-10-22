@@ -168,6 +168,29 @@ impl Outposts {
     pub(crate) async fn list_sites(&self, query: &str) -> Value {
         self.ok("GET", &format!("/sites{query}"), None).await
     }
+
+    /// Dispatch every [`Refusal`] in a table and require the status and wire error
+    /// code each one names.
+    pub(crate) async fn expect_refusals(&self, cases: &[Refusal]) {
+        for expected in cases {
+            let reply = self
+                .call(expected.method, &expected.path, expected.body.as_ref())
+                .await;
+            assert_eq!(
+                (reply.status, reply.error_code.as_str()),
+                (expected.status, expected.code),
+                "case {:?} ({} {}): expected {} {}, got {} {} {:?}",
+                expected.case,
+                expected.method,
+                expected.path,
+                expected.status,
+                expected.code,
+                reply.status,
+                reply.error_code,
+                reply.body
+            );
+        }
+    }
 }
 
 /// Percent-encode a value for use as ONE `@httpLabel` path segment.
@@ -843,25 +866,25 @@ async fn delete_removes_the_record_and_is_refused_while_referenced() {
 
 /// One request the emulator must refuse, and the status and wire error code it must
 /// refuse it with.
-struct Refusal {
-    case: &'static str,
-    method: &'static str,
-    path: String,
-    body: Option<Value>,
-    status: u16,
-    code: &'static str,
+pub(crate) struct Refusal {
+    pub(crate) case: &'static str,
+    pub(crate) method: &'static str,
+    pub(crate) path: String,
+    pub(crate) body: Option<Value>,
+    pub(crate) status: u16,
+    pub(crate) code: &'static str,
 }
 
 impl Refusal {
     /// The same case, with a JSON request payload.
-    fn with_body(mut self, body: Value) -> Self {
+    pub(crate) fn with_body(mut self, body: Value) -> Self {
         self.body = Some(body);
         self
     }
 }
 
 /// A [`Refusal`] on a route that binds every member to the URI, so it carries no body.
-fn refusal(
+pub(crate) fn refusal(
     case: &'static str,
     method: &'static str,
     path: String,
@@ -989,24 +1012,7 @@ async fn absent_identifiers_are_not_found_and_malformed_ones_are_refused() {
         ),
     ];
 
-    for expected in &cases {
-        let reply = outposts
-            .call(expected.method, &expected.path, expected.body.as_ref())
-            .await;
-        assert_eq!(
-            (reply.status, reply.error_code.as_str()),
-            (expected.status, expected.code),
-            "case {:?} ({} {}): expected {} {}, got {} {} {:?}",
-            expected.case,
-            expected.method,
-            expected.path,
-            expected.status,
-            expected.code,
-            reply.status,
-            reply.error_code,
-            reply.body
-        );
-    }
+    outposts.expect_refusals(&cases).await;
 }
 
 /// The identifiers a list page reports, in the order it reported them.

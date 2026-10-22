@@ -99,14 +99,6 @@ pub struct ComAmazonawsOutpostsOutpostsolafserviceState {
 }
 
 impl ComAmazonawsOutpostsOutpostsolafserviceState {
-    /// Mint a fresh resource id of the form `<prefix>-<17 lowercase hex chars>`,
-    /// and return it with the creation sequence to record on the new resource.
-    ///
-    /// Both `OutpostId` (`^op-[a-f0-9]{17}$`) and `SiteId` (`^os-[a-f0-9]{17}$`)
-    /// are a two-letter prefix and exactly 17 lowercase hex characters, so one
-    /// helper serves both. `created` advances on every call and is hashed into the
-    /// seed with the wall clock and the process id, so repeated calls never return
-    /// the same id.
     /// Materialise every Outpost lifecycle transition the clock has already made
     /// due.
     ///
@@ -125,6 +117,14 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         }
     }
 
+    /// Mint a fresh resource id of the form `<prefix>-<17 lowercase hex chars>`,
+    /// and return it with the creation sequence to record on the new resource.
+    ///
+    /// Both `OutpostId` (`^op-[a-f0-9]{17}$`) and `SiteId` (`^os-[a-f0-9]{17}$`)
+    /// are a two-letter prefix and exactly 17 lowercase hex characters, so one
+    /// helper serves both. `created` advances on every call and is hashed into the
+    /// seed with the wall clock and the process id, so repeated calls never return
+    /// the same id.
     pub fn mint_id(&mut self, prefix: &str) -> (String, u64) {
         self.created = self.created.wrapping_add(1);
         let nanos = std::time::SystemTime::now()
@@ -380,6 +380,18 @@ pub fn availability_zone(zone_id: &str) -> Option<String> {
 /// `OutpostDescription`, so an empty one is omitted rather than stored.
 pub fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
+}
+
+/// Apply one member of a partial (PATCH) update to the stored resource.
+///
+/// Every update in this API is modelled `@http(method: "PATCH")` with optional
+/// members, so a member the request carries replaces the stored one and a member
+/// it omits leaves the stored one exactly as it was. Shared by the three update
+/// operations so they cannot drift apart on that rule.
+pub fn apply<T>(stored: &mut Option<T>, update: Option<T>) {
+    if let Some(value) = update {
+        *stored = Some(value);
+    }
 }
 
 // ---------------------------------------------------------------------------

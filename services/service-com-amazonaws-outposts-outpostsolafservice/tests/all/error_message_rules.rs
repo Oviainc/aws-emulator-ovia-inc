@@ -196,6 +196,76 @@ async fn not_found_bodies_echo_the_identifier_the_request_supplied() {
             member: SITE_ID_MEMBER,
             supplied: absent_site_arn.clone(),
         },
+        // The three PATCH updates state rule A on the same identifier members, and
+        // a PATCH carries a body, so these rows also show the echo is of the LABEL
+        // and never of anything the payload held.
+        NotFound {
+            case: "UpdateSite on a site nothing holds, by bare id",
+            method: "PATCH",
+            path: format!("/sites/{ABSENT_SITE_ID}"),
+            body: Some(json!({ "Name": "renamed" })),
+            member: SITE_ID_MEMBER,
+            supplied: ABSENT_SITE_ID.to_string(),
+        },
+        NotFound {
+            case: "UpdateSite on a site nothing holds, by site ARN",
+            method: "PATCH",
+            path: format!("/sites/{}", segment(&absent_site_arn)),
+            body: Some(json!({ "Description": "re-described" })),
+            member: SITE_ID_MEMBER,
+            supplied: absent_site_arn.clone(),
+        },
+        NotFound {
+            case: "UpdateSite by a site ARN from another partition",
+            method: "PATCH",
+            path: format!("/sites/{}", segment(FOREIGN_SITE_ARN)),
+            body: Some(json!({ "Notes": "noted" })),
+            member: SITE_ID_MEMBER,
+            supplied: FOREIGN_SITE_ARN.to_string(),
+        },
+        NotFound {
+            case: "UpdateSiteRackPhysicalProperties on a site nothing holds, by bare id",
+            method: "PATCH",
+            path: format!("/sites/{ABSENT_SITE_ID}/rackPhysicalProperties"),
+            body: Some(json!({ "PowerPhase": "THREE_PHASE" })),
+            member: SITE_ID_MEMBER,
+            supplied: ABSENT_SITE_ID.to_string(),
+        },
+        NotFound {
+            case: "UpdateSiteRackPhysicalProperties on a site nothing holds, by site ARN",
+            method: "PATCH",
+            path: format!(
+                "/sites/{}/rackPhysicalProperties",
+                segment(&absent_site_arn)
+            ),
+            body: Some(json!({ "UplinkGbps": "UPLINK_10G" })),
+            member: SITE_ID_MEMBER,
+            supplied: absent_site_arn.clone(),
+        },
+        NotFound {
+            case: "UpdateOutpost on an Outpost nothing holds, by bare id",
+            method: "PATCH",
+            path: format!("/outposts/{ABSENT_OUTPOST_ID}"),
+            body: Some(json!({ "Description": "re-described" })),
+            member: OUTPOST_ID_MEMBER,
+            supplied: ABSENT_OUTPOST_ID.to_string(),
+        },
+        NotFound {
+            case: "UpdateOutpost on an Outpost nothing holds, by Outpost ARN",
+            method: "PATCH",
+            path: format!("/outposts/{}", segment(&absent_outpost_arn)),
+            body: Some(json!({ "Name": "renamed" })),
+            member: OUTPOST_ID_MEMBER,
+            supplied: absent_outpost_arn.clone(),
+        },
+        NotFound {
+            case: "UpdateOutpost by an Outpost ARN from another partition",
+            method: "PATCH",
+            path: format!("/outposts/{}", segment(FOREIGN_OUTPOST_ARN)),
+            body: Some(json!({ "SupportedHardwareType": "SERVER" })),
+            member: OUTPOST_ID_MEMBER,
+            supplied: FOREIGN_OUTPOST_ARN.to_string(),
+        },
     ];
 
     for expected in &cases {
@@ -382,6 +452,27 @@ async fn validation_reports_name_the_member_and_constraint_and_omit_the_value() 
             format!("/sites/{ABSENT_OUTPOST_ID}"),
             None,
             &clause(SITE_ID_MEMBER, &pattern(SITE_ID_PATTERN)),
+        ),
+        one(
+            "UpdateSite with a label that is no site identifier",
+            "PATCH",
+            "/sites/not-a-site-id".to_string(),
+            Some(json!({ "Name": "renamed" })),
+            &clause(SITE_ID_MEMBER, &pattern(SITE_ID_PATTERN)),
+        ),
+        one(
+            "UpdateSiteRackPhysicalProperties with a label whose hex is too short",
+            "PATCH",
+            "/sites/os-0000000000000000/rackPhysicalProperties".to_string(),
+            Some(json!({ "PowerPhase": "THREE_PHASE" })),
+            &clause(SITE_ID_MEMBER, &pattern(SITE_ID_PATTERN)),
+        ),
+        one(
+            "UpdateOutpost with a label that is a site id",
+            "PATCH",
+            format!("/outposts/{ABSENT_SITE_ID}"),
+            Some(json!({ "Name": "renamed" })),
+            &clause(OUTPOST_ID_MEMBER, &pattern(OUTPOST_ID_PATTERN)),
         ),
         one(
             "GetConnection with a connection id outside its pattern",
