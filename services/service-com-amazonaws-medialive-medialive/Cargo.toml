@@ -28,6 +28,11 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Percent-encodes the URI path labels the group suite's reads carry, rather than
+# carrying a second hand-written encoder. Pinned here rather than through
+# `[workspace.dependencies]` because the root manifest is not editable from a
+# service crate.
+percent-encoding = "2"
 
 [lints]
 workspace = true

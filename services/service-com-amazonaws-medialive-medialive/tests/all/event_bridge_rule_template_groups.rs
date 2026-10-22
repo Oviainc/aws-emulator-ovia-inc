@@ -11,11 +11,13 @@
 //! The region is a COLUMN here, because a group's name is unique per region, so
 //! these tests sign through the harness's `call_in_region`.
 
-use aws_smithy_types::date_time::Format;
-use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+// `timestamp` reads a wire timestamp in either rendering the restJson1 codec
+// may emit, so every group suite asserts the INSTANT the service reports rather
+// than the serializer's choice of form. One copy, in `support`.
+use crate::support::timestamp;
 use crate::wire::{call_in_region, error_code, medialive, ACCOUNT, DEFAULT_REGION};
 
 /// `CreateEventBridgeRuleTemplateGroup` / `ListEventBridgeRuleTemplateGroups`
@@ -45,22 +47,6 @@ async fn get(router: &MultiServiceRouter, region: &str, identifier: &str) -> (u1
         None,
     )
     .await
-}
-
-/// One timestamp member of a group response, parsed. The wire carries a
-/// restJson1 timestamp either as epoch seconds or as an ISO-8601 string, so both
-/// forms are read here: this suite asserts the VALUE the service reports, not
-/// the serializer's choice of form.
-fn timestamp(case: &str, member: &str, group: &Value) -> DateTime {
-    match &group[member] {
-        Value::String(text) => DateTime::from_str(text, Format::DateTime).unwrap_or_else(|error| {
-            panic!("case {case:?}: expected {member} to parse as a date-time, got {text:?}: {error}")
-        }),
-        Value::Number(seconds) => DateTime::from_secs_f64(seconds.as_f64().unwrap_or_else(|| {
-            panic!("case {case:?}: expected {member} to be a finite epoch time, got {seconds}")
-        })),
-        other => panic!("case {case:?}: expected {member} to be a timestamp, got {other:?}"),
-    }
 }
 
 /// Rule: a create mints the resource's id, builds its ARN from the request's
@@ -311,6 +297,58 @@ async fn a_retried_create_returns_the_group_its_request_id_already_created() {
         assert_eq!(
             status, 409,
             "case {case:?}: expected a fresh token reusing the name to conflict, got {status}: {conflict}"
+        );
+    }
+}
+
+/// Rule: an `@idempotencyToken` is idempotent for the regional endpoint it was
+/// presented to, so one token presented in several regions creates one resource
+/// in each and every retry resolves the resource its own region's call created.
+///
+/// The rows are the regions the one token is presented in; nothing about them
+/// matters except that they differ.
+#[tokio::test]
+async fn one_request_id_is_idempotent_within_each_region() {
+    let regions = ["us-west-2", "eu-central-1", "ap-south-1"];
+    let token = "token-shared-across-regions";
+    let name = "same-name-in-every-region";
+
+    let router = medialive();
+    let mut created: Vec<Value> = Vec::new();
+
+    for region in regions {
+        let (status, group) = create(
+            &router,
+            region,
+            json!({ "name": name, "requestId": token }),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {region}: expected the create to succeed, got {status}: {group}"
+        );
+        assert!(
+            !created.iter().any(|earlier| earlier["id"] == group["id"]),
+            "case {region}: expected a group of its own, got {:?} which another region already has",
+            group["id"]
+        );
+        created.push(group);
+    }
+
+    for (region, expected) in regions.iter().zip(&created) {
+        let (status, retried) = create(
+            &router,
+            region,
+            json!({ "name": name, "requestId": token }),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {region} retry: expected 201, got {status}: {retried}"
+        );
+        assert_eq!(
+            &retried, expected,
+            "case {region} retry: expected the group this region's token created, got {retried}"
         );
     }
 }

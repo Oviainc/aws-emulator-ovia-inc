@@ -17,20 +17,21 @@
 //! `Id`. A group's `State`, `Inputs` and `Channels` are derived from the rest of
 //! the state on every read, never recorded at create time.
 //!
-//! The eventbridge rule template GROUP slice lives here as well: one
-//! [`EventBridgeRuleTemplateGroupRecord`] per created group, keyed by its minted
-//! `Id`, with the region it was created in so a group's name is unique "within
-//! the scope of a resource type in a specific region" (the `Name` member's own
-//! documentation).
+//! The monitor side of the service lives here as well: one
+//! [`CloudWatchAlarmTemplateGroupRecord`] per created cloudwatch alarm template
+//! group and one [`EventBridgeRuleTemplateGroupRecord`] per created eventbridge
+//! rule template group, each keyed by its minted `Id` and carrying the region it
+//! was created in, so a group's name is unique "within the scope of a resource
+//! type in a specific region" (the `Name` member's own documentation).
 //!
 //! Every value a channel-, input-, input-security-group-, SdiSource-,
-//! eventbridge-rule-template-group- or signal-map-shaped response carries is
-//! either stored verbatim from the request that created the resource or derived
-//! from the stored state
-//! ([`ComAmazonawsMedialiveMedialiveState::channel_description`],
+//! signal-map- or template-group-shaped response carries is either stored
+//! verbatim from the request that created the resource or derived from the stored
+//! state ([`ComAmazonawsMedialiveMedialiveState::channel_description`],
 //! [`ComAmazonawsMedialiveMedialiveState::input_description`],
 //! [`ComAmazonawsMedialiveMedialiveState::sdi_source_description`],
 //! [`ComAmazonawsMedialiveMedialiveState::signal_map_description`],
+//! [`alarm_template_group_output`],
 //! [`event_bridge_rule_template_group_output`]) - no operation builds a response
 //! out of its own request.
 
@@ -53,6 +54,21 @@ use crate::ops::types::{
     SuccessfulMonitorDeployment,
     VpcOutputSettings, VpcOutputSettingsDescription,
 };
+
+/// The cloudwatch alarm template group slice: its record, its bounds, its
+/// refusal, the store's methods and its output projection, in one module of its
+/// own so the slice can be read (and merged) on its own. What stays in this file
+/// is the part the rest of the state needs: the store members on
+/// [`ComAmazonawsMedialiveMedialiveState`] and the token key both group
+/// resources share.
+pub mod alarm_template_groups;
+
+pub use alarm_template_groups::{
+    AlarmTemplateGroupRefusal, CloudWatchAlarmTemplateGroupRecord,
+    MAX_ALARM_TEMPLATE_GROUPS, MAX_ALARM_TEMPLATE_GROUP_TOKENS,
+};
+
+pub(crate) use alarm_template_groups::alarm_template_group_output;
 
 /// The `ChannelState` enum values this slice uses, spelled exactly as the model
 /// declares them (`smithy_query(query="shape", shape="ChannelState")`:
@@ -479,11 +495,11 @@ pub fn is_ipv4_cidr(cidr: &str) -> bool {
 /// first attempt made instead of a second one.
 ///
 /// One implementation for every resource kind that models an idempotency token
-/// (channels, inputs, SDI sources, signal maps), so the cap and the eviction
-/// order cannot drift between them, and a token used on two different creates
-/// cannot make one of them answer with the other's resource. The fields are
-/// PRIVATE: the only way in is [`Self::record`], which enforces the cap by
-/// evicting the oldest token.
+/// (channels, inputs, SDI sources, signal maps, template groups), so the cap and
+/// the eviction order cannot drift between them, and a token used on two
+/// different creates cannot make one of them answer with the other's resource.
+/// The fields are PRIVATE: the only way in is [`Self::record`], which enforces
+/// the cap by evicting the oldest token.
 #[derive(Debug, Default)]
 pub struct IdempotencyTokens {
     /// token -> the id of the resource it created.
@@ -603,6 +619,19 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     pub next_input_id: u64,
     /// `CreateInput`'s `RequestId` (`@idempotencyToken`) -> the input it created.
     input_tokens: IdempotencyTokens,
+    /// Every cloudwatch alarm template group that exists, keyed by its minted
+    /// `Id`. A `BTreeMap` so a later `ListCloudWatchAlarmTemplateGroups` walks it
+    /// in id order on every call.
+    ///
+    /// PRIVATE, so the name-uniqueness rule, the cap and the mint stay invariants
+    /// of [`Self::insert_alarm_template_group`] rather than of each handler.
+    alarm_template_groups: BTreeMap<String, CloudWatchAlarmTemplateGroupRecord>,
+    /// Mint counter behind [`Self::mint_alarm_template_group_id`].
+    next_alarm_template_group_id: u64,
+    /// `CreateCloudWatchAlarmTemplateGroup`'s `RequestId` (`@idempotencyToken`),
+    /// keyed per region by [`template_group_token_key`] -> the group it
+    /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
+    alarm_template_group_tokens: IdempotencyTokens,
     /// Every SdiSource that exists, keyed by its minted `Id`, in a `BTreeMap`
     /// for the same reason as [`Self::channels`].
     pub sdi_sources: BTreeMap<String, SdiSourceRecord>,
@@ -871,23 +900,39 @@ impl ComAmazonawsMedialiveMedialiveState {
         id.to_string()
     }
 
-    /// Record `token` as having created the group `group_id`.
-    pub fn record_event_bridge_rule_template_group_token(&mut self, token: String, group_id: &str) {
+    /// Record `token`, as presented in `region`, as having created the group
+    /// `group_id`.
+    pub fn record_event_bridge_rule_template_group_token(
+        &mut self,
+        region: &str,
+        token: &str,
+        group_id: &str,
+    ) {
         self.event_bridge_rule_template_group_tokens.record(
-            token,
+            template_group_token_key(region, token),
             group_id,
             MAX_EVENT_BRIDGE_RULE_TEMPLATE_GROUPS,
         );
     }
 
-    /// The eventbridge rule template group a stored `RequestId` created, if that
-    /// group still exists.
-    pub fn event_bridge_rule_template_group_for_token(&self, request_id: &str) -> Option<&str> {
+    /// The eventbridge rule template group a `RequestId` presented in `region`
+    /// created, if that group still exists and belongs to that region.
+    ///
+    /// An `@idempotencyToken` is idempotent for the regional endpoint it was
+    /// presented to, so the region is part of the key AND re-checked on the
+    /// record: one token used in two regions creates (and resolves) a group of
+    /// its own in each.
+    pub fn event_bridge_rule_template_group_for_token(
+        &self,
+        region: &str,
+        request_id: &str,
+    ) -> Option<&str> {
         let id = self
             .event_bridge_rule_template_group_tokens
-            .created(request_id)?;
+            .created(&template_group_token_key(region, request_id))?;
         self.event_bridge_rule_template_groups
             .get(id)
+            .filter(|group| group.region == region)
             .map(|group| group.id.as_str())
     }
 
@@ -2017,8 +2062,28 @@ pub(crate) use input_description_output;
 /// when the group carries tags: an empty map would claim a tag set the caller
 /// never supplied.
 macro_rules! event_bridge_rule_template_group_output {
-    ($out:ident, $group:expr) => {{
-        let group: &$crate::state::EventBridgeRuleTemplateGroupRecord = $group;
+    ($out:ident, $group:expr) => {
+        $crate::state::template_group_output!(
+            $out,
+            $crate::state::EventBridgeRuleTemplateGroupRecord,
+            $group
+        )
+    };
+}
+
+pub(crate) use event_bridge_rule_template_group_output;
+
+/// The ONE projection of a stored template-group record onto a group output
+/// shape, parameterised by the record type.
+///
+/// Every monitor template group the service models carries the same members, so
+/// the per-resource macros above and below delegate here rather than each
+/// carrying its own copy of the projection, which could then drift. `Tags` is
+/// reported only when the group carries tags: an empty map would claim a tag set
+/// the caller never supplied.
+macro_rules! template_group_output {
+    ($out:ident, $record:ty, $group:expr) => {{
+        let group: &$record = $group;
         $out {
             arn: Some(group.arn.clone()),
             created_at: Some(::aws_smithy_types::DateTime::from(group.created_at)),
@@ -2035,7 +2100,7 @@ macro_rules! event_bridge_rule_template_group_output {
     }};
 }
 
-pub(crate) use event_bridge_rule_template_group_output;
+pub(crate) use template_group_output;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
@@ -2046,4 +2111,23 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsMedialiveMedialiveState>)
+}
+
+// ---------------------------------------------------------------------------
+// What the cloudwatch alarm template group slice leaves in this file: the token
+// key below, which both group resources share. The slice itself is the
+// `alarm_template_groups` module declared at the top of this file, and its store
+// is the `alarm_template_groups` member of
+// `ComAmazonawsMedialiveMedialiveState` above.
+// ---------------------------------------------------------------------------
+
+/// The key a template-group token map uses, for both group resources.
+///
+/// A `RequestId` is idempotent for the regional endpoint it was presented to, so
+/// the region is part of the key: two regions using the same token each keep
+/// their own entry instead of overwriting one another's. The region is re-checked
+/// on the record the token resolves to, so the key's shape carries no invariant
+/// of its own.
+fn template_group_token_key(region: &str, token: &str) -> String {
+    format!("{region}/{token}")
 }
