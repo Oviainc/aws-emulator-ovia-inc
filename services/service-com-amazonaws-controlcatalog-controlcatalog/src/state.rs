@@ -475,7 +475,26 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
     let mut control_mappings = BTreeMap::new();
 
     // --- domains -----------------------------------------------------------
-    let domain_seed: [(&str, &str, &str); 3] = [
+    // The top of the published Control Catalog ontology. The NAMES are the ones
+    // Amazon Web Services publishes for its control domains — "Asset management",
+    // "Business continuity and recovery", "Data protection", "Identity and access
+    // management", "Logging and monitoring", "Secure development lifecycle and change
+    // management" — so a client browsing this emulator walks the same domain names it
+    // walks against the service. The 25-character opaque identifier AWS assigned to
+    // each published record is registry data that no rule derives, so the ARN of each
+    // entry here is derived deterministically from its slug (see [`catalog_id`])
+    // rather than copied from any one recorded response.
+    let domain_seed: [(&str, &str, &str); 6] = [
+        (
+            "asset-management",
+            "Asset management",
+            "Controls that inventory Amazon Web Services resources and keep that inventory current.",
+        ),
+        (
+            "business-continuity-and-recovery",
+            "Business continuity and recovery",
+            "Controls that keep workloads available, and restore them after a disruption.",
+        ),
         (
             "data-protection",
             "Data protection",
@@ -491,6 +510,11 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
             "Logging and monitoring",
             "Controls that record and observe activity across Amazon Web Services accounts.",
         ),
+        (
+            "secure-development-lifecycle-and-change-management",
+            "Secure development lifecycle and change management",
+            "Controls that govern how changes to workloads are proposed, reviewed and released.",
+        ),
     ];
     for (index, (slug, name, description)) in domain_seed.iter().enumerate() {
         let arn = catalog_arn("domain", &catalog_id(slug));
@@ -502,14 +526,43 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
                 name: (*name).to_string(),
                 description: (*description).to_string(),
                 create_time,
-                last_update_time: create_time + DAY,
+                // `LastUpdateTime` is documented as "the time when the domain was most
+                // recently updated": a published catalog record that has not been
+                // revised since it was created was most recently updated when it was
+                // created, so the two timestamps are equal. Nothing in this service
+                // revises a record — there is no create, update or delete API — so only
+                // a future revision of the seeded catalog moves this later.
+                last_update_time: create_time,
             },
         );
     }
     let domain_arn = |slug: &str| catalog_arn("domain", &catalog_id(slug));
 
     // --- objectives --------------------------------------------------------
-    let objective_seed: [(&str, &str, &str, &str); 5] = [
+    // The second level of the published ontology: every objective belongs to exactly
+    // one domain above. As with the domains, the names are the published ones (AWS
+    // publishes "Asset inventory management" under "Asset management" and "Change
+    // management" under "Secure development lifecycle and change management") and the
+    // identifiers are derived, not recorded.
+    let objective_seed: [(&str, &str, &str, &str); 8] = [
+        (
+            "asset-inventory-management",
+            "Asset inventory management",
+            "Discover and record the resources an account holds.",
+            "asset-management",
+        ),
+        (
+            "backup-and-recovery",
+            "Backup and recovery",
+            "Copy data so that a workload can be restored after a disruption.",
+            "business-continuity-and-recovery",
+        ),
+        (
+            "change-management",
+            "Change management",
+            "Review and approve changes before they reach a workload.",
+            "secure-development-lifecycle-and-change-management",
+        ),
         (
             "encryption-of-data-at-rest",
             "Encryption of data at rest",
@@ -552,14 +605,36 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
                 description: (*description).to_string(),
                 domain_arn: domain_arn(domain_slug),
                 create_time,
-                last_update_time: create_time + DAY,
+                // Equal to `CreateTime` until a revision moves it; see the domain seed.
+                last_update_time: create_time,
             },
         );
     }
     let objective_arn = |slug: &str| catalog_arn("objective", &catalog_id(slug));
 
     // --- common controls ---------------------------------------------------
-    let common_control_seed: [(&str, &str, &str, &str, &str); 6] = [
+    let common_control_seed: [(&str, &str, &str, &str, &str); 9] = [
+        (
+            "maintain-an-asset-inventory",
+            "Maintain an asset inventory",
+            "Keep a current record of the resources an account holds.",
+            "asset-inventory-management",
+            "asset-management",
+        ),
+        (
+            "back-up-data-on-a-defined-schedule",
+            "Back up data on a defined schedule",
+            "Copy data to a separate, restorable location on a schedule.",
+            "backup-and-recovery",
+            "business-continuity-and-recovery",
+        ),
+        (
+            "change-request-and-approval",
+            "Change request and approval",
+            "Require a reviewed and approved request before a change is released.",
+            "change-management",
+            "secure-development-lifecycle-and-change-management",
+        ),
         (
             "encrypt-data-at-rest-in-storage-services",
             "Encrypt data at rest in storage services",
@@ -617,7 +692,8 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
                 objective_arn: objective_arn(objective_slug),
                 domain_arn: domain_arn(domain_slug),
                 create_time,
-                last_update_time: create_time + DAY,
+                // Equal to `CreateTime` until a revision moves it; see the domain seed.
+                last_update_time: create_time,
             },
         );
     }

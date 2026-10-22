@@ -36,15 +36,16 @@ const LIST_OPERATIONS: [(&str, &str, u32); 5] = [
 
 /// A router with only this service mounted — one emulator "session".
 ///
-/// `pub(crate)` so the sibling suites in this test target drive the emulator through
-/// the same front door rather than standing up a second harness of their own.
+/// `pub(crate)` so the sibling suites in this test target (see `tests/all.rs`) drive
+/// the emulator through the same front door rather than standing up a second harness
+/// of their own.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
     /// A session over an existing engine, so two sessions can share one catalog.
-    fn with_engine(engine: &Arc<engine::InMemoryEngine>) -> Self {
+    pub(crate) fn with_engine(engine: &Arc<engine::InMemoryEngine>) -> Self {
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(engine)));
@@ -179,7 +180,7 @@ pub(crate) async fn drain(
 }
 
 /// Sort items by their `Arn`, so two differently ordered sets compare equal.
-fn by_arn(mut items: Vec<Value>) -> Vec<Value> {
+pub(crate) fn by_arn(mut items: Vec<Value>) -> Vec<Value> {
     items.sort_by_key(|item| {
         item.get("Arn")
             .and_then(Value::as_str)
