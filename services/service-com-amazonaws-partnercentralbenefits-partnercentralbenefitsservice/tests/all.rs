@@ -15,6 +15,8 @@
 mod benefit_application_lifecycle;
 #[path = "all/recall_benefit_application.rs"]
 mod recall_benefit_application;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/service_error_rules.rs"]
 mod service_error_rules;
 #[path = "all/state_roundtrip.rs"]
