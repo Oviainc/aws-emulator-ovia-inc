@@ -33,9 +33,9 @@
 //!
 //! An asynchronous cluster update lives ON the cluster it updates
 //! ([`ClusterRecord::updates`]), so `AssociateEncryptionConfig` and
-//! `AssociateIdentityProviderConfig` write one there and `DescribeUpdate` reads
-//! it back; deleting the cluster drops its updates with it rather than leaving
-//! them behind in a second map.
+//! `AssociateIdentityProviderConfig` write one there, `DescribeUpdate` reads it
+//! back and `CancelUpdate` records its cancellation on it; deleting the cluster
+//! drops its updates with it rather than leaving them behind in a second map.
 //!
 //! The identity-provider slice lives on the same record:
 //! `AssociateIdentityProviderConfig` writes an [`IdentityProviderConfigRecord`]
@@ -52,8 +52,9 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AccessConfigResponse, AccessEntry, AccessScope, AssociatedAccessPolicy, Certificate, Cluster,
-    ClusterVersionInformation, ComputeConfigResponse, ConnectorConfigResponse,
+    AccessConfigResponse, AccessEntry, AccessScope, AssociatedAccessPolicy, Cancellation,
+    Certificate, Cluster, ClusterVersionInformation, ComputeConfigResponse,
+    ConnectorConfigResponse,
     ControlPlaneScalingConfig, EncryptionConfig, Identity, KubeApiServerConfigResponse,
     KubeControllerManagerConfigResponse, KubeSchedulerConfigResponse,
     KubernetesNetworkConfigResponse, Logging, OidcIdentityProviderConfig, OutpostConfigResponse,
@@ -87,6 +88,12 @@ pub const STATUS_UPDATING: &str = "UPDATING";
 pub const UPDATE_IN_PROGRESS: &str = "InProgress";
 /// See [`UPDATE_IN_PROGRESS`].
 pub const UPDATE_SUCCESSFUL: &str = "Successful";
+/// See [`UPDATE_IN_PROGRESS`] — the status `CancelUpdate` moves an update to
+/// once it has stopped it.
+pub const UPDATE_CANCELLED: &str = "Cancelled";
+/// See [`UPDATE_IN_PROGRESS`] — the fourth member of the enum, which an update
+/// reaches when the change it carries could not be made.
+pub const UPDATE_FAILED: &str = "Failed";
 
 /// The `UpdateType` member an encryption association reports
 /// (`smithy_query query="shape" shape="UpdateType"`).
@@ -211,6 +218,36 @@ pub const MAX_STORED_CLUSTERS: usize = MAX_CLUSTERS * 10;
 /// would push a record past it is refused rather than letting repeated
 /// `TagResource` calls grow the record without limit.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The `CancellationStatus` member a cancellation this emulator performed
+/// carries. The model's enum is `InProgress | Failed | Successful`
+/// (`smithy_query query="shape" shape="CancellationStatus"`); the other two
+/// describe a cancellation still running or one that could not stop the
+/// rollback, and this emulator stops the rollback within the call, so the
+/// recorded outcome is always the terminal success.
+pub const CANCELLATION_STATUS_SUCCESSFUL: &str = "Successful";
+
+/// The one `UpdateType` whose cancellation EKS performs: "Currently, this is
+/// supported for `VersionRollback` update types on EKS Auto Mode clusters when
+/// nodes are rolling back" (`CancelUpdate`). The full type catalog is the
+/// model's `UpdateType` enum (`smithy_query query="shape" shape="UpdateType"`).
+pub const UPDATE_TYPE_VERSION_ROLLBACK: &str = "VersionRollback";
+
+/// How long a `VersionRollback` update spends rolling nodes back — the phase in
+/// which `CancelUpdate` can still stop it — before the control plane rollback
+/// begins.
+///
+/// `CancelUpdate` documents both ends of this window: cancellation "is
+/// supported for VersionRollback update types on EKS Auto Mode clusters when
+/// nodes are rolling back", and "if the control plane rollback has already
+/// begun, the cancellation request fails". AWS publishes no length for the node
+/// phase, so the span is CHOSEN rather than cited: a rollback rolls its nodes
+/// back first and its control plane after, so this is the first HALF of
+/// [`UPDATE_COMPLETION_DELAY`] — non-zero, so a caller that cancels straight
+/// after the rollback starts still lands inside the window, and closed well
+/// before the update completes. It is derived from the update's stored
+/// `createdAt`; nothing sleeps for it.
+pub const VERSION_ROLLBACK_NODE_PHASE: Duration = Duration::from_millis(250);
 
 /// The number of clusters `ListClusters` returns when the caller gives no
 /// `maxResults`. The model bounds `maxResults` at 1..100, so the full page is the
@@ -775,11 +812,12 @@ pub struct ClusterRecord {
 /// One asynchronous update of a cluster, as this service stores it.
 ///
 /// Everything the modelled `Update` reports is held here, so `DescribeUpdate`
-/// returns what the call that started the update wrote rather than recomputing
-/// it. The two extra fields are not reported: `succeeds_at` is the instant the
-/// clock owes this update its `Successful` status, and
-/// `pending_encryption_config` is the change applied to the cluster at that same
-/// instant.
+/// returns what the call that started the update wrote, and what a later
+/// `CancelUpdate` recorded on it, rather than recomputing either. Three fields
+/// are not reported: `succeeds_at` is the instant the clock owes this update its
+/// `Successful` status, `pending_encryption_config` is the change applied to the
+/// cluster at that same instant, and `cancellation_request_token` is what makes
+/// a retried cancel request idempotent.
 #[derive(Debug, Clone)]
 pub struct UpdateRecord {
     pub id: String,
@@ -794,9 +832,37 @@ pub struct UpdateRecord {
     /// The `encryptionConfig` this update puts on its cluster when it completes,
     /// for an `AssociateEncryptionConfig` update. Taken when applied.
     pub pending_encryption_config: Option<Vec<EncryptionConfig>>,
+    /// "The latest cancellation information for the update. This field is
+    /// present only if any cancellation is attempted for the update"
+    /// (`Update$cancellation`) — written by `CancelUpdate`.
+    pub cancellation: Option<Cancellation>,
+    /// The `clientRequestToken` of the cancel request that produced
+    /// [`Self::cancellation`], so a retry of THAT request — which an SDK sends
+    /// with the same idempotency token — is answered with the cancellation it
+    /// already performed instead of being refused as a second attempt. It is
+    /// separate from [`Self::client_request_token`], which belongs to the call
+    /// that STARTED the update.
+    pub cancellation_request_token: Option<String>,
 }
 
 impl UpdateRecord {
+    /// Whether this update is still in flight, i.e. in the one non-terminal
+    /// `UpdateStatus`.
+    pub fn is_in_progress(&self) -> bool {
+        self.status == UPDATE_IN_PROGRESS
+    }
+
+    /// The instant at which a `VersionRollback` update's control plane rollback
+    /// begins, after which a cancellation can no longer stop it.
+    ///
+    /// Derived from the stored `created_at`, so every caller computes the same
+    /// instant and no read has to write anything to advance the phase. `None`
+    /// only on a clock so far past the representable range that the phase can
+    /// no longer be placed, which a caller reads as "already begun".
+    pub fn control_plane_phase_at(&self) -> Option<SystemTime> {
+        self.created_at.checked_add(VERSION_ROLLBACK_NODE_PHASE)
+    }
+
     /// This record as the modelled `Update` shape.
     pub fn to_update(&self) -> Update {
         Update {
@@ -805,13 +871,13 @@ impl UpdateRecord {
             r#type: Some(self.r#type.clone()),
             params: Some(self.params.clone()),
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
-            // `errors` carries "any errors associated with a `Failed` update" and
-            // `cancellation` "is present only if any cancellation is attempted",
-            // so neither is reported for an update that is running or succeeded.
-            // The slices that can fail or cancel an update (`CancelUpdate` and
-            // friends) fill them in; each is still 501 with its own gap issue.
+            // `errors` carries "any errors associated with a `Failed` update",
+            // and no slice can fail an update yet (each operation that could is
+            // still 501 with its own gap issue). `cancellation` "is present only
+            // if any cancellation is attempted", so it is reported exactly when
+            // `CancelUpdate` has attempted one.
             errors: None,
-            cancellation: None,
+            cancellation: self.cancellation.clone(),
         }
     }
 }
@@ -884,7 +950,7 @@ impl ClusterRecord {
     pub fn in_flight_update(&self) -> Option<&UpdateRecord> {
         self.updates
             .values()
-            .find(|update| update.status == UPDATE_IN_PROGRESS)
+            .find(|update| update.is_in_progress())
     }
 
     /// The update this cluster already recorded for `client_request_token`, if
@@ -893,6 +959,18 @@ impl ClusterRecord {
         self.updates
             .values()
             .find(|update| update.client_request_token.as_deref() == Some(token))
+    }
+
+    /// Whether this is an EKS Auto Mode cluster, which is what
+    /// `computeConfig.enabled` reports: "Request to enable or disable the
+    /// compute capability on your EKS Auto Mode cluster"
+    /// (`ComputeConfigRequest$enabled`). A cluster created without a
+    /// `computeConfig`, or with one that does not enable compute, is not one.
+    pub fn is_auto_mode(&self) -> bool {
+        self.compute_config
+            .as_ref()
+            .and_then(|config| config.enabled)
+            .unwrap_or(false)
     }
 
     /// This record as the modelled `Cluster` shape.

@@ -34,11 +34,18 @@ impl Answer {
 /// The emulator under test: one shared engine, one service, authentication off so a
 /// test signs nothing (the credential scope below is still parsed for its region).
 pub fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// The same emulator, with a handle on the engine behind it — what a suite needs when
+/// it has to read or write the store directly (to stand up a precondition only an
+/// operation that is still a 501 scaffold could otherwise write).
+pub fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
 }
 
 /// Percent-encode a value that travels in ONE path segment, the way an AWS SDK

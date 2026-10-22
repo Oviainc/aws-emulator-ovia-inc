@@ -286,6 +286,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_request_token: replayed_token.map(str::to_owned),
             succeeds_at: Some(now + UPDATE_COMPLETION_DELAY),
             pending_encryption_config: Some(input.encryption_config.clone()),
+            // "This field is present only if any cancellation is attempted for the
+            // update": none has been, so `CancelUpdate` is the only writer of either.
+            cancellation: None,
+            cancellation_request_token: None,
         };
         let answer = update.to_update();
 

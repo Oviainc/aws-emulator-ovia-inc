@@ -395,6 +395,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // This update associates an identity provider, so it carries no pending
             // `encryptionConfig` for the cluster itself.
             pending_encryption_config: None,
+            // "This field is present only if any cancellation is attempted for the
+            // update": none has been, so `CancelUpdate` is the only writer of either.
+            cancellation: None,
+            cancellation_request_token: None,
         };
         let answered_update = update.to_update();
 
