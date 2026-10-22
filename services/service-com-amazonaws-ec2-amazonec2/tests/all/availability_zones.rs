@@ -29,38 +29,15 @@
 //! Zone ORDER is deliberately not asserted — "the order of the elements in the
 //! response ... might vary" — so every comparison here is over a sorted set.
 
-use std::sync::Arc;
-
-use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The emulator the tests drive: one shared engine with the EC2 service mounted on
-/// it, request authentication off (these tests sign nothing — they only carry the
-/// `Credential=` scope the service reads the Region from).
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(ec2::EmulatedService::new(engine));
-    router
-}
+use super::ec2_query::{element, filters, indexed, unescaped};
 
-/// Percent-encode the characters that are significant in an
-/// `application/x-www-form-urlencoded` body, leaving everything else as a client's
-/// own encoder would.
-fn form_value(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| match c {
-            '&' => "%26".to_string(),
-            '=' => "%3D".to_string(),
-            '+' => "%2B".to_string(),
-            '%' => "%25".to_string(),
-            ' ' => "%20".to_string(),
-            '\\' => "%5C".to_string(),
-            other => other.to_string(),
-        })
-        .collect()
+/// The emulator the tests drive, as [`super::ec2_query::emulator`] builds it. This
+/// operation reports facts of a Region and stores nothing, so the engine handle it hands
+/// back is not needed here.
+fn emulator() -> MultiServiceRouter {
+    super::ec2_query::emulator().0
 }
 
 /// One `DescribeAvailabilityZones` call signed for `region`, with `params` as extra
@@ -70,73 +47,7 @@ async fn describe(
     region: &str,
     params: &[(String, String)],
 ) -> (u16, String) {
-    let mut body = "Action=DescribeAvailabilityZones&Version=2016-11-15".to_string();
-    for (name, value) in params {
-        body.push('&');
-        body.push_str(name);
-        body.push('=');
-        body.push_str(&form_value(value));
-    }
-    let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260101/{region}/ec2/aws4_request, \
-         SignedHeaders=host;x-amz-date, Signature=0123456789abcdef"
-    );
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://ec2.{region}.amazonaws.com/"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header("authorization", authorization)
-        .body(bytes::Bytes::from(body))
-        .expect("a well-formed ec2Query request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    (status, String::from_utf8_lossy(response.body()).to_string())
-}
-
-/// `ZoneName.N` / `ZoneId.N` / `Filter.N.Name` form fields, as ec2Query flattens a
-/// list into indexed keys.
-fn indexed(prefix: &str, values: &[&str]) -> Vec<(String, String)> {
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| (format!("{prefix}.{}", index + 1), (*value).to_string()))
-        .collect()
-}
-
-/// The form fields for one `Filters` entry at position `index` (counting from 1).
-fn filter_fields(index: usize, name: &str, values: &[&str]) -> Vec<(String, String)> {
-    let mut fields = vec![(format!("Filter.{index}.Name"), name.to_string())];
-    fields.extend(indexed(&format!("Filter.{index}.Value"), values));
-    fields
-}
-
-/// The form fields for a whole `Filters` list.
-fn filters(entries: &[(&str, &[&str])]) -> Vec<(String, String)> {
-    entries
-        .iter()
-        .enumerate()
-        .flat_map(|(index, (name, values))| filter_fields(index + 1, name, values))
-        .collect()
-}
-
-/// The text of the first `<name>…</name>` element in `xml`.
-fn element(xml: &str, name: &str) -> Option<String> {
-    let open = format!("<{name}>");
-    let close = format!("</{name}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)? + start;
-    Some(xml[start..end].to_string())
-}
-
-/// XML text as the service wrote it, with the five entities resolved — an error
-/// message quoting a filter name reaches the wire as `&apos;…&apos;`.
-fn unescaped(xml_text: &str) -> String {
-    xml_text
-        .replace("&apos;", "'")
-        .replace("&quot;", "\"")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
+    super::ec2_query::call(router, region, "DescribeAvailabilityZones", params).await
 }
 
 /// One zone of a `DescribeAvailabilityZones` response.

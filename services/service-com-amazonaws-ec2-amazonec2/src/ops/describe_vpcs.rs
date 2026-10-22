@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVpcs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVpcs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVpcs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's VPCs out of [`crate::state`]: the whole store by default, or the
+//! subset the request's `VpcIds` and `Filters` select, one `MaxResults`-sized page at a
+//! time. A reporting operation only — it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +146,252 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVpcs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVpcsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVpcs"))
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`DescribeVpcsRequest$DryRun`). Every caller of this emulator is permitted, so a
+        // dry run reports that outcome and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::state::internal_error("the EC2 VPC store is unavailable"))?;
+
+        // "The token returned from a previous paginated request"
+        // (`DescribeVpcsRequest$NextToken`) — anything else is refused rather than read as
+        // an id, and it is refused before any other member is looked at, so whether a
+        // bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(crate::state::invalid_pagination_token)?,
+            ),
+        };
+
+        // A filter name this operation does not document is refused whether or not any VPC
+        // would have matched it, so an unsupported filter can never read as "no results".
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !is_documented_filter(name) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+        }
+
+        let store = state.lock();
+
+        // "The IDs of the VPCs" (`DescribeVpcsRequest$VpcIds`): an id that names no VPC of
+        // the account is an error, not an absent row.
+        let requested: &[String] = input.vpc_ids.as_deref().unwrap_or_default();
+        if let Some(unknown) = requested
+            .iter()
+            .find(|id| !store.vpcs.contains_key(id.as_str()))
+        {
+            return Err(crate::state::invalid_vpc_id_not_found(unknown));
+        }
+
+        // "The default is to describe all your VPCs": `VpcIds` narrows the store to the
+        // ids named, and every filter must then hold ("If you specify multiple filters,
+        // the filters are joined with an AND" — `Filter`).
+        let mut selected: Vec<&Vpc> = store
+            .vpcs
+            .values()
+            .filter(|vpc| {
+                requested.is_empty()
+                    || requested
+                        .iter()
+                        .any(|id| vpc.vpc_id.as_deref() == Some(id.as_str()))
+            })
+            .filter(|vpc| matches_every_filter(vpc, filters))
+            .collect();
+
+        // Page in `VpcId` order, which the cursor below names a position in. The store is
+        // an ordered map, so its iteration order already satisfies this sort; doing it
+        // here establishes the invariant the cursor depends on at the point of use rather
+        // than inheriting it from the container `crate::state` happens to hold.
+        selected.sort_by(|left, right| left.vpc_id.cmp(&right.vpc_id));
+
+        // That order is both the stable paging order and the cursor, so a token naming the
+        // id the next page starts at always advances.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => {
+                selected.partition_point(|vpc| vpc.vpc_id.as_deref().unwrap_or_default() < cursor)
+            }
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of items to return for this request"
+        // (`DescribeVpcsRequest$MaxResults`). A request that names none gets the largest
+        // page the model publishes, so the `NextToken` path below behaves the same whether
+        // or not a page size was asked for. The model's `range 5..1000` has already
+        // refused anything outside it, so the only value that cannot convert is one the
+        // boundary validator would have rejected.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        // "This value is null when there are no more items to return"
+        // (`DescribeVpcsResult$NextToken`): a token only when a VPC follows this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|vpc| vpc.vpc_id.as_deref())
+            .map(crate::state::encode_page_token);
+
+        Ok(DescribeVpcsOutput {
+            vpcs: Some(page.iter().take(limit).map(|vpc| (*vpc).clone()).collect()),
+            next_token,
+        })
     }
+}
+
+/// The page size a request that names no `MaxResults` gets: the largest the model
+/// publishes (`DescribeVpcsMaxResults`, `range 5..1000`), which is also the most EC2
+/// returns in one page.
+const DEFAULT_MAX_RESULTS: usize = 1000;
+
+/// The filter names this operation documents, from `DescribeVpcsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeVpcsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather
+/// than listed here. Every entry must be answered by [`filter_values`].
+const VPC_FILTERS: [&str; 14] = [
+    "cidr",
+    "cidr-block-association.association-id",
+    "cidr-block-association.cidr-block",
+    "cidr-block-association.state",
+    "dhcp-options-id",
+    "ipv6-cidr-block-association.association-id",
+    "ipv6-cidr-block-association.ipv6-cidr-block",
+    "ipv6-cidr-block-association.ipv6-pool",
+    "ipv6-cidr-block-association.state",
+    "is-default",
+    "owner-id",
+    "state",
+    "tag-key",
+    "vpc-id",
+];
+
+/// The prefix of the tag filter: "Use the tag key in the filter name and the tag value as
+/// the filter value" (`DescribeVpcsRequest$Filters`).
+const TAG_FILTER_PREFIX: &str = "tag:";
+
+/// Is `name` a filter this operation documents? "Filter names are case-sensitive"
+/// (`Filter$Name`), so the comparison is exact — and a `tag:` prefix with no key names no
+/// tag, so it is as undocumented as any other misspelling.
+fn is_documented_filter(name: &str) -> bool {
+    name.strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+        || VPC_FILTERS.contains(&name)
+}
+
+/// The values the EC2 filter `name` compares against this VPC.
+///
+/// A filter naming an attribute this VPC does not carry compares against NO values, so it
+/// selects nothing — the same answer AWS gives for, say,
+/// `ipv6-cidr-block-association.ipv6-pool` on a VPC with no IPv6 CIDR block.
+fn filter_values<'a>(vpc: &'a Vpc, name: &str) -> Vec<&'a str> {
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return vpc
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref())
+            .collect();
+    }
+
+    let ipv4_associations = || vpc.cidr_block_association_set.iter().flatten();
+    let ipv6_associations = || vpc.ipv6_cidr_block_association_set.iter().flatten();
+    match name {
+        "cidr" => vpc.cidr_block.as_deref().into_iter().collect(),
+        "cidr-block-association.association-id" => ipv4_associations()
+            .filter_map(|association| association.association_id.as_deref())
+            .collect(),
+        "cidr-block-association.cidr-block" => ipv4_associations()
+            .filter_map(|association| association.cidr_block.as_deref())
+            .collect(),
+        "cidr-block-association.state" => ipv4_associations()
+            .filter_map(|association| {
+                association
+                    .cidr_block_state
+                    .as_ref()
+                    .and_then(|block| block.state.as_deref())
+            })
+            .collect(),
+        "dhcp-options-id" => vpc.dhcp_options_id.as_deref().into_iter().collect(),
+        "ipv6-cidr-block-association.association-id" => ipv6_associations()
+            .filter_map(|association| association.association_id.as_deref())
+            .collect(),
+        "ipv6-cidr-block-association.ipv6-cidr-block" => ipv6_associations()
+            .filter_map(|association| association.ipv6_cidr_block.as_deref())
+            .collect(),
+        "ipv6-cidr-block-association.ipv6-pool" => ipv6_associations()
+            .filter_map(|association| association.ipv6_pool.as_deref())
+            .collect(),
+        "ipv6-cidr-block-association.state" => ipv6_associations()
+            .filter_map(|association| {
+                association
+                    .ipv6_cidr_block_state
+                    .as_ref()
+                    .and_then(|block| block.state.as_deref())
+            })
+            .collect(),
+        // A boolean attribute is filtered on the value a client sends for it, which is how
+        // the wire renders it: `true` or `false`. A VPC whose flag is not set carries no
+        // value for the filter to match, like any other absent attribute.
+        "is-default" => vpc
+            .is_default
+            .map(|is_default| if is_default { "true" } else { "false" })
+            .into_iter()
+            .collect(),
+        "owner-id" => vpc.owner_id.as_deref().into_iter().collect(),
+        "state" => vpc.state.as_deref().into_iter().collect(),
+        "tag-key" => vpc
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref())
+            .collect(),
+        "vpc-id" => vpc.vpc_id.as_deref().into_iter().collect(),
+        // Unreachable: `is_documented_filter` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even
+        // if that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// Does `vpc` satisfy every filter?
+///
+/// "If you specify multiple filters, the filters are joined with an AND" (`Filter`), and
+/// within one filter "if you specify multiple values for a filter, the values are joined
+/// with an OR" (`Filter$Values`) — each value matched case-sensitively, with EC2's own
+/// `*`/`?` wildcards, by [`crate::state::filter_value_matches`]. So a filter carrying no
+/// value at all matches nothing, there being no value for the attribute to match.
+fn matches_every_filter(vpc: &Vpc, filters: &[Filter]) -> bool {
+    filters.iter().all(|filter| {
+        let name = filter.name.as_deref().unwrap_or_default();
+        let held = filter_values(vpc, name);
+        filter
+            .values
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|wanted| {
+                held.iter()
+                    .any(|value| crate::state::filter_value_matches(wanted, value))
+            })
+    })
 }

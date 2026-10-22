@@ -12,11 +12,23 @@
 //! writes nothing at all: two calls signed for the same Region report the same zones,
 //! and a read can never change what a later caller sees.
 //!
-//! Resources callers DO create (VPCs, subnets, security groups, …) belong in the
-//! state struct below as they are implemented, and should be validated against
+//! ## Resources callers create are stored
+//!
+//! [`ComAmazonawsEc2Amazonec2State::vpcs`] holds the account's VPCs as the modelled
+//! [`Vpc`] shape itself rather than a parallel record, so every member a writer sets
+//! round-trips through `DescribeVpcs` without a field-by-field copy that can silently
+//! drop one. The store is keyed by `VpcId` in a [`BTreeMap`], which gives the describe
+//! path one stable order and lets a pagination token name the id the next page starts
+//! at. Further caller-created resources (subnets, security groups, …) belong beside it
+//! as they are implemented, and should be validated against
 //! [`availability_zones_in_region`] rather than against a second zone list.
 
-use crate::ops::types::{AvailabilityZone, AvailabilityZoneMessage};
+use std::collections::BTreeMap;
+
+use crate::ops::types::{
+    AvailabilityZone, AvailabilityZoneMessage, BlockPublicAccessStates, Tag, Vpc,
+    VpcCidrBlockAssociation, VpcCidrBlockState,
+};
 
 /// The Region a request belongs to when it carries no SigV4 credential scope to read
 /// one from — `::engine::emulator_arn`'s documented default Region.
@@ -57,6 +69,16 @@ pub const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 /// `DryRunOperation`" (the `DryRun` member's own doc).
 pub const DRY_RUN_OPERATION: &str = "DryRunOperation";
 
+/// EC2's error code for a request that named a VPC id no VPC of the account has.
+pub const INVALID_VPC_ID_NOT_FOUND: &str = "InvalidVpcID.NotFound";
+
+/// EC2's error code for a pagination token this service did not issue.
+pub const INVALID_PAGINATION_TOKEN: &str = "InvalidPaginationToken";
+
+/// EC2's error code for a failure of the emulator itself, never for anything a request
+/// carries: a 5xx is retryable to an SDK's retry classifier.
+pub const INTERNAL_ERROR: &str = "InternalError";
+
 /// Every filter `DescribeAvailabilityZones` documents, as its `Filters` member lists
 /// them
 /// (`smithy_query(query="doc",shape="DescribeAvailabilityZonesRequest",member="Filters")`).
@@ -76,11 +98,122 @@ pub const AVAILABILITY_ZONE_FILTERS: [&str; 11] = [
     "zone-type",
 ];
 
+/// The IPv4 CIDR block of an account's default VPC.
+///
+/// AWS creates one default VPC per Region for every account (every account created after
+/// 2013-12-04 in a Region that supports them), with "an IPv4 CIDR block of
+/// `172.31.0.0/16`" — Amazon VPC User Guide, "Default VPCs". A fresh account therefore
+/// already has a VPC before anything calls `CreateVpc`, which is why the VPC store starts
+/// with one rather than empty.
+pub const DEFAULT_VPC_CIDR_BLOCK: &str = "172.31.0.0/16";
+
+/// The tenancy of instances launched into a VPC created without an explicit one: the
+/// `Tenancy` enum's `default` member.
+pub const DEFAULT_INSTANCE_TENANCY: &str = "default";
+
+/// A VPC AWS has finished creating: the `VpcState` enum's `available` member.
+pub const VPC_STATE_AVAILABLE: &str = "available";
+
+/// An IPv4 CIDR block associated with its VPC: the `VpcCidrBlockStateCode` enum's
+/// `associated` member.
+pub const CIDR_BLOCK_STATE_ASSOCIATED: &str = "associated";
+
+/// VPC Block Public Access turned off — "`off`: VPC BPA is not enabled and traffic is
+/// allowed to and from internet gateways and egress-only internet gateways in this
+/// Region" (`BlockPublicAccessStates$InternetGatewayBlockMode`), which is the state of an
+/// account that has never enabled it.
+pub const BLOCK_PUBLIC_ACCESS_OFF: &str = "off";
+
 /// Per-service state for com-amazonaws-ec2-amazonec2. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsEc2Amazonec2State {
-    // Availability Zones are derived from the Region (see the module docs), so no
-    // field here mirrors them. Caller-created resources go here as they land.
+    /// Every VPC the account holds, by `VpcId`.
+    ///
+    /// Availability Zones are NOT here: they are derived from the Region (see the
+    /// module docs). Further caller-created resources go beside this field as they
+    /// land.
+    pub vpcs: BTreeMap<String, Vpc>,
+    /// Monotonic source of generated resource-id suffixes, so an id is unique within a
+    /// run and deterministic across runs.
+    pub id_counter: u64,
+}
+
+/// A fresh account's EC2 state: the default VPC AWS creates for it, and nothing else.
+impl Default for ComAmazonawsEc2Amazonec2State {
+    fn default() -> Self {
+        let mut state = Self {
+            vpcs: BTreeMap::new(),
+            id_counter: 0,
+        };
+        state.insert_vpc(
+            DEFAULT_VPC_CIDR_BLOCK,
+            true,
+            DEFAULT_INSTANCE_TENANCY,
+            VPC_STATE_AVAILABLE,
+            Vec::new(),
+        );
+        state
+    }
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Mint the next id for `prefix`, e.g. `vpc-00000000000000001`.
+    ///
+    /// EC2 resource ids are `<prefix>-<hex>`, with 8 or 17 lowercase hex digits (the
+    /// model's own id patterns read like `^vpc-([0-9a-f]{8}|[0-9a-f]{17})$`), so the
+    /// suffix is 17 lowercase hex digits of the monotonic counter.
+    pub fn next_id(&mut self, prefix: &str) -> String {
+        self.id_counter = self.id_counter.saturating_add(1);
+        format!("{prefix}-{:017x}", self.id_counter)
+    }
+
+    /// Insert a VPC with `cidr_block` as its primary IPv4 CIDR block, in `vpc_state`, and
+    /// answer the `VpcId` it was given.
+    ///
+    /// Every id the record carries — the VPC's own, its primary CIDR association's, and
+    /// the DHCP options set associated with it — is minted here, so a VPC never shares an
+    /// id with another resource of this store.
+    pub fn insert_vpc(
+        &mut self,
+        cidr_block: &str,
+        is_default: bool,
+        instance_tenancy: &str,
+        vpc_state: &str,
+        tags: Vec<Tag>,
+    ) -> String {
+        let vpc_id = self.next_id("vpc");
+        let association_id = self.next_id("vpc-cidr-assoc");
+        let dhcp_options_id = self.next_id("dopt");
+        let vpc = Vpc {
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            instance_tenancy: Some(instance_tenancy.to_string()),
+            // No IPv6 CIDR block is associated until something associates one.
+            ipv6_cidr_block_association_set: Some(Vec::new()),
+            // "Information about the IPv4 CIDR blocks associated with the VPC" (`Vpc`):
+            // the primary block is one of them, so it appears in both members.
+            cidr_block_association_set: Some(vec![VpcCidrBlockAssociation {
+                association_id: Some(association_id),
+                cidr_block: Some(cidr_block.to_string()),
+                cidr_block_state: Some(VpcCidrBlockState {
+                    state: Some(CIDR_BLOCK_STATE_ASSOCIATED.to_string()),
+                    status_message: None,
+                }),
+            }]),
+            is_default: Some(is_default),
+            // No VPC encryption control exists until one is created for the VPC.
+            encryption_control: None,
+            tags: Some(tags),
+            block_public_access_states: Some(BlockPublicAccessStates {
+                internet_gateway_block_mode: Some(BLOCK_PUBLIC_ACCESS_OFF.to_string()),
+            }),
+            vpc_id: Some(vpc_id.clone()),
+            state: Some(vpc_state.to_string()),
+            cidr_block: Some(cidr_block.to_string()),
+            dhcp_options_id: Some(dhcp_options_id),
+        };
+        self.vpcs.insert(vpc_id.clone(), vpc);
+        vpc_id
+    }
 }
 
 /// One Availability Zone of one Region, as the describe reads it.
@@ -307,6 +440,32 @@ pub fn invalid_parameter_value<E>(message: impl Into<String>) -> crate::scaffold
     crate::scaffolded::Scaffolded::service_error(INVALID_PARAMETER_VALUE, 400, message)
 }
 
+/// Refuse a request that named a VPC id no VPC of the account has, the way EC2 does:
+/// HTTP 400 `InvalidVpcID.NotFound`.
+pub fn invalid_vpc_id_not_found<E>(vpc_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_VPC_ID_NOT_FOUND,
+        400,
+        format!("The vpc ID '{vpc_id}' does not exist"),
+    )
+}
+
+/// Refuse a `NextToken` this service did not issue: HTTP 400 `InvalidPaginationToken`.
+/// The token itself is not echoed — it carried nothing the caller can act on.
+pub fn invalid_pagination_token<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_PAGINATION_TOKEN,
+        400,
+        "The NextToken is not a token this service issued",
+    )
+}
+
+/// Report that the emulator itself could not serve the request: HTTP 500
+/// `InternalError`. Never for anything a request carries.
+pub fn internal_error<E>(message: impl Into<String>) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(INTERNAL_ERROR, 500, message)
+}
+
 /// Answer a `DryRun` request the way EC2 does for a caller that holds the action's
 /// permissions — which every caller of this emulator does: HTTP 412
 /// `DryRunOperation`, and the action itself is not performed.
@@ -346,4 +505,50 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsEc2Amazonec2State>)
+}
+
+/// The marker every token this service mints carries, ahead of the checksum and the
+/// cursor itself: a token a caller assembled carries neither, so it is detectable rather
+/// than read as a cursor.
+const PAGE_TOKEN_VERSION: &str = "ec2-1";
+
+/// Encode a pagination cursor — the resource id the NEXT page starts at — as an opaque
+/// token.
+///
+/// The token is the hex of `<version>:<checksum>:<id>`, so it is opaque to the caller and
+/// a token this service did not mint fails verification in [`decode_page_token`] instead
+/// of being treated as an id. Hex alone would not do that: any even-length hex string
+/// decodes to something.
+pub fn encode_page_token(start_at: &str) -> String {
+    let checksum = page_token_checksum(start_at);
+    ::hex::encode(format!("{PAGE_TOKEN_VERSION}:{checksum:016x}:{start_at}").as_bytes())
+}
+
+/// Decode a pagination cursor minted by [`encode_page_token`]; `None` for anything else —
+/// a token that is not hex, does not carry this service's marker, or whose checksum does
+/// not match the cursor it carries.
+pub fn decode_page_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let marked = decoded
+        .strip_prefix(PAGE_TOKEN_VERSION)
+        .and_then(|rest| rest.strip_prefix(':'))?;
+    let (checksum, start_at) = marked.split_once(':')?;
+    let expected = format!("{:016x}", page_token_checksum(start_at));
+    (checksum == expected).then(|| start_at.to_string())
+}
+
+/// The checksum a token carries over its cursor.
+///
+/// A token is only ever presented back to the process that minted it — pagination is
+/// resumed within one run — so the standard library's hasher is enough to tell a token
+/// this service built from one a caller assembled. It is not a secret and nothing depends
+/// on it being unforgeable: the cursor it protects is a resource id of the caller's own
+/// account, so the check exists to refuse a malformed token, not to withhold anything.
+fn page_token_checksum(start_at: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = ::std::hash::DefaultHasher::new();
+    PAGE_TOKEN_VERSION.hash(&mut hasher);
+    start_at.hash(&mut hasher);
+    hasher.finish()
 }
