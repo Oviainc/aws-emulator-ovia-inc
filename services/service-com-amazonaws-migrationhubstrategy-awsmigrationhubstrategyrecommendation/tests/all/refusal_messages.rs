@@ -12,10 +12,14 @@
 //!    it rejected, whatever the constraint kind and wherever the value was bound (JSON
 //!    body or URI label). The rows below cover the kinds the scaffold's boundary
 //!    validator enforces: `@length`, `@range` and an absent `@required` member;
-//! 2. a request naming an id that resolves to no resource is refused with the service's
-//!    one sentence for an unresolvable parameter,
-//!    `Looks like you provided invalid or missing parameters.`, which likewise carries
-//!    nothing from the request — in particular not the id that failed to resolve.
+//! 2. a request naming an id that resolves to no resource is refused with the sentence
+//!    the service uses for that condition, which likewise carries nothing from the
+//!    request — in particular not the id that failed to resolve. Where the operation
+//!    reports the id as an unresolvable PARAMETER that is
+//!    `Looks like you provided invalid or missing parameters.`; where it reports the
+//!    resource as ABSENT (`StopAssessment`'s recorded 404) it is
+//!    `Invalid resourceId: `. One sentence per condition, never a rendering of the
+//!    request.
 //!
 //! So each table below spans the class the rule generalises over and asserts the ONE
 //! sentence for every row; the recorded probes (a 70-character `S3Bucket`, a
@@ -34,8 +38,13 @@ use crate::import_and_assess::{call, emulator, Answer};
 /// This service's message for a value that fails a rule the model declares.
 const INVALID_REQUEST_BODY: &str = "Invalid request body";
 
-/// This service's message for an id that resolves to no resource.
+/// This service's message for an id that resolves to no resource, on an operation that
+/// reports it as an unresolvable parameter.
 const INVALID_OR_MISSING_PARAMETERS: &str = "Looks like you provided invalid or missing parameters.";
+
+/// This service's message for an id that resolves to no resource, on an operation that
+/// reports the resource as absent — the recorded `StopAssessment` 404.
+const INVALID_RESOURCE_ID: &str = "Invalid resourceId: ";
 
 /// `[0-9a-z]+[0-9a-z\.\-]*[0-9a-z]+` within `importS3Bucket`'s `@length(0, 63)`, from
 /// `smithy_query(query="shape",shape="importS3Bucket")`: a legal bucket name of exactly
@@ -221,8 +230,13 @@ async fn a_value_at_a_published_bound_is_not_refused() {
 
     let mut at_bucket_max = valid_import();
     at_bucket_max["S3Bucket"] = json!(bucket_of_length(63));
+    // The shortest name the SERVICE accepts, not the shortest `@pattern` admits: the
+    // member documents a `migrationhub-strategy-` prefix, so the shortest acceptable
+    // bucket is that prefix plus one character. A two-character name satisfies the bound
+    // this table is about and is still refused, for the prefix rule rather than for the
+    // bound — see `assessment_error_paths.rs`.
     let mut shortest_bucket = valid_import();
-    shortest_bucket["S3Bucket"] = json!("ab");
+    shortest_bucket["S3Bucket"] = json!(bucket_of_length("migrationhub-strategy-".len() + 1));
 
     let accepted = vec![
         post(
@@ -231,7 +245,7 @@ async fn a_value_at_a_published_bound_is_not_refused() {
             at_bucket_max,
         ),
         post(
-            "S3Bucket of two characters, the shortest importS3Bucket's @pattern admits",
+            "the shortest S3Bucket the service's documented prefix admits",
             "/start-import-file-task",
             shortest_bucket,
         ),
@@ -295,22 +309,23 @@ const UNRESOLVABLE_IDS: &[(&str, &str)] = &[
 ];
 
 /// One operation's answer to an unresolvable id: which operation asked, what came back,
-/// and the status/code pair pinned for it when the corpus records one.
+/// the status/code pair pinned for it, and the sentence its condition is worded with.
 struct Probe {
     operation: &'static str,
     answer: Answer,
     pinned: Option<(u16, &'static str)>,
+    message: &'static str,
 }
 
-/// Every operation that resolves an id answers an id it cannot resolve with the
-/// service's ONE sentence for an unresolvable parameter — and with nothing from the
-/// request in it.
+/// Every operation that resolves an id answers an id it cannot resolve with the service's
+/// ONE sentence for that condition — and with nothing from the request in it.
 ///
-/// `GetImportFileTask`'s status and error code are pinned (404 /
-/// `ResourceNotFoundException`, which the model declares and the corpus records); the
-/// assessment paths' status and code are a cause of a SEPARATE open issue, so this suite
-/// asserts only that the refusal is a 4xx worded the service's way, which is what this
-/// rule governs.
+/// Each operation's status and error code is pinned to what the corpus records for its
+/// route: `GetImportFileTask` and `StopAssessment` report the resource as absent (404 /
+/// `ResourceNotFoundException`), while `GetAssessment` refuses the id as an invalid
+/// parameter (400 / `ValidationException`). `StopAssessment` is the one of the three that
+/// words the condition as an absent resource rather than an unresolvable parameter, so it
+/// carries its own sentence.
 #[tokio::test]
 async fn an_unresolvable_id_is_refused_with_the_services_one_parameter_message() {
     let router = emulator();
@@ -321,11 +336,13 @@ async fn an_unresolvable_id_is_refused_with_the_services_one_parameter_message()
                 operation: "GetImportFileTask",
                 answer: call(&router, "GET", &format!("/get-import-file-task/{id}"), None).await,
                 pinned: Some((404, "ResourceNotFoundException")),
+                message: INVALID_OR_MISSING_PARAMETERS,
             },
             Probe {
                 operation: "GetAssessment",
                 answer: call(&router, "GET", &format!("/get-assessment/{id}"), None).await,
-                pinned: None,
+                pinned: Some((400, "ValidationException")),
+                message: INVALID_OR_MISSING_PARAMETERS,
             },
             Probe {
                 operation: "StopAssessment",
@@ -336,7 +353,8 @@ async fn an_unresolvable_id_is_refused_with_the_services_one_parameter_message()
                     Some(json!({"assessmentId": id})),
                 )
                 .await,
-                pinned: None,
+                pinned: Some((404, "ResourceNotFoundException")),
+                message: INVALID_RESOURCE_ID,
             },
         ];
 
@@ -344,6 +362,7 @@ async fn an_unresolvable_id_is_refused_with_the_services_one_parameter_message()
             operation,
             answer,
             pinned,
+            message: expected,
         } in probes
         {
             let case = format!("{operation} with {shape} ({id:?})");
@@ -368,8 +387,8 @@ async fn an_unresolvable_id_is_refused_with_the_services_one_parameter_message()
             }
             let message = answer.string("/message");
             assert_eq!(
-                message, INVALID_OR_MISSING_PARAMETERS,
-                "case {case:?}: expected the service's {INVALID_OR_MISSING_PARAMETERS:?}, got {:?}",
+                message, expected,
+                "case {case:?}: expected the service's {expected:?}, got {:?}",
                 answer.body
             );
             assert!(

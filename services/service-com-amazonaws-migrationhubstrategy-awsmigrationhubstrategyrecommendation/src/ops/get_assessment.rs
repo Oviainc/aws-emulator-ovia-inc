@@ -64,6 +64,10 @@
 //!   again.
 //! * `ResourceNotFoundException` (HTTP 404) — The specified ID in the request is not found.
 //! * `ThrottlingException` (HTTP 429) — The request was denied due to request throttling.
+//!
+//! Widened in with `extra_errors` (see the `#[operation_error]` note below):
+//!
+//! * `ValidationException` (HTTP 400) — The request body isn't valid.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -79,13 +83,23 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-migrationhubstrategy-aw
 // here — hence the `GetAssessmentError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.migrationhubstrategy#GetAssessment")]
+//
+// `ValidationException` is widened in with `extra_errors`: it is a shape the SERVICE
+// models (`httpError` 400) that this operation's own `errors` list omits, and it is what
+// Strategy Recommendations answers for an `id` that names no assessment of this account
+// — the recorded `GET /get-assessment/{id}` refusal for a pattern- and length-legal id
+// is HTTP 400 `ValidationException`, not the 404 this operation's list would suggest.
+#[smithy_macros::operation_error(
+    "com.amazonaws.migrationhubstrategy#GetAssessment",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum GetAssessmentErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -162,8 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 data_collection_details: Some(assessment.to_data_collection_details()),
                 assessment_targets: Some(assessment.assessment_targets.clone()),
             }),
-            None => Err(GetAssessmentErrorModeled::ResourceNotFoundException(
-                crate::state::assessment_not_found(),
+            // An id this account was never issued is refused as an invalid parameter
+            // (HTTP 400 `ValidationException`), which is what the service answers here —
+            // not the 404 the operation's own error list would suggest.
+            None => Err(GetAssessmentErrorModeled::ValidationException(
+                crate::state::assessment_id_not_accepted(),
             )
             .into()),
         }

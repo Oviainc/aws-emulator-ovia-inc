@@ -56,6 +56,10 @@
 //!   again.
 //! * `ThrottlingException` (HTTP 429) — The request was denied due to request throttling.
 //! * `ValidationException` (HTTP 400) — The request body isn't valid.
+//!
+//! Widened in with `extra_errors` (see the `#[operation_error]` note below):
+//!
+//! * `ResourceNotFoundException` (HTTP 404) — The specified ID in the request is not found.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -71,11 +75,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-migrationhubstrategy-aw
 // here — hence the `StopAssessmentError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.migrationhubstrategy#StopAssessment")]
+//
+// `ResourceNotFoundException` is widened in with `extra_errors`: it is a shape the
+// SERVICE models (`httpError` 404, "The specified ID in the request is not found.") that
+// this operation's own `errors` list omits, and it is what the service answers for an
+// `assessmentId` that names no assessment. A narrow error list is not a licence to
+// substitute a different shape: the condition is a missing resource, so the answer is the
+// not-found, not the 400 this list would otherwise force.
+#[smithy_macros::operation_error(
+    "com.amazonaws.migrationhubstrategy#StopAssessment",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum StopAssessmentErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -149,10 +164,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // was already due finished before this call, so the stop finds it terminal and
         // leaves the status the clock gave it.
         let Some(assessment) = store.settled_assessment_mut(&input.assessment_id, now) else {
-            // This operation models no `ResourceNotFoundException`, so an id that names
-            // no assessment is refused with its modelled client error.
-            return Err(StopAssessmentErrorModeled::ValidationException(
-                crate::state::invalid_assessment_id(),
+            // The condition is a resource that is not there, so the answer is the
+            // service's not-found (HTTP 404) — widened in above, because this
+            // operation's own error list omits it.
+            return Err(StopAssessmentErrorModeled::ResourceNotFoundException(
+                crate::state::assessment_not_found(),
             )
             .into());
         };

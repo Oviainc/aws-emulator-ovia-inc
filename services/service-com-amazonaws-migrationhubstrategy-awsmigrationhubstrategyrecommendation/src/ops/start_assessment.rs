@@ -70,6 +70,10 @@
 //! * `ServiceQuotaExceededException` (HTTP 402) — The AWS account has reached its quota of
 //!   imports. Contact AWS Support to increase the quota for this account.
 //! * `ThrottlingException` (HTTP 429) — The request was denied due to request throttling.
+//!
+//! Widened in with `extra_errors` (see the `#[operation_error]` note below):
+//!
+//! * `ValidationException` (HTTP 400) — The request body isn't valid.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -85,13 +89,23 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-migrationhubstrategy-aw
 // here — hence the `StartAssessmentError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.migrationhubstrategy#StartAssessment")]
+//
+// `ValidationException` is widened in with `extra_errors`: it is a shape the SERVICE
+// models (`httpError` 400, "The request body isn't valid.") that this operation's own
+// `errors` list omits, and without it the handler has no way to refuse a request the
+// service refuses — an assessment that named no analysis-data bucket, or a bucket name
+// that breaks the documented `migrationhub-strategy-` prefix rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.migrationhubstrategy#StartAssessment",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum StartAssessmentErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -158,6 +172,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+
+        // The buckets the collectors use are held to the prefix rule each member's own
+        // documentation states and its `@pattern` cannot express. The analysis-data
+        // bucket is where the collectors send the data this assessment is made of, so
+        // the service refuses a start that names none — recorded wire behaviour of
+        // `POST /start-assessment`, which the model's optional member does not capture.
+        // The report bucket is optional and is only held to the prefix. Both run BEFORE
+        // anything is minted, so a refused request leaves no assessment behind.
+        let analysis_bucket = input.s3bucket_for_analysis_data.as_deref();
+        crate::state::require_bucket(
+            "s3bucketForAnalysisData",
+            "perform assessment",
+            analysis_bucket,
+        )
+        .map_err(StartAssessmentErrorModeled::ValidationException)?;
+        crate::state::check_bucket_usable(analysis_bucket)
+            .map_err(StartAssessmentErrorModeled::ValidationException)?;
+        crate::state::check_bucket_usable(input.s3bucket_for_report_data.as_deref())
+            .map_err(StartAssessmentErrorModeled::ValidationException)?;
+
         let mut store = state.lock();
 
         // The store is bounded: past its quota an assessment is refused rather than

@@ -56,6 +56,10 @@
 //! * `InternalServerException` (HTTP 500) — The server experienced an internal error. Try
 //!   again.
 //! * `ValidationException` (HTTP 400) — The request body isn't valid.
+//!
+//! Widened in with `extra_errors` (see the `#[operation_error]` note below):
+//!
+//! * `ResourceNotFoundException` (HTTP 404) — The specified ID in the request is not found.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -71,12 +75,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-migrationhubstrategy-aw
 // here — hence the `GetLatestAssessmentIdError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.migrationhubstrategy#GetLatestAssessmentId")]
+//
+// `ResourceNotFoundException` is widened in with `extra_errors`: it is a shape the
+// SERVICE models (`httpError` 404) that this operation's own `errors` list omits, and an
+// account with no assessment is exactly the condition it reports. This operation takes
+// NO input, so the 400 `ValidationException` its list carries is not a reachable
+// outcome: there is nothing a caller could have sent wrongly.
+#[smithy_macros::operation_error(
+    "com.amazonaws.migrationhubstrategy#GetLatestAssessmentId",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum GetLatestAssessmentIdErrorModeled {
     AccessDeniedException(AccessDeniedException),
     DependencyException(DependencyException),
     InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
 }
 
@@ -148,17 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let latest = state.lock().latest_assessment_id.clone();
         match latest {
             Some(id) => Ok(GetLatestAssessmentIdOutput { id: Some(id) }),
-            // There is no latest id to report until an assessment is started. This
-            // operation models no `ResourceNotFoundException`, so the refusal is its
-            // one modelled client error rather than an id nothing minted.
-            None => Err(GetLatestAssessmentIdErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(
-                        "no assessment has been started in this account, so there is no \
-                         latest assessment id"
-                            .to_string(),
-                    ),
-                },
+            // There is no latest id to report until an assessment is started: the
+            // resource the operation reports on is absent, so the answer is the
+            // service's not-found (HTTP 404) rather than an id nothing minted — and
+            // never a validation refusal, which an input-less operation cannot earn.
+            None => Err(GetLatestAssessmentIdErrorModeled::ResourceNotFoundException(
+                crate::state::no_latest_assessment(),
             )
             .into()),
         }

@@ -364,22 +364,109 @@ pub fn import_task_not_found() -> ResourceNotFoundException {
     }
 }
 
-/// The `ResourceNotFoundException` payload for an assessment id that names no
-/// assessment. The same constant, for the same reason.
-pub fn assessment_not_found() -> ResourceNotFoundException {
-    ResourceNotFoundException {
+/// This service's message for an assessment id that resolves to no assessment, on the
+/// operation that reports it as a missing resource.
+///
+/// `StopAssessment`'s recorded 404 carries this sentence rather than
+/// [`INVALID_OR_MISSING_PARAMETERS`]: the service words "I cannot resolve what you sent"
+/// and "that resource is not here" differently. Like the other two it is a constant of
+/// the service — the recorded response for an unknown id does not interpolate the id, so
+/// neither does this.
+pub const INVALID_RESOURCE_ID: &str = "Invalid resourceId: ";
+
+/// This service's message for a report it cannot produce because the resource it would
+/// name does not exist yet, as `GetLatestAssessmentId` answers it in an account where no
+/// assessment has ever been started.
+pub const NOTHING_TO_REPORT: &str = "Something went wrong, please try again later.";
+
+/// The prefix every S3 bucket name this service can use has to begin with.
+///
+/// Documented on each bucket member the service takes — `StartAssessmentRequest`'s
+/// `s3bucketForAnalysisData` and `s3bucketForReportData` ("The bucket name must begin
+/// with `migrationhub-strategy-`") and `StartImportFileTaskRequest`'s `S3Bucket` and
+/// `s3bucketForReportData` ("The bucket name is required to begin with
+/// `migrationhub-strategy-`"). The members' own `@pattern`
+/// (`[0-9a-z]+[0-9a-z\.\-]*[0-9a-z]+`) and `@length(0,63)` cannot express a prefix, so
+/// the boundary validator passes a non-conforming name and the handler enforces it.
+pub const BUCKET_NAME_PREFIX: &str = "migrationhub-strategy-";
+
+/// Refuse a bucket naming one this service cannot use.
+///
+/// `Ok` for an absent member (nothing was named) and for a name carrying
+/// [`BUCKET_NAME_PREFIX`]; otherwise the `ValidationException` (HTTP 400) the service
+/// answers for a bucket it cannot reach, naming the bucket the way it reports any such
+/// bucket.
+///
+/// The prefix is the whole of the check. This emulator serves no S3 data plane, so it
+/// cannot look a bucket up; the documented prefix is the one property of a name it can
+/// decide, and a conforming name is taken to name a bucket the service can use rather
+/// than refusing every start call and leaving the resource unreachable.
+pub fn check_bucket_usable(value: Option<&str>) -> Result<(), ValidationException> {
+    match value {
+        Some(bucket) if !bucket.starts_with(BUCKET_NAME_PREFIX) => Err(ValidationException {
+            message: Some(format!(
+                "S3 bucket \"{bucket}\" does not exist or is not accessible [S3BucketNotFound]"
+            )),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Refuse an operation that was given no bucket for a member it cannot run without.
+///
+/// For a member the model leaves optional but the service needs: the refusal names the
+/// MEMBER and the prefix a bucket for it has to carry, which is what the caller has to
+/// fix. `action` is what the operation does with the bucket, so the message reads for the
+/// operation it came from. A member the model marks `@required` never reaches here — the
+/// boundary validator refuses its absence first.
+pub fn require_bucket(
+    member: &str,
+    action: &str,
+    value: Option<&str>,
+) -> Result<(), ValidationException> {
+    if value.is_some() {
+        return Ok(());
+    }
+    Err(ValidationException {
+        message: Some(format!(
+            "S3 bucket {member} is required for {action}. Please specify s3 bucket \
+             with \"{BUCKET_NAME_PREFIX}\" prefix"
+        )),
+    })
+}
+
+/// `GetAssessment`'s refusal of an `id` that names no assessment of this account.
+///
+/// Strategy Recommendations answers that read with its invalid-parameter refusal —
+/// `ValidationException`, HTTP 400 — rather than a not-found, which is what the recorded
+/// wire behaviour of `GET /get-assessment/{id}` shows for a pattern- and length-legal id
+/// the account was never issued. The status and the error code are the requirement; the
+/// message is this service's one sentence for an unresolvable parameter
+/// ([`INVALID_OR_MISSING_PARAMETERS`]), which carries nothing from the request.
+pub fn assessment_id_not_accepted() -> ValidationException {
+    ValidationException {
         message: Some(INVALID_OR_MISSING_PARAMETERS.to_string()),
     }
 }
 
-/// The `ValidationException` payload for an assessment id that names no assessment, on
-/// an operation whose model declares no `ResourceNotFoundException`.
+/// `StopAssessment`'s refusal of an `assessmentId` that names no assessment: the
+/// service's `ResourceNotFoundException` (HTTP 404, "The specified ID in the request is
+/// not found."), worded with [`INVALID_RESOURCE_ID`].
+pub fn assessment_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(INVALID_RESOURCE_ID.to_string()),
+    }
+}
+
+/// `GetLatestAssessmentId`'s answer in an account where no assessment has ever been
+/// started: there is no assessment to name, so the absent resource is reported with
+/// `ResourceNotFoundException`, HTTP 404.
 ///
-/// Same family, same constant: an id that resolves to nothing is an unresolvable
-/// parameter whichever error shape the operation declares for it.
-pub fn invalid_assessment_id() -> ValidationException {
-    ValidationException {
-        message: Some(INVALID_OR_MISSING_PARAMETERS.to_string()),
+/// The operation takes no input, so an invalid-request refusal is not a reachable
+/// outcome — there is nothing a caller could have sent wrongly.
+pub fn no_latest_assessment() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(NOTHING_TO_REPORT.to_string()),
     }
 }
 
