@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssetModelProperties
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssetModelProperties`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssetModelProperties::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation enumerates the property definitions stored for one
+//! asset model in the shared engine store (`crate::state`); this is the ONLY file to
+//! touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +161,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssetModelProperties` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssetModelPropertiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssetModelProperties"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAssetModelPropertiesError::Modeled(
+                ListAssetModelPropertiesErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+
+        // `filter` defaults to BASE — "The list includes only base asset model
+        // properties for a given asset model ID" — which is the model's own property
+        // definitions. ALL also walks the properties each of its composite models
+        // defines. The modelled enum admits no other value, and the runtime refuses
+        // one before this handler runs.
+        let include_composite = input.filter.as_deref().unwrap_or(DEFAULT_FILTER) == FILTER_ALL;
+
+        // A pure read: nothing below writes, so two callers reading the same model in
+        // either order see the same properties.
+        let store = state.lock();
+        // The label is either the raw UUID or the `externalId:<externalId>` alias form.
+        let id = store
+            .resolve_asset_model_id(&input.asset_model_id)
+            .ok_or_else(|| not_found(&input.asset_model_id))?;
+        let record = store
+            .asset_models
+            .get(&id)
+            .ok_or_else(|| not_found(&input.asset_model_id))?;
+
+        // `assetModelVersion` (LATEST | ACTIVE) picks which version of the model to
+        // report the properties of. This store keeps exactly ONE version per asset
+        // model — `UpdateAssetModel`, the only operation that could supersede it, is
+        // still a 501 scaffold — and that version is both the latest and the active
+        // one, so either alias selects the same property definitions. Nothing is
+        // fabricated for a version history that does not exist.
+        let _ = &input.asset_model_version;
+
+        // The enumeration order: the model's own properties in definition order, then
+        // each composite model's properties, composite models in their stored order.
+        // Stable across calls, which is what makes `nextToken` resumable.
+        let mut summaries: Vec<AssetModelPropertySummary> = record
+            .properties
+            .iter()
+            .map(|property| summarize(property, None))
+            .collect();
+        if include_composite {
+            for composite in &record.composite_models {
+                for property in composite.properties.as_deref().unwrap_or(&[]) {
+                    summaries.push(summarize(property, Some(composite)));
+                }
+            }
+        }
+
+        // `nextToken` is this enumeration's resume point: the key of the first summary
+        // of the next page, hex-encoded so the token matches the modelled
+        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration is
+        // refused rather than answered with an empty page, which would report absence
+        // as success.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                summaries
+                    .iter()
+                    .position(|summary| page_key(summary) == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime validates
+        // BEFORE this handler runs, so a value that arrives here is already in range
+        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
+        // total. The default is the one AWS documents for this operation.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(summaries.len());
+
+        let next_token = summaries
+            .get(end)
+            .map(|summary| ::hex::encode(page_key(summary)));
+
+        Ok(ListAssetModelPropertiesOutput {
+            asset_model_property_summaries: summaries[start..end].to_vec(),
+            next_token,
+        })
     }
+}
+
+/// The page size AWS documents for this operation when the caller gives no
+/// `maxResults`.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// The `filter` AWS documents as this operation's default.
+const DEFAULT_FILTER: &str = "BASE";
+
+/// The `filter` value that widens the list past the model's own properties.
+const FILTER_ALL: &str = "ALL";
+
+/// One stored property definition as a `ListAssetModelProperties` summary.
+///
+/// `composite` is the composite model the property is defined in, or `None` for one
+/// of the model's own (base) properties.
+fn summarize(
+    property: &AssetModelProperty,
+    composite: Option<&AssetModelCompositeModel>,
+) -> AssetModelPropertySummary {
+    // `path` is "the structured path to the property from the root of the asset
+    // model": the containing composite model, when there is one, then the property
+    // itself. Derived from the same stored record the summary's other members come
+    // from, so the two cannot disagree.
+    let mut path = Vec::new();
+    if let Some(composite) = composite {
+        path.push(AssetModelPropertyPathSegment {
+            id: composite.id.clone(),
+            name: Some(composite.name.clone()),
+        });
+    }
+    path.push(AssetModelPropertyPathSegment {
+        id: property.id.clone(),
+        name: Some(property.name.clone()),
+    });
+
+    AssetModelPropertySummary {
+        id: property.id.clone(),
+        external_id: property.external_id.clone(),
+        name: property.name.clone(),
+        data_type: property.data_type.clone(),
+        data_type_spec: property.data_type_spec.clone(),
+        unit: property.unit.clone(),
+        r#type: property.r#type.clone(),
+        asset_model_composite_model_id: composite.and_then(|composite| composite.id.clone()),
+        path: Some(path),
+        // Which interfaces a property belongs to is written only by
+        // `PutAssetModelInterfaceRelationship`, still a 501 scaffold, so this store
+        // holds no interface relationship to report. Left ABSENT rather than reported
+        // as an empty list: the emulator has nothing to say here, which is not the
+        // same claim as "this property belongs to no interface".
+        interface_summaries: None,
+    }
+}
+
+/// This enumeration's resume key for one summary: unique, because a property id is
+/// minted unique and a composite model's properties are scoped to it.
+fn page_key(summary: &AssetModelPropertySummary) -> String {
+    format!(
+        "{}|{}",
+        summary
+            .asset_model_composite_model_id
+            .as_deref()
+            .unwrap_or_default(),
+        summary.id.as_deref().unwrap_or_default()
+    )
+}
+
+/// Decode a `nextToken` back into the resume key it names.
+fn decode_token(token: &str) -> Result<String, ListAssetModelPropertiesError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> ListAssetModelPropertiesError {
+    ListAssetModelPropertiesError::Modeled(
+        ListAssetModelPropertiesErrorModeled::InvalidRequestException(InvalidRequestException {
+            message: "The nextToken is not a token this operation issued.".to_string(),
+        }),
+    )
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the label that resolved to nothing.
+fn not_found(label: &str) -> ListAssetModelPropertiesError {
+    ListAssetModelPropertiesError::Modeled(
+        ListAssetModelPropertiesErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: format!("The asset model {label} could not be found."),
+            },
+        ),
+    )
 }
