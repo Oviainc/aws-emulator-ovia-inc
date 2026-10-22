@@ -27,6 +27,24 @@ use crate::ops::types::{
     ValidationExceptionField,
 };
 
+/// The HTTP status a successful call that has NO content to report answers with.
+///
+/// Every operation of this service leaves its success code defaulted in the model
+/// (`@http` carries no `code:`, i.e. `codeDefaulted: true`), so the Smithy default of
+/// 200 is not a statement about this service — the status is a behavioural fact, and
+/// the recorded AWS responses are what states it: a call whose output is a DECLARED
+/// structure with no members (`TagResourceResponse`, `UntagResourceResponse`,
+/// `CancelPolicyGenerationResponse` — the only three in this model) is answered with
+/// 204 No Content, because there is no content to parse. A 200 there promises a body
+/// the response does not carry, so every client path gated on 204 (conditional body
+/// parsing, caches and proxies that key on it) takes the wrong branch.
+///
+/// This does NOT extend to an operation whose output is `smithy.api#Unit` — the model
+/// gives it no response structure at all, and the recordings show AWS answering those
+/// (`CreateArchiveRule`, `UpdateArchiveRule`, `DeleteArchiveRule`, `DeleteAnalyzer`, …)
+/// with the defaulted 200; those operations keep it.
+pub const NO_CONTENT_SUCCESS_STATUS: u16 = 204;
+
 /// The status a customer-managed analyzer is in once `CreateAnalyzer` returns.
 ///
 /// One of `AnalyzerStatus`' modelled values (`ACTIVE | CREATING | DISABLED | FAILED`).

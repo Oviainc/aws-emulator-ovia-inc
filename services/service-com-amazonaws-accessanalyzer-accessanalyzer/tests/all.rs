@@ -27,6 +27,8 @@ mod harness;
 mod modeled_rejections;
 #[path = "all/modelled_wire_shape.rs"]
 mod modelled_wire_shape;
+#[path = "all/no_content_responses.rs"]
+mod no_content_responses;
 #[path = "all/policy_access_check.rs"]
 mod policy_access_check;
 #[path = "all/policy_checks.rs"]
