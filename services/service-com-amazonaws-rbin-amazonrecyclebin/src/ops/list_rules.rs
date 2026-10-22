@@ -169,10 +169,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(token) => match crate::state::decode_page_token(token) {
                 Some(identifier) => Some(identifier),
                 None => {
+                    // The token's SYNTAX satisfied `NextToken`'s `@pattern` (the gate in
+                    // `crate::service` refuses one that does not, as a parameter value
+                    // fault) — it is simply not a cursor this service issued, which is
+                    // the OTHER fault class `ValidationExceptionReason` names.
                     return Err(ListRulesErrorModeled::ValidationException(
                         ValidationException {
                             message: Some("NextToken is not a valid page token".to_string()),
-                            reason: Some("INVALID_PAGE_TOKEN".to_string()),
+                            reason: Some(
+                                crate::state::VALIDATION_REASON_INVALID_PAGE_TOKEN.to_string(),
+                            ),
                         },
                     )
                     .into())

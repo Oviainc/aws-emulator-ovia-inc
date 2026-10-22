@@ -39,7 +39,10 @@ const SECONDS_PER_DAY: f64 = 86_400.0;
 /// Source: smithy_query(query="shape", shape="ResourceType") — enum values.
 const RESOURCE_TYPES: [&str; 3] = ["EBS_SNAPSHOT", "EBS_VOLUME", "EC2_IMAGE"];
 
-async fn lock_rule(
+/// `PATCH /rules/{Identifier}/lock` with `LockConfiguration` in the body — `LockRule`.
+/// `pub(crate)` so the sibling suites of this one test target drive a lock through the
+/// same request shape.
+pub(crate) async fn lock_rule(
     router: &MultiServiceRouter,
     identifier: &str,
     body: serde_json::Value,
@@ -53,7 +56,12 @@ async fn lock_rule(
     .await
 }
 
-async fn unlock_rule(router: &MultiServiceRouter, identifier: &str) -> (u16, serde_json::Value) {
+/// `PATCH /rules/{Identifier}/unlock` — `UnlockRule`. `pub(crate)` for the same reason
+/// as [`lock_rule`].
+pub(crate) async fn unlock_rule(
+    router: &MultiServiceRouter,
+    identifier: &str,
+) -> (u16, serde_json::Value) {
     call(
         router,
         "PATCH",
@@ -62,6 +70,12 @@ async fn unlock_rule(router: &MultiServiceRouter, identifier: &str) -> (u16, ser
     )
     .await
 }
+
+/// One row of a refused lock/unlock table: the case, the identifier it addresses, the
+/// HTTP status expected, the `Reason` the body must carry (`None` where the modelled
+/// member is not populated on that path) and the `LockState` the rule must still report
+/// afterwards (`None` for a rule that has never been locked).
+type RefusalRow<'a> = (&'a str, &'a str, u16, Option<&'a str>, Option<&'a str>);
 
 /// Create a rule and hand back its minted identifier, failing the case that asked for it.
 async fn created_identifier(
@@ -277,33 +291,30 @@ async fn lock_rule_is_refused_for_every_rule_that_cannot_be_locked() {
     )
     .await;
 
-    let rows: [(&str, &str, u16, &str, Option<&str>); 4] = [
-        (
-            "unknown identifier",
-            "0000000000z",
-            404,
-            "RULE_NOT_FOUND",
-            None,
-        ),
+    // The expected `Reason` is `None` for the 404: Recycle Bin populates no `Reason` on
+    // the not-found path (see `tests/all/error_response_bodies.rs`, which asserts those
+    // bodies over the whole class).
+    let rows: [RefusalRow<'_>; 4] = [
+        ("unknown identifier", "0000000000z", 404, None, None),
         (
             "tag-level rule",
             tag_level.as_str(),
             409,
-            "INVALID_RULE_STATE",
+            Some("INVALID_RULE_STATE"),
             None,
         ),
         (
             "region-level rule with exclusion tags",
             excluded.as_str(),
             409,
-            "INVALID_RULE_STATE",
+            Some("INVALID_RULE_STATE"),
             None,
         ),
         (
             "already locked rule",
             already_locked.as_str(),
             409,
-            "INVALID_RULE_STATE",
+            Some("INVALID_RULE_STATE"),
             Some("locked"),
         ),
     ];
@@ -320,8 +331,8 @@ async fn lock_rule_is_refused_for_every_rule_that_cannot_be_locked() {
         );
         assert_eq!(
             body["Reason"].as_str(),
-            Some(expected_reason),
-            "case {case:?}: expected reason {expected_reason}, got {:?}",
+            expected_reason,
+            "case {case:?}: expected reason {expected_reason:?}, got {:?}",
             body["Reason"]
         );
         if case == "unknown identifier" {
@@ -511,20 +522,21 @@ async fn unlock_rule_is_refused_unless_the_rule_is_locked() {
          got {status}"
     );
 
-    let rows: [(&str, &str, u16, &str, Option<&str>); 3] = [
-        ("unknown identifier", "zzzzzzzzzz0", 404, "RULE_NOT_FOUND", None),
+    // As above, the 404 carries no `Reason`.
+    let rows: [RefusalRow<'_>; 3] = [
+        ("unknown identifier", "zzzzzzzzzz0", 404, None, None),
         (
             "never locked rule",
             never_locked.as_str(),
             409,
-            "INVALID_RULE_STATE",
+            Some("INVALID_RULE_STATE"),
             None,
         ),
         (
             "rule already inside its unlock delay",
             pending_unlock.as_str(),
             409,
-            "INVALID_RULE_STATE",
+            Some("INVALID_RULE_STATE"),
             Some("pending_unlock"),
         ),
     ];
@@ -536,8 +548,8 @@ async fn unlock_rule_is_refused_unless_the_rule_is_locked() {
         );
         assert_eq!(
             body["Reason"].as_str(),
-            Some(expected_reason),
-            "case {case:?}: expected reason {expected_reason}, got {:?}",
+            expected_reason,
+            "case {case:?}: expected reason {expected_reason:?}, got {:?}",
             body["Reason"]
         );
         if case == "unknown identifier" {
