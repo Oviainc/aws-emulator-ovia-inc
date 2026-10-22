@@ -145,11 +145,24 @@ impl From<CreateRepositoryErrorModeled> for CreateRepositoryError {
 
 /// The `Repository` this operation reports comes from [`crate::state::Repo`], so the
 /// shared failures those helpers raise are mapped onto this operation's own modelled
-/// error here.
-fn invalid_parameter(fault: crate::state::Fault) -> CreateRepositoryErrorModeled {
-    CreateRepositoryErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(fault.message().to_string()),
-    })
+/// errors here.
+fn fault_error(fault: crate::state::Fault) -> CreateRepositoryErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::InvalidTagParameter(_) => {
+            CreateRepositoryErrorModeled::InvalidTagParameterException(
+                InvalidTagParameterException { message },
+            )
+        }
+        crate::state::Fault::TooManyTags(_) => {
+            CreateRepositoryErrorModeled::TooManyTagsException(TooManyTagsException { message })
+        }
+        // `RepositoryNotFound` and `ImageNotFound` cannot arise here: this operation
+        // resolves neither an existing repository nor an image.
+        _ => CreateRepositoryErrorModeled::InvalidParameterException(InvalidParameterException {
+            message,
+        }),
+    }
 }
 
 /// The `CreateRepository` operation.
@@ -197,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `registryId` names the registry to create the repository in; this emulator
         // serves exactly one registry — its own account's.
-        crate::state::check_registry(input.registry_id.as_ref()).map_err(invalid_parameter)?;
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
 
         // "If this parameter is omitted, the default setting of MUTABLE will be used."
         // A value outside `ImageTagMutability` was already refused at the boundary.
@@ -219,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if encryption.kms_key.is_some()
             && encryption.encryption_type == crate::state::S3_MANAGED_ENCRYPTION_TYPE
         {
-            return Err(invalid_parameter(crate::state::Fault::InvalidParameter(
+            return Err(fault_error(crate::state::Fault::InvalidParameter(
                 "encryptionConfiguration.kmsKey cannot be specified with the AES256 \
                  encryption type"
                     .to_string(),
@@ -227,52 +240,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "The maximum number of tags that can be applied to a repository is 50"; a tag
-        // key is at most 128 and a tag value at most 256 characters.
+        // The tags a repository is created with are the same tags `TagResource` applies
+        // later, so they go through the same checks: no key in the reserved namespace,
+        // no over-long key or value, and no more tags than one repository may carry
+        // ("the maximum number of tags that can be applied to a repository is 50").
         let tags = input.tags.unwrap_or_default();
-        if tags.len() > crate::state::MAX_TAGS {
-            return Err(
-                CreateRepositoryErrorModeled::TooManyTagsException(TooManyTagsException {
-                    message: Some(format!(
-                        "{} tags were supplied; the maximum number of tags that can be \
-                         applied to a repository is {}",
-                        tags.len(),
-                        crate::state::MAX_TAGS
-                    )),
-                })
-                .into(),
-            );
-        }
-        for tag in &tags {
-            let key_len = tag.key.chars().count();
-            let value_len = tag.value.chars().count();
-            if key_len > crate::state::MAX_TAG_KEY_LEN {
-                return Err(CreateRepositoryErrorModeled::InvalidTagParameterException(
-                    InvalidTagParameterException {
-                        message: Some(format!(
-                            "tag key '{}' is {key_len} characters; a tag key can have a \
-                             maximum character length of {}",
-                            tag.key,
-                            crate::state::MAX_TAG_KEY_LEN
-                        )),
-                    },
-                )
-                .into());
-            }
-            if value_len > crate::state::MAX_TAG_VALUE_LEN {
-                return Err(CreateRepositoryErrorModeled::InvalidTagParameterException(
-                    InvalidTagParameterException {
-                        message: Some(format!(
-                            "the value of tag key '{}' is {value_len} characters; a tag \
-                             value can have a maximum length of {}",
-                            tag.key,
-                            crate::state::MAX_TAG_VALUE_LEN
-                        )),
-                    },
-                )
-                .into());
-            }
-        }
+        crate::state::check_tags(&tags).map_err(fault_error)?;
+        crate::state::check_tag_count(&[], &tags).map_err(fault_error)?;
 
         let now = ::std::time::SystemTime::now();
         // ECR is regional: the ARN and the repository URI name the region the request
@@ -310,7 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let repo = crate::state::Repo {
+        let mut repo = crate::state::Repo {
             arn: crate::state::repository_arn(&region, &name),
             uri: crate::state::repository_uri(&region, &name),
             registry_id: crate::state::registry_id().to_string(),
@@ -322,10 +296,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default(),
             image_scanning_config: input.image_scanning_configuration,
             encryption_config: encryption,
-            tags,
+            tags: Vec::new(),
             images: ::std::collections::BTreeMap::new(),
             tag_index: ::std::collections::BTreeMap::new(),
         };
+
+        // The create's tags go in through the same merge `TagResource` uses, so one key
+        // carries one value here too: a request naming a key twice stores the last value
+        // for it rather than two entries for one key.
+        repo.merge_tags(tags);
 
         let repository = repo.to_repository();
         store.repositories.insert(name, repo);
