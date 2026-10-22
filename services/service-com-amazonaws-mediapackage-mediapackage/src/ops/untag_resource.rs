@@ -165,29 +165,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Parsed before the store is read, exactly as on `TagResource`: a `ResourceArn`
         // that names no MediaPackage resource type is a malformed request, not a missing
-        // resource.
+        // resource — so it is keyed by the member rather than by a resource type.
         let Some(target) = crate::state::parse_tag_arn(&input.resource_arn) else {
-            return Err(UntagResourceErrorModeled::UnprocessableEntityException(
-                UnprocessableEntityException {
-                    message: Some(format!(
-                        "ResourceArn \"{}\" is not a MediaPackage channel or origin endpoint ARN.",
-                        input.resource_arn
-                    )),
-                },
+            return Err(crate::state::member_invalid(
+                "resourceArn",
+                "must be a MediaPackage channel or origin endpoint ARN",
             )
             .into());
         };
 
         let mut state = state.lock();
         let Some(tags) = state.tags_mut(&target) else {
-            return Err(UntagResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "{} with ID \"{}\" not found.",
-                    target.label(),
-                    target.id()
-                )),
-            })
-            .into());
+            return Err(
+                crate::state::resource_not_found(target.kind(), target.id()).into(),
+            );
         };
 
         // The request's effect is that the named keys are gone, so a key the resource

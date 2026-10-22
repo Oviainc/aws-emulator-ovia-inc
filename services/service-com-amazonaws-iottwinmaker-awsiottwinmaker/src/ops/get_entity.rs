@@ -309,47 +309,18 @@ fn components_response(
         .collect()
 }
 
-/// The single value the model's `GroupType` enum defines (`GROUP_TYPE_VALUES`).
-///
-/// Named here so the response fallback below cannot emit a value the model does
-/// not define.
-const TABULAR_GROUP_TYPE: &str = "TABULAR";
-
 /// One stored property as the modelled `PropertyResponse`.
+///
+/// The definition is projected by [`crate::state::property_definition_response`],
+/// the one conversion every reader of a stored definition shares, so an entity's
+/// properties and a component type's property definitions report a definition
+/// the same way.
 fn property_response(property: &crate::state::PropertyRecord) -> PropertyResponse {
     PropertyResponse {
-        definition: property.definition.as_ref().and_then(|definition| {
-            // `dataType` is required on the response but optional on the
-            // request (an update may omit it). `CreateEntity` refuses a new
-            // property definition without one, so a stored definition always
-            // carries it; this stays fallible rather than inventing an enum
-            // value the model does not define.
-            let Some(data_type) = definition.data_type.clone() else {
-                // Unreachable while `CreateEntity` is the only write path: it
-                // refuses a new property definition without a `dataType`.
-                // Logged rather than dropped silently so a regression there is
-                // visible instead of quietly costing the member.
-                ::tracing::warn!(
-                    "a stored property definition carries no dataType; omitting the definition"
-                );
-                return None;
-            };
-            Some(PropertyDefinitionResponse {
-                data_type,
-                is_time_series: definition.is_time_series.unwrap_or(false),
-                is_required_in_entity: definition.is_required_in_entity.unwrap_or(false),
-                is_external_id: definition.is_external_id.unwrap_or(false),
-                is_stored_externally: definition.is_stored_externally.unwrap_or(false),
-                // Nothing imports, finalises or inherits a definition in this
-                // slice: all three come from a component type.
-                is_imported: false,
-                is_final: false,
-                is_inherited: false,
-                default_value: definition.default_value.clone(),
-                configuration: definition.configuration.clone(),
-                display_name: definition.display_name.clone(),
-            })
-        }),
+        definition: property
+            .definition
+            .as_ref()
+            .and_then(crate::state::property_definition_response),
         value: property.value.clone(),
         are_all_property_values_returned: Some(true),
     }
@@ -358,8 +329,9 @@ fn property_response(property: &crate::state::PropertyRecord) -> PropertyRespons
 /// One stored property group as the modelled `ComponentPropertyGroupResponse`.
 ///
 /// `groupType` is required on the response but optional on the request; the
-/// model's `GroupType` enum admits exactly one value (`GROUP_TYPE_VALUES`), so a
-/// group stored without one reports that value.
+/// model's `GroupType` enum admits exactly one value
+/// ([`crate::state::TABULAR_GROUP_TYPE`]), so a group stored without one reports
+/// that value.
 fn property_group_response(
     group: &crate::state::PropertyGroupRecord,
 ) -> ComponentPropertyGroupResponse {
@@ -367,7 +339,7 @@ fn property_group_response(
         group_type: group
             .group_type
             .clone()
-            .unwrap_or_else(|| TABULAR_GROUP_TYPE.to_string()),
+            .unwrap_or_else(|| crate::state::TABULAR_GROUP_TYPE.to_string()),
         property_names: group.property_names.clone(),
         is_inherited: false,
     }

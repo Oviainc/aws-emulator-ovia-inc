@@ -4,11 +4,11 @@
 //! Deletes a workspace, so the next `GetWorkspace` on it is a
 //! `ResourceNotFoundException`.
 //!
-//! The workspace must be EMPTY first: AWS requires the entities (and, in a later
-//! slice, the component types and scenes) in a workspace to be deleted before
-//! the workspace itself, so one that still holds entities is refused with the
-//! modelled `ValidationException` rather than silently cascading. The ARN the
-//! workspace was minted with stops resolving with it.
+//! The workspace must be EMPTY first: AWS requires the resources in a workspace
+//! (its entities and component types, and in a later slice its scenes) to be
+//! deleted before the workspace itself, so one that still holds either is
+//! refused with the modelled `ValidationException` rather than silently
+//! cascading. The ARN the workspace was minted with stops resolving with it.
 //!
 //! Authorization is not emulated, so the modelled `AccessDeniedException` is
 //! never returned: a 200 from here is not an authorization decision.
@@ -171,7 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // A workspace's contents are deleted before the workspace itself.
+        // A workspace's contents are deleted before the workspace itself —
+        // every kind of them, so no contained resource and no ARN it was
+        // indexed under can outlive the workspace that owned it.
         if !workspace.entities.is_empty() {
             return Err(DeleteWorkspaceErrorModeled::ValidationException(
                 ValidationException {
@@ -179,6 +181,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "workspace {} still contains {} entities; delete them first",
                         input.workspace_id,
                         workspace.entities.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        if !workspace.component_types.is_empty() {
+            return Err(DeleteWorkspaceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "workspace {} still contains {} component types; delete them first",
+                        input.workspace_id,
+                        workspace.component_types.len()
                     )),
                 },
             )

@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(stored) = store.distribution(&input.distribution_id) else {
             return Err(CreateInvalidationErrorModeled::NoSuchDistribution(
-                crate::state::no_such_distribution(&input.distribution_id),
+                crate::state::no_such_distribution(),
             )
             .into());
         };
@@ -262,7 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let reported = invalidation.to_invalidation();
         let Some(owner) = store.distributions.get_mut(&input.distribution_id) else {
             return Err(CreateInvalidationErrorModeled::NoSuchDistribution(
-                crate::state::no_such_distribution(&input.distribution_id),
+                crate::state::no_such_distribution(),
             )
             .into());
         };

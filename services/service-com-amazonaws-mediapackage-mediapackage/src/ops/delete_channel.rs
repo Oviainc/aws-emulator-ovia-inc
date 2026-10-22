@@ -145,26 +145,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         if !state.channels.contains_key(&input.id) {
-            return Err(DeleteChannelErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Channel with ID \"{}\" not found.", input.id)),
-            })
-            .into());
+            return Err(crate::state::channel_not_found(&input.id).into());
         }
 
         // An OriginEndpoint packages exactly one Channel, so a channel that still has
         // endpoints cannot be deleted: its endpoints are removed first. This is also what
         // keeps the two stores consistent — no stored endpoint ever names a channel this
-        // service no longer holds, which `CreateOriginEndpoint` already refuses as 404.
+        // service no longer holds, which `CreateOriginEndpoint` already refuses.
+        //
+        // The refusal names the blocker programmatically — how many children hold the
+        // channel, and what they are — in the body's `errors` map, so a client learns the
+        // dependency from the error rather than only from its prose.
         let endpoints = state.origin_endpoints_of(&input.id);
         if endpoints > 0 {
-            return Err(DeleteChannelErrorModeled::UnprocessableEntityException(
-                UnprocessableEntityException {
-                    message: Some(format!(
-                        "Channel with ID \"{}\" still has {endpoints} origin endpoint(s); \
-                         delete them before deleting the channel.",
-                        input.id
-                    )),
-                },
+            return Err(crate::state::has_attached_children(
+                crate::state::CHANNEL_KIND,
+                crate::state::ORIGIN_ENDPOINT_SHAPE,
+                endpoints,
             )
             .into());
         }

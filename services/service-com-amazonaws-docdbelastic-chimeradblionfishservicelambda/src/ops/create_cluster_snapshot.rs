@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Everything the snapshot copies is taken here, in one lookup.
         let Some(cluster) = guard.clusters.get(&input.cluster_arn) else {
             return Err(CreateClusterSnapshotErrorModeled::ResourceNotFoundException(
-                state::not_found("cluster", &input.cluster_arn),
+                state::not_found(state::ResourceKind::Cluster, &input.cluster_arn),
             )
             .into());
         };
@@ -192,21 +192,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(CreateClusterSnapshotErrorModeled::ServiceQuotaExceededException)?;
         if let Some(existing_arn) = guard.snapshot_names.get(&input.snapshot_name) {
             return Err(CreateClusterSnapshotErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
+                state::conflict(
+                    state::ResourceKind::ClusterSnapshot,
+                    existing_arn,
+                    format!(
                         "A cluster snapshot named {} already exists",
                         input.snapshot_name
                     ),
-                    resource_id: existing_arn.clone(),
-                    resource_type: "cluster-snapshot".to_string(),
-                },
+                ),
             )
             .into());
         }
 
         let snapshot_id = state::new_resource_id();
-        let snapshot_arn =
-            state::docdb_elastic_arn(&region, &format!("cluster-snapshot/{snapshot_id}"));
+        let snapshot_arn = state::ResourceKind::ClusterSnapshot.arn(&region, &snapshot_id);
         let record = state::SnapshotRecord {
             snapshot_name: input.snapshot_name,
             snapshot_arn: snapshot_arn.clone(),

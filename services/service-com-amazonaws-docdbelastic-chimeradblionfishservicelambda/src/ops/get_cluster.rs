@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = store.lock();
         let Some(record) = guard.clusters.get_mut(&input.cluster_arn) else {
             return Err(GetClusterErrorModeled::ResourceNotFoundException(
-                state::not_found("cluster", &input.cluster_arn),
+                state::not_found(state::ResourceKind::Cluster, &input.cluster_arn),
             )
             .into());
         };

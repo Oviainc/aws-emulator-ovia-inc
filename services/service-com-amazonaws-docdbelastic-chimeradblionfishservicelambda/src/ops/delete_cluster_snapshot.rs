@@ -158,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = store.lock();
         let Some(mut record) = guard.snapshots.remove(&input.snapshot_arn) else {
             return Err(DeleteClusterSnapshotErrorModeled::ResourceNotFoundException(
-                state::not_found("cluster-snapshot", &input.snapshot_arn),
+                state::not_found(state::ResourceKind::ClusterSnapshot, &input.snapshot_arn),
             )
             .into());
         };

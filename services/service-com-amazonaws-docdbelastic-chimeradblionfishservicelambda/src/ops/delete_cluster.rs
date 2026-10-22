@@ -159,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // gone, not merely flagged.
         let Some(mut record) = guard.clusters.remove(&input.cluster_arn) else {
             return Err(DeleteClusterErrorModeled::ResourceNotFoundException(
-                state::not_found("cluster", &input.cluster_arn),
+                state::not_found(state::ResourceKind::Cluster, &input.cluster_arn),
             )
             .into());
         };

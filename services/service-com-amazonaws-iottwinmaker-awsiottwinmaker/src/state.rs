@@ -3,19 +3,23 @@
 //! Engine state for the com-amazonaws-iottwinmaker-awsiottwinmaker service.
 //!
 //! IoT TwinMaker's control plane is a two-level tree: a *workspace* owns the
-//! *entities* (and, in a later slice, the component types and scenes) created
-//! inside it. That containment is modelled literally here — `Workspace::entities`
-//! — so an entity cannot outlive its workspace and two operations cannot read two
-//! copies of one entity.
+//! *entities* and *component types* (and, in a later slice, the scenes) created
+//! inside it. That containment is modelled literally here —
+//! `Workspace::entities` and `Workspace::component_types` — so neither can
+//! outlive its workspace and two operations cannot read two copies of one
+//! resource.
 //!
 //! Nothing derivable is stored: `hasChildEntities` is computed by scanning the
-//! workspace's entities for the id as a parent. An entity's `state`, by
-//! contrast, IS stored — a create settles it in `ACTIVE` within the call that
-//! asked for it, so there is no provisioning instant for a read to compute a
-//! transient state from.
+//! workspace's entities for the id as a parent. A resource's `state`, by
+//! contrast, IS stored. An entity's create settles it in `ACTIVE` within the
+//! call that asked for it, so there is no provisioning instant for a read to
+//! compute a transient state from; a component type's create answers the
+//! non-terminal `CREATING`, so its record also carries the instant its
+//! transition to `ACTIVE` falls due (`ComponentType::settles_at`), which a
+//! reader materialises rather than sleeps for.
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// The `ParentEntityId` sentinel the service uses for an entity with no parent.
 /// Taken from the `ParentEntityId` pattern, which admits the literal `$ROOT`
@@ -36,6 +40,36 @@ pub const ROOT_PARENT_ENTITY_ID: &str = "$ROOT";
 pub const STATE_ACTIVE: &str = "ACTIVE";
 /// See [`STATE_ACTIVE`].
 pub const STATE_DELETING: &str = "DELETING";
+/// See [`STATE_ACTIVE`]. A COMPONENT TYPE, unlike an entity, is reported in
+/// this non-terminal state by the call that creates it and settles in
+/// [`STATE_ACTIVE`] once [`COMPONENT_TYPE_SETTLE_SPAN`] has elapsed.
+pub const STATE_CREATING: &str = "CREATING";
+
+/// How long a component type stays in [`STATE_CREATING`] before the clock makes
+/// its transition to [`STATE_ACTIVE`] due.
+///
+/// `CreateComponentType` answers with the component type's `state`, and the
+/// state of a component type the service has just accepted is the non-terminal
+/// `CREATING` — so there IS a provisioning window here, unlike an entity, which
+/// is reported `ACTIVE` by its own create. AWS documents no duration for that
+/// window, so this span is CHOSEN by this emulator; it is deliberately non-zero,
+/// so a caller that reads the component type back in the same breath as the
+/// create still observes `CREATING`, and deliberately short, so a client that
+/// polls reaches `ACTIVE` without a long wait. Nothing sleeps for it: the
+/// instant it is due is stored on the record (see
+/// [`ComponentType::settles_at`]) and a reader materialises the transition the
+/// clock already owed.
+pub const COMPONENT_TYPE_SETTLE_SPAN: Duration = Duration::from_millis(500);
+
+/// The name of the function whose presence makes a component type's schema
+/// initialized.
+///
+/// `isSchemaInitialized` is documented as "whether the component type has a
+/// schema initializer and that the schema initializer has run": the schema
+/// initializer is the entry of a component type's `functions` map under this
+/// name, so a component type whose `functions` carry none has no schema to
+/// initialize. See [`ComponentType::is_schema_initialized`].
+pub const SCHEMA_INITIALIZER_FUNCTION: &str = "schemaInitializer";
 
 /// The region an emulated ARN is built in when a request carries no SigV4
 /// credential scope to read one from.
@@ -74,9 +108,10 @@ pub const MAX_PROPERTIES_RETURNED: usize = 800;
 /// `TooManyTagsException` (HTTP 400) that operation models.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
-/// The most workspaces this emulator holds, and the most entities one workspace
-/// holds, before `CreateWorkspace` / `CreateEntity` answer the
-/// `ServiceQuotaExceededException` (HTTP 402) both operations model.
+/// The most workspaces this emulator holds, the most entities one workspace
+/// holds, and the most component types one workspace holds, before
+/// `CreateWorkspace` / `CreateEntity` / `CreateComponentType` answer the
+/// `ServiceQuotaExceededException` (HTTP 402) each operation models.
 ///
 /// The real service's quotas are per-account and adjustable, so no fixed number
 /// is AWS's; these are this emulator's own declared ceilings, so the in-memory
@@ -84,6 +119,8 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 pub const MAX_WORKSPACES: usize = 50;
 /// See [`MAX_WORKSPACES`].
 pub const MAX_ENTITIES_PER_WORKSPACE: usize = 1000;
+/// See [`MAX_WORKSPACES`].
+pub const MAX_COMPONENT_TYPES_PER_WORKSPACE: usize = 1000;
 
 /// Per-service state for com-amazonaws-iottwinmaker-awsiottwinmaker. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -105,6 +142,11 @@ pub enum ResourceRef {
     Entity {
         workspace_id: String,
         entity_id: String,
+    },
+    /// A component type, by the workspace that owns it and its own id.
+    ComponentType {
+        workspace_id: String,
+        component_type_id: String,
     },
 }
 
@@ -128,6 +170,13 @@ pub struct Workspace {
     pub update_date_time: SystemTime,
     /// The entities created in this workspace, keyed by `entityId`.
     pub entities: BTreeMap<String, Entity>,
+    /// The component types created in this workspace, keyed by
+    /// `componentTypeId`. Owned by the workspace for the same reason entities
+    /// are: a component type is addressed as
+    /// `/workspaces/{workspaceId}/component-types/{componentTypeId}`, so it
+    /// cannot outlive the workspace that contains it, and two operations must
+    /// not read two copies of one component type.
+    pub component_types: BTreeMap<String, ComponentType>,
 }
 
 impl Workspace {
@@ -230,6 +279,80 @@ impl Entity {
     }
 }
 
+/// One stored component type.
+///
+/// A component type's property definitions, functions and composite component
+/// types are kept as the modelled REQUEST shapes the caller supplied — the same
+/// choice [`ComponentRecord`] makes for an entity's properties — so a read
+/// reports back exactly what was persisted rather than a lossy projection of
+/// it.
+#[derive(Debug, Clone)]
+pub struct ComponentType {
+    pub component_type_id: String,
+    pub arn: String,
+    pub workspace_id: String,
+    /// The friendly name the create supplied, absent when it named none.
+    pub component_type_name: Option<String>,
+    /// The description the create supplied, absent when it named none.
+    pub description: Option<String>,
+    /// "Whether an entity can have more than one component of this type" — the
+    /// member's own documentation. Stored resolved: a create that names none
+    /// leaves it `false`.
+    pub is_singleton: bool,
+    /// The parent component types this one extends, in the order the create
+    /// gave them.
+    pub extends_from: Vec<String>,
+    pub property_definitions: BTreeMap<String, crate::ops::types::PropertyDefinitionRequest>,
+    pub functions: BTreeMap<String, crate::ops::types::FunctionRequest>,
+    pub property_groups: BTreeMap<String, PropertyGroupRecord>,
+    pub composite_component_types:
+        BTreeMap<String, crate::ops::types::CompositeComponentTypeRequest>,
+    pub tags: BTreeMap<String, String>,
+    pub creation_date_time: SystemTime,
+    pub update_date_time: SystemTime,
+    /// The component type's `State`, as STORED: [`STATE_CREATING`] from the
+    /// create until [`settles_at`](Self::settles_at) passes, then
+    /// [`STATE_ACTIVE`].
+    pub state: String,
+    /// The instant the transition out of [`STATE_CREATING`] falls due —
+    /// the create's instant plus [`COMPONENT_TYPE_SETTLE_SPAN`]. Stored, never
+    /// slept for, so a reader can materialise a transition the clock already
+    /// owed without any caller having had to poll.
+    pub settles_at: SystemTime,
+}
+
+impl ComponentType {
+    /// Materialise the lifecycle transition the CLOCK has already made due.
+    ///
+    /// Called by a reader before it reports this component type: the
+    /// `CREATING` -> `ACTIVE` transition was owed at
+    /// [`settles_at`](Self::settles_at) whether or not anybody called, so
+    /// writing it here is making the record say what was already true, not a
+    /// change a read caused. Idempotent, and a no-op before the instant falls
+    /// due.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.state == STATE_CREATING && now >= self.settles_at {
+            self.state = STATE_ACTIVE.to_string();
+        }
+    }
+
+    /// The component type's modelled `Status`: its stored state plus the
+    /// `error` structure every reported status carries. See [`status`].
+    pub fn status(&self) -> crate::ops::types::Status {
+        status(&self.state)
+    }
+
+    /// Whether the component type "has a schema initializer and the schema
+    /// initializer has run" (the `isSchemaInitialized` member's own
+    /// documentation): it has one when its `functions` carry
+    /// [`SCHEMA_INITIALIZER_FUNCTION`], and that initializer has run once the
+    /// create has settled, which is exactly when the stored state is
+    /// [`STATE_ACTIVE`].
+    pub fn is_schema_initialized(&self) -> bool {
+        self.functions.contains_key(SCHEMA_INITIALIZER_FUNCTION) && self.state == STATE_ACTIVE
+    }
+}
+
 /// The modelled `Status` of a resource in `state`.
 ///
 /// Both of `Status`'s members are optional in the model, but the service
@@ -246,6 +369,53 @@ pub fn status(state: &str) -> crate::ops::types::Status {
             message: None,
         }),
     }
+}
+
+/// The single value the model's `GroupType` enum defines
+/// (`ops::types::GROUP_TYPE_VALUES`).
+///
+/// `groupType` is required on every property-group RESPONSE but optional on the
+/// request, so a group stored without one is reported with the only value the
+/// model admits rather than with an invented string.
+pub const TABULAR_GROUP_TYPE: &str = "TABULAR";
+
+/// One stored `PropertyDefinitionRequest` as the modelled
+/// `PropertyDefinitionResponse` a read reports.
+///
+/// Shared by every reader of a stored definition — an entity's component
+/// properties (`GetEntity`) and a component type's own property definitions
+/// (`GetComponentType`) — so both report one definition the same way.
+///
+/// `None` when the stored definition carries no `dataType`, which the response
+/// shape requires: the writers refuse a new definition without one, so this
+/// stays fallible rather than inventing a `Type` the model does not define.
+/// Nothing imports, finalises or inherits a definition yet: `isImported`,
+/// `isFinal` and `isInherited` all describe a definition that came from
+/// somewhere else, and every definition stored here was written by the create
+/// that declared it.
+pub fn property_definition_response(
+    definition: &crate::ops::types::PropertyDefinitionRequest,
+) -> Option<crate::ops::types::PropertyDefinitionResponse> {
+    let Some(data_type) = definition.data_type.clone() else {
+        // Logged rather than dropped silently so a regression in a writer that
+        // is supposed to refuse a definition without a `dataType` is visible
+        // instead of quietly costing the member.
+        ::tracing::warn!("a stored property definition carries no dataType; omitting it");
+        return None;
+    };
+    Some(crate::ops::types::PropertyDefinitionResponse {
+        data_type,
+        is_time_series: definition.is_time_series.unwrap_or(false),
+        is_required_in_entity: definition.is_required_in_entity.unwrap_or(false),
+        is_external_id: definition.is_external_id.unwrap_or(false),
+        is_stored_externally: definition.is_stored_externally.unwrap_or(false),
+        is_imported: false,
+        is_final: false,
+        is_inherited: false,
+        default_value: definition.default_value.clone(),
+        configuration: definition.configuration.clone(),
+        display_name: definition.display_name.clone(),
+    })
 }
 
 /// One component of an entity.
@@ -332,8 +502,9 @@ impl ComAmazonawsIottwinmakerAwsiottwinmakerState {
     ///
     /// ONE resolution path for every taggable resource: the tags live on the
     /// resource record itself (never in a second map beside it), and the ARN
-    /// index says which record an ARN points at, so a workspace and an entity
-    /// are reached the same way and a reader and a writer see one tag set.
+    /// index says which record an ARN points at, so a workspace, an entity and
+    /// a component type are reached the same way and a reader and a writer see
+    /// one tag set.
     pub fn tags_for_resource(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
         match self.arn_index.get(resource_arn)? {
             ResourceRef::Workspace { workspace_id } => {
@@ -348,6 +519,17 @@ impl ComAmazonawsIottwinmakerAwsiottwinmakerState {
                     .get(workspace_id)?
                     .entities
                     .get(entity_id)?
+                    .tags,
+            ),
+            ResourceRef::ComponentType {
+                workspace_id,
+                component_type_id,
+            } => Some(
+                &self
+                    .workspaces
+                    .get(workspace_id)?
+                    .component_types
+                    .get(component_type_id)?
                     .tags,
             ),
         }
@@ -377,6 +559,17 @@ impl ComAmazonawsIottwinmakerAwsiottwinmakerState {
                     .get_mut(&entity_id)?
                     .tags,
             ),
+            ResourceRef::ComponentType {
+                workspace_id,
+                component_type_id,
+            } => Some(
+                &mut self
+                    .workspaces
+                    .get_mut(&workspace_id)?
+                    .component_types
+                    .get_mut(&component_type_id)?
+                    .tags,
+            ),
         }
     }
 }
@@ -397,6 +590,13 @@ pub fn resource_not_found_message(resource_arn: &str) -> String {
 /// `ResourceNotFoundException` for an entity uses.
 pub fn entity_not_found_message(workspace_id: &str, entity_id: &str) -> String {
     format!("Entity {entity_id} in workspace {workspace_id} not found.")
+}
+
+/// The message for a component type the workspace the request named does not
+/// hold. Built from the request, naming what was looked for and where, the same
+/// construction as [`entity_not_found_message`] one resource across.
+pub fn component_type_not_found_message(workspace_id: &str, component_type_id: &str) -> String {
+    format!("ComponentType {component_type_id} in workspace {workspace_id} not found.")
 }
 
 /// The message for a workspace this service does not hold: built from the
@@ -435,6 +635,16 @@ pub fn entity_arn(region: &str, workspace_id: &str, entity_id: &str) -> String {
         "iottwinmaker",
         region,
         &format!("workspace/{workspace_id}/entity/{entity_id}"),
+    )
+}
+
+/// The ARN of a component type, nested under its workspace's resource path the
+/// way [`entity_arn`] nests an entity's.
+pub fn component_type_arn(region: &str, workspace_id: &str, component_type_id: &str) -> String {
+    ::engine::emulator_arn(
+        "iottwinmaker",
+        region,
+        &format!("workspace/{workspace_id}/componentType/{component_type_id}"),
     )
 }
 

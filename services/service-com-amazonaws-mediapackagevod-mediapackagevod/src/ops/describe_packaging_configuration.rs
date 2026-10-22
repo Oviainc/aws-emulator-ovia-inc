@@ -169,11 +169,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read: the response is computed from the stored record and the tag store
         // and nothing is written, so a later caller sees exactly what this one saw.
         let state = store.lock();
+        // The `Id` addresses the resource (it is an `@httpLabel`), so one this service
+        // holds nothing under is the addressed resource missing — 404.
         let Some(stored) = state.packaging_configurations.get(&input.id) else {
             return Err(DescribePackagingConfigurationErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::scaffolded::not_found_message(
-                        "PackagingConfiguration",
+                        crate::scaffolded::PACKAGING_CONFIGURATION_LABEL,
                         &input.id,
                     )),
                 },
