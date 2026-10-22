@@ -373,6 +373,12 @@ fn delete_input(
 /// "the list of inputs / channels currently using this Input Security Group", so
 /// a group a resource still uses is refused; a group nothing uses moves to the
 /// terminal `DELETED` state it then keeps.
+///
+/// The refusal is THIS operation's: it is reported through the batch's recorded
+/// per-resource failure channel. The single-resource
+/// `DeleteInputSecurityGroup` deletes an in-use group instead, because it models
+/// no conflict error and no recording shows it refusing — see the note in
+/// `ops::delete_input_security_group`.
 fn delete_input_security_group(
     state: &mut State,
     id: &str,

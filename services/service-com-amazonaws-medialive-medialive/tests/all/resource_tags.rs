@@ -164,7 +164,7 @@ async fn create_resource(
         "inputSecurityGroup" => (
             "/prod/inputSecurityGroups".to_string(),
             with_tags(json!({ "whitelistRules": [{ "cidr": "192.0.2.0/24" }] })),
-            200,
+            201,
             vec!["securityGroup", "arn"],
         ),
         "sdiSource" => (
