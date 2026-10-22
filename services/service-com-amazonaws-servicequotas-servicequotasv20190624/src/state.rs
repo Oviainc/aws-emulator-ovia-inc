@@ -17,6 +17,10 @@
 //!   `ListRequestedServiceQuotaChangeHistoryByQuota`) — append-only, with an
 //!   insertion-ordered index so a history listing is newest-first and a pagination
 //!   token keeps meaning the same position;
+//! * the **quota utilization reports** (`StartQuotaUtilizationReport`,
+//!   `GetQuotaUtilizationReport`) — each one a FROZEN snapshot of the quota values in
+//!   force when it was initiated, published once the clock has made its generation
+//!   due and deleted once its retention has passed;
 //! * the **tags on an applied quota** (`TagResource`, `ListTagsForResource`,
 //!   `UntagResource`) — keyed by the quota's own ARN, the only thing a tagging
 //!   operation names its resource by, so one quota has exactly one tag set however
@@ -47,8 +51,8 @@ use std::time::{Duration, SystemTime};
 use base64::Engine as _;
 
 use crate::ops::types::{
-    MetricInfo, QuotaInfo, QuotaPeriod, RequestedServiceQuotaChange, ServiceInfo, ServiceQuota,
-    Tag,
+    MetricInfo, QuotaInfo, QuotaPeriod, QuotaUtilizationInfo, RequestedServiceQuotaChange,
+    ServiceInfo, ServiceQuota, Tag,
 };
 
 /// The region a request carries no SigV4 credential scope to name, and the one a
@@ -163,6 +167,63 @@ pub const REQUEST_DECISION_DELAY: Duration = Duration::from_millis(500);
 /// caller that names no `MaxResults` gets the whole listing in one page (see
 /// [`paginate`]).
 pub const MAX_PAGE_SIZE: usize = 100;
+
+/// `ReportStatus` member `PENDING`: the status a report carries from the call that
+/// initiates it until its generation starts.
+pub const REPORT_STATUS_PENDING: &str = "PENDING";
+/// `ReportStatus` member `IN_PROGRESS`: generation has started.
+pub const REPORT_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+/// `ReportStatus` member `COMPLETED`: the report's results are available.
+pub const REPORT_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// How long after it is initiated a utilization report's generation starts
+/// (`PENDING` -> `IN_PROGRESS`).
+///
+/// CHOSEN, not an AWS-documented duration: `StartQuotaUtilizationReport` documents
+/// only that generation "may take several seconds ... depending on the number of
+/// quotas". It is kept inside the 250-750 ms band this project fixes for a transition
+/// the clock owes, so a caller that polls straight after starting a report still
+/// observes `PENDING`, and nothing sleeps: the due instant is stored on the report and
+/// materialised on the next call that is already past it.
+pub const REPORT_PROCESSING_DELAY: Duration = Duration::from_millis(250);
+
+/// How long after it is initiated a utilization report's generation completes
+/// (`IN_PROGRESS` -> `COMPLETED`). CHOSEN for the same reason as
+/// [`REPORT_PROCESSING_DELAY`], and 250 ms past it, so each of the two transitions
+/// the clock owes sits inside that band.
+pub const REPORT_COMPLETION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long a utilization report is readable before it is deleted.
+///
+/// AWS-DOCUMENTED, so it keeps its value: `GetQuotaUtilizationReport`'s own
+/// documentation says "Reports are automatically deleted after 15 minutes."
+pub const REPORT_RETENTION: Duration = Duration::from_secs(15 * 60);
+
+/// The most un-expired utilization reports this emulator keeps per region.
+///
+/// A report holds a snapshot of every quota, so the store needs a ceiling for a
+/// caller that starts reports in a loop; past it a further start is refused with the
+/// `TooManyRequestsException` the model declares on `StartQuotaUtilizationReport`
+/// (`@httpError(429)` in the model, which this awsJson front end puts on the wire as
+/// HTTP 400 with that `__type`, the way [`crate::scaffolded::wire_http_status`]
+/// classifies every client fault). The number is CHOSEN (AWS publishes no limit on
+/// concurrent reports) and reports leave the store on their own as
+/// [`REPORT_RETENTION`] passes.
+pub const MAX_LIVE_REPORTS_PER_REGION: usize = 50;
+
+/// The usage this service's state has recorded against a quota.
+///
+/// Zero: nothing in this emulator consumes a quota, so no consumption has ever been
+/// recorded against one. It is named rather than inlined because it is the `usage`
+/// term of the utilization formula in [`utilization_pct`], not a placeholder for a
+/// percentage.
+const RECORDED_QUOTA_USAGE: f64 = 0.0;
+
+/// The page size `GetQuotaUtilizationReport` uses when the caller names no
+/// `MaxResults`, and the most records it puts on one page: the maximum the model's
+/// `MaxResultsUtilization` range declares (1..1000), which its documentation repeats
+/// as "The default value is 1,000 and the maximum allowed value is 1,000."
+pub const UTILIZATION_REPORT_PAGE_SIZE: usize = 1_000;
 
 /// The most quota increase requests this emulator stores per region.
 ///
@@ -314,6 +375,27 @@ pub struct QuotaRequest {
     pub quota_requested_at_level: String,
 }
 
+/// One quota utilization report: the snapshot `StartQuotaUtilizationReport` froze,
+/// plus the instants the clock owes its generation and its deletion at.
+#[derive(Debug, Clone)]
+pub struct UtilizationReport {
+    /// `ReportId` — minted here and stored; every later read answers from this record.
+    pub id: String,
+    /// A `ReportStatus` member.
+    pub status: String,
+    /// When generation starts (`PENDING` -> `IN_PROGRESS`). Stored, never slept on.
+    pub in_progress_at: SystemTime,
+    /// When generation completes (`IN_PROGRESS` -> `COMPLETED`), and the `GeneratedAt`
+    /// a completed report reports. Stored, never slept on.
+    pub completed_at: SystemTime,
+    /// When the report is deleted, [`REPORT_RETENTION`] after it was initiated.
+    pub expires_at: SystemTime,
+    /// The analysed quotas, in report order. Frozen when the report was initiated —
+    /// that is the state the report analysed — and published only once the report has
+    /// completed, so every page of one report sees the same records.
+    pub quotas: Vec<QuotaUtilizationInfo>,
+}
+
 /// Why a `ResourceARN` handed to a tagging operation names no applied quota.
 ///
 /// The two cases are different refusals in the model: input this service cannot read
@@ -353,6 +435,10 @@ struct RegionState {
     /// How many requests this region has minted; part of the id derivation, so two
     /// requests for the same quota in the same nanosecond still get distinct ids.
     minted: u64,
+    /// The un-expired quota utilization reports, keyed by `ReportId`.
+    reports: BTreeMap<String, UtilizationReport>,
+    /// How many reports this region has minted; part of the report id derivation.
+    reports_minted: u64,
 }
 
 /// Per-service state for com-amazonaws-servicequotas-servicequotasv20190624. A handler reaches it through [`service_state`].
@@ -720,6 +806,119 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         }
     }
 
+    /// Initiate a quota utilization report and return the stored record — `None` when
+    /// this region already holds [`MAX_LIVE_REPORTS_PER_REGION`] un-expired reports.
+    ///
+    /// The report is stored `PENDING` with the instants its generation and its
+    /// deletion come due at, and with the snapshot of the quota values in force NOW:
+    /// that is the state the report analyses, so what it publishes does not depend on
+    /// when anybody polls it.
+    pub fn start_utilization_report(
+        &mut self,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<UtilizationReport> {
+        self.purge_expired_reports(region, now);
+        // The ceiling is checked BEFORE the snapshot is taken, so a refused start does
+        // no analysis work.
+        if self.stored_report_count(region) >= MAX_LIVE_REPORTS_PER_REGION {
+            return None;
+        }
+        let quotas = self.utilization_snapshot(region);
+        let state = self.regions.entry(region.to_string()).or_default();
+        state.reports_minted += 1;
+        let id = report_id(region, state.reports_minted, now);
+        let report = UtilizationReport {
+            id: id.clone(),
+            status: REPORT_STATUS_PENDING.to_string(),
+            in_progress_at: now + REPORT_PROCESSING_DELAY,
+            completed_at: now + REPORT_COMPLETION_DELAY,
+            expires_at: now + REPORT_RETENTION,
+            quotas,
+        };
+        state.reports.insert(id, report.clone());
+        Some(report)
+    }
+
+    /// Materialise every report transition the clock has already made due in `region`:
+    /// a report past its retention is deleted, one past its completion instant is
+    /// `COMPLETED`, and one past its processing instant is `IN_PROGRESS`.
+    ///
+    /// Each of these is owed at a stored instant whether or not anybody calls, so a
+    /// reporting operation may settle them before answering and two reads at the same
+    /// instant give the same answer.
+    pub fn settle_due_reports(&mut self, region: &str, now: SystemTime) {
+        self.purge_expired_reports(region, now);
+        let Some(state) = self.regions.get_mut(region) else {
+            return;
+        };
+        for report in state.reports.values_mut() {
+            if report.status == REPORT_STATUS_COMPLETED {
+                continue;
+            }
+            if report.completed_at <= now {
+                report.status = REPORT_STATUS_COMPLETED.to_string();
+            } else if report.in_progress_at <= now {
+                report.status = REPORT_STATUS_IN_PROGRESS.to_string();
+            }
+        }
+    }
+
+    /// One stored utilization report by `ReportId`, within the caller's region.
+    pub fn utilization_report(&self, region: &str, id: &str) -> Option<&UtilizationReport> {
+        self.regions.get(region)?.reports.get(id)
+    }
+
+    /// How many un-expired utilization reports this region holds, against
+    /// [`MAX_LIVE_REPORTS_PER_REGION`].
+    pub fn stored_report_count(&self, region: &str) -> usize {
+        self.regions.get(region).map_or(0, |state| state.reports.len())
+    }
+
+    /// Every quota's utilization, as a report records it.
+    ///
+    /// One record per quota in the catalog, carrying the AWS default, the value in
+    /// force in `region` and the namespace of the metric Service Quotas tracks that
+    /// quota's usage with. Sorted by utilization DESCENDING, the quotas whose
+    /// utilization is unknown last, and then by service and quota code \u2014 a total order,
+    /// so a page boundary in one report always falls in the same place.
+    fn utilization_snapshot(&self, region: &str) -> Vec<QuotaUtilizationInfo> {
+        let mut records: Vec<QuotaUtilizationInfo> = self
+            .default_quotas
+            .iter()
+            .map(|default| {
+                let service_code = default.service_code.as_str();
+                let quota_code = default.quota_code.as_str();
+                let applied = self
+                    .applied_entry(region, service_code, quota_code)
+                    .map_or(default.value, |entry| entry.value);
+                QuotaUtilizationInfo {
+                    quota_code: Some(default.quota_code.clone()),
+                    service_code: Some(default.service_code.clone()),
+                    quota_name: Some(default.quota_name.clone()),
+                    namespace: default
+                        .usage_metric
+                        .as_ref()
+                        .and_then(|metric| metric.metric_namespace.clone()),
+                    utilization: utilization_pct(default, applied),
+                    default_value: Some(default.value),
+                    applied_value: Some(applied),
+                    service_name: self.service_name(service_code).map(str::to_string),
+                    adjustable: default.adjustable,
+                }
+            })
+            .collect();
+        records.sort_by(compare_utilization);
+        records
+    }
+
+    /// Drop every report in `region` whose retention has passed.
+    fn purge_expired_reports(&mut self, region: &str, now: SystemTime) {
+        if let Some(state) = self.regions.get_mut(region) {
+            state.reports.retain(|_, report| report.expires_at > now);
+        }
+    }
+
     /// The applied quota a tagging operation's `ResourceARN` names, as the ARN this
     /// service reports for it — or why it names none.
     ///
@@ -903,7 +1102,7 @@ pub fn stored_exclusion_list(
 }
 
 /// A wall-clock instant as the modelled `Timestamp` the wire carries.
-fn epoch_timestamp(time: SystemTime) -> ::aws_smithy_types::DateTime {
+pub fn epoch_timestamp(time: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = time
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
@@ -1073,16 +1272,77 @@ fn request_id(
     sequence: u64,
     now: SystemTime,
 ) -> String {
+    derive_id(&format!("request:{region}:{service_code}:{quota_code}:{sequence}"), now)
+}
+
+/// Derive a `ReportId`, the same way and in the same shape as [`request_id`]: 32
+/// lowercase hex characters, which satisfies the model's `ReportId` pattern
+/// `^[0-9a-zA-Z][a-zA-Z0-9-]{1,128}$` and its 1..128 length.
+fn report_id(region: &str, sequence: u64, now: SystemTime) -> String {
+    derive_id(&format!("report:{region}:{sequence}"), now)
+}
+
+/// 32 lowercase hex characters derived from `seed` and the clock.
+///
+/// The seed carries the region's own mint counter, so two ids minted in the same
+/// nanosecond still differ, and the caller stores what it gets back — a client only
+/// ever sees an id that is in state.
+fn derive_id(seed: &str, now: SystemTime) -> String {
     use sha2::{Digest as _, Sha256};
 
     let nanos = now
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|since| since.as_nanos())
         .unwrap_or_default();
-    let digest = Sha256::digest(format!(
-        "{region}:{service_code}:{quota_code}:{sequence}:{nanos}"
-    ));
+    let digest = Sha256::digest(format!("{seed}:{nanos}"));
     hex::encode(&digest[..16])
+}
+
+/// A quota's `Utilization`: recorded usage / the value in force * 100, the formula the
+/// model's `UtilizationPct` documents.
+///
+/// Service Quotas tracks a quota's usage through the CloudWatch usage metric that
+/// quota publishes, so a quota publishing NO usage metric has no usage source and its
+/// record carries no `Utilization` at all rather than a zero. For a quota that does
+/// publish one, the usage is what this service's state has recorded against it —
+/// nothing in this emulator consumes a quota, so that is zero — and the percentage is
+/// that usage over the value in force.
+///
+/// A value in force of zero (AWS publishes several, e.g. an opt-in instance family
+/// whose default is 0) is no denominator to divide by: with no usage recorded against
+/// it, none of what it permits is used, so its utilization is 0 %. Usage ABOVE a zero
+/// value in force would have no finite percentage, and nothing here can record usage,
+/// so that case reports nothing rather than an invented number.
+fn utilization_pct(default: &DefaultQuota, applied: f64) -> Option<f64> {
+    // No usage metric, no usage source, no percentage to report.
+    default.usage_metric.as_ref()?;
+    let usage = RECORDED_QUOTA_USAGE;
+    if applied <= 0.0 {
+        return (usage <= 0.0).then_some(0.0);
+    }
+    Some(usage / applied * 100.0)
+}
+
+/// Report order for two utilization records: utilization descending, the records
+/// whose utilization is unknown last, then service code and quota code ascending.
+///
+/// The code tie-break is what makes the order TOTAL, so equal utilizations never swap
+/// between two pages of the same report.
+fn compare_utilization(
+    left: &QuotaUtilizationInfo,
+    right: &QuotaUtilizationInfo,
+) -> ::std::cmp::Ordering {
+    use ::std::cmp::Ordering;
+
+    let by_utilization = match (left.utilization, right.utilization) {
+        (Some(left), Some(right)) => right.total_cmp(&left),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    };
+    by_utilization
+        .then_with(|| left.service_code.cmp(&right.service_code))
+        .then_with(|| left.quota_code.cmp(&right.quota_code))
 }
 
 /// One page of an ordered listing.
@@ -1114,6 +1374,40 @@ pub fn paginate<T>(
     max_results: Option<i32>,
     next_token: Option<&str>,
 ) -> Result<Page<T>, InvalidPageToken> {
+    // No `MaxResults` is no page size: the listing is returned whole, in one page,
+    // and only a caller that asks for a page size gets one. `MaxResults` bounds what
+    // a CALLER may ask for (1..100), not what the service returns unasked — a
+    // catalog listing of several hundred entries comes back in a single response.
+    // Nothing here grows without bound: the catalog and the defaults are seeded
+    // tables and the request store is capped by [`MAX_REQUESTS_PER_REGION`].
+    let whole_listing = all.len();
+    paginate_bounded(
+        listing,
+        all,
+        max_results,
+        next_token,
+        MAX_PAGE_SIZE,
+        whole_listing,
+    )
+}
+
+/// [`paginate`], for a listing whose own model declares page bounds of its own.
+///
+/// `caller_page_limit` is the ceiling a caller's `MaxResults` is clamped to, and
+/// `unasked_page_limit` the page size a caller that names no `MaxResults` gets, so
+/// each listing pages at the bounds ITS model declares: the quota listings carry
+/// `MaxResults` (1..100) and document no default, so an unasked listing comes back
+/// whole, while `GetQuotaUtilizationReport` carries `MaxResultsUtilization` (1..1000)
+/// and documents 1,000 as both the default and the maximum — which is also the most
+/// records `QuotaUtilizationInfoList` may hold, so its pages are bounded either way.
+pub fn paginate_bounded<T>(
+    listing: &str,
+    all: Vec<T>,
+    max_results: Option<i32>,
+    next_token: Option<&str>,
+    caller_page_limit: usize,
+    unasked_page_limit: usize,
+) -> Result<Page<T>, InvalidPageToken> {
     let start = match next_token {
         Some(token) => decode_page_token(listing, token)?,
         None => 0,
@@ -1122,14 +1416,8 @@ pub fn paginate<T>(
     if start > total {
         return Err(InvalidPageToken);
     }
-    // No `MaxResults` is no page size: the listing is returned whole, in one page,
-    // and only a caller that asks for a page size gets one. `MaxResults` bounds what
-    // a CALLER may ask for (1..100), not what the service returns unasked — a
-    // catalog listing of several hundred entries comes back in a single response.
-    // Nothing here grows without bound: the catalog and the defaults are seeded
-    // tables and the request store is capped by [`MAX_REQUESTS_PER_REGION`].
-    let size = max_results.map_or(total, |requested| {
-        (requested.max(1) as usize).min(MAX_PAGE_SIZE)
+    let size = max_results.map_or(unasked_page_limit, |requested| {
+        (requested.max(1) as usize).min(caller_page_limit)
     });
     let items: Vec<T> = all.into_iter().skip(start).take(size).collect();
     let stopped_at = start + items.len();

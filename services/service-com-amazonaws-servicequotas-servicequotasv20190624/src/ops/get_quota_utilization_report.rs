@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetQuotaUtilizationReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetQuotaUtilizationReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetQuotaUtilizationReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Retrieves a quota utilization report: materialises the generation the clock has
+//! made due, then pages the report's frozen snapshot, highest utilization first.
 //!
 //! ## Shape of an operation
 //!
@@ -183,23 +176,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::GET_QUOTA_UTILIZATION_REPORT_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report one page of a quota utilization report.
+    ///
+    /// REPORTING: it writes only what the clock already owed — a report past its
+    /// processing instant is `IN_PROGRESS`, one past its completion instant is
+    /// `COMPLETED`, one past its 15-minute retention is deleted — all of which were
+    /// due at those instants whether or not anybody polled. Results are published only
+    /// once the report has completed, from the snapshot the report froze, so every page
+    /// of one report sees the same records in the same order.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetQuotaUtilizationReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetQuotaUtilizationReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetQuotaUtilizationReport"))
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetQuotaUtilizationReportErrorModeled::ServiceException(ServiceException {
+                message: Some("the Service Quotas state store is unavailable".to_string()),
+            })
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let report = {
+            let mut quotas_state = state.lock();
+            quotas_state.settle_due_reports(&region, now);
+            quotas_state
+                .utilization_report(&region, &input.report_id)
+                .cloned()
+                .ok_or_else(|| {
+                    GetQuotaUtilizationReportErrorModeled::NoSuchResourceException(
+                        NoSuchResourceException {
+                            message: Some(format!(
+                                "no quota utilization report with ReportId '{}' exists",
+                                input.report_id
+                            )),
+                        },
+                    )
+                })?
+        };
+
+        // A report that has not completed has no results yet: the caller polls the
+        // status until it does.
+        if report.status != crate::state::REPORT_STATUS_COMPLETED {
+            return Ok(GetQuotaUtilizationReportOutput {
+                report_id: Some(report.id),
+                status: Some(report.status),
+                ..GetQuotaUtilizationReportOutput::default()
+            });
+        }
+
+        let total_count = report.quotas.len();
+        // The token names a position in THIS report, so one report's token cannot
+        // resume another's listing.
+        let listing = format!("{}:{}", Self::NAME, report.id);
+        let page = crate::state::paginate_bounded(
+            &listing,
+            report.quotas,
+            input.max_results,
+            input.next_token.as_deref(),
+            crate::state::UTILIZATION_REPORT_PAGE_SIZE,
+            crate::state::UTILIZATION_REPORT_PAGE_SIZE,
+        )
+        .map_err(|_| {
+            GetQuotaUtilizationReportErrorModeled::InvalidPaginationTokenException(
+                InvalidPaginationTokenException {
+                    message: Some(
+                        "NextToken does not name a position in this report".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        Ok(GetQuotaUtilizationReportOutput {
+            report_id: Some(report.id),
+            status: Some(report.status),
+            generated_at: Some(crate::state::epoch_timestamp(report.completed_at)),
+            total_count: Some(i32::try_from(total_count).unwrap_or(i32::MAX)),
+            quotas: Some(page.items),
+            next_token: page.next_token,
+            error_code: None,
+            error_message: None,
+        })
     }
 }

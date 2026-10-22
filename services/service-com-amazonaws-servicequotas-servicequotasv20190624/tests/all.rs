@@ -31,3 +31,5 @@ mod state_roundtrip;
 mod support_case_and_templates;
 #[path = "all/tags.rs"]
 mod tags;
+#[path = "all/utilization_report.rs"]
+mod utilization_report;

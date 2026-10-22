@@ -199,7 +199,7 @@ pub(crate) async fn walk_pages_counted(
 }
 
 /// A `NextToken`-shaped base64 string carrying `payload`.
-fn base64_of(payload: &str) -> String {
+pub(crate) fn base64_of(payload: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(payload)
 }
 
