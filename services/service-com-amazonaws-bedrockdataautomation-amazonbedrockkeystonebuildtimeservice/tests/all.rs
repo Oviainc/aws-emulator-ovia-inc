@@ -13,5 +13,9 @@
 // points it into `tests/all/`.
 #[path = "all/blueprint_lifecycle.rs"]
 mod blueprint_lifecycle;
+#[path = "all/data_automation_project_lifecycle.rs"]
+mod data_automation_project_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/support.rs"]
+mod support;
