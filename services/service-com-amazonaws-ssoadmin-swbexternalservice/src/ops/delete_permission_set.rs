@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePermissionSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePermissionSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes a permission set, and the assignments made from it, from this
+//! service's state (`crate::state`). This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePermissionSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The removal is observable to the next reader: `DescribePermissionSet` answers
+//! `ResourceNotFoundException` and `ListPermissionSets` no longer carries the ARN. The
+//! assignments go with it because an assignment names the permission set it grants —
+//! leaving the rows behind would keep a grant of a permission set that no longer exists.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +153,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePermissionSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePermissionSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePermissionSet"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeletePermissionSetErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+        let mut store = state.lock();
+
+        if store.instance(&input.instance_arn).is_none() {
+            return Err(DeletePermissionSetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No instance found with the ARN {}",
+                        input.instance_arn
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+        // Delete is not idempotent on a missing resource: a second delete of the same
+        // ARN has nothing to remove, which is the same 404 a never-created ARN gets.
+        if store
+            .permission_set(&input.instance_arn, &input.permission_set_arn)
+            .is_none()
+        {
+            return Err(DeletePermissionSetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No permission set found with the ARN {}",
+                        input.permission_set_arn
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        store.permission_sets.remove(&input.permission_set_arn);
+        // The assignments that referenced the deleted permission set go with it, and so
+        // do their creation-status records: a status record exists to report on one
+        // assignment, so keeping it after that assignment is gone would both report
+        // work on a resource no reader can see and hold store capacity for it forever.
+        let removed: Vec<String> = store
+            .account_assignments
+            .iter()
+            .filter(|row| {
+                row.instance_arn == input.instance_arn
+                    && row.permission_set_arn == input.permission_set_arn
+            })
+            .map(|row| row.request_id.clone())
+            .collect();
+        store.account_assignments.retain(|row| {
+            row.instance_arn != input.instance_arn
+                || row.permission_set_arn != input.permission_set_arn
+        });
+        for request_id in removed {
+            store.assignment_operations.remove(&request_id);
+        }
+        Ok(DeletePermissionSetOutput {})
     }
 }

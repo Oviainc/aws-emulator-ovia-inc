@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePermissionSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePermissionSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates a permission set under an existing IAM Identity Center
+//! instance, stores it in this service's state (`crate::state`) under a freshly minted
+//! `PermissionSetArn`, and returns the stored record. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePermissionSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `PermissionSetArn` and `CreatedDate` are server-generated here; everything else is
+//! the caller's input, persisted so `DescribePermissionSet` reads back the same values.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +173,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePermissionSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePermissionSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePermissionSet"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreatePermissionSetErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // The instance the permission set will live under must exist: a syntactically
+        // valid ARN for an instance that does not is a missing resource, not a bad
+        // request.
+        let instance_arn = store
+            .instance(&input.instance_arn)
+            .map(|instance| instance.instance_arn.clone())
+            .ok_or_else(|| {
+                CreatePermissionSetErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No instance found with the ARN {}",
+                            input.instance_arn
+                        )),
+                        reason: None,
+                    },
+                )
+            })?;
+
+        // A permission set's name is unique within its instance.
+        if store.permission_set_name_taken(&instance_arn, &input.name) {
+            return Err(CreatePermissionSetErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "A permission set named {} already exists in this instance",
+                    input.name
+                )),
+            })
+            .into());
+        }
+
+        // The emulator's own memory ceiling: a stored permission set lives until a
+        // caller deletes it, and a caller can vary `Name` indefinitely, so the store
+        // needs a count bound that the name check above is not.
+        if store.permission_sets.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(CreatePermissionSetErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(crate::state::quota_exceeded_message("permission sets")),
+                },
+            )
+            .into());
+        }
+
+        let permission_set_arn = crate::state::mint_permission_set_arn(&instance_arn);
+        // A freshly minted ARN cannot already be stored; if it somehow were, keeping the
+        // older record would answer this create with ANOTHER permission set's Name and
+        // CreatedDate, so the collision is reported rather than papered over.
+        if store.permission_sets.contains_key(&permission_set_arn) {
+            return Err(CreatePermissionSetErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the minted PermissionSetArn collided with a stored one".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        let record = crate::state::PermissionSetRecord {
+            permission_set_arn: permission_set_arn.clone(),
+            instance_arn,
+            name: input.name,
+            description: input.description,
+            created_date: ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+            session_duration: input.session_duration,
+            relay_state: input.relay_state,
+            tags: input.tags.unwrap_or_default(),
+            // No policy is attached at creation; the attach/put operations own these.
+            managed_policies: Vec::new(),
+            inline_policy: None,
+        };
+        // Answer from the STORED record, so the response cannot differ from what the
+        // next `DescribePermissionSet` reads.
+        store
+            .permission_sets
+            .insert(permission_set_arn.clone(), record);
+        let stored = store
+            .permission_sets
+            .get(&permission_set_arn)
+            .ok_or_else(|| {
+                CreatePermissionSetErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the stored permission set could not be read".to_string()),
+                    },
+                )
+            })?;
+        Ok(CreatePermissionSetOutput {
+            permission_set: Some(stored.to_shape()),
+        })
     }
 }

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAccountAssignments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAccountAssignments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: lists the assignments stored in this service's state (`crate::state`)
+//! for one (account, permission set) pair. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAccountAssignments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read. An account with nothing assigned from that permission set is an empty
+//! list, not an error — the resources named in the request both exist.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +163,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAccountAssignments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAccountAssignmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAccountAssignments"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAccountAssignmentsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+
+        // The cursor is scoped to THIS enumeration: the operation and the whole filter
+        // that selected the rows, since the page key only distinguishes rows within it.
+        let scope = crate::state::cursor_account_assignments(
+            &input.instance_arn,
+            &input.account_id,
+            &input.permission_set_arn,
+        );
+        let after = crate::state::cursor_after(&scope, input.next_token.as_deref()).map_err(
+            |message| {
+                ListAccountAssignmentsErrorModeled::ValidationException(ValidationException {
+                    message: Some(message.to_string()),
+                    reason: None,
+                })
+            },
+        )?;
+
+        let ordered: Vec<(String, AccountAssignment)> = {
+            let store = state.lock();
+            if store.instance(&input.instance_arn).is_none() {
+                return Err(ListAccountAssignmentsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No instance found with the ARN {}",
+                            input.instance_arn
+                        )),
+                        reason: None,
+                    },
+                )
+                .into());
+            }
+            if store
+                .permission_set(&input.instance_arn, &input.permission_set_arn)
+                .is_none()
+            {
+                return Err(ListAccountAssignmentsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No permission set found with the ARN {}",
+                            input.permission_set_arn
+                        )),
+                        reason: None,
+                    },
+                )
+                .into());
+            }
+            // The (account, permission set) filter fixes two thirds of an assignment's
+            // identity; the principal is what remains, so it is the page key.
+            let mut rows: Vec<(String, AccountAssignment)> = store
+                .account_assignments
+                .iter()
+                .filter(|row| {
+                    row.instance_arn == input.instance_arn
+                        && row.account_id == input.account_id
+                        && row.permission_set_arn == input.permission_set_arn
+                })
+                .map(|row| (row.page_key(), row.to_shape()))
+                .collect();
+            rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+            rows
+        };
+
+        let (account_assignments, next_token) =
+            crate::state::page(&scope, ordered, after.as_deref(), input.max_results);
+        Ok(ListAccountAssignmentsOutput {
+            account_assignments: Some(account_assignments),
+            next_token,
+        })
     }
 }

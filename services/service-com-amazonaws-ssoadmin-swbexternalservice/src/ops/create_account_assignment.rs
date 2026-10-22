@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccountAssignment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAccountAssignment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: assigns a permission set to a principal on one account, persisting both
+//! the assignment and the status record of the operation that created it. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAccountAssignment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The emulator applies the assignment in full before answering, so the status it
+//! reports is the terminal `SUCCEEDED` rather than a pending one: there is no work left
+//! outstanding for a later poll to finish. `RequestId` is a freshly minted UUID and the
+//! status record is stored under it, so `DescribeAccountAssignmentCreationStatus` and
+//! `ListAccountAssignmentCreationStatus` have a real record to read.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +185,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAccountAssignment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAccountAssignmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAccountAssignment"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAccountAssignmentErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+        let mut store = state.lock();
+
+        if store.instance(&input.instance_arn).is_none() {
+            return Err(CreateAccountAssignmentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No instance found with the ARN {}",
+                        input.instance_arn
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+        if store
+            .permission_set(&input.instance_arn, &input.permission_set_arn)
+            .is_none()
+        {
+            return Err(CreateAccountAssignmentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No permission set found with the ARN {}",
+                        input.permission_set_arn
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        let created_date = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        // (instance, account, permission set, principal type, principal id) is the
+        // assignment's identity, so re-creating one that already exists grants nothing
+        // further: it must not add a second assignment row AND must not write a second
+        // operation-status record for work that was already done. It answers from the
+        // status record the create that DID grant it stored.
+        if let Some(existing) = store.assignment_position(
+            &input.instance_arn,
+            &input.target_id,
+            &input.permission_set_arn,
+            &input.principal_type,
+            &input.principal_id,
+        ) {
+            let request_id = store.account_assignments[existing].request_id.clone();
+            let status = store
+                .assignment_operations
+                .get(&request_id)
+                .ok_or_else(|| {
+                    CreateAccountAssignmentErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: Some(
+                                "the assignment's creation-status record is missing".to_string(),
+                            ),
+                        },
+                    )
+                })?
+                .to_shape();
+            return Ok(CreateAccountAssignmentOutput {
+                account_assignment_creation_status: Some(status),
+            });
+        }
+
+        // The emulator's own memory ceiling: both stores below grow one record per
+        // distinct assignment and shrink only on a delete.
+        if store.account_assignments.len() >= crate::state::MAX_RECORDS_PER_STORE
+            || store.assignment_operations.len() >= crate::state::MAX_RECORDS_PER_STORE
+        {
+            return Err(
+                CreateAccountAssignmentErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::quota_exceeded_message("account assignments")),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A freshly minted `RequestId` cannot already be stored; the collision is
+        // checked BEFORE either record is written, so the two stores can only ever be
+        // updated together: no assignment row is left pointing at a status record that
+        // was never created.
+        let request_id = crate::state::mint_request_id();
+        if store.assignment_operations.contains_key(&request_id) {
+            return Err(CreateAccountAssignmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the minted RequestId collided with a stored one".to_string()),
+                },
+            )
+            .into());
+        }
+
+        store
+            .account_assignments
+            .push(crate::state::AccountAssignmentRecord {
+                instance_arn: input.instance_arn,
+                account_id: input.target_id.clone(),
+                target_type: input.target_type.clone(),
+                permission_set_arn: input.permission_set_arn.clone(),
+                principal_type: input.principal_type.clone(),
+                principal_id: input.principal_id.clone(),
+                created_date,
+                request_id: request_id.clone(),
+            });
+        store.assignment_operations.insert(
+            request_id.clone(),
+            crate::state::AssignmentOperationRecord {
+                request_id: request_id.clone(),
+                status: crate::state::STATUS_SUCCEEDED.to_string(),
+                // Nothing failed: the assignment is in effect by the time this returns.
+                failure_reason: None,
+                target_id: input.target_id,
+                target_type: input.target_type,
+                permission_set_arn: input.permission_set_arn,
+                principal_type: input.principal_type,
+                principal_id: input.principal_id,
+                created_date,
+            },
+        );
+        // Answer from the STORED status record, so a later read of it by `RequestId`
+        // cannot disagree with what this call reported.
+        let stored = store
+            .assignment_operations
+            .get(&request_id)
+            .ok_or_else(|| {
+                CreateAccountAssignmentErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the stored creation-status record could not be read".to_string(),
+                        ),
+                    },
+                )
+            })?;
+        Ok(CreateAccountAssignmentOutput {
+            account_assignment_creation_status: Some(stored.to_shape()),
+        })
     }
 }
