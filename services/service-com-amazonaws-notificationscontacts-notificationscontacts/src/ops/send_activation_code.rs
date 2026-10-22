@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendActivationCode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendActivationCode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendActivationCode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Issues the activation code for the stored email contact the request's ARN names:
+//! generates a fresh `^[a-z0-9]{7}$` token and persists it on that record in
+//! [`crate::state`], so the `ActivateEmailContact` that follows can verify it. The
+//! modelled 404 for an ARN the store does not hold, and the modelled 409 for a
+//! contact that is already active and so has nothing to activate.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +144,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendActivationCode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendActivationCodeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendActivationCode"))
+        // `arn`'s own pattern is modelled, so the centralized walk has already
+        // refused a malformed one with a 400 before this body runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SendActivationCodeErrorModeled::InternalServerException(InternalServerException {
+                message: "the email contact store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // A fresh code is drawn before the record is borrowed mutably, since both
+        // need the one store guard.
+        let code = store.fresh_activation_code();
+        let contact = store.contact_mut(&input.arn).ok_or_else(|| {
+            SendActivationCodeErrorModeled::ResourceNotFoundException(
+                crate::state::contact_not_found(&input.arn),
+            )
+        })?;
+
+        // An activated contact has nothing left to activate, so there is no
+        // activation email to send for it.
+        if contact.is_active() {
+            return Err(SendActivationCodeErrorModeled::ConflictException(
+                crate::state::contact_conflict(
+                    &input.arn,
+                    format!(
+                        "this email contact is already {}, so no activation code was sent",
+                        crate::state::STATUS_ACTIVE
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // Sending another activation email supersedes the previous code: exactly one
+        // code is outstanding per contact, the last one issued. `updateTime` does not
+        // move — no member this service reports about the contact changed.
+        contact.pending_activation_code = Some(code);
+
+        Ok(SendActivationCodeOutput {})
     }
 }

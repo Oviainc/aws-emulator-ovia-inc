@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEmailContact
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEmailContact`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEmailContact::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an email contact: stores the request under a freshly generated ARN in
+//! [`crate::state`], with the `inactive` status a contact starts in and its creation
+//! and update times set to the same instant, and answers 201 with that ARN — the one
+//! every later Get, List, activation and delete resolves.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +151,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEmailContact` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEmailContactErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEmailContact"))
+        // `name` (1..64, `[\w-.~]+`), `emailAddress` (6..254, `^(.+)@(.+)$`) and the
+        // `tags` map's 0..200 length, key pattern and value length are all modelled
+        // constraints, so the centralized walk has already refused anything outside
+        // them with a 400 `ValidationException` before this body runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateEmailContactErrorModeled::InternalServerException(InternalServerException {
+                message: "the email contact store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // The store is finite: a create that would take it past its cap is refused
+        // rather than growing it, the way the service refuses one past its quota.
+        if store.contacts.len() >= crate::state::MAX_EMAIL_CONTACTS {
+            return Err(CreateEmailContactErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} email contacts",
+                        crate::state::MAX_EMAIL_CONTACTS
+                    ),
+                    resource_id: String::new(),
+                    resource_type: crate::state::CONTACT_RESOURCE_TYPE.to_string(),
+                    service_code: crate::state::ARN_SERVICE.to_string(),
+                    quota_code: crate::state::EMAIL_CONTACTS_QUOTA_CODE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let id = store.fresh_contact_id();
+        let arn = crate::state::contact_arn(&id);
+        // One instant for both members: the contact was created and last updated at
+        // the same moment, and nothing has changed it since.
+        let created_at = store.next_instant_millis();
+        store.insert_contact(crate::state::EmailContactRecord {
+            arn: arn.clone(),
+            name: input.name,
+            // The create's `emailAddress` is what the wire shape reports as
+            // `address`: one stored value, two modelled member names.
+            address: input.email_address,
+            // A new contact cannot receive email until it is activated, so it starts
+            // in `EmailContactStatus`' `inactive` value.
+            status: crate::state::STATUS_INACTIVE.to_string(),
+            creation_time_millis: created_at,
+            update_time_millis: created_at,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // No activation code exists until a `SendActivationCode` issues one.
+            pending_activation_code: None,
+        });
+
+        Ok(CreateEmailContactOutput { arn })
     }
 }

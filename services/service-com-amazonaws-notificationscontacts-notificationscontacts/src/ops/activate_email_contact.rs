@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ActivateEmailContact
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ActivateEmailContact`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ActivateEmailContact::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Activates the stored email contact the request's ARN names, when the `code` label
+//! matches the activation code [`crate::ops::send_activation_code`] persisted for it:
+//! flips that record's status to `active` and moves its `updateTime`, both observable
+//! through a later `GetEmailContact` or `ListEmailContacts`. The modelled 404 for an
+//! ARN the store does not hold, and the modelled 400 for a code that is not the one
+//! outstanding for this contact. Idempotent: activating an already-active contact
+//! with its own code changes nothing and still answers 200.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +149,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ActivateEmailContact` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ActivateEmailContactErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ActivateEmailContact"))
+        // `arn`'s pattern and `code`'s 7..7 length and `^[a-z0-9]{7}$` pattern are
+        // modelled, so the centralized walk has already refused anything outside them
+        // with a 400 before this body runs: reaching here means the code is
+        // well-formed, and all that is left is whether it is the one this contact is
+        // waiting on.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ActivateEmailContactErrorModeled::InternalServerException(InternalServerException {
+                message: "the email contact store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut store = state.lock();
+        let already_active = {
+            let contact = store.contact(&input.arn).ok_or_else(|| {
+                ActivateEmailContactErrorModeled::ResourceNotFoundException(
+                    crate::state::contact_not_found(&input.arn),
+                )
+            })?;
+            // A contact with no outstanding code has nothing any code can match, so
+            // this refuses the request rather than activating on a code nobody
+            // issued. The submitted code is `@sensitive`, so it is never echoed back.
+            if contact.pending_activation_code.as_deref() != Some(input.code.as_str()) {
+                return Err(ActivateEmailContactErrorModeled::ValidationException(
+                    crate::state::field_validation_failure(
+                        "code",
+                        "is not the activation code outstanding for this email contact",
+                    ),
+                )
+                .into());
+            }
+            contact.is_active()
+        };
+
+        // Activating an already-active contact is a no-op, so `updateTime` moves only
+        // on the call that actually changes the status.
+        if !already_active {
+            let activated_at = store.next_instant_millis();
+            if let Some(contact) = store.contact_mut(&input.arn) {
+                contact.status = crate::state::STATUS_ACTIVE.to_string();
+                contact.update_time_millis = activated_at;
+            }
+        }
+
+        Ok(ActivateEmailContactOutput {})
     }
 }

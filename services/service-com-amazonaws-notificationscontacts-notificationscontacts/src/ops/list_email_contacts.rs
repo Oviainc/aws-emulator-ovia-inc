@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEmailContacts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEmailContacts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEmailContacts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the email contacts [`crate::state`] holds, in ARN order, straight from the
+//! stored records — so a contact a create added is listed, with whatever status the
+//! last activation wrote, and a deleted one is gone. `maxResults` bounds the page and
+//! an opaque `nextToken` names where it stopped, so the next call resumes beyond it;
+//! the last page carries no token. A token this operation did not issue is the
+//! modelled 400.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +75,41 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The page size this operation applies when a request names none.
+///
+/// The modelled upper bound of `maxResults` (`range 1..100`):
+/// `smithy_query(query="operation",operation="ListEmailContacts")`. The walk refuses
+/// anything outside that range before the handler runs, so a request that DOES name
+/// a size is already within it.
+const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// The opaque `nextToken` for a page that stopped after `arn`.
+///
+/// Hex rather than base64 so the token is a single `[0-9a-f]+` word that needs no
+/// URL-escaping as a query parameter. It is opaque to the caller, not secret: it
+/// carries nothing beyond an ARN the caller already holds.
+fn encode_page_token(arn: &str) -> String {
+    hex::encode(arn)
+}
+
+/// The ARN a page token names, or the modelled 400 when the token is not one this
+/// operation issued.
+fn decode_page_token(token: &str) -> Result<String, ListEmailContactsError> {
+    hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|arn| crate::state::contact_id_from_arn(arn).is_some())
+        .ok_or_else(|| {
+            ListEmailContactsErrorModeled::ValidationException(
+                crate::state::field_validation_failure(
+                    "nextToken",
+                    "is not a pagination token issued by ListEmailContacts",
+                ),
+            )
+            .into()
+        })
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -150,18 +182,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEmailContacts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEmailContactsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEmailContacts"))
+        // `maxResults`' 1..100 range is modelled, so the centralized walk has already
+        // refused a value outside it with a 400 before this body runs. `nextToken`
+        // carries no modelled constraint, so its validity is checked here.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListEmailContactsErrorModeled::InternalServerException(InternalServerException {
+                message: "the email contact store is unavailable".to_string(),
+            })
+        })?;
+
+        // The page size is the server's own decision: clamped into
+        // 1..=DEFAULT_PAGE_SIZE whatever the request asked for, so no allocation below
+        // is sized by input.
+        let page_size = input.max_results.map_or(DEFAULT_PAGE_SIZE, |requested| {
+            requested.clamp(1, DEFAULT_PAGE_SIZE as i32) as usize
+        });
+        let after = input
+            .next_token
+            .as_deref()
+            .map(decode_page_token)
+            .transpose()?;
+
+        let store = state.lock();
+        // "the response includes only results beyond the token": the token names the
+        // last ARN the previous page reported, so this page starts strictly after it.
+        let mut remaining = match &after {
+            Some(arn) => store.contacts.range((
+                ::std::ops::Bound::Excluded(arn.clone()),
+                ::std::ops::Bound::Unbounded,
+            )),
+            None => store.contacts.range::<String, _>(..),
+        };
+
+        // Reserve no more than the store can actually yield.
+        let mut email_contacts = Vec::with_capacity(page_size.min(store.contacts.len()));
+        for (_, contact) in remaining.by_ref().take(page_size) {
+            email_contacts.push(contact.to_wire());
+        }
+        // A `nextToken` is emitted only when a contact is actually left beyond this
+        // page, so the last page carries none.
+        let next_token = remaining
+            .next()
+            .and(email_contacts.last())
+            .map(|last| encode_page_token(&last.arn));
+
+        Ok(ListEmailContactsOutput {
+            next_token,
+            email_contacts,
+        })
     }
 }
