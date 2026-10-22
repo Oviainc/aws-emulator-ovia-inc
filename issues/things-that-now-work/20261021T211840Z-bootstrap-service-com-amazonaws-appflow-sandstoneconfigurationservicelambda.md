@@ -4,6 +4,17 @@ Issue-Commit: 34e6e58e29d15417fc6ff05c31f4f08593fa6d9a
 
 # Bootstrap the service-com-amazonaws-appflow-sandstoneconfigurationservicelambda emulator
 
+## Resolution
+
+Implemented: the flow lifecycle slice this report prescribes — `CreateFlow`,
+`DescribeFlow`, `ListFlows`, `StartFlow`, `DescribeFlowExecutionRecords` and
+`DeleteFlow` — now computes every response from the flow store held by the shared
+engine (`crate::state::service_state`), with minted ARNs, stored `executionId`s, real
+pagination cursors and the modelled `ConflictException` / `ResourceNotFoundException` /
+`ValidationException` / `ServiceQuotaExceededException` answers. Covered end to end by
+`tests/all/flow_lifecycle.rs`. The 19 operations the report puts out of scope are
+untouched and still answer HTTP 501 until their own slices land.
+
 _Filed: 2026-10-21T21:18:40Z_
 _Operation: service-com-amazonaws-appflow-sandstoneconfigurationservicelambda | Class: missing_
 
