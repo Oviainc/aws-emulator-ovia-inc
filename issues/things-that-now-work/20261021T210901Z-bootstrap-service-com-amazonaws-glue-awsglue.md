@@ -53,3 +53,26 @@ All other Glue operations (jobs, crawlers, triggers, workflows, sessions, regist
 8. `GetTables {"DatabaseName": "bootstrap_db", "Expression": "ev*"}` — expect only `events`.
 9. `DeleteTable {"DatabaseName": "bootstrap_db", "Name": "events"}` then `GetTable` the same table — expect `EntityNotFoundException` (HTTP 400).
 10. `DeleteDatabase {"Name": "bootstrap_db"}` then `GetDatabase {"Name": "bootstrap_db"}` — expect `EntityNotFoundException`, and `GetTables` on it to fail the same way (cascade delete).
+
+## Resolution
+
+Implemented: the Data Catalog slice is stateful in
+`services/service-com-amazonaws-glue-awsglue/` — `CreateDatabase`, `GetDatabase`,
+`CreateTable`, `GetTable`, `GetTables`, `DeleteTable` and `DeleteDatabase` all compute
+their answer from the catalog -> database -> table store in `src/state.rs`, with the
+modelled `AlreadyExistsException` / `EntityNotFoundException` / `InvalidInputException` /
+`ResourceNumberLimitExceededException` failures. Covered end-to-end over `awsJson1_1` by
+`tests/all/data_catalog.rs`. All ten reproduction steps behave as written.
+
+`GetTables`'s `Expression` is served as the Hive-style pattern the Hive-metastore
+compatible catalog takes — `*` matches any run of characters, `|` separates
+alternatives, every other character is a literal, and the WHOLE stored name must match
+— so step 8's `ev*` selects the `ev`-prefixed tables. The model's prose calls the
+member "A regular expression pattern"
+(`smithy_query(query="doc", shape="GetTablesRequest", member="Expression")`); the two
+readings differ only on a regex metacharacter, and the pattern language is stated in
+`src/ops/get_tables.rs`'s module header and pinned by the test table (prefix, suffix,
+both-sided wildcard, alternation, match-everything, empty, bare prefix, and
+metacharacters as literals). A pattern carrying more wildcards than the handler's
+`MAX_PATTERN_WILDCARDS` ceiling is refused with `InvalidInputException`, so the work
+request text can buy stays bounded.

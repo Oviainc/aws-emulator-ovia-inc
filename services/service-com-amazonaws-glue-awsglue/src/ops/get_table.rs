@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! A pure read: it rebuilds the `Table` output shape from the stored record, so the
+//! `StorageDescriptor` and `PartitionKeys` sent to `CreateTable` come back unchanged
+//! beside the server-set `DatabaseName`, `CatalogId`, `CreateTime`, `UpdateTime` and
+//! `VersionId`. An absent catalog, database or table is `EntityNotFoundException`.
+//!
+//! `TransactionId`, `QueryAsOfTime` and `IncludeStatusDetails` are REFUSED rather than
+//! ignored, and `AttributesToGet` is honoured: `DEFAULT` is the Hive-style definition
+//! this slice stores, while `LATEST_ICEBERG_METADATA` is refused because no Iceberg
+//! metadata is maintained here. `AuditContext` is input-only Lake Formation audit
+//! metadata that does not change this operation's answer.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +178,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTable"))
+        let _ = ctx;
+        // The model documents that `QueryAsOfTime` "cannot be specified along with
+        // TransactionId", so that pair is a client error whatever else is supported.
+        if input.transaction_id.is_some() && input.query_as_of_time.is_some() {
+            return Err(GetTableErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        "QueryAsOfTime cannot be specified along with TransactionId".into(),
+                    ),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        // A governed or point-in-time read needs a transaction log and a table version
+        // history this emulator does not keep; answering from the latest state would be
+        // a wrong-but-live result, so the request is refused instead.
+        if input.transaction_id.is_some() || input.query_as_of_time.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetTable with TransactionId or QueryAsOfTime",
+            ));
+        }
+        // `IncludeStatusDetails` asks for the status of a Data Catalog VIEW create or
+        // update, which this slice does not model, so ASKING for it is refused; not
+        // asking for it is served normally.
+        if input.include_status_details == Some(true) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetTable with IncludeStatusDetails",
+            ));
+        }
+        // `AttributesToGet` selects which halves of the answer to return. The model:
+        // it "doesn't accept an empty list", and the valid combinations are `DEFAULT`
+        // (the Hive-style table definition), `LATEST_ICEBERG_METADATA`, or both. This
+        // slice stores the Hive-style definition, so `DEFAULT` is served; Iceberg
+        // metadata is not maintained here (see `CreateTable`'s `OpenTableFormatInput`),
+        // so a request for it is refused rather than answered with an empty table.
+        match input.attributes_to_get.as_deref() {
+            None => {}
+            Some([]) => {
+                return Err(GetTableErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some("AttributesToGet does not accept an empty list".into()),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
+            Some(attributes) => {
+                let wanted: Vec<&str> = attributes.iter().map(String::as_str).collect();
+                if wanted.contains(&"LATEST_ICEBERG_METADATA") {
+                    return Err(crate::scaffolded::Scaffolded::not_implemented(
+                        "GetTable with AttributesToGet LATEST_ICEBERG_METADATA",
+                    ));
+                }
+                if wanted.as_slice() != ["DEFAULT"] {
+                    return Err(GetTableErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(format!(
+                                "AttributesToGet valid combinations are DEFAULT, \
+                                 LATEST_ICEBERG_METADATA, or both, not {wanted:?}"
+                            )),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetTableErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let store = state.lock();
+        let Some(database) = store.database(&catalog_id, &input.database_name) else {
+            return Err(GetTableErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(format!(
+                        "Database {} not found in catalog {catalog_id}",
+                        crate::state::fold_name(&input.database_name)
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        let Some(entry) = database.tables.get(&crate::state::fold_name(&input.name)) else {
+            return Err(GetTableErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(format!(
+                        "Table {} not found in database {}",
+                        crate::state::fold_name(&input.name),
+                        database.name
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(GetTableOutput {
+            table: Some(entry.to_table()),
+        })
     }
 }

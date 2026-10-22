@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDatabase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDatabase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDatabase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Creates a database in a Data Catalog. The record is written to
+//! [`crate::state::ComAmazonawsGlueAwsglueState::catalogs`], so `GetDatabase` in a
+//! later request reads back exactly what was persisted, and a second create of the
+//! same (folded) name in the same catalog is refused with `AlreadyExistsException`.
+//!
+//! A `CatalogId` this emulator does not hold is refused rather than created: see
+//! [`crate::state::is_known_catalog`].
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +158,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDatabase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDatabaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDatabase"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDatabaseErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // A `CatalogId` this emulator does not hold must not be conjured into
+        // existence by the create: on the real service it is another account's
+        // catalog, or one that `CreateCatalog` has not made. This operation models no
+        // not-found error, so the refusal is the modelled client-input error.
+        if !crate::state::is_known_catalog(&catalog_id) {
+            return Err(CreateDatabaseErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "CatalogId {catalog_id} is not a Data Catalog in this account"
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        let folded = crate::state::fold_name(&input.database_input.name);
+
+        let mut store = state.lock();
+        // Read the existing catalog rather than `entry(..).or_default()`: a refused
+        // create must leave nothing behind, and inserting the container first would
+        // store a catalog no successful call created.
+        let existing = store.catalogs.get(&catalog_id);
+        if existing.is_some_and(|catalog| catalog.databases.contains_key(&folded)) {
+            return Err(CreateDatabaseErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(format!("Database already exists: {folded}")),
+                },
+            )
+            .into());
+        }
+        // The store is resident memory and this create is reachable by any caller, so
+        // the number of records one process will hold is bounded. Past the ceiling the
+        // request is refused with the operation's own modelled limit error.
+        if existing.is_some_and(|catalog| !catalog.can_store_database()) {
+            return Err(
+                CreateDatabaseErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "Catalog {catalog_id} already holds the maximum of {} databases",
+                            crate::state::MAX_DATABASES_PER_CATALOG
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let entry = crate::state::DatabaseEntry::from_input(
+            &input.database_input,
+            &catalog_id,
+            input.tags.as_ref(),
+            ::std::time::SystemTime::now(),
+        );
+        store
+            .catalogs
+            .entry(catalog_id.clone())
+            .or_default()
+            .databases
+            .insert(folded.clone(), entry);
+        ::tracing::info!(
+            operation = "CreateDatabase",
+            catalog_id = %catalog_id,
+            database = %folded,
+            "created a Data Catalog database"
+        );
+
+        Ok(CreateDatabaseOutput {})
     }
 }

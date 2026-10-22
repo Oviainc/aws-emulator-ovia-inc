@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTables
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTables`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTables::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Lists the tables actually stored in one database, in folded-name order.
+//!
+//! `Expression` selects the tables whose WHOLE name matches a Hive-style pattern: `*`
+//! matches any run of characters (including none), `|` separates alternatives, and
+//! every other character — `.`, `[`, `(` included — is a literal. The Data Catalog is
+//! Hive-metastore compatible (the model folds both `DatabaseInput$Name` and
+//! `TableInput$Name` "for Hive compatibility"), and that is the pattern language the
+//! metastore's table listing takes, which is why `events*` selects `events` and
+//! `events_raw` — the behaviour clients and this service's own reproduction script
+//! expect. The model's prose calls the member "A regular expression pattern"; the
+//! difference shows only on a regex metacharacter, and the Hive reading is the one the
+//! catalog implements. Every string is a valid pattern, so a pattern is never refused
+//! as malformed; one carrying more wildcards than [`MAX_PATTERN_WILDCARDS`] is refused
+//! with `InvalidInputException`, so the work a caller-supplied pattern can buy stays
+//! bounded. `MaxResults` truncates the page and the returned `NextToken` is the last
+//! name on it, so the next call resumes at the first stored name strictly after it.
+//!
+//! Members this slice does not act on, and why: `AuditContext` is input-only Lake
+//! Formation audit metadata that does not change this operation's answer. Every other
+//! member IS acted on: `Expression`, `MaxResults` and `NextToken` as above;
+//! `AttributesToGet` projects each returned table (and its documented validation is
+//! enforced); `ResourceShareType` selects federated tables only, a stored table being
+//! federated exactly when it carries a `FederatedTable`; and `TransactionId`,
+//! `QueryAsOfTime` and `IncludeStatusDetails` are REFUSED, because serving the latest
+//! unqualified state for a point-in-time, transactional or view-status read would be a
+//! wrong-but-live answer.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +125,85 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page this operation serves, and the page size it uses when the request
+/// names no `MaxResults`. Source: the model's `MaxResults` target `CatalogGetterPageSize`,
+/// whose range is 1..100.
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// Ceiling on the number of `*` wildcards and `|` alternatives one `Expression` may
+/// carry. The pattern is request text and every stored name in the database is matched
+/// against it, so the work it can buy is bounded here rather than left to grow with the
+/// modelled 2048-character length: matching is O(name length x wildcards) per name, so
+/// this ceiling and the per-database table ceiling together bound one request. A
+/// pattern past it is refused with `InvalidInputException`.
+pub const MAX_PATTERN_WILDCARDS: usize = 64;
+
+/// Whether `name` matches the Hive-style `pattern` in full: `|` separates alternatives
+/// and `*` matches any run of characters within one, every other character being a
+/// literal.
+fn matches_expression(pattern: &str, name: &str) -> bool {
+    pattern
+        .split('|')
+        .any(|alternative| matches_wildcard(alternative, name))
+}
+
+/// Whether `name` matches one alternative in full. The pattern's literal segments
+/// (what sits between its `*`s) must appear in order: the first as a prefix, the last
+/// as a suffix, and each middle one at its leftmost occurrence after the previous —
+/// which is the standard wildcard match, and needs no backtracking.
+fn matches_wildcard(pattern: &str, name: &str) -> bool {
+    let mut segments = pattern.split('*');
+    // `split` always yields at least one segment, so this cannot be `None`.
+    let first = segments.next().unwrap_or_default();
+    if !name.starts_with(first) {
+        return false;
+    }
+    // Safe to slice: `starts_with` means `first.len()` is a character boundary.
+    let mut rest = &name[first.len()..];
+    let after_first: Vec<&str> = segments.collect();
+    let Some((last, middle)) = after_first.split_last() else {
+        // No `*` at all: the pattern is a literal, so it must be the whole name.
+        return rest.is_empty();
+    };
+    for segment in middle {
+        match rest.find(segment) {
+            // `find` answers a character boundary, so this slice is safe too.
+            Some(at) => rest = &rest[at + segment.len()..],
+            None => return false,
+        }
+    }
+    rest.ends_with(last)
+}
+
+/// Which members of each `Table` the request asked for.
+///
+/// From `AttributesToGet`, whose documented valid combinations for this operation are
+/// exactly `NAME` and `NAME, TABLE_TYPE`; absent, the whole `Table` is returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Projection {
+    Full,
+    Name,
+    NameAndTableType,
+}
+
+impl Projection {
+    /// Narrow a rebuilt `Table` to the members this projection asked for.
+    fn apply(self, table: Table) -> Table {
+        match self {
+            Self::Full => table,
+            Self::Name => Table {
+                name: table.name,
+                ..Table::default()
+            },
+            Self::NameAndTableType => Table {
+                name: table.name,
+                table_type: table.table_type,
+                ..Table::default()
+            },
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -179,18 +278,185 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTables` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTablesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTables"))
+        let _ = ctx;
+        // The model documents that `QueryAsOfTime` "cannot be specified along with
+        // TransactionId", so that pair is a client error whatever else is supported.
+        if input.transaction_id.is_some() && input.query_as_of_time.is_some() {
+            return Err(GetTablesErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        "QueryAsOfTime cannot be specified along with TransactionId".into(),
+                    ),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        // Governed tables and point-in-time reads need a transaction log and a table
+        // version history this emulator does not keep, so a request that asks for one
+        // is answered "not written yet" rather than silently served from the latest
+        // state.
+        if input.transaction_id.is_some() || input.query_as_of_time.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetTables with TransactionId or QueryAsOfTime",
+            ));
+        }
+        // `IncludeStatusDetails` asks for the status of a Data Catalog VIEW create or
+        // update, which this slice does not model, so ASKING for it is refused; not
+        // asking for it is served normally.
+        if input.include_status_details == Some(true) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetTables with IncludeStatusDetails",
+            ));
+        }
+
+        // `AttributesToGet` projects each returned table. The model: it "doesn't accept
+        // an empty list", "must include NAME", and its valid combinations are `NAME`
+        // and `NAME, TABLE_TYPE`.
+        let projection = match input.attributes_to_get.as_deref() {
+            None => Projection::Full,
+            Some([]) => {
+                return Err(GetTablesErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some("AttributesToGet does not accept an empty list".into()),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
+            Some(attributes) => {
+                let wanted: Vec<&str> = attributes.iter().map(String::as_str).collect();
+                match wanted.as_slice() {
+                    ["NAME"] => Projection::Name,
+                    ["NAME", "TABLE_TYPE"] | ["TABLE_TYPE", "NAME"] => {
+                        Projection::NameAndTableType
+                    }
+                    _ => {
+                        return Err(GetTablesErrorModeled::InvalidInputException(
+                            InvalidInputException {
+                                message: Some(format!(
+                                    "AttributesToGet must include NAME; the valid combinations \
+                                     are NAME and NAME,TABLE_TYPE, not {wanted:?}"
+                                )),
+                                from_federation_source: None,
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        // `ResourceShareType`: "If set to FEDERATED, returns only federated tables,
+        // which reference an entity outside the Glue Data Catalog. If set to ALL,
+        // returns all tables in the database, both federated and non-federated.\" A
+        // stored table is federated exactly when it carries a `FederatedTable`.
+        let federated_only = match input.resource_share_type.as_deref() {
+            None | Some("ALL") => false,
+            Some("FEDERATED") => true,
+            Some(other) => {
+                return Err(GetTablesErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "ResourceShareType {other} is not one of FEDERATED, ALL"
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
+        };
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetTablesErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+
+        // `Expression` is a Hive-style pattern matched against the WHOLE table name (see
+        // the module header). Every string is a valid pattern, so the only refusal is a
+        // pattern carrying more wildcards than this operation will match against every
+        // stored name.
+        let filter = input.expression.as_deref();
+        if let Some(pattern) = filter {
+            let wildcards = pattern
+                .chars()
+                .filter(|character| *character == '*' || *character == '|')
+                .count();
+            if wildcards > MAX_PATTERN_WILDCARDS {
+                return Err(GetTablesErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "Expression carries {wildcards} wildcards, more than the \
+                             {MAX_PATTERN_WILDCARDS} this catalog matches"
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Absent `MaxResults`, page at the largest value the model accepts for it
+        // (`CatalogGetterPageSize`, range 1..100). The clamp re-states that range in
+        // the handler so the page size is never 0 even if the boundary validator ever
+        // stops enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let store = state.lock();
+        let Some(database) = store.database(&catalog_id, &input.database_name) else {
+            return Err(GetTablesErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(format!(
+                        "Database {} not found in catalog {catalog_id}",
+                        crate::state::fold_name(&input.database_name)
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        let matching: Vec<&crate::state::TableEntry> = database
+            .tables_ordered()
+            .into_iter()
+            .filter(|table| !federated_only || table.federated_table.is_some())
+            .filter(|table| {
+                filter.is_none_or(|pattern| matches_expression(pattern, &table.name))
+            })
+            .collect();
+
+        // The token is the last name of the previous page, so the page resumes at the
+        // first stored name strictly after it — which stays correct across tables
+        // created or deleted between two calls.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => matching.partition_point(|table| table.name.as_str() <= cursor),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(matching.len());
+
+        let page = &matching[start..end];
+        let table_list: Vec<Table> = page
+            .iter()
+            .map(|table| projection.apply(table.to_table()))
+            .collect();
+        // The token names the last entry of the page, taken from the page itself so
+        // there is no index arithmetic to underflow on an empty page.
+        let next_token = if end < matching.len() {
+            page.last().map(|table| table.name.clone())
+        } else {
+            None
+        };
+
+        Ok(GetTablesOutput {
+            table_list: Some(table_list),
+            next_token,
+        })
     }
 }

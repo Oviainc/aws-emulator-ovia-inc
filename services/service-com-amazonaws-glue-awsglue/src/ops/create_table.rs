@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Persists the table inside its parent database and sets the server-derived members
+//! `DatabaseName`, `CatalogId`, `CreateTime`, `UpdateTime`, `VersionId` and `CreatedBy`,
+//! none of which exist on `TableInput`. An absent database is `EntityNotFoundException`;
+//! a duplicate (folded) table name is `AlreadyExistsException`.
+//!
+//! The `OpenTableFormatInput` create path (an Iceberg table whose metadata this
+//! emulator does not maintain) still answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +172,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTable"))
+        // An Iceberg/open-table-format create needs a table-metadata layer this
+        // emulator does not maintain, so that path is still unimplemented.
+        if input.open_table_format_input.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateTable with OpenTableFormatInput",
+            ));
+        }
+
+        // Partition indexes are a separate stored resource (GetPartitionIndexes) this
+        // slice does not keep, and a transactional create needs a transaction log it
+        // does not keep either. Accepting either member and dropping it would answer
+        // 200 for work nothing did, so both are refused.
+        if input
+            .partition_indexes
+            .as_ref()
+            .is_some_and(|indexes| !indexes.is_empty())
+        {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateTable with PartitionIndexes",
+            ));
+        }
+        if input.transaction_id.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateTable with TransactionId",
+            ));
+        }
+
+        let Some(table_input) = input.table_input.as_ref() else {
+            return Err(CreateTableErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        "TableInput is required unless OpenTableFormatInput is supplied".into(),
+                    ),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateTableErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let folded_table = crate::state::fold_name(&table_input.name);
+        // `CreatedBy` is "the person or entity who created the table": the caller this
+        // request was signed by, read off its SigV4 credential scope. That key id is
+        // request text, so only what an access key id can contain is carried into the
+        // ARN; anything else is attributed to this emulator instead of letting a client
+        // write arbitrary text into a value shaped like a principal.
+        let created_by = ::engine::emulator_arn(
+            "iam",
+            "",
+            &format!(
+                "user/{}",
+                crate::state::caller_principal(&ctx.parts().headers)
+            ),
+        );
+
+        let mut store = state.lock();
+        // The store is resident memory and this create is reachable by any caller, so
+        // the number of records one process will hold is bounded, store-wide as well as
+        // per database. The store-wide answer is read BEFORE the parent database is
+        // borrowed, but used AFTER it is resolved, so a request naming a database that
+        // does not exist still gets the precise `EntityNotFoundException`.
+        let store_can_hold_another_table = store.can_store_table();
+        let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
+            return Err(CreateTableErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(format!(
+                        "Database {} not found in catalog {catalog_id}",
+                        crate::state::fold_name(&input.database_name)
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        if database.tables.contains_key(&folded_table) {
+            return Err(CreateTableErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(format!("Table already exists: {folded_table}")),
+                },
+            )
+            .into());
+        }
+        if !store_can_hold_another_table {
+            return Err(
+                CreateTableErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "the Data Catalog already holds the maximum of {} tables",
+                            crate::state::MAX_STORED_TABLES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if !database.can_store_table() {
+            return Err(
+                CreateTableErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "Database {} already holds the maximum of {} tables",
+                            database.name,
+                            crate::state::MAX_TABLES_PER_DATABASE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let database_name = database.name.clone();
+        let entry = crate::state::TableEntry::from_input(
+            table_input,
+            &database_name,
+            &catalog_id,
+            Some(created_by),
+            ::std::time::SystemTime::now(),
+        );
+        database.tables.insert(folded_table.clone(), entry);
+        ::tracing::info!(
+            operation = "CreateTable",
+            catalog_id = %catalog_id,
+            database = %database_name,
+            table = %folded_table,
+            "created a Data Catalog table"
+        );
+
+        Ok(CreateTableOutput {})
     }
 }
