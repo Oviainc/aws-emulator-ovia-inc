@@ -18,7 +18,7 @@
 
 use serde_json::{json, Value};
 
-use crate::app_branch_lifecycle::{list_member, string_member, Emulator, Reply};
+use crate::app_branch_lifecycle::{list_member, string_member, without_tags, Emulator, Reply};
 
 /// The `NotFoundException` message the rule says a request addressing `identifier` of
 /// kind `entity` must come back with.
@@ -108,9 +108,12 @@ async fn delete_branch_removes_the_branch_and_every_later_read_answers_not_found
             deleted.status, 200,
             "case {label:?}: expected HTTP 200 from DeleteBranch, got {deleted:?}"
         );
+        // A READ reports the resource's tag map and a WRITE echoes only the tags the
+        // request set (asserted on its own in `app_branch_projection`), so the two
+        // records are compared without that member.
         assert_eq!(
-            deleted.member("branch"),
-            before_record,
+            without_tags(&deleted.member("branch")),
+            without_tags(&before_record),
             "case {label:?}: DeleteBranch must answer the record as it existed at delete \
              time, got {:?}",
             deleted.member("branch")
@@ -197,8 +200,8 @@ async fn a_deleted_branch_name_is_free_again_and_the_recreated_branch_reads_back
             "case {label:?}: the re-created branch must be readable, got {read_back:?}"
         );
         assert_eq!(
-            read_back.member("branch"),
-            again.member("branch"),
+            without_tags(&read_back.member("branch")),
+            without_tags(&again.member("branch")),
             "case {label:?}: GetBranch must answer the re-created record, got {:?}",
             read_back.member("branch")
         );

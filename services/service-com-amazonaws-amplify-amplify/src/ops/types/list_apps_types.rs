@@ -21,7 +21,7 @@ pub struct ListAppsInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.amplify#ListAppsResult")]
 #[derive(Debug, Clone, Default)]
 pub struct ListAppsOutput {
-    pub apps: Vec<App>,
+    pub apps: Vec<AppProjection>,
     pub next_token: Option<String>,
 }
 

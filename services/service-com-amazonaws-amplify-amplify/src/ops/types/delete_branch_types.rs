@@ -21,6 +21,6 @@ pub struct DeleteBranchInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.amplify#DeleteBranchResult")]
 #[derive(Debug, Clone)]
 pub struct DeleteBranchOutput {
-    pub branch: Branch,
+    pub branch: BranchProjection,
 }
 

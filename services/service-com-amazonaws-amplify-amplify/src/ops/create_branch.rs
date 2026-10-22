@@ -243,7 +243,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // default domain prefix is its own name.
             display_name: input.display_name.unwrap_or_else(|| input.branch_name.clone()),
             branch_name: input.branch_name,
+            // The @required members below have no value in a request that omits them.
+            // The record holds the empty value of the member's type, which is what
+            // `BranchProjection` reports as JSON `null`.
             description: input.description.unwrap_or_default(),
+            // `tags` is echoed exactly as the request set it; a later read reports
+            // the branch's tag map (see `BranchProjection::reported`).
             tags: input.tags,
             stage: input.stage.unwrap_or_else(|| DEFAULT_STAGE.to_string()),
             enable_notification: input.enable_notification.unwrap_or(false),
@@ -261,7 +266,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             active_job_id: String::new(),
             total_number_of_jobs: "0".to_string(),
             enable_basic_auth: input.enable_basic_auth.unwrap_or(false),
-            enable_performance_mode: input.enable_performance_mode,
+            // Performance mode is OFF on a branch created without it, and a branch
+            // Amplify created has a definite answer for it: `false`, not nothing.
+            enable_performance_mode: Some(input.enable_performance_mode.unwrap_or(false)),
             // The thumbnail is a screenshot of a deployed branch.
             thumbnail_url: None,
             basic_auth_credentials: input.basic_auth_credentials,
@@ -274,14 +281,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             destination_branch: None,
             source_branch: None,
             backend_environment_arn: input.backend_environment_arn,
-            backend: input.backend,
+            // Every branch has a backend; its `stackArn` is set once a Gen 2
+            // deployment provisions the CloudFormation stack, which creating a
+            // branch does not do.
+            backend: Some(input.backend.unwrap_or_default()),
             compute_role_arn: input.compute_role_arn,
         };
 
         app.branches
             .insert(branch.branch_name.clone(), branch.clone());
 
-        Ok(CreateBranchOutput { branch })
+        Ok(CreateBranchOutput {
+            branch: BranchProjection::written(branch),
+        })
     }
 }
 

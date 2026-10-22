@@ -20,6 +20,6 @@ pub struct DeleteAppInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.amplify#DeleteAppResult")]
 #[derive(Debug, Clone)]
 pub struct DeleteAppOutput {
-    pub app: App,
+    pub app: AppProjection,
 }
 
