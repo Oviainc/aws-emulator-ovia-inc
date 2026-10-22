@@ -31,6 +31,9 @@ mod state_roundtrip;
 #[path = "all/table_control_plane.rs"]
 mod table_control_plane;
 
+#[path = "all/table_description_members.rs"]
+mod table_description_members;
+
 #[path = "all/table_items.rs"]
 mod table_items;
 

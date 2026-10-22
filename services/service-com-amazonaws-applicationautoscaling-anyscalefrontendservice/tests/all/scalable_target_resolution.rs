@@ -566,10 +566,14 @@ async fn a_global_secondary_index_round_trips_through_describe_table() {
     );
 }
 
-/// An item that carries the index's key attribute is in the index; one that does not is
-/// not, which is what `ItemCount` counts.
+/// What `ItemCount` reports is the METERED figure, not a live count: "DynamoDB updates this
+/// value approximately every six hours. Recent changes might not be reflected in this value"
+/// (`TableDescription$ItemCount`, and the same sentence on an index's `IndexSizeBytes`). The
+/// projection rule those figures are computed from — an item is in an index only when it
+/// carries the index's key attribute — is pinned by the DynamoDB crate's own
+/// `table_description_members` suite, which drives the refresh the clock owes.
 #[tokio::test]
-async fn an_index_counts_only_the_items_it_projects() {
+async fn the_item_figures_a_table_reports_are_the_metered_ones() {
     let emulator = Emulator::empty();
     emulator
         .create_table_with_index("orders", "by-customer", "customer", 1, 1)
@@ -601,13 +605,13 @@ async fn an_index_counts_only_the_items_it_projects() {
     );
     assert_eq!(
         body["Table"]["ItemCount"],
-        json!(2),
-        "case \"describe\": expected both items on the table, got {body:?}"
+        json!(0),
+        "case \"describe\": expected the metered ItemCount, which the two writes do not \
+         move, got {body:?}"
     );
     assert_eq!(
         body["Table"]["GlobalSecondaryIndexes"][0]["ItemCount"],
-        json!(1),
-        "case \"describe\": expected only the item carrying the index key in the index, got \
-         {body:?}"
+        json!(0),
+        "case \"describe\": expected the index's metered ItemCount, got {body:?}"
     );
 }
