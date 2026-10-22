@@ -249,6 +249,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // A new file system carries no resource policy until
                     // `PutFileSystemPolicy` attaches one.
                     policy: None,
+                    // Nor any synchronization configuration until
+                    // `PutSynchronizationConfiguration` creates one.
+                    synchronization: None,
                     sequence,
                 };
                 store.file_systems.insert(file_system_id.clone(), record);

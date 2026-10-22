@@ -27,9 +27,10 @@
 //! The form and the theme are the control plane's other app-environment
 //! resources, held the same way: `CreateForm` mints a form, `UpdateForm` merges
 //! into it, `GetForm` reports it from the single [`StoredForm`] record and
-//! `DeleteForm` removes that record; `CreateTheme` mints a theme and `GetTheme`
-//! reports it from the single [`StoredTheme`] record, both keyed by the same
-//! (appId, environmentName) a component is keyed by and both with the projection
+//! `DeleteForm` removes that record; `CreateTheme` mints a theme, `GetTheme`
+//! reports it from the single [`StoredTheme`] record, `UpdateTheme` merges into
+//! that record and `DeleteTheme` removes it, all keyed by the same
+//! (appId, environmentName) a component is keyed by and all with the projection
 //! the model asks for.
 
 use std::collections::HashMap;
@@ -902,12 +903,47 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
             .find(|theme| theme.id == id)
     }
 
+    /// The theme `id` names in one app environment, for a caller that changes it.
+    pub fn theme_mut(
+        &mut self,
+        app_id: &str,
+        environment_name: &str,
+        id: &str,
+    ) -> Option<&mut StoredTheme> {
+        self.themes
+            .get_mut(&(app_id.to_string(), environment_name.to_string()))?
+            .iter_mut()
+            .find(|theme| theme.id == id)
+    }
+
     /// Store a theme at the end of its environment's creation order.
     pub fn insert_theme(&mut self, theme: StoredTheme) {
         self.themes
             .entry((theme.app_id.clone(), theme.environment_name.clone()))
             .or_default()
             .push(theme);
+    }
+
+    /// Remove the theme `id` names, and forget every client token that named it
+    /// so the token map cannot outlive the record — the same way
+    /// [`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::remove_component`]
+    /// releases a component.
+    pub fn remove_theme(
+        &mut self,
+        app_id: &str,
+        environment_name: &str,
+        id: &str,
+    ) -> Option<StoredTheme> {
+        let key = (app_id.to_string(), environment_name.to_string());
+        let themes = self.themes.get_mut(&key)?;
+        let index = themes.iter().position(|theme| theme.id == id)?;
+        let removed = themes.remove(index);
+        if themes.is_empty() {
+            self.themes.remove(&key);
+        }
+        self.theme_tokens
+            .retain(|(token_key, _), token_id| !(*token_key == key && token_id == id));
+        Some(removed)
     }
 
     /// The theme one `clientToken` already created in the app environment the

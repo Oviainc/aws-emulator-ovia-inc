@@ -7,7 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{Connection, Host, Tag, VpcConfiguration};
+use crate::ops::types::{
+    Connection, Host, RepositoryLinkInfo, SyncBlocker, SyncBlockerContext, SyncConfiguration, Tag,
+    VpcConfiguration,
+};
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
 /// scope names one. `emulator_arn`'s own documentation gives `us-east-1` as the
@@ -57,6 +60,19 @@ pub const MAX_CONNECTIONS: usize = 1000;
 /// lives in the emulator's process. `CreateHost` refuses past it with the modeled
 /// `LimitExceededException` (429), the only error that operation declares.
 pub const MAX_HOSTS: usize = 1000;
+
+/// The largest number of repository links this emulator stores for the account.
+///
+/// A CHOSEN bound, exactly like [`MAX_CONNECTIONS`] and for the same reason: the store
+/// lives in the emulator's process. `CreateRepositoryLink` refuses past it with the
+/// modeled `LimitExceededException` (429), which it declares for exactly this.
+pub const MAX_REPOSITORY_LINKS: usize = 1000;
+
+/// The largest number of sync configurations this emulator stores for the account.
+///
+/// A CHOSEN bound, exactly like [`MAX_CONNECTIONS`]. `CreateSyncConfiguration` refuses
+/// past it with the modeled `LimitExceededException` (429), which it declares.
+pub const MAX_SYNC_CONFIGURATIONS: usize = 1000;
 
 /// A connection as this service persists it.
 ///
@@ -139,6 +155,154 @@ impl StoredHost {
     }
 }
 
+/// A repository link as this service persists it.
+///
+/// One record per `RepositoryLinkId`; every member of the modeled `RepositoryLinkInfo`
+/// shape is stored here, so `GetRepositoryLink`, `CreateRepositoryLink` and
+/// `UpdateRepositoryLink` all render from the same row.
+#[derive(Debug, Clone)]
+pub struct StoredRepositoryLink {
+    /// The link's id: the 8-4-4-4-12 hex label the modeled `RepositoryLinkId` pattern
+    /// requires, and the key of [`ComAmazonawsCodeconnectionsCodeconnections20231201State::repository_links`].
+    pub repository_link_id: String,
+    pub repository_link_arn: String,
+    /// The connection Git sync reaches the repository through.
+    pub connection_arn: String,
+    pub encryption_key_arn: Option<String>,
+    /// The repository owner at the provider (the GitHub owner, say).
+    pub owner_id: String,
+    /// DERIVED from the connection, never taken from the request: the modeled
+    /// `RepositoryLinkInfo.ProviderType` is "The provider type for the connection […]
+    /// associated with the repository link", so it is whatever the connection names and
+    /// it follows the connection when `UpdateRepositoryLink` replaces it.
+    pub provider_type: String,
+    pub repository_name: String,
+    /// The tags supplied at create time, in the order they were supplied.
+    pub tags: Vec<Tag>,
+}
+
+impl StoredRepositoryLink {
+    /// Render the stored row as the modeled `RepositoryLinkInfo` structure: the single
+    /// projection from state onto the wire shape, so every reader reports the same link
+    /// the same way.
+    pub fn to_modeled(&self) -> RepositoryLinkInfo {
+        RepositoryLinkInfo {
+            connection_arn: self.connection_arn.clone(),
+            encryption_key_arn: self.encryption_key_arn.clone(),
+            owner_id: self.owner_id.clone(),
+            provider_type: self.provider_type.clone(),
+            repository_link_arn: self.repository_link_arn.clone(),
+            repository_link_id: self.repository_link_id.clone(),
+            repository_name: self.repository_name.clone(),
+        }
+    }
+}
+
+/// A sync configuration as this service persists it.
+///
+/// One record per `(SyncType, ResourceName)` — the pair every sync-configuration
+/// operation addresses it by (`GetSyncConfiguration`, `UpdateSyncConfiguration`,
+/// `DeleteSyncConfiguration` all take exactly those two members).
+#[derive(Debug, Clone)]
+pub struct StoredSyncConfiguration {
+    /// One of the modeled `SyncConfigurationType` values (`CFN_STACK_SYNC`).
+    pub sync_type: String,
+    /// The Amazon Web Services resource the configuration syncs.
+    pub resource_name: String,
+    pub branch: String,
+    pub config_file: Option<String>,
+    /// DERIVED from the repository link, like `repository_name` and `provider_type`:
+    /// the modeled members describe the repository the link names, so they are
+    /// re-derived whenever the configuration's `RepositoryLinkId` changes.
+    pub owner_id: String,
+    pub provider_type: String,
+    pub repository_link_id: String,
+    pub repository_name: String,
+    pub role_arn: String,
+    pub publish_deployment_status: Option<String>,
+    pub trigger_resource_update_on: Option<String>,
+    pub pull_request_comment: Option<String>,
+}
+
+impl StoredSyncConfiguration {
+    /// Render the stored row as the modeled `SyncConfiguration` structure.
+    pub fn to_modeled(&self) -> SyncConfiguration {
+        SyncConfiguration {
+            branch: self.branch.clone(),
+            config_file: self.config_file.clone(),
+            owner_id: self.owner_id.clone(),
+            provider_type: self.provider_type.clone(),
+            repository_link_id: self.repository_link_id.clone(),
+            repository_name: self.repository_name.clone(),
+            resource_name: self.resource_name.clone(),
+            role_arn: self.role_arn.clone(),
+            sync_type: self.sync_type.clone(),
+            publish_deployment_status: self.publish_deployment_status.clone(),
+            trigger_resource_update_on: self.trigger_resource_update_on.clone(),
+            pull_request_comment: self.pull_request_comment.clone(),
+        }
+    }
+}
+
+/// A sync blocker as this service persists it.
+///
+/// A blocker is minted by the SERVICE when a sync it performed is blocked (the
+/// `SyncBlocker` shape carries the reason and the instant it was created, and
+/// `BlockerType` has the single value `AUTOMATED`), never by a caller: this API has no
+/// create-blocker operation. `UpdateSyncBlocker` resolves one by id, and
+/// `GetSyncBlockerSummary` reports the ones a resource holds.
+#[derive(Debug, Clone)]
+pub struct StoredSyncBlocker {
+    /// The blocker's id, and the key of
+    /// [`ComAmazonawsCodeconnectionsCodeconnections20231201State::sync_blockers`].
+    pub id: String,
+    /// The sync type and resource the blocker belongs to: `UpdateSyncBlocker` names
+    /// both beside the id, so a blocker found by id is checked against them.
+    pub sync_type: String,
+    pub resource_name: String,
+    pub parent_resource_name: Option<String>,
+    /// One of the modeled `BlockerType` values; see `types::BLOCKER_TYPE_VALUES`.
+    pub blocker_type: String,
+    /// One of the modeled `BlockerStatus` values; see `types::BLOCKER_STATUS_VALUES`.
+    pub status: String,
+    pub created_reason: String,
+    pub created_at: ::aws_smithy_types::DateTime,
+    pub contexts: Vec<SyncBlockerContext>,
+    pub resolved_reason: Option<String>,
+    pub resolved_at: Option<::aws_smithy_types::DateTime>,
+}
+
+impl StoredSyncBlocker {
+    /// Render the stored row as the modeled `SyncBlocker` structure.
+    pub fn to_modeled(&self) -> SyncBlocker {
+        SyncBlocker {
+            id: self.id.clone(),
+            r#type: self.blocker_type.clone(),
+            status: self.status.clone(),
+            created_reason: self.created_reason.clone(),
+            created_at: self.created_at,
+            // The modeled member is a list the service omits when it has no context to
+            // report, exactly like a connection's absent `HostArn`.
+            contexts: if self.contexts.is_empty() {
+                None
+            } else {
+                Some(self.contexts.clone())
+            },
+            resolved_reason: self.resolved_reason.clone(),
+            resolved_at: self.resolved_at,
+        }
+    }
+}
+
+/// The key a sync configuration is stored under: the `(SyncType, ResourceName)` pair
+/// every sync-configuration operation addresses.
+///
+/// One function so a writer and a reader can never disagree about the key's field
+/// order.
+pub fn sync_configuration_key(sync_type: &str, resource_name: &str) -> (String, String) {
+    (sync_type.to_string(), resource_name.to_string())
+}
+
 /// Per-service state for com-amazonaws-codeconnections-codeconnections-20231201. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCodeconnectionsCodeconnections20231201State {
@@ -161,6 +325,28 @@ pub struct ComAmazonawsCodeconnectionsCodeconnections20231201State {
     /// How many hosts this store has ever minted: the sequence number behind the next
     /// host's resource id (see [`resource_id`]). It counts mints, so it never rewinds.
     pub hosts_minted: u64,
+    /// Every repository link this account holds, keyed by its `RepositoryLinkId`.
+    ///
+    /// A `BTreeMap` for the same reason as `connections`: a total, stable order every
+    /// reader walks the same way.
+    pub repository_links: BTreeMap<String, StoredRepositoryLink>,
+    /// How many repository links this store has ever minted: the sequence number behind
+    /// the next link's id (see [`resource_id`]). It counts mints, so it never rewinds
+    /// and a deleted link's id and ARN never come back.
+    pub repository_links_minted: u64,
+    /// Every sync configuration this account holds, keyed by
+    /// [`sync_configuration_key`] — the `(SyncType, ResourceName)` pair the API
+    /// addresses one by.
+    pub sync_configurations: BTreeMap<(String, String), StoredSyncConfiguration>,
+    /// Every sync blocker this account holds, keyed by its blocker `Id`.
+    ///
+    /// Keyed by id ALONE because `UpdateSyncBlocker` resolves the id before the
+    /// `(SyncType, ResourceName)` pair it is also given. Only the service mints a
+    /// blocker, when a sync it performed is blocked; this emulator performs no Git sync
+    /// (nothing fetches from or pushes to a remote repository), so nothing puts a row
+    /// here and every lookup misses — which is why `UpdateSyncBlocker` answers the
+    /// modeled `SyncBlockerDoesNotExistException` rather than inventing a blocker.
+    pub sync_blockers: BTreeMap<String, StoredSyncBlocker>,
 }
 
 impl ComAmazonawsCodeconnectionsCodeconnections20231201State {
@@ -180,16 +366,45 @@ impl ComAmazonawsCodeconnectionsCodeconnections20231201State {
     /// The tags stored against the resource this ARN names, or `None` when the
     /// service holds no such resource.
     ///
-    /// Every resource this service persists is taggable (`CreateConnection` and
-    /// `CreateHost` both take a `TagList`), so tag reporting resolves an ARN against
-    /// each store rather than against connections alone. An ARN names at most one
-    /// resource: the modeled patterns put the resource type in the ARN
-    /// (`connection/…` vs `host/…`).
+    /// Every resource this service persists is taggable (`CreateConnection`,
+    /// `CreateHost` and `CreateRepositoryLink` all take a `TagList`), so tag reporting
+    /// resolves an ARN against each store rather than against connections alone. An ARN
+    /// names at most one resource: the modeled patterns put the resource type in the ARN
+    /// (`connection/…` vs `host/…` vs `repository-link/…`).
     pub fn tags_for_resource(&self, resource_arn: &str) -> Option<&[Tag]> {
         self.connections
             .get(resource_arn)
             .map(|connection| connection.tags.as_slice())
             .or_else(|| self.hosts.get(resource_arn).map(|host| host.tags.as_slice()))
+            .or_else(|| {
+                // Keyed by id rather than by ARN, so this store is scanned: one map is
+                // one source of truth, and a second ARN index could only disagree
+                // with it.
+                self.repository_links
+                    .values()
+                    .find(|link| link.repository_link_arn == resource_arn)
+                    .map(|link| link.tags.as_slice())
+            })
+    }
+
+    /// The repository link already registered for this connection, owner and
+    /// repository, when there is one.
+    ///
+    /// A repository link IS that triple — the connection Git sync reaches the
+    /// repository through, plus the repository it names — so registering the same
+    /// triple twice is the duplicate `CreateRepositoryLink` refuses with the modeled
+    /// `ResourceAlreadyExistsException`.
+    pub fn repository_link_for(
+        &self,
+        connection_arn: &str,
+        owner_id: &str,
+        repository_name: &str,
+    ) -> Option<&StoredRepositoryLink> {
+        self.repository_links.values().find(|link| {
+            link.connection_arn == connection_arn
+                && link.owner_id == owner_id
+                && link.repository_name == repository_name
+        })
     }
 }
 

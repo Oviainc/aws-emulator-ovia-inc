@@ -17,6 +17,9 @@ mod assessment_error_paths;
 #[path = "all/import_and_assess.rs"]
 mod import_and_assess;
 
+#[path = "all/import_file_task_listing.rs"]
+mod import_file_task_listing;
+
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
 

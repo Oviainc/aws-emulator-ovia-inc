@@ -320,12 +320,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.scope,
                 &input.name,
                 "",
-                "WAFNonexistentItemException",
+                // The reference that could not be resolved is a diagnostic, so it is
+                // recorded here; the refusal itself carries the exception type's
+                // constant sentence.
+                &format!("WAFNonexistentItemException: {reason}"),
             );
             return Err(CreateWebACLErrorModeled::WAFNonexistentItemException(
-                WAFNonexistentItemException {
-                    message: Some(reason),
-                },
+                crate::state::nonexistent_item_exception(),
             )
             .into());
         }
@@ -340,12 +341,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "WAFDuplicateItemException",
             );
             return Err(CreateWebACLErrorModeled::WAFDuplicateItemException(
-                WAFDuplicateItemException {
-                    message: Some(format!(
-                        "A WebACL named {:?} already exists in scope {}",
-                        input.name, input.scope
-                    )),
-                },
+                crate::state::duplicate_item_exception(),
             )
             .into());
         }
@@ -359,13 +355,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "WAFLimitsExceededException",
             );
             return Err(CreateWebACLErrorModeled::WAFLimitsExceededException(
-                WAFLimitsExceededException {
-                    message: Some(format!(
-                        "You have reached the maximum of {} WebACLs in scope {}",
-                        crate::state::MAX_WEB_ACLS_PER_SCOPE, input.scope
-                    )),
-                    source_type: None,
-                },
+                crate::state::limits_exceeded_exception(),
             )
             .into());
         }

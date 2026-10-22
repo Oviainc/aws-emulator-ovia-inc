@@ -195,7 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 PutPackageOriginConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("Domain {} not found.", input.domain),
+                        message: crate::state::domain_not_found_message(
+                            &input.domain,
+                            input.domain_owner.as_deref(),
+                        ),
                         resource_id: Some(input.domain.clone()),
                         resource_type: Some("domain".to_string()),
                     },
@@ -207,9 +210,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 PutPackageOriginConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "Repository {} not found in domain {}.",
-                            input.repository, input.domain
+                        message: crate::state::repository_not_found_message(
+                            &input.domain,
+                            input.domain_owner.as_deref(),
+                            &input.repository,
                         ),
                         resource_id: Some(input.repository.clone()),
                         resource_type: Some("repository".to_string()),

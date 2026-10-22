@@ -317,6 +317,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The same alarm rules `UpdateDeploymentGroup` enforces, from the one
+        // place they live: a deployment group's alarm configuration is bounded
+        // and well-formed however it was set.
+        if let Some(configuration) = input.alarm_configuration.as_ref() {
+            match crate::state::validate_alarm_configuration(configuration) {
+                Ok(()) => {}
+                Err(crate::state::AlarmConfigurationRejection::TooManyAlarms(count)) => {
+                    return Err(
+                        CreateDeploymentGroupErrorModeled::AlarmsLimitExceededException(
+                            AlarmsLimitExceededException {
+                                message: Some(format!(
+                                    "The maximum number of alarms for a deployment group ({}) was \
+                                     exceeded: {count} alarms were specified",
+                                    crate::state::MAX_ALARMS_PER_ALARM_CONFIGURATION
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                Err(crate::state::AlarmConfigurationRejection::Malformed(reason)) => {
+                    return Err(
+                        CreateDeploymentGroupErrorModeled::InvalidAlarmConfigException(
+                            InvalidAlarmConfigException {
+                                message: Some(format!(
+                                    "The alarm configuration is invalid: {reason}"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
 
         let application_name = input.application_name;
         let deployment_group_name = input.deployment_group_name;

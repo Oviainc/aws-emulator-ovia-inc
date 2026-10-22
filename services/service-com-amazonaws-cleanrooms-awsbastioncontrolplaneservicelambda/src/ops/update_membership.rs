@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMembership
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMembership`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMembership::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! `UpdateMembership` is a PATCH over the stored `Membership`: every member the request
+//! carries replaces the stored one, and every member it omits leaves the stored value
+//! untouched. The membership's `updateTime` is restamped on each successful call
+//! (`Membership$updateTime`: "The time the membership metadata was last updated"), and
+//! the response is the stored record read back, so `GetMembership` / `ListMemberships`
+//! report exactly what this call persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -161,20 +161,177 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMembership` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMembershipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMembership"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(UpdateMembershipErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("cleanrooms state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let membership_id = input.membership_identifier;
+        let caller = st::caller_account_id().to_string();
+        let mut store = state.lock();
+
+        let Some(stored) = store.memberships.get(&membership_id).cloned() else {
+            return Err(UpdateMembershipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("membership {membership_id} not found"),
+                    resource_id: membership_id,
+                    resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A membership that is no longer ACTIVE (its collaboration was deleted, or the
+        // member was removed — the other two `MembershipStatus` values) has no
+        // collaboration left to carry the change, so updating it is the inconsistent
+        // state `ConflictException` is for ("Updating or deleting a resource can cause
+        // an inconsistent state"), with the `ConflictExceptionReason` INVALID_STATE.
+        if stored.status != st::MEMBERSHIP_STATUS_ACTIVE {
+            return Err(UpdateMembershipErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "membership {membership_id} is {} and cannot be updated",
+                    stored.status
+                )),
+                resource_id: Some(membership_id),
+                resource_type: Some(st::RESOURCE_TYPE_MEMBERSHIP.to_string()),
+                reason: Some(st::CONFLICT_REASON_INVALID_STATE.to_string()),
+            })
+            .into());
+        }
+
+        let payment_configuration = match input.membership_payment_configuration {
+            None => stored.payment_configuration.clone(),
+            Some(requested) => {
+                // `MembershipQueryComputePaymentConfig$isResponsible` and
+                // `MembershipJobComputePaymentConfig$isResponsible` both document the
+                // same refusal: "An error message is returned ... if you set the value
+                // to FALSE but you are responsible to pay ... [or] to TRUE but you are
+                // not responsible to pay". Who is responsible is decided by the
+                // collaboration (the payer the creator configured, else the member
+                // holding the paying ability), which is what
+                // `st::membership_payment_configuration` computes from the grant — so an
+                // update may restate that responsibility but never flip it. No ability
+                // makes a member the default payer for an ML cost, so the ML block
+                // carries no such rule and is accepted as sent.
+                let assigned = store
+                    .collaborations
+                    .get(&stored.collaboration_id)
+                    .and_then(|record| record.grant_for(&caller))
+                    .map(|grant| st::membership_payment_configuration(None, &grant));
+                if let Some(assigned) = assigned.as_ref() {
+                    if let Some(query_compute) = requested.query_compute.as_ref() {
+                        if query_compute.is_responsible != assigned.query_compute.is_responsible {
+                            return Err(payment_responsibility_error(
+                                "membershipPaymentConfiguration.queryCompute.isResponsible",
+                                "query compute",
+                                assigned.query_compute.is_responsible,
+                            ));
+                        }
+                    }
+                    if let (Some(job_compute), Some(assigned_job)) =
+                        (requested.job_compute.as_ref(), assigned.job_compute.as_ref())
+                    {
+                        if job_compute.is_responsible != assigned_job.is_responsible {
+                            return Err(payment_responsibility_error(
+                                "membershipPaymentConfiguration.jobCompute.isResponsible",
+                                "job compute",
+                                assigned_job.is_responsible,
+                            ));
+                        }
+                    }
+                }
+                merge_payment_configuration(&stored.payment_configuration, requested)
+            }
+        };
+
+        let Some(membership) = store.memberships.get_mut(&membership_id) else {
+            return Err(UpdateMembershipErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!("membership {membership_id} was not persisted")),
+                },
+            )
+            .into());
+        };
+        if let Some(query_log_status) = input.query_log_status {
+            membership.query_log_status = query_log_status;
+        }
+        if let Some(job_log_status) = input.job_log_status {
+            membership.job_log_status = Some(job_log_status);
+        }
+        if let Some(default_result_configuration) = input.default_result_configuration {
+            membership.default_result_configuration = Some(default_result_configuration);
+        }
+        if let Some(default_job_result_configuration) = input.default_job_result_configuration {
+            membership.default_job_result_configuration = Some(default_job_result_configuration);
+        }
+        membership.payment_configuration = payment_configuration;
+        membership.update_time = st::now();
+
+        Ok(UpdateMembershipOutput {
+            membership: membership.clone(),
+        })
+    }
+}
+
+/// The 400 a request takes when it accepts a payment responsibility the collaboration
+/// did not assign the caller, or declines one it did. `field` is the input member at
+/// fault and `assigned` the responsibility in force, so the message states the rule that
+/// refused the request rather than a bare "invalid".
+fn payment_responsibility_error(
+    field: &str,
+    cost: &str,
+    assigned: bool,
+) -> UpdateMembershipError {
+    let detail = if assigned {
+        format!("the member is responsible to pay for {cost} costs, so isResponsible must be true")
+    } else {
+        format!(
+            "the member is not responsible to pay for {cost} costs, so isResponsible must be false"
+        )
+    };
+    UpdateMembershipErrorModeled::ValidationException(ValidationException {
+        message: Some(format!("{field}: {detail}")),
+        reason: Some(crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+        field_list: Some(vec![ValidationExceptionField {
+            name: field.to_string(),
+            message: detail,
+        }]),
+    })
+    .into()
+}
+
+/// The stored payment configuration with the update applied member by member: a member
+/// the request carries replaces the stored one, a member it omits is left as stored. The
+/// rule is applied to the nested ML block too, so naming one ML cost does not erase the
+/// responsibilities accepted for the other two.
+fn merge_payment_configuration(
+    stored: &MembershipPaymentConfiguration,
+    requested: UpdateMembershipPaymentConfiguration,
+) -> MembershipPaymentConfiguration {
+    let machine_learning = match (stored.machine_learning.clone(), requested.machine_learning) {
+        (stored, None) => stored,
+        (None, Some(requested)) => Some(requested),
+        (Some(stored), Some(requested)) => Some(MembershipMLPaymentConfig {
+            model_training: requested.model_training.or(stored.model_training),
+            model_inference: requested.model_inference.or(stored.model_inference),
+            synthetic_data_generation: requested
+                .synthetic_data_generation
+                .or(stored.synthetic_data_generation),
+        }),
+    };
+    MembershipPaymentConfiguration {
+        query_compute: requested
+            .query_compute
+            .unwrap_or_else(|| stored.query_compute.clone()),
+        machine_learning,
+        job_compute: requested.job_compute.or_else(|| stored.job_compute.clone()),
     }
 }

@@ -173,7 +173,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => {
                 return Err(DeleteDomainErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("Domain {} not found.", input.domain),
+                        message: crate::state::domain_not_found_message(
+                            &input.domain,
+                            input.domain_owner.as_deref(),
+                        ),
                         resource_id: Some(input.domain.clone()),
                         resource_type: Some("domain".to_string()),
                     },
@@ -184,11 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // deleted first.
             Some(domain) if !domain.repositories.is_empty() => {
                 return Err(DeleteDomainErrorModeled::ConflictException(ConflictException {
-                    message: format!(
-                        "Domain {} cannot be deleted because it still contains {} repositories.",
-                        input.domain,
-                        domain.repositories.len()
-                    ),
+                    message: crate::state::DOMAIN_NOT_EMPTY_MESSAGE.to_string(),
                     resource_id: Some(input.domain.clone()),
                     resource_type: Some("domain".to_string()),
                 })

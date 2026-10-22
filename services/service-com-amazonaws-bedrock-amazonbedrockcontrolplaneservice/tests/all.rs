@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_inputs.rs"]
 mod arn_inputs;
+#[path = "all/guardrail_timestamp_wire_form.rs"]
+mod guardrail_timestamp_wire_form;
 #[path = "all/guardrail_wire_shape.rs"]
 mod guardrail_wire_shape;
 #[path = "all/guardrails.rs"]

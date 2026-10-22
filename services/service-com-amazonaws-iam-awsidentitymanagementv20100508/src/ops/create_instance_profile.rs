@@ -251,10 +251,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The response is the record that was stored, so a caller sees exactly what a
-        // later `GetInstanceProfile` reports.
-        store
-            .instance_profiles
-            .insert(key, instance_profile.clone());
+        // later `GetInstanceProfile` reports. The profile is stored holding NO binding:
+        // a role is bound to it only by `AddRoleToInstanceProfile`.
+        store.instance_profiles.insert(
+            key,
+            crate::state::InstanceProfileRecord {
+                profile: instance_profile.clone(),
+                role_keys: Vec::new(),
+            },
+        );
         Ok(CreateInstanceProfileOutput { instance_profile })
     }
 }

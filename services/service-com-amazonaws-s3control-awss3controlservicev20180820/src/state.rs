@@ -88,6 +88,19 @@ pub const MAX_POLICY_BYTES: usize = 20 * 1024;
 /// point name, which is the pair a name is unique within.
 pub type AccessPointKey = (String, String);
 
+/// How many accounts' `PublicAccessBlock` configurations the store holds before
+/// `PutPublicAccessBlock` refuses to record one for a FURTHER account.
+///
+/// This is the emulator's OWN bound on its store, not a claim about any limit
+/// AWS publishes: every account has exactly one such configuration, and
+/// `AccountId` is constrained only to `^\d{12}$`, which bounds the shape of a
+/// key and not how many of them a caller can name. Without this bound a caller
+/// could grow this process's state without end by varying `AccountId`. It is
+/// checked only when a request would ADD an account's configuration, so every
+/// account already in the store stays writable, and `DeletePublicAccessBlock`
+/// releases a slot.
+pub const PUBLIC_ACCESS_BLOCK_QUOTA: usize = 1_000;
+
 /// One stored S3 Storage Lens configuration: the document the last
 /// `PutStorageLensConfiguration` stored, and the tag set that configuration
 /// carries.
@@ -147,6 +160,21 @@ pub struct ComAmazonawsS3controlAwss3controlservicev20180820State {
     /// one is caller-chosen without limit. `DeleteAccessPoint` releases a
     /// record and its policy.
     pub access_points: BTreeMap<AccessPointKey, AccessPointRecord>,
+
+    /// The account-level `PublicAccessBlock` configuration each account has set,
+    /// by account id — what `PutPublicAccessBlock` records,
+    /// `GetPublicAccessBlock` reports and `DeletePublicAccessBlock` removes.
+    ///
+    /// An account is a KEY here only once a configuration has been put for it:
+    /// an ABSENT entry is what `GetPublicAccessBlock` answers
+    /// `NoSuchPublicAccessBlockConfiguration` for, and it is a different state
+    /// from a PRESENT configuration whose four settings are all `false`, which
+    /// that read reports as a configuration.
+    ///
+    /// BOUNDED: one fixed-size record per account and at most
+    /// [`PUBLIC_ACCESS_BLOCK_QUOTA`] accounts, released by
+    /// `DeletePublicAccessBlock`.
+    pub public_access_blocks: BTreeMap<String, PublicAccessBlockConfiguration>,
 
     /// S3 Storage Lens configurations by (account id, configuration id).
     ///
@@ -333,6 +361,23 @@ pub fn malformed_policy<E>(why: &str) -> crate::scaffolded::Scaffolded<E> {
         "MalformedPolicy",
         400,
         format!("The specified policy is not a policy this service can store: {why}"),
+    )
+}
+
+/// `AccessDenied` (HTTP 403): the store already holds
+/// [`PUBLIC_ACCESS_BLOCK_QUOTA`] accounts' configurations, so recording one for
+/// a further account would grow this process's state without end.
+/// `PutPublicAccessBlock` documents `AccessDenied` (403) as the refusal a
+/// caller gets when the service will not let the account-level configuration be
+/// written, and the message says which bound was reached.
+pub fn public_access_block_store_full<E>(account_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "AccessDenied",
+        403,
+        format!(
+            "This emulator already holds the maximum of {PUBLIC_ACCESS_BLOCK_QUOTA} \
+             PublicAccessBlock configurations and cannot add one for account {account_id}."
+        ),
     )
 }
 

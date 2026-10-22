@@ -278,16 +278,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
             return Err(not_found(
-                format!("Domain {} not found.", input.domain),
+                crate::state::domain_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                ),
                 &input.domain,
                 "domain",
             ));
         };
         let Some(repository) = domain.repositories.get_mut(&input.repository) else {
             return Err(not_found(
-                format!(
-                    "Repository {} not found in domain {}.",
-                    input.repository, input.domain
+                crate::state::repository_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                    &input.repository,
                 ),
                 &input.repository,
                 "repository",

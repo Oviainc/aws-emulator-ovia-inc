@@ -189,6 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+
         if state.recovery_groups.contains_key(&input.recovery_group_name) {
             return Err(CreateRecoveryGroupErrorModeled::ConflictException(
                 ConflictException {

@@ -332,6 +332,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // owes it `available`.
             life_cycle_state: efs::LIFE_CYCLE_CREATING.to_string(),
             available_at: now + efs::CREATING_FOR,
+            // No delete has been accepted for a brand-new access point.
+            deleted_at: None,
             posix_user: input.posix_user.clone(),
             root_directory,
             tags,

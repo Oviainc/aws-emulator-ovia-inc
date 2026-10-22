@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePolicyStatement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePolicyStatement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePolicyStatement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes ONE statement — the one whose `Sid` is the requested `statementId` — from
+//! the resource-based policy stored for the resource the `arn` @httpLabel names, and
+//! answers the document the removal left. Every other member of that document is
+//! carried through untouched. Removing a statement is a new revision, so it mints a
+//! new `token`; a `statementId` the document does not hold removes nothing, which is
+//! no revision at all, so the standing token stands (the operation is modelled
+//! `@idempotent`, and a repeated delete of one statement is exactly that case).
+//! Removing the LAST statement deletes the policy itself: a policy is its statements,
+//! so its readers answer not-found again.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +160,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePolicyStatement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePolicyStatementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePolicyStatement"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeletePolicyStatementErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+
+        // A policy belongs TO a resource, so the resource has to exist, and a resource
+        // whose policy does not exist — never written, or deleted with its last
+        // statement — has no revision to report for the @required `token`: the two
+        // conditions `GetPolicy` reports separately, reported the same way here.
+        if store
+            .policy_resource_created_at(&input.arn, &region)
+            .is_none()
+        {
+            return Err(DeletePolicyStatementErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::messages::policy_resource_not_found(&input.arn)),
+                },
+            )
+            .into());
+        }
+        let standing = store
+            .resource_policy(&input.arn, &region)
+            // Cloned so the record can be written back below without holding a borrow
+            // of the store across the change.
+            .map(|policy| (policy.token.clone(), policy.policy.clone()))
+            .ok_or_else(|| {
+                DeletePolicyStatementErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::messages::GET_POLICY_NOT_FOUND.to_string()),
+                    },
+                )
+            })?;
+        let (standing_token, standing_document) = standing;
+
+        let (object, mut statements) = crate::state::policy_document_parts(&standing_document)
+            .ok_or_else(|| {
+                DeletePolicyStatementErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::messages::POLICY_NOT_JSON.to_string()),
+                })
+            })?;
+
+        // Removing a statement is a new revision of the policy; removing NOTHING is
+        // not, so a `statementId` the document does not hold leaves both the document
+        // and the token exactly as they were. That is what makes a repeated delete
+        // idempotent rather than a token-minting no-op.
+        let before = statements.len();
+        statements.retain(|statement| {
+            crate::state::statement_sid(statement) != Some(input.statement_id.as_str())
+        });
+        if statements.len() == before {
+            return Ok(DeletePolicyStatementOutput {
+                arn: input.arn,
+                token: standing_token,
+                policy: Some(standing_document),
+            });
+        }
+
+        let emptied = statements.is_empty();
+        let document = crate::state::render_policy_document(object, statements).ok_or_else(|| {
+            DeletePolicyStatementErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator could not render the policy document"
+                        .to_string(),
+                ),
+            })
+        })?;
+        // `token` is documented on this operation's output as "a unique identifier for
+        // the DELETED policy", so it is the revision this call produced even when that
+        // revision is the policy's last.
+        let token = crate::state::new_policy_token();
+
+        if emptied {
+            // A policy is its statements, so the last removal deletes the policy
+            // itself rather than leaving a statement-less one behind: its readers
+            // answer not-found again, exactly as they did before the first statement
+            // was added.
+            store.policies.remove(&input.arn);
+            return Ok(DeletePolicyStatementOutput {
+                arn: input.arn,
+                token,
+                policy: Some(document),
+            });
+        }
+
+        // Answered from the STORED record, which the standing entry is updated in
+        // place to become: the statements that remain, and the revision they are.
+        let stored = store.policies.get_mut(&input.arn).ok_or_else(|| {
+            DeletePolicyStatementErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator lost the policy it just read".to_string(),
+                ),
+            })
+        })?;
+        stored.policy = document;
+        stored.token = token;
+        Ok(DeletePolicyStatementOutput {
+            arn: input.arn.clone(),
+            token: stored.token.clone(),
+            policy: Some(stored.policy.clone()),
+        })
     }
 }

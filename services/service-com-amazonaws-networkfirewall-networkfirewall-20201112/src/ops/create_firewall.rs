@@ -401,7 +401,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             firewall_policy_change_protection: input.firewall_policy_change_protection,
             description: input.description,
             tags: input.tags,
-            encryption_configuration: input.encryption_configuration,
+            encryption_configuration: Some(crate::state::effective_encryption_configuration(
+                input.encryption_configuration,
+            )),
             enabled_analysis_types: input.enabled_analysis_types,
             status: crate::state::FIREWALL_PROVISIONING.to_string(),
             config_sync_state: crate::state::SYNC_IN_SYNC.to_string(),

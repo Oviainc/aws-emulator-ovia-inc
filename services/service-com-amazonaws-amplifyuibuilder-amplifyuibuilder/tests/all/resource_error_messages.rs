@@ -279,14 +279,25 @@ async fn a_read_that_finds_nothing_answers_one_fixed_literal() {
             assert_names_no_request_value(&case, &answer, &[app_id, environment, id]);
         }
 
-        // The two updates answer the read literal too — the class is the same, whichever
-        // resource kind the update addressed.
-        for (operation, kind) in [("UpdateComponent", "components"), ("UpdateForm", "forms")] {
+        // The updates answer the read literal too — the class is the same, whichever
+        // resource kind the update addressed. Each carries the smallest patch its
+        // `Update…Data` admits, so the request reaches the handler rather than being
+        // refused on a modelled constraint.
+        for (operation, kind, patch) in [
+            ("UpdateComponent", "components", json!({"name": "Ghost"})),
+            ("UpdateForm", "forms", json!({"name": "Ghost"})),
+            (
+                "UpdateTheme",
+                "themes",
+                // `UpdateThemeData$values` is `@required`.
+                json!({"values": [{"key": "a", "value": {"value": "b"}}]}),
+            ),
+        ] {
             let updated = call(
                 &router,
                 "PATCH",
                 &member_uri(kind, app_id, environment, id),
-                Some(json!({"name": "Ghost"})),
+                Some(patch),
             )
             .await;
             let case = format!("{case} on {operation}");
@@ -313,19 +324,30 @@ async fn a_delete_that_finds_nothing_answers_its_own_fixed_literal() {
     let router = emulator();
 
     for (case, app_id, environment, id) in absent_addressings() {
-        let answer = delete_in(&router, app_id, environment, id).await;
-        assert_eq!(
-            answer.status, 404,
-            "case {case:?}: an absent id must answer HTTP 404, got {} with {:?}",
-            answer.status, answer.body
-        );
-        assert_eq!(
-            answer.message(),
-            DELETE_NOT_FOUND_MESSAGE,
-            "case {case:?}: expected the message {DELETE_NOT_FOUND_MESSAGE:?}, got {:?}",
-            answer.message()
-        );
-        assert_names_no_request_value(case, &answer, &[app_id, environment, id]);
+        // Every delete addressed by (appId, environmentName, id): one literal for all
+        // of them, whichever resource kind the delete named.
+        for kind in ["components", "forms", "themes"] {
+            let answer = call(
+                &router,
+                "DELETE",
+                &member_uri(kind, app_id, environment, id),
+                None,
+            )
+            .await;
+            let case = format!("{case} on the {kind} delete");
+            assert_eq!(
+                answer.status, 404,
+                "case {case:?}: an absent id must answer HTTP 404, got {} with {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                answer.message(),
+                DELETE_NOT_FOUND_MESSAGE,
+                "case {case:?}: expected the message {DELETE_NOT_FOUND_MESSAGE:?}, got {:?}",
+                answer.message()
+            );
+            assert_names_no_request_value(&case, &answer, &[app_id, environment, id]);
+        }
     }
 
     // The two literals stay apart on one id across the whole lifecycle: a component is

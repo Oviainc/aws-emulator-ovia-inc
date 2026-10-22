@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRepositoryLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRepositoryLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRepositoryLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +154,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRepositoryLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRepositoryLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRepositoryLink"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateRepositoryLinkErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The CodeConnections resource store is unavailable. Try again.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // The resource this call addresses is resolved FIRST: an id naming no
+        // repository link is refused with the modeled `ResourceNotFoundException`
+        // (404), the error the operation declares for a resource that is not there, and
+        // nothing is written.
+        let Some(existing) = store
+            .repository_links
+            .get(&input.repository_link_id)
+            .cloned()
+        else {
+            return Err(UpdateRepositoryLinkErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Repository not found for accountId: {} and UUID: {}",
+                        ::engine::emulator_account_id(),
+                        input.repository_link_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // A replacement connection is RESOLVED against the connection store, exactly as
+        // `CreateRepositoryLink` resolves the first one: the link must never be left
+        // pointing at a connection that is not there. The operation models no
+        // `ResourceUnavailableException`, so the refusal is `InvalidInputException`
+        // (400), naming the member that could not be resolved.
+        let replacement = match input.connection_arn.as_deref() {
+            None => None,
+            Some(connection_arn) => match store.connections.get(connection_arn) {
+                None => {
+                    return Err(UpdateRepositoryLinkErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(format!(
+                                "The input is not valid. ConnectionArn names no connection in this account: {connection_arn}"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                // The link's `ProviderType` is the provider type OF ITS CONNECTION, so
+                // replacing the connection re-derives it rather than leaving the old
+                // provider on the link.
+                Some(connection) => match connection.provider_type.clone() {
+                    Some(provider_type) => Some((connection_arn.to_string(), provider_type)),
+                    None => {
+                        return Err(UpdateRepositoryLinkErrorModeled::InvalidInputException(
+                            InvalidInputException {
+                                message: Some(format!(
+                                    "The input is not valid. The connection {connection_arn} has no ProviderType, so it cannot back a repository link."
+                                )),
+                            },
+                        )
+                        .into());
+                    }
+                },
+            },
+        };
+
+        // Each member the request carries replaces the stored one; a member it omits
+        // leaves that value alone, so an update that names nothing changes nothing.
+        let mut updated = existing;
+        if let Some((connection_arn, provider_type)) = replacement {
+            updated.connection_arn = connection_arn;
+            updated.provider_type = provider_type;
+        }
+        if let Some(encryption_key_arn) = input.encryption_key_arn {
+            updated.encryption_key_arn = Some(encryption_key_arn);
+        }
+        let repository_link_info = updated.to_modeled();
+        store
+            .repository_links
+            .insert(input.repository_link_id.clone(), updated);
+        drop(store);
+
+        // Audit record for a state-changing operation: who presented which access key
+        // id, what changed, and the outcome. No secret is logged.
+        ::tracing::info!(
+            operation = "UpdateRepositoryLink",
+            access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+            repository_link_arn = %repository_link_info.repository_link_arn,
+            outcome = "updated",
+            "codeconnections state change"
+        );
+
+        Ok(UpdateRepositoryLinkOutput {
+            repository_link_info,
+        })
     }
 }

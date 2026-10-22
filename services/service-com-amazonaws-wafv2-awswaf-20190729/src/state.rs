@@ -14,7 +14,10 @@
 
 use std::collections::HashMap;
 
-use crate::ops::types::{IPSet, Rule, Statement, Tag, WebACL};
+use crate::ops::types::{
+    IPSet, Rule, Statement, Tag, WAFAssociatedItemException, WAFDuplicateItemException,
+    WAFLimitsExceededException, WAFNonexistentItemException, WAFOptimisticLockException, WebACL,
+};
 
 /// The `Scope` values the model declares
 /// (`smithy_query(query="shape",shape="Scope")` → `CLOUDFRONT`, `REGIONAL`).
@@ -29,6 +32,103 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// `true` when `scope` is one of the two values the `Scope` enum declares.
 pub fn is_known_scope(scope: &str) -> bool {
     matches!(scope, SCOPE_CLOUDFRONT | SCOPE_REGIONAL)
+}
+
+// ---------------------------------------------------------------------------
+// The exception messages: ONE constant sentence per exception type.
+// ---------------------------------------------------------------------------
+//
+// Every WAFv2 exception below models its detail as a lone `Message` (the limits
+// error adds a `SourceType`), and the model documents ONE sentence for the SHAPE
+// itself — `smithy_query(query="shape",shape="WAFNonexistentItemException")` is
+// "WAF couldn’t perform the operation because your resource doesn't exist …", not
+// a template with a slot for the resource that was named. The message is therefore
+// a property of the exception TYPE, not of the call: WAF answers the same sentence
+// for every request that trips that exception, and the body carries no name, id,
+// ARN or scope taken from the request. A handler that needs to record WHICH
+// resource tripped it writes that to the audit log ([`audit`]), never to the
+// response.
+//
+// `WAFInvalidParameterException` is the one exception whose body does describe the
+// call: the model gives it `Field`, `Parameter` and `Reason` members for exactly
+// that ("The invalid parameter that resulted in the exception"), so its message
+// stays request-derived. `WAFInternalErrorException` already carries a constant,
+// request-independent sentence naming the internal fault it reports.
+
+/// The sentence `WAFDuplicateItemException` carries, whatever the request named.
+///
+/// The wire wording WAF answers with, as the recorded wafv2 responses show it; the
+/// model documents the same single sentence for the shape (see the note above).
+pub const DUPLICATE_ITEM_MESSAGE: &str = "AWS WAF couldn’t perform the operation \
+     because some resource in your request is a duplicate of an existing one.";
+
+/// The sentence `WAFOptimisticLockException` carries. See
+/// [`DUPLICATE_ITEM_MESSAGE`] for where the wording comes from.
+pub const OPTIMISTIC_LOCK_MESSAGE: &str = "AWS WAF couldn’t save your changes \
+     because someone changed the resource after you started to edit it. Reapply \
+     your changes.";
+
+/// The sentence `WAFNonexistentItemException` carries. See
+/// [`DUPLICATE_ITEM_MESSAGE`].
+pub const NONEXISTENT_ITEM_MESSAGE: &str =
+    "AWS WAF couldn’t perform the operation because your resource doesn’t exist.";
+
+/// The sentence `WAFAssociatedItemException` carries: the shape's own documented
+/// sentence (`smithy_query(query="shape",shape="WAFAssociatedItemException")`, its
+/// wrapping whitespace flattened), which is what pins it as constant per exception
+/// type.
+pub const ASSOCIATED_ITEM_MESSAGE: &str = "WAF couldn’t perform the operation \
+     because your resource is being used by another resource or it’s associated \
+     with another resource.";
+
+/// The sentence `WAFLimitsExceededException` carries: the shape's own documented
+/// sentence (`smithy_query(query="shape",shape="WAFLimitsExceededException")`),
+/// link text flattened, which names no particular quota or request.
+pub const LIMITS_EXCEEDED_MESSAGE: &str = "WAF couldn’t perform the operation \
+     because you exceeded your resource limit. For example, the maximum number of \
+     WebACL objects that you can create for an Amazon Web Services account. For \
+     more information, see WAF quotas in the WAF Developer Guide.";
+
+/// `WAFDuplicateItemException` as WAF returns it: nothing but
+/// [`DUPLICATE_ITEM_MESSAGE`].
+pub fn duplicate_item_exception() -> WAFDuplicateItemException {
+    WAFDuplicateItemException {
+        message: Some(DUPLICATE_ITEM_MESSAGE.to_string()),
+    }
+}
+
+/// `WAFOptimisticLockException` as WAF returns it: nothing but
+/// [`OPTIMISTIC_LOCK_MESSAGE`].
+pub fn optimistic_lock_exception() -> WAFOptimisticLockException {
+    WAFOptimisticLockException {
+        message: Some(OPTIMISTIC_LOCK_MESSAGE.to_string()),
+    }
+}
+
+/// `WAFNonexistentItemException` as WAF returns it: nothing but
+/// [`NONEXISTENT_ITEM_MESSAGE`].
+pub fn nonexistent_item_exception() -> WAFNonexistentItemException {
+    WAFNonexistentItemException {
+        message: Some(NONEXISTENT_ITEM_MESSAGE.to_string()),
+    }
+}
+
+/// `WAFAssociatedItemException` as WAF returns it: nothing but
+/// [`ASSOCIATED_ITEM_MESSAGE`].
+pub fn associated_item_exception() -> WAFAssociatedItemException {
+    WAFAssociatedItemException {
+        message: Some(ASSOCIATED_ITEM_MESSAGE.to_string()),
+    }
+}
+
+/// `WAFLimitsExceededException` as WAF returns it: [`LIMITS_EXCEEDED_MESSAGE`] and
+/// no `SourceType`, which the model leaves optional and which this emulator has no
+/// source value to report.
+pub fn limits_exceeded_exception() -> WAFLimitsExceededException {
+    WAFLimitsExceededException {
+        message: Some(LIMITS_EXCEEDED_MESSAGE.to_string()),
+        source_type: None,
+    }
 }
 
 /// A WebACL as stored: the modelled shape plus the bookkeeping WAFv2 keeps beside
@@ -170,7 +270,10 @@ impl ComAmazonawsWafv2Awswaf20190729State {
     /// entity kinds this emulator has no store for yet (`CreateRuleGroup`,
     /// `CreateRegexPatternSet` and the managed-rule-group catalogue are still
     /// scaffolded 501s, tracked as separate gap issues), so every reference to one
-    /// names nothing that exists and is refused here. That is also what keeps
+    /// names nothing that exists and is refused here. The `Some` it answers is the
+    /// DIAGNOSTIC for the refusal's audit record — the response itself carries
+    /// [`NONEXISTENT_ITEM_MESSAGE`], the constant sentence that exception type always
+    /// carries. That is also what keeps
     /// [`web_acl_capacity`] from pricing a statement whose cost is the referenced
     /// group's own capacity: no stored rule list can carry one.
     ///

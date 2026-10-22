@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeComplianceByConfigRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeComplianceByConfigRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeComplianceByConfigRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports whether each Config rule in [`crate::state`] is compliant: the rule's
+//! `ComplianceType` rolled up from the evaluation results recorded against it, plus
+//! the number of resources contributing a `NON_COMPLIANT` result, filtered by the
+//! requested rule names and compliance types and paged over the store's stable name
+//! ordering.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +159,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeComplianceByConfigRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeComplianceByConfigRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeComplianceByConfigRule"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let names = input.config_rule_names.unwrap_or_default();
+        let compliance_types = input.compliance_types.unwrap_or_default();
+        let store = state.lock();
+
+        // A requested name that names no rule is a failure, not an empty page.
+        for name in &names {
+            if !store.config_rules.contains_key(name) {
+                return Err(
+                    DescribeComplianceByConfigRuleErrorModeled::NoSuchConfigRuleException(
+                        NoSuchConfigRuleException {
+                            message: Some(crate::state::no_such_config_rule_message(name)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        DescribeComplianceByConfigRuleErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "the specified NextToken is not valid; use the NextToken a \
+                                     previous DescribeComplianceByConfigRule response returned"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // A reporting operation: every entry is computed from the rules and the
+        // evaluation results already in state, and nothing is written. Paging follows
+        // the store's own name ordering, so a token holds the NAME the next page
+        // resumes at and survives rules created or deleted between pages.
+        let mut page = Vec::new();
+        let mut next_token = None;
+        for (name, entry) in &store.config_rules {
+            if resume_at.as_ref().is_some_and(|resume_at| name < resume_at) {
+                continue;
+            }
+            if !names.is_empty() && !names.iter().any(|requested| requested == name) {
+                continue;
+            }
+            // The compliance filter selects on what the rule ROLLS UP TO, so a rule
+            // whose results do not place it in a requested compliance type is left out
+            // rather than reported with another one.
+            let compliance = entry.compliance_shape();
+            if !compliance_types.is_empty()
+                && !compliance_types.iter().any(|requested| {
+                    Some(requested.as_str()) == compliance.compliance_type.as_deref()
+                })
+            {
+                continue;
+            }
+            if page.len() == crate::state::DESCRIBE_COMPLIANCE_BY_CONFIG_RULE_PAGE_SIZE {
+                next_token = Some(crate::state::encode_page_token(name));
+                break;
+            }
+            page.push(ComplianceByConfigRule {
+                config_rule_name: Some(entry.name.clone()),
+                compliance: Some(compliance),
+            });
+        }
+
+        Ok(DescribeComplianceByConfigRuleOutput {
+            compliance_by_config_rules: Some(page),
+            next_token,
+        })
     }
 }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRepositoryLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRepositoryLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRepositoryLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +157,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRepositoryLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRepositoryLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRepositoryLinkErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The CodeConnections resource store is unavailable. Try again.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let tags = input.tags.unwrap_or_default();
+
+        let mut store = state.lock();
+
+        // A repository link is an association with a connection this account holds, so
+        // the `ConnectionArn` is RESOLVED against the connection store rather than
+        // judged by its syntax: a link must never name a connection that is not there.
+        // This operation models no `ResourceNotFoundException`, so the refusal is the
+        // modeled `InvalidInputException` (400), and the message names the member whose
+        // value could not be resolved.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRepositoryLink"))
+        // The connection's STATUS is deliberately not a condition: a connection minted
+        // through the API stays `PENDING` until a console handshake this emulator cannot
+        // perform (see `state::CONNECTION_STATUS_ON_CREATE`), so refusing a pending
+        // connection here would make every repository link unreachable.
+        let provider_type = match store.connections.get(&input.connection_arn) {
+            None => {
+                return Err(CreateRepositoryLinkErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "The input is not valid. ConnectionArn names no connection in this account: {}",
+                            input.connection_arn
+                        )),
+                    },
+                )
+                .into());
+            }
+            // `RepositoryLinkInfo.ProviderType` is required and documents itself as the
+            // provider type OF THE CONNECTION the link is associated with, so it is
+            // derived from that connection and never taken from the request. A
+            // connection created without a provider type names no provider, so it cannot
+            // back a link.
+            Some(connection) => match connection.provider_type.clone() {
+                Some(provider_type) => provider_type,
+                None => {
+                    return Err(CreateRepositoryLinkErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(format!(
+                                "The input is not valid. The connection {} has no ProviderType, so it cannot back a repository link.",
+                                input.connection_arn
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // A repository link IS the (connection, owner, repository) triple, so the same
+        // triple cannot be registered twice: the second request names a resource that is
+        // already there.
+        if let Some(existing) = store.repository_link_for(
+            &input.connection_arn,
+            &input.owner_id,
+            &input.repository_name,
+        ) {
+            return Err(
+                CreateRepositoryLinkErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!(
+                            "Unable to create resource. Repository link {} already links {}/{} through that connection.",
+                            existing.repository_link_id, input.owner_id, input.repository_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Then the capacity of the store: the records live in this process, so the
+        // number a caller can accumulate is capped and the overflow is refused with the
+        // error the operation models for it. See `state::MAX_REPOSITORY_LINKS`.
+        if store.repository_links.len() >= crate::state::MAX_REPOSITORY_LINKS {
+            return Err(CreateRepositoryLinkErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Exceeded the maximum limit for repository links ({}).",
+                        crate::state::MAX_REPOSITORY_LINKS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The id is minted from a counter the store never rewinds, the way a connection
+        // or host id is, so a deleted link's id and ARN never come back.
+        let sequence = store.repository_links_minted;
+        store.repository_links_minted = store.repository_links_minted.saturating_add(1);
+        let owner_account_id = ::engine::emulator_account_id().to_string();
+        // 8-4-4-4-12 hex: exactly what the modeled `RepositoryLinkId` pattern requires.
+        let repository_link_id =
+            crate::state::resource_id("repository-link", &owner_account_id, &region, sequence);
+        let repository_link_arn = ::engine::emulator_arn(
+            "codeconnections",
+            &region,
+            &format!("repository-link/{repository_link_id}"),
+        );
+
+        let record = crate::state::StoredRepositoryLink {
+            repository_link_id: repository_link_id.clone(),
+            repository_link_arn,
+            connection_arn: input.connection_arn,
+            encryption_key_arn: input.encryption_key_arn,
+            owner_id: input.owner_id,
+            provider_type,
+            repository_name: input.repository_name,
+            tags,
+        };
+        let repository_link_info = record.to_modeled();
+        store.repository_links.insert(repository_link_id, record);
+        drop(store);
+
+        // Audit record for a state-changing operation: who presented which access key
+        // id, what changed, and the outcome. No secret is logged.
+        ::tracing::info!(
+            operation = "CreateRepositoryLink",
+            access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+            repository_link_arn = %repository_link_info.repository_link_arn,
+            outcome = "created",
+            "codeconnections state change"
+        );
+
+        Ok(CreateRepositoryLinkOutput {
+            repository_link_info,
+        })
     }
 }

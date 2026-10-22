@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApplication`'s real behaviour. Implement it here — this is
+//! Implemented: applies the properties the request supplied to the stored application
+//! and answers with the `ApplicationDescription` built from what is now stored. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +129,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApplication"))
+        // This operation derives nothing from the request's region: it updates a
+        // record the store already holds, ARN and all.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateApplicationError::internal_failure("the Elastic Beanstalk store is unavailable")
+        })?;
+        let mut store = state.lock();
+
+        // Read from the version store before the application is borrowed
+        // mutably, so the reported `Versions` list is the version store's own
+        // content rather than a second copy of it. A name the store holds no
+        // application under has no versions either, so this is answered for the
+        // refusal below as well.
+        let versions = store.version_labels(&input.application_name);
+
+        // "The name of the application to update. If no such application is
+        // found, UpdateApplication returns an InvalidParameterValue error." The
+        // operation updates an application the store holds — it never creates one.
+        let Some(application) = store.applications.get_mut(&input.application_name) else {
+            return Err(UpdateApplicationError::invalid_parameter_value(format!(
+                "No Application named '{}' found.",
+                input.application_name
+            )));
+        };
+
+        // "Updates the specified application to have the specified properties. If
+        // a property (for example, description) is not provided, the value
+        // remains unchanged. To clear these properties, specify an empty string."
+        // So a property the request omits is left exactly as stored — as are the
+        // ARN, the creation time, the lifecycle config, the versions and the
+        // tags, none of which this operation takes — and an empty string clears
+        // the property rather than storing an empty value.
+        if let Some(description) = input.description {
+            application.description = Some(description).filter(|text| !text.is_empty());
+            // A property was applied, so the record was last updated now. An
+            // update that supplies no property changes nothing, and leaves the
+            // stored `DateUpdated` where it was.
+            application.date_updated = crate::state::now();
+        }
+
+        Ok(UpdateApplicationOutput {
+            application: Some(application.to_description(versions)),
+        })
     }
 }

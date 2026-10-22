@@ -42,6 +42,11 @@
 //! ([`KAFKA_VERSION_CATALOG`], with [`compatible_target_versions`] and
 //! [`kafka_version_order`]), for the same reason: it is the single list every
 //! version-aware operation answers from.
+//!
+//! The multi-VPC (PrivateLink) connection registry lives here too:
+//! `CreateVpcConnection` mints a [`VpcConnection`] with
+//! [`VpcConnection::requested`] and `DescribeVpcConnection` reports that same
+//! stored record.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
@@ -50,14 +55,15 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     BrokerEBSVolumeInfo, BrokerNodeGroupInfo, BrokerSoftwareInfo, ChannelLoggingInfo,
     ClientAuthentication, ClusterInfo, ClusterOperationInfo, ConfigurationInfo, ConnectivityInfo,
-    CreateChannelInput, CreateClusterInput, CreateReplicatorInput, DescribeChannelOutput,
-    EBSStorageInfo, EncryptionAtRest, EncryptionConfiguration, EncryptionInTransit, EncryptionInfo,
-    IcebergDestinationConfiguration, JmxExporter, JmxExporterInfo, KafkaCluster,
-    KafkaClusterDescription, KafkaClusterSummary, LogDelivery, LoggingInfo, MutableClusterInfo,
-    NodeExporter, NodeExporterInfo, OpenMonitoring, OpenMonitoringInfo, Prometheus, PrometheusInfo,
-    Provisioned, ProvisionedThroughput, Rebalancing, ReplicationInfo, ReplicationInfoDescription,
-    ReplicationInfoSummary, ReplicatorSummary, S3DestinationConfiguration, StorageInfo,
-    TopicConfiguration, ZookeeperAccess,
+    CreateChannelInput, CreateClusterInput, CreateReplicatorInput, CreateVpcConnectionInput,
+    DescribeChannelOutput, EBSStorageInfo, EncryptionAtRest, EncryptionConfiguration,
+    EncryptionInTransit, EncryptionInfo, IcebergDestinationConfiguration, JmxExporter,
+    JmxExporterInfo, KafkaCluster, KafkaClusterDescription, KafkaClusterSummary, LogDelivery,
+    LoggingInfo, MutableClusterInfo, NodeExporter, NodeExporterInfo, OpenMonitoring,
+    OpenMonitoringInfo, Prometheus, PrometheusInfo, Provisioned, ProvisionedThroughput,
+    Rebalancing, ReplicationInfo, ReplicationInfoDescription, ReplicationInfoSummary,
+    ReplicatorSummary, S3DestinationConfiguration, StorageInfo, TopicConfiguration,
+    ZookeeperAccess,
 };
 
 /// How long after `CreateCluster` a new cluster becomes `ACTIVE`.
@@ -142,6 +148,29 @@ pub const MAX_CLUSTERS_PER_REGION: usize = 90;
 /// regions than AWS publishes, so it can only ever be reached by a caller trying
 /// to exhaust the emulator, never by a realistic client script.
 pub const MAX_CLUSTERS_IN_REGISTRY: usize = MAX_CLUSTERS_PER_REGION * 64;
+
+/// How long after `CreateVpcConnection` a new VPC connection becomes
+/// `AVAILABLE`.
+///
+/// CHOSEN, not documented: the real service takes minutes to place the
+/// PrivateLink endpoint. The project fixes an emulated clock-owed transition at
+/// 250–750 ms, so a caller that describes the connection immediately still
+/// observes `CREATING` while a caller that waits sees `AVAILABLE`.
+pub const VPC_CONNECTION_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// Absolute ceiling on the VPC-connection registry.
+///
+/// CHOSEN as a process-safety backstop, not an AWS quota: the registry must not
+/// grow without bound with the number of calls a client makes. Sized far above
+/// anything a realistic client script creates, so it can only be reached by a
+/// caller trying to exhaust the emulator.
+pub const MAX_VPC_CONNECTIONS_IN_REGISTRY: usize = 1024;
+
+/// The authentication types an MSK VPC connection may use, from Amazon MSK's
+/// multi-VPC private connectivity documentation: a connection authenticates with
+/// SASL/IAM, SASL/SCRAM or TLS. `CreateVpcConnectionRequest$Authentication` is a
+/// plain `__string` in the model, so the handler is what refuses anything else.
+pub const VPC_CONNECTION_AUTHENTICATION_TYPES: [&str; 3] = ["SASL_IAM", "SASL_SCRAM", "TLS"];
 
 /// How long after `CreateTopic` a new topic becomes `ACTIVE`.
 ///
@@ -274,6 +303,11 @@ pub const PORT_VPC_SASL_IAM: u16 = 14098;
 const PORT_ZOOKEEPER: u16 = 2181;
 /// TLS Apache ZooKeeper access.
 const PORT_ZOOKEEPER_TLS: u16 = 2182;
+
+/// The message Amazon MSK answers a parameter it cannot parse with: its
+/// `BadRequestException` carries one fixed, request-independent sentence rather
+/// than a description of the offending value.
+pub const BAD_REQUEST_MESSAGE: &str = "One or more of the parameters are not valid.";
 
 /// The default for `EncryptionInTransit$ClientBroker`, per that member's model
 /// documentation ("The default value is TLS_PLAINTEXT").
@@ -619,6 +653,36 @@ impl ClusterOperation {
             vpc_connection_info: None,
         }
     }
+}
+
+/// One MSK VPC connection: a client VPC's private (PrivateLink) connection to a
+/// cluster, as `CreateVpcConnection` requested it. The whole submitted
+/// configuration is held here so every reader computes its answer from the
+/// record rather than echoing a request.
+#[derive(Debug, Clone)]
+pub struct VpcConnection {
+    pub arn: String,
+    /// The region the connection lives in: the signing region of the request
+    /// that created it, and the region segment of its ARN. A regional endpoint
+    /// serves only its own region's connections.
+    pub region: String,
+    pub target_cluster_arn: String,
+    /// One of [`VPC_CONNECTION_AUTHENTICATION_TYPES`].
+    pub authentication: String,
+    pub vpc_id: String,
+    /// The client subnets the connection reaches the cluster from, in the order
+    /// the request listed them. `DescribeVpcConnection` reports them as
+    /// `Subnets`, `CreateVpcConnection` as `ClientSubnets`.
+    pub client_subnets: Vec<String>,
+    pub security_groups: Vec<String>,
+    pub creation_time: SystemTime,
+    /// The instant the clock owes this connection its `CREATING` ->
+    /// `AVAILABLE` transition. Stored, never slept on.
+    pub available_due: SystemTime,
+    /// A `VpcConnectionState` value.
+    pub state: String,
+    /// Ordered so every reader renders a stable map.
+    pub tags: BTreeMap<String, String>,
 }
 
 /// A channel streaming one cluster topic to Amazon S3 or Apache Iceberg, holding
@@ -1188,6 +1252,12 @@ pub struct ComAmazonawsKafkaKafkaState {
     /// Monotonic counter feeding replicator ARNs, so each replicator gets a
     /// distinct identity.
     pub next_replicator_suffix: u64,
+    /// Every live VPC connection, keyed by ARN. `BTreeMap` so the readers have
+    /// one total order to walk.
+    pub vpc_connections: BTreeMap<String, VpcConnection>,
+    /// Monotonic counter feeding each VPC connection's ARN, so each one gets a
+    /// distinct identity.
+    pub next_vpc_connection_suffix: u64,
 }
 
 impl ComAmazonawsKafkaKafkaState {
@@ -1324,6 +1394,68 @@ impl ComAmazonawsKafkaKafkaState {
         }
         cluster.settle(now);
         Some(cluster)
+    }
+
+    /// Add `connection` to the VPC-connection registry. The one insertion path,
+    /// so it is also the one place the registry's ceiling is enforced — a create
+    /// past it is refused here rather than for whichever handler remembered to
+    /// check.
+    ///
+    /// Refuses, changing nothing, when the registry is at
+    /// [`MAX_VPC_CONNECTIONS_IN_REGISTRY`] or when the ARN is already
+    /// registered.
+    pub fn register_vpc_connection(
+        &mut self,
+        connection: VpcConnection,
+    ) -> Result<(), RegisterRejected> {
+        if self.vpc_connections.contains_key(&connection.arn) {
+            return Err(RegisterRejected::DuplicateArn);
+        }
+        if self.vpc_connections.len() >= MAX_VPC_CONNECTIONS_IN_REGISTRY {
+            return Err(RegisterRejected::RegistryCeiling);
+        }
+        self.vpc_connections
+            .insert(connection.arn.clone(), connection);
+        Ok(())
+    }
+
+    /// The VPC connection `arn` names, as an endpoint for `region` sees it: a
+    /// regional endpoint serves only its own region's connections, so a
+    /// well-formed ARN from another region resolves to `None` exactly as an
+    /// absent one does.
+    pub fn vpc_connection_in(&self, region: &str, arn: &str) -> Option<&VpcConnection> {
+        self.vpc_connections
+            .get(arn)
+            .filter(|connection| connection.region == region)
+    }
+
+    /// Remove the VPC connection `arn` names, as an endpoint for `region` sees
+    /// it: an ARN belonging to another region resolves to `None` exactly as an
+    /// absent one does, so no endpoint can delete another region's connection.
+    pub fn unregister_vpc_connection_in(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<VpcConnection> {
+        self.vpc_connection_in(region, arn)?;
+        self.vpc_connections.remove(arn)
+    }
+
+    /// The same lookup, with the `CREATING` -> `AVAILABLE` transition the clock
+    /// already owed THIS connection materialised. Scoped to the one connection
+    /// being reported, for the same reason as [`Self::settled_cluster_in`].
+    pub fn settled_vpc_connection_in(
+        &mut self,
+        region: &str,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<&VpcConnection> {
+        let connection = self.vpc_connections.get_mut(arn)?;
+        if connection.region != region {
+            return None;
+        }
+        connection.settle(now);
+        Some(connection)
     }
 
     /// The cluster `arn` names in `region`, mutably — the write counterpart of
@@ -1823,6 +1955,73 @@ impl ComAmazonawsKafkaKafkaState {
             None
         };
         ClusterPage { keys, next_token }
+    }
+}
+
+impl VpcConnection {
+    /// Mint a VPC connection to the cluster `cluster_arn`/`cluster_name` names
+    /// from the submitted request.
+    ///
+    /// `region` is the caller's signing region, `suffix` the registry's
+    /// monotonic counter (used as the 1-based ordinal `suffix + 1`, so one value
+    /// seeds the whole identity) and `now` the creation instant. The connection
+    /// starts in `CREATING`, which is the state the real service reports a
+    /// just-requested connection in.
+    pub fn requested(
+        region: &str,
+        suffix: u64,
+        now: SystemTime,
+        cluster_arn: &str,
+        cluster_name: &str,
+        input: CreateVpcConnectionInput,
+    ) -> Self {
+        let ordinal = suffix + 1;
+        let account = ::engine::emulator_account_id();
+        let digest = stable_digest(&format!(
+            "{account}:{region}:{cluster_arn}:{}:{ordinal}",
+            input.vpc_id
+        ));
+        // An MSK VPC-connection ARN names the cluster owner's account and the
+        // cluster alongside the connection's own id:
+        // `vpc-connection/<cluster-owner-account>/<cluster-name>/<uuid>-<n>`.
+        let arn = ::engine::emulator_arn(
+            "kafka",
+            region,
+            &format!(
+                "vpc-connection/{account}/{cluster_name}/{}-{ordinal}",
+                uuid_v4_shaped_from_digest(&digest)
+            ),
+        );
+        Self {
+            arn,
+            region: region.to_string(),
+            target_cluster_arn: cluster_arn.to_string(),
+            authentication: input.authentication,
+            vpc_id: input.vpc_id,
+            client_subnets: input.client_subnets,
+            security_groups: input.security_groups,
+            creation_time: now,
+            available_due: now + VPC_CONNECTION_ACTIVATION_DELAY,
+            state: "CREATING".to_string(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        }
+    }
+
+    /// Apply the `CREATING` -> `AVAILABLE` transition once `now` has reached
+    /// [`Self::available_due`]. Idempotent, and a no-op for every other state:
+    /// only a transition the clock already owed is materialised here.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.state == "CREATING" && now >= self.available_due {
+            self.state = "AVAILABLE".to_string();
+        }
+    }
+
+    /// The connection's tags as the map every reader reports.
+    pub fn tag_map(&self) -> HashMap<String, String> {
+        self.tags
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
     }
 }
 
@@ -2941,6 +3140,32 @@ fn is_kafka_arn_for(value: &str, kind: &str) -> bool {
     )
 }
 
+/// Whether `value` is shaped like an MSK VPC-connection ARN —
+/// `arn:<partition>:kafka:<region>:<account>:vpc-connection/<cluster-owner-account>/<cluster-name>/<id>`,
+/// the form [`VpcConnection::requested`] mints and the one the real service
+/// puts on a multi-VPC connection.
+///
+/// Same split of the two client errors as [`is_cluster_arn`]: a value of any
+/// other shape is a request the service cannot parse, not a resource it cannot
+/// find.
+pub fn is_vpc_connection_arn(value: &str) -> bool {
+    let Some(resource) = kafka_arn_resource(value) else {
+        return false;
+    };
+    let mut segments = resource.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next()
+        ),
+        (Some("vpc-connection"), Some(owner), Some(cluster), Some(id), None)
+            if !owner.is_empty() && !cluster.is_empty() && !id.is_empty()
+    )
+}
+
 /// Whether `value` is shaped like an MSK cluster-operation ARN —
 /// `arn:<partition>:kafka:<region>:<account>:cluster-operation/<cluster
 /// name>/<cluster id>/<operation id>`, the form
@@ -3006,6 +3231,27 @@ pub fn is_channel_arn(value: &str) -> bool {
             && !name.is_empty()
             && !id.is_empty()
     )
+}
+
+/// Whether `value` is an EC2 resource id of `kind` (`"vpc"`, `"subnet"`,
+/// `"sg"`): the prefix, a hyphen, and then either 8 or 17 lowercase
+/// hexadecimal digits — the two published EC2 resource-id forms, the original
+/// 8-character one and the longer 17-character one.
+///
+/// A handler that takes EC2 ids refuses anything else as a bad request: the
+/// emulator holds no VPC inventory to look the id up in, but a value that is
+/// not an id at all is a request the service cannot act on either way.
+pub fn is_ec2_resource_id(kind: &str, value: &str) -> bool {
+    let Some(suffix) = value
+        .strip_prefix(kind)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 /// The resource part of `value` when it is an ARN of THIS service in some

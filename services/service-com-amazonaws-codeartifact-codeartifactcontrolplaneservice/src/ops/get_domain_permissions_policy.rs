@@ -177,7 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetDomainPermissionsPolicyErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("Domain {} not found.", input.domain),
+                        message: crate::state::domain_not_found_message(
+                            &input.domain,
+                            input.domain_owner.as_deref(),
+                        ),
                         resource_id: Some(input.domain.clone()),
                         resource_type: Some(DOMAIN_RESOURCE_TYPE.to_string()),
                     },

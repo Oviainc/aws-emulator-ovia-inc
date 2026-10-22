@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTheme
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTheme`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTheme::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the stored theme the request names and answers an empty 2xx. An id that names
+//! no theme in that app environment answers the modelled `ResourceNotFoundException`
+//! (HTTP 404) — the same miss `GetTheme` reports, so a delete and a read agree on which
+//! themes exist.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +160,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTheme` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteThemeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTheme"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteThemeErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the amplifyuibuilder theme store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        if store
+            .remove_theme(&input.app_id, &input.environment_name, &input.id)
+            .is_none()
+        {
+            // A theme is addressed by (appId, environmentName, id), so an id that
+            // resolves nowhere in the addressed app environment names no theme the
+            // caller can delete — the modelled `ResourceNotFoundException` (404).
+            // The message is the DELETE path's own fixed literal: with no error type
+            // on the wire, that literal is what tells a client a delete missed
+            // rather than a read.
+            //
+            // An id ANOTHER app environment owns is reported absent here too, which
+            // is what `GetTheme` already answers for it (`get_theme.rs`): the three
+            // theme operations agree on which themes exist. A component or a form in
+            // that position is instead refused as wrong-scope (400, via
+            // `component_in_other_scope` / `form_in_other_scope`), so the two
+            // resource kinds classify it differently. Themes are left on the
+            // reported-absent classification deliberately: it is the one `GetTheme`
+            // was written to and whose units pass, no recorded theme unit shows the
+            // 400, and moving all three theme operations onto a
+            // `theme_in_other_scope` path would change `GetTheme`'s answer — its own
+            // change, not this one's.
+            return Err(DeleteThemeErrorModeled::ResourceNotFoundException(
+                crate::state::item_to_delete_not_found(),
+            )
+            .into());
+        }
+
+        // `DeleteThemeResponse` is `Unit`: the answer is the status alone.
+        Ok(DeleteThemeOutput)
     }
 }

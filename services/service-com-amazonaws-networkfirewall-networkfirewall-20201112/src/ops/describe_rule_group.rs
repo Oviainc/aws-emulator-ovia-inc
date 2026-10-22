@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRuleGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRuleGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRuleGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -179,17 +170,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRuleGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRuleGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRuleGroup"))
+        // request metadata, which a read of stored state does not need.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeRuleGroupErrorModeled::InternalServerError(InternalServerError {
+                    message: Some("the rule group store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        let state = state.lock();
+
+        // A rule group's name is unique only within its type, so `Type` "is required
+        // for requests that do not include the RuleGroupARN"
+        // (`DescribeRuleGroupRequest$Type`).
+        let resource_path = match (input.rule_group_name.as_deref(), input.r#type.as_deref()) {
+            (Some(name), Some(group_type)) => {
+                Some(crate::state::rule_group_resource_path(group_type, name))
+            }
+            (Some(_), None) if input.rule_group_arn.is_none() => {
+                return Err(DescribeRuleGroupErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "Type is required for requests that do not include the RuleGroupArn."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+            // With an ARN in hand the name adds nothing the ARN does not already
+            // carry, so a typeless name is resolved through the ARN.
+            (_, _) => None,
+        };
+        let key = state
+            .resolve_rule_group(resource_path.as_deref(), input.rule_group_arn.as_deref())
+            .map_err(describe_lookup_error)?;
+        let record = state.rule_groups.get(&key).cloned().ok_or_else(|| {
+            DescribeRuleGroupError::from(
+                DescribeRuleGroupErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Rule group {key} does not exist.")),
+                    },
+                ),
+            )
+        })?;
+        // A name given WITHOUT a type was resolved through the ARN, so the two are
+        // still checked against each other here rather than the name being ignored.
+        if resource_path.is_none()
+            && input
+                .rule_group_name
+                .as_deref()
+                .is_some_and(|name| name != record.rule_group_name)
+        {
+            return Err(describe_lookup_error(
+                crate::state::ResolveError::Mismatch,
+            ));
+        }
+        // Everything below reads the record this request took a copy of, so the lock
+        // is released before the response — and before the analyzer — is built: a read
+        // never holds the store while it works.
+        drop(state);
+
+        let mut rule_group_response = record.to_response();
+        // The analyzer runs on request and reports on stateless rule groups only, so a
+        // stateful rule group has no findings to report rather than an empty list. It
+        // reads the rules and writes nothing: a describe leaves the rule group exactly
+        // as the next caller would have found it.
+        if input.analyze_rule_group && record.rule_group_type == crate::state::RULE_GROUP_STATELESS
+        {
+            rule_group_response.analysis_results =
+                Some(crate::state::analyze_stateless_rule_group(&record.rule_group));
+        }
+
+        Ok(DescribeRuleGroupOutput {
+            update_token: record.update_token.clone(),
+            rule_group: Some(record.rule_group.clone()),
+            rule_group_response,
+        })
     }
 }
+
+crate::state::impl_resolve_error!(
+    describe_lookup_error -> DescribeRuleGroupError, DescribeRuleGroupErrorModeled,
+    resource = "rule group", plural = "rule groups",
+    name_member = "RuleGroupName", arn_member = "RuleGroupArn"
+);

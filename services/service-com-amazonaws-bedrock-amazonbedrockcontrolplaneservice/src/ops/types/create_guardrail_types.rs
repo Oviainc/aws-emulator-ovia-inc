@@ -54,4 +54,3 @@ bedrock_schema_and_codec!(
     (M_VERSION, version, "version", 2, req, string),
     (M_CREATED_AT, created_at, "createdAt", 3, req, date_time),
 );
-

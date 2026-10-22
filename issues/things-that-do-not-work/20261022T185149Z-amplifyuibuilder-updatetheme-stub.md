@@ -31,3 +31,18 @@ botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling
 Boot the amplifyuibuilder emulator
 Call UpdateTheme and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Status note (added by the DeleteTheme fix)
+
+`UpdateTheme` was IMPLEMENTED as part of the fix for
+`20261022T185149Z-amplifyuibuilder-deletetheme-stub.md`: that issue's recorded unit
+(`amplifyuibuilder.delete-theme-state-transition-then-not-found`) also requires the deleted
+theme to be absent for `UpdateTheme`, which it could not be while the operation answered
+501. `src/ops/update_theme.rs` now merges the `updatedTheme` patch into the stored
+[`StoredTheme`] record, refuses an absent id with the untyped 404 and a payload naming
+another theme with the untyped 400, and its `//! SCAFFOLDED, NOT IMPLEMENTED:` marker is
+deleted; `tests/all/theme_update.rs` covers it end to end. This report is left here only
+because its own recorded unit
+(`amplifyuibuilder.update-theme-persists-value-changes`) has not been replayed from this
+session — whoever picks it up should replay that unit and, if it passes, close this report
+rather than re-implementing the handler.

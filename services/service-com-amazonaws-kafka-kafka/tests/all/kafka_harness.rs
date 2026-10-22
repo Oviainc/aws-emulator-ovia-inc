@@ -2,8 +2,9 @@
 
 //! The shared harness every suite in this crate drives the service through: the
 //! kafka service mounted in a `MultiServiceRouter` and called over HTTP exactly as
-//! the emulator serves it, plus the `CreateCluster` request builder a suite writes
-//! its table rows in.
+//! the emulator serves it, plus the request builders a suite writes its table rows
+//! in (`ClusterRequest` for `CreateCluster`, `ConnectionRequest` for
+//! `CreateVpcConnection`).
 //!
 //! One harness rather than one per suite, so every suite dispatches through the
 //! same path and a new suite adds only its rule.
@@ -16,7 +17,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
-use service_com_amazonaws_kafka_kafka::state::{CLUSTER_ACTIVATION_DELAY, CLUSTER_UPDATE_DELAY};
+use service_com_amazonaws_kafka_kafka::state::{
+    CLUSTER_ACTIVATION_DELAY, CLUSTER_UPDATE_DELAY, VPC_CONNECTION_ACTIVATION_DELAY,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The signing region every request below is scoped to; it is the region the
@@ -50,6 +53,15 @@ impl Reply {
     /// A member of the response body, or `Value::Null` when absent.
     pub fn at(&self, pointer: &str) -> &Value {
         self.body.pointer(pointer).unwrap_or(&Value::Null)
+    }
+
+    /// The error envelope's message, or `""` when there is none.
+    pub fn error_message(&self) -> &str {
+        self.body
+            .get("message")
+            .or_else(|| self.body.get("Message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
     }
 }
 
@@ -143,10 +155,18 @@ impl Emulator {
 
     /// Create `request`, assert it succeeded, and hand back the minted ARN.
     pub async fn create_ok(&self, request: &ClusterRequest) -> String {
-        let reply = self.create(request).await;
+        self.create_ok_in(REGION, request).await
+    }
+
+    /// The same create, signed for `region`, which is the region the cluster and
+    /// everything addressed under it then live in.
+    pub async fn create_ok_in(&self, region: &str, request: &ClusterRequest) -> String {
+        let reply = self
+            .call_in(region, "POST", "/v1/clusters", Some(request.to_json()))
+            .await;
         assert_eq!(
             reply.status, 200,
-            "case {request:?}: expected CreateCluster to return 200, got {} {}",
+            "case {request:?}: expected CreateCluster in {region} to return 200, got {} {}",
             reply.status, reply.body
         );
         reply.body["clusterArn"]
@@ -154,6 +174,44 @@ impl Emulator {
             .unwrap_or_else(|| panic!("case {request:?}: CreateCluster returned no clusterArn"))
             .to_string()
     }
+
+    /// `CreateVpcConnection`, which the model binds to `POST /v1/vpc-connection`.
+    pub async fn create_vpc_connection(&self, request: &ConnectionRequest) -> Reply {
+        self.call("POST", "/v1/vpc-connection", Some(request.to_json()))
+            .await
+    }
+
+    /// `DescribeVpcConnection`, whose `Arn` is an `@httpLabel`.
+    pub async fn describe_vpc_connection(&self, arn: &str) -> Reply {
+        self.call("GET", &vpc_connection_uri(arn), None).await
+    }
+
+    /// `DeleteVpcConnection`, on the same resource URI.
+    pub async fn delete_vpc_connection(&self, arn: &str) -> Reply {
+        self.call("DELETE", &vpc_connection_uri(arn), None).await
+    }
+
+    /// Create `request`, assert it succeeded, and hand back the minted ARN.
+    pub async fn create_vpc_connection_ok(&self, request: &ConnectionRequest) -> String {
+        let reply = self.create_vpc_connection(request).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {request:?}: expected CreateVpcConnection to return 200, got {} {}",
+            reply.status, reply.body
+        );
+        reply.body["vpcConnectionArn"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("case {request:?}: CreateVpcConnection returned no vpcConnectionArn")
+            })
+            .to_string()
+    }
+}
+
+/// The resource URI of one MSK VPC connection, with the ARN percent-encoded into
+/// the single `@httpLabel` path segment the model declares.
+pub fn vpc_connection_uri(arn: &str) -> String {
+    format!("/v1/vpc-connection/{}", pct(arn))
 }
 
 /// Percent-encode a URI component. An MSK ARN is an `@httpLabel`, so its `:` and
@@ -304,6 +362,63 @@ impl ClusterRequest {
 /// timer feature; nothing else has to make progress here.
 pub fn sleep_past_activation() {
     std::thread::sleep(CLUSTER_ACTIVATION_DELAY + Duration::from_millis(250));
+}
+
+/// One row of a `CreateVpcConnection` table: every member the request carries.
+#[derive(Debug, Clone)]
+pub struct ConnectionRequest {
+    pub target_cluster_arn: String,
+    pub authentication: &'static str,
+    pub vpc_id: &'static str,
+    pub client_subnets: Vec<&'static str>,
+    pub security_groups: Vec<&'static str>,
+    pub tags: Vec<(&'static str, &'static str)>,
+}
+
+impl ConnectionRequest {
+    /// A minimal, valid request against the cluster `cluster` names. The EC2 ids
+    /// are in their 8-hex-digit form; a row that exercises the 17-digit one says
+    /// so.
+    pub fn to(cluster: &str) -> Self {
+        Self {
+            target_cluster_arn: cluster.to_string(),
+            authentication: "SASL_IAM",
+            vpc_id: "vpc-0a1b2c3d",
+            client_subnets: vec!["subnet-0a1b2c3d"],
+            security_groups: vec!["sg-0a1b2c3d"],
+            tags: Vec::new(),
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        let mut body = json!({
+            "targetClusterArn": self.target_cluster_arn,
+            "authentication": self.authentication,
+            "vpcId": self.vpc_id,
+            "clientSubnets": self.client_subnets,
+            "securityGroups": self.security_groups,
+        });
+        if !self.tags.is_empty() {
+            body["tags"] = self.tag_json();
+        }
+        body
+    }
+
+    /// The tags as the JSON map a reader must report.
+    pub fn tag_json(&self) -> Value {
+        Value::Object(
+            self.tags
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), json!(value)))
+                .collect(),
+        )
+    }
+}
+
+/// Sleep past the emulator's own `CREATING` -> `AVAILABLE` span, so a later read
+/// sees a settled VPC connection.
+pub fn sleep_past_vpc_connection_activation() {
+    std::thread::sleep(VPC_CONNECTION_ACTIVATION_DELAY + Duration::from_millis(250));
 }
 
 /// Sleep past the emulator's own `UPDATING` -> `ACTIVE` span, so a later read

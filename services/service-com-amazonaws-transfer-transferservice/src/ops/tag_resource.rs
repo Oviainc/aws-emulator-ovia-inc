@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches the request's key-value pairs to the resource its `Arn` identifies.
+//!
+//! A tag set is NOT a resource of its own: every taggable resource already stores its
+//! own `tags`, so this resolves the resource by its stored ARN
+//! ([`crate::state::ComAmazonawsTransferTransferserviceState::tags_mut`]) and rewrites
+//! that one set — which is why a tag written here is immediately visible to that
+//! resource's own reader and to `ListTagsForResource`. A key the resource already
+//! carries takes the new value in place; a key it does not carry is added
+//! ([`crate::state::merge_tags`]). An `Arn` nothing answers to is refused with the
+//! modelled `ResourceNotFoundException`, and a write that would push the set past
+//! [`crate::state::MAX_TAGS_PER_RESOURCE`] with the modelled
+//! `InvalidRequestException`, before anything is written.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +169,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        use crate::state as st;
+
+        // The target is named by the request's `Arn` alone, so this operation reads no
+        // request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+
+        // The ARN is matched against each resource's OWN stored ARN, so a well-formed
+        // ARN that no resource answers to is a not-found rather than a silent no-op.
+        let tags = guard.tags_mut(&input.arn).ok_or_else(|| {
+            st::not_found(TagResourceErrorModeled::ResourceNotFoundException(
+                st::unknown_tagged_resource(&input.arn),
+            ))
+        })?;
+
+        // Checked BEFORE the merge, so a refused write leaves the stored set untouched
+        // rather than half-applied.
+        if st::merged_tag_count(tags, &input.tags) > st::MAX_TAGS_PER_RESOURCE {
+            return Err(
+                TagResourceErrorModeled::InvalidRequestException(st::too_many_tags()).into(),
+            );
+        }
+
+        st::merge_tags(tags, input.tags);
+        drop(guard);
+
+        // "There is no response returned from this call": the modelled output is Unit.
+        Ok(TagResourceOutput)
     }
 }

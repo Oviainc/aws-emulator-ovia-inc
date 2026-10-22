@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeServerlessCaches
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeServerlessCaches`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeServerlessCaches::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports this service's stored serverless caches and no
+//! longer answers 501, so it carries no `SCAFFOLDED, NOT IMPLEMENTED:` marker line
+//! (that line is the machine-readable census of the operations that are still stubs,
+//! `grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`). This is still the ONLY
+//! file to touch for `DescribeServerlessCaches`.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +150,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeServerlessCaches` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeServerlessCachesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeServerlessCaches"))
+        // This is a reporting operation: it reads the stored serverless caches.
+        // The one write it makes is materialising the status change the clock
+        // already owed each of them — owed at this instant whether or not
+        // anybody called — through `settle_all`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `MaxResults` is "the maximum number of records in the response … The
+        // default is 50", with no documented bounds, so any page it can serve is
+        // served and only a count that cannot be one is refused.
+        let page_size = match crate::state::unbounded_page_size_with_default(
+            input.max_results,
+            crate::state::SERVERLESS_MAX_RESULTS_DEFAULT,
+        ) {
+            Ok(size) => size,
+            Err(message) => {
+                return Err(
+                    DescribeServerlessCachesErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+        // A `NextToken` only ever travels back unchanged, so one this service
+        // did not mint is a bad parameter value rather than an empty page.
+        let resume_from = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_marker(token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(
+                        DescribeServerlessCachesErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(format!("Invalid value {token} for NextToken.")),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        // "Returns information about a specific serverless cache. If no
+        // identifier is specified, then the API returns information on all the
+        // serverless caches belonging to this Amazon Web Services account."
+        // Pagination does not apply to a single-resource lookup.
+        if let Some(requested) = input.serverless_cache_name.as_deref() {
+            let key = requested.to_ascii_lowercase();
+            let Some(cache) = store.serverless_caches.get(&key) else {
+                return Err(
+                    DescribeServerlessCachesErrorModeled::ServerlessCacheNotFoundFault(
+                        ServerlessCacheNotFoundFault {
+                            message: Some(format!("Serverless cache {requested} not found.")),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            return Ok(DescribeServerlessCachesOutput {
+                next_token: None,
+                serverless_caches: Some(vec![cache.to_modeled()]),
+            });
+        }
+
+        let mut page: Vec<ServerlessCache> = Vec::new();
+        let mut next_token = None;
+        for (key, cache) in store
+            .serverless_caches
+            .iter()
+            .filter(|(key, _)| resume_from.as_ref().is_none_or(|from| *key >= from))
+        {
+            if page.len() == page_size {
+                // More records exist than `MaxResults`, so the response carries
+                // the token the next call resumes from — the key of the first
+                // record this page did not return.
+                next_token = Some(crate::state::encode_marker(key));
+                break;
+            }
+            page.push(cache.to_modeled());
+        }
+
+        Ok(DescribeServerlessCachesOutput {
+            next_token,
+            serverless_caches: Some(page),
+        })
     }
 }
+

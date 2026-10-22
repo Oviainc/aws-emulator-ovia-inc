@@ -14,7 +14,10 @@ use std::collections::{BTreeMap, HashMap};
 
 use ::aws_smithy_types::DateTime;
 
-use crate::ops::types::{BillInterval, HistoricalUsageEntity, UsageAmount, UsageQuantity};
+use crate::ops::types::{
+    BillInterval, Expression, HistoricalUsageEntity, UsageAmount, UsageQuantity,
+    WorkloadEstimateUsageQuantity,
+};
 
 /// The region an ARN carries when the request's SigV4 credential scope names none.
 /// `engine::emulator_arn`'s contract: "emulators default to us-east-1".
@@ -91,6 +94,19 @@ pub const WORKLOAD_ESTIMATE_UPDATING_MILLIS: i64 = 500;
 /// WorkloadEstimate`), as the bill-scenario handlers name theirs `BillScenario`.
 pub const WORKLOAD_ESTIMATE_RESOURCE_TYPE: &str = "WorkloadEstimate";
 
+/// What the `resourceType` member of a modelled error names ONE usage line of a
+/// workload estimate as: that line's own Smithy shape name
+/// (`com.amazonaws.bcmpricingcalculator#WorkloadEstimateUsageItem`), as the
+/// bill-scenario handlers name theirs `BillScenarioUsageModification`.
+pub const WORKLOAD_ESTIMATE_USAGE_RESOURCE_TYPE: &str = "WorkloadEstimateUsageItem";
+
+/// The greatest number of usage lines ONE workload estimate holds at once. Chosen for
+/// the same two reasons as [`MAX_USAGE_MODIFICATIONS_PER_BILL_SCENARIO`] —
+/// `BatchCreateWorkloadEstimateUsage` models `ServiceQuotaExceededException` (HTTP 402),
+/// which is unreachable without a cap, and an uncapped store grows for the life of the
+/// process — and answered with that same modelled error.
+pub const MAX_USAGE_PER_WORKLOAD_ESTIMATE: usize = 2000;
+
 /// The only `CurrencyCode` the model declares (smithy_query: `shape="CurrencyCode"`,
 /// values `USD`), so it is the currency every cost this service reports is in.
 pub const COST_CURRENCY: &str = "USD";
@@ -163,6 +179,54 @@ impl UsageModification {
     }
 }
 
+/// One stored usage line of a workload estimate: the usage a
+/// `BatchCreateWorkloadEstimateUsage` entry asked to model, stored on its parent
+/// estimate rather than in a second map that could drift from it (as a bill scenario's
+/// [`UsageModification`]s are stored on their scenario).
+#[derive(Debug, Clone)]
+pub struct WorkloadEstimateUsage {
+    /// The server-assigned `ResourceId` (a lowercase-hex v4 UUID).
+    pub id: String,
+    /// The `key` the batch entry that created this line carried, so a later batch
+    /// response can report an error against the same key.
+    pub key: Option<String>,
+    pub service_code: String,
+    pub usage_type: String,
+    pub operation: String,
+    pub usage_account_id: String,
+    /// The pricing location of this line. Only resolvable from the price list, which
+    /// this emulator does not carry, so it stays unset.
+    pub location: Option<String>,
+    pub group: Option<String>,
+    /// The usage amount the entry asked to model, which is what this line's
+    /// `quantity.amount` reports back.
+    pub amount: f64,
+    /// What this line's usage costs, in [`COST_CURRENCY`].
+    ///
+    /// Pricing a usage type needs the AWS price list, which this emulator does not
+    /// carry, so it stays unset rather than carrying a number nothing computed — the
+    /// same reason [`Self::location`] and a quantity's `unit` stay unset. It is stored
+    /// (rather than assumed absent) because it is what
+    /// [`WorkloadEstimate::cost_over_usage`] sums, so a line that ever does carry a
+    /// cost is counted without changing that sum's definition.
+    pub cost: Option<f64>,
+    pub historical_usage: Option<HistoricalUsageEntity>,
+}
+
+impl WorkloadEstimateUsage {
+    /// The modelled quantity of this line's usage.
+    ///
+    /// `unit` stays unset: a usage type's unit of measure comes from the price list,
+    /// which this emulator does not carry, and `WorkloadEstimateUsageQuantity$unit` is
+    /// optional precisely so it can be absent.
+    pub fn quantity(&self) -> WorkloadEstimateUsageQuantity {
+        WorkloadEstimateUsageQuantity {
+            unit: None,
+            amount: Some(self.amount),
+        }
+    }
+}
+
 /// One stored workload estimate.
 #[derive(Debug, Clone)]
 pub struct WorkloadEstimate {
@@ -194,13 +258,17 @@ pub struct WorkloadEstimate {
     pub rate_timestamp: DateTime,
     /// The estimated cost of this estimate's usage, in [`COST_CURRENCY`].
     ///
-    /// A newly created estimate holds no usage, so the sum over its usage is `0.0`; the
-    /// operations that add, update and delete that usage
-    /// (`BatchCreateWorkloadEstimateUsage` and its siblings, still scaffolds with their
-    /// own issues) are what maintain this field.
+    /// Maintained by the operations that change that usage: each of them starts the
+    /// recomputation ([`WorkloadEstimate::begin_cost_recompute`]) that
+    /// [`ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::settle`] lands
+    /// here as [`WorkloadEstimate::cost_over_usage`] once the window closes. An
+    /// estimate holding no usage costs `0.0`.
     pub total_cost: f64,
     pub failure_message: Option<String>,
     pub tags: BTreeMap<String, String>,
+    /// This estimate's usage lines, insertion-ordered so a paginated read of them is
+    /// stable across calls.
+    pub usage: Vec<WorkloadEstimateUsage>,
 }
 
 impl WorkloadEstimate {
@@ -215,6 +283,34 @@ impl WorkloadEstimate {
             "NAME" => Some(self.name.as_str()),
             _ => None,
         }
+    }
+
+    /// The usage line with this id, if this estimate holds it.
+    pub fn usage_line(&self, id: &str) -> Option<&WorkloadEstimateUsage> {
+        self.usage.iter().find(|line| line.id == id)
+    }
+
+    /// The cost of this estimate's usage: the sum over the costs of its usage lines.
+    ///
+    /// A line whose cost this emulator cannot resolve contributes nothing (see
+    /// [`WorkloadEstimateUsage::cost`]), so an estimate whose lines are all unpriced
+    /// costs the same `0.0` an estimate holding no usage does.
+    pub fn cost_over_usage(&self) -> f64 {
+        self.usage.iter().filter_map(|line| line.cost).sum()
+    }
+
+    /// Start the cost recomputation a change to this estimate's usage owes it: the
+    /// estimate re-enters the non-terminal status it was created in, and the clock owes
+    /// it the terminal one — with the recomputed cost — one
+    /// [`WORKLOAD_ESTIMATE_UPDATING_MILLIS`] window later, applied by
+    /// [`ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::settle`].
+    ///
+    /// The window is never zero, so a caller reading the estimate straight after
+    /// changing its usage still sees the transient status the real service reports
+    /// while it works the new cost out.
+    pub fn begin_cost_recompute(&mut self, now_millis: i64) {
+        self.status = WORKLOAD_ESTIMATE_STATUS_UPDATING.to_string();
+        self.status_due_at_millis = now_millis + WORKLOAD_ESTIMATE_UPDATING_MILLIS;
     }
 }
 
@@ -425,11 +521,10 @@ impl ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
                     .map(|modification| modification.id.as_str()),
             );
         }
-        live.extend(
-            self.workload_estimates
-                .iter()
-                .map(|estimate| estimate.id.as_str()),
-        );
+        for estimate in &self.workload_estimates {
+            live.insert(estimate.id.as_str());
+            live.extend(estimate.usage.iter().map(|line| line.id.as_str()));
+        }
         let mut minted: Vec<String> = Vec::with_capacity(count);
         while minted.len() < count {
             let candidate = candidate_resource_id();
@@ -474,7 +569,9 @@ impl ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
     /// Materialise EVERYTHING the clock has already made due at `now_millis`: the
     /// expiry [`Self::purge_expired`] applies, and the move out of the transient
     /// `UPDATING` status a workload estimate was owed once its recomputation window
-    /// closed.
+    /// closed — which lands the recomputed cost
+    /// ([`WorkloadEstimate::cost_over_usage`]) with it, since that recomputation is
+    /// what the transient status was reporting.
     ///
     /// Both changes were owed at `now_millis` whether or not anybody called, which is
     /// why a reporting operation may apply them; every operation that resolves a
@@ -486,7 +583,9 @@ impl ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
             if estimate.status == WORKLOAD_ESTIMATE_STATUS_UPDATING
                 && estimate.status_due_at_millis <= now_millis
             {
+                let recomputed = estimate.cost_over_usage();
                 estimate.status = WORKLOAD_ESTIMATE_STATUS_VALID.to_string();
+                estimate.total_cost = recomputed;
             }
         }
     }
@@ -533,11 +632,10 @@ impl ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
                         .map(|modification| modification.id.as_str()),
                 )
             })
-            .chain(
-                workload_estimates
-                    .iter()
-                    .map(|estimate| estimate.id.as_str()),
-            )
+            .chain(workload_estimates.iter().flat_map(|estimate| {
+                std::iter::once(estimate.id.as_str())
+                    .chain(estimate.usage.iter().map(|line| line.id.as_str()))
+            }))
             .collect();
         idempotency.retain(|_, record| {
             record.ids.retain(|id| live.contains(id.as_str()));
@@ -615,6 +713,76 @@ pub fn request_fingerprint<S: AsRef<str>>(parts: &[S]) -> String {
         digest.update(part.as_bytes());
     }
     hex::encode(digest.finalize())
+}
+
+/// How deep a `filterExpression` is digested before the digest stops descending.
+///
+/// `Expression` nests through caller-supplied `and`/`or`/`not`, so
+/// [`push_expression_digest`] is bounded rather than trusting the request's depth. A
+/// request deeper than this digests to the same value past the cap, which costs only
+/// that two such requests could share one idempotency token — never a crash.
+pub const MAX_EXPRESSION_DEPTH: usize = 32;
+
+/// Push the digest parts of one `HistoricalUsageEntity`, the shape every batch entry of
+/// this service carries, so each of those operations fingerprints it the same way.
+///
+/// Written member by member rather than from a derived `Debug`, so the digest is a
+/// contract: ADD A LINE HERE when the model gives `HistoricalUsageEntity` another
+/// member, or two requests differing only in that member will share one fingerprint.
+/// [`request_fingerprint`] length-prefixes every part, so parts cannot run together.
+pub fn push_historical_usage_digest(parts: &mut Vec<String>, historical: &HistoricalUsageEntity) {
+    parts.push(historical.service_code.clone());
+    parts.push(historical.usage_type.clone());
+    parts.push(historical.operation.clone());
+    parts.push(historical.location.clone().unwrap_or_default());
+    parts.push(historical.usage_account_id.clone());
+    parts.push(
+        historical
+            .bill_interval
+            .start
+            .map(|start| start.secs())
+            .unwrap_or_default()
+            .to_string(),
+    );
+    parts.push(
+        historical
+            .bill_interval
+            .end
+            .map(|end| end.secs())
+            .unwrap_or_default()
+            .to_string(),
+    );
+    push_expression_digest(parts, &historical.filter_expression, 0);
+}
+
+/// Push the digest parts of a filter expression, descending at most
+/// [`MAX_EXPRESSION_DEPTH`] levels.
+pub fn push_expression_digest(parts: &mut Vec<String>, expression: &Expression, depth: usize) {
+    if depth > MAX_EXPRESSION_DEPTH {
+        return;
+    }
+    for (member, filter) in [
+        ("costCategories", &expression.cost_categories),
+        ("dimensions", &expression.dimensions),
+        ("tags", &expression.tags),
+    ] {
+        if let Some(filter) = filter {
+            parts.push(member.to_string());
+            parts.push(filter.key.clone().unwrap_or_default());
+            parts.extend(filter.match_options.clone().unwrap_or_default());
+            parts.extend(filter.values.clone().unwrap_or_default());
+        }
+    }
+    for (member, branch) in [("and", &expression.and), ("or", &expression.or)] {
+        for child in branch.iter().flatten() {
+            parts.push(member.to_string());
+            push_expression_digest(parts, child, depth + 1);
+        }
+    }
+    if let Some(negated) = &expression.not {
+        parts.push("not".to_string());
+        push_expression_digest(parts, negated, depth + 1);
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

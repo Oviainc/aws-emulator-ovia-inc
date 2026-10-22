@@ -18,6 +18,12 @@
 //! attaches one by name — so the catalog is published data rather than per-account
 //! state, and `DescribeSecurityPolicy` answers out of it.
 //!
+//! A tag set is NOT a map of its own: it belongs to the resource that carries it, so
+//! the tag plane ([`ComAmazonawsTransferTransferserviceState::tags_of`],
+//! [`ComAmazonawsTransferTransferserviceState::tags_mut`]) resolves a resource by its
+//! stored ARN and reads or rewrites that resource's own `tags` — which is why a tag
+//! written through `TagResource` is at once what the resource's own reader reports.
+//!
 //! `UserCount` and `SshPublicKeyCount` are DERIVED at read time ([`
 //! ComAmazonawsTransferTransferserviceState::user_count`],
 //! [`User::ssh_public_key_count`]) rather than stored, so they cannot go stale when a
@@ -2972,5 +2978,191 @@ impl ComAmazonawsTransferTransferserviceState {
     /// [`MAX_ACCESSES_PER_SERVER`].
     pub fn server_has_access_capacity(&self, server_id: &str) -> bool {
         self.accesses_of(server_id).count() < MAX_ACCESSES_PER_SERVER
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The tag plane
+// ---------------------------------------------------------------------------
+//
+// A tag set is not a resource of its own: every taggable resource already stores its
+// own `tags`, written by the create (or import) that made it and reported by that
+// resource's own reader. So `TagResource`/`UntagResource`/`ListTagsForResource` add no
+// map here — they RESOLVE a resource by the ARN the caller sends and then read or
+// rewrite that resource's existing set, which is why a tag written through
+// `TagResource` is immediately visible to `DescribeServer`, `DescribeUser`,
+// `DescribeHostKey`, `DescribeWebApp`, `DescribeProfile`, `DescribeConnector` and
+// `DescribeWorkflow` without any of them changing.
+
+/// How many tags ONE resource carries before a tag write is refused instead of
+/// growing the set.
+///
+/// The modelled `Tags` list is `len 1..50`
+/// (`smithy_query(query="shape",shape="Tags")`), and `Tags` is the shape EVERY reader
+/// reports a resource's tag set through — `ListTagsForResource`'s output member and
+/// each `Describe*`'s — so a set past 50 could not be reported without violating the
+/// model. That makes 50 the bound here, and it is also the AWS-wide limit of 50 tags
+/// per resource. `UntagResource` releases capacity again.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// `ResourceType` for a resource addressed by its ARN alone.
+///
+/// A tag write resolves its target by ARN, so when nothing in the store answers to
+/// that ARN the service has no kind to name for it: the ARN may name a kind this
+/// emulator does not hold, or no Transfer resource at all. This is the emulator's own
+/// token for that case, on the same capitalized convention as
+/// [`RESOURCE_TYPE_SERVER`]; the ARN the caller sent travels in `Resource`, never in
+/// the message.
+pub const RESOURCE_TYPE_RESOURCE: &str = "Resource";
+
+/// An ARN no stored resource answers to. Its own entry in the not-found table, like
+/// every other kind.
+pub const NOT_FOUND_TAGGED_RESOURCE: NotFoundResource = NotFoundResource {
+    resource_type: RESOURCE_TYPE_RESOURCE,
+    message: "Unknown resource",
+};
+
+/// The not-found payload for a tag write whose `Arn` names no stored resource.
+///
+/// Built through [`resource_not_found`] like every other not-found in this service,
+/// so the ARN travels in `Resource` alone and the `Message` is the fixed text for the
+/// condition.
+pub fn unknown_tagged_resource(arn: &str) -> ResourceNotFoundException {
+    resource_not_found(&NOT_FOUND_TAGGED_RESOURCE, arn)
+}
+
+/// The refusal for a tag write that would push a resource past
+/// [`MAX_TAGS_PER_RESOURCE`]: a FIXED text for the condition, with the bound it
+/// states and no request data.
+pub fn too_many_tags() -> InvalidRequestException {
+    InvalidRequestException {
+        message: format!("A resource cannot carry more than {MAX_TAGS_PER_RESOURCE} tags"),
+    }
+}
+
+/// The tag set the merge of `incoming` into `tags` would have, as a COUNT, without
+/// touching either.
+///
+/// A tag key identifies one tag on a resource, so a key already present is replaced
+/// rather than added: only the keys that are new to `tags` grow the set, and a key
+/// repeated inside `incoming` grows it once. A write consults this BEFORE mutating,
+/// so a refused write leaves the set exactly as it was.
+pub fn merged_tag_count(tags: &[Tag], incoming: &[Tag]) -> usize {
+    let present: ::std::collections::BTreeSet<&str> =
+        tags.iter().map(|tag| tag.key.as_str()).collect();
+    let added: ::std::collections::BTreeSet<&str> = incoming
+        .iter()
+        .map(|tag| tag.key.as_str())
+        .filter(|key| !present.contains(key))
+        .collect();
+    present.len() + added.len()
+}
+
+/// Merge `incoming` into `tags`: a key the resource already carries takes the
+/// incoming value IN PLACE, a key it does not carry is appended.
+///
+/// A tag key is unique per resource (tags are a key-value map, not a multiset), so
+/// tagging with a key that is already there is an update and not a second tag — which
+/// is also why a key repeated within one request leaves the LAST value sent.
+pub fn merge_tags(tags: &mut Vec<Tag>, incoming: Vec<Tag>) {
+    for tag in incoming {
+        match tags.iter_mut().find(|present| present.key == tag.key) {
+            Some(present) => present.value = tag.value,
+            None => tags.push(tag),
+        }
+    }
+}
+
+/// Detach every tag whose key is in `keys`, keeping the rest in their stored order.
+///
+/// A key the resource does not carry removes nothing and is not an error: the request
+/// asks for those keys to be absent, and after it they are.
+pub fn remove_tags(tags: &mut Vec<Tag>, keys: &[String]) {
+    tags.retain(|tag| !keys.contains(&tag.key));
+}
+
+impl ComAmazonawsTransferTransferserviceState {
+    /// Every stored resource that carries a tag set, as `(ARN, tags)` pairs.
+    ///
+    /// The ONE list of what is taggable in this service, and the order
+    /// [`Self::tags_mut`] resolves in. A resource kind becomes taggable by storing an
+    /// `arn` and a `tags` of its own and being added to both.
+    fn taggable(&self) -> impl Iterator<Item = (&str, &[Tag])> {
+        let servers = self
+            .servers
+            .values()
+            .map(|r| (r.arn.as_str(), r.tags.as_slice()));
+        let users = self
+            .users
+            .values()
+            .map(|r| (r.arn.as_str(), r.tags.as_slice()));
+        let host_keys = self
+            .host_keys
+            .values()
+            .map(|r| (r.arn.as_str(), r.tags.as_slice()));
+        let web_apps = self
+            .web_apps
+            .values()
+            .map(|r| (r.arn.as_str(), r.tags.as_slice()));
+        let profiles = self
+            .profiles
+            .values()
+            .map(|r| (r.arn.as_str(), r.tags.as_slice()));
+        let connectors = self
+            .connectors
+            .values()
+            .map(|r| (r.arn.as_str(), r.tags.as_slice()));
+        let workflows = self
+            .workflows
+            .values()
+            .map(|r| (r.arn.as_str(), r.tags.as_slice()));
+        servers
+            .chain(users)
+            .chain(host_keys)
+            .chain(web_apps)
+            .chain(profiles)
+            .chain(connectors)
+            .chain(workflows)
+    }
+
+    /// The tag set of the resource `arn` identifies, or `None` when no stored resource
+    /// answers to that ARN.
+    ///
+    /// Matched against each resource's OWN stored ARN, so the region and account id in
+    /// the ARN are part of the identity: an ARN that differs from the one the create
+    /// returned names no resource, rather than resolving by id alone.
+    pub fn tags_of(&self, arn: &str) -> Option<&[Tag]> {
+        self.taggable()
+            .find(|(stored, _)| *stored == arn)
+            .map(|(_, tags)| tags)
+    }
+
+    /// The tag set of the resource `arn` identifies, for a write.
+    ///
+    /// The same resolution as [`Self::tags_of`] over the same maps in the same order;
+    /// an ARN is unique across the store, so at most one record answers to it.
+    pub fn tags_mut(&mut self, arn: &str) -> Option<&mut Vec<Tag>> {
+        if let Some(found) = self.servers.values_mut().find(|r| r.arn == arn) {
+            return Some(&mut found.tags);
+        }
+        if let Some(found) = self.users.values_mut().find(|r| r.arn == arn) {
+            return Some(&mut found.tags);
+        }
+        if let Some(found) = self.host_keys.values_mut().find(|r| r.arn == arn) {
+            return Some(&mut found.tags);
+        }
+        if let Some(found) = self.web_apps.values_mut().find(|r| r.arn == arn) {
+            return Some(&mut found.tags);
+        }
+        if let Some(found) = self.profiles.values_mut().find(|r| r.arn == arn) {
+            return Some(&mut found.tags);
+        }
+        if let Some(found) = self.connectors.values_mut().find(|r| r.arn == arn) {
+            return Some(&mut found.tags);
+        }
+        if let Some(found) = self.workflows.values_mut().find(|r| r.arn == arn) {
+            return Some(&mut found.tags);
+        }
+        None
     }
 }

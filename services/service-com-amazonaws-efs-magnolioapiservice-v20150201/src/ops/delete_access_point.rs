@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAccessPoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAccessPoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAccessPoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: accepts the deletion of a stored access point of [`crate::state`] and
+//! moves it to the modelled `deleting` lifecycle state, from which the clock owes its
+//! removal; once that removal is due the id is refused as `AccessPointNotFound`, which
+//! is what `DescribeAccessPoints` then answers for it too.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +160,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAccessPoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAccessPointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAccessPoint"))
+        use crate::state as efs;
+
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        // The member accepts "the ID of the access point that you want to delete" as an
+        // id or as an access-point ARN; both name the same stored access point.
+        let access_point_id = efs::access_point_id_of(&input.access_point_id).to_string();
+
+        let mut state = state.lock();
+        state.materialize_due_transitions(now);
+
+        // "Returned if the specified AccessPointId value doesn't exist in the requester's
+        // Amazon Web Services account": once an accepted deletion has completed the
+        // record is gone, so a further delete of that id is refused rather than accepted
+        // again — acceptance is conditional on the access point still being there.
+        let Some(access_point) = state.access_points.get_mut(&access_point_id) else {
+            return Err(DeleteAccessPointErrorModeled::AccessPointNotFound(
+                AccessPointNotFound {
+                    error_code: "AccessPointNotFound".to_string(),
+                    message: Some(efs::access_point_not_found_message(&access_point_id)),
+                },
+            )
+            .into());
+        };
+
+        // "After deletion is complete, new clients can no longer connect to the access
+        // point" — so the deletion is NOT complete when this call returns: the access
+        // point moves to `deleting` and the clock owes its removal. A delete racing
+        // another one against the same still-present access point is accepted too, and
+        // converges on that first deletion instead of restarting its span.
+        if access_point.deleted_at.is_none() {
+            access_point.life_cycle_state = efs::LIFE_CYCLE_DELETING.to_string();
+            access_point.deleted_at = Some(now + efs::DELETING_FOR);
+        }
+        Ok(DeleteAccessPointOutput)
     }
+}
+
+/// A 500 `InternalServerError`, for the one case this handler cannot serve: the engine
+/// this service was mounted on holds no store for it.
+fn internal_server_error() -> DeleteAccessPointError {
+    DeleteAccessPointErrorModeled::InternalServerError(InternalServerError {
+        error_code: "InternalServerError".to_string(),
+        message: Some("the EFS emulator state store is unavailable".to_string()),
+    })
+    .into()
 }

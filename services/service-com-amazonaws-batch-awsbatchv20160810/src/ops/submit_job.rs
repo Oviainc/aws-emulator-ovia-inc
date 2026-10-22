@@ -336,6 +336,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_phase_due_at: Some(now + batch::JOB_PHASE_MILLIS),
             is_cancelled: false,
             is_terminated: false,
+            // Nothing has asked for this job to be cancelled yet (`CancelJob` records a
+            // cancel here when the job is PENDING on its dependencies).
+            cancel_requested: None,
             parameters: batch::merged_parameters(
                 definition.parameters.as_ref(),
                 input.parameters.as_ref(),

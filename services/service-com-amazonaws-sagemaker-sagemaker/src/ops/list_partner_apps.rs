@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPartnerApps
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPartnerApps`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: pages the SageMaker Partner AI Apps stored in `crate::state`. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPartnerApps::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +134,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPartnerApps` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPartnerAppsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPartnerApps"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write this reporting call makes: the `Creating` -> `Available` moves the
+        // clock already owed. Each was due at the app's stored instant whether or not
+        // anybody listed the apps, so no caller's read changes what a later one sees.
+        let mut settled: Vec<String> = Vec::new();
+        for app in store.partner_apps.values_mut() {
+            if app.settle_status(now) {
+                settled.push(app.arn.clone());
+            }
+        }
+        for arn in &settled {
+            // Each transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path. Recorded here, with
+            // the write, so a request this handler goes on to refuse still leaves the
+            // record of the transitions it did materialise.
+            crate::state::record_state_change(Self::NAME, arn, ctx);
+        }
+
+        // The model documents no sort for this operation, so the apps are ordered oldest
+        // first with the app id breaking a tie: one total order, stable across calls, which
+        // is what makes a `NextToken` land on the same boundary on the next page. The
+        // summaries are built here, so the store guard is released before the response is.
+        let mut listed: Vec<(::std::time::SystemTime, String, PartnerAppSummary)> = store
+            .partner_apps
+            .values()
+            .map(|app| {
+                (
+                    app.creation_time,
+                    app.app_id.clone(),
+                    PartnerAppSummary {
+                        arn: Some(app.arn.clone()),
+                        name: Some(app.name.clone()),
+                        r#type: Some(app.app_type.clone()),
+                        status: Some(app.status.clone()),
+                        creation_time: Some(crate::state::timestamp(app.creation_time)),
+                    },
+                )
+            })
+            .collect();
+        drop(store);
+        listed.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|app_id| listed.iter().position(|app| app.1 == app_id))
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(
+                            "NextToken does not name a page boundary of this result set; \
+                             restart the listing without it.",
+                        )
+                    })?;
+                resumed_after + 1
+            }
+        };
+        let start = start.min(listed.len());
+
+        // `MaxResults` caps the page ("an upper bound, not a target", defaulting to 10),
+        // and so does the service's own ceiling: one call can never serialise the whole
+        // store. The token below is emitted whenever anything is left, so a paginating
+        // client walks the full result set exactly once either way.
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::PARTNER_APP_DEFAULT_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE)
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(listed.len());
+
+        let next_token = match listed.get(end.saturating_sub(1)) {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end > start && end < listed.len() => {
+                Some(crate::state::encode_page_token(&last.1))
+            }
+            _ => None,
+        };
+        let output = ListPartnerAppsOutput {
+            summaries: Some(
+                listed
+                    .drain(start..end)
+                    .map(|(_, _, summary)| summary)
+                    .collect(),
+            ),
+            next_token,
+        };
+        Ok(output)
     }
 }

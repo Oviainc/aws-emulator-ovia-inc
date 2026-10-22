@@ -33,6 +33,11 @@ pub const LIFE_CYCLE_AVAILABLE: &str = "available";
 /// See [`LIFE_CYCLE_CREATING`]. The phase a file system is in while a change the
 /// service applies in the background — a throughput change — is still settling.
 pub const LIFE_CYCLE_UPDATING: &str = "updating";
+/// See [`LIFE_CYCLE_CREATING`]. The phase a resource a delete was accepted for is in
+/// until that deletion completes: `DeleteAccessPoint` documents that "after deletion is
+/// complete, new clients can no longer connect to the access point", so the deletion is
+/// not complete when the call returns; see [`DELETING_FOR`].
+pub const LIFE_CYCLE_DELETING: &str = "deleting";
 
 /// Values of the modelled `ReplicationStatus` enum this slice produces
 /// (`smithy_query(query="shape",shape="ReplicationStatus")` -> ENABLED | ENABLING |
@@ -166,6 +171,15 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// a create still observes `creating` and the state errors that go with it; the due
 /// instant is stored on the record and materialised on the next call, never slept for.
 pub const CREATING_FOR: Duration = Duration::from_millis(500);
+
+/// How long a resource a delete has been accepted for stays in `deleting` before the
+/// clock owes its removal. AWS publishes no duration for the transition either, so this
+/// span is the emulator's own choice inside the same band (250-750 ms) and is never
+/// zero: a caller that acts immediately after a delete still observes the record in
+/// `deleting`, which is what lets every racing delete of one live resource be accepted
+/// and converge on a single deletion. The due instant is stored on the record and
+/// materialised on the next call, never slept for.
+pub const DELETING_FOR: Duration = Duration::from_millis(500);
 
 /// `UpdateFileSystem`'s `TooManyRequests` (HTTP 429): "Returned if you don't wait at
 /// least 24 hours before either changing the throughput mode, or decreasing the
@@ -478,6 +492,9 @@ pub struct AccessPoint {
     pub life_cycle_state: String,
     /// When the clock owes this access point `available`; see [`CREATING_FOR`].
     pub available_at: SystemTime,
+    /// When the clock owes this access point's removal, once a delete has been accepted
+    /// for it; `None` while no delete has been. See [`DELETING_FOR`].
+    pub deleted_at: Option<SystemTime>,
     pub posix_user: Option<PosixUser>,
     pub root_directory: RootDirectory,
     pub tags: Vec<Tag>,
@@ -618,8 +635,9 @@ impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
 
     /// Materialise every lifecycle transition the clock has already made due: a
     /// resource whose `creating` span has elapsed becomes `available`, as does a file
-    /// system whose `updating` span has. Owed at the same instant whether or not anybody
-    /// called, so a reporting operation may apply it.
+    /// system whose `updating` span has, and a resource whose accepted deletion's
+    /// `deleting` span has elapsed is gone. Owed at the same instant whether or not
+    /// anybody called, so a reporting operation may apply it.
     pub fn materialize_due_transitions(&mut self, now: SystemTime) {
         for file_system in self.file_systems.values_mut() {
             if (file_system.life_cycle_state == LIFE_CYCLE_CREATING
@@ -641,6 +659,24 @@ impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
                 && access_point.available_at <= now
             {
                 access_point.life_cycle_state = LIFE_CYCLE_AVAILABLE.to_string();
+            }
+        }
+        // An accepted deletion whose `deleting` span has elapsed is complete: the record
+        // goes, so the id is "not found" to every later read and delete, and the
+        // `ClientToken` it was created with is free to mint an access point again.
+        let completed: Vec<String> = self
+            .access_points
+            .values()
+            .filter(|access_point| access_point.deleted_at.is_some_and(|due| due <= now))
+            .map(|access_point| access_point.access_point_id.clone())
+            .collect();
+        for access_point_id in completed {
+            if let Some(removed) = self.access_points.remove(&access_point_id) {
+                if self.access_point_tokens.get(&removed.client_token)
+                    == Some(&removed.access_point_id)
+                {
+                    self.access_point_tokens.remove(&removed.client_token);
+                }
             }
         }
         for replication in self.replications.values_mut() {

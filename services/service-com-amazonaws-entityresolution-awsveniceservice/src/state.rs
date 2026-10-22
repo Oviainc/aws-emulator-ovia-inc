@@ -26,6 +26,14 @@
 //! Beside the control-plane resources this module owns the MATCHING JOBS a workflow
 //! has been run with ([`MatchingJob`]), and the clock-driven status lifecycle every
 //! reader of one materialises ([`MatchingJob::materialize_due`]).
+//!
+//! The RESOURCE-BASED POLICIES ([`ResourcePolicy`]) are keyed by the ARN of the
+//! resource they are attached to, because one policy API covers all four resource
+//! types a `VeniceGlobalArn` names. The policy DOCUMENT is stored as the writer left
+//! it — `PutPolicy` writes one verbatim, and `AddPolicyStatement` /
+//! `DeletePolicyStatement` change its `Statement` list and leave the rest of it alone
+//! ([`policy_document_parts`], [`render_policy_document`]) — so a reader serves the
+//! document the last write produced and the two cannot drift.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -346,6 +354,167 @@ pub struct IdMappingWorkflow {
     pub created_at: ::aws_smithy_types::DateTime,
     pub updated_at: ::aws_smithy_types::DateTime,
     pub tags: Option<HashMap<String, String>>,
+}
+
+/// The policy-language `Version` a `PolicyDocument` this service composes carries.
+///
+/// A resource-based policy is an IAM policy document — `AddPolicyStatement` composes
+/// one from each statement's `effect`, `action`, `principal` and `condition`
+/// (`smithy_query(query="operation",operation="AddPolicyStatement")`) — and
+/// `2012-10-17` is the current version of that language, so what this service composes
+/// is a document an IAM policy parser accepts. A document a `PutPolicy` caller wrote
+/// keeps ITS own members: this is only what a composed one starts from.
+pub const POLICY_VERSION: &str = "2012-10-17";
+
+/// The two forms `StatementPrincipal` admits, and which `Principal` key each is
+/// written under.
+///
+/// `AddPolicyStatement$principal` is documented as "The Amazon Web Services service or
+/// Amazon Web Services account that can access the resource defined as ARN", i.e. ONE
+/// member carrying both kinds, and its modelled pattern is exactly that alternation:
+/// `^((\d{12})|([a-z0-9\.]+))$` (`length 12..64`,
+/// `smithy_query(query="shape",shape="StatementPrincipalList")`) — a 12-digit account
+/// id, or a lowercase dotted service name. An IAM policy document writes an account
+/// principal under `Principal.AWS` and a service principal under `Principal.Service`,
+/// so the branch of that alternation a value matches is what decides its key: a value
+/// of exactly twelve ASCII digits is the account form, and every other value the
+/// pattern admits is the service-name form.
+fn is_service_principal(principal: &str) -> bool {
+    let is_account_id =
+        principal.len() == 12 && principal.bytes().all(|byte| byte.is_ascii_digit());
+    !is_account_id
+}
+
+/// The longest `PolicyDocument` this service will store, and so the largest a policy
+/// can grow to: the modelled maximum of the member it is served on (`PolicyDocument`,
+/// `length 1..40960`, `smithy_query(query="shape",shape="PolicyDocument")`).
+///
+/// `PutPolicy` takes a whole document, which the boundary validator already holds to
+/// that maximum; `AddPolicyStatement` GROWS one across calls out of values with no
+/// modelled maximum of their own (an `action` or `principal` list is `length 1..`, a
+/// `condition` is up to 40960 characters), so the add is where the bound has to be
+/// checked: a policy that could not be served as a `PolicyDocument` is refused rather
+/// than stored (see [`messages::policy_document_too_large`]). Together with
+/// [`ComAmazonawsEntityresolutionAwsveniceserviceState::prune_orphaned_policies`] that
+/// bounds the whole collection — at most one document's worth per live resource, and
+/// every resource collection has its own quota.
+pub const MAX_POLICY_DOCUMENT_LENGTH: usize = 40960;
+
+/// The `Statement` member of a policy document: the list of statements
+/// `AddPolicyStatement` appends to and `DeletePolicyStatement` removes from.
+const POLICY_STATEMENT_MEMBER: &str = "Statement";
+
+/// The `Version` member of a policy document, which carries [`POLICY_VERSION`].
+const POLICY_VERSION_MEMBER: &str = "Version";
+
+/// The `Sid` member of one statement, which is where that statement's `statementId`
+/// lives.
+const POLICY_SID_MEMBER: &str = "Sid";
+
+/// A stored `PolicyDocument` taken apart into the object it is and its `Statement`
+/// list — `None` when `document` is not a document this service can change: one that
+/// is not a JSON object, or whose `Statement` member is neither absent nor an array.
+///
+/// Every OTHER member of the document (`Version`, `Id`, anything a `PutPolicy` caller
+/// wrote) stays in the returned object, so adding or removing a statement preserves
+/// the rest of the document instead of replacing it with a composed one.
+pub fn policy_document_parts(
+    document: &str,
+) -> Option<(
+    ::serde_json::Map<String, ::serde_json::Value>,
+    Vec<::serde_json::Value>,
+)> {
+    let ::serde_json::Value::Object(mut object) = ::serde_json::from_str(document).ok()? else {
+        return None;
+    };
+    let statements = match object.remove(POLICY_STATEMENT_MEMBER) {
+        None => Vec::new(),
+        Some(::serde_json::Value::Array(statements)) => statements,
+        Some(_) => return None,
+    };
+    Some((object, statements))
+}
+
+/// The document `object` renders once `statements` is written back as its `Statement`
+/// member: the counterpart of [`policy_document_parts`], and `None` only if the result
+/// cannot be serialized at all.
+pub fn render_policy_document(
+    mut object: ::serde_json::Map<String, ::serde_json::Value>,
+    statements: Vec<::serde_json::Value>,
+) -> Option<String> {
+    object.insert(
+        POLICY_STATEMENT_MEMBER.to_string(),
+        ::serde_json::Value::Array(statements),
+    );
+    ::serde_json::to_string(&::serde_json::Value::Object(object)).ok()
+}
+
+/// The document a resource carrying no policy yet starts from when a statement is
+/// added to it: the policy language's `Version`, and nothing else.
+pub fn new_policy_document() -> ::serde_json::Map<String, ::serde_json::Value> {
+    let mut object = ::serde_json::Map::new();
+    object.insert(
+        POLICY_VERSION_MEMBER.to_string(),
+        ::serde_json::Value::String(POLICY_VERSION.to_string()),
+    );
+    object
+}
+
+/// The `Sid` of one statement of a policy document, when it carries one.
+///
+/// `Sid` is where a statement's `statementId` lives, so this is what decides whether a
+/// policy already holds the statement an add names, and which statement a delete
+/// removes.
+pub fn statement_sid(statement: &::serde_json::Value) -> Option<&str> {
+    statement.get(POLICY_SID_MEMBER)?.as_str()
+}
+
+/// One statement of a policy document, composed from the members `AddPolicyStatement`
+/// carries plus the ARN of the resource the policy is attached to.
+///
+/// Every member goes through unchanged except `Principal`: the modelled
+/// `StatementPrincipal` carries BOTH principal kinds in one member, while an IAM
+/// document writes them under two keys, so they are split here (see
+/// [`is_service_principal`]) and a kind no principal belongs to is left off the block.
+/// `Resource` is the policy's own resource, so a statement added through this API can
+/// never name another one, and `Condition` is absent when the request carried none,
+/// because an IAM statement without conditions carries no `Condition` block at all.
+pub fn policy_statement(
+    statement_id: &str,
+    effect: &str,
+    action: &[String],
+    principal: &[String],
+    condition: Option<&::serde_json::Value>,
+    resource_arn: &str,
+) -> ::serde_json::Value {
+    let (service, aws): (Vec<&str>, Vec<&str>) = principal
+        .iter()
+        .map(String::as_str)
+        .partition(|principal| is_service_principal(principal));
+    let mut principal_block = ::serde_json::Map::new();
+    if !aws.is_empty() {
+        principal_block.insert("AWS".to_string(), ::serde_json::json!(aws));
+    }
+    if !service.is_empty() {
+        principal_block.insert("Service".to_string(), ::serde_json::json!(service));
+    }
+
+    let mut statement = ::serde_json::Map::new();
+    statement.insert(
+        POLICY_SID_MEMBER.to_string(),
+        ::serde_json::json!(statement_id),
+    );
+    statement.insert("Effect".to_string(), ::serde_json::json!(effect));
+    statement.insert(
+        "Principal".to_string(),
+        ::serde_json::Value::Object(principal_block),
+    );
+    statement.insert("Action".to_string(), ::serde_json::json!(action));
+    statement.insert("Resource".to_string(), ::serde_json::json!(resource_arn));
+    if let Some(condition) = condition {
+        statement.insert("Condition".to_string(), condition.clone());
+    }
+    ::serde_json::Value::Object(statement)
 }
 
 /// One resource-based policy as this service persists it.
@@ -993,12 +1162,55 @@ pub mod messages {
         format!("Resource {arn} does not exist")
     }
 
-    /// `GetPolicy`'s `ResourceNotFoundException$message` (HTTP 404) when the resource
-    /// exists but carries no resource-based policy: there is no policy revision to
-    /// report. Not recorded; this reader's own constant, in the same constant,
-    /// no-name form as the recorded [`GET_SCHEMA_MAPPING_NOT_FOUND`] and spelled with
-    /// the resource the operation reads.
-    pub const GET_POLICY_NOT_FOUND: &str = "Policy does not exist";
+    /// The `ResourceNotFoundException$message` (HTTP 404) the policy paths answer when
+    /// the resource exists but carries no resource-based policy: there is no policy
+    /// revision to report.
+    ///
+    /// RECORDED from AWS on a `GetPolicy` for a resource whose policy had just been
+    /// emptied by `DeletePolicyStatement`. It is a fixed service string that names
+    /// neither the resource nor the condition, in the same constant, no-name form as
+    /// the recorded [`GET_SCHEMA_MAPPING_NOT_FOUND`], and the statement paths answer
+    /// the same text for the same condition.
+    pub const GET_POLICY_NOT_FOUND: &str = "The resource specified in the request does not exist.";
+
+    /// `AddPolicyStatement`'s `ValidationException$message` (HTTP 400) when the policy
+    /// already holds a statement with the requested `statementId`.
+    ///
+    /// Both the code and the text are recorded behaviour: AWS refuses a repeated
+    /// `statementId` as a `ValidationException` and not as a `ConflictException`, even
+    /// though the operation models both, and answers this fixed string, which names
+    /// neither the identifier nor the resource. That fits what the member documents —
+    /// `statementId` is "a statement identifier that differentiates the statement from
+    /// others in the same policy", so a value that differentiates nothing fails that
+    /// member's own rule rather than conflicting with the resource's state — and it is
+    /// in the same per-operation constant form as [`CREATE_SCHEMA_MAPPING_CONFLICT`].
+    pub const DUPLICATE_STATEMENT_ID: &str = "Statement ID already exists in document";
+
+    /// `AddPolicyStatement`'s `ValidationException$message` (HTTP 400) when the
+    /// statement would take the policy past what a `PolicyDocument` can carry.
+    ///
+    /// Not itself recorded. Built from the request's own limit: the message names the
+    /// length the policy would reach and the modelled maximum it would exceed
+    /// ([`super::MAX_POLICY_DOCUMENT_LENGTH`]), which is what a caller needs to fix the
+    /// call.
+    pub fn policy_document_too_large(length: usize) -> String {
+        format!(
+            "the policy this statement would produce is {length} characters, past the maximum \
+             of {} a policy document can carry",
+            super::MAX_POLICY_DOCUMENT_LENGTH
+        )
+    }
+
+    /// `AddPolicyStatement`'s `ValidationException$message` (HTTP 400) when
+    /// `condition` is not a policy condition block.
+    ///
+    /// The model constrains that member only by length (`StatementCondition`,
+    /// `length 1..40960`), so a value that is not a JSON object of condition keys
+    /// reaches the handler; the message names the member and the constraint it failed,
+    /// the way the boundary validator's own refusals do.
+    pub fn invalid_statement_condition(reason: &str) -> String {
+        format!("condition must be a JSON object of policy condition keys: {reason}")
+    }
 
     /// `PutPolicy`'s `ConflictException$message` (HTTP 400) when the request carries a
     /// `token` that is not the current revision of the resource's policy — the

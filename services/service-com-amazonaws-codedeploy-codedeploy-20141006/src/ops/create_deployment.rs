@@ -296,6 +296,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+        // A deployment's `overrideAlarmConfiguration` is bounded by the same
+        // alarm rules as a deployment group's, from the one place they live.
+        if let Some(configuration) = input.override_alarm_configuration.as_ref() {
+            match crate::state::validate_alarm_configuration(configuration) {
+                Ok(()) => {}
+                Err(crate::state::AlarmConfigurationRejection::TooManyAlarms(count)) => {
+                    return Err(CreateDeploymentErrorModeled::AlarmsLimitExceededException(
+                        AlarmsLimitExceededException {
+                            message: Some(format!(
+                                "The maximum number of alarms for a deployment group ({}) was \
+                                 exceeded: {count} alarms were specified",
+                                crate::state::MAX_ALARMS_PER_ALARM_CONFIGURATION
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                Err(crate::state::AlarmConfigurationRejection::Malformed(reason)) => {
+                    return Err(CreateDeploymentErrorModeled::InvalidAlarmConfigException(
+                        InvalidAlarmConfigException {
+                            message: Some(format!("The alarm configuration is invalid: {reason}")),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
         let application_name = input.application_name;
         let requested_config = input.deployment_config_name;
         let requested_revision = input.revision;

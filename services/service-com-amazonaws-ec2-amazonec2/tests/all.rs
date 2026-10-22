@@ -48,6 +48,8 @@ mod volume_lifecycle;
 mod vpc_attributes;
 #[path = "all/vpc_lifecycle.rs"]
 mod vpc_lifecycle;
+#[path = "all/vpc_network_lifecycle.rs"]
+mod vpc_network_lifecycle;
 // Reading one VPC back out of an ec2Query response, on top of `ec2_query`'s plumbing.
 #[path = "all/wire.rs"]
 mod wire;

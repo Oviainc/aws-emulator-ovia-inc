@@ -134,6 +134,14 @@ impl Emulator {
             .await
     }
 
+    /// `DELETE /2015-02-01/access-points/{AccessPointId}`, the modelled
+    /// `DeleteAccessPoint` binding. The label takes an id or an access-point ARN, so the
+    /// value is percent-encoded nowhere: both forms are sent as the caller wrote them.
+    pub async fn delete_access_point(&self, id: &str) -> Reply {
+        self.send("DELETE", &format!("/2015-02-01/access-points/{id}"), None)
+            .await
+    }
+
     pub async fn update_file_system_protection(&self, id: &str, body: Value) -> Reply {
         self.send(
             "PUT",
@@ -194,6 +202,13 @@ impl Emulator {
 /// state waits here.
 pub async fn settle() {
     tokio::time::sleep(state::CREATING_FOR + Duration::from_millis(150)).await;
+}
+
+/// Wait past the clock-owed removal of a resource an accepted delete moved to
+/// `deleting`. Like [`settle`], the handlers store the due instant instead of sleeping
+/// for it, so only a test that wants the completed deletion waits here.
+pub async fn settle_deletion() {
+    tokio::time::sleep(state::DELETING_FOR + Duration::from_millis(150)).await;
 }
 
 /// `^fs-[0-9a-f]{8,40}$` / `^fsmt-[0-9a-f]{8,40}$`, the modelled id patterns.

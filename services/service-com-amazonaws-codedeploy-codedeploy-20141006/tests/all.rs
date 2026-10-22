@@ -19,6 +19,8 @@ mod batch_get_deployments;
 mod codedeploy_deployment_outcome;
 #[path = "all/codedeploy_lifecycle.rs"]
 mod codedeploy_lifecycle;
+#[path = "all/deployment_group_update.rs"]
+mod deployment_group_update;
 #[path = "all/git_hub_account_token_names.rs"]
 mod git_hub_account_token_names;
 #[path = "all/github_account_tokens.rs"]

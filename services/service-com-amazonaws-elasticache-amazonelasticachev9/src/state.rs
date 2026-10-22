@@ -19,10 +19,16 @@
 //! engines. No operation creates one (the API has no such call), so the store
 //! starts out holding the catalog and `DescribeServiceUpdates` reports it.
 //!
-//! Everything else in this service (replication groups, serverless caches,
-//! users, parameter groups, migrations, update actions) is still a
-//! scaffolded 501 and owns its own gap issue; where a member of an implemented
-//! operation belongs to one of those resources, the comment beside it says so.
+//! Everything else in this service (replication groups, users, parameter
+//! groups, migrations, update actions) is still a scaffolded 501 and owns its
+//! own gap issue; where a member of an implemented operation belongs to one of
+//! those resources, the comment beside it says so.
+//!
+//! The serverless cache is another customer-created resource this store holds:
+//! `CreateServerlessCache` mints one and `DescribeServerlessCaches` reports it.
+//! `ModifyServerlessCache` / `DeleteServerlessCache` and the serverless
+//! snapshot operations are still scaffolded 501s with their own gap issues, and
+//! they read and write the SAME record rather than a copy beside it.
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
@@ -30,10 +36,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AvailabilityZone, CacheCluster, CacheNode, CacheParameterGroup, CacheParameterGroupStatus,
-    CacheSubnetGroup, DestinationDetails, Endpoint, LogDeliveryConfiguration,
+    CacheSubnetGroup, CacheUsageLimits, DestinationDetails, Endpoint, LogDeliveryConfiguration,
     LogDeliveryConfigurationRequest, NodeGroupConfiguration, NodeSnapshot,
     NotificationConfiguration, PendingModifiedValues, RecurringCharge, ReservedCacheNodesOffering,
-    ScaleConfig, SecurityGroupMembership,
+    ScaleConfig, SecurityGroupMembership, ServerlessCache,
     ServiceUpdate, Snapshot, Subnet, Tag,
 };
 
@@ -573,7 +579,16 @@ pub fn snapshot_page_size(max_records: Option<i32>) -> Result<usize, String> {
 /// refused. [`MAX_RECORDS_DEFAULT`] is the page it serves when the request names
 /// no `MaxRecords` at all.
 pub fn unbounded_page_size(max_records: Option<i32>) -> Result<usize, String> {
-    let requested = max_records.unwrap_or(MAX_RECORDS_DEFAULT);
+    unbounded_page_size_with_default(max_records, MAX_RECORDS_DEFAULT)
+}
+
+/// [`unbounded_page_size`], for a describe whose `MaxResults` documents its own
+/// default page (`DescribeServerlessCaches`: "The default is 50.").
+pub fn unbounded_page_size_with_default(
+    max_records: Option<i32>,
+    default: i32,
+) -> Result<usize, String> {
+    let requested = max_records.unwrap_or(default);
     match usize::try_from(requested) {
         Ok(size) if size > 0 => Ok(size),
         _ => Err(format!(
@@ -1526,6 +1541,375 @@ impl CacheSubnetGroupRecord {
     }
 }
 
+/// `ServerlessCache$Status`'s values this slice writes and reads: "The current
+/// status of the serverless cache. The allowed values are CREATING, AVAILABLE,
+/// DELETING, CREATE-FAILED and MODIFYING." The member is a plain `String`
+/// rather than an enum, so these are the spellings. `DELETING` / `MODIFYING`
+/// belong to `DeleteServerlessCache` / `ModifyServerlessCache`, which are still
+/// scaffolded 501s, so they are spelled where those land rather than here.
+pub const SERVERLESS_STATUS_CREATING: &str = "CREATING";
+/// See [`SERVERLESS_STATUS_CREATING`].
+pub const SERVERLESS_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// How long a serverless cache stays `CREATING` before the clock owes it
+/// `AVAILABLE` — the same span a cache cluster's transitions take; see
+/// [`CLUSTER_TRANSITION`] for why it is a chosen, non-zero span.
+pub const SERVERLESS_CACHE_TRANSITION: Duration = CLUSTER_TRANSITION;
+
+/// How many serverless caches the store holds before a create is refused with
+/// `ServerlessCacheQuotaForCustomerExceededFault`. The emulator's OWN bound on
+/// the store, for the reason [`CLUSTER_QUOTA`] gives.
+pub const SERVERLESS_CACHE_QUOTA: usize = 150;
+
+/// The largest `SnapshotRetentionLimit` a serverless cache may carry, as
+/// `CreateServerlessCache$SnapshotRetentionLimit` documents it: "The maximum
+/// value allowed is 35 days."
+pub const MAX_SNAPSHOT_RETENTION_LIMIT: i32 = 35;
+
+/// The bounds a `DataStorage` limit must be within, and the value that removes
+/// the limit instead.
+///
+/// The member carries no modelled `@range`; the recorded refusal this repo
+/// holds for an out-of-range limit
+/// (`issues/.../20261022T193451Z-elasticache-nine-operation-families-answer-notimplemented-instead-of.md`,
+/// recorded example "Invalid value for DataStorage limit. Must be between 1 and
+/// 5000. You can set the value to zero to remove the limit.") is where these
+/// come from.
+pub const DATA_STORAGE_MIN_GB: i32 = 1;
+/// See [`DATA_STORAGE_MIN_GB`].
+pub const DATA_STORAGE_MAX_GB: i32 = 5000;
+/// The `CacheUsageLimits` bound value that removes a limit rather than setting
+/// one; see [`DATA_STORAGE_MIN_GB`].
+pub const USAGE_LIMIT_REMOVED: i32 = 0;
+
+/// The longest `Description` a serverless cache may carry, as
+/// `CreateServerlessCache$Description` documents it: "The maximum length is 255
+/// characters." The member carries no modelled `@length`, so the bound is
+/// enforced in the handler.
+pub const MAX_SERVERLESS_DESCRIPTION_LENGTH: usize = 255;
+
+/// What `ServerlessCache$Description` reports for a cache created without one.
+///
+/// `CreateServerlessCache$Description` documents "The default is NULL, i.e. if
+/// no description is provided then an empty string will be returned", and the
+/// API normalises that empty description to a single space: a recorded create
+/// that names no `Description` is answered with `" "`, and every later read of
+/// the cache reports the same. The value is STORED, so the create response and
+/// a later describe cannot disagree.
+pub const DEFAULT_SERVERLESS_DESCRIPTION: &str = " ";
+
+/// `ConnectionType`'s values (`smithy_query(query="shape",
+/// shape="ConnectionType")`: `vpc | public`), and the default
+/// `CreateServerlessCache$ConnectionType` documents: "If not specified,
+/// defaults to vpc."
+pub const CONNECTION_TYPE_VPC: &str = "vpc";
+/// See [`CONNECTION_TYPE_VPC`].
+pub const CONNECTION_TYPE_PUBLIC: &str = "public";
+
+/// The engine, and the lowest major version of it, that a `public`
+/// `ConnectionType` needs: "Setting this to public requires Valkey 9 or above"
+/// (`CreateServerlessCache$ConnectionType`).
+pub const PUBLIC_CONNECTION_ENGINE: &str = "valkey";
+/// See [`PUBLIC_CONNECTION_ENGINE`].
+pub const PUBLIC_CONNECTION_MIN_MAJOR: u32 = 9;
+
+/// The `NetworkType` a serverless cache is created with when the request names
+/// none: "If not specified, defaults to ipv4, unless all provided subnets are
+/// IPv6-only, in which case it defaults to ipv6"
+/// (`CreateServerlessCache$NetworkType`). The emulator models no EC2 subnets to
+/// read an address family from, so the documented default applies.
+pub const DEFAULT_NETWORK_TYPE: &str = "ipv4";
+
+/// `StorageEncryptionType`'s values this slice uses, as
+/// `ServerlessCache$StorageEncryptionType` documents them: "Serverless caches
+/// are always encrypted at rest. The value is `sse-elasticache` if an
+/// ElastiCache service-managed key is used, or `sse-kms` if a customer-managed
+/// KMS key is used."
+pub const STORAGE_ENCRYPTION_SSE_ELASTICACHE: &str = "sse-elasticache";
+/// See [`STORAGE_ENCRYPTION_SSE_ELASTICACHE`].
+pub const STORAGE_ENCRYPTION_SSE_KMS: &str = "sse-kms";
+
+/// The Region in which a serverless cache that names no `SubnetIds` is given
+/// two default subnets, and the number of default subnets everywhere else, as
+/// `ServerlessCache$SubnetIds` documents it: "If no subnet IDs are given and
+/// your VPC is in us-west-1, then ElastiCache will select 2 default subnets
+/// across AZs in your VPC. For all other Regions, if no subnet IDs are given
+/// then ElastiCache will select 3 default subnets across AZs in your default
+/// VPC."
+pub const TWO_DEFAULT_SUBNET_REGION: &str = "us-west-1";
+/// See [`TWO_DEFAULT_SUBNET_REGION`].
+pub const DEFAULT_SUBNETS_IN_TWO_SUBNET_REGION: usize = 2;
+/// See [`TWO_DEFAULT_SUBNET_REGION`].
+pub const DEFAULT_SUBNETS: usize = 3;
+
+/// The page a `DescribeServerlessCaches` serves when the request names no
+/// `MaxResults`: "The maximum number of records in the response. … The default
+/// is 50." (`smithy_query(query="doc", shape="DescribeServerlessCachesRequest",
+/// member="MaxResults")`).
+pub const SERVERLESS_MAX_RESULTS_DEFAULT: i32 = 50;
+
+/// The ARN of a serverless cache:
+/// `arn:aws:elasticache:<region>:<account>:serverlesscache:<name>`.
+pub fn serverless_cache_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("serverlesscache:{name}"))
+}
+
+/// How many default subnets a serverless cache created in `region` without
+/// `SubnetIds` is given; see [`TWO_DEFAULT_SUBNET_REGION`].
+pub fn default_subnet_count(region: &str) -> usize {
+    if region == TWO_DEFAULT_SUBNET_REGION {
+        DEFAULT_SUBNETS_IN_TWO_SUBNET_REGION
+    } else {
+        DEFAULT_SUBNETS
+    }
+}
+
+/// The major engine version a serverless cache is created with when the request
+/// names none: the major line of the engine's current version, which is the one
+/// statement this emulator makes about what that version is (see
+/// [`default_engine_version`]).
+///
+/// A line is the engine's version up to the component the parameter-group family
+/// is named for — `<major>` for Valkey and Redis OSS, `<major>.<minor>` for
+/// Memcached — exactly as [`default_parameter_group_name`] splits it.
+pub fn default_major_engine_version(engine: &str) -> String {
+    let version = default_engine_version(engine);
+    let mut parts = version.split('.');
+    let major = parts.next().unwrap_or_default();
+    if engine == "memcached" {
+        format!("{major}.{}", parts.next().unwrap_or("0"))
+    } else {
+        major.to_string()
+    }
+}
+
+/// The full engine version a serverless cache compatible with major version
+/// `major` runs, reported as `ServerlessCache$FullEngineVersion` ("The name and
+/// version number of the engine the serverless cache is compatible with").
+///
+/// `DescribeCacheEngineVersions` is still a scaffolded 501, so the emulator's
+/// own statement of the current version of each engine
+/// ([`default_engine_version`]) is what a request for that engine's current
+/// major line resolves to; any other line resolves to its first release.
+pub fn serverless_full_engine_version(engine: &str, major: &str) -> String {
+    let current = default_engine_version(engine);
+    if current == major || current.starts_with(&format!("{major}.")) {
+        current.to_string()
+    } else {
+        format!("{major}.0")
+    }
+}
+
+/// True when `value` has the form of an engine version: dot-separated groups of
+/// digits (`7`, `1.6`, `8.0`).
+///
+/// `MajorEngineVersion` carries no modelled constraint, so the boundary
+/// validator passes any string and a value that cannot name a version is
+/// refused here.
+pub fn is_version_label(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The leading (major) component of a version label, or `None` when `value` is
+/// not one.
+pub fn major_version_number(value: &str) -> Option<u32> {
+    value.split('.').next()?.parse().ok()
+}
+
+/// True when `value` is a daily snapshot time: `HH:MM` in UTC, the format
+/// `DailySnapshotTime` takes ("The daily time that snapshots will be created
+/// from the new serverless cache", the same `HH:MM` wall-clock form
+/// `SnapshotWindow`'s "Example: 05:00-09:00" is built from).
+pub fn is_daily_snapshot_time(value: &str) -> bool {
+    let Some((hours, minutes)) = value.split_once(':') else {
+        return false;
+    };
+    let two_digits = |part: &str| part.len() == 2 && part.bytes().all(|b| b.is_ascii_digit());
+    if !two_digits(hours) || !two_digits(minutes) {
+        return false;
+    }
+    matches!(hours.parse::<u32>(), Ok(h) if h < 24)
+        && matches!(minutes.parse::<u32>(), Ok(m) if m < 60)
+}
+
+/// One `CacheUsageLimits` member as [`validate_cache_usage_limits`] checks it:
+/// its name, its `Minimum`, its `Maximum`, and the upper bound its values must
+/// be within (`None` where the API publishes none).
+type UsageLimitBounds = (&'static str, Option<i32>, Option<i32>, Option<i32>);
+
+/// Why a request's `CacheUsageLimits` cannot be stored, as the message the
+/// refusal carries, or `Ok(())` when every limit is one this store may hold.
+///
+/// `DataStorage` / `ECPUPerSecond` carry no modelled `@range`, so the boundary
+/// validator passes any integer and the bounds are enforced here: a
+/// `DataStorage` bound must be within [`DATA_STORAGE_MIN_GB`] ..=
+/// [`DATA_STORAGE_MAX_GB`], an `ECPUPerSecond` bound must be positive (the API
+/// publishes no upper bound for it, so none is enforced), and either member
+/// takes [`USAGE_LIMIT_REMOVED`] to remove the limit instead of setting one. A
+/// `Minimum` above its own `Maximum` is refused for both. Every accepted value
+/// is persisted EXACTLY as sent — the stored limits are what a later read
+/// reports.
+pub fn validate_cache_usage_limits(limits: &CacheUsageLimits) -> Result<(), String> {
+    let mut members: Vec<UsageLimitBounds> = Vec::new();
+    if let Some(storage) = limits.data_storage.as_ref() {
+        members.push((
+            "DataStorage",
+            storage.minimum,
+            storage.maximum,
+            Some(DATA_STORAGE_MAX_GB),
+        ));
+    }
+    if let Some(ecpu) = limits.ecpu_per_second.as_ref() {
+        members.push(("ECPUPerSecond", ecpu.minimum, ecpu.maximum, None));
+    }
+    for (member, minimum, maximum, upper) in members {
+        for value in [minimum, maximum].into_iter().flatten() {
+            if value == USAGE_LIMIT_REMOVED {
+                continue;
+            }
+            let within = value >= DATA_STORAGE_MIN_GB && upper.is_none_or(|upper| value <= upper);
+            if !within {
+                return Err(match upper {
+                    Some(upper) => format!(
+                        "Invalid value {value} for {member} limit. Must be between \
+                         {DATA_STORAGE_MIN_GB} and {upper}. You can set the value to \
+                         {USAGE_LIMIT_REMOVED} to remove the limit."
+                    ),
+                    None => format!(
+                        "Invalid value {value} for {member} limit. Must be at least \
+                         {DATA_STORAGE_MIN_GB}. You can set the value to {USAGE_LIMIT_REMOVED} to \
+                         remove the limit."
+                    ),
+                });
+            }
+        }
+        // A removed bound bounds nothing, so it cannot be the inverted one.
+        if let (Some(minimum), Some(maximum)) = (minimum, maximum) {
+            if minimum != USAGE_LIMIT_REMOVED
+                && maximum != USAGE_LIMIT_REMOVED
+                && minimum > maximum
+            {
+                return Err(format!(
+                    "Invalid values for {member}. Minimum must not be greater than Maximum."
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One serverless cache, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct ServerlessCacheRecord {
+    /// The (lowercased) `ServerlessCacheName`, which "is stored as a lowercase
+    /// string" and is the resource's identity in this API.
+    pub name: String,
+    pub region: String,
+    /// What `ServerlessCache$Description` reports; see
+    /// [`DEFAULT_SERVERLESS_DESCRIPTION`].
+    pub description: String,
+    pub engine: String,
+    pub major_engine_version: String,
+    pub full_engine_version: String,
+    /// One of `ServerlessCache$Status`'s values.
+    pub status: String,
+    /// The status change the clock owes this cache, if any.
+    pub pending_status: Option<PendingTransition>,
+    pub created_at: SystemTime,
+    /// The usage limits as the request set them, persisted unchanged.
+    pub cache_usage_limits: Option<CacheUsageLimits>,
+    pub kms_key_id: Option<String>,
+    /// `sse-kms` for a customer-managed key, else `sse-elasticache`; see
+    /// [`STORAGE_ENCRYPTION_SSE_ELASTICACHE`].
+    pub storage_encryption_type: String,
+    pub security_group_ids: Vec<String>,
+    /// The subnets the cache's VPC endpoint is deployed in: the ones the request
+    /// named, or the defaults ElastiCache selects; see [`DEFAULT_SUBNETS`].
+    pub subnet_ids: Vec<String>,
+    pub user_group_id: Option<String>,
+    pub snapshot_retention_limit: Option<i32>,
+    pub daily_snapshot_time: Option<String>,
+    pub network_type: String,
+    pub connection_type: String,
+    pub endpoint_address: String,
+    pub reader_endpoint_address: String,
+    pub endpoint_port: i32,
+    pub arn: String,
+    /// The tags `CreateServerlessCache` was given; see
+    /// [`CacheClusterRecord::tags`].
+    pub tags: Vec<(String, String)>,
+}
+
+impl ServerlessCacheRecord {
+    /// The endpoint address clients write to, and the one they read from.
+    ///
+    /// A serverless cache is reached through one DNS name per role rather than
+    /// per node, so the name is the cache, this cache's stored DNS token, the
+    /// `serverless` label, the Region and the service's DNS suffix — the same
+    /// suffix [`CacheClusterRecord::configuration_endpoint_address`] builds. The
+    /// reader endpoint is the same name with the `-ro` (read-only) suffix.
+    fn endpoint_addresses(name: &str, dns_token: &str, region: &str) -> (String, String) {
+        (
+            format!("{name}-{dns_token}.serverless.{region}.cache.amazonaws.com"),
+            format!("{name}-{dns_token}-ro.serverless.{region}.cache.amazonaws.com"),
+        )
+    }
+
+    /// Materialise the status change the clock owes this cache, if `now` is past
+    /// its due instant; see [`CacheClusterRecord::settle`].
+    pub fn settle(&mut self, now: SystemTime) {
+        let Some(pending) = self.pending_status.as_ref() else {
+            return;
+        };
+        if now < pending.due {
+            return;
+        }
+        self.status = pending.status.clone();
+        self.pending_status = None;
+    }
+
+    /// This record as the modelled `ServerlessCache`.
+    pub fn to_modeled(&self) -> ServerlessCache {
+        ServerlessCache {
+            serverless_cache_name: Some(self.name.clone()),
+            description: Some(self.description.clone()),
+            create_time: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            status: Some(self.status.clone()),
+            engine: Some(self.engine.clone()),
+            major_engine_version: Some(self.major_engine_version.clone()),
+            full_engine_version: Some(self.full_engine_version.clone()),
+            cache_usage_limits: self.cache_usage_limits.clone(),
+            kms_key_id: self.kms_key_id.clone(),
+            storage_encryption_type: Some(self.storage_encryption_type.clone()),
+            security_group_ids: (!self.security_group_ids.is_empty())
+                .then(|| self.security_group_ids.clone()),
+            endpoint: Some(Endpoint {
+                address: Some(self.endpoint_address.clone()),
+                port: Some(self.endpoint_port),
+            }),
+            reader_endpoint: Some(Endpoint {
+                address: Some(self.reader_endpoint_address.clone()),
+                port: Some(self.endpoint_port),
+            }),
+            arn: Some(self.arn.clone()),
+            user_group_id: self.user_group_id.clone(),
+            subnet_ids: Some(self.subnet_ids.clone()),
+            snapshot_retention_limit: self.snapshot_retention_limit,
+            daily_snapshot_time: self.daily_snapshot_time.clone(),
+            network_type: Some(self.network_type.clone()),
+            connection_type: Some(self.connection_type.clone()),
+            // A migration moves a self-designed cluster into a serverless
+            // cache, and every migration operation (`StartMigration`,
+            // `PrepareMigration`, `CompleteMigration`, …) is a scaffolded 501,
+            // so no cache of this slice has one.
+            migration: None,
+        }
+    }
+}
+
 /// One cache node, as the snapshot of its cluster holds it.
 ///
 /// A snapshot is "a copy of an entire cluster as of the time when the snapshot
@@ -1745,6 +2129,30 @@ impl SnapshotRecord {
             durability: None,
         }
     }
+}
+
+/// The validated values a new serverless cache is built from — one argument so
+/// [`ComAmazonawsElasticacheAmazonelasticachev9State::insert_serverless_cache`]
+/// does not take two dozen positional strings.
+#[derive(Debug, Clone)]
+pub struct NewServerlessCache {
+    pub name: String,
+    pub region: String,
+    pub description: String,
+    pub engine: String,
+    pub major_engine_version: String,
+    pub cache_usage_limits: Option<CacheUsageLimits>,
+    pub kms_key_id: Option<String>,
+    pub security_group_ids: Vec<String>,
+    pub subnet_ids: Vec<String>,
+    pub user_group_id: Option<String>,
+    pub snapshot_retention_limit: Option<i32>,
+    pub daily_snapshot_time: Option<String>,
+    pub network_type: String,
+    pub connection_type: String,
+    pub port: i32,
+    pub tags: Vec<(String, String)>,
+    pub now: SystemTime,
 }
 
 /// `ServiceUpdateStatus`'s values (`smithy_query(query="shape",
@@ -2002,10 +2410,15 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     /// rather than an account creating them, so the store holds the catalog
     /// from the moment it comes up — see [`published_service_updates`].
     pub service_updates: BTreeMap<String, ServiceUpdateRecord>,
+    /// Every stored serverless cache, keyed by its (lowercased)
+    /// `ServerlessCacheName`, ordered for the same reason.
+    pub serverless_caches: BTreeMap<String, ServerlessCacheRecord>,
     /// The counter endpoint DNS labels are minted from.
     pub dns_token_seq: u64,
     /// The counter VPC ids are minted from.
     pub vpc_seq: u64,
+    /// The counter the default subnet ids of a serverless cache are minted from.
+    pub subnet_seq: u64,
     /// The reserved-cache-node offerings this service publishes, keyed for the
     /// same stable total order. Stocked from [`offering_catalog`] when the store
     /// is created, because the catalog is the service's own and no operation
@@ -2028,11 +2441,13 @@ impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
         Self {
             cache_clusters: BTreeMap::new(),
             cache_subnet_groups: BTreeMap::new(),
+            serverless_caches: BTreeMap::new(),
             cache_parameter_groups: default_parameter_groups(),
             snapshots: BTreeMap::new(),
             service_updates: published_service_updates(SystemTime::now()),
             dns_token_seq: 0,
             vpc_seq: 0,
+            subnet_seq: 0,
             reserved_cache_nodes_offerings: offering_catalog(),
         }
     }
@@ -2060,6 +2475,74 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
     pub fn mint_vpc_id(&mut self) -> String {
         self.vpc_seq = self.vpc_seq.wrapping_add(1);
         format!("vpc-{:08x}", self.vpc_seq & 0xffff_ffff)
+    }
+
+    /// Mint the id of one subnet ElastiCache selects for a serverless cache the
+    /// request gave no `SubnetIds`: `subnet-` and eight lowercase hex digits,
+    /// the form EC2 uses. The emulator models no EC2 subnets to read one from,
+    /// so the selected ids are minted once and STORED on the record, which is
+    /// what makes every later read report the same subnets.
+    pub fn mint_subnet_id(&mut self) -> String {
+        self.subnet_seq = self.subnet_seq.wrapping_add(1);
+        format!("subnet-{:08x}", self.subnet_seq & 0xffff_ffff)
+    }
+
+    /// Build and store a serverless-cache record, returning what was stored.
+    ///
+    /// Takes the already-validated values so the one place a serverless cache is
+    /// created is also the one place its endpoints, ARN and encryption type are
+    /// derived from them. A created cache is NOT ready: it answers `CREATING`,
+    /// and the clock owes it `AVAILABLE` once
+    /// [`SERVERLESS_CACHE_TRANSITION`] has passed.
+    pub fn insert_serverless_cache(&mut self, new: NewServerlessCache) -> &ServerlessCacheRecord {
+        let dns_token = self.mint_dns_token();
+        let (endpoint_address, reader_endpoint_address) =
+            ServerlessCacheRecord::endpoint_addresses(&new.name, &dns_token, &new.region);
+        let record = ServerlessCacheRecord {
+            arn: serverless_cache_arn(&new.region, &new.name),
+            name: new.name.clone(),
+            region: new.region,
+            description: new.description,
+            full_engine_version: serverless_full_engine_version(
+                &new.engine,
+                &new.major_engine_version,
+            ),
+            engine: new.engine,
+            major_engine_version: new.major_engine_version,
+            status: SERVERLESS_STATUS_CREATING.to_string(),
+            pending_status: Some(PendingTransition {
+                due: new.now + SERVERLESS_CACHE_TRANSITION,
+                status: SERVERLESS_STATUS_AVAILABLE.to_string(),
+            }),
+            created_at: new.now,
+            cache_usage_limits: new.cache_usage_limits,
+            storage_encryption_type: if new.kms_key_id.is_some() {
+                STORAGE_ENCRYPTION_SSE_KMS.to_string()
+            } else {
+                STORAGE_ENCRYPTION_SSE_ELASTICACHE.to_string()
+            },
+            kms_key_id: new.kms_key_id,
+            security_group_ids: new.security_group_ids,
+            subnet_ids: new.subnet_ids,
+            user_group_id: new.user_group_id,
+            snapshot_retention_limit: new.snapshot_retention_limit,
+            daily_snapshot_time: new.daily_snapshot_time,
+            network_type: new.network_type,
+            connection_type: new.connection_type,
+            endpoint_address,
+            reader_endpoint_address,
+            endpoint_port: new.port,
+            tags: new.tags,
+        };
+        // The handler refuses a name the store already holds, under the same
+        // lock this insert takes, so the slot is always vacant here. The
+        // response is read back out of the map, so it is built from the record
+        // this service persisted rather than from a copy beside it.
+        debug_assert!(
+            !self.serverless_caches.contains_key(&new.name),
+            "a serverless cache is only inserted once"
+        );
+        self.serverless_caches.entry(new.name).or_insert(record)
     }
 
     /// Build and store a cluster record, returning what was stored.
@@ -2152,6 +2635,9 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
     pub fn settle_all(&mut self, now: SystemTime) {
         for cluster in self.cache_clusters.values_mut() {
             cluster.settle(now);
+        }
+        for cache in self.serverless_caches.values_mut() {
+            cache.settle(now);
         }
         for snapshot in self.snapshots.values_mut() {
             snapshot.settle(now);
