@@ -21,12 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# CodeSha256 is the SHA-256 of the stored deployment package...
+sha2 = { workspace = true }
+# ...reported base64-encoded, as the model's CodeSha256 member describes it.
+base64 = "0.22"
+# RevisionId is a UUID, minted fresh on every change to a function.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
 hex = { workspace = true }
 
 [lints]
