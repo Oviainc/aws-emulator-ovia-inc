@@ -45,7 +45,8 @@ pub(crate) struct Emulator {
     pub(crate) region: String,
     /// The SINGLE shared engine the router hands every handler of this service, kept
     /// so a suite can reach this service's store the way a handler does — for state
-    /// no operation of this API mints.
+    /// no operation of this API mints yet (the evaluation results `PutEvaluations`
+    /// will record once it lands).
     pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
