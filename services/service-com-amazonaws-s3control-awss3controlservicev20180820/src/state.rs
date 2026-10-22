@@ -2,13 +2,15 @@
 
 //! Engine state for the com-amazonaws-s3control-awss3controlservicev20180820 service.
 //!
-//! Besides the state struct itself this module holds the derivations every access
-//! point handler shares — the ARN, the alias, the network origin and the
-//! `ListAccessPoints` page token — so the six handlers under `src/ops/` compute
-//! them one way instead of six.
+//! Besides the state struct itself this module holds the derivations every
+//! handler shares — the access point ARN, alias, network origin and
+//! `ListAccessPoints` page token, the Storage Lens configuration ARN, and the
+//! refusals both resource lifecycles answer — so the handlers under `src/ops/`
+//! compute each one way instead of once per handler.
 
 use crate::ops::types::{
-    AccessPoint, PublicAccessBlockConfiguration, Tag, VpcConfiguration, NETWORK_ORIGIN_VALUES,
+    AccessPoint, PublicAccessBlockConfiguration, StorageLensConfiguration, StorageLensTag, Tag,
+    VpcConfiguration, NETWORK_ORIGIN_VALUES,
 };
 use std::collections::BTreeMap;
 
@@ -86,6 +88,49 @@ pub const MAX_POLICY_BYTES: usize = 20 * 1024;
 /// point name, which is the pair a name is unique within.
 pub type AccessPointKey = (String, String);
 
+/// One stored S3 Storage Lens configuration: the document the last
+/// `PutStorageLensConfiguration` stored, and the tag set that configuration
+/// carries.
+#[derive(Debug, Clone)]
+pub struct StorageLensConfigurationRecord {
+    /// The configuration document as the last put left it — stored WHOLE, never
+    /// merged with the document before it, with `StorageLensArn` set to the ARN
+    /// this service assigns (that member is documented read-only).
+    pub configuration: StorageLensConfiguration,
+    /// The configuration's tag set.
+    ///
+    /// Held BESIDE the document rather than inside it, because the two are
+    /// separate resources on the wire: `GetStorageLensConfiguration` reports no
+    /// tags at all, and `GetStorageLensConfigurationTagging` /
+    /// `PutStorageLensConfigurationTagging` are what report and replace them.
+    pub tags: Vec<StorageLensTag>,
+}
+
+/// How a stored S3 Storage Lens configuration is keyed: the owning account id
+/// and the configuration id, which is the pair an id is unique within.
+pub type StorageLensConfigurationKey = (String, String);
+
+/// How many S3 Storage Lens configurations the store holds before
+/// `PutStorageLensConfiguration` refuses to add another.
+///
+/// S3 Storage Lens limits how many configurations an account may hold in a
+/// Region, and this emulator models neither Service Quotas nor an account's
+/// adjustments — so this is the emulator's OWN bound on the store rather than a
+/// claim about any account's limit. It is set far above any workflow an
+/// emulator serves, and together with [`MAX_STORAGE_LENS_TAGS`] it is what
+/// stops this part of the state growing without end. (The record a put adds is
+/// released by `DeleteStorageLensConfiguration`, which is still a scaffold with
+/// its own gap issue; until it is written the bound is the only limit.)
+pub const STORAGE_LENS_CONFIGURATION_QUOTA: usize = 1_000;
+
+/// The largest tag set an S3 Storage Lens configuration carries.
+///
+/// The model documents it on both members that carry a tag set
+/// (`PutStorageLensConfigurationRequest$Tags` and
+/// `PutStorageLensConfigurationTaggingRequest$Tags`): "You can set up to a
+/// maximum of 50 tags."
+pub const MAX_STORAGE_LENS_TAGS: usize = 50;
+
 /// Per-service state for com-amazonaws-s3control-awss3controlservicev20180820. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsS3controlAwss3controlservicev20180820State {
@@ -102,6 +147,19 @@ pub struct ComAmazonawsS3controlAwss3controlservicev20180820State {
     /// one is caller-chosen without limit. `DeleteAccessPoint` releases a
     /// record and its policy.
     pub access_points: BTreeMap<AccessPointKey, AccessPointRecord>,
+
+    /// S3 Storage Lens configurations by (account id, configuration id).
+    ///
+    /// A `BTreeMap` for the same reason as `access_points`:
+    /// `ListStorageLensConfigurations` is `@paginated`, and a page token can
+    /// only resume a scan whose order does not change between calls.
+    ///
+    /// BOUNDED: `PutStorageLensConfiguration` refuses a NEW configuration past
+    /// [`STORAGE_LENS_CONFIGURATION_QUOTA`] records, and both puts that carry a
+    /// tag set refuse one past [`MAX_STORAGE_LENS_TAGS`] tags; every member of
+    /// the document itself is length-bounded by the model.
+    pub storage_lens_configurations:
+        BTreeMap<StorageLensConfigurationKey, StorageLensConfigurationRecord>,
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -136,6 +194,19 @@ const DEFAULT_REGION: &str = "us-east-1";
 /// never puts another account id in an ARN it emits.
 pub fn access_point_arn(region: &str, name: &str) -> String {
     ::emulator_server::emulator_arn("s3", region, &format!("accesspoint/{name}"))
+}
+
+/// The ARN of an S3 Storage Lens configuration.
+///
+/// `StorageLensConfiguration$StorageLensArn` documents the member as read-only
+/// and states the format it follows:
+/// `arn:aws:s3:<region>:<account-id>:storage-lens/<config-id>` — so the service
+/// assigns it from the configuration's own identity rather than taking whatever
+/// a request submitted. The account segment comes from
+/// [`::emulator_server::emulator_arn`], the single source of truth for the
+/// canonical emulator account.
+pub fn storage_lens_configuration_arn(region: &str, config_id: &str) -> String {
+    ::emulator_server::emulator_arn("s3", region, &format!("storage-lens/{config_id}"))
 }
 
 /// The suffix length AWS access point aliases carry between the name and the
@@ -262,6 +333,77 @@ pub fn malformed_policy<E>(why: &str) -> crate::scaffolded::Scaffolded<E> {
         "MalformedPolicy",
         400,
         format!("The specified policy is not a policy this service can store: {why}"),
+    )
+}
+
+/// `NoSuchConfiguration` (HTTP 404): no S3 Storage Lens configuration of that
+/// id is owned by the account the request names.
+///
+/// S3 Control declares no error for the Storage Lens operations, so — exactly
+/// as for the access point refusals above — the refusal is carried in the
+/// S3-style XML `<Code>`/`<Message>` envelope with the code and status the real
+/// service answers a missing configuration with.
+pub fn no_such_storage_lens_configuration<E>(config_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "NoSuchConfiguration",
+        404,
+        format!("The specified configuration does not exist: {config_id}"),
+    )
+}
+
+/// `InvalidRequestException` (HTTP 400): a `PutStorageLensConfiguration` whose
+/// URI names one configuration id and whose document names another.
+///
+/// Both members are documented as the id OF the S3 Storage Lens configuration
+/// (`PutStorageLensConfigurationRequest$ConfigId`, `StorageLensConfiguration$Id`),
+/// so a request carrying two different ids names no one configuration. The code
+/// and status are this service's own modelled `InvalidRequestException`
+/// (`com.amazonaws.s3control#InvalidRequestException`, a 400 client error),
+/// which this operation's model does not list.
+pub fn storage_lens_configuration_id_mismatch<E>(
+    config_id: &str,
+    document_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "InvalidRequestException",
+        400,
+        format!(
+            "ConfigId is {config_id} but the submitted StorageLensConfiguration's Id is \
+             {document_id}; they must name the same configuration."
+        ),
+    )
+}
+
+/// `TooManyTagsException` (HTTP 400): the request carries more than
+/// [`MAX_STORAGE_LENS_TAGS`] tags, the maximum the model documents for a
+/// Storage Lens configuration's tag set.
+///
+/// The code and status are this service's own modelled `TooManyTagsException`
+/// ("Amazon S3 throws this exception if you have too many tags in your tag
+/// set", a 400 client error), which these operations' models do not list.
+pub fn too_many_storage_lens_tags<E>(submitted: usize) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "TooManyTagsException",
+        400,
+        format!(
+            "A Storage Lens configuration carries at most {MAX_STORAGE_LENS_TAGS} tags; \
+             the request carries {submitted}."
+        ),
+    )
+}
+
+/// `TooManyConfigurations` (HTTP 400): the store already holds
+/// [`STORAGE_LENS_CONFIGURATION_QUOTA`] Storage Lens configurations, so another
+/// record would grow it without end. Replacing an existing configuration is
+/// never refused by this bound: it adds no record.
+pub fn too_many_storage_lens_configurations<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "TooManyConfigurations",
+        400,
+        format!(
+            "This emulator holds the maximum of {STORAGE_LENS_CONFIGURATION_QUOTA} \
+             Storage Lens configurations."
+        ),
     )
 }
 

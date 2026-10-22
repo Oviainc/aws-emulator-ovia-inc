@@ -15,3 +15,5 @@
 mod access_point_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/storage_lens_configuration.rs"]
+mod storage_lens_configuration;

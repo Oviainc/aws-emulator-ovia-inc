@@ -13,6 +13,10 @@
 //! is VPC-restricted, whether it carries a public-access block, the bucket it
 //! fronts, the length and shape of its name, the page size a list asks for, and
 //! the bytes of the policy put on it.
+//!
+//! The router, the request builder, the XML escaping and the response reader
+//! below are `pub(crate)` because the sibling suites in `tests/all/` stand an
+//! emulator up the same way rather than each writing its own harness.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -37,7 +41,7 @@ const XML_ENTITIES: [(&str, char); 5] = [
 
 /// Escape a value for an XML text node — what the emulator's own parser
 /// resolves on the way in, for the request bodies this suite builds by hand.
-fn xml_escape(text: &str) -> String {
+pub(crate) fn xml_escape(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for character in text.chars() {
         match XML_ENTITIES.iter().find(|(_, plain)| *plain == character) {
@@ -50,7 +54,7 @@ fn xml_escape(text: &str) -> String {
 
 /// Resolve the escaped forms in an element's text, the inverse of
 /// [`xml_escape`].
-fn xml_unescape(text: &str) -> String {
+pub(crate) fn xml_unescape(text: &str) -> String {
     let mut plain = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(ampersand) = rest.find('&') {
@@ -79,17 +83,17 @@ fn xml_unescape(text: &str) -> String {
 /// The region every request in this suite is signed for. The emulator reads it
 /// from the request's SigV4 credential scope, so it is also the region expected
 /// in every ARN below.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account that owns the access points in these tests.
-const ACCOUNT: &str = "123456789012";
+pub(crate) const ACCOUNT: &str = "123456789012";
 
 /// A second account, used to pin that one account cannot read another's access
 /// points even when both use the same access point name.
-const OTHER_ACCOUNT: &str = "210987654321";
+pub(crate) const OTHER_ACCOUNT: &str = "210987654321";
 
 /// The XML namespace this service's model declares.
-const XMLNS: &str = "http://awss3control.amazonaws.com/doc/2018-08-20/";
+pub(crate) const XMLNS: &str = "http://awss3control.amazonaws.com/doc/2018-08-20/";
 
 /// How many characters of the access point name the alias can carry: the
 /// modelled `Alias` maximum (63) less the `-s3alias` tail, the 26-character
@@ -97,15 +101,15 @@ const XMLNS: &str = "http://awss3control.amazonaws.com/doc/2018-08-20/";
 const ALIAS_NAME_ROOM: usize = 63 - "-s3alias".len() - 26 - 1;
 
 /// One response: the status and the body, with readers for the XML elements.
-struct Reply {
-    status: u16,
-    body: String,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
 impl Reply {
     /// The text of the first `element` in the body, or `None` when the body
     /// carries none.
-    fn text(&self, element: &str) -> Option<String> {
+    pub(crate) fn text(&self, element: &str) -> Option<String> {
         self.texts(element).into_iter().next()
     }
 
@@ -116,7 +120,7 @@ impl Reply {
     /// exactly the bytes between its open and close tags, unescaped. An element
     /// written in the empty form (`<Element/>`) carries no text and is reported
     /// as absent, which is how an absent `NextToken` is read below.
-    fn texts(&self, element: &str) -> Vec<String> {
+    pub(crate) fn texts(&self, element: &str) -> Vec<String> {
         let open = format!("<{element}>");
         let close = format!("</{element}>");
         let mut found = Vec::new();
@@ -136,7 +140,7 @@ impl Reply {
     }
 
     /// The S3-style error code (`<Code>`) of a failure response.
-    fn code(&self) -> String {
+    pub(crate) fn code(&self) -> String {
         self.text("Code")
             .unwrap_or_else(|| format!("<no Code element> in {}", self.body))
     }
@@ -144,12 +148,12 @@ impl Reply {
 
 /// One emulator: a router with this service mounted on a single shared engine,
 /// exactly as `core/router` assembles it.
-struct Emulator {
-    router: MultiServiceRouter,
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These requests carry an unsigned `Authorization` header, which is
@@ -164,27 +168,14 @@ impl Emulator {
         Self { router }
     }
 
-    async fn call(&self, method: &str, uri: &str, account_id: &str, body: &str) -> Reply {
-        let request = ::http::Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("host", format!("{account_id}.s3-control.{REGION}.amazonaws.com"))
-            .header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/s3/aws4_request, \
-                     SignedHeaders=host, Signature=abc"
-                ),
-            )
-            .header("x-amz-account-id", account_id)
-            .header("content-type", "application/xml")
-            .body(::bytes::Bytes::from(body.to_owned()))
-            .expect("build the request");
-        let response = self.router.dispatch(request).await;
-        Reply {
-            status: response.status().as_u16(),
-            body: String::from_utf8(response.body().to_vec()).expect("a UTF-8 response body"),
-        }
+    pub(crate) async fn call(
+        &self,
+        method: &str,
+        uri: &str,
+        account_id: &str,
+        body: &str,
+    ) -> Reply {
+        call_in_region(&self.router, REGION, method, uri, account_id, body).await
     }
 
     async fn create(&self, account_id: &str, case: &CreateCase) -> Reply {
@@ -318,6 +309,44 @@ impl CreateCase {
         } else {
             "Internet"
         }
+    }
+}
+
+/// Send one request through the router, signed for `region`.
+///
+/// Taken out of [`Emulator::call`] so a suite that varies the signing region —
+/// the region every ARN this service reports is in — reaches the same request
+/// builder rather than writing a second one.
+pub(crate) async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    uri: &str,
+    account_id: &str,
+    body: &str,
+) -> Reply {
+    let request = ::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(
+            "host",
+            format!("{account_id}.s3-control.{region}.amazonaws.com"),
+        )
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{region}/s3/aws4_request, \
+                 SignedHeaders=host, Signature=abc"
+            ),
+        )
+        .header("x-amz-account-id", account_id)
+        .header("content-type", "application/xml")
+        .body(::bytes::Bytes::from(body.to_owned()))
+        .expect("build the request");
+    let response = router.dispatch(request).await;
+    Reply {
+        status: response.status().as_u16(),
+        body: String::from_utf8(response.body().to_vec()).expect("a UTF-8 response body"),
     }
 }
 

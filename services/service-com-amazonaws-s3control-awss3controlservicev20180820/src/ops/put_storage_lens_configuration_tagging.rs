@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutStorageLensConfigurationTagging
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutStorageLensConfigurationTagging`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutStorageLensConfigurationTagging::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Puts or replaces the tag set of an EXISTING S3 Storage Lens configuration,
+//! as the operation's documentation states: the submitted set becomes the
+//! configuration's whole tag set, and a configuration the account does not own
+//! is refused rather than created.
+//!
+//! It touches only the tag set — the configuration document is left exactly as
+//! `PutStorageLensConfiguration` stored it.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +134,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutStorageLensConfigurationTagging` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutStorageLensConfigurationTaggingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutStorageLensConfigurationTagging"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        if input.tags.len() > crate::state::MAX_STORAGE_LENS_TAGS {
+            return Err(crate::state::too_many_storage_lens_tags(input.tags.len()));
+        }
+
+        let key = (input.account_id, input.config_id);
+        let mut store = state.lock();
+        let Some(record) = store.storage_lens_configurations.get_mut(&key) else {
+            return Err(crate::state::no_such_storage_lens_configuration(&key.1));
+        };
+
+        // "Put or replace tags": the submitted set becomes the whole tag set,
+        // so a key the request omits is gone rather than merged forward.
+        record.tags = input.tags;
+        Ok(PutStorageLensConfigurationTaggingOutput {})
     }
 }

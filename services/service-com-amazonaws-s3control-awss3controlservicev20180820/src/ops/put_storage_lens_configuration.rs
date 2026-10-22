@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutStorageLensConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutStorageLensConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutStorageLensConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one S3 Storage Lens configuration under the id the URI names, for the
+//! account the request names. The document is stored WHOLE: a put is the new
+//! configuration, never a patch onto the one before it, so a member the
+//! submitted document leaves out is absent from every later read.
+//!
+//! `StorageLensArn` is documented read-only, so this handler assigns it from the
+//! configuration's own identity ([`crate::state::storage_lens_configuration_arn`])
+//! rather than keeping whatever a request submitted in that member.
+//!
+//! The optional `Tags` member replaces the configuration's tag set when the
+//! request carries one. That tag set is a resource of its own — the tagging
+//! operations are what report and replace it, and `GetStorageLensConfiguration`
+//! reports no tags at all — so a put naming no `Tags` leaves it alone rather
+//! than emptying it.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +168,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutStorageLensConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutStorageLensConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutStorageLensConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        let mut configuration = input.storage_lens_configuration;
+        // The URI's `ConfigId` and the document's `Id` are both documented as the
+        // id of the Storage Lens configuration, so a request naming two different
+        // ids names no one configuration.
+        if configuration.id != input.config_id {
+            return Err(crate::state::storage_lens_configuration_id_mismatch(
+                &input.config_id,
+                &configuration.id,
+            ));
+        }
+
+        let tags = input.tags;
+        if let Some(submitted) = tags.as_ref() {
+            if submitted.len() > crate::state::MAX_STORAGE_LENS_TAGS {
+                return Err(crate::state::too_many_storage_lens_tags(submitted.len()));
+            }
+        }
+
+        // `StorageLensArn` is read-only: the service assigns it, so whatever the
+        // request carried in that member is replaced rather than stored.
+        let region = crate::state::signing_region(ctx.parts());
+        configuration.storage_lens_arn = Some(crate::state::storage_lens_configuration_arn(
+            &region,
+            &input.config_id,
+        ));
+
+        let key = (input.account_id, input.config_id);
+        let mut store = state.lock();
+        match store.storage_lens_configurations.get_mut(&key) {
+            // Replacing an existing configuration: the whole document goes, and
+            // the tag set changes only if this request carried one.
+            Some(record) => {
+                record.configuration = configuration;
+                if let Some(submitted) = tags {
+                    record.tags = submitted;
+                }
+            }
+            None => {
+                // The store is bounded: past its quota a NEW configuration is
+                // refused rather than adding another record, so a caller cannot
+                // grow this process's state without end by varying the id.
+                if store.storage_lens_configurations.len()
+                    >= crate::state::STORAGE_LENS_CONFIGURATION_QUOTA
+                {
+                    return Err(crate::state::too_many_storage_lens_configurations());
+                }
+                store.storage_lens_configurations.insert(
+                    key,
+                    crate::state::StorageLensConfigurationRecord {
+                        configuration,
+                        tags: tags.unwrap_or_default(),
+                    },
+                );
+            }
+        }
+
+        Ok(PutStorageLensConfigurationOutput)
     }
 }
