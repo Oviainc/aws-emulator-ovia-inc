@@ -150,10 +150,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         let Some(record) = state.instances.get(&input.workspace_instance_id) else {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                crate::state::instance_not_found(&input.workspace_instance_id),
-            )
-            .into());
+            return Err(crate::state::instance_not_found_error(
+                &input.workspace_instance_id,
+                ListTagsForResourceErrorModeled::ResourceNotFoundException,
+            ));
         };
 
         // Exactly what create and `TagResource` persisted — no echo of the request.

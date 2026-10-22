@@ -151,12 +151,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // "Usage of this API will result in deletion of the resource in question": the
-        // record goes, so a later Get is a 404 and a later List no longer carries it.
+        // record goes, so a later Get answers not-found and a later List no longer
+        // carries it.
         let Some(removed) = state.instances.remove(&input.workspace_instance_id) else {
-            return Err(DeleteWorkspaceInstanceErrorModeled::ResourceNotFoundException(
-                crate::state::instance_not_found(&input.workspace_instance_id),
-            )
-            .into());
+            return Err(crate::state::instance_not_found_error(
+                &input.workspace_instance_id,
+                DeleteWorkspaceInstanceErrorModeled::ResourceNotFoundException,
+            ));
         };
 
         // Retire the creating `ClientToken` with the record: the token identifies that
