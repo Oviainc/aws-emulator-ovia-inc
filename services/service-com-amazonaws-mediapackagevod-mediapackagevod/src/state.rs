@@ -90,6 +90,9 @@ pub const LISTING_ASSETS: &str = "assets";
 /// cursor to.
 pub const LISTING_PACKAGING_CONFIGURATIONS: &str = "packaging-configurations";
 
+/// The listing name [`encode_page_token`] binds a `ListPackagingGroups` cursor to.
+pub const LISTING_PACKAGING_GROUPS: &str = "packaging-groups";
+
 /// The smallest page a listing returns: the minimum of the `MaxResults` `range`
 /// trait every paginated operation in this model shares (`min: 1, max: 1000`).
 pub const MIN_PAGE_SIZE: usize = 1;

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPackagingGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPackagingGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPackagingGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages the stored PackagingGroups in one stable `Id` order, each
+//! entry carrying the same record `DescribePackagingGroup` returns (including the
+//! `ApproximateAssetCount` counted from the asset map at read time). Reads only.
 //!
 //! ## Shape of an operation
 //!
@@ -150,20 +144,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPackagingGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPackagingGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPackagingGroups"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPackagingGroupsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the MediaPackage VOD state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A cursor this listing did not issue cannot name a resume point.
+        let resume_after = crate::state::resume_after(
+            crate::state::LISTING_PACKAGING_GROUPS,
+            input.next_token.as_deref(),
+        )?;
+        let page_size = crate::state::page_size(input.max_results)?;
+
+        let state = store.lock();
+        // `packaging_groups` is a `BTreeMap`, so this is one stable id order across
+        // pages: a cursor can resume strictly after the id the previous page ended on.
+        let matching: Vec<&crate::state::PackagingGroupRecord> = state
+            .packaging_groups
+            .values()
+            .filter(|group| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| group.id.as_str() > after)
+            })
+            .collect();
+
+        let page_records: Vec<&crate::state::PackagingGroupRecord> =
+            matching.iter().take(page_size).copied().collect();
+        let page: Vec<PackagingGroup> = page_records
+            .iter()
+            .map(|group| PackagingGroup {
+                // Counted from the asset map on every read, exactly as
+                // `DescribePackagingGroup` reports it.
+                approximate_asset_count: Some(state.asset_count(&group.id)),
+                arn: Some(group.arn.clone()),
+                authorization: group.authorization.clone(),
+                created_at: Some(group.created_at.clone()),
+                domain_name: Some(group.domain_name.clone()),
+                egress_access_logs: group.egress_access_logs.clone(),
+                id: Some(group.id.clone()),
+                tags: Some(state.tags_of(&group.arn)),
+            })
+            .collect();
+        // A cursor only when something is left to read, so a caller that follows
+        // tokens stops rather than asking for an empty page.
+        let next_token = if matching.len() > page_records.len() {
+            page_records.last().map(|last| {
+                crate::state::encode_page_token(crate::state::LISTING_PACKAGING_GROUPS, &last.id)
+            })
+        } else {
+            None
+        };
+
+        Ok(ListPackagingGroupsOutput {
+            next_token,
+            packaging_groups: Some(page),
+        })
     }
 }

@@ -15,6 +15,9 @@
 //!   configuration was created with;
 //! * paging with any page size yields every asset exactly once, in one stable order;
 //! * `MaxResults` is accepted on each modelled bound and refused one past it;
+//! * a collection operation reports each stored resource exactly the record the
+//!   matching describe returns, and a cursor one collection issued is refused by
+//!   another;
 //! * a packaging group is removed only while no packaging configuration references
 //!   it, and a refused delete removes nothing.
 
@@ -97,6 +100,12 @@ async fn create_group(router: &MultiServiceRouter, id: &str, tags: Option<Value>
     if let Some(tags) = tags {
         body["tags"] = tags;
     }
+    create_group_from(router, id, body).await
+}
+
+/// Create a packaging group from a whole request body, asserting it succeeded — for a
+/// create that names optional members `create_group` does not carry.
+async fn create_group_from(router: &MultiServiceRouter, id: &str, body: Value) -> Value {
     let (status, group) = call(router, "POST", "/packaging_groups", Some(body)).await;
     assert_eq!(status, 200, "CreatePackagingGroup {id}: body {group}");
     group
@@ -928,6 +937,323 @@ async fn egress_domain_names_are_stable_and_distinct_per_group() {
             "group {id:?}: the domain name {domain:?} collided with another group's"
         );
     }
+}
+
+/// Every member `PackagingGroup` models, so a listed entry is compared on all of
+/// them rather than on the few a single recorded call happened to carry
+/// (`smithy_query(query="shape",shape="PackagingGroup")`).
+const PACKAGING_GROUP_MEMBERS: [&str; 8] = [
+    "approximateAssetCount",
+    "arn",
+    "authorization",
+    "createdAt",
+    "domainName",
+    "egressAccessLogs",
+    "id",
+    "tags",
+];
+
+/// The ids `ListPackagingGroups` reports for `query`, following `nextToken` to the end.
+async fn list_all_group_ids(router: &MultiServiceRouter, query: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut token: Option<String> = None;
+    // One more iteration than there can be pages of one group each, so a cursor that
+    // fails to advance fails the test instead of looping forever.
+    for _ in 0..64 {
+        let mut path = format!("/packaging_groups?{query}");
+        if let Some(token) = &token {
+            path.push_str(&format!("&nextToken={token}"));
+        }
+        let (status, page) = call(router, "GET", &path, None).await;
+        assert_eq!(status, 200, "ListPackagingGroups {path}: body {page}");
+        for group in page["packagingGroups"].as_array().into_iter().flatten() {
+            ids.push(group["id"].as_str().unwrap_or_default().to_string());
+        }
+        match page["nextToken"].as_str() {
+            Some(next) => token = Some(next.to_string()),
+            None => return ids,
+        }
+    }
+    panic!("ListPackagingGroups never stopped returning a nextToken for query {query:?}");
+}
+
+/// A listed PackagingGroup is the stored record — the same one `DescribePackagingGroup`
+/// returns, on every member the shape models, whichever optional members the create
+/// carried and however many assets the group holds.
+#[tokio::test]
+async fn list_packaging_groups_reports_the_stored_record() {
+    // (case, extra create members, assets to ingest into the group)
+    let cases: Vec<(&str, Value, usize)> = vec![
+        ("no optional members", json!({}), 0),
+        (
+            "tags only",
+            json!({ "tags": { "env": "test", "team": "vod" } }),
+            0,
+        ),
+        (
+            "cdn authorization",
+            json!({
+                "authorization": {
+                    "cdnIdentifierSecret":
+                        format!("arn:aws:secretsmanager:{REGION}:{}:secret:cdn", account_id()),
+                    "secretsRoleArn":
+                        format!("arn:aws:iam::{}:role/MediaPackageVodSecrets", account_id()),
+                },
+            }),
+            0,
+        ),
+        (
+            "egress access logs",
+            json!({ "egressAccessLogs": { "logGroupName": "/aws/MediaPackage/vod" } }),
+            2,
+        ),
+        (
+            "every optional member, with assets stored",
+            json!({
+                "authorization": {
+                    "cdnIdentifierSecret":
+                        format!("arn:aws:secretsmanager:{REGION}:{}:secret:cdn2", account_id()),
+                    "secretsRoleArn":
+                        format!("arn:aws:iam::{}:role/MediaPackageVodSecrets", account_id()),
+                },
+                "egressAccessLogs": { "logGroupName": "/aws/MediaPackage/vod-2" },
+                "tags": { "env": "prod" },
+            }),
+            3,
+        ),
+    ];
+
+    for (case, extra, assets) in cases {
+        let router = router();
+        let mut body = json!({ "id": "listed-group" });
+        let Value::Object(members) = extra else {
+            panic!("case {case:?}: the extra create members must be a JSON object");
+        };
+        for (key, value) in members {
+            body[key] = value;
+        }
+        create_group_from(&router, "listed-group", body).await;
+        for index in 0..assets {
+            create_asset(&router, &format!("asset-{index}"), "listed-group").await;
+        }
+
+        let (status, page) = call(&router, "GET", "/packaging_groups", None).await;
+        assert_eq!(status, 200, "case {case:?}: body {page}");
+        let listed = page["packagingGroups"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let [listed] = listed else {
+            panic!("case {case:?}: expected exactly one listed group, got {page}");
+        };
+        let (status, described) =
+            call(&router, "GET", "/packaging_groups/listed-group", None).await;
+        assert_eq!(status, 200, "case {case:?}: body {described}");
+        for member in PACKAGING_GROUP_MEMBERS {
+            assert_eq!(
+                listed[member], described[member],
+                "case {case:?}: listed {member} must be the stored record's, got {}",
+                listed[member]
+            );
+        }
+        // Counted from the asset map at read time, like every other read of the group.
+        assert_eq!(
+            listed["approximateAssetCount"].as_i64(),
+            Some(assets as i64),
+            "case {case:?}: expected {assets} assets counted, got {}",
+            listed["approximateAssetCount"]
+        );
+        // Nothing the listing read may change what the next caller sees.
+        let (_, again) = call(&router, "GET", "/packaging_groups", None).await;
+        assert_eq!(
+            again["packagingGroups"], page["packagingGroups"],
+            "case {case:?}: a second listing must report the same groups, got {}",
+            again["packagingGroups"]
+        );
+    }
+}
+
+/// Paging reports every stored packaging group exactly once, in one stable order,
+/// whatever the page size — and a cursor resumes strictly after the id the previous
+/// page ended on. An empty store reports an empty collection and no cursor.
+#[tokio::test]
+async fn list_packaging_groups_pages_every_group_exactly_once() {
+    // (total groups, maxResults per page)
+    for (total, page_size) in [
+        (0_usize, 1_usize),
+        (1, 1),
+        (3, 1),
+        (3, 2),
+        (5, 4),
+        (4, 1000),
+        (7, 3),
+    ] {
+        let router = router();
+        let mut expected: Vec<String> = Vec::new();
+        for index in 0..total {
+            // Zero-padded so the id order the service pages in is unambiguous.
+            let id = format!("group-{index:02}");
+            create_group(&router, &id, None).await;
+            expected.push(id);
+        }
+        expected.sort();
+
+        let seen = list_all_group_ids(&router, &format!("maxResults={page_size}")).await;
+        assert_eq!(
+            seen, expected,
+            "case total={total} maxResults={page_size}: every group exactly once, in id order"
+        );
+        assert_eq!(
+            seen.iter().collect::<BTreeSet<_>>().len(),
+            seen.len(),
+            "case total={total} maxResults={page_size}: a page repeated a group: {seen:?}"
+        );
+
+        let (status, first) = call(
+            &router,
+            "GET",
+            &format!("/packaging_groups?maxResults={page_size}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "case maxResults={page_size}: body {first}");
+        // The first page is no longer than the page size the caller asked for, and it
+        // carries a cursor only when something is left to read.
+        let first_len = first["packagingGroups"].as_array().map_or(0, Vec::len);
+        assert!(
+            first_len <= page_size,
+            "case total={total} maxResults={page_size}: first page held {first_len} groups"
+        );
+        assert_eq!(
+            first["nextToken"].is_null(),
+            total <= page_size,
+            "case total={total} maxResults={page_size}: a cursor only when a page is left, \
+             got {}",
+            first["nextToken"]
+        );
+        if total == 0 {
+            assert_eq!(
+                first["packagingGroups"],
+                json!([]),
+                "with nothing stored the collection is empty, got {first}"
+            );
+        }
+    }
+}
+
+/// `ListPackagingGroups`'s `MaxResults` is accepted on each bound the model publishes
+/// (`range(min: 1, max: 1000)`) and refused one past either, and a `NextToken` this
+/// listing never issued — including one another listing issued — is refused as
+/// unprocessable.
+#[tokio::test]
+async fn list_packaging_groups_max_results_and_next_token_follow_their_modelled_constraints() {
+    let router = router();
+    create_group(&router, "g-1", None).await;
+    create_group(&router, "g-2", None).await;
+    create_asset(&router, "a-1", "g-1").await;
+    create_asset(&router, "a-2", "g-1").await;
+
+    for accepted in [1, 2, 1000] {
+        let (status, body) = call(
+            &router,
+            "GET",
+            &format!("/packaging_groups?maxResults={accepted}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "maxResults={accepted} is within the modelled range: body {body}"
+        );
+        let returned = body["packagingGroups"].as_array().map_or(0, Vec::len);
+        assert_eq!(
+            returned,
+            accepted.min(2),
+            "maxResults={accepted}: expected at most that many groups, got {returned}"
+        );
+    }
+
+    for refused in [0, 1001] {
+        let (status, body) = call(
+            &router,
+            "GET",
+            &format!("/packaging_groups?maxResults={refused}"),
+            None,
+        )
+        .await;
+        assert!(
+            (400..500).contains(&status),
+            "maxResults={refused} is outside the modelled range and must be refused, \
+             got {status}: body {body}"
+        );
+    }
+
+    // A cursor the ASSETS collection issued names an asset id, so it is not a resume
+    // point in this collection: each listing's cursors are its own.
+    let (status, assets_page) = call(&router, "GET", "/assets?maxResults=1", None).await;
+    assert_eq!(status, 200, "the first assets page: body {assets_page}");
+    let assets_cursor = assets_page["nextToken"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !assets_cursor.is_empty(),
+        "with two assets and maxResults=1 the first assets page must carry a cursor: \
+         {assets_page}"
+    );
+
+    // (case, nextToken) — every cursor this listing did not issue is refused.
+    let forged: Vec<(&str, String)> = vec![
+        ("not hex at all", "not-a-cursor".to_string()),
+        ("hex, but no checksum prefix", hex::encode("g-1")),
+        (
+            "hex with a wrong checksum prefix",
+            format!("00000000{}", hex::encode("g-1")),
+        ),
+        ("shorter than the checksum prefix", "00ff".to_string()),
+        ("non-ascii", "🙈🙈🙈🙈🙈".to_string()),
+        ("a cursor the assets collection issued", assets_cursor),
+    ];
+    for (case, token) in forged {
+        let (status, body) = call(
+            &router,
+            "GET",
+            &format!("/packaging_groups?nextToken={token}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 422,
+            "case {case:?}: a NextToken this listing never issued must be refused as \
+             unprocessable, got {status}: body {body}"
+        );
+    }
+
+    // ... and the cursor it DID issue resumes the listing.
+    let (status, first) = call(&router, "GET", "/packaging_groups?maxResults=1", None).await;
+    assert_eq!(status, 200, "the first page: body {first}");
+    let issued = first["nextToken"].as_str().unwrap_or_default().to_string();
+    assert!(
+        !issued.is_empty(),
+        "with two groups and maxResults=1 the first page must carry a cursor: {first}"
+    );
+    let (status, second) = call(
+        &router,
+        "GET",
+        &format!("/packaging_groups?maxResults=1&nextToken={issued}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the issued cursor must be accepted: body {second}"
+    );
+    assert_eq!(
+        second["packagingGroups"][0]["id"].as_str(),
+        Some("g-2"),
+        "the issued cursor must resume after the first page, got {}",
+        second["packagingGroups"]
+    );
 }
 
 /// A packaging group is removed only while nothing references it.
