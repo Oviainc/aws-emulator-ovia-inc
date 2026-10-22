@@ -17,6 +17,12 @@
 //! `Id`. A group's `State`, `Inputs` and `Channels` are derived from the rest of
 //! the state on every read, never recorded at create time.
 //!
+//! A channel's schedule lives on its own [`ChannelRecord`], as the
+//! [`ChannelSchedule`] of the [`schedules`] slice: the actions
+//! `BatchUpdateSchedule` created and `DeleteSchedule` clears, swept of the ones
+//! whose start time is over an hour past whenever [`ComAmazonawsMedialiveMedialiveState::settle`]
+//! runs.
+//!
 //! The monitor side of the service lives here as well: one
 //! [`CloudWatchAlarmTemplateGroupRecord`] per created cloudwatch alarm template
 //! group and one [`EventBridgeRuleTemplateGroupRecord`] per created eventbridge
@@ -68,9 +74,21 @@ use crate::ops::types::{
 /// resources share.
 pub mod alarm_template_groups;
 
+/// The channel schedule slice: one channel's schedule, the rules
+/// `BatchUpdateSchedule` validates a request against, the clock-owed cleanup of
+/// actions whose start time has passed and the start-time order a read reports.
+/// Its store is the `schedule` member of [`ChannelRecord`] below, so a schedule
+/// goes away with the channel that owns it.
+pub mod schedules;
+
 pub use alarm_template_groups::{
     AlarmTemplateGroupRefusal, CloudWatchAlarmTemplateGroupRecord,
     MAX_ALARM_TEMPLATE_GROUPS, MAX_ALARM_TEMPLATE_GROUP_TOKENS,
+};
+
+pub use schedules::{
+    parse_action_time, AppliedSchedule, ChannelSchedule, ScheduleActionRecord, ScheduleRefusal,
+    MAX_SCHEDULE_ACTIONS, SCHEDULE_ACTION_RETENTION,
 };
 
 pub(crate) use alarm_template_groups::alarm_template_group_output;
@@ -408,6 +426,11 @@ pub struct ChannelRecord {
     pub inference_settings: Option<InferenceSettings>,
     pub vpc: Option<VpcOutputSettings>,
     pub channel_engine_version: Option<String>,
+    /// This channel's schedule: the actions `BatchUpdateSchedule` has created in
+    /// it and not yet deleted. It lives on the channel because that is what owns
+    /// it — `DeleteChannel` takes the schedule with it, and no operation reaches
+    /// a schedule without naming its channel.
+    pub schedule: ChannelSchedule,
     /// The transition the clock owes this channel, if any.
     transition: Option<Transition>,
 }
@@ -485,6 +508,9 @@ impl ChannelRecord {
     /// when the channel is now gone (a settled `DELETING`), so the caller drops
     /// the record.
     fn settle(&mut self, now: SystemTime) -> bool {
+        // The schedule's own clock-owed cleanup: an action whose start time is
+        // more than an hour past is no longer in the schedule.
+        self.schedule.settle(now);
         match self.transition {
             Some(transition) if now >= transition.due => match transition.to {
                 Settled::Idle => {
@@ -2253,6 +2279,7 @@ pub fn new_channel(
         inference_settings: None,
         vpc: None,
         channel_engine_version: None,
+        schedule: ChannelSchedule::default(),
         transition: None,
     };
     channel.begin_transition(channel_state::CREATING, Settled::Idle, now);
