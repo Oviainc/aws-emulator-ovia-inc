@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRegions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRegions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists every Region of the commercial partition with the opt-in status the resolved
+//! account carries for it, filtered by `RegionOptStatusContains` when the request
+//! names one and paged by `MaxResults` / `NextToken`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRegions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORTING operation (`@readonly`): the store is read and never written, so the
+//! Regions a later caller sees are exactly the ones this call saw.
 //!
 //! ## Shape of an operation
 //!
@@ -99,6 +96,48 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page `ListRegions` returns, and the page size a caller that names no
+/// `MaxResults` gets: the maximum of that member's modelled `@range(min: 1, max: 50)`
+/// (`smithy_query(query="operation", operation="ListRegions")`). The boundary
+/// validator has already refused a page size outside that range by the time this
+/// handler runs.
+const MAX_PAGE_SIZE: i32 = 50;
+
+/// Encode the resume point of a page as the opaque `NextToken` the caller hands back.
+///
+/// The token names the LAST Region on the page just returned, hex-encoded so a caller
+/// is not invited to read a resume point out of it or to assemble one by hand. A
+/// Region code is at most 50 characters, so the token stays well inside `NextToken`'s
+/// modelled `@length(max: 1000)`.
+fn encode_page_token(region_name: &str) -> String {
+    ::hex::encode(region_name)
+}
+
+/// The Region code a `NextToken` resumes after, or `None` when the token is not one
+/// this operation could have issued — one minted elsewhere resumes nothing here and is
+/// refused rather than silently ignored.
+fn decode_page_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    crate::state::catalog_region_status(&decoded).map(|_| decoded)
+}
+
+/// The modelled `ValidationException` for a `NextToken` this operation never issued.
+///
+/// `reason` is `fieldValidationFailed` and `fieldList` names the member, so a client
+/// can see which input was invalid. The token itself is not echoed: `message` is
+/// modelled `@sensitive`.
+fn invalid_next_token() -> ValidationException {
+    ValidationException {
+        message: "NextToken is not a pagination token that ListRegions issued".to_string(),
+        reason: Some(crate::state::FIELD_VALIDATION_FAILED.to_string()),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "NextToken".to_string(),
+            message: "must be the NextToken of a previously truncated ListRegions response"
+                .to_string(),
+        }]),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -170,18 +209,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRegions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRegionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRegions"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRegionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                    error_type: None,
+                },
+            )
+            .into());
+        };
+
+        let account_id = crate::state::resolve_account_id(input.account_id.as_deref());
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize);
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                ListRegionsErrorModeled::ValidationException(invalid_next_token())
+            })?),
+        };
+
+        // A REPORTING operation: the store is read, never written, so no record is
+        // created here and a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let Some(account) = store.account(&account_id) else {
+            // Naming another account requires the caller to be an identity in the
+            // organization's management account, with the named account a member of
+            // the same organization. An account this emulator holds no record of is
+            // outside that organization, and the operation models no "not found":
+            // the modelled refusal for an account the caller may not read is
+            // `AccessDeniedException`.
+            return Err(ListRegionsErrorModeled::AccessDeniedException(
+                crate::state::account_not_accessible(&account_id),
+            )
+            .into());
+        };
+
+        // The filter is applied BEFORE the page is cut, so a page carries up to
+        // `MaxResults` MATCHING Regions rather than up to `MaxResults` candidates. An
+        // absent `RegionOptStatusContains` filters nothing; a Region is reported when
+        // its status is one of the listed ones.
+        let wanted = input.region_opt_status_contains.as_deref();
+        // One page, plus one lookahead Region: the token is present exactly when a
+        // matching Region follows the last one on this page, so the final page carries
+        // none.
+        let mut page: Vec<(&str, &str)> = account
+            .reported_regions()
+            .into_iter()
+            .filter(|(region_name, _)| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| *region_name > after)
+            })
+            .filter(|(_, status)| {
+                wanted.is_none_or(|statuses| statuses.iter().any(|value| value == status))
+            })
+            .take(page_size + 1)
+            .collect();
+        let truncated = page.len() > page_size;
+        page.truncate(page_size);
+        let next_token = match truncated {
+            true => page
+                .last()
+                .map(|(region_name, _)| encode_page_token(region_name)),
+            false => None,
+        };
+
+        Ok(ListRegionsOutput {
+            next_token,
+            regions: Some(
+                page.into_iter()
+                    .map(|(region_name, status)| Region {
+                        region_name: Some(region_name.to_string()),
+                        region_opt_status: Some(status.to_string()),
+                    })
+                    .collect(),
+            ),
+        })
     }
 }

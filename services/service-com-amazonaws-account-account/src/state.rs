@@ -68,6 +68,84 @@ pub fn initial_account_name(account_id: &str) -> String {
 /// would ADD a record: every account already in the store stays writable.
 pub const MAX_ACCOUNTS: usize = 1_000;
 
+/// The `RegionOptStatus` a Region that Amazon Web Services turns on for every
+/// account carries: `ENABLED_BY_DEFAULT`, one of `RegionOptStatus`'s five values
+/// (`REGION_OPT_STATUS_VALUES` in `ops::types`). Such a Region cannot be
+/// disabled, so no account ever reports anything else for it.
+pub const ENABLED_BY_DEFAULT_REGION_STATUS: &str = "ENABLED_BY_DEFAULT";
+
+/// The `RegionOptStatus` an opt-in Region carries for an account that has not
+/// enabled it: `DISABLED`. `EnableRegion` is what moves such a Region to
+/// `ENABLING` and then `ENABLED`.
+pub const DISABLED_REGION_STATUS: &str = "DISABLED";
+
+/// Every Region of the commercial (`aws`) partition this emulator reports, with
+/// the `RegionOptStatus` an account that has neither enabled nor disabled it
+/// reports for that Region.
+///
+/// MEMBERSHIP is service data, not a modelled list: `RegionName` is a free
+/// string constrained only to `@length(min: 1, max: 50)`
+/// (`smithy_query(query="shape",shape="RegionName")`), so there is no modelled
+/// list to project. SOURCE: the AWS General Reference's Region table
+/// ("Regions, Availability Zones, and Local Zones") together with the opt-in
+/// Regions the Account Management guide lists under "Specify which AWS Regions
+/// your account can use" — the Regions a new account must enable before use. A
+/// Region AWS turns on by default is `ENABLED_BY_DEFAULT` here; an opt-in Region
+/// is `DISABLED` until `EnableRegion` says otherwise.
+///
+/// Regions of the GovCloud and China partitions are deliberately absent: this
+/// emulator serves the commercial partition, which is the partition its
+/// endpoints and its signing scope name.
+///
+/// Kept SORTED by Region code and free of duplicates: `ListRegions` reports it in
+/// this order and pages through it by Region code, so a resume point is a
+/// position in this sequence.
+pub const REGION_CATALOG: &[(&str, &str)] = &[
+    ("af-south-1", DISABLED_REGION_STATUS),
+    ("ap-east-1", DISABLED_REGION_STATUS),
+    ("ap-northeast-1", ENABLED_BY_DEFAULT_REGION_STATUS),
+    ("ap-northeast-2", ENABLED_BY_DEFAULT_REGION_STATUS),
+    ("ap-northeast-3", ENABLED_BY_DEFAULT_REGION_STATUS),
+    ("ap-south-1", ENABLED_BY_DEFAULT_REGION_STATUS),
+    ("ap-south-2", DISABLED_REGION_STATUS),
+    ("ap-southeast-1", ENABLED_BY_DEFAULT_REGION_STATUS),
+    ("ap-southeast-2", ENABLED_BY_DEFAULT_REGION_STATUS),
+    ("ap-southeast-3", DISABLED_REGION_STATUS),
+    ("ap-southeast-4", DISABLED_REGION_STATUS),
+    ("ap-southeast-5", DISABLED_REGION_STATUS),
+    ("ap-southeast-7", DISABLED_REGION_STATUS),
+    ("ca-central-1", ENABLED_BY_DEFAULT_REGION_STATUS),
+    ("ca-west-1", DISABLED_REGION_STATUS),
+    ("eu-central-1", ENABLED_BY_DEFAULT_REGION_STATUS),
+    ("eu-central-2", DISABLED_REGION_STATUS),
+    ("eu-north-1", ENABLED_BY_DEFAULT_REGION_STATUS),
+    ("eu-south-1", DISABLED_REGION_STATUS),
+    ("eu-south-2", DISABLED_REGION_STATUS),
+    ("eu-west-1", ENABLED_BY_DEFAULT_REGION_STATUS),
+    ("eu-west-2", ENABLED_BY_DEFAULT_REGION_STATUS),
+    ("eu-west-3", ENABLED_BY_DEFAULT_REGION_STATUS),
+    ("il-central-1", DISABLED_REGION_STATUS),
+    ("me-central-1", DISABLED_REGION_STATUS),
+    ("me-south-1", DISABLED_REGION_STATUS),
+    ("mx-central-1", DISABLED_REGION_STATUS),
+    ("sa-east-1", ENABLED_BY_DEFAULT_REGION_STATUS),
+    ("us-east-1", ENABLED_BY_DEFAULT_REGION_STATUS),
+    ("us-east-2", ENABLED_BY_DEFAULT_REGION_STATUS),
+    ("us-west-1", ENABLED_BY_DEFAULT_REGION_STATUS),
+    ("us-west-2", ENABLED_BY_DEFAULT_REGION_STATUS),
+];
+
+/// The status [`REGION_CATALOG`] gives `region_name` before any account-specific
+/// opt-in is recorded, or `None` for a Region code the catalog does not hold.
+///
+/// The catalog is sorted by Region code, so the lookup is a binary search over it.
+pub fn catalog_region_status(region_name: &str) -> Option<&'static str> {
+    REGION_CATALOG
+        .binary_search_by(|(name, _)| (*name).cmp(region_name))
+        .ok()
+        .map(|index| REGION_CATALOG[index].1)
+}
+
 /// Which alternate contact a record is: the `AlternateContactType` enum, whose
 /// wire values are `BILLING | OPERATIONS | SECURITY`
 /// (`ALTERNATE_CONTACT_TYPE_VALUES` in `ops::types`).
@@ -145,6 +223,13 @@ pub struct Account {
     /// At most one contact per `AlternateContactType`, which is what makes
     /// `PutAlternateContact` an upsert rather than an append.
     pub alternate_contacts: BTreeMap<AlternateContactType, AlternateContactRecord>,
+    /// The `RegionOptStatus` this account carries for a Region it has been opted
+    /// into or out of, keyed by Region code. A Region ABSENT from this map still
+    /// reports its [`REGION_CATALOG`] status, so the map holds only what an
+    /// opt-in call changed: `EnableRegion` and `DisableRegion` are the
+    /// operations that write it (each still scaffolded, with its own stub
+    /// issue), and `ListRegions` and `GetRegionOptStatus` report it.
+    pub region_opt_status: BTreeMap<String, String>,
 }
 
 impl Account {
@@ -156,7 +241,40 @@ impl Account {
             created_date: now,
             state: ACTIVE_ACCOUNT_STATE.to_string(),
             alternate_contacts: BTreeMap::new(),
+            region_opt_status: BTreeMap::new(),
         }
+    }
+
+    /// The `RegionOptStatus` this account reports for `region_name`: the status
+    /// an opt-in call stored for it, else its [`REGION_CATALOG`] status. `None`
+    /// for a Region code the catalog does not hold.
+    ///
+    /// A Region AWS turns on by default is never opted out of, so a stored
+    /// status is honoured only where the catalog admits one — which keeps
+    /// `ENABLED_BY_DEFAULT` the one status such a Region can report.
+    pub fn reported_region_status(&self, region_name: &str) -> Option<&str> {
+        let catalog = catalog_region_status(region_name)?;
+        if catalog == ENABLED_BY_DEFAULT_REGION_STATUS {
+            return Some(ENABLED_BY_DEFAULT_REGION_STATUS);
+        }
+        Some(
+            self.region_opt_status
+                .get(region_name)
+                .map(String::as_str)
+                .unwrap_or(catalog),
+        )
+    }
+
+    /// Every Region in [`REGION_CATALOG`], in catalog order, with the status this
+    /// account reports for it — what `ListRegions` projects.
+    pub fn reported_regions(&self) -> Vec<(&'static str, &str)> {
+        REGION_CATALOG
+            .iter()
+            .filter_map(|(name, _)| {
+                self.reported_region_status(name)
+                    .map(|status| (*name, status))
+            })
+            .collect()
     }
 }
 

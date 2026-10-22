@@ -17,5 +17,7 @@ mod account_information_wire_fidelity;
 mod account_settings;
 #[path = "all/pattern_validation_messages.rs"]
 mod pattern_validation_messages;
+#[path = "all/region_opt_in_listing.rs"]
+mod region_opt_in_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
