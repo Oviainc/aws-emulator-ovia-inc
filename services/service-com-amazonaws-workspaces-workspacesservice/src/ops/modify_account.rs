@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: persists the account-wide Bring Your Own License (BYOL)
+//! configuration `DescribeAccount` reports, held in
+//! `crate::state::AccountByolConfig`.
 //!
 //! ## Shape of an operation
 //!
@@ -91,7 +86,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-workspaces-workspacesse
 // here — hence the `ModifyAccountError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.workspaces#ModifyAccount")]
+// `InternalServerException` is widened in with `extra_errors`: the service models it
+// ("Unexpected server error occured.") but does not list it on this operation, and it
+// is the only shape that can carry the one fault this handler can hit — the engine not
+// being the in-memory engine this service's store lives in.
+#[smithy_macros::operation_error(
+    "com.amazonaws.workspaces#ModifyAccount",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ModifyAccountErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -99,6 +101,7 @@ pub enum ModifyAccountErrorModeled {
     InvalidResourceStateException(InvalidResourceStateException),
     ResourceNotFoundException(ResourceNotFoundException),
     ResourceUnavailableException(ResourceUnavailableException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -152,18 +155,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyAccount"))
+        // Request metadata decides nothing here; the two input members do.
+        let _ = ctx;
+
+        let support = input.dedicated_tenancy_support.as_deref();
+        let management_cidr_range = input.dedicated_tenancy_management_cidr_range.as_deref();
+
+        // A `ModifyAccount` request carries only the parts of the BYOL
+        // configuration it changes, so one that names neither member asks for no
+        // modification at all and cannot be applied.
+        if support.is_none() && management_cidr_range.is_none() {
+            return Err(ModifyAccountErrorModeled::InvalidParameterValuesException(
+                InvalidParameterValuesException {
+                    message: Some(
+                        "At least one of DedicatedTenancySupport and \
+                         DedicatedTenancyManagementCidrRange must be specified."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The model's `DedicatedTenancySupportEnum` has the single value
+        // `ENABLED`: BYOL cannot be turned off through this operation. Boundary
+        // validation refuses anything else, so this only guards the case where it
+        // does not.
+        if let Some(other) = support.filter(|value| *value != crate::state::BYOL_SUPPORT_ENABLED) {
+            return Err(ModifyAccountErrorModeled::InvalidParameterValuesException(
+                InvalidParameterValuesException {
+                    message: Some(format!(
+                        "DedicatedTenancySupport must be {}, but {other} was specified.",
+                        crate::state::BYOL_SUPPORT_ENABLED,
+                    )),
+                },
+            )
+            .into());
+        }
+        // "The request asked for BYOL to be ENABLED": the member's absence leaves
+        // the stored support value alone rather than turning BYOL off (see
+        // `ComAmazonawsWorkspacesWorkspacesserviceState::modify_byol`).
+        let turn_on_byol = support.is_some();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ModifyAccountErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the WorkSpaces state store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // BYOL runs over a management network interface, and the model documents
+        // the CIDR block for it as something the caller must "specify ... as
+        // available by the ListAvailableManagementCidrRanges operation" — there is
+        // no default to fall back on, so turning BYOL on without one either stored
+        // already or supplied now is not a valid parameter combination. (The
+        // block's shape — a /16 whose host bits are zero — is the member's own
+        // pattern, already refused at the boundary.)
+        if turn_on_byol
+            && management_cidr_range.is_none()
+            && state.byol().management_cidr_range().is_none()
+        {
+            return Err(ModifyAccountErrorModeled::InvalidParameterValuesException(
+                InvalidParameterValuesException {
+                    message: Some(
+                        "DedicatedTenancyManagementCidrRange must be specified when \
+                         DedicatedTenancySupport is ENABLED and no management network \
+                         CIDR range is configured for this account."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let stored = state.modify_byol(turn_on_byol, management_cidr_range);
+        drop(state);
+
+        Ok(ModifyAccountOutput {
+            // "The text message to describe the status of BYOL modification",
+            // computed from what is now stored.
+            message: Some(stored.status_message()),
+        })
     }
 }
