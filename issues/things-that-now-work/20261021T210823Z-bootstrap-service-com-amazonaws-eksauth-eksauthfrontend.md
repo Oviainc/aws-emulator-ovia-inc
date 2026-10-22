@@ -50,3 +50,31 @@ Done = an integration test seeds a cluster + association, calls `AssumeRoleForPo
 5. POST to /clusters/no-such-cluster/assume-role-for-pod-identity with the same token — expect `ResourceNotFoundException` HTTP 404.
 6. POST to /clusters/demo-cluster/... with a token for service account `other-sa` (no association) — expect `AccessDeniedException` HTTP 400.
 7. POST to /clusters/demo-cluster/... with a token whose `exp` is in the past — expect `ExpiredTokenException` HTTP 400.
+
+## Resolution
+
+`AssumeRoleForPodIdentity` is implemented and computes every output member from the
+persisted cluster / association / session records; the SCAFFOLDED marker is gone and
+`src/state.rs` carries `clusters` + `sessions` + `role_ids` with the registration seam
+this issue asks for. Covered by the ten table-driven suites in
+`services/service-com-amazonaws-eksauth-eksauthfrontend/tests/all/assume_role_for_pod_identity.rs`.
+
+DELIBERATE DEVIATION from step 2 of the plan above: the handler does NOT decode the
+presented token's payload. A projected pod identity token is minted by a cluster's own
+Kubernetes API server, and only that cluster can say whose service account it names — and
+this emulator IS the cluster, so each cluster records the tokens it issued
+(`Cluster::issued_tokens`: namespace, service account, pod, audiences, validity window)
+and `verify_service_account_token` answers from that record plus the clock. That is
+strictly more state-driven than decoding claims a caller presents, and it avoids
+hand-writing a JOSE parser. A token the cluster did not issue names nobody, which is what
+the real service answers for a token signed by keys it does not hold, so the requirement
+to decode a payload should not be re-filed.
+
+REMAINING, TRACKED ELSEWHERE: a cluster and its pod identity associations can only be
+registered through the state seam (`ComAmazonawsEksauthEksauthfrontendState::register_cluster`
+/ `Cluster::associate_pod_identity`), because EKS Auth models no create/list/delete calls.
+An out-of-process client can therefore only reach `ResourceNotFoundException` until
+`CreateCluster` and `CreatePodIdentityAssociation` are implemented in
+`service-com-amazonaws-eks-awswesleyfrontend`, which is its own bootstrap issue
+(`20261021T210857Z-bootstrap-service-com-amazonaws-eks-awswesleyfrontend.md`); wiring those
+operations to this service's records is the next step and belongs with that issue.

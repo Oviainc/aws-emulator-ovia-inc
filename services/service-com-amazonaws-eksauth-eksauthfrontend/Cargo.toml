@@ -26,8 +26,8 @@ tracing = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
 hex = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true
