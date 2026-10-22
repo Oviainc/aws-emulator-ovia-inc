@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStack
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStack`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: allocates a stack id, persists the stack (template body verbatim,
+//! parameters, tags, capabilities, notification ARNs, stack policy and the rest of the
+//! request's configuration) in this service's store, records its `CREATE_IN_PROGRESS`
+//! event and answers the stack id. A request naming a live stack's name is refused with
+//! the modelled `AlreadyExistsException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStack::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Two members are stored but have nothing to act on in this slice, which creates no
+//! stack RESOURCES: `StackPolicyBody` (a stack policy governs which resources an update
+//! may change; `GetStackPolicy` reports it back) and `ResourceTypes` (which resource
+//! types the stack's operations may work with). `DisableValidation` turns off
+//! pre-deployment template validation, which this emulator does not perform either way.
+//! `StackPolicyURL` names a policy in Amazon S3 and is answered 501, like `TemplateURL`.
 //!
 //! ## Shape of an operation
 //!
@@ -170,6 +173,70 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{status, StoredParameter, StoredStack};
+
+/// The `OnFailure` value that means the same thing as `DisableRollback=true` (the model
+/// documents the two as alternative spellings: "You can specify either OnFailure or
+/// DisableRollback, but not both").
+const ON_FAILURE_DO_NOTHING: &str = "DO_NOTHING";
+
+/// `CreateStackInput$StackName`'s documented rule: "A stack name can contain only
+/// alphanumeric characters (case sensitive) and hyphens. It must start with an
+/// alphabetical character and can't be longer than 128 characters." The model carries no
+/// `@pattern` or `@length` for `StackName`, so the handler is what enforces it.
+const STACK_NAME_PATTERN: &str = "[a-zA-Z][-a-zA-Z0-9]*";
+const STACK_NAME_MAX_LEN: usize = 128;
+
+/// `Err(message)` naming the member and the constraint the name fails, in the form the
+/// service's own input validation words it.
+fn validate_stack_name(name: &str) -> Result<(), String> {
+    if name.len() > STACK_NAME_MAX_LEN {
+        return Err(format!(
+            "1 validation error detected: Value '{name}' at 'stackName' failed to satisfy \
+             constraint: Member must have length less than or equal to {STACK_NAME_MAX_LEN}"
+        ));
+    }
+    let well_formed = name.starts_with(|c: char| c.is_ascii_alphabetic())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !well_formed {
+        return Err(format!(
+            "1 validation error detected: Value '{name}' at 'stackName' failed to satisfy \
+             constraint: Member must satisfy regular expression pattern: {STACK_NAME_PATTERN}"
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the request's `Parameters` into the key/value pairs the stack stores.
+///
+/// `Parameter$UsePreviousValue` is a stack-UPDATE instruction ("During a stack update,
+/// use the existing parameter value that the stack is using for a given parameter
+/// key"), so a create that asks for it has no previous value to use and is refused
+/// rather than silently storing an empty one.
+fn resolved_parameters(parameters: &[Parameter]) -> Result<Vec<StoredParameter>, String> {
+    parameters
+        .iter()
+        .map(|parameter| {
+            let key = parameter
+                .parameter_key
+                .clone()
+                .filter(|key| !key.is_empty())
+                .ok_or_else(|| {
+                    "Parameters: every parameter must have a ParameterKey".to_string()
+                })?;
+            if parameter.use_previous_value == Some(true) {
+                return Err(format!(
+                    "Parameters: [{key}] cannot use the previous value: the stack does not exist yet"
+                ));
+            }
+            let value = parameter
+                .parameter_value
+                .clone()
+                .ok_or_else(|| format!("Parameters: [{key}] must have values"))?;
+            Ok(StoredParameter { key, value })
+        })
+        .collect()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -242,18 +309,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStack` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStack"))
+        // Conditional: "You must specify either TemplateBody or TemplateURL, but not
+        // both" (`CreateStackInput$TemplateBody`).
+        let template_body = match (&input.template_body, &input.template_url) {
+            (Some(body), None) => body.clone(),
+            (Some(_), Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    "You cannot specify both TemplateBody and TemplateURL",
+                ))
+            }
+            (None, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    "Either TemplateBody or TemplateURL must be specified",
+                ))
+            }
+            // A `TemplateURL` names a template in an Amazon S3 bucket or a Systems
+            // Manager document, which would have to be fetched over the network — this
+            // emulator makes no outbound connections. Answered 501 rather than with a
+            // stack created from a template nobody read.
+            (None, Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "CreateStack with TemplateURL (fetching a template from Amazon S3)",
+                ))
+            }
+        };
+        // "You can specify either DisableRollback or OnFailure, but not both."
+        if input.disable_rollback.is_some() && input.on_failure.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "You cannot specify both OnFailure and DisableRollback",
+            ));
+        }
+        // A `StackPolicyURL` names a policy document in an Amazon S3 bucket, which would
+        // have to be fetched over the network — this emulator makes no outbound
+        // connections, so it is answered 501 rather than with a stack whose policy nobody
+        // read. ("You can specify either the StackPolicyBody or the StackPolicyURL
+        // parameter, but not both", so only the body can reach the store.)
+        if input.stack_policy_url.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateStack with StackPolicyURL (fetching a stack policy from Amazon S3)",
+            ));
+        }
+        validate_stack_name(&input.stack_name)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // The documented `TemplateBody` maximum, which the model carries no `@length` for:
+        // a stored body is caller-sized otherwise.
+        crate::state::validate_template_body(&template_body)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        let parameters = resolved_parameters(input.parameters.as_deref().unwrap_or_default())
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This service was mounted on an engine that is not the shared in-memory
+            // one, so there is no store to create the stack in: nothing was written, and
+            // 501 is the only honest answer.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateStack"));
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        store.settle(now);
+
+        // "The name must be unique in the Region in which you are creating the stack" —
+        // unique among the LIVE stacks: a name is free again once its stack's deletion
+        // has completed.
+        if store
+            .live_stacks()
+            .any(|stack| stack.stack_name == input.stack_name)
+        {
+            return Err(CreateStackErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(format!("Stack [{}] already exists", input.stack_name)),
+                },
+            )
+            .into());
+        }
+
+        // "The quota for the resource has already been reached": the store holds at most
+        // `MAX_STACKS` live stacks, which is what bounds its growth.
+        if store.live_stacks().count() >= crate::state::MAX_STACKS {
+            return Err(CreateStackErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Limit for stacks exceeded: no more than {} stacks can exist in this \
+                         account and Region",
+                        crate::state::MAX_STACKS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Validated and within quota: from here the call allocates.
+        let operation_id = crate::state::new_operation_id();
+        let mut stack = StoredStack::new(
+            crate::state::new_stack_id(&region, &input.stack_name),
+            input.stack_name.clone(),
+            template_body,
+            now,
+        );
+        stack.parameters = parameters;
+        stack.capabilities = input.capabilities.clone().unwrap_or_default();
+        stack.tags = crate::state::stored_tags(input.tags.as_deref().unwrap_or_default());
+        stack.notification_arns = input.notification_ar_ns.clone().unwrap_or_default();
+        stack.role_arn = input.role_arn.clone();
+        stack.timeout_in_minutes = input.timeout_in_minutes;
+        stack.disable_rollback = input
+            .disable_rollback
+            .unwrap_or(input.on_failure.as_deref() == Some(ON_FAILURE_DO_NOTHING));
+        stack.enable_termination_protection =
+            input.enable_termination_protection.unwrap_or(false);
+        stack.retain_except_on_create = input.retain_except_on_create;
+        stack.deployment_config =
+            crate::state::stored_deployment_config(input.deployment_config.as_ref());
+        stack.rollback_configuration =
+            crate::state::stored_rollback_configuration(input.rollback_configuration.as_ref());
+        stack.client_request_token = input.client_request_token.clone();
+        stack.stack_policy_body = input.stack_policy_body.clone();
+        stack.resource_types = input.resource_types.clone().unwrap_or_default();
+        // "After the call completes successfully, the stack creation starts": the stack
+        // is answered in CREATE_IN_PROGRESS and settles to CREATE_COMPLETE once the
+        // clock makes that due.
+        stack.begin_transition(
+            now,
+            status::CREATE_IN_PROGRESS,
+            status::CREATE_COMPLETE,
+            Some(operation_id.clone()),
+            input.client_request_token.clone(),
+        );
+        let stack_id = stack.stack_id.clone();
+        store.stacks.push(stack);
+
+        Ok(CreateStackOutput {
+            stack_id: Some(stack_id),
+            operation_id: Some(operation_id),
+        })
     }
 }

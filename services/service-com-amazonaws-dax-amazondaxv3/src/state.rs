@@ -3,9 +3,15 @@
 //! Engine state for the com-amazonaws-dax-amazondaxv3 service.
 //!
 //! This module owns the DAX control plane's persisted records (clusters, their nodes
-//! and subnet groups) and the projections from a record to the modelled wire shape, so
-//! every handler in `src/ops/` renders the SAME view of one stored resource instead of
-//! building its own.
+//! and subnet groups), the event log those records write to, and the projections from
+//! a record to the modelled wire shape, so every handler in `src/ops/` renders the SAME
+//! view of one stored resource instead of building its own. It also owns the message
+//! each fault answers with, so one fault reads the same whatever raises it.
+//!
+//! It carries one thing DAX does not own: the Region's NETWORK, against which a
+//! subnet group's identifiers are resolved ([`region_subnets`]). The emulator's EC2
+//! service models no subnets yet; when it does, `resolve_subnet` is the one place that
+//! should read them from it instead.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,8 +19,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Cluster, Endpoint, Node, NotificationConfiguration, ParameterGroup, ParameterGroupStatus,
-    SSEDescription, SecurityGroupMembership, Subnet, SubnetGroup,
+    Cluster, ClusterNotFoundFault, Endpoint, Event, InvalidClusterStateFault,
+    InvalidParameterCombinationException, InvalidParameterValueException, Node,
+    NotificationConfiguration, ParameterGroup, ParameterGroupNotFoundFault,
+    ParameterGroupStatus, SSEDescription, SecurityGroupMembership, Subnet, SubnetGroup,
+    SubnetGroupNotFoundFault,
 };
 
 /// The region an ARN or an endpoint hostname carries when the request is unsigned and
@@ -142,6 +151,124 @@ pub const STATUS_SETTLE_DELAY: Duration = Duration::from_millis(500);
 /// cluster's subnet group names any. DAX "will spread the nodes across Availability
 /// Zones for the highest availability" (`CreateCluster$AvailabilityZones`).
 const AZ_SUFFIXES: [&str; 3] = ["a", "b", "c"];
+
+/// `Event$SourceType` for an event about a cluster. The `SourceType` enum lists
+/// `CLUSTER | PARAMETER_GROUP | SUBNET_GROUP`
+/// (`smithy_query(query="shape",shape="SourceType")`).
+pub const SOURCE_TYPE_CLUSTER: &str = "CLUSTER";
+/// `Event$SourceType` for an event about a parameter group.
+pub const SOURCE_TYPE_PARAMETER_GROUP: &str = "PARAMETER_GROUP";
+/// `Event$SourceType` for an event about a subnet group.
+pub const SOURCE_TYPE_SUBNET_GROUP: &str = "SUBNET_GROUP";
+
+/// Every value the `SourceType` enum lists, so a `DescribeEvents` filter outside the
+/// enum is refused rather than quietly selecting nothing.
+pub const SOURCE_TYPES: [&str; 3] = [
+    SOURCE_TYPE_CLUSTER,
+    SOURCE_TYPE_PARAMETER_GROUP,
+    SOURCE_TYPE_SUBNET_GROUP,
+];
+
+/// The event a `CreateCluster` records against the cluster it minted.
+///
+/// AWS publishes no message template for a DAX event, so the wording of each of these
+/// is the emulator's own; what a client can rely on is the event's source, its type
+/// and the instant it was recorded at, which all come from the stored resource.
+pub const EVENT_CLUSTER_CREATED: &str = "Cluster created.";
+/// The event recorded when the clock settles a cluster into `available`.
+pub const EVENT_CLUSTER_AVAILABLE: &str = "Cluster is available.";
+/// The event an `UpdateCluster` records.
+pub const EVENT_CLUSTER_MODIFIED: &str = "Cluster modified.";
+/// The event an `IncreaseReplicationFactor` records.
+pub const EVENT_CLUSTER_NODES_ADDED: &str = "Added nodes to the cluster.";
+/// The event a `DeleteCluster` records when the deletion starts.
+pub const EVENT_CLUSTER_DELETING: &str = "Deleting cluster.";
+/// The event recorded when the clock completes a deletion.
+pub const EVENT_CLUSTER_DELETED: &str = "Cluster deleted.";
+/// The event a `CreateSubnetGroup` records against the group it minted.
+pub const EVENT_SUBNET_GROUP_CREATED: &str = "Subnet group created.";
+/// The event a `CreateParameterGroup` records against the group it minted.
+pub const EVENT_PARAMETER_GROUP_CREATED: &str = "Parameter group created.";
+/// The event a `DeleteParameterGroup` records.
+pub const EVENT_PARAMETER_GROUP_DELETED: &str = "Parameter group deleted.";
+
+/// The furthest back a `DescribeEvents` window may reach, in minutes: "you can
+/// retrieve up to 14 days' worth of events if necessary" (`DescribeEvents`).
+pub const MAX_EVENT_DURATION: i32 = 14 * 24 * 60;
+
+/// [`MAX_EVENT_DURATION`] as a duration: the age at which a recorded event is no
+/// longer available and is dropped from the store.
+pub const EVENT_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// The window a `DescribeEvents` that names neither `Duration` nor `StartTime` reads:
+/// "By default, only the events occurring within the last 24 hours are returned"
+/// (`DescribeEvents`).
+pub const DEFAULT_EVENT_DURATION: i32 = 24 * 60;
+
+/// The number of events the store keeps (oldest dropped first), so no sequence of
+/// requests grows the event log without limit.
+pub const MAX_EVENTS: usize = 500;
+
+/// How many hex characters an EC2 subnet identifier carries in its long form
+/// (`subnet-0bb1c79de3example`), which is the form the network model below mints.
+const SUBNET_ID_HEX_LEN: usize = 17;
+
+/// A subnet of the account's network in one Region: the identifier a request names,
+/// the VPC it belongs to and the Availability Zone it sits in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubnetRecord {
+    /// The EC2 subnet identifier, as a request names it.
+    pub subnet_id: String,
+    /// The VPC this subnet belongs to.
+    pub vpc_id: String,
+    /// The Availability Zone this subnet sits in.
+    pub availability_zone: String,
+}
+
+/// The id of the account's default VPC in `region`.
+///
+/// AWS gives an account a default VPC in every Region and this emulator models no
+/// other, so the id is DERIVED from the Region name — stable, so every read reports
+/// the same VPC — in EC2's short `vpc-<8 hex>` form.
+pub fn default_vpc_id(region: &str) -> String {
+    format!("vpc-{}", hex::encode(&Sha256::digest(region.as_bytes())[..4]))
+}
+
+/// The subnets that exist in `region`: the default VPC's default subnet in each
+/// Availability Zone of that Region.
+///
+/// AWS creates the default VPC with "a size /16 IPv4 CIDR block and a default subnet
+/// in each Availability Zone" (EC2's `CreateDefaultVpc`), so these subnets are facts
+/// of the account's Region rather than resources a DAX request creates — the same
+/// reasoning EC2's own state module gives for deriving a Region's Availability Zones
+/// instead of storing them. Each identifier is derived from its zone name in EC2's
+/// long `subnet-<17 hex>` form, so a Region always reports the same subnets and
+/// [`resolve_subnet`] can tell an identifier that names one from an identifier that
+/// names nothing at all.
+pub fn region_subnets(region: &str) -> Vec<SubnetRecord> {
+    let vpc_id = default_vpc_id(region);
+    AZ_SUFFIXES
+        .iter()
+        .map(|suffix| {
+            let availability_zone = format!("{region}{suffix}");
+            let digest = hex::encode(Sha256::digest(availability_zone.as_bytes()));
+            SubnetRecord {
+                subnet_id: format!("subnet-{}", &digest[..SUBNET_ID_HEX_LEN]),
+                vpc_id: vpc_id.clone(),
+                availability_zone,
+            }
+        })
+        .collect()
+}
+
+/// The subnet `subnet_id` names in `region`, or `None` when no subnet of that Region
+/// carries that identifier — which is what lets a request naming it be refused
+/// instead of stored.
+pub fn resolve_subnet(region: &str, subnet_id: &str) -> Option<SubnetRecord> {
+    region_subnets(region)
+        .into_iter()
+        .find(|subnet| subnet.subnet_id == subnet_id)
+}
 
 /// A stored `Endpoint`: a DNS name, a port and the URL a DAX client dials.
 #[derive(Debug, Clone)]
@@ -391,25 +518,28 @@ pub struct SubnetGroupRecord {
     pub name: String,
     pub description: Option<String>,
     pub vpc_id: String,
-    pub subnet_ids: Vec<String>,
+    /// The subnets this group names, as [`resolve_subnet`] resolved them when the
+    /// group was created, in the order the request named them.
+    pub subnets: Vec<SubnetRecord>,
+    /// The Region whose network the group's subnets were resolved in.
     pub region: String,
 }
 
 impl SubnetGroupRecord {
-    /// The modelled `SubnetGroup` for this record. Each `Subnet` is derived from the
-    /// stored identifier: its AZ is this emulator's placement for that identifier, and
-    /// its supported network types are IPv4 (see [`NETWORK_TYPE_IPV4`]).
+    /// The modelled `SubnetGroup` for this record. Each `Subnet` reports the zone the
+    /// network model holds for it, and its supported network types are IPv4 (see
+    /// [`NETWORK_TYPE_IPV4`]).
     pub fn view(&self) -> SubnetGroup {
         SubnetGroup {
             subnet_group_name: Some(self.name.clone()),
             description: self.description.clone(),
             vpc_id: Some(self.vpc_id.clone()),
             subnets: Some(
-                self.subnet_ids
+                self.subnets
                     .iter()
-                    .map(|id| Subnet {
-                        subnet_identifier: Some(id.clone()),
-                        subnet_availability_zone: Some(subnet_availability_zone(&self.region, id)),
+                    .map(|subnet| Subnet {
+                        subnet_identifier: Some(subnet.subnet_id.clone()),
+                        subnet_availability_zone: Some(subnet.availability_zone.clone()),
                         supported_network_types: Some(vec![NETWORK_TYPE_IPV4.to_string()]),
                     })
                     .collect(),
@@ -422,13 +552,40 @@ impl SubnetGroupRecord {
     /// cluster placed in this group spreads its nodes over.
     pub fn availability_zones(&self) -> Vec<String> {
         let mut zones: Vec<String> = self
-            .subnet_ids
+            .subnets
             .iter()
-            .map(|id| subnet_availability_zone(&self.region, id))
+            .map(|subnet| subnet.availability_zone.clone())
             .collect();
         zones.sort_unstable();
         zones.dedup();
         zones
+    }
+}
+
+/// One recorded DAX event: what happened to which resource, and when.
+#[derive(Debug, Clone)]
+pub struct EventRecord {
+    /// Monotonic sequence number, which a `DescribeEvents` page token names.
+    pub seq: u64,
+    /// The resource the event is about (`Event$SourceName`).
+    pub source_name: String,
+    /// One of [`SOURCE_TYPES`] (`Event$SourceType`).
+    pub source_type: String,
+    /// What happened (`Event$Message`).
+    pub message: String,
+    /// When it happened (`Event$Date`).
+    pub date: SystemTime,
+}
+
+impl EventRecord {
+    /// The modelled `Event` for this record.
+    pub fn view(&self) -> Event {
+        Event {
+            source_name: Some(self.source_name.clone()),
+            source_type: Some(self.source_type.clone()),
+            message: Some(self.message.clone()),
+            date: Some(to_date_time(self.date)),
+        }
     }
 }
 
@@ -446,6 +603,10 @@ pub struct ComAmazonawsDaxAmazondaxv3State {
     pub parameter_groups: BTreeMap<String, ParameterGroupRecord>,
     /// Monotonic node counter, so a node id is unique and reproducible.
     pub next_node_seq: u64,
+    /// Events recorded for this service's resources, oldest first.
+    pub events: Vec<EventRecord>,
+    /// Monotonic event counter, so one page token names exactly one event.
+    pub next_event_seq: u64,
 }
 
 /// A fresh store is an account DAX has just become available in: no clusters and no
@@ -459,6 +620,8 @@ impl Default for ComAmazonawsDaxAmazondaxv3State {
             subnet_groups: BTreeMap::new(),
             parameter_groups: BTreeMap::from([(default_group.name.clone(), default_group)]),
             next_node_seq: 0,
+            events: Vec::new(),
+            next_event_seq: 0,
         }
     }
 }
@@ -468,6 +631,43 @@ impl ComAmazonawsDaxAmazondaxv3State {
     pub fn next_node_seq(&mut self) -> u64 {
         self.next_node_seq += 1;
         self.next_node_seq
+    }
+
+    /// Record one event against `source_name` (a [`SOURCE_TYPES`] resource) at `at`.
+    ///
+    /// The log is BOUNDED: past [`MAX_EVENTS`] the oldest events are dropped, so no
+    /// sequence of requests grows it without limit.
+    pub fn record_event(
+        &mut self,
+        source_name: &str,
+        source_type: &str,
+        message: &str,
+        at: SystemTime,
+    ) {
+        self.next_event_seq += 1;
+        self.events.push(EventRecord {
+            seq: self.next_event_seq,
+            source_name: source_name.to_string(),
+            source_type: source_type.to_string(),
+            message: message.to_string(),
+            date: at,
+        });
+        if self.events.len() > MAX_EVENTS {
+            let overflow = self.events.len() - MAX_EVENTS;
+            self.events.drain(..overflow);
+        }
+    }
+
+    /// Drop every event older than [`EVENT_RETENTION`] as of `now`.
+    ///
+    /// This is a move the CLOCK already made due — an event 14 days old is no longer
+    /// available whether or not anybody called — so a reporting operation may run it
+    /// before it reads.
+    pub fn expire_events(&mut self, now: SystemTime) {
+        let Some(cutoff) = now.checked_sub(EVENT_RETENTION) else {
+            return;
+        };
+        self.events.retain(|event| event.date >= cutoff);
     }
 
     /// Apply every cluster status move the clock has already made due as of `now`:
@@ -489,14 +689,20 @@ impl ComAmazonawsDaxAmazondaxv3State {
                 .is_some_and(|cluster| cluster.status == CLUSTER_DELETING);
             if deleting {
                 self.clusters.remove(&name);
+                self.record_event(&name, SOURCE_TYPE_CLUSTER, EVENT_CLUSTER_DELETED, now);
                 continue;
             }
+            let mut settled = false;
             if let Some(cluster) = self.clusters.get_mut(&name) {
                 cluster.status = CLUSTER_AVAILABLE.to_string();
                 for node in &mut cluster.nodes {
                     node.node_status = NODE_AVAILABLE.to_string();
                 }
                 cluster.settles_at = None;
+                settled = true;
+            }
+            if settled {
+                self.record_event(&name, SOURCE_TYPE_CLUSTER, EVENT_CLUSTER_AVAILABLE, now);
             }
         }
     }
@@ -555,28 +761,6 @@ pub fn node_endpoint_address(node_id: &str, cluster_name: &str, region: &str) ->
 /// the region's zones.
 pub fn default_availability_zone(region: &str, index: usize) -> String {
     format!("{region}{}", AZ_SUFFIXES[index % AZ_SUFFIXES.len()])
-}
-
-/// This emulator's placement of a subnet: a zone of the subnet's own region, chosen by
-/// a digest of the subnet identifier, so the same identifier always reports the same AZ
-/// however it is ordered in a request.
-pub fn subnet_availability_zone(region: &str, subnet_id: &str) -> String {
-    let digest = Sha256::digest(subnet_id.as_bytes());
-    format!(
-        "{region}{}",
-        AZ_SUFFIXES[usize::from(digest[0]) % AZ_SUFFIXES.len()]
-    )
-}
-
-/// The VPC a subnet group's subnets belong to. The emulator models no EC2 subnets, so
-/// the identifier is DERIVED from the set of subnet identifiers (order-independent):
-/// one set of subnets is always one VPC, and two different sets are different VPCs.
-pub fn derived_vpc_id(subnet_ids: &[String]) -> String {
-    let mut sorted: Vec<&str> = subnet_ids.iter().map(String::as_str).collect();
-    sorted.sort_unstable();
-    sorted.dedup();
-    let digest = Sha256::digest(sorted.join(",").as_bytes());
-    format!("vpc-{}", hex::encode(&digest[..4]))
 }
 
 /// A `ClusterName` the `CreateCluster$ClusterName` doc accepts: "A name must contain
@@ -663,4 +847,99 @@ pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
         .map(|since| since.as_secs_f64())
         .unwrap_or(0.0);
     ::aws_smithy_types::DateTime::from_secs_f64(secs)
+}
+
+/// A modelled `TStamp` as an instant, or `None` for a timestamp this service cannot
+/// place: a value that is not finite, is before the epoch, or is further from it than
+/// an instant reaches. A request carries this value, so every one of those answers
+/// `None` for the caller to refuse rather than panicking in the conversion.
+pub fn from_date_time(at: ::aws_smithy_types::DateTime) -> Option<SystemTime> {
+    let secs = at.as_secs_f64();
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    UNIX_EPOCH.checked_add(Duration::try_from_secs_f64(secs).ok()?)
+}
+
+// ---------------------------------------------------------------------------
+// The message each fault answers with
+//
+// DAX words a fault with ONE template, so the message is a property of the FAULT and
+// not of the operation that raises it: every site raising a given fault builds it
+// here, and a template echoes the request only where that fault's template does.
+// ---------------------------------------------------------------------------
+
+/// `ClusterNotFoundFault` for a cluster this store does not hold. The template names
+/// no identifier, so every operation that resolves a cluster by name answers with the
+/// same text.
+pub fn cluster_not_found() -> ClusterNotFoundFault {
+    ClusterNotFoundFault {
+        message: Some("Cluster not found.".to_string()),
+    }
+}
+
+/// `SubnetGroupNotFoundFault` for a subnet group this store does not hold. This
+/// fault's template DOES name the group it was asked for.
+pub fn subnet_group_not_found(name: &str) -> SubnetGroupNotFoundFault {
+    SubnetGroupNotFoundFault {
+        message: Some(format!("Subnet group {name} not found.")),
+    }
+}
+
+/// `InvalidClusterStateFault` for a cluster that is not [`CLUSTER_AVAILABLE`], which
+/// is the only status a modification is accepted from.
+pub fn invalid_cluster_state() -> InvalidClusterStateFault {
+    InvalidClusterStateFault {
+        message: Some(format!("Cluster is not in the {CLUSTER_AVAILABLE} state.")),
+    }
+}
+
+/// `InvalidParameterValueException` for a `MaxResults` outside the window both
+/// paginated describes document ("The value for `MaxResults` must be between 20 and
+/// 100"), carrying [`max_results_out_of_range_message`].
+pub fn invalid_max_results() -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        message: Some(max_results_out_of_range_message()),
+    }
+}
+
+/// `InvalidParameterValueException` for a `NextToken` this service did not issue,
+/// naming the operation whose page it would have continued.
+pub fn invalid_next_token(operation: &str) -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        message: Some(format!(
+            "NextToken is not a continuation token from a prior {operation} response"
+        )),
+    }
+}
+
+/// `InvalidParameterValueException` for a request naming subnets that do not exist in
+/// the Region's network: the template lists the identifiers that could not be
+/// resolved, which is the one part of it built from the request.
+pub fn invalid_subnets(subnet_ids: &[String]) -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        message: Some(format!(
+            "Some input subnets in :[{}] are invalid.",
+            subnet_ids.join(", ")
+        )),
+    }
+}
+
+/// `InvalidParameterCombinationException` for a `DescribeEvents` window reaching
+/// further back than the events DAX retains ([`MAX_EVENT_DURATION`]).
+pub fn events_beyond_retention() -> InvalidParameterCombinationException {
+    InvalidParameterCombinationException {
+        message: Some(format!(
+            "Events occurring more than {} days in the past are not available.",
+            MAX_EVENT_DURATION / (24 * 60)
+        )),
+    }
+}
+
+/// `ParameterGroupNotFoundFault` for a parameter group this store does not hold,
+/// carrying [`parameter_group_not_found_message`].
+pub fn parameter_group_not_found() -> ParameterGroupNotFoundFault {
+    ParameterGroupNotFoundFault {
+        message: Some(parameter_group_not_found_message()),
+    }
 }

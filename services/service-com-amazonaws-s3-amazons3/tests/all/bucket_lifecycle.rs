@@ -37,7 +37,10 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 /// One service mounted on its own engine, reached exactly the way the production router
 /// reaches it.
-fn router() -> MultiServiceRouter {
+///
+/// `pub(crate)`, like the three helpers below it: the tagging suite in this same test
+/// crate drives its requests through the same harness instead of standing up a second one.
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -57,15 +60,15 @@ type CreateRow<'a> = (
 );
 
 /// What a dispatched request answered.
-struct Answer {
-    status: u16,
-    headers: http::HeaderMap,
-    body: bytes::Bytes,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) body: bytes::Bytes,
 }
 
 impl Answer {
     /// A bound response header's value.
-    fn header(&self, name: &str) -> Option<String> {
+    pub(crate) fn header(&self, name: &str) -> Option<String> {
         self.headers
             .get(name)
             .and_then(|value| value.to_str().ok())
@@ -75,7 +78,7 @@ impl Answer {
     /// The wire error code: the `<Code>` element of S3's restXml error document (the
     /// model sets `noErrorWrapping`, so it is the document's own child), or the
     /// `x-amzn-errortype` header when the protocol carried it there instead.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         let body = String::from_utf8_lossy(&self.body).to_string();
         let between = body
             .split_once("<Code>")
@@ -88,7 +91,7 @@ impl Answer {
 }
 
 /// Dispatch one request with the given headers and body.
-async fn send(
+pub(crate) async fn send(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -118,7 +121,7 @@ async fn send(
 
 /// `PUT /<bucket>` — `CreateBucket`, with the location constraint (when any) in the XML
 /// payload and the bucket namespace (when any) in its bound header.
-async fn create_bucket(
+pub(crate) async fn create_bucket(
     router: &MultiServiceRouter,
     bucket: &str,
     location_constraint: Option<&str>,

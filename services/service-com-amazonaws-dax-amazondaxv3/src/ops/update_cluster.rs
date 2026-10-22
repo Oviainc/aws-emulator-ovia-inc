@@ -191,24 +191,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_due(now);
 
         let Some(cluster) = store.clusters.get_mut(&cluster_name) else {
-            return Err(
-                UpdateClusterErrorModeled::ClusterNotFoundFault(ClusterNotFoundFault {
-                    message: Some(format!("Cluster {cluster_name} does not exist")),
-                })
-                .into(),
-            );
+            return Err(UpdateClusterErrorModeled::ClusterNotFoundFault(
+                crate::state::cluster_not_found(),
+            )
+            .into());
         };
         if cluster.status != crate::state::CLUSTER_AVAILABLE {
-            return Err(
-                UpdateClusterErrorModeled::InvalidClusterStateFault(InvalidClusterStateFault {
-                    message: Some(format!(
-                        "Cluster {cluster_name} is {}, not {}",
-                        cluster.status,
-                        crate::state::CLUSTER_AVAILABLE
-                    )),
-                })
-                .into(),
-            );
+            return Err(UpdateClusterErrorModeled::InvalidClusterStateFault(
+                crate::state::invalid_cluster_state(),
+            )
+            .into());
         }
         // A topic status is only meaningful alongside a topic.
         if input.notification_topic_status.is_some()
@@ -253,9 +245,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         cluster.status = crate::state::CLUSTER_MODIFYING.to_string();
         cluster.settles_at = Some(now + crate::state::STATUS_SETTLE_DELAY);
+        let view = cluster.view();
+        store.record_event(
+            &cluster_name,
+            crate::state::SOURCE_TYPE_CLUSTER,
+            crate::state::EVENT_CLUSTER_MODIFIED,
+            now,
+        );
 
         Ok(UpdateClusterOutput {
-            cluster: Some(cluster.view()),
+            cluster: Some(view),
         })
     }
 }

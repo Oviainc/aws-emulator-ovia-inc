@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStacks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStacks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStacks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: projects every persisted stack — live and deleted — into a
+//! `StackSummary`, filtered by `StackStatusFilter` when one is given.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +66,32 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{StoredStack, DRIFT_STATUS_NOT_CHECKED};
+
+/// One stored stack as the modelled `StackSummary` shape.
+///
+/// `TemplateDescription` is the template's own `Description`, `DeletionTime` is set only
+/// once the stack's deletion has completed, and `ParentId`/`RootId` are absent because
+/// nested stacks are not implemented.
+fn stack_summary(stored: &StoredStack) -> StackSummary {
+    StackSummary {
+        stack_id: Some(stored.stack_id.clone()),
+        stack_name: stored.stack_name.clone(),
+        template_description: stored.description(),
+        creation_time: crate::state::timestamp(stored.creation_time),
+        last_updated_time: stored.last_updated_time.map(crate::state::timestamp),
+        deletion_time: stored.deletion_time.map(crate::state::timestamp),
+        stack_status: stored.status.clone(),
+        stack_status_reason: stored.status_reason.clone(),
+        parent_id: None,
+        root_id: None,
+        drift_information: Some(StackDriftInformationSummary {
+            stack_drift_status: DRIFT_STATUS_NOT_CHECKED.to_string(),
+            last_check_timestamp: None,
+        }),
+        last_operations: None,
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -141,18 +160,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStacks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStacksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStacks"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no stack store to list, so this
+            // answers 501 rather than an empty, truthful-looking list.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("ListStacks"));
+        };
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the
+        // clock had already made due.
+        store.settle(::std::time::SystemTime::now());
+
+        // "Returns the summary information for stacks whose status matches the specified
+        // StackStatusFilter … If no StackStatusFilter is specified, summary information
+        // for all stacks is returned (including existing stacks and stacks that have
+        // been deleted)."
+        let filter = input.stack_status_filter.as_deref().unwrap_or_default();
+        let matching: Vec<StackSummary> = store
+            .stacks
+            .iter()
+            .filter(|stack| filter.is_empty() || filter.contains(&stack.status))
+            .map(stack_summary)
+            .collect();
+        // `@paginated(inputToken: NextToken, outputToken: NextToken,
+        // items: StackSummaries)`: one response carries one bounded page.
+        let (stack_summaries, next_token) = crate::state::paginate(
+            crate::state::PageOf::StackSummaries,
+            matching,
+            input.next_token.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(ListStacksOutput {
+            stack_summaries: Some(stack_summaries),
+            next_token,
+        })
     }
 }

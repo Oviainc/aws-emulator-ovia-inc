@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOrganization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOrganization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOrganization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates and persists the singleton organization, its implicit root, and the
+//! management account's membership of that root. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +192,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOrganization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOrganizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOrganization"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // `FeatureSet` is optional, so a request that omits it is defaulted here, from
+        // this operation's own documentation: "By default (or if you set the FeatureSet
+        // parameter to ALL), the new organization is created with all features enabled
+        // and service control policies automatically enabled in the root."
+        let feature_set = input
+            .feature_set
+            .unwrap_or_else(|| crate::state::DEFAULT_FEATURE_SET.to_string());
+        if !ORGANIZATION_FEATURE_SET_VALUES.contains(&feature_set.as_str()) {
+            return Err(CreateOrganizationErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "FeatureSet must be one of {}, got {feature_set}",
+                        ORGANIZATION_FEATURE_SET_VALUES.join(", ")
+                    )),
+                    reason: Some(INVALID_ENUM_REASON.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A root's enabled policy types follow from the feature set: all features
+        // enables service control policies in the root, consolidated billing enables
+        // none ("no policy types are enabled by default and you can't use organization
+        // policies").
+        let policy_types = if feature_set == crate::state::FEATURE_SET_CONSOLIDATED_BILLING {
+            Vec::new()
+        } else {
+            vec![crate::state::PolicyTypeRecord {
+                policy_type: crate::state::POLICY_TYPE_SERVICE_CONTROL_POLICY.to_string(),
+                status: crate::state::POLICY_TYPE_STATUS_ENABLED.to_string(),
+            }]
+        };
+
+        let mut store = state.lock();
+
+        // An account belongs to at most one organization, so a second create while one
+        // exists is refused rather than replacing it.
+        if store.organization.is_some() {
+            return Err(
+                CreateOrganizationErrorModeled::AlreadyInOrganizationException(
+                    AlreadyInOrganizationException {
+                        message: Some(crate::state::ALREADY_IN_ORGANIZATION_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let organization_id = store.mint_organization_id();
+        let root_id = store.mint_root_id();
+        // The calling account becomes the management account: "The account whose user is
+        // calling the CreateOrganization operation automatically becomes the management
+        // account of the new organization."
+        let master_account_id = ::engine::emulator_account_id().to_string();
+        let master_account_email = format!("{master_account_id}@{MANAGEMENT_EMAIL_DOMAIN}");
+
+        let organization = crate::state::OrganizationRecord {
+            arn: ::engine::emulator_arn(
+                crate::state::ARN_SERVICE,
+                crate::state::ARN_REGION,
+                &format!("organization/{organization_id}"),
+            ),
+            master_account_arn: ::engine::emulator_arn(
+                crate::state::ARN_SERVICE,
+                crate::state::ARN_REGION,
+                &format!("account/{organization_id}/{master_account_id}"),
+            ),
+            id: organization_id.clone(),
+            feature_set,
+            master_account_id: master_account_id.clone(),
+            master_account_email: master_account_email.clone(),
+            // Deprecated on the wire ("To determine the policies that are enabled and
+            // available for use in your organization, use the ListRoots operation
+            // instead"), so it reports exactly what the root reports.
+            available_policy_types: policy_types.clone(),
+        };
+
+        let root = crate::state::RootRecord {
+            arn: ::engine::emulator_arn(
+                crate::state::ARN_SERVICE,
+                crate::state::ARN_REGION,
+                &format!("root/{organization_id}/{root_id}"),
+            ),
+            id: root_id.clone(),
+            name: crate::state::ROOT_NAME.to_string(),
+            policy_types,
+        };
+
+        let management_account = crate::state::AccountRecord {
+            arn: ::engine::emulator_arn(
+                crate::state::ARN_SERVICE,
+                crate::state::ARN_REGION,
+                &format!("account/{organization_id}/{master_account_id}"),
+            ),
+            id: master_account_id.clone(),
+            email: master_account_email,
+            name: MANAGEMENT_ACCOUNT_NAME.to_string(),
+            status: crate::state::ACCOUNT_STATUS_ACTIVE.to_string(),
+            joined_method: crate::state::ACCOUNT_JOINED_METHOD_CREATED.to_string(),
+            joined_timestamp: ::aws_smithy_types::DateTime::from(
+                ::std::time::SystemTime::now(),
+            ),
+        };
+
+        store.organization = Some(organization);
+        store.roots.push(root);
+        store.children.insert(
+            root_id,
+            vec![crate::state::ChildRef {
+                id: master_account_id.clone(),
+                child_type: crate::state::CHILD_TYPE_ACCOUNT.to_string(),
+            }],
+        );
+        store
+            .accounts
+            .insert(master_account_id, management_account);
+
+        // Read back what was stored, so the response is the persisted record rather
+        // than a value built beside it.
+        let stored = store.organization.as_ref().ok_or_else(|| {
+            // A broken store invariant, unreachable through the API: reported as the
+            // modelled HTTP 500 `ServiceException` rather than the scaffold's 501,
+            // because this operation IS written.
+            CreateOrganizationError::from(CreateOrganizationErrorModeled::ServiceException(
+                ServiceException {
+                    message: Some(
+                        "Organizations can't complete your request because of an internal service error (the organization just created could not be read back). Try again later."
+                            .to_string(),
+                    ),
+                },
+            ))
+        })?;
+        Ok(CreateOrganizationOutput {
+            organization: Some(stored.to_modelled()),
+        })
     }
 }
+
+/// The `InvalidInputExceptionReason` for a member whose value is outside its enum.
+const INVALID_ENUM_REASON: &str = "INVALID_ENUM";
+
+/// The domain of the management account's email address. The address is derived from
+/// the account id rather than invented per request, so it is stable across reads and
+/// satisfies `Email`'s modelled pattern `^[^\s@]+@[^\s@]+\.[^\s@]+$`. `example.com` is
+/// the RFC 2606 reserved domain, and it is a crate-local constant because the engine
+/// exposes no emulator-wide email or domain setting to source it from (`engine`'s
+/// public surface is `state`, `listeners`, `extract_akid`, `emulator_account_id` and
+/// `emulator_arn`).
+const MANAGEMENT_EMAIL_DOMAIN: &str = "example.com";
+
+/// The management account's friendly name.
+const MANAGEMENT_ACCOUNT_NAME: &str = "Management account";

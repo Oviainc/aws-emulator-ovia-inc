@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTargetHealth
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTargetHealth`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTargetHealth::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one description per target registered with the target group named by
+//! `TargetGroupArn` — which must be in state, else `TargetGroupNotFoundException` —
+//! derived from the stored registrations: the health state follows from whether a
+//! load balancer forwards to the group, whether its health checks are on, and how
+//! long ago the target was registered. A `Targets` filter narrows the answer to the
+//! named targets, and one that is not registered is reported as such.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +143,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTargetHealth` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTargetHealthErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTargetHealth"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("DescribeTargetHealth")
+        })?;
+        let now = std::time::SystemTime::now();
+
+        let guard = state.lock();
+        let Some(group) = guard.target_groups.get(&input.target_group_arn) else {
+            return Err(DescribeTargetHealthErrorModeled::TargetGroupNotFoundException(
+                TargetGroupNotFoundException {
+                    message: Some(format!(
+                        "Target group '{}' not found",
+                        input.target_group_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let descriptions = match input.targets.as_deref() {
+            // "Describes the health of the specified targets": each named target, in
+            // the order named, whether or not it is registered.
+            Some(targets) => targets
+                .iter()
+                .map(|target| {
+                    let port = target.port.or(group.port);
+                    match group.targets.get(&(target.id.clone(), port)) {
+                        Some(registered) => group.health_description_of(registered, now),
+                        None => group.unregistered_health_description(target),
+                    }
+                })
+                .collect(),
+            // "... or all of your targets."
+            None => group
+                .targets
+                .values()
+                .map(|registered| group.health_description_of(registered, now))
+                .collect(),
+        };
+
+        Ok(DescribeTargetHealthOutput {
+            target_health_descriptions: Some(descriptions),
+        })
     }
 }

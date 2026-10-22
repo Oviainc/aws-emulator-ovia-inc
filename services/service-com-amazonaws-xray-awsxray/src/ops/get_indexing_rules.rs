@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIndexingRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIndexingRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIndexingRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the indexing rules this service holds, recomputed from
+//! [`crate::state::IndexingRuleStore`] on every call: the account's `Default`
+//! rule until `UpdateIndexingRule` rewrites it, and the rewritten configuration
+//! afterwards. Nothing is echoed from the request.
+//!
+//! A read, so it writes nothing. The rule set is fixed — X-Ray models no create
+//! and no delete for an indexing rule — so the store already holds the
+//! account's rule when the first call arrives.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +143,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIndexingRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIndexingRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIndexingRules"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetIndexingRulesErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray indexing rule store is unavailable on this emulator engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+
+        // A token this service issued names the rule the next page starts at,
+        // and the rule set never changes, so a `NextToken` that names no stored
+        // rule — the empty string among them — never came from here. It is
+        // refused rather than quietly read as "start from the beginning", which
+        // would hand a paginator the first page a second time.
+        if let Some(token) = input.next_token.as_deref() {
+            if !store.indexing_rules.contains(token) {
+                return Err(GetIndexingRulesErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "NextToken `{token}` was not issued by this service"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Rule-name order, so a token naming the next rule resumes exactly
+        // where the previous page stopped.
+        let selected: Vec<&crate::state::IndexingRuleRecord> = match input.next_token.as_deref() {
+            Some(token) => store.indexing_rules.iter_from(token).collect(),
+            None => store.indexing_rules.iter().collect(),
+        };
+
+        let next_token = selected
+            .get(INDEXING_RULES_PAGE_SIZE)
+            .map(|record| record.name.clone());
+        let indexing_rules: Vec<IndexingRule> = selected
+            .iter()
+            .take(INDEXING_RULES_PAGE_SIZE)
+            .map(|record| record.to_indexing_rule())
+            .collect();
+
+        Ok(GetIndexingRulesOutput {
+            indexing_rules: Some(indexing_rules),
+            next_token,
+        })
     }
 }
+
+/// How many `IndexingRule` values one page carries.
+///
+/// `IndexingRuleList` is modelled `len 1..10`, so ten rules is the most a page
+/// can carry and a longer listing has to be truncated with a `NextToken`. The
+/// modelled minimum of one is why a resumed page is never empty: a token that
+/// names no stored rule is refused above.
+pub const INDEXING_RULES_PAGE_SIZE: usize = 10;

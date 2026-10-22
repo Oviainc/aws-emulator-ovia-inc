@@ -90,9 +90,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dax-amazondaxv3.json");
 // here — hence the `DescribeSubnetGroupsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dax#DescribeSubnetGroups")]
+//
+// `InvalidParameterValueException` is widened in through `extra_errors`: the SERVICE
+// models it ("The value for a parameter is invalid", HTTP 400) and it is the fault the
+// other paginated describe answers a bad `MaxResults`/`NextToken` with, so this one
+// answers the same fault with the same template rather than a synthetic
+// `ValidationException`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.dax#DescribeSubnetGroups",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum DescribeSubnetGroupsErrorModeled {
+    InvalidParameterValueException(InvalidParameterValueException),
     ServiceLinkedRoleNotFoundFault(ServiceLinkedRoleNotFoundFault),
     SubnetGroupNotFoundFault(SubnetGroupNotFoundFault),
 }
@@ -156,11 +166,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !(crate::state::MIN_MAX_RESULTS..=crate::state::MAX_MAX_RESULTS)
                 .contains(&max_results)
             {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "MaxResults must be between {} and {}, got {max_results}",
-                    crate::state::MIN_MAX_RESULTS,
-                    crate::state::MAX_MAX_RESULTS
-                )));
+                return Err(
+                    DescribeSubnetGroupsErrorModeled::InvalidParameterValueException(
+                        crate::state::invalid_max_results(),
+                    )
+                    .into(),
+                );
             }
         }
 
@@ -170,10 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(token) => match crate::state::decode_token(token) {
                 Some(from) => Some(from),
                 None => {
-                    return Err(crate::scaffolded::Scaffolded::validation(
-                        "NextToken is not a continuation token from a prior \
-                         DescribeSubnetGroups response",
-                    ))
+                    return Err(
+                        DescribeSubnetGroupsErrorModeled::InvalidParameterValueException(
+                            crate::state::invalid_next_token(Self::NAME),
+                        )
+                        .into(),
+                    )
                 }
             },
             None => None,
@@ -189,9 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let name = name.to_lowercase();
                 if !store.subnet_groups.contains_key(&name) {
                     return Err(DescribeSubnetGroupsErrorModeled::SubnetGroupNotFoundFault(
-                        SubnetGroupNotFoundFault {
-                            message: Some(format!("Subnet group {name} does not exist")),
-                        },
+                        crate::state::subnet_group_not_found(&name),
                     )
                     .into());
                 }

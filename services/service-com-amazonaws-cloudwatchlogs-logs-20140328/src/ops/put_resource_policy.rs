@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: creates or updates a resource policy in the shared store — an
+//! account-scoped one when the request names no `resourceArn`, otherwise the single
+//! policy attached to the log group that ARN names. This is the ONLY file to touch for
+//! this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
@@ -169,18 +170,180 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        // `ctx` carries only request metadata; the ARN this policy is attached to comes
+        // from the log group it names, not from the request's credential scope.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutResourcePolicyError::from(
+                PutResourcePolicyErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        let invalid = |message: &str| {
+            PutResourcePolicyError::from(
+                PutResourcePolicyErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                ),
+            )
+        };
+
+        // `policyName` and `policyDocument` are documented "This parameter is
+        // required", but the model does not mark them required, so the boundary
+        // validator lets a request without them through to here.
+        let Some(policy_name) = input
+            .policy_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        else {
+            return Err(invalid("policyName is required"));
+        };
+        let Some(policy_document) = input.policy_document.as_deref() else {
+            return Err(invalid("policyDocument is required"));
+        };
+        // "This is formatted as a JSON string": a document that is not a JSON object is
+        // not a policy document.
+        if !::serde_json::from_str::<::serde_json::Value>(policy_document)
+            .is_ok_and(|document| document.is_object())
+        {
+            return Err(invalid(
+                "policyDocument must be a JSON policy document (a JSON object)",
+            ));
+        }
+        let now = crate::state::now_ms();
+
+        let record = match input.resource_arn.as_deref() {
+            // Resource-scoped: "Currently only supports LogGroup ARN", and the policy is
+            // attached to that log group, so there is at most one per group.
+            Some(resource_arn) => {
+                if !crate::state::is_log_group_arn(resource_arn) {
+                    return Err(invalid(
+                        "resourceArn must be the ARN of a CloudWatch Logs log group",
+                    ));
+                }
+                let group_name =
+                    crate::state::log_group_name_from_identifier(resource_arn).to_string();
+                let Some((attached_arn, existing)) = store
+                    .log_groups
+                    .get(&group_name)
+                    .map(|group| (group.log_group_arn.clone(), group.resource_policy.clone()))
+                else {
+                    return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some("The specified log group does not exist".to_string()),
+                        },
+                    )
+                    .into());
+                };
+
+                // "Required when resourceArn is provided to prevent concurrent
+                // modifications. Use null when creating a resource policy for the first
+                // time."
+                match (&existing, input.expected_revision_id.as_deref()) {
+                    (None, Some(_)) => {
+                        return Err(invalid(
+                            "expectedRevisionId must be omitted when creating the resource policy for a resource for the first time",
+                        ));
+                    }
+                    (Some(_), None) => {
+                        return Err(invalid(
+                            "expectedRevisionId is required when resourceArn names a resource that already has a resource policy",
+                        ));
+                    }
+                    (Some(current), Some(expected))
+                        if current.revision_id.as_deref() != Some(expected) =>
+                    {
+                        return Err(
+                            PutResourcePolicyErrorModeled::OperationAbortedException(
+                                OperationAbortedException {
+                                    message: Some(
+                                        "expectedRevisionId does not match the current revision of this resource policy"
+                                            .to_string(),
+                                    ),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                    _ => {}
+                }
+
+                // Every accepted put moves the policy to a revision no earlier one used,
+                // so the next update must present this one.
+                let revision_id = crate::state::mint_revision_id(store.take_policy_revision());
+                let record = crate::state::ResourcePolicyRecord {
+                    policy_name: policy_name.to_string(),
+                    policy_document: policy_document.to_string(),
+                    last_updated_time_ms: now,
+                    // The ARN as the log group reports it, so a request naming the
+                    // group's `arn` form (with its trailing `:*`) and one naming its
+                    // `logGroupArn` form attach to, and report, the same resource.
+                    resource_arn: Some(attached_arn),
+                    revision_id: Some(revision_id),
+                };
+                if let Some(group) = store.log_groups.get_mut(&group_name) {
+                    group.resource_policy = Some(record.clone());
+                }
+                record
+            }
+            // Account-scoped: keyed by `policyName`, and the account holds at most ten.
+            None => {
+                // The revision guard serializes updates of ONE resource's policy;
+                // without a resource there is nothing for it to guard.
+                if input.expected_revision_id.is_some() {
+                    return Err(invalid(
+                        "expectedRevisionId is only valid when resourceArn is specified",
+                    ));
+                }
+                // "An account can have a maximum of 10 policies without resourceARN."
+                // Replacing a policy that already exists is an update, not a new one.
+                if !store.account_resource_policies.contains_key(policy_name)
+                    && store.account_resource_policies.len()
+                        >= crate::state::MAX_ACCOUNT_RESOURCE_POLICIES
+                {
+                    return Err(PutResourcePolicyErrorModeled::LimitExceededException(
+                        LimitExceededException {
+                            message: Some(format!(
+                                "an account can have a maximum of {} resource policies without a resourceArn",
+                                crate::state::MAX_ACCOUNT_RESOURCE_POLICIES
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                let record = crate::state::ResourcePolicyRecord {
+                    policy_name: policy_name.to_string(),
+                    policy_document: policy_document.to_string(),
+                    last_updated_time_ms: now,
+                    resource_arn: None,
+                    revision_id: None,
+                };
+                store
+                    .account_resource_policies
+                    .insert(policy_name.to_string(), record.clone());
+                record
+            }
+        };
+
+        Ok(PutResourcePolicyOutput {
+            // "Only returned for resource-scoped policies" — which are exactly the
+            // policies that carry a revision.
+            revision_id: record.revision_id.clone(),
+            resource_policy: Some(ResourcePolicy {
+                policy_name: Some(record.policy_name.clone()),
+                policy_document: Some(record.policy_document.clone()),
+                last_updated_time: Some(record.last_updated_time_ms),
+                policy_scope: Some(record.policy_scope().to_string()),
+                resource_arn: record.resource_arn.clone(),
+                revision_id: record.revision_id,
+            }),
+        })
     }
 }

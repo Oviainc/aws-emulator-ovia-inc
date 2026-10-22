@@ -40,7 +40,8 @@ const PIPELINE_ARN: &str = "arn:aws:osis:eu-west-2:000000000000:pipeline/endpoin
 ///
 /// Source: `smithy_query(query="shape", shape="com.amazonaws.osis#SubnetId,com.amazonaws.osis#SecurityGroupId,com.amazonaws.osis#PipelineEndpointId")`
 /// — `@length(min, max)` and `@pattern`. `pattern` is written here in the
-/// unanchored form a validation message states it in.
+/// PUBLISHED form a validation message states it in; `tests/all/pattern_messages.rs`
+/// owns that rule and its rows.
 struct ElementShape {
     max_length: i64,
     min_length: i64,
@@ -62,11 +63,12 @@ const SECURITY_GROUP_ID: ElementShape = ElementShape {
 };
 
 /// `com.amazonaws.osis#PipelineEndpointId`: `@length(3, 512)`,
-/// `@pattern("^[a-zA-Z0-9][a-zA-Z0-9-_]+$")`.
+/// `@pattern("^[a-zA-Z0-9][a-zA-Z0-9-_]+$")` — one leading character plus 2..511
+/// more is the 3..512 the length bound states.
 const PIPELINE_ENDPOINT_ID: ElementShape = ElementShape {
     max_length: 512,
     min_length: 3,
-    pattern: r"[a-zA-Z0-9][a-zA-Z0-9-_]+.*",
+    pattern: r"[a-zA-Z0-9][a-zA-Z0-9-_]{2,511}",
 };
 
 /// A security group id the model accepts, for a row that refuses only the other
@@ -331,8 +333,8 @@ async fn a_constrained_collection_member_is_refused_once_with_its_whole_contract
 }
 
 /// A member that is not a constrained collection keeps the framework's own
-/// per-member clause: no bracketed value, no enumerated contract, anchors as the
-/// model writes them.
+/// per-member clause: no bracketed value and no enumerated contract, one clause
+/// per constraint it failed.
 #[tokio::test]
 async fn a_scalar_member_keeps_the_frameworks_own_clause() {
     let router = new_router();
@@ -362,8 +364,8 @@ async fn a_scalar_member_keeps_the_frameworks_own_clause() {
         "case {case:?}: expected the framework's per-member clause, got {message:?}"
     );
     assert!(
-        message.contains("pattern: ^arn:"),
-        "case {case:?}: a scalar member's pattern stays as the model writes it, got {message:?}"
+        message.contains("pattern: arn:"),
+        "case {case:?}: a scalar member states its own pattern clause, got {message:?}"
     );
     assert!(
         !message.contains("Member must satisfy constraint: ["),

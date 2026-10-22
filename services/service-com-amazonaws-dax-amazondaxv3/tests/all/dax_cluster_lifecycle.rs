@@ -95,6 +95,24 @@ fn create_cluster_body(name: &str, replication_factor: i64) -> Value {
     })
 }
 
+/// The subnets that EXIST in `REGION`'s network — the only identifiers a subnet group
+/// may name (`state::region_subnets`).
+fn existing_subnets() -> Vec<String> {
+    state::region_subnets(REGION)
+        .into_iter()
+        .map(|subnet| subnet.subnet_id)
+        .collect()
+}
+
+/// One subnet that exists in `REGION`.
+fn a_subnet() -> String {
+    state::region_subnets(REGION)
+        .first()
+        .expect("a Region has subnets")
+        .subnet_id
+        .clone()
+}
+
 /// Create a cluster and drive it to `available`, returning its describe view.
 async fn available_cluster(router: &MultiServiceRouter, name: &str, nodes: i64) -> Value {
     let (status, body) = call(router, "CreateCluster", create_cluster_body(name, nodes)).await;
@@ -136,13 +154,14 @@ async fn the_cluster_lifecycle_round_trips_through_persisted_state() {
     let router = emulator();
 
     // 1. CreateSubnetGroup, read back through DescribeSubnetGroups.
+    let subnets = existing_subnets();
     let (status, created) = call(
         &router,
         "CreateSubnetGroup",
         json!({
             "SubnetGroupName": "dax-subnets",
             "Description": "two subnets",
-            "SubnetIds": ["subnet-1", "subnet-2"],
+            "SubnetIds": [subnets[0], subnets[1]],
         }),
     )
     .await;
@@ -412,7 +431,7 @@ async fn a_resource_name_is_stored_lower_cased_and_resolves_case_insensitively()
         let (status, body) = call(
             &router,
             "CreateSubnetGroup",
-            json!({ "SubnetGroupName": given, "SubnetIds": ["subnet-1"] }),
+            json!({ "SubnetGroupName": given, "SubnetIds": [a_subnet()] }),
         )
         .await;
         assert_eq!(status, 200, "case {given:?}: CreateSubnetGroup got {body:?}");
@@ -759,7 +778,7 @@ async fn each_store_is_bounded_and_a_create_past_the_bound_is_refused() {
         let (status, body) = call(
             &router,
             "CreateSubnetGroup",
-            json!({ "SubnetGroupName": name, "SubnetIds": ["subnet-1"] }),
+            json!({ "SubnetGroupName": name, "SubnetIds": [a_subnet()] }),
         )
         .await;
         assert_eq!(
@@ -770,7 +789,7 @@ async fn each_store_is_bounded_and_a_create_past_the_bound_is_refused() {
     let (status, body) = call(
         &router,
         "CreateSubnetGroup",
-        json!({ "SubnetGroupName": "sgquota-over", "SubnetIds": ["subnet-1"] }),
+        json!({ "SubnetGroupName": "sgquota-over", "SubnetIds": [a_subnet()] }),
     )
     .await;
     assert_eq!(
@@ -784,10 +803,12 @@ async fn each_store_is_bounded_and_a_create_past_the_bound_is_refused() {
         "case subnet group bound: expected SubnetGroupQuotaExceededFault, got {body:?}"
     );
 
-    // The subnets-per-group and tags-per-cluster bounds, on a fresh store.
+    // The subnets-per-group and tags-per-cluster bounds, on a fresh store. Every
+    // identifier must name a subnet that EXISTS, so the rows fill the quota by
+    // repeating one rather than by inventing identifiers.
     let router = emulator();
     let at_bound: Vec<String> = (0..state::MAX_SUBNETS_PER_GROUP)
-        .map(|index| format!("subnet-{index}"))
+        .map(|_| a_subnet())
         .collect();
     let (status, body) = call(
         &router,
@@ -801,7 +822,7 @@ async fn each_store_is_bounded_and_a_create_past_the_bound_is_refused() {
         state::MAX_SUBNETS_PER_GROUP
     );
     let past_bound: Vec<String> = (0..=state::MAX_SUBNETS_PER_GROUP)
-        .map(|index| format!("subnet-{index}"))
+        .map(|_| a_subnet())
         .collect();
     let (status, body) = call(
         &router,
@@ -859,7 +880,7 @@ async fn a_truncated_page_continues_through_its_next_token() {
         let (status, body) = call(
             &router,
             "CreateSubnetGroup",
-            json!({ "SubnetGroupName": name, "SubnetIds": ["subnet-1"] }),
+            json!({ "SubnetGroupName": name, "SubnetIds": [a_subnet()] }),
         )
         .await;
         assert_eq!(status, 200, "case {name}: CreateSubnetGroup got {body:?}");
@@ -980,7 +1001,7 @@ async fn a_name_collision_and_a_dangling_reference_are_refused() {
     let collisions: [(&str, Value, &str); 2] = [
         (
             "CreateSubnetGroup",
-            json!({ "SubnetGroupName": "collide", "SubnetIds": ["subnet-1"] }),
+            json!({ "SubnetGroupName": "collide", "SubnetIds": [a_subnet()] }),
             "SubnetGroupAlreadyExistsFault",
         ),
         (
@@ -1047,25 +1068,35 @@ async fn a_name_collision_and_a_dangling_reference_are_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule: a subnet group's VPC is a function of the SET of subnet identifiers it names
-// — order-independent, so one set is always one VPC and two different sets are
-// different VPCs — and a subnet's zone is a function of its own identifier.
+// Rule: a subnet group reports, for every subnet it names, the VPC and the
+// Availability Zone the REGION'S NETWORK holds for that subnet — so the group's VpcId
+// is the VPC its subnets belong to, and one identifier always reports one zone,
+// whatever the order of the request or the repeats in it.
+// Source: `state::region_subnets` / `state::default_vpc_id` (the Region's default-VPC
+// subnets), reported through `SubnetGroup$VpcId` and `Subnet$SubnetAvailabilityZone`.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_subnet_groups_vpc_and_zones_are_derived_from_its_subnet_identifiers() {
+async fn a_subnet_groups_vpc_and_zones_come_from_the_regions_network() {
     let router = emulator();
+    let known = state::region_subnets(REGION);
+    let ids: Vec<String> = known
+        .iter()
+        .map(|subnet| subnet.subnet_id.clone())
+        .collect();
 
-    // Rows: the same set in two orders, a set with a repeated identifier, and a
-    // different set.
-    let cases: [(&str, Vec<&str>); 4] = [
-        ("group-a", vec!["subnet-1", "subnet-2", "subnet-3"]),
-        ("group-b", vec!["subnet-3", "subnet-1", "subnet-2"]),
-        ("group-c", vec!["subnet-1", "subnet-2", "subnet-2", "subnet-3"]),
-        ("group-d", vec!["subnet-9"]),
+    // Rows: every subnet of the Region, the same set in the opposite order, a set with
+    // a repeated identifier, and a single subnet.
+    let cases: [(&str, Vec<String>); 4] = [
+        ("group-a", ids.clone()),
+        ("group-b", ids.iter().rev().cloned().collect()),
+        (
+            "group-c",
+            vec![ids[0].clone(), ids[1].clone(), ids[1].clone()],
+        ),
+        ("group-d", vec![ids[2].clone()]),
     ];
 
-    let mut vpcs: Vec<(String, String)> = Vec::new();
     for (name, subnet_ids) in cases {
         let (status, body) = call(
             &router,
@@ -1075,37 +1106,29 @@ async fn a_subnet_groups_vpc_and_zones_are_derived_from_its_subnet_identifiers()
         .await;
         assert_eq!(status, 200, "case {name}: CreateSubnetGroup got {body:?}");
         let group = &body["SubnetGroup"];
-        let vpc = group["VpcId"].as_str().unwrap_or_default().to_string();
-        assert!(
-            vpc.starts_with("vpc-"),
-            "case {name}: expected an EC2-shaped VPC id, got {vpc:?}"
+        assert_eq!(
+            group["VpcId"],
+            json!(state::default_vpc_id(REGION)),
+            "case {name}: the group reports the VPC its subnets belong to, got {group:?}"
         );
         for subnet in group["Subnets"].as_array().expect("Subnets is a list") {
-            assert!(
-                subnet["SubnetAvailabilityZone"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .starts_with(REGION),
-                "case {name}: a subnet sits in a zone of the signed region, got {subnet:?}"
+            let id = subnet["SubnetIdentifier"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let expected = known
+                .iter()
+                .find(|candidate| candidate.subnet_id == id)
+                .map(|candidate| candidate.availability_zone.clone());
+            assert_eq!(
+                subnet["SubnetAvailabilityZone"].as_str().map(str::to_string),
+                expected,
+                "case {name}: subnet {id} must report its own zone, got {subnet:?}"
             );
         }
-        vpcs.push((name.to_string(), vpc));
     }
 
-    assert_eq!(
-        vpcs[0].1, vpcs[1].1,
-        "the same subnet set in another order is the same VPC, got {vpcs:?}"
-    );
-    assert_eq!(
-        vpcs[0].1, vpcs[2].1,
-        "repeating an identifier does not change the set, got {vpcs:?}"
-    );
-    assert_ne!(
-        vpcs[0].1, vpcs[3].1,
-        "a different subnet set is a different VPC, got {vpcs:?}"
-    );
-
-    // The zone a subnet identifier maps to is stable across groups.
+    // The zone one identifier reports is the same in every group that names it.
     let zone_of = |group: &Value, id: &str| -> Option<String> {
         group["Subnets"].as_array()?.iter().find_map(|subnet| {
             if subnet["SubnetIdentifier"] == json!(id) {
@@ -1128,8 +1151,8 @@ async fn a_subnet_groups_vpc_and_zones_are_derived_from_its_subnet_identifiers()
     )
     .await;
     assert_eq!(
-        zone_of(&a["SubnetGroups"][0], "subnet-1"),
-        zone_of(&b["SubnetGroups"][0], "subnet-1"),
+        zone_of(&a["SubnetGroups"][0], &ids[0]),
+        zone_of(&b["SubnetGroups"][0], &ids[0]),
         "one subnet identifier always reports one zone, got {a:?} and {b:?}"
     );
 }

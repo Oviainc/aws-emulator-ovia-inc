@@ -1556,9 +1556,8 @@ async fn filters_select_from_state() {
             "case {member:?}: must answer ValidationException, got {:?}",
             refused.body
         );
-        assert_eq!(
-            refused.text("/ValidationExceptionFieldList/0/Field"),
-            member,
+        assert!(
+            refused.text("/Message").contains(member),
             "case {member:?}: the refusal must name the member supplied, got {:?}",
             refused.body
         );

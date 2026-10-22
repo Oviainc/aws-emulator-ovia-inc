@@ -11078,6 +11078,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "quick-xml",
  "serde_json",
  "sha2 0.10.9",
  "tokio",

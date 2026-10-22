@@ -1,11 +1,717 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-cloudformation-cloudformation service.
+//!
+//! One store holds every stack this emulator has ever created, in creation order, so
+//! `CreateStack` / `UpdateStack` / `DeleteStack` write exactly the rows
+//! `DescribeStacks` / `ListStacks` / `GetTemplate` / `DescribeStackEvents` read back.
+//! A deleted stack is NOT dropped: CloudFormation keeps a deleted stack's summary,
+//! template and events addressable by its stack id (`ListStacks`: "Summary information
+//! for stacks that have been deleted is kept for 90 days"; `GetTemplate`: "You can get
+//! the template for running or deleted stacks"), so the single `stacks` vector carries
+//! live and deleted stacks alike and `StoredStack::is_live` is what separates them.
+//!
+//! ## Bounds
+//!
+//! Every growth site in this store is bounded, because a caller chooses both how many
+//! records it writes and how big each one is: [`MAX_STACKS`] live stacks (past which
+//! `CreateStack` answers the modelled `LimitExceededException`),
+//! [`MAX_DELETED_STACKS_RETAINED`] completed deletions (the oldest deletion is reclaimed
+//! past that, which is this emulator's stand-in for CloudFormation's 90-day retention of
+//! deleted-stack summaries), [`MAX_EVENTS_PER_STACK`] events per stack (oldest-first),
+//! [`TEMPLATE_BODY_MAX_BYTES`] per stored template body (the documented `TemplateBody`
+//! maximum, which the model carries no `@length` for) and [`PAGE_SIZE`] items per
+//! paginated response.
+//!
+//! ## Status transitions the clock owes
+//!
+//! CloudFormation answers `CreateStack` / `UpdateStack` / `DeleteStack` while the
+//! operation is still in progress and settles the stack a moment later. Each call
+//! therefore records a [`PendingStatus`] with the instant its terminal status becomes
+//! due, and every operation calls [`ComAmazonawsCloudformationCloudformationState::settle`]
+//! first: a caller that reads straight after the write still sees `*_IN_PROGRESS`, and
+//! one that reads after the due instant sees the terminal status and the event that
+//! carries it. Nothing sleeps, and no read invents a transition the clock had not
+//! already made due.
+
+use std::time::{Duration, SystemTime};
+
+/// How long after the call that starts it a stack's terminal status becomes due.
+///
+/// Chosen (CloudFormation's real stack operations take as long as the resources do, so
+/// there is no documented value to honour): long enough that a caller acting straight
+/// after a create, update or delete observes the `*_IN_PROGRESS` status and the state
+/// errors that go with it, short enough that a test can wait for it.
+pub const STATUS_TRANSITION_DELAY: Duration = Duration::from_millis(500);
+
+/// The region an unsigned request is served as. The emulator's own default; a signed
+/// request is served in the region of its SigV4 credential scope.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// This service's ARN namespace (`awsService.arnNamespace` in the model).
+pub const ARN_NAMESPACE: &str = "cloudformation";
+
+/// The resource type CloudFormation reports on a stack-level event.
+pub const STACK_RESOURCE_TYPE: &str = "AWS::CloudFormation::Stack";
+
+/// `StackDriftStatus` for a stack that has never been checked for drift — every stack
+/// here, since drift detection is not implemented.
+pub const DRIFT_STATUS_NOT_CHECKED: &str = "NOT_CHECKED";
+
+/// The most LIVE stacks this emulator holds.
+///
+/// CloudFormation meters stacks per Region and models `LimitExceededException` on
+/// `CreateStack` for exactly that case ("The quota for the resource has already been
+/// reached. For information about resource and stack limitations, see CloudFormation
+/// quotas"); the documented default stack quota is 2,000 per Region and is adjustable
+/// through Service Quotas, so this is that default as this emulator's own ceiling. It is
+/// what bounds the live half of the store: one record, one template body and one event
+/// log per live stack.
+pub const MAX_STACKS: usize = 2_000;
+
+/// The most stacks in `DELETE_COMPLETE` this emulator keeps.
+///
+/// CloudFormation keeps a deleted stack's summary, template and events addressable by
+/// stack id for 90 days and then reclaims them. This emulator has no 90-day clock worth
+/// emulating, so it bounds the same retention by COUNT instead: past this many completed
+/// deletions the oldest deletion is reclaimed, so a caller that creates and deletes in a
+/// loop cannot grow the store without limit. Chosen, like every count here; it sits far
+/// above any client workflow.
+pub const MAX_DELETED_STACKS_RETAINED: usize = 200;
+
+/// The most events one stack retains, oldest evicted first.
+///
+/// CloudFormation bounds a stack's event history by age, not by count; a caller here can
+/// drive an unbounded number of updates against one stack, so the emulator bounds the log
+/// by count. Chosen: far more than the handful of events any client workflow reads.
+pub const MAX_EVENTS_PER_STACK: usize = 1_000;
+
+/// The most bytes of template body this service stores.
+///
+/// `CreateStackInput$TemplateBody`: "Structure that contains the template body with a
+/// minimum length of 1 byte and a maximum length of 51,200 bytes." The model carries only
+/// `@length(min: 1)`, so the handler is what enforces the documented maximum.
+pub const TEMPLATE_BODY_MAX_BYTES: usize = 51_200;
+
+/// How many items one page of a paginated read carries.
+///
+/// CloudFormation pages `DescribeStacks`, `ListStacks` and `DescribeStackEvents` by
+/// response SIZE ("If the output exceeds 1 MB in size"), which is not a count a client can
+/// depend on, so this emulator pages by a fixed count instead — chosen, and the thing that
+/// keeps one response bounded however large the store is.
+pub const PAGE_SIZE: usize = 100;
+
+/// `Err(message)` for a `TemplateBody` past its documented maximum, naming the member and
+/// the constraint it failed.
+pub fn validate_template_body(template_body: &str) -> Result<(), String> {
+    if template_body.len() > TEMPLATE_BODY_MAX_BYTES {
+        return Err(format!(
+            "1 validation error detected: Value at 'templateBody' failed to satisfy \
+             constraint: Member must have length less than or equal to \
+             {TEMPLATE_BODY_MAX_BYTES}"
+        ));
+    }
+    Ok(())
+}
+
+/// `StackStatus` values this service puts a stack into (all from the model's
+/// `StackStatus` enum).
+pub mod status {
+    pub const CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
+    pub const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+    pub const UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
+    pub const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
+    pub const DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
+    pub const DELETE_COMPLETE: &str = "DELETE_COMPLETE";
+}
+
+/// The reason CloudFormation records on the event that opens a stack operation.
+pub const USER_INITIATED: &str = "User Initiated";
+
+/// A resolved stack parameter: the key and the value in force on the stack.
+///
+/// `Parameter$UsePreviousValue` is a request-time instruction, not stored state — it is
+/// resolved against the stored value when an update is applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredParameter {
+    pub key: String,
+    pub value: String,
+}
+
+/// A stack tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredTag {
+    pub key: String,
+    pub value: String,
+}
+
+/// `DeploymentConfig` as supplied on the call that last set it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredDeploymentConfig {
+    pub mode: Option<String>,
+    pub disable_rollback: Option<bool>,
+}
+
+/// One `RollbackTrigger` of a stack's rollback configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredRollbackTrigger {
+    pub arn: String,
+    pub trigger_type: String,
+}
+
+/// `RollbackConfiguration` as supplied on the call that last set it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredRollbackConfiguration {
+    pub triggers: Vec<StoredRollbackTrigger>,
+    pub monitoring_time_in_minutes: Option<i32>,
+}
+
+/// One stack event, appended (never overwritten) by the operation that caused it.
+#[derive(Debug, Clone)]
+pub struct StoredEvent {
+    pub event_id: String,
+    pub stack_id: String,
+    pub stack_name: String,
+    pub operation_id: Option<String>,
+    pub logical_resource_id: String,
+    pub physical_resource_id: Option<String>,
+    pub resource_type: String,
+    pub timestamp: SystemTime,
+    pub resource_status: String,
+    pub resource_status_reason: Option<String>,
+    pub client_request_token: Option<String>,
+}
+
+/// The terminal status a stack operation is headed for, and the instant it is due.
+#[derive(Debug, Clone)]
+pub struct PendingStatus {
+    pub status: String,
+    pub due_at: SystemTime,
+    pub operation_id: Option<String>,
+    pub client_request_token: Option<String>,
+}
+
+/// One stack, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct StoredStack {
+    pub stack_id: String,
+    pub stack_name: String,
+    pub template_body: String,
+    /// The template's own `Description`, parsed once when the body is stored rather than
+    /// on every read: this is where CloudFormation takes both `Stack$Description` and
+    /// `StackSummary$TemplateDescription` from, and a read must not re-parse a
+    /// caller-sized body under the store lock.
+    pub template_description: Option<String>,
+    pub parameters: Vec<StoredParameter>,
+    pub capabilities: Vec<String>,
+    pub tags: Vec<StoredTag>,
+    pub notification_arns: Vec<String>,
+    pub role_arn: Option<String>,
+    pub timeout_in_minutes: Option<i32>,
+    pub disable_rollback: bool,
+    pub enable_termination_protection: bool,
+    pub retain_except_on_create: Option<bool>,
+    pub deployment_config: Option<StoredDeploymentConfig>,
+    pub rollback_configuration: Option<StoredRollbackConfiguration>,
+    pub deletion_mode: Option<String>,
+    /// The stack policy body in force, as `CreateStack`/`UpdateStack` last supplied it.
+    ///
+    /// A stack policy governs which of a stack's RESOURCES an update may change; this
+    /// slice creates no stack resources, so the policy has nothing to protect yet and is
+    /// stored (and reported by `GetStackPolicy`) rather than enforced.
+    pub stack_policy_body: Option<String>,
+    /// `ResourceTypes`: the resource types this stack's operations may work with. Stored
+    /// as supplied; it constrains resource creation, which this slice does not do.
+    pub resource_types: Vec<String>,
+    pub status: String,
+    pub status_reason: Option<String>,
+    pub pending: Option<PendingStatus>,
+    pub creation_time: SystemTime,
+    pub last_updated_time: Option<SystemTime>,
+    pub deletion_time: Option<SystemTime>,
+    pub client_request_token: Option<String>,
+    pub events: ::std::collections::VecDeque<StoredEvent>,
+}
+
+impl StoredStack {
+    /// A stack as `CreateStack` first stores it: the identity and the template, with every
+    /// optional member at its default. The caller fills in what the request supplied and
+    /// then opens the create transition.
+    pub fn new(stack_id: String, stack_name: String, template_body: String, now: SystemTime) -> Self {
+        Self {
+            stack_id,
+            stack_name,
+            template_description: template_description(&template_body),
+            template_body,
+            parameters: Vec::new(),
+            capabilities: Vec::new(),
+            tags: Vec::new(),
+            notification_arns: Vec::new(),
+            role_arn: None,
+            timeout_in_minutes: None,
+            disable_rollback: false,
+            enable_termination_protection: false,
+            retain_except_on_create: None,
+            deployment_config: None,
+            rollback_configuration: None,
+            deletion_mode: None,
+            stack_policy_body: None,
+            resource_types: Vec::new(),
+            status: status::CREATE_IN_PROGRESS.to_string(),
+            status_reason: None,
+            pending: None,
+            creation_time: now,
+            last_updated_time: None,
+            deletion_time: None,
+            client_request_token: None,
+            events: ::std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Replace the stored template body, re-deriving the description it carries.
+    pub fn set_template_body(&mut self, template_body: String) {
+        self.template_description = template_description(&template_body);
+        self.template_body = template_body;
+    }
+
+    /// Whether this stack is still part of the live set — the set addressable by stack
+    /// NAME. A stack whose deletion has completed is reachable only by its stack id
+    /// (`DescribeStacksInput$StackName`: "Deleted stacks: You must specify the unique
+    /// stack ID").
+    pub fn is_live(&self) -> bool {
+        self.status != status::DELETE_COMPLETE
+    }
+
+    /// The stack's `Description`: the template's own `Description`, which is where
+    /// CloudFormation takes both `Stack$Description` and
+    /// `StackSummary$TemplateDescription` from.
+    pub fn description(&self) -> Option<String> {
+        self.template_description.clone()
+    }
+
+    /// Append a stack-level event. `LogicalResourceId` is the stack's name and
+    /// `PhysicalResourceId` its id, as CloudFormation reports for the stack's own
+    /// resource.
+    /// The log is bounded at [`MAX_EVENTS_PER_STACK`]: past that the OLDEST event is
+    /// reclaimed, so one caller cannot grow a single stack's history without limit.
+    pub fn record_event(
+        &mut self,
+        at: SystemTime,
+        resource_status: &str,
+        resource_status_reason: Option<String>,
+        operation_id: Option<String>,
+        client_request_token: Option<String>,
+    ) {
+        // Oldest-first eviction off the FRONT of a deque, so the bound costs O(1) rather
+        // than a shift of the whole log.
+        while self.events.len() >= MAX_EVENTS_PER_STACK {
+            self.events.pop_front();
+        }
+        self.events.push_back(StoredEvent {
+            event_id: new_identifier(&self.stack_id),
+            stack_id: self.stack_id.clone(),
+            stack_name: self.stack_name.clone(),
+            operation_id,
+            logical_resource_id: self.stack_name.clone(),
+            physical_resource_id: Some(self.stack_id.clone()),
+            resource_type: STACK_RESOURCE_TYPE.to_string(),
+            timestamp: at,
+            resource_status: resource_status.to_string(),
+            resource_status_reason,
+            client_request_token,
+        });
+    }
+
+    /// Materialise the status transition the clock has already made due, if any.
+    ///
+    /// Only ever applies a transition whose due instant has passed, so it reports what
+    /// was owed at `now` even if nobody had called — it never advances a stack because
+    /// it was read.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.pending.as_ref().is_none_or(|p| p.due_at > now) {
+            return;
+        }
+        let pending = self.pending.take().expect("checked just above");
+        self.status = pending.status;
+        self.status_reason = None;
+        if self.status == status::DELETE_COMPLETE {
+            self.deletion_time = Some(pending.due_at);
+        }
+        let status = self.status.clone();
+        self.record_event(
+            pending.due_at,
+            &status,
+            None,
+            pending.operation_id,
+            pending.client_request_token,
+        );
+    }
+
+    /// Start a stack operation: move the stack to its `*_IN_PROGRESS` status, record the
+    /// opening event, and make the terminal status due one [`STATUS_TRANSITION_DELAY`]
+    /// from now.
+    pub fn begin_transition(
+        &mut self,
+        now: SystemTime,
+        in_progress: &str,
+        settles_to: &str,
+        operation_id: Option<String>,
+        client_request_token: Option<String>,
+    ) {
+        self.status = in_progress.to_string();
+        self.status_reason = Some(USER_INITIATED.to_string());
+        self.record_event(
+            now,
+            in_progress,
+            Some(USER_INITIATED.to_string()),
+            operation_id.clone(),
+            client_request_token.clone(),
+        );
+        self.pending = Some(PendingStatus {
+            status: settles_to.to_string(),
+            due_at: now + STATUS_TRANSITION_DELAY,
+            operation_id,
+            client_request_token,
+        });
+    }
+}
 
 /// Per-service state for com-amazonaws-cloudformation-cloudformation. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudformationCloudformationState {
-    // TODO: add service-specific state fields
+    /// Every stack, in creation order, so `DescribeStacks` and `ListStacks` are
+    /// deterministic. Includes deleted stacks (see this module's docs).
+    pub stacks: Vec<StoredStack>,
+}
+
+impl ComAmazonawsCloudformationCloudformationState {
+    /// Materialise every status transition the clock has made due, then enforce the
+    /// retention bound on completed deletions. Called first by every operation, so no
+    /// caller can observe a stack that should have settled already, or one the retention
+    /// policy had already reclaimed.
+    pub fn settle(&mut self, now: SystemTime) {
+        for stack in &mut self.stacks {
+            stack.settle(now);
+        }
+        self.reclaim_retired_stacks();
+    }
+
+    /// Drop the oldest completed deletions past [`MAX_DELETED_STACKS_RETAINED`].
+    ///
+    /// Retention, not a mutation a caller asked for: a deleted stack is over the bound the
+    /// moment the deletion that pushed the count past it completed, whether or not anybody
+    /// called. Live stacks are never touched.
+    fn reclaim_retired_stacks(&mut self) {
+        // Early-out before allocating anything: all but the rare call that completes a
+        // deletion past the bound stops here.
+        let retired_count = self.stacks.iter().filter(|stack| !stack.is_live()).count();
+        if retired_count <= MAX_DELETED_STACKS_RETAINED {
+            return;
+        }
+        let mut retired: Vec<(SystemTime, usize)> = self
+            .stacks
+            .iter()
+            .enumerate()
+            .filter(|(_, stack)| !stack.is_live())
+            .map(|(index, stack)| (stack.deletion_time.unwrap_or(stack.creation_time), index))
+            .collect();
+        // Oldest deletion first, so the rows reclaimed are the ones furthest past the
+        // retention bound.
+        retired.sort_by_key(|(deleted_at, index)| (*deleted_at, *index));
+        let over = retired.len() - MAX_DELETED_STACKS_RETAINED;
+        let reclaimed: ::std::collections::HashSet<usize> =
+            retired.into_iter().take(over).map(|(_, index)| index).collect();
+        // Rebuilt by index rather than driven by a counter beside `retain`, so nothing
+        // depends on the order `retain` happens to visit elements in.
+        self.stacks = ::std::mem::take(&mut self.stacks)
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| !reclaimed.contains(index))
+            .map(|(_, stack)| stack)
+            .collect();
+    }
+
+    /// Resolve the `StackName` input member, which CloudFormation accepts as either a
+    /// stack name or a stack id: a stack id matches any stack, live or deleted, while a
+    /// name matches only a live one.
+    pub fn resolve(&self, name_or_id: &str) -> Option<&StoredStack> {
+        self.position_of(name_or_id).map(|i| &self.stacks[i])
+    }
+
+    /// [`Self::resolve`], for a caller that mutates the stack it resolved.
+    pub fn resolve_mut(&mut self, name_or_id: &str) -> Option<&mut StoredStack> {
+        self.position_of(name_or_id).map(|i| &mut self.stacks[i])
+    }
+
+    /// The live stacks, in creation order: what `DescribeStacks` reports when no
+    /// `StackName` is given ("Deleted stacks don't show up in DescribeStacks if the
+    /// deletion has been completed successfully").
+    pub fn live_stacks(&self) -> impl Iterator<Item = &StoredStack> {
+        self.stacks.iter().filter(|stack| stack.is_live())
+    }
+
+    fn position_of(&self, name_or_id: &str) -> Option<usize> {
+        self.stacks
+            .iter()
+            .position(|stack| stack.stack_id == name_or_id)
+            .or_else(|| {
+                self.stacks
+                    .iter()
+                    .position(|stack| stack.stack_name == name_or_id && stack.is_live())
+            })
+    }
+}
+
+/// The `Description` a CloudFormation template declares, if it declares one.
+///
+/// The template body is caller-supplied text; a body that is not JSON (a YAML template,
+/// say) or that carries no string `Description` simply has none, which is why this
+/// answers `Option` rather than refusing the body.
+pub fn template_description(template_body: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(template_body).ok()?;
+    let description = parsed.get("Description")?.as_str()?;
+    (!description.is_empty()).then(|| description.to_string())
+}
+
+/// The region the request was signed for, or [`DEFAULT_REGION`] for an unsigned one.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Mint a fresh identifier in the 8-4-4-4-12 lowercase-hex form CloudFormation's stack
+/// ids, event ids and operation ids carry.
+///
+/// The value is a SHA-256 digest of a per-process counter, the current instant and the
+/// caller's seed: the counter alone makes every call distinct, so two ids minted in the
+/// same nanosecond still differ, and the digest gives the opaque 128-bit shape a client
+/// sees. It is an identifier, never a secret — nothing authenticates with it, and the
+/// crate's existing `sha2`/`hex` dependencies are all it needs.
+fn new_identifier(seed: &str) -> String {
+    use ::sha2::{Digest, Sha256};
+
+    static MINTED: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+    let counter = MINTED.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    let mut hasher = Sha256::new();
+    hasher.update(seed.as_bytes());
+    hasher.update(counter.to_be_bytes());
+    hasher.update(nanos.to_be_bytes());
+    let digest = ::hex::encode(hasher.finalize());
+
+    format!(
+        "{}-{}-{}-{}-{}",
+        &digest[0..8],
+        &digest[8..12],
+        &digest[12..16],
+        &digest[16..20],
+        &digest[20..32]
+    )
+}
+
+/// Mint a stack id: `arn:aws:cloudformation:<region>:<account>:stack/<name>/<uuid>`,
+/// the form CloudFormation gives a stack. The account segment comes from the
+/// emulator-wide [`::emulator_server::emulator_arn`] helper.
+pub fn new_stack_id(region: &str, stack_name: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("stack/{stack_name}/{}", new_identifier(stack_name)),
+    )
+}
+
+/// Mint an id for one stack operation (`CreateStackOutput$OperationId` and the
+/// `StackEvent$OperationId` of every event that operation causes).
+pub fn new_operation_id() -> String {
+    new_identifier("operation")
+}
+
+/// The message CloudFormation answers when a request names a stack that is not
+/// addressable: no live stack has that name and no stack has that id.
+pub fn stack_does_not_exist(name_or_id: &str) -> String {
+    format!("Stack with id {name_or_id} does not exist")
+}
+
+/// `Some(list)` unless the list is empty, which the wire shapes spell as an absent
+/// member rather than an empty one.
+pub fn non_empty<T>(list: Vec<T>) -> Option<Vec<T>> {
+    (!list.is_empty()).then_some(list)
+}
+
+/// Which paginated read a cursor belongs to. A token one operation issued must not
+/// resume a page of another operation's collection, so the cursor carries the collection
+/// it counts into and a token from elsewhere is refused rather than silently applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageOf {
+    /// `DescribeStacks`'s `Stacks`.
+    Stacks,
+    /// `ListStacks`'s `StackSummaries`.
+    StackSummaries,
+    /// `DescribeStackEvents`'s `StackEvents`.
+    StackEvents,
+}
+
+impl PageOf {
+    /// The discriminant the cursor carries.
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Stacks => "stacks",
+            Self::StackSummaries => "summaries",
+            Self::StackEvents => "events",
+        }
+    }
+}
+
+/// Encode a page cursor as an opaque, self-describing `NextToken`.
+///
+/// Hex of the JSON cursor: it satisfies the modelled `NextToken` length (1..1024) and
+/// carries the whole cursor, so paging needs no server-side token table — a reporting
+/// operation must not write to state just because it was read.
+pub fn encode_next_token(page_of: PageOf, offset: usize) -> String {
+    ::hex::encode(::serde_json::json!({ "c": page_of.tag(), "o": offset }).to_string())
+}
+
+/// The offset a `NextToken` resumes at, or `None` when the token is not one this service
+/// issued for THIS collection.
+pub fn decode_next_token(page_of: PageOf, token: &str) -> Option<usize> {
+    let bytes = ::hex::decode(token).ok()?;
+    let cursor: ::serde_json::Value = ::serde_json::from_slice(&bytes).ok()?;
+    if cursor.get("c")?.as_str()? != page_of.tag() {
+        return None;
+    }
+    usize::try_from(cursor.get("o")?.as_u64()?).ok()
+}
+
+/// One page of a paginated read: the items from the request's cursor on, at most
+/// [`PAGE_SIZE`] of them, plus the `NextToken` that resumes just past them (`None` on the
+/// last page).
+///
+/// `Err(message)` for a token this service never issued for this collection — a bad
+/// request, not an empty page.
+pub fn paginate<T>(
+    page_of: PageOf,
+    items: Vec<T>,
+    token: Option<&str>,
+) -> Result<(Vec<T>, Option<String>), String> {
+    let offset = match token {
+        None => 0,
+        Some(token) => decode_next_token(page_of, token)
+            .filter(|offset| *offset <= items.len())
+            .ok_or_else(|| format!("Invalid NextToken: {token}"))?,
+    };
+    let remaining = items.len() - offset;
+    let next_token =
+        (remaining > PAGE_SIZE).then(|| encode_next_token(page_of, offset + PAGE_SIZE));
+    let page = items.into_iter().skip(offset).take(PAGE_SIZE).collect();
+    Ok((page, next_token))
+}
+
+/// A stored instant as the modelled timestamp type.
+pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from(at)
+}
+
+/// The request's `Tags` as stored tags.
+pub fn stored_tags(tags: &[crate::ops::types::Tag]) -> Vec<StoredTag> {
+    tags.iter()
+        .map(|tag| StoredTag {
+            key: tag.key.clone(),
+            value: tag.value.clone(),
+        })
+        .collect()
+}
+
+/// Stored tags as the modelled `Tags` member.
+pub fn tag_views(tags: &[StoredTag]) -> Option<Vec<crate::ops::types::Tag>> {
+    non_empty(
+        tags.iter()
+            .map(|tag| crate::ops::types::Tag {
+                key: tag.key.clone(),
+                value: tag.value.clone(),
+            })
+            .collect(),
+    )
+}
+
+/// Stored parameters as the modelled `Parameters` member. `UsePreviousValue` is a
+/// request-time instruction, so it is never reported back; `ResolvedValue` belongs to
+/// SSM-typed parameters, which this emulator does not resolve.
+pub fn parameter_views(
+    parameters: &[StoredParameter],
+) -> Option<Vec<crate::ops::types::Parameter>> {
+    non_empty(
+        parameters
+            .iter()
+            .map(|parameter| crate::ops::types::Parameter {
+                parameter_key: Some(parameter.key.clone()),
+                parameter_value: Some(parameter.value.clone()),
+                use_previous_value: None,
+                resolved_value: None,
+            })
+            .collect(),
+    )
+}
+
+/// The request's `RollbackConfiguration` as stored configuration.
+pub fn stored_rollback_configuration(
+    configuration: Option<&crate::ops::types::RollbackConfiguration>,
+) -> Option<StoredRollbackConfiguration> {
+    configuration.map(|configuration| StoredRollbackConfiguration {
+        triggers: configuration
+            .rollback_triggers
+            .iter()
+            .flatten()
+            .map(|trigger| StoredRollbackTrigger {
+                arn: trigger.arn.clone(),
+                trigger_type: trigger.r#type.clone(),
+            })
+            .collect(),
+        monitoring_time_in_minutes: configuration.monitoring_time_in_minutes,
+    })
+}
+
+/// Stored rollback configuration as the modelled member.
+pub fn rollback_configuration_view(
+    configuration: Option<&StoredRollbackConfiguration>,
+) -> Option<crate::ops::types::RollbackConfiguration> {
+    configuration.map(|configuration| crate::ops::types::RollbackConfiguration {
+        rollback_triggers: non_empty(
+            configuration
+                .triggers
+                .iter()
+                .map(|trigger| crate::ops::types::RollbackTrigger {
+                    arn: trigger.arn.clone(),
+                    r#type: trigger.trigger_type.clone(),
+                })
+                .collect(),
+        ),
+        monitoring_time_in_minutes: configuration.monitoring_time_in_minutes,
+    })
+}
+
+/// The request's `DeploymentConfig` as stored configuration.
+pub fn stored_deployment_config(
+    config: Option<&crate::ops::types::DeploymentConfig>,
+) -> Option<StoredDeploymentConfig> {
+    config.map(|config| StoredDeploymentConfig {
+        mode: config.mode.clone(),
+        disable_rollback: config.disable_rollback,
+    })
+}
+
+/// Stored deployment configuration as the modelled member.
+pub fn deployment_config_view(
+    config: Option<&StoredDeploymentConfig>,
+) -> Option<crate::ops::types::DeploymentConfig> {
+    config.map(|config| crate::ops::types::DeploymentConfig {
+        mode: config.mode.clone(),
+        disable_rollback: config.disable_rollback,
+    })
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

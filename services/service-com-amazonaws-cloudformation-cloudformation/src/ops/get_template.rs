@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: answers the exact template body `CreateStack`/`UpdateStack` persisted
+//! for the named stack — a byte-identical round trip — for a running or a deleted stack.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +81,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The two `TemplateStage` enum values (model shape `TemplateStage`).
+const TEMPLATE_STAGE_ORIGINAL: &str = "Original";
+const TEMPLATE_STAGE_PROCESSED: &str = "Processed";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -156,18 +153,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTemplate"))
+        let _ = ctx;
+        // A change set's template is addressed by `ChangeSetName`. This emulator stores
+        // no change sets, so no change set name or id names one that exists — which is
+        // exactly what the modelled 404 says.
+        if let Some(change_set) = &input.change_set_name {
+            return Err(GetTemplateErrorModeled::ChangeSetNotFoundException(
+                ChangeSetNotFoundException {
+                    message: Some(format!("ChangeSet [{change_set}] does not exist")),
+                },
+            )
+            .into());
+        }
+        let Some(name_or_id) = input.stack_name.as_deref() else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "Either StackName or ChangeSetName must be specified",
+            ));
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no template store to read.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("GetTemplate"));
+        };
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the
+        // clock had already made due.
+        store.settle(::std::time::SystemTime::now());
+
+        // "You can get the template for running or deleted stacks" — a deleted stack is
+        // addressable by its stack id, which is what `resolve` honours. "If the template
+        // doesn't exist, a ValidationError is returned."
+        let stack = store.resolve(name_or_id).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation_error(crate::state::stack_does_not_exist(
+                name_or_id,
+            ))
+        })?;
+
+        // The body is answered verbatim for either stage: this emulator runs no template
+        // transforms, so the processed template IS the original one.
+        // "For stacks, the Original and Processed templates are always available."
+        Ok(GetTemplateOutput {
+            template_body: Some(stack.template_body.clone()),
+            stages_available: Some(vec![
+                TEMPLATE_STAGE_ORIGINAL.to_string(),
+                TEMPLATE_STAGE_PROCESSED.to_string(),
+            ]),
+        })
     }
 }

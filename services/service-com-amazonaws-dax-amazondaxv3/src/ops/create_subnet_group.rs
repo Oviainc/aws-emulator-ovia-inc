@@ -7,10 +7,12 @@
 //! stored. A second create of the same name is refused with
 //! `SubnetGroupAlreadyExistsFault`; a request naming no subnet with `InvalidSubnet`.
 //!
-//! The VPC and each subnet's Availability Zone are DERIVED from the subnet identifiers
-//! (`crate::state::derived_vpc_id` / `subnet_availability_zone`), because this emulator
-//! models no EC2 subnets: one set of identifiers is always one VPC, and one identifier
-//! always one zone.
+//! Every identifier in `SubnetIds` is RESOLVED against the Region's network
+//! (`crate::state::resolve_subnet`), and a request naming an identifier that resolves
+//! to no subnet is refused with 400 `InvalidParameterValueException` and stores
+//! nothing: a subnet group that points at subnets which do not exist is unusable, and
+//! AWS refuses it rather than answering 200. The group's VPC and each subnet's
+//! Availability Zone come from the resolved subnets, not from the identifier text.
 //!
 //! ## Shape of an operation
 //!
@@ -94,9 +96,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dax-amazondaxv3.json");
 // here — hence the `CreateSubnetGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dax#CreateSubnetGroup")]
+//
+// `InvalidParameterValueException` is widened in through `extra_errors`: the SERVICE
+// models it ("The value for a parameter is invalid", HTTP 400) and it is the error AWS
+// answers a `SubnetIds` naming a subnet that does not exist with, but the model's
+// `errors` list for this operation omits it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.dax#CreateSubnetGroup",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum CreateSubnetGroupErrorModeled {
+    InvalidParameterValueException(InvalidParameterValueException),
     InvalidSubnet(InvalidSubnet),
     ServiceLinkedRoleNotFoundFault(ServiceLinkedRoleNotFoundFault),
     SubnetGroupAlreadyExistsFault(SubnetGroupAlreadyExistsFault),
@@ -158,6 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::store(&*self.engine, Self::NAME)?;
         let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
 
         // A group must name at least one subnet: the model's `@required` is satisfied by
         // an empty list, which no VPC subnet group can be built from.
@@ -178,6 +190,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::MAX_SUBNETS_PER_GROUP
                     )),
                 },
+            )
+            .into());
+        }
+
+        // Every identifier must name a subnet that exists in the Region this request
+        // was signed for. An identifier that resolves to nothing cannot be placed in a
+        // VPC or a zone, so the request is refused and NOTHING is stored.
+        let mut resolved = Vec::with_capacity(input.subnet_ids.len());
+        let mut unresolved: Vec<String> = Vec::new();
+        for subnet_id in &input.subnet_ids {
+            match crate::state::resolve_subnet(&region, subnet_id) {
+                Some(subnet) => resolved.push(subnet),
+                None if unresolved.contains(subnet_id) => {}
+                None => unresolved.push(subnet_id.clone()),
+            }
+        }
+        if !unresolved.is_empty() {
+            return Err(CreateSubnetGroupErrorModeled::InvalidParameterValueException(
+                crate::state::invalid_subnets(&unresolved),
             )
             .into());
         }
@@ -209,12 +240,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::SubnetGroupRecord {
             name: name.clone(),
             description: input.description,
-            vpc_id: crate::state::derived_vpc_id(&input.subnet_ids),
-            subnet_ids: input.subnet_ids,
+            // Every subnet of this emulator's network sits in the Region's one VPC, so
+            // the group's VPC is the VPC its resolved subnets belong to.
+            vpc_id: resolved
+                .first()
+                .map(|subnet| subnet.vpc_id.clone())
+                .unwrap_or_else(|| crate::state::default_vpc_id(&region)),
+            subnets: resolved,
             region,
         };
         let view = record.view();
-        store.subnet_groups.insert(name, record);
+        store.subnet_groups.insert(name.clone(), record);
+        store.record_event(
+            &name,
+            crate::state::SOURCE_TYPE_SUBNET_GROUP,
+            crate::state::EVENT_SUBNET_GROUP_CREATED,
+            now,
+        );
 
         Ok(CreateSubnetGroupOutput {
             subnet_group: Some(view),

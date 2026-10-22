@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLoadBalancer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLoadBalancer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLoadBalancer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints and persists a load balancer in [`crate::state`] and answers with the
+//! stored record. The model documents the operation as idempotent — "if you attempt
+//! to create multiple load balancers with the same settings, each call succeeds" —
+//! so a repeat of the same name with the same settings returns the stored load
+//! balancer, and only a repeat with DIFFERENT settings is
+//! `DuplicateLoadBalancerNameException`.
 //!
 //! ## Shape of an operation
 //!
@@ -138,6 +136,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{AvailabilityZoneRecord, LoadBalancerAddressRecord, LoadBalancerRecord};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -218,18 +218,227 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLoadBalancer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLoadBalancerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLoadBalancer"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("CreateLoadBalancer")
+        })?;
+        let region = crate::state::request_region(ctx);
+        let now = std::time::SystemTime::now();
+
+        // The model: "You must specify either subnets or subnet mappings, but not
+        // both." The model cannot express that pairing, so the handler refuses it
+        // with the modelled "requested configuration is not valid" error rather than
+        // merging the two lists into one zone set.
+        let subnets = input.subnets.as_deref().unwrap_or_default();
+        let subnet_mappings = input.subnet_mappings.as_deref().unwrap_or_default();
+        if !subnets.is_empty() && !subnet_mappings.is_empty() {
+            return Err(invalid_configuration(
+                "Specify either Subnets or SubnetMappings, but not both",
+            ));
+        }
+        if subnets.is_empty() && subnet_mappings.is_empty() {
+            return Err(invalid_configuration(
+                "You must specify either Subnets or SubnetMappings",
+            ));
+        }
+
+        let mut candidate = LoadBalancerRecord {
+            arn: String::new(),
+            id: String::new(),
+            name: input.name.clone(),
+            dns_name: String::new(),
+            created_time: now,
+            // The modelled default for `Scheme`: "the default is an Internet-facing
+            // load balancer".
+            scheme: input
+                .scheme
+                .clone()
+                .unwrap_or_else(|| "internet-facing".to_string()),
+            // The VPC of a subnet is EC2 state this emulator does not model, and
+            // nothing in the request carries it, so it is left unreported rather
+            // than invented.
+            vpc_id: None,
+            state_code: "provisioning".to_string(),
+            active_at: now + crate::state::SETTLE_AFTER,
+            // The modelled default for `Type`: "the default is application".
+            lb_type: input
+                .r#type
+                .clone()
+                .unwrap_or_else(|| "application".to_string()),
+            availability_zones: availability_zones(&input, &region),
+            security_groups: input.security_groups.clone().unwrap_or_default(),
+            // The modelled default for `IpAddressType`.
+            ip_address_type: input
+                .ip_address_type
+                .clone()
+                .unwrap_or_else(|| "ipv4".to_string()),
+            customer_owned_ipv4_pool: input.customer_owned_ipv4_pool.clone(),
+            attributes: std::collections::HashMap::new(),
+            tags: tag_map(input.tags.as_deref())?,
+            listener_arns: Vec::new(),
+        };
+
+        let mut guard = state.lock();
+        guard.settle(now);
+
+        if let Some(existing) = guard
+            .name_to_lb_arn
+            .get(&candidate.name)
+            .and_then(|arn| guard.load_balancers.get(arn))
+        {
+            if existing.has_settings_of(&candidate) {
+                // The idempotent repeat the model documents: answer with the stored
+                // load balancer and mint nothing.
+                return Ok(CreateLoadBalancerOutput {
+                    load_balancers: Some(vec![existing.to_shape()]),
+                });
+            }
+            return Err(CreateLoadBalancerErrorModeled::DuplicateLoadBalancerNameException(
+                DuplicateLoadBalancerNameException {
+                    message: Some(format!(
+                        "A load balancer with the name '{}' already exists",
+                        candidate.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store's own bound, enforced before the insert: past it the emulator
+        // answers the modelled quota error instead of growing without end.
+        if guard.load_balancers.len() >= crate::state::LOAD_BALANCER_QUOTA {
+            return Err(CreateLoadBalancerErrorModeled::TooManyLoadBalancersException(
+                TooManyLoadBalancersException {
+                    message: Some(format!(
+                        "This emulator holds at most {} load balancers",
+                        crate::state::LOAD_BALANCER_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = guard.mint_id();
+        let type_code = crate::state::load_balancer_type_code(&candidate.lb_type);
+        candidate.arn = emulator_server::emulator_arn(
+            crate::state::SERVICE_NAMESPACE,
+            &region,
+            &format!("loadbalancer/{type_code}/{}/{id}", candidate.name),
+        );
+        candidate.dns_name = dns_name(&candidate.name, &candidate.scheme, &id, &region);
+        candidate.id = id;
+
+        guard
+            .name_to_lb_arn
+            .insert(candidate.name.clone(), candidate.arn.clone());
+        let arn = candidate.arn.clone();
+        guard.load_balancers.insert(arn.clone(), candidate);
+        let stored = guard
+            .load_balancers
+            .get(&arn)
+            .expect("the load balancer just inserted");
+        Ok(CreateLoadBalancerOutput {
+            load_balancers: Some(vec![stored.to_shape()]),
+        })
     }
 }
+
+/// The modelled "the requested configuration is not valid" refusal, for a pairing of
+/// members the model forbids but cannot express.
+fn invalid_configuration(message: &str) -> CreateLoadBalancerError {
+    CreateLoadBalancerErrorModeled::InvalidConfigurationRequestException(
+        InvalidConfigurationRequestException {
+            message: Some(message.to_string()),
+        },
+    )
+    .into()
+}
+
+/// The tags to store, refusing a list that names one key twice.
+fn tag_map(
+    tags: Option<&[Tag]>,
+) -> Result<std::collections::HashMap<String, String>, CreateLoadBalancerError> {
+    let mut map = std::collections::HashMap::new();
+    for tag in tags.unwrap_or_default() {
+        if map
+            .insert(tag.key.clone(), tag.value.clone().unwrap_or_default())
+            .is_some()
+        {
+            return Err(CreateLoadBalancerErrorModeled::DuplicateTagKeysException(
+                DuplicateTagKeysException {
+                    message: Some(format!("The tag key '{}' was specified twice", tag.key)),
+                },
+            )
+            .into());
+        }
+    }
+    Ok(map)
+}
+
+/// The letters AWS appends to a region to name an Availability Zone.
+const ZONE_LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+
+/// The zones the load balancer is attached to, one per requested subnet, taken from
+/// `Subnets` or `SubnetMappings` (the model: "you must specify either subnets or
+/// subnet mappings, but not both").
+///
+/// Which zone a subnet is in is EC2 state this emulator does not model, so each
+/// subnet is given a distinct zone of the request's region, in the order the request
+/// listed them. The mapping is persisted on the load balancer, so every later read
+/// reports the same zone for the same subnet.
+fn availability_zones(
+    input: &CreateLoadBalancerInput,
+    region: &str,
+) -> Vec<AvailabilityZoneRecord> {
+    let mut zones: Vec<AvailabilityZoneRecord> = Vec::new();
+    let mut push = |subnet_id: String, addresses: Vec<LoadBalancerAddressRecord>| {
+        let index = zones.len();
+        let letter = char::from(ZONE_LETTERS[index % ZONE_LETTERS.len()]);
+        let wrap = index / ZONE_LETTERS.len();
+        let zone_name = if wrap == 0 {
+            format!("{region}{letter}")
+        } else {
+            format!("{region}{letter}{wrap}")
+        };
+        zones.push(AvailabilityZoneRecord {
+            zone_name,
+            subnet_id,
+            outpost_id: None,
+            addresses,
+        });
+    };
+
+    for subnet_id in input.subnets.iter().flatten() {
+        push(subnet_id.clone(), Vec::new());
+    }
+    for mapping in input.subnet_mappings.iter().flatten() {
+        // Only what the caller pinned is kept: the emulator models no address pool,
+        // so it never invents an `IpAddress`.
+        let address = LoadBalancerAddressRecord {
+            allocation_id: mapping.allocation_id.clone(),
+            private_ipv4_address: mapping.private_i_pv4_address.clone(),
+            ipv6_address: mapping.i_pv6_address.clone(),
+        };
+        let addresses = if address.is_empty() {
+            Vec::new()
+        } else {
+            vec![address]
+        };
+        push(mapping.subnet_id.clone().unwrap_or_default(), addresses);
+    }
+    zones
+}
+
+/// The load balancer's DNS name, in the form AWS publishes:
+/// `<name>-<id>.<region>.elb.amazonaws.com`, prefixed `internal-` for an internal
+/// load balancer.
+fn dns_name(name: &str, scheme: &str, id: &str, region: &str) -> String {
+    let prefix = if scheme == "internal" {
+        "internal-"
+    } else {
+        ""
+    };
+    format!("{prefix}{name}-{id}.{region}.elb.amazonaws.com")
+}
+

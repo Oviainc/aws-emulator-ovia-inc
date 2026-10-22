@@ -18,7 +18,7 @@
 //! *observably* later than the write before it even when both land inside one clock
 //! tick.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::aws_smithy_types::{Document, Number};
@@ -38,6 +38,34 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// is the one part of that answer they share.
 pub const STORE_UNAVAILABLE: &str =
     "the benefit application store is unavailable; retry the request";
+
+/// What this service answers a caller whose account holds no active AWS partner
+/// benefit: the entitlement gate's refusal, carried by the modelled
+/// `AccessDeniedException` (HTTP 403).
+///
+/// The gate is an account-level authorization stage, not a per-request computation, so
+/// its wording is a fixed sentence rather than something built from the request. This
+/// is the sentence the service answers with, recorded against the real API.
+pub const PARTNER_ENTITLEMENT_REQUIRED: &str = "This action requires an active AWS \
+     partner benefit. Register as an AWS partner if you haven't already, or contact AWS \
+     partner central support.";
+
+/// The name a `ResourceNotFoundException` message gives the catalog a request named.
+///
+/// The catalog is not a modelled `@resource` (no operation creates one); it is named by
+/// the `Catalog` input member every operation carries, so that member's name is what the
+/// message states. See [`not_found_message`].
+pub const CATALOG_KIND: &str = "Catalog";
+
+/// The name a `ResourceNotFoundException` message gives a benefit: the modelled resource
+/// shape `com.amazonaws.partnercentralbenefits#Benefit`
+/// (`smithy_query(query="shape",shape="Benefit")`).
+pub const BENEFIT_KIND: &str = "Benefit";
+
+/// The name a `ResourceNotFoundException` message gives a benefit application: the
+/// modelled resource shape `com.amazonaws.partnercentralbenefits#BenefitApplication`
+/// (`smithy_query(query="shape",shape="BenefitApplication")`).
+pub const APPLICATION_KIND: &str = "BenefitApplication";
 
 /// The prefix a benefit id carries, from the modelled `BenefitSummary$Id` pattern
 /// `^ben-[0-9a-z]{14}$`.
@@ -386,6 +414,15 @@ pub const APPLICATION_RESOURCE: &str = "benefit-application";
 pub struct ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     /// Every catalog, keyed by the `Catalog` input string.
     pub catalogs: BTreeMap<String, Catalog>,
+    /// The AWS accounts that hold an active AWS partner benefit — the whole input to the
+    /// entitlement gate [`entitlement_refusal`] applies ahead of every operation.
+    ///
+    /// EMPTY at state init, and deliberately so: being a registered AWS partner is a
+    /// property of an account that this API cannot establish — it models no partner
+    /// registration — so no account is entitled until something outside the API records
+    /// one. Seeding an entitled account here would make the gate unobservable, which is
+    /// the defect this field exists to close.
+    partner_accounts: BTreeSet<String>,
     /// Application ARN -> (catalog, application id), so an `Identifier` given as an ARN
     /// resolves to the same record as the bare id.
     pub arns: HashMap<String, (String, String)>,
@@ -403,6 +440,7 @@ impl Default for ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsservice
                 .iter()
                 .map(|name| ((*name).to_string(), Catalog::seeded(name)))
                 .collect(),
+            partner_accounts: BTreeSet::new(),
             arns: HashMap::new(),
             id_sequence: 0,
         }
@@ -410,6 +448,23 @@ impl Default for ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsservice
 }
 
 impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
+    /// Whether `account` holds an active AWS partner benefit, which is what the
+    /// entitlement gate admits a request on.
+    pub fn has_active_partner_benefit(&self, account: &str) -> bool {
+        self.partner_accounts.contains(account)
+    }
+
+    /// Record an active AWS partner benefit for `account`, so the gate admits its
+    /// requests. `true` when this call is what recorded it.
+    ///
+    /// No modelled operation reaches this: the API has none that registers a partner, so
+    /// entitlement arrives from outside the API — which in this emulator means an
+    /// in-process caller holding the shared engine (a test standing in for an entitled
+    /// partner account). Nothing on the wire can grant itself the entitlement.
+    pub fn grant_partner_entitlement(&mut self, account: &str) -> bool {
+        self.partner_accounts.insert(account.to_string())
+    }
+
     /// The application `identifier` names inside `catalog`, accepting either form the
     /// modelled `BenefitApplicationIdentifier` allows (`^(arn:.+|benappl-[0-9a-z]{14})$`).
     ///
@@ -825,6 +880,41 @@ pub fn parse_resource_arn<'a>(arn: &'a str, resource: &str) -> Option<(&'a str, 
     }
     let id = segments.next()?;
     (segments.next().is_none()).then_some((catalog, id))
+}
+
+/// AWS's "not found" message: the resource that was looked up, then the identifier the
+/// request named it with, backtick-quoted — e.g. ``Catalog `Sandbox` not found``.
+///
+/// One construction for every lookup this service does, so a client reading the message
+/// learns WHICH resource was missing from the one place the sentence is written.
+/// `resource` is [`CATALOG_KIND`], [`BENEFIT_KIND`] or [`APPLICATION_KIND`].
+pub fn not_found_message(resource: &str, identifier: &str) -> String {
+    format!("{resource} `{identifier}` not found")
+}
+
+/// The entitlement gate: `Some(..)` when the calling account holds no active AWS partner
+/// benefit, and the request must be refused with the modelled `AccessDeniedException`
+/// (HTTP 403) instead of being served.
+///
+/// Every operation applies this BEFORE it looks any resource up, so an un-entitled
+/// caller is told it is not entitled rather than whether a resource exists; the
+/// modelled constraints are refused earlier still, by the centralized request walk, so
+/// a malformed request is a `ValidationException` whether the caller is entitled or not.
+///
+/// The emulator presents exactly one account (`engine::EMULATOR_ACCOUNT_ID`), so that is
+/// the account every request is made from and the only one the gate can be asked about.
+/// A store that cannot be reached answers `None` — unknown is not "denied", and the
+/// handler's own store check turns it into the modelled server error.
+pub fn entitlement_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<crate::ops::types::AccessDeniedException> {
+    let state = service_state(engine)?;
+    let entitled = state
+        .lock()
+        .has_active_partner_benefit(::engine::emulator_account_id());
+    (!entitled).then(|| crate::ops::types::AccessDeniedException {
+        message: PARTNER_ENTITLEMENT_REQUIRED.to_string(),
+    })
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

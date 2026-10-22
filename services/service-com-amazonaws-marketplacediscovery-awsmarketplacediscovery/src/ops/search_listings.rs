@@ -189,13 +189,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Order by the requested key, then by listing id so a page boundary is stable and
         // `nextToken` neither repeats nor skips an entry.
+        //
+        // `sortOrder` is "the sort direction" of the RESULT, so it reverses the whole
+        // ordering, tie-break included: ASCENDING and DESCENDING are exact reverses of each
+        // other even where every match carries the same sort key.
+        let ascending = input.sort_order.as_str() == "ASCENDING";
         matches.sort_by(|(left, left_listing), (right, right_listing)| {
-            let by_score = match input.sort_order.as_str() {
-                "ASCENDING" => left.total_cmp(right),
+            let ascending_order = left
+                .total_cmp(right)
+                .then_with(|| left_listing.listing_id.cmp(&right_listing.listing_id));
+            if ascending {
+                ascending_order
+            } else {
                 // DESCENDING, the model's default.
-                _ => right.total_cmp(left),
-            };
-            by_score.then_with(|| left_listing.listing_id.cmp(&right_listing.listing_id))
+                ascending_order.reverse()
+            }
         });
 
         let total_results = i64::try_from(matches.len()).unwrap_or(i64::MAX);
@@ -331,19 +339,21 @@ fn matches_every_filter(
 
 /// The single rating a range filter carries, refusing a value list or a rating outside the
 /// documented 0.0–5.0 range.
+///
+/// Both refusals are built from the request and follow AWS's recorded template for a range
+/// filter: they name the offending `filterType`, and the out-of-range one also carries the
+/// offending value bare after `"got: "`. A value that is not a number at all is not a
+/// rating between 0.0 and 5.0 either, so it is refused by the same message.
 fn rating_bound(filter_type: &str, values: &[String]) -> Result<f64, String> {
     let [value] = values else {
         return Err(format!(
-            "filters: {filter_type} accepts exactly one filterValues entry, got {}",
-            values.len()
+            "Range filter {filter_type} requires exactly one value"
         ));
     };
-    let rating: f64 = value
-        .parse()
-        .map_err(|_| format!("filters: {filter_type} expects a number, got '{value}'"))?;
+    let rating: f64 = value.parse().unwrap_or(f64::NAN);
     if !(0.0..=5.0).contains(&rating) {
         return Err(format!(
-            "filters: {filter_type} expects a value between 0.0 and 5.0, got '{value}'"
+            "Range filter {filter_type} value must be between 0.0 and 5.0, got: {value}"
         ));
     }
     Ok(rating)

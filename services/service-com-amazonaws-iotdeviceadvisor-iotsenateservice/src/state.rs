@@ -1,11 +1,510 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-iotdeviceadvisor-iotsenateservice service.
+//!
+//! IoT Core Device Advisor keeps two resources: a **suite definition** (a versioned test
+//! suite configuration) and a **suite run** of one definition version. Both live here, in
+//! the single per-service store behind the engine's state lock, so a value a create mints
+//! is observable by every later read in the process.
+//!
+//! Besides the records this module owns the handful of rules every handler shares: the ARN
+//! and endpoint shapes, the version-string sequence, and the clock-owed suite-run status
+//! transitions ([`SuiteRun::materialize_due`]).
+
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
+
+use crate::ops::types::{SuiteDefinitionConfiguration, SuiteRunConfiguration};
+
+/// The region an ARN or endpoint falls back to when the request carries no SigV4 scope.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// This service's ARN namespace, as the Smithy model's `aws.api#service` trait gives it
+/// (`arnNamespace: iotdeviceadvisor`).
+pub const ARN_NAMESPACE: &str = "iotdeviceadvisor";
+
+/// How long a suite run spends in each non-terminal status before the clock owes it the
+/// next one. A chosen span (AWS documents no duration for it): inside the 250–750 ms
+/// window the emulator contract fixes, so a caller acting straight after `StartSuiteRun`
+/// still observes `PENDING`, and never zero.
+pub const STATUS_TRANSITION: Duration = Duration::from_millis(500);
+
+/// Why a suite run cannot reach a test-result status in this emulator.
+///
+/// Device Advisor drives real MQTT test cases against a physical device over the IoT data
+/// plane; this emulator has no device and no test runner, so a run is accepted, tracked,
+/// and then ends in the modelled `ERROR` status carrying this reason — never in `PASS` /
+/// `FAIL` / `PASS_WITH_WARNINGS`, which would report an outcome for tests nothing ran.
+pub const NO_TEST_RUNNER_REASON: &str =
+    "Device Advisor test execution is not available in this emulator: no device test runner \
+     is attached, so the suite run could not be executed against the primary device.";
+
+/// Suite-run statuses from which no further transition is owed.
+///
+/// The `SuiteRunStatus` values that are not `PENDING`, `RUNNING` or `STOPPING`; a run in
+/// one of these keeps its status and its `endTime` forever. The single definition of
+/// "terminal": [`SuiteRun::materialize_due`] consults it rather than listing the statuses
+/// a second time.
+pub const TERMINAL_STATUSES: &[&str] = &[
+    "CANCELED",
+    "ERROR",
+    "FAIL",
+    "PASS",
+    "PASS_WITH_WARNINGS",
+    "STOPPED",
+];
+
+/// True when `status` is one no clock-owed transition leaves.
+pub fn is_terminal(status: &str) -> bool {
+    TERMINAL_STATUSES.contains(&status)
+}
+
+/// How many suite definitions this account's store holds at once.
+///
+/// An OCCUPANCY BOUND this emulator chooses, not a claim about a published AWS quota: the
+/// store is in memory and every `CreateSuiteDefinition` adds a record, so without a cap a
+/// caller could grow it without limit. `CreateSuiteDefinition` refuses past it with the
+/// modelled `ValidationException` (the only client-input error it declares), the way a
+/// real service refuses a creation past its account quota.
+pub const MAX_SUITE_DEFINITIONS: usize = 100;
+
+/// How many suite runs the store retains per definition.
+///
+/// The same occupancy bound for runs, as a RETENTION policy rather than a refusal: a
+/// definition can be run any number of times, so `StartSuiteRun` drops the oldest runs of
+/// that definition (and their tag rows) that are no longer in progress once it would
+/// exceed this count, exactly as a real service ages out old run history. A run still in
+/// progress is never dropped.
+pub const MAX_RUNS_PER_DEFINITION: usize = 50;
+
+/// A stored suite definition: its identity, every configuration version, and its tags.
+#[derive(Debug, Clone)]
+pub struct SuiteDefinition {
+    /// The minted `suiteDefinitionId` (a UUID, so inside the modelled 12..36 length).
+    pub id: String,
+    /// `arn:aws:iotdeviceadvisor:<region>:<account>:suitedefinition/<id>`.
+    pub arn: String,
+    /// The version recorded last — the one an unqualified read answers with. Tracked
+    /// explicitly rather than derived from [`versions`](Self::versions), whose keys order
+    /// lexicographically (`v10` before `v2`).
+    pub latest_version: String,
+    /// version string -> the configuration snapshot that version holds.
+    pub versions: BTreeMap<String, SuiteDefinitionConfiguration>,
+    pub created_at: SystemTime,
+    pub last_modified_at: SystemTime,
+}
+
+impl SuiteDefinition {
+    /// The configuration snapshot for `version`, or for [`latest_version`](Self::latest_version)
+    /// when the caller named none. `None` means the caller named a version this definition
+    /// never had.
+    pub fn configuration(&self, version: Option<&str>) -> Option<&SuiteDefinitionConfiguration> {
+        self.versions
+            .get(version.unwrap_or(self.latest_version.as_str()))
+    }
+
+    /// `suiteDefinitionName` as the STORED configuration of the latest version holds it.
+    pub fn name(&self) -> &str {
+        self.configuration(None)
+            .map_or("", |config| config.suite_definition_name.as_str())
+    }
+}
+
+/// A stored suite run of one definition version.
+#[derive(Debug, Clone)]
+pub struct SuiteRun {
+    /// The minted `suiteRunId` (a UUID).
+    pub id: String,
+    /// `arn:aws:iotdeviceadvisor:<region>:<account>:suiterun/<definition id>/<run id>`.
+    pub arn: String,
+    pub suite_definition_id: String,
+    pub suite_definition_version: String,
+    /// The `suiteRunConfiguration` the start call carried, returned verbatim by reads.
+    pub configuration: SuiteRunConfiguration,
+    /// One of `SuiteRunStatus`.
+    pub status: String,
+    pub created_at: SystemTime,
+    /// Set when the run leaves `PENDING`; absent while it is still queued.
+    pub started_at: Option<SystemTime>,
+    /// Set only once the status is terminal.
+    pub end_at: Option<SystemTime>,
+    pub error_reason: Option<String>,
+    /// The Device Advisor endpoint a device under test connects to for this run.
+    pub endpoint: String,
+    /// The instant the next status transition becomes due, while one is owed.
+    pub next_transition_at: Option<SystemTime>,
+}
+
+impl SuiteRun {
+    /// Apply every status transition the clock has ALREADY made due at `now`.
+    ///
+    /// The whole lifecycle is clock-driven, so each reader materialises it before
+    /// answering and nothing has to sleep: `PENDING` -> `RUNNING` -> `ERROR` for a run the
+    /// emulator cannot execute (see [`NO_TEST_RUNNER_REASON`]), and `STOPPING` -> `STOPPED`
+    /// for one a caller stopped. A transition that is not due yet is left alone, and a
+    /// terminal run is never touched again.
+    pub fn materialize_due(&mut self, now: SystemTime) {
+        while let Some(due) = self.next_transition_at {
+            if is_terminal(&self.status) {
+                // Nothing is owed from a terminal status: drop any stale due instant.
+                self.next_transition_at = None;
+                return;
+            }
+            if due > now {
+                return;
+            }
+            match self.status.as_str() {
+                "PENDING" => {
+                    self.status = "RUNNING".to_string();
+                    self.started_at = Some(due);
+                    self.next_transition_at = Some(due + STATUS_TRANSITION);
+                }
+                "RUNNING" => {
+                    self.status = "ERROR".to_string();
+                    self.error_reason = Some(NO_TEST_RUNNER_REASON.to_string());
+                    self.end_at = Some(due);
+                    self.next_transition_at = None;
+                }
+                "STOPPING" => {
+                    self.status = "STOPPED".to_string();
+                    self.end_at = Some(due);
+                    self.next_transition_at = None;
+                }
+                _ => {
+                    // Unreachable: `TERMINAL_STATUSES` above plus these three arms cover
+                    // every `SuiteRunStatus`. Clear the due instant rather than loop.
+                    self.next_transition_at = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// True while this run holds the definition's single run slot: any status that is not
+    /// terminal, so `STOPPING` still counts — a run the caller asked to stop is in
+    /// progress until the stop completes.
+    ///
+    /// This is what `StartSuiteRun` refuses a concurrent start on, and what retention
+    /// never drops.
+    pub fn is_in_progress(&self) -> bool {
+        !is_terminal(&self.status)
+    }
+
+    /// True when a stop would move this run: it has not been asked to stop yet and has
+    /// not finished. `STOPPING` and every terminal status answer false, so stopping twice
+    /// neither restarts the stop clock nor resurrects a finished run.
+    pub fn is_stoppable(&self) -> bool {
+        matches!(self.status.as_str(), "PENDING" | "RUNNING")
+    }
+}
 
 /// Per-service state for com-amazonaws-iotdeviceadvisor-iotsenateservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotdeviceadvisorIotsenateserviceState {
-    // TODO: add service-specific state fields
+    /// suiteDefinitionId -> definition. A `BTreeMap` so every listing, and the paging
+    /// token built from it, has one deterministic order.
+    pub definitions: BTreeMap<String, SuiteDefinition>,
+    /// suiteRunId -> run.
+    pub runs: BTreeMap<String, SuiteRun>,
+    /// resourceArn -> tags. The ONE place tags live: a definition's and a run's tags are
+    /// both keyed by their ARN here, so the tagging operations and the reads that echo
+    /// tags cannot disagree.
+    pub tags: BTreeMap<String, BTreeMap<String, String>>,
+    /// `clientToken` -> what that token already created, so a retried
+    /// `CreateSuiteDefinition` returns the first definition instead of minting a second,
+    /// and the same token offered for a DIFFERENT request is refused. One entry per
+    /// stored definition at most — a token is recorded only alongside a new definition
+    /// and dropped with it — so [`MAX_SUITE_DEFINITIONS`] bounds this map too.
+    pub create_definition_tokens: BTreeMap<String, AcceptedCreateRequest>,
+}
+
+/// What one `clientToken` was accepted for: the definition it created, and a fingerprint
+/// of the request that created it.
+///
+/// An `@idempotencyToken` identifies a RETRY of one request, not "whatever the caller
+/// sends next under the same name": a token offered again with different parameters is a
+/// client mistake, not a retry, so the fingerprint is kept to tell the two apart.
+#[derive(Debug, Clone)]
+pub struct AcceptedCreateRequest {
+    pub suite_definition_id: String,
+    /// See [`create_request_fingerprint`].
+    pub fingerprint: String,
+}
+
+/// A fingerprint of a `CreateSuiteDefinition` request: everything the stored definition is
+/// built from — the configuration, the tags, and the region the ARN is minted in.
+///
+/// Derived member by member from the already-normalised values (the tags as a sorted
+/// map), each written as a length-prefixed field so no value can impersonate another
+/// through a separator, and so the fingerprint is defined by the DATA rather than by a
+/// formatter whose output is not a stability contract.
+pub fn create_request_fingerprint(
+    region: &str,
+    configuration: &SuiteDefinitionConfiguration,
+    tags: &BTreeMap<String, String>,
+) -> String {
+    /// One length-prefixed field: `<len>:<value>;`.
+    fn field(value: &str, into: &mut String) {
+        use ::std::fmt::Write;
+        // `write!` into the buffer we already own: no per-field allocation.
+        let _ = write!(into, "{}:{value};", value.len());
+    }
+
+    let mut out = String::new();
+    field(region, &mut out);
+    field(&configuration.suite_definition_name, &mut out);
+    field(&configuration.root_group, &mut out);
+    field(&configuration.device_permission_role_arn, &mut out);
+    field(configuration.protocol.as_deref().unwrap_or(""), &mut out);
+    field(
+        match configuration.intended_for_qualification {
+            Some(true) => "qualification=true",
+            Some(false) => "qualification=false",
+            None => "qualification=unset",
+        },
+        &mut out,
+    );
+    field(
+        match configuration.is_long_duration_test {
+            Some(true) => "longDuration=true",
+            Some(false) => "longDuration=false",
+            None => "longDuration=unset",
+        },
+        &mut out,
+    );
+    let devices = configuration.devices.as_deref().unwrap_or_default();
+    field(&devices.len().to_string(), &mut out);
+    for device in devices {
+        field(device.thing_arn.as_deref().unwrap_or(""), &mut out);
+        field(device.certificate_arn.as_deref().unwrap_or(""), &mut out);
+        field(device.device_role_arn.as_deref().unwrap_or(""), &mut out);
+    }
+    field(&tags.len().to_string(), &mut out);
+    for (key, value) in tags {
+        field(key, &mut out);
+        field(value, &mut out);
+    }
+    out
+}
+
+impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
+    /// Materialise every clock-owed run transition, then hand back the run named by
+    /// `(definition id, run id)`.
+    ///
+    /// A read goes through here: it writes only what the clock already made due at `now`
+    /// — the same state a caller would have seen had nobody called at all — and only to
+    /// the run the caller named. A run of ANOTHER definition is matched out first, so no
+    /// operation ever touches a resource it was not asked about.
+    pub fn run_mut(
+        &mut self,
+        suite_definition_id: &str,
+        suite_run_id: &str,
+        now: SystemTime,
+    ) -> Option<&mut SuiteRun> {
+        let run = self.runs.get_mut(suite_run_id)?;
+        if run.suite_definition_id != suite_definition_id {
+            return None;
+        }
+        run.materialize_due(now);
+        Some(run)
+    }
+
+    /// Every run OF ONE DEFINITION, with its clock-owed transitions materialised.
+    ///
+    /// The definition filter runs before the materialisation, so a call about one
+    /// definition never advances another definition's runs.
+    pub fn runs_of_mut(
+        &mut self,
+        suite_definition_id: &str,
+        now: SystemTime,
+    ) -> impl Iterator<Item = &mut SuiteRun> {
+        let suite_definition_id = suite_definition_id.to_string();
+        self.runs.values_mut().filter_map(move |run| {
+            if run.suite_definition_id != suite_definition_id {
+                return None;
+            }
+            run.materialize_due(now);
+            Some(run)
+        })
+    }
+
+    /// The tags recorded for `arn`, or `None` when it carries none — an absent `tags`
+    /// member rather than an empty map.
+    pub fn tags_of(&self, arn: &str) -> Option<std::collections::HashMap<String, String>> {
+        let tags = self.tags.get(arn)?;
+        (!tags.is_empty()).then(|| {
+            tags.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+    }
+
+    /// Retain at most `keep` runs of `suite_definition_id`, dropping the OLDEST ones that
+    /// have FINISHED, with their tag rows.
+    ///
+    /// The store's occupancy bound for runs (see [`MAX_RUNS_PER_DEFINITION`]). Liveness is
+    /// judged on the CURRENT status, so the clock-owed transitions are materialised first:
+    /// the lifecycle only advances when something touches the run, so a run nobody has
+    /// read still carries the status it was stored with and would otherwise look in
+    /// progress forever — leaving the bound with nothing it is allowed to drop.
+    ///
+    /// A run that is still in progress — including one that is `STOPPING` — is never
+    /// dropped, so a caller can always read back the run it just started or stopped. That
+    /// cannot defeat the bound: `StartSuiteRun` refuses a start while any run of the
+    /// definition is in progress, so at most one run is ever skipped and the remaining
+    /// candidates still take the count down to `keep`.
+    pub fn prune_runs(&mut self, suite_definition_id: &str, keep: usize, now: SystemTime) {
+        let mut total = 0usize;
+        let mut droppable: Vec<(SystemTime, String, String)> = Vec::new();
+        for run in self.runs.values_mut() {
+            if run.suite_definition_id != suite_definition_id {
+                continue;
+            }
+            run.materialize_due(now);
+            total += 1;
+            if !run.is_in_progress() {
+                droppable.push((run.created_at, run.id.clone(), run.arn.clone()));
+            }
+        }
+        if total <= keep {
+            return;
+        }
+        // Oldest first: retention keeps the most recent runs.
+        droppable.sort();
+        for (_, id, arn) in droppable.into_iter().take(total - keep) {
+            self.runs.remove(&id);
+            self.tags.remove(&arn);
+        }
+    }
+}
+
+/// The version string for the `n`-th configuration a definition holds (1-based).
+///
+/// `SuiteDefinitionVersion` is `len 2..255`, so a bare ordinal (`"1"`) is not a legal
+/// value for the member; the sequence is `v1`, `v2`, … and the same strings are what
+/// `GetSuiteDefinition` accepts back on its `suiteDefinitionVersion` query.
+pub fn version_label(n: usize) -> String {
+    format!("v{n}")
+}
+
+/// Record one state-changing call of this service in the emulator's audit trail.
+///
+/// Every mutating operation here emits exactly one event on the `emulator::audit` target:
+/// who presented which access key id, in which region, which operation, which resource,
+/// and how the call ended (the subscriber stamps the time). That is what makes a
+/// destructive call — `DeleteSuiteDefinition` cascading to a definition's runs, or
+/// `StopSuiteRun` moving a run — attributable after the fact.
+///
+/// Request-derived values are written with `Debug`, so a newline inside one cannot forge a
+/// second record. Nothing secret is written: the presented ACCESS KEY ID identifies the
+/// caller and is not a secret, and no secret key, session token or emulator credential is
+/// read here.
+pub fn audit(
+    operation: &str,
+    parts: &::http::request::Parts,
+    region: &str,
+    resource: &str,
+    outcome: &str,
+) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = %operation,
+        access_key_id = ?::emulator_server::extract_akid(&parts.headers),
+        region = ?region,
+        resource = ?resource,
+        outcome = %outcome,
+        "state-changing iotdeviceadvisor request"
+    );
+}
+
+/// A freshly minted `UUID`-shaped id: a random v4 UUID, 36 characters, inside the
+/// modelled 12..36 length.
+///
+/// The generator is the `uuid` crate's, reached through `emulator_telemetry`'s `random()`
+/// constructor — `uuid::Uuid::new_v4().as_hyphenated()` verbatim
+/// (`vendor/emulator-telemetry/src/types.rs`) — because `emulator-telemetry` is already
+/// one of this crate's dependencies, so no new entry in the workspace lockfile is needed
+/// for it. Only the generator is borrowed: the newtype's telemetry meaning is dropped on
+/// the next line and nothing about the UUID's layout or entropy is relied on here. The
+/// same borrowing is what `service-com-amazonaws-cloudwatchomni-cloudwatchomnifrontend`
+/// does for its ids.
+pub fn new_uuid() -> String {
+    ::emulator_telemetry::BatchId::random().as_str().to_string()
+}
+
+/// The region to stamp into ARNs and endpoints: the SigV4 credential scope's region when
+/// the request is signed and that region has the published shape, else [`DEFAULT_REGION`].
+///
+/// The scope region is caller-supplied, and it is interpolated into ARNs and into the
+/// endpoint host, where `:` or an extra dotted label would produce a structurally
+/// well-formed but fabricated value AWS never mints. AWS resolves the region from the
+/// endpoint it served and only honours a region it publishes, so a region that does not
+/// LOOK like a published one is replaced by the default instead of being reflected back.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| has_published_region_shape(region))
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// True when `region` has the shape every AWS region identifier has:
+/// `<2+ lowercase letters>(-<lowercase letters>)+-<digit>`, e.g. `us-east-1`,
+/// `ap-southeast-4`, `il-central-1`, `us-gov-west-1`.
+///
+/// A shape test, not an allowlist of the regions that exist today: a new region must keep
+/// working without an emulator change, while a value carrying ARN- or host-structural
+/// characters (`:`, `.`, `/`, whitespace, upper case) is refused.
+pub fn has_published_region_shape(region: &str) -> bool {
+    let mut parts = region.split('-');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    if first.len() < 2 || !first.bytes().all(|b| b.is_ascii_lowercase()) {
+        return false;
+    }
+    let rest: Vec<&str> = parts.collect();
+    // At least one middle label plus the trailing number.
+    let Some((number, middle)) = rest.split_last() else {
+        return false;
+    };
+    if middle.is_empty() {
+        return false;
+    }
+    middle
+        .iter()
+        .all(|label| !label.is_empty() && label.bytes().all(|b| b.is_ascii_lowercase()))
+        && !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// This service's ARN for `resource` in `region`.
+pub fn arn(region: &str, resource: &str) -> String {
+    ::emulator_server::emulator_arn(ARN_NAMESPACE, region, resource)
+}
+
+/// The Device Advisor endpoint for this account in `region`.
+///
+/// Device Advisor vends one account-scoped host of the form
+/// `<account>.deviceadvisor.iot.<region>.amazonaws.com`, which is what a suite run reports
+/// and what a device under test connects to. It is derived here rather than stored, so
+/// every operation that has to report it answers the same host for the same account and
+/// region — `GetEndpoint`, still a 501 stub in this slice, included once it is written.
+///
+/// `Endpoint` is `len 45..75`: every region AWS publishes keeps the host inside that, and
+/// a region long enough to break it falls back to [`DEFAULT_REGION`] here rather than
+/// emitting an out-of-range value (the ARN still carries the caller's own region).
+pub fn endpoint_for_region(region: &str) -> String {
+    let host = |region: &str| {
+        format!(
+            "{}.deviceadvisor.iot.{region}.amazonaws.com",
+            ::emulator_server::emulator_account_id()
+        )
+    };
+    let endpoint = host(region);
+    if endpoint.len() > 75 {
+        return host(DEFAULT_REGION);
+    }
+    endpoint
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

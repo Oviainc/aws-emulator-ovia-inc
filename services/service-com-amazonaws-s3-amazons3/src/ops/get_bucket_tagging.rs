@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBucketTagging
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBucketTagging`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBucketTagging::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tag set `PutBucketTagging` stored on the named bucket, and answers the
+//! documented `NoSuchTagSet` (HTTP 404) when the bucket has none. Reporting only: nothing
+//! about the bucket changes, so a later caller sees what this one saw.
 //!
 //! ## Shape of an operation
 //!
@@ -80,28 +75,195 @@ use super::types::*;
 // `GetBucketTaggingError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `GetBucketTaggingError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#GetBucketTagging")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="GetBucketTagging")` reports `errors: []`),
+// but `Bucket` is an @httpLabel, so a request can name a bucket that does not exist and
+// AWS answers the service-wide `NoSuchBucket` ("The specified bucket does not exist",
+// `httpError 404`) — the same 404 `PutBucketTagging` and `DeleteBucketTagging` answer for
+// that name, which is why the shape is widened in here rather than a second rule invented.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#GetBucketTagging",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum GetBucketTaggingErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
-/// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::get_bucket_tagging::GetBucketTaggingError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type GetBucketTaggingError = crate::scaffolded::Scaffolded<GetBucketTaggingErrorModeled>;
+/// The `message` member of the synthetic `NoSuchTagSet` error shape.
+///
+/// `with_xml_name("Message")` spells the member the way S3's restXml error envelope does,
+/// exactly as `crate::scaffolded`'s synthetic shapes spell theirs.
+static NO_SUCH_TAG_SET_MESSAGE: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "smithy.framework#NoSuchTagSet$message",
+            "smithy.framework",
+            "message",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "message",
+        0,
+    )
+    .with_xml_name("Message");
 
-/// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
-/// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// Schema for the synthetic `NoSuchTagSet` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason `crate::scaffolded`'s shapes
+/// are: `NoSuchTagSet` is NOT in this service's model
+/// (`smithy_query(query="shape",shape="NoSuchTagSet")` finds nothing), so it must not
+/// collide with a modelled shape. The wire `<Code>` comes from
+/// [`smithy_server_runtime::OperationError::shape_name`] below, not from this schema.
+pub static NO_SUCH_TAG_SET_SCHEMA: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "smithy.framework#NoSuchTagSet",
+            "smithy.framework",
+            "NoSuchTagSet",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&NO_SUCH_TAG_SET_MESSAGE],
+    );
+
+/// The HTTP status AWS answers `NoSuchTagSet` with: 404, the status S3's error-responses
+/// list carries for every `NoSuch*` code.
+const NO_SUCH_TAG_SET_STATUS: u16 = 404;
+
+/// The payload of the documented `NoSuchTagSet` failure.
+///
+/// The message is the description the model's own documentation gives the code ("Error
+/// code: NoSuchTagSet Description: There is no tag set associated with the bucket"), so
+/// the text is the documented rule rather than one request's wording.
+#[derive(Debug, Clone)]
+pub struct NoSuchTagSet {
+    pub message: String,
+}
+
+impl NoSuchTagSet {
+    /// The failure for a bucket that has no tag set associated with it.
+    pub fn new() -> Self {
+        Self {
+            message: "There is no tag set associated with the bucket".to_string(),
+        }
+    }
+}
+
+impl Default for NoSuchTagSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for NoSuchTagSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NoSuchTagSet: {}", self.message)
+    }
+}
+
+impl std::error::Error for NoSuchTagSet {}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for NoSuchTagSet {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        s.write_string(&NO_SUCH_TAG_SET_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
+/// This operation's error channel, as the `impl Operation` below names it
+/// (`crate::ops::get_bucket_tagging::GetBucketTaggingError`): the scaffold wrapper (the
+/// 501 signal, a modelled error, or a refusal) widened by the synthetic [`NoSuchTagSet`].
+///
+/// The widening is what lets this operation answer the status and code AWS documents for a
+/// bucket with no tag set — 404 `NoSuchTagSet` — even though the model declares no shape
+/// for it. Everything else still goes out through `crate::scaffolded::Scaffolded`, so
+/// nothing about how a modelled error renders changes.
+#[derive(Debug)]
+pub enum GetBucketTaggingError {
+    /// The framework channel: `NotImplemented`, a modelled error, or a refusal.
+    Scaffolded(crate::scaffolded::Scaffolded<GetBucketTaggingErrorModeled>),
+    /// There is no tag set associated with the bucket.
+    NoSuchTagSet(NoSuchTagSet),
+}
+
+impl std::fmt::Display for GetBucketTaggingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Scaffolded(error) => write!(f, "{error}"),
+            Self::NoSuchTagSet(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for GetBucketTaggingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Scaffolded(error) => error.source(),
+            Self::NoSuchTagSet(error) => error.source(),
+        }
+    }
+}
+
+/// Every method delegates to the wrapped channel, so the synthetic variant is the only one
+/// that behaves differently — and it is the one that must carry 404 `NoSuchTagSet`.
+impl smithy_server_runtime::OperationError for GetBucketTaggingError {
+    fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
+        match self {
+            Self::Scaffolded(error) => error.as_serializable(),
+            Self::NoSuchTagSet(error) => error,
+        }
+    }
+
+    fn variant_schema(&self) -> &'static ::aws_smithy_schema::Schema {
+        match self {
+            Self::Scaffolded(error) => error.variant_schema(),
+            Self::NoSuchTagSet(_) => &NO_SUCH_TAG_SET_SCHEMA,
+        }
+    }
+
+    /// The wire error code (`<Code>` on restXml). Keep the literal as it is: it is what a
+    /// client matches on.
+    fn shape_name(&self) -> &'static str {
+        match self {
+            Self::Scaffolded(error) => error.shape_name(),
+            Self::NoSuchTagSet(_) => "NoSuchTagSet",
+        }
+    }
+
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::Scaffolded(error) => error.http_status(),
+            Self::NoSuchTagSet(_) => NO_SUCH_TAG_SET_STATUS,
+        }
+    }
+
+    fn query_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Scaffolded(error) => error.query_error_code(),
+            // No `awsQueryError` trait to honour: the shape is not in the model, and S3 is
+            // a restXml service whose clients read `<Code>` above.
+            Self::NoSuchTagSet(_) => None,
+        }
+    }
+}
+
+/// Lets `?` and `.into()` lift a modeled failure into the error channel, so the handler
+/// writes `Err(SomeModeledError.into())` rather than naming the wrapper variant.
 impl From<GetBucketTaggingErrorModeled> for GetBucketTaggingError {
     fn from(modeled: GetBucketTaggingErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Scaffolded(crate::scaffolded::Scaffolded::Modeled(modeled))
+    }
+}
+
+/// Same for the framework channel, so `Scaffolded::not_implemented(..)` and
+/// `Scaffolded::validation(..)` keep reading the way they do in every other handler.
+impl From<crate::scaffolded::Scaffolded<GetBucketTaggingErrorModeled>> for GetBucketTaggingError {
+    fn from(scaffolded: crate::scaffolded::Scaffolded<GetBucketTaggingErrorModeled>) -> Self {
+        Self::Scaffolded(scaffolded)
     }
 }
 
@@ -141,18 +303,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBucketTagging` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBucketTaggingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBucketTagging"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Nothing can be reported about a bucket the emulator cannot look up, and the
+            // one widened-in error here says "no such bucket", which would be a false
+            // statement about the bucket. The scaffold's 501 says what is true: this
+            // emulator cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("GetBucketTagging").into());
+        };
+
+        // Read-only: the guard is taken, the tag set is copied out, and nothing is
+        // written — a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(GetBucketTaggingErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+
+        let tags = bucket.tags();
+        if tags.is_empty() {
+            // "GetBucketTagging has the following special error: Error code: NoSuchTagSet
+            // Description: There is no tag set associated with the bucket" (this
+            // operation's own documentation). `TagSet` is a required output member, so an
+            // empty success would be a false report of a tag set that does not exist. The
+            // code is not a shape in this service's model, so it goes out through the
+            // synthetic shape above — the documented 404 and `<Code>NoSuchTagSet</Code>`,
+            // which is what a client matches on.
+            return Err(GetBucketTaggingError::NoSuchTagSet(NoSuchTagSet::new()));
+        }
+
+        Ok(GetBucketTaggingOutput {
+            tag_set: tags
+                .iter()
+                .map(|tag| Tag {
+                    key: tag.key.clone(),
+                    value: tag.value.clone(),
+                })
+                .collect(),
+        })
     }
 }

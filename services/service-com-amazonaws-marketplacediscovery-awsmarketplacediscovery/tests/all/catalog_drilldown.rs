@@ -24,7 +24,7 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260205/us-east-1/aws-marketplace/aws4_request, \
      SignedHeaders=host, Signature=0000";
 
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The suite signs nothing, so request authentication is off for this router only.
@@ -34,7 +34,11 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Call one operation and return its HTTP status and JSON body.
-async fn call(router: &MultiServiceRouter, operation: &str, input: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    input: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("{PREFIX}/{operation}"))
@@ -53,7 +57,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, input: &Value) -> (u
 }
 
 /// Call one operation, requiring HTTP 200.
-async fn ok(router: &MultiServiceRouter, operation: &str, input: &Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, input: &Value) -> Value {
     let (status, body) = call(router, operation, input).await;
     assert_eq!(
         status, 200,
@@ -62,14 +66,14 @@ async fn ok(router: &MultiServiceRouter, operation: &str, input: &Value) -> Valu
     body
 }
 
-fn array(body: &Value, member: &str) -> Vec<Value> {
+pub(crate) fn array(body: &Value, member: &str) -> Vec<Value> {
     body.get(member)
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
 }
 
-fn text(value: &Value, member: &str) -> String {
+pub(crate) fn text(value: &Value, member: &str) -> String {
     value
         .get(member)
         .and_then(Value::as_str)
@@ -77,7 +81,7 @@ fn text(value: &Value, member: &str) -> String {
         .to_string()
 }
 
-fn ids(summaries: &[Value], member: &str) -> Vec<String> {
+pub(crate) fn ids(summaries: &[Value], member: &str) -> Vec<String> {
     summaries.iter().map(|item| text(item, member)).collect()
 }
 
@@ -122,7 +126,7 @@ fn relevance(summary: &Value, needle: &str) -> u32 {
 }
 
 /// Every listing in the catalog, as search summaries.
-async fn whole_catalog(router: &MultiServiceRouter) -> Vec<Value> {
+pub(crate) async fn whole_catalog(router: &MultiServiceRouter) -> Vec<Value> {
     let body = ok(router, "searchListings", &json!({ "maxResults": 100 })).await;
     let summaries = array(&body, "listingSummaries");
     assert!(

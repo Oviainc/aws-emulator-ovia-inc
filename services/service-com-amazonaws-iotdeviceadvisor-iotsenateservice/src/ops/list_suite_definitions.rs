@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSuiteDefinitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSuiteDefinitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSuiteDefinitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Projects `SuiteDefinitionInformation` from every stored definition, in the store's one
+//! deterministic (id) order, and pages it: at most `maxResults` entries per call, with
+//! `nextToken` carrying the id to resume at and absent on the last page.
 //!
 //! ## Shape of an operation
 //!
@@ -139,20 +134,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSuiteDefinitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSuiteDefinitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSuiteDefinitions"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSuiteDefinitionsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iotdeviceadvisor store is unavailable".to_string()),
+            })
+        })?;
+        let store = state.lock();
+
+        // `maxResults` is `range 1..50`, so an absent one defaults to the modelled
+        // maximum: one page holds every definition unless the caller asks for fewer. The
+        // boundary validator has already refused anything outside that range; `max(1)`
+        // only keeps the paging loop below total if it ever stops doing so.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_RESULTS_MAX))
+            .unwrap_or(1)
+            .max(1);
+
+        // The token is the id to resume AT, so paging is stable while definitions are
+        // created or deleted between pages. An absent token resumes at the empty string,
+        // which is the start of the map — the same iterator type, so no boxing.
+        let mut remaining = match input.next_token {
+            Some(token) => store.definitions.range(token..).peekable(),
+            None => store.definitions.range(String::new()..).peekable(),
+        };
+
+        let mut page = Vec::new();
+        while page.len() < page_size {
+            let Some((_, definition)) = remaining.next() else {
+                break;
+            };
+            let config = definition.configuration(None);
+            page.push(SuiteDefinitionInformation {
+                suite_definition_id: Some(definition.id.clone()),
+                suite_definition_name: config.map(|c| c.suite_definition_name.clone()),
+                default_devices: config.and_then(|c| c.devices.clone()),
+                intended_for_qualification: config.and_then(|c| c.intended_for_qualification),
+                is_long_duration_test: config.and_then(|c| c.is_long_duration_test),
+                protocol: config.and_then(|c| c.protocol.clone()),
+                created_at: Some(definition.created_at.into()),
+            });
+        }
+
+        Ok(ListSuiteDefinitionsOutput {
+            suite_definition_information_list: Some(page),
+            next_token: remaining.peek().map(|(id, _)| (*id).clone()),
+        })
     }
 }
+
+/// The upper bound the model puts on `maxResults` (`range 1..50`), which is also the page
+/// size a caller who names none gets.
+const MAX_RESULTS_MAX: i32 = 50;

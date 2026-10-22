@@ -115,6 +115,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // So the claim is narrowed the way the framework narrows it for the other
         // signing-name collisions: the signing name must match AND the request must
         // address this service's own modeled URI path space (see `claims_modeled_path`).
+        // This is a `restJson1` service whose one operation binds a literal first segment
+        // (`/getBuyerDashboard`), disjoint from every sibling's, so that conjunct is what
+        // separates them.
         match smithy_server_runtime::resolve_route_key(parts) {
             Some(key) if key == self.entry.identity().signing_name() => {
                 claims_modeled_path(parts, crate::ROUTE_PATH_SEGMENTS)

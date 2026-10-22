@@ -162,9 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(
                     DescribeParameterGroupsErrorModeled::InvalidParameterValueException(
-                        InvalidParameterValueException {
-                            message: Some(crate::state::max_results_out_of_range_message()),
-                        },
+                        crate::state::invalid_max_results(),
                     )
                     .into(),
                 );
@@ -179,13 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(
                         DescribeParameterGroupsErrorModeled::InvalidParameterValueException(
-                            InvalidParameterValueException {
-                                message: Some(
-                                    "NextToken is not a continuation token from a prior \
-                                     DescribeParameterGroups response"
-                                        .to_string(),
-                                ),
-                            },
+                            crate::state::invalid_next_token(Self::NAME),
                         )
                         .into(),
                     )
@@ -206,9 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if !store.parameter_groups.contains_key(name) {
                     return Err(
                         DescribeParameterGroupsErrorModeled::ParameterGroupNotFoundFault(
-                            ParameterGroupNotFoundFault {
-                                message: Some(crate::state::parameter_group_not_found_message()),
-                            },
+                            crate::state::parameter_group_not_found(),
                         )
                         .into(),
                     );

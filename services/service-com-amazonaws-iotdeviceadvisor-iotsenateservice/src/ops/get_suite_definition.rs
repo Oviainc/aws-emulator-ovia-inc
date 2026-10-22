@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSuiteDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSuiteDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSuiteDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers from the suite definition the store holds: its ARN, the requested (or latest)
+//! configuration version, both timestamps and its tags. A pure read — it never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +147,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSuiteDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSuiteDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSuiteDefinition"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetSuiteDefinitionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iotdeviceadvisor store is unavailable".to_string()),
+            })
+        })?;
+        let store = state.lock();
+
+        let definition = store.definitions.get(&input.suite_definition_id).ok_or_else(|| {
+            GetSuiteDefinitionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "No suite definition with suiteDefinitionId {}",
+                    input.suite_definition_id
+                )),
+            })
+        })?;
+
+        let version = input
+            .suite_definition_version
+            .clone()
+            .unwrap_or_else(|| definition.latest_version.clone());
+        let configuration = definition
+            .configuration(input.suite_definition_version.as_deref())
+            .ok_or_else(|| {
+                GetSuiteDefinitionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Suite definition {} has no version {version}",
+                            definition.id
+                        )),
+                    },
+                )
+            })?
+            .clone();
+
+        Ok(GetSuiteDefinitionOutput {
+            suite_definition_id: Some(definition.id.clone()),
+            suite_definition_arn: Some(definition.arn.clone()),
+            suite_definition_version: Some(version),
+            latest_version: Some(definition.latest_version.clone()),
+            suite_definition_configuration: Some(configuration),
+            created_at: Some(definition.created_at.into()),
+            last_modified_at: Some(definition.last_modified_at.into()),
+            tags: store.tags_of(&definition.arn),
+        })
     }
 }

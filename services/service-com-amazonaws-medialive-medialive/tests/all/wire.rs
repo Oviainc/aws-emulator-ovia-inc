@@ -3,10 +3,10 @@
 //! The restJson1 wire harness every MediaLive suite in this crate drives the
 //! service through.
 //!
-//! One copy, so `channel_lifecycle` and `sdi_source_lifecycle` cannot disagree
-//! about how a request reaches the emulator: each test builds a real HTTP
-//! request and dispatches it through `MultiServiceRouter`, so what is asserted
-//! is the emulator's wire behaviour, not an internal function's return value.
+//! One copy, so the suites cannot disagree about how a request reaches the
+//! emulator: each test builds a real HTTP request and dispatches it through
+//! `MultiServiceRouter`, so what is asserted is the emulator's wire behaviour,
+//! not an internal function's return value.
 
 use std::sync::Arc;
 
@@ -14,12 +14,20 @@ use bytes::Bytes;
 use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
+/// The region [`call`] signs for, and so the region every ARN those requests
+/// mint must name. A suite whose rule is scoped to a region signs for one of its
+/// own with [`call_in_region`].
+pub const DEFAULT_REGION: &str = "us-west-2";
+
 /// A SigV4 credential scope naming `medialive`, which is how the router decides
-/// this service claims the request, and `us-west-2`, which is the region every
-/// ARN the request mints must name.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDEXAMPLE/20240101/us-west-2/medialive/aws4_request, \
-     SignedHeaders=host, Signature=abc";
+/// this service claims the request, and `region`, which is the region the
+/// request's resources live in.
+fn authorization(region: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{region}/medialive/aws4_request, \
+         SignedHeaders=host, Signature=abc"
+    )
+}
 
 /// The account segment of every ARN a generated emulator emits
 /// (`emulator_server::EMULATOR_ACCOUNT_ID`).
@@ -38,9 +46,22 @@ pub fn medialive() -> MultiServiceRouter {
     router
 }
 
-/// Dispatch one request and read back its status and JSON body.
+/// Dispatch one request signed for [`DEFAULT_REGION`] and read back its status
+/// and JSON body.
 pub async fn call(
     router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    call_in_region(router, DEFAULT_REGION, method, uri, body).await
+}
+
+/// Dispatch one request signed for `region` and read back its status and JSON
+/// body.
+pub async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
     method: &str,
     uri: &str,
     body: Option<Value>,
@@ -51,8 +72,8 @@ pub async fn call(
     let request = http::Request::builder()
         .method(method)
         .uri(uri)
-        .header("host", "medialive.us-west-2.amazonaws.com")
-        .header("authorization", AUTHORIZATION)
+        .header("host", format!("medialive.{region}.amazonaws.com"))
+        .header("authorization", authorization(region))
         .header("content-type", "application/json")
         .body(payload)
         .expect("build the request");

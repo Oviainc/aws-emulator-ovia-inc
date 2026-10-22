@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSuiteRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSuiteRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSuiteRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers from the persisted run. A report, not a mutation: the only write it makes is
+//! materialising the status transitions the CLOCK had already made due
+//! ([`crate::state::SuiteRun::materialize_due`]) — the same state the next caller would
+//! have seen had nobody polled.
+//!
+//! `testResult` stays ABSENT: no device test case ran (see `start_suite_run`), so there is
+//! no group or test-case outcome to report, and inventing one would report a result for
+//! work nothing performed. `endTime` appears only once the status is terminal.
 //!
 //! ## Shape of an operation
 //!
@@ -152,20 +152,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSuiteRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSuiteRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSuiteRun"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetSuiteRunErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iotdeviceadvisor store is unavailable".to_string()),
+            })
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let run = store
+            .run_mut(&input.suite_definition_id, &input.suite_run_id, now)
+            .ok_or_else(|| {
+                GetSuiteRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(format!(
+                        "No suite run with suiteRunId {} for suite definition {}",
+                        input.suite_run_id, input.suite_definition_id
+                    )),
+                })
+            })?
+            .clone();
+
+        Ok(GetSuiteRunOutput {
+            suite_definition_id: Some(run.suite_definition_id.clone()),
+            suite_definition_version: Some(run.suite_definition_version.clone()),
+            suite_run_id: Some(run.id.clone()),
+            suite_run_arn: Some(run.arn.clone()),
+            suite_run_configuration: Some(run.configuration.clone()),
+            // No test case executed, so there is no group result to report.
+            test_result: None,
+            start_time: run.started_at.map(Into::into),
+            end_time: run.end_at.map(Into::into),
+            status: Some(run.status.clone()),
+            error_reason: run.error_reason.clone(),
+            tags: store.tags_of(&run.arn),
+        })
     }
 }

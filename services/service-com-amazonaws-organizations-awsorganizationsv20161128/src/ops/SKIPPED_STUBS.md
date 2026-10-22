@@ -23,3 +23,10 @@ handler returns an error, so it never has to construct a value.
 // SKIPPED: DescribeOrganization — unsupported shape construct: operation 'DescribeOrganization' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: DescribeResourcePolicy — unsupported shape construct: operation 'DescribeResourcePolicy' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: LeaveOrganization — unsupported shape construct: operation 'LeaveOrganization' has a Unit/absent input, which the generator does not emit yet
+
+## Since hand-authored
+
+`DescribeOrganization` is now hand-authored in `src/ops/describe_organization.rs`: its
+empty input is declared there as `smithy.api#Unit`, and `build.rs` wires the operation
+in from that file's `//! @op DescribeOrganization` header like any other. The decline
+line above records only that the GENERATOR did not emit it.

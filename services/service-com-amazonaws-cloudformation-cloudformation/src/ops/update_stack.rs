@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateStack
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateStack`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mutates the SAME stored stack (same `StackId`) — replaces the template
+//! unless `UsePreviousTemplate` is set, merges `Parameters` honouring
+//! `UsePreviousValue`, applies the configuration members the request carries, sets
+//! `LastUpdatedTime` and records the `UPDATE_IN_PROGRESS` event.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateStack::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Members this slice stores but has nothing to act on, because it creates no stack
+//! RESOURCES: `StackPolicyBody` (replaces the stack's policy, which `GetStackPolicy`
+//! reports back) and `ResourceTypes`. `StackPolicyDuringUpdateBody` is a policy that
+//! applies to THIS update only, protecting resources from being changed by it; with no
+//! resources to protect it has nothing to override, so it is accepted and not stored.
+//! `DisableValidation` turns off pre-deployment validation this emulator does not perform
+//! either way. `StackPolicyURL` and `StackPolicyDuringUpdateURL` name a policy in Amazon
+//! S3 and are answered 501, like `TemplateURL`.
 //!
 //! ## Shape of an operation
 //!
@@ -175,6 +179,90 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    status, StoredDeploymentConfig, StoredParameter, StoredRollbackConfiguration, StoredStack,
+    StoredTag,
+};
+
+/// The stored values this update is resolved against: every member the merge below reads
+/// and the no-op check compares.
+///
+/// Cloned field by field rather than cloning the whole `StoredStack`, so an update never
+/// copies the stack's event log.
+struct PreviousValues {
+    template_body: String,
+    parameters: Vec<StoredParameter>,
+    tags: Vec<StoredTag>,
+    notification_arns: Vec<String>,
+    capabilities: Vec<String>,
+    role_arn: Option<String>,
+    rollback_configuration: Option<StoredRollbackConfiguration>,
+    deployment_config: Option<StoredDeploymentConfig>,
+}
+
+impl PreviousValues {
+    fn of(stack: &StoredStack) -> Self {
+        Self {
+            template_body: stack.template_body.clone(),
+            parameters: stack.parameters.clone(),
+            tags: stack.tags.clone(),
+            notification_arns: stack.notification_arns.clone(),
+            capabilities: stack.capabilities.clone(),
+            role_arn: stack.role_arn.clone(),
+            rollback_configuration: stack.rollback_configuration.clone(),
+            deployment_config: stack.deployment_config.clone(),
+        }
+    }
+}
+
+/// Resolve the request's `Parameters` against the values the stack already carries.
+///
+/// A request with no `Parameters` at all leaves the stack's parameters as they are;
+/// otherwise the request states the parameter set, and each entry either carries a new
+/// value or asks (`UsePreviousValue`) for the one the stack is already using. "If you
+/// specify true, do not specify a parameter value" — so a request doing both is refused,
+/// and so is one asking for a previous value the stack does not have.
+fn merged_parameters(
+    previous: &[StoredParameter],
+    requested: Option<&[Parameter]>,
+) -> Result<Vec<StoredParameter>, String> {
+    let Some(requested) = requested else {
+        return Ok(previous.to_vec());
+    };
+    requested
+        .iter()
+        .map(|parameter| {
+            let key = parameter
+                .parameter_key
+                .clone()
+                .filter(|key| !key.is_empty())
+                .ok_or_else(|| {
+                    "Parameters: every parameter must have a ParameterKey".to_string()
+                })?;
+            if parameter.use_previous_value == Some(true) {
+                if parameter.parameter_value.is_some() {
+                    return Err(format!(
+                        "Parameters: [{key}] cannot specify both a ParameterValue and \
+                         UsePreviousValue"
+                    ));
+                }
+                let value = previous
+                    .iter()
+                    .find(|stored| stored.key == key)
+                    .map(|stored| stored.value.clone())
+                    .ok_or_else(|| {
+                        format!("Parameters: [{key}] has no previous value on this stack")
+                    })?;
+                return Ok(StoredParameter { key, value });
+            }
+            let value = parameter
+                .parameter_value
+                .clone()
+                .ok_or_else(|| format!("Parameters: [{key}] must have values"))?;
+            Ok(StoredParameter { key, value })
+        })
+        .collect()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -245,18 +333,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateStack` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateStackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateStack"))
+        let _ = ctx;
+        // "Conditional: You must specify only one of the following parameters:
+        // TemplateBody, TemplateURL, or set the UsePreviousTemplate to true."
+        let template_sources = [
+            input.template_body.is_some(),
+            input.template_url.is_some(),
+            input.use_previous_template == Some(true),
+        ]
+        .into_iter()
+        .filter(|specified| *specified)
+        .count();
+        if template_sources != 1 {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "You must specify exactly one of TemplateBody, TemplateURL or \
+                 UsePreviousTemplate",
+            ));
+        }
+        // A `TemplateURL` would have to be fetched from Amazon S3; this emulator makes no
+        // outbound connections, so the request is answered 501 rather than with an update
+        // applied from a template nobody read.
+        if input.template_url.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateStack with TemplateURL (fetching a template from Amazon S3)",
+            ));
+        }
+        // The same holds for a stack policy named by URL: fetching it would need an
+        // outbound connection this emulator does not make.
+        if input.stack_policy_url.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateStack with StackPolicyURL (fetching a stack policy from Amazon S3)",
+            ));
+        }
+        if input.stack_policy_during_update_url.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateStack with StackPolicyDuringUpdateURL (fetching a stack policy from \
+                 Amazon S3)",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no stack to update, and nothing
+            // was written.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("UpdateStack"));
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let not_found = || {
+            crate::scaffolded::Scaffolded::validation_error(crate::state::stack_does_not_exist(
+                &input.stack_name,
+            ))
+        };
+        let previous = store.resolve(&input.stack_name).ok_or_else(not_found)?;
+        // A stack id resolves a deleted stack too, but a deleted stack cannot be updated.
+        if !previous.is_live() {
+            return Err(not_found());
+        }
+        // An operation is still in flight on this stack, so the update cannot start.
+        if previous.pending.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "Stack:{} is in {} state and can not be updated.",
+                previous.stack_id, previous.status
+            )));
+        }
+        let previous = PreviousValues::of(previous);
+
+        let template_body = match &input.template_body {
+            Some(body) => {
+                // The documented `TemplateBody` maximum, which the model carries no
+                // `@length` for.
+                crate::state::validate_template_body(body)
+                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+                body.clone()
+            }
+            // `UsePreviousTemplate`: "Reuse the existing template that is associated with
+            // the stack that you are updating."
+            None => previous.template_body.clone(),
+        };
+        let parameters = merged_parameters(&previous.parameters, input.parameters.as_deref())
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // "If you don't specify this parameter, CloudFormation doesn't modify the stack's
+        // tags. If you specify an empty value, CloudFormation removes all associated
+        // tags." The same shape holds for the other collection members the request may
+        // restate: absent leaves the stored value alone, present replaces it.
+        let tags = match input.tags.as_deref() {
+            Some(tags) => crate::state::stored_tags(tags),
+            None => previous.tags.clone(),
+        };
+        // "Specify an empty list to remove all notification topics."
+        let notification_arns = match &input.notification_ar_ns {
+            Some(arns) => arns.clone(),
+            None => previous.notification_arns.clone(),
+        };
+        let capabilities = match &input.capabilities {
+            Some(capabilities) => capabilities.clone(),
+            None => previous.capabilities.clone(),
+        };
+        // "If you don't specify a value, CloudFormation uses the role that was previously
+        // associated with the stack."
+        let role_arn = input.role_arn.clone().or(previous.role_arn.clone());
+        let rollback_configuration = match input.rollback_configuration.as_ref() {
+            Some(configuration) => {
+                crate::state::stored_rollback_configuration(Some(configuration))
+            }
+            None => previous.rollback_configuration.clone(),
+        };
+        let deployment_config = match input.deployment_config.as_ref() {
+            Some(config) => crate::state::stored_deployment_config(Some(config)),
+            None => previous.deployment_config.clone(),
+        };
+
+        // CloudFormation refuses an update that would change nothing about the stack.
+        if template_body == previous.template_body
+            && parameters == previous.parameters
+            && tags == previous.tags
+            && notification_arns == previous.notification_arns
+            && capabilities == previous.capabilities
+            && role_arn == previous.role_arn
+            && rollback_configuration == previous.rollback_configuration
+            && deployment_config == previous.deployment_config
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "No updates are to be performed.",
+            ));
+        }
+
+        let operation_id = crate::state::new_operation_id();
+        let stack = store
+            .resolve_mut(&input.stack_name)
+            .expect("the stack resolved immediately above");
+        stack.set_template_body(template_body);
+        stack.parameters = parameters;
+        stack.tags = tags;
+        stack.notification_arns = notification_arns;
+        stack.capabilities = capabilities;
+        stack.role_arn = role_arn;
+        stack.rollback_configuration = rollback_configuration;
+        stack.deployment_config = deployment_config;
+        if let Some(disable_rollback) = input.disable_rollback {
+            stack.disable_rollback = disable_rollback;
+        }
+        if let Some(retain_except_on_create) = input.retain_except_on_create {
+            stack.retain_except_on_create = Some(retain_except_on_create);
+        }
+        if let Some(token) = &input.client_request_token {
+            stack.client_request_token = Some(token.clone());
+        }
+        // "Structure that contains a new stack policy body": present replaces the stored
+        // policy, absent leaves it alone, as for the other restated members.
+        if let Some(policy) = &input.stack_policy_body {
+            stack.stack_policy_body = Some(policy.clone());
+        }
+        if let Some(resource_types) = &input.resource_types {
+            stack.resource_types = resource_types.clone();
+        }
+        stack.last_updated_time = Some(now);
+        // The update starts now and settles to UPDATE_COMPLETE once the clock makes that
+        // due; the stack id never changes.
+        stack.begin_transition(
+            now,
+            status::UPDATE_IN_PROGRESS,
+            status::UPDATE_COMPLETE,
+            Some(operation_id.clone()),
+            input.client_request_token.clone(),
+        );
+
+        Ok(UpdateStackOutput {
+            stack_id: Some(stack.stack_id.clone()),
+            operation_id: Some(operation_id),
+        })
     }
 }

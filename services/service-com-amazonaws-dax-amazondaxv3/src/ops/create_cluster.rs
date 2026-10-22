@@ -340,9 +340,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let name = name.to_lowercase();
                 let Some(group) = store.subnet_groups.get(&name) else {
                     return Err(CreateClusterErrorModeled::SubnetGroupNotFoundFault(
-                        SubnetGroupNotFoundFault {
-                            message: Some(format!("Subnet group {name} does not exist")),
-                        },
+                        crate::state::subnet_group_not_found(&name),
                     )
                     .into());
                 };
@@ -406,7 +404,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let view = record.view();
-        store.clusters.insert(cluster_name, record);
+        store.clusters.insert(cluster_name.clone(), record);
+        store.record_event(
+            &cluster_name,
+            crate::state::SOURCE_TYPE_CLUSTER,
+            crate::state::EVENT_CLUSTER_CREATED,
+            now,
+        );
 
         Ok(CreateClusterOutput {
             cluster: Some(view),

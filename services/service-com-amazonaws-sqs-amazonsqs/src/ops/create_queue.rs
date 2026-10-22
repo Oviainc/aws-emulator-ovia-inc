@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Allocates a queue in [`crate::state::ComAmazonawsSqsAmazonsqsState::queues`] and
+//! answers with the url a client addresses it by. Every later reference to that queue
+//! — `GetQueueUrl`, `GetQueueAttributes`, `SetQueueAttributes` — resolves the SAME
+//! record, so what this call writes is what they report.
+//!
+//! Three rules from the operation's own documentation drive the body:
+//!
+//! - "If you don't provide a value for an attribute, the queue is created with the
+//!   default value for the attribute" — the defaults live beside the bounds in
+//!   [`crate::state::SETTABLE_ATTRIBUTES`], each with the sentence that states it.
+//! - "If you specify the name of an existing queue and provide the exact same names
+//!   and values for all its attributes, the CreateQueue action will return the URL of
+//!   the existing queue instead of creating a new one. If you attempt to create a
+//!   queue with a name that already exists but with different attribute names or
+//!   values, the CreateQueue action will return an error."
+//! - "If you don't specify the FifoQueue attribute, Amazon SQS creates a standard
+//!   queue", and "A FIFO queue name must end with the .fifo suffix."
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +206,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateQueue"))
+        use crate::state;
+
+        // `QueueName` carries no modelled constraint, so the member's own rule is
+        // enforced here. The operation models no error for a malformed member, hence
+        // the 400 `ValidationException` channel rather than a 501.
+        if let Some(why) = state::queue_name_refusal(&input.queue_name) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
+        let supplied = input.attributes.unwrap_or_default();
+        // "If you don't specify the FifoQueue attribute, Amazon SQS creates a standard
+        // queue" — and it is being FIFO that makes the FIFO-only attributes applicable.
+        let fifo = supplied
+            .get(state::FIFO_QUEUE_ATTRIBUTE)
+            .is_some_and(|value| value == "true");
+        state::validate_attributes(&supplied, true, fifo).map_err(|refusal| match refusal {
+            state::AttributeRefusal::Name(error) => {
+                CreateQueueErrorModeled::InvalidAttributeName(error)
+            }
+            state::AttributeRefusal::Value(error) => {
+                CreateQueueErrorModeled::InvalidAttributeValue(error)
+            }
+        })?;
+
+        if fifo && !input.queue_name.ends_with(state::FIFO_QUEUE_NAME_SUFFIX) {
+            return Err(CreateQueueErrorModeled::InvalidAttributeValue(InvalidAttributeValue {
+                message: Some(format!(
+                    "Invalid value for the parameter {}: a FIFO queue name must end with the {} suffix, but {} does not.",
+                    state::FIFO_QUEUE_ATTRIBUTE,
+                    state::FIFO_QUEUE_NAME_SUFFIX,
+                    input.queue_name,
+                )),
+            })
+            .into());
+        }
+
+        // The documented defaults, overlaid with what this request supplied: the
+        // attribute set the queue carries, and the one an idempotent re-create of the
+        // same name has to match exactly.
+        let mut attributes: ::std::collections::BTreeMap<String, String> =
+            state::SETTABLE_ATTRIBUTES
+                .iter()
+                .filter_map(|spec| {
+                    spec.default
+                        .map(|value| (spec.name.to_string(), value.to_string()))
+                })
+                .collect();
+        attributes.extend(
+            supplied
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
+
+        let store = state::service_state(&*self.engine).ok_or_else(|| {
+            CreateQueueErrorModeled::UnsupportedOperation(state::store_unavailable())
+        })?;
+        let mut store = store.lock();
+
+        if let Some(existing) = store.queues.get(&input.queue_name) {
+            if existing.attributes == attributes {
+                return Ok(CreateQueueOutput {
+                    queue_url: Some(existing.url.clone()),
+                });
+            }
+            return Err(CreateQueueErrorModeled::QueueNameExists(QueueNameExists {
+                message: Some(format!(
+                    "A queue already exists with the name {} and attributes that differ from the ones this request supplied.",
+                    input.queue_name,
+                )),
+            })
+            .into());
+        }
+
+        if store.queues.len() >= state::MAX_QUEUES {
+            // The emulator's own store ceiling. This operation models no quota error,
+            // so the refusal rides on `RequestThrottled` — "The request was denied" —
+            // the only one of its errors that means the call was turned away rather
+            // than that the request was malformed.
+            return Err(CreateQueueErrorModeled::RequestThrottled(RequestThrottled {
+                message: Some(format!(
+                    "Cannot create queue {}: this emulator already holds {} queues.",
+                    input.queue_name,
+                    state::MAX_QUEUES,
+                )),
+            })
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = state::request_region(ctx.parts());
+        let url = state::queue_url(ctx.parts(), &region, &input.queue_name);
+        let queue = state::Queue {
+            name: input.queue_name.clone(),
+            url: url.clone(),
+            arn: state::queue_arn(&region, &input.queue_name),
+            attributes,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at: now,
+            // Nothing has changed the queue yet, so it was last modified when it was
+            // created.
+            last_modified_at: now,
+        };
+        store.queues.insert(input.queue_name, queue);
+
+        Ok(CreateQueueOutput {
+            queue_url: Some(url),
+        })
     }
 }

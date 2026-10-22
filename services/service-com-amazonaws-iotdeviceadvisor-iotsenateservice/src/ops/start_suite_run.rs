@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSuiteRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSuiteRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSuiteRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates and PERSISTS a suite run of one definition version: a new UUID id, the ARN, the
+//! endpoint a device under test connects to, and the `PENDING` status the run starts in.
+//!
+//! ## The run itself cannot execute here
+//!
+//! Device Advisor drives real MQTT test cases against a physical device over the IoT data
+//! plane, which this emulator has no runner for. The control plane is real — the run is
+//! minted, tracked, readable and stoppable — and the execution it cannot perform ends in
+//! the service's own modelled failure status (`ERROR`, with
+//! [`crate::state::NO_TEST_RUNNER_REASON`] as `errorReason`) rather than in a fabricated
+//! `PASS`/`FAIL` with test results nothing produced.
+//!
+//! ## An unknown definition is a `ValidationException`, not a `ResourceNotFoundException`
+//!
+//! `smithy_query(query="operation",operation="StartSuiteRun")` declares exactly three
+//! errors for this operation — `ConflictException` (400), `InternalServerException` (500)
+//! and `ValidationException` (400) — and no `ResourceNotFoundException`, so a request
+//! naming a `suiteDefinitionId` (or a `suiteDefinitionVersion`) the store does not hold is
+//! refused with the modelled client-input error this operation actually declares.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +160,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSuiteRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSuiteRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSuiteRun"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartSuiteRunErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iotdeviceadvisor store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(definition) = store.definitions.get(&input.suite_definition_id) else {
+            return Err(StartSuiteRunErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "No suite definition with suiteDefinitionId {}",
+                    input.suite_definition_id
+                )),
+            })
+            .into());
+        };
+        let version = input
+            .suite_definition_version
+            .clone()
+            .unwrap_or_else(|| definition.latest_version.clone());
+        if !definition.versions.contains_key(&version) {
+            return Err(StartSuiteRunErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "Suite definition {} has no version {version}",
+                    input.suite_definition_id
+                )),
+            })
+            .into());
+        }
+
+        // One run at a time per definition: any run of it that is not finished — PENDING,
+        // RUNNING, or STOPPING until the stop completes — refuses the next start.
+        let in_progress = store
+            .runs_of_mut(&input.suite_definition_id, now)
+            .find(|run| run.is_in_progress())
+            .map(|run| run.id.clone());
+        if let Some(in_progress) = in_progress {
+            return Err(StartSuiteRunErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Suite run {in_progress} is still in progress for suite definition {}",
+                    input.suite_definition_id
+                )),
+            })
+            .into());
+        }
+
+        let id = crate::state::new_uuid();
+        let arn = crate::state::arn(
+            &region,
+            &format!("suiterun/{}/{id}", input.suite_definition_id),
+        );
+        // Retention, so a definition run over and over cannot grow the store without
+        // limit: make room for this run by dropping the oldest finished ones.
+        store.prune_runs(
+            &input.suite_definition_id,
+            crate::state::MAX_RUNS_PER_DEFINITION.saturating_sub(1),
+            now,
+        );
+        let tags: ::std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
+        let run = crate::state::SuiteRun {
+            id: id.clone(),
+            arn: arn.clone(),
+            suite_definition_id: input.suite_definition_id,
+            suite_definition_version: version,
+            configuration: input.suite_run_configuration,
+            status: "PENDING".to_string(),
+            created_at: now,
+            started_at: None,
+            end_at: None,
+            error_reason: None,
+            endpoint: crate::state::endpoint_for_region(&region),
+            next_transition_at: Some(now + crate::state::STATUS_TRANSITION),
+        };
+
+        if !tags.is_empty() {
+            store.tags.insert(arn, tags);
+        }
+        store.runs.insert(id.clone(), run);
+
+        let stored = store.runs.get(&id).ok_or_else(|| {
+            StartSuiteRunErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the created suite run could not be read back".to_string()),
+            })
+        })?;
+        crate::state::audit(Self::NAME, ctx.parts(), &region, &stored.arn, "started");
+        Ok(StartSuiteRunOutput {
+            suite_run_id: Some(stored.id.clone()),
+            suite_run_arn: Some(stored.arn.clone()),
+            created_at: Some(stored.created_at.into()),
+            endpoint: Some(stored.endpoint.clone()),
+        })
     }
 }

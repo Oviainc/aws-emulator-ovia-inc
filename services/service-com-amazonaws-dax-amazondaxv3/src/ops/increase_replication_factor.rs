@@ -191,22 +191,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_seqs = {
             let Some(cluster) = store.clusters.get(&cluster_name) else {
                 return Err(IncreaseReplicationFactorErrorModeled::ClusterNotFoundFault(
-                    ClusterNotFoundFault {
-                        message: Some(format!("Cluster {cluster_name} does not exist")),
-                    },
+                    crate::state::cluster_not_found(),
                 )
                 .into());
             };
             if cluster.status != crate::state::CLUSTER_AVAILABLE {
                 return Err(
                     IncreaseReplicationFactorErrorModeled::InvalidClusterStateFault(
-                        InvalidClusterStateFault {
-                            message: Some(format!(
-                                "Cluster {cluster_name} is {}, not {}",
-                                cluster.status,
-                                crate::state::CLUSTER_AVAILABLE
-                            )),
-                        },
+                        crate::state::invalid_cluster_state(),
                     )
                     .into(),
                 );
@@ -235,9 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(cluster) = store.clusters.get_mut(&cluster_name) else {
             return Err(IncreaseReplicationFactorErrorModeled::ClusterNotFoundFault(
-                ClusterNotFoundFault {
-                    message: Some(format!("Cluster {cluster_name} does not exist")),
-                },
+                crate::state::cluster_not_found(),
             )
             .into());
         };
@@ -251,9 +241,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         cluster.status = crate::state::CLUSTER_MODIFYING.to_string();
         cluster.settles_at = Some(now + crate::state::STATUS_SETTLE_DELAY);
+        let view = cluster.view();
+        store.record_event(
+            &cluster_name,
+            crate::state::SOURCE_TYPE_CLUSTER,
+            crate::state::EVENT_CLUSTER_NODES_ADDED,
+            now,
+        );
 
         Ok(IncreaseReplicationFactorOutput {
-            cluster: Some(cluster.view()),
+            cluster: Some(view),
         })
     }
 }

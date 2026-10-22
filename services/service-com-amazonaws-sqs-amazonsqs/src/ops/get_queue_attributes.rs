@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetQueueAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetQueueAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetQueueAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the attributes of the queue a `QueueUrl` addresses, projected from the
+//! stored [`crate::state::Queue`] by [`crate::state::Queue::reported_attributes`].
+//!
+//! Two rules from the `AttributeNames` documentation drive the body:
+//!
+//! - "The `AttributeNames` parameter is optional, but if you don't specify values for
+//!   this parameter, the request returns empty results."
+//! - "`All` – Returns all values", and every other name returns just that attribute.
+//!
+//! An attribute the queue has no value for is absent from the map rather than present
+//! and empty — which is also how the three `ApproximateNumberOfMessages*` counters
+//! answer, because this crate has no message plane for them to count yet. See
+//! [`crate::state::MESSAGE_PLANE_ATTRIBUTES`].
+//!
+//! A pure read: nothing about reporting a queue changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +167,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetQueueAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetQueueAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetQueueAttributes"))
+        use crate::state;
+
+        let _ = ctx;
+        let store = state::service_state(&*self.engine).ok_or_else(|| {
+            GetQueueAttributesErrorModeled::UnsupportedOperation(state::store_unavailable())
+        })?;
+        let store = store.lock();
+
+        let queue = state::queue_name_from_url(&input.queue_url)
+            .and_then(|name| store.queues.get(name))
+            .ok_or_else(|| {
+                GetQueueAttributesErrorModeled::QueueDoesNotExist(state::queue_does_not_exist(
+                    &input.queue_url,
+                ))
+            })?;
+
+        let requested = input.attribute_names.unwrap_or_default();
+        if requested.is_empty() {
+            // "if you don't specify values for this parameter, the request returns
+            // empty results" — no `Attributes` member at all.
+            return Ok(GetQueueAttributesOutput { attributes: None });
+        }
+
+        for name in &requested {
+            // Belt-and-braces: `AttributeNames` is a list of the model's
+            // `QueueAttributeName` enum, so the boundary constraint walk already
+            // refuses an undeclared element before this handler runs — and
+            // `crate::service`'s refusal override states that refusal with THIS
+            // error's code, which is why the two agree.
+            if !QUEUE_ATTRIBUTE_NAME_VALUES.contains(&name.as_str()) {
+                return Err(GetQueueAttributesErrorModeled::InvalidAttributeName(
+                    InvalidAttributeName {
+                        message: Some(format!("Unknown Attribute {name}.")),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let reported = queue.reported_attributes();
+        let attributes = if requested
+            .iter()
+            .any(|name| name == state::ALL_ATTRIBUTES)
+        {
+            reported
+        } else {
+            requested
+                .iter()
+                .filter_map(|name| {
+                    reported
+                        .get(name)
+                        .map(|value| (name.clone(), value.clone()))
+                })
+                .collect()
+        };
+
+        Ok(GetQueueAttributesOutput {
+            attributes: Some(attributes.into_iter().collect()),
+        })
     }
 }
