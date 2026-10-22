@@ -15,7 +15,27 @@ use crate::ops::types::{
 
 /// The `ResourceType` this service reports for a WorkSpace Instance in its
 /// resource-scoped errors.
-pub const WORKSPACE_INSTANCE_RESOURCE_TYPE: &str = "workspace-instance";
+///
+/// `ResourceNotFoundException$ResourceType` and
+/// `ServiceQuotaExceededException$ResourceType` are free `String` members — the
+/// model enumerates no token for them (`ResourceTypeEnum` is the EC2-style tag
+/// specification enum, nothing to do with these errors), so the token form is
+/// RECORDED behaviour: the wire corpus answers `WORKSPACE_INSTANCE` for a missing
+/// WorkSpace Instance. A client switches on this field, so the token is the one the
+/// service really sends: upper case, underscore separated.
+pub const WORKSPACE_INSTANCE_RESOURCE_TYPE: &str = "WORKSPACE_INSTANCE";
+
+/// The HTTP status this service answers `ResourceNotFoundException` with.
+///
+/// The error SHAPE carries `@httpError 404`
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), but the
+/// service OVERRIDES it on the WorkSpace Instance paths: the wire recordings for an
+/// unknown `wsinst-…` id answer HTTP 400 carrying that same shape, its members and
+/// its `__type`. A client branches on the status as well as the code, so the pair it
+/// sees has to be the pair the service sends — hence the status is stated here and
+/// applied through [`crate::scaffolded::Scaffolded::ModeledWithStatus`], leaving the
+/// shape, its members and its wire code the model's.
+pub const RESOURCE_NOT_FOUND_STATUS: u16 = 400;
 
 /// The `ServiceCode` this service reports in its quota errors: the service's own
 /// code, which is also its sigv4 signing name and ARN namespace.
@@ -229,14 +249,44 @@ pub fn instance_quota_exceeded(held: usize) -> ServiceQuotaExceededException {
     }
 }
 
-/// The modelled `ResourceNotFoundException` (HTTP 404) for a WorkSpace Instance id
-/// that names no stored record. Every member the model marks `@required` is filled.
+/// The `Message` this service states for a WorkSpace Instance that names no stored
+/// record.
+///
+/// A FIXED sentence, not built from the request: the service states that the
+/// resource kind was not found and leaves the identity to the modelled
+/// `ResourceId` member, which carries the id a client needs. Echoing the submitted
+/// id into the prose as well would make the message vary per request for no
+/// information a structured member does not already carry — the same reason this
+/// service's validation messages name the member and the constraint without the
+/// rejected value.
+pub const INSTANCE_NOT_FOUND_MESSAGE: &str = "Workspace instance is not found";
+
+/// The modelled `ResourceNotFoundException` for a WorkSpace Instance id that names
+/// no stored record. Every member the model marks `@required` is filled: the
+/// request-independent [`INSTANCE_NOT_FOUND_MESSAGE`], the id that was looked up,
+/// and this service's [`WORKSPACE_INSTANCE_RESOURCE_TYPE`] token.
 pub fn instance_not_found(id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("WorkSpace Instance {id} does not exist"),
+        message: INSTANCE_NOT_FOUND_MESSAGE.to_string(),
         resource_id: id.to_string(),
         resource_type: WORKSPACE_INSTANCE_RESOURCE_TYPE.to_string(),
     }
+}
+
+/// [`instance_not_found`] lifted into an operation's error channel, answered with
+/// [`RESOURCE_NOT_FOUND_STATUS`].
+///
+/// `wrap` is the operation's own `ResourceNotFoundException` variant, so every
+/// single-instance operation reports a missing instance through this ONE place and
+/// none of them can drift to the shape's status or to another token.
+pub fn instance_not_found_error<E>(
+    id: &str,
+    wrap: impl FnOnce(ResourceNotFoundException) -> E,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        wrap(instance_not_found(id)),
+        RESOURCE_NOT_FOUND_STATUS,
+    )
 }
 
 /// The persisted tags of a record, as the modelled `TagList`.

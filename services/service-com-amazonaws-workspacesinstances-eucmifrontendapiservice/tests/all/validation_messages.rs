@@ -495,12 +495,16 @@ async fn a_value_inside_every_published_bound_is_not_refused() {
              ({status}): {raw}"
         );
         // Whatever the operation then does with the accepted request — serve it
-        // (200), report the resource absent (404) or answer the scaffold's 501 —
+        // (200), report the resource absent (this service answers
+        // `ResourceNotFoundException` with HTTP 400, see
+        // `crate::state::RESOURCE_NOT_FOUND_STATUS`) or answer the scaffold's 501 —
         // it is past the boundary and no refusal of any kind was rendered.
+        let past_boundary =
+            matches!(status, 200 | 501) || (status == 400 && code == "ResourceNotFoundException");
         assert!(
-            matches!(status, 200 | 404 | 501),
+            past_boundary,
             "case {name:?} on {operation}: expected the request to get past the boundary \
-             (200, 404 or 501), got {status} with {raw}"
+             (200, a not-found, or 501), got {status} with {raw}"
         );
     }
 }

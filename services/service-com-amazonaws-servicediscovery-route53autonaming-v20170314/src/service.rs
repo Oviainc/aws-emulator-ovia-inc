@@ -98,15 +98,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Cloud Map models NO `ValidationException` — the framework's default code
+        // for this class — and declares exactly one error for it instead:
+        // `InvalidInput`, documented as "One or more specified values aren't valid.
+        // For example, a required value might be missing, a numeric value might be
+        // outside the allowed range, or a string value might exceed length
+        // constraints." That sentence describes this refusal class member for member,
+        // so every operation of this service answers a boundary refusal with the code
+        // its own model declares, the way a handler does for the rules the model
+        // cannot express. The framework's message is kept: it already names the member
+        // and the constraint it failed, in the envelope AWS itself uses.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "InvalidInput".to_string(),
+                message: aws_smithy_schema_server::envelope(violations).unwrap_or_else(|| {
+                    "One or more specified values aren't valid.".to_string()
+                }),
+            }),
+            // Authentication is the emulator's, not this service's: its model declares
+            // no shape for a refused caller, so the framework's 403 stands.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

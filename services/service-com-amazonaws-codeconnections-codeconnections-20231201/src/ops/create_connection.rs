@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -96,12 +87,26 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codeconnections-codecon
 // here — hence the `CreateConnectionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codeconnections#CreateConnection")]
+//
+// Two shapes this SERVICE models that this OPERATION does not list are widened in:
+//
+// * `ResourceAlreadyExistsException` (409, "Unable to create resource. Resource
+//   already exists.") — the `Connection.ConnectionName` member documents that
+//   connection names must be unique in an account, and this is the service's own
+//   shape for a create refused because the resource is already there.
+// * `InternalServerException` (503) — the modelled server fault for a state store
+//   this handler cannot reach, which must never be reported as a client error.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codeconnections#CreateConnection",
+    extra_errors = ["ResourceAlreadyExistsException", "InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateConnectionErrorModeled {
     LimitExceededException(LimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
     ResourceUnavailableException(ResourceUnavailableException),
+    ResourceAlreadyExistsException(ResourceAlreadyExistsException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -155,18 +160,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConnection"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateConnectionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The CodeConnections resource store is unavailable. Try again.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `HostArn` names a host resource, and a host only exists once `CreateHost`
+        // minted it. That operation is still a scaffold, so this service holds no
+        // host at all and any `HostArn` a caller supplies names one that does not
+        // exist — for which the modelled answer is `ResourceUnavailableException`
+        // (400, "Resource not found. Verify the ARN for the host resource and try
+        // again."), not a connection pointing at a resource that is not there.
+        if let Some(host_arn) = input.host_arn.as_deref() {
+            return Err(CreateConnectionErrorModeled::ResourceUnavailableException(
+                ResourceUnavailableException {
+                    message: Some(format!(
+                        "Resource not found. Verify the ARN for the host resource and try again: {host_arn}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let tags = input.tags.unwrap_or_default();
+
+        let mut store = state.lock();
+
+        // The request-level condition first: a name that is taken makes THIS request
+        // invalid, and the caller needs that specific reason even when the store is
+        // also at its bound. `Connection.ConnectionName`: "Connection names must be
+        // unique in an Amazon Web Services account."
+        if store.connection_name_taken(&input.connection_name) {
+            return Err(CreateConnectionErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!(
+                        "Unable to create resource. A connection named '{}' already exists in this account.",
+                        input.connection_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Then the capacity of the store: the records live in this process, so the
+        // number a caller can accumulate is capped and the overflow is refused with
+        // the error the operation models for it. See `state::MAX_CONNECTIONS`.
+        if store.connections.len() >= crate::state::MAX_CONNECTIONS {
+            return Err(CreateConnectionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Exceeded the maximum limit for connections ({}).",
+                        crate::state::MAX_CONNECTIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The ARN is never reused, so the resource id is minted from a counter the
+        // store never rewinds rather than from anything derived from the name: a
+        // deleted connection's name can be taken again, and its old ARN must not come
+        // back with it.
+        let sequence = store.connections_minted;
+        store.connections_minted = store.connections_minted.saturating_add(1);
+        let owner_account_id = ::engine::emulator_account_id().to_string();
+        let connection_arn = ::engine::emulator_arn(
+            "codeconnections",
+            &region,
+            &format!(
+                "connection/{}",
+                crate::state::connection_resource_id(&owner_account_id, &region, sequence)
+            ),
+        );
+
+        let record = crate::state::StoredConnection {
+            connection_name: input.connection_name,
+            connection_arn: connection_arn.clone(),
+            provider_type: input.provider_type,
+            owner_account_id,
+            connection_status: crate::state::CONNECTION_STATUS_ON_CREATE.to_string(),
+            host_arn: None,
+            tags,
+        };
+        let stored_tags = record.tags.clone();
+        store.connections.insert(connection_arn.clone(), record);
+        drop(store);
+
+        // Audit record for a state-changing operation: who presented which access
+        // key id, what changed, and the outcome. No secret is logged — the access key
+        // id is the public half the request already carries in its SigV4 scope.
+        ::tracing::info!(
+            operation = "CreateConnection",
+            access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+            connection_arn = %connection_arn,
+            outcome = "created",
+            "codeconnections state change"
+        );
+
+        Ok(CreateConnectionOutput {
+            connection_arn,
+            // The modelled member reports the tags applied to the resource, so a
+            // connection created with none has no tag list to report. That is
+            // deliberately not the same rendering as `ListTagsForResource`, whose
+            // whole output IS the tag list and so always renders one (empty when the
+            // resource carries no tags).
+            tags: if stored_tags.is_empty() {
+                None
+            } else {
+                Some(stored_tags)
+            },
+        })
     }
 }

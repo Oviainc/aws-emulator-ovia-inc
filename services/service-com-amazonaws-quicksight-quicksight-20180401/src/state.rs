@@ -14,9 +14,9 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    ColumnGroup, ColumnLevelPermissionRule, DataPrepConfiguration, DataSet, DataSetSummary,
-    DataSetUsageConfiguration, DataSource, DataSourceErrorInfo, DataSourceParameters,
-    DatasetParameter, FieldFolder, InputColumn, LogicalTable, OutputColumn,
+    AccountInfo, ColumnGroup, ColumnLevelPermissionRule, DataPrepConfiguration, DataSet,
+    DataSetSummary, DataSetUsageConfiguration, DataSource, DataSourceErrorInfo,
+    DataSourceParameters, DatasetParameter, FieldFolder, InputColumn, LogicalTable, OutputColumn,
     PerformanceConfiguration, PhysicalTable, ResourcePermission, RowLevelPermissionDataSet,
     RowLevelPermissionTagConfiguration, SemanticModelConfiguration, SslProperties, Tag,
     VpcConnectionProperties,
@@ -35,6 +35,12 @@ pub struct ComAmazonawsQuicksightQuicksight20180401State {
     pub data_sets: HashMap<(String, String), DataSetRecord>,
     /// Ingestions by `(AwsAccountId, DataSetId, IngestionId)`.
     pub ingestions: HashMap<(String, String, String), IngestionRecord>,
+    /// The sign-up details `CreateAccountSubscription` stored, by `AwsAccountId`.
+    ///
+    /// An account with no entry here is still a QuickSight account — see
+    /// [`ComAmazonawsQuicksightQuicksight20180401State::account_info`] — it just has
+    /// not had its subscription customised by a sign-up call.
+    pub account_subscriptions: HashMap<String, AccountSubscriptionRecord>,
 }
 
 impl ComAmazonawsQuicksightQuicksight20180401State {
@@ -96,6 +102,130 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
             .filter(|record| record.arn == arn)
     }
 }
+
+impl ComAmazonawsQuicksightQuicksight20180401State {
+    /// The subscription QuickSight reports for `aws_account_id`.
+    ///
+    /// QuickSight is enabled in every account this emulator serves — no operation in
+    /// this crate requires a prior sign-up, and a data source or data set can be
+    /// created under any `AwsAccountId` — so every account has a subscription in the
+    /// terminal [`ACCOUNT_SUBSCRIPTION_STATUS_CREATED`] status. The details reported
+    /// are the ones `CreateAccountSubscription` stored for that account when it signed
+    /// up, and the service defaults for an account that never did.
+    pub fn account_info(&self, aws_account_id: &str) -> AccountInfo {
+        match self.account_subscriptions.get(aws_account_id) {
+            Some(record) => record.to_account_info(),
+            None => default_account_info(aws_account_id),
+        }
+    }
+}
+
+/// A stored account subscription: what one account's `CreateAccountSubscription`
+/// sign-up chose.
+///
+/// The author contact details the sign-up may carry (`FirstName`, `LastName`,
+/// `EmailAddress`, `ContactNumber`) are deliberately absent, for the same reason
+/// `DataSourceRecord` drops `Credentials`: QuickSight returns them on no read, so
+/// keeping them would only hold personal data nothing can reach.
+#[derive(Debug, Clone)]
+pub struct AccountSubscriptionRecord {
+    pub account_name: String,
+    pub edition: String,
+    pub notification_email: String,
+    /// The `AuthenticationMethod` the sign-up chose, which is what `AccountInfo`
+    /// reports as its `AuthenticationType`.
+    pub authentication_method: String,
+    pub iam_identity_center_instance_arn: Option<String>,
+    pub active_directory_name: Option<String>,
+    pub realm: Option<String>,
+    pub directory_id: Option<String>,
+    pub admin_groups: Vec<String>,
+    pub author_groups: Vec<String>,
+    pub reader_groups: Vec<String>,
+    pub created_time: DateTime,
+}
+
+impl AccountSubscriptionRecord {
+    /// The modelled `AccountInfo` this record describes.
+    pub fn to_account_info(&self) -> AccountInfo {
+        AccountInfo {
+            account_name: Some(self.account_name.clone()),
+            edition: Some(self.edition.clone()),
+            notification_email: Some(self.notification_email.clone()),
+            authentication_type: Some(self.authentication_method.clone()),
+            account_subscription_status: Some(
+                ACCOUNT_SUBSCRIPTION_STATUS_CREATED.to_string(),
+            ),
+            iam_identity_center_instance_arn: self.iam_identity_center_instance_arn.clone(),
+        }
+    }
+}
+
+/// The `AccountInfo` of an account that never called `CreateAccountSubscription`.
+///
+/// `NotificationEmail` and `IAMIdentityCenterInstanceArn` are left unset rather than
+/// invented: only a sign-up (or an account-settings update) supplies an address, and
+/// this emulator has no IAM Identity Center instance.
+fn default_account_info(aws_account_id: &str) -> AccountInfo {
+    AccountInfo {
+        account_name: Some(default_account_name(aws_account_id)),
+        edition: Some(DEFAULT_EDITION.to_string()),
+        notification_email: None,
+        authentication_type: Some(DEFAULT_AUTHENTICATION_METHOD.to_string()),
+        account_subscription_status: Some(ACCOUNT_SUBSCRIPTION_STATUS_CREATED.to_string()),
+        iam_identity_center_instance_arn: None,
+    }
+}
+
+/// The QuickSight account name of an account that never named one.
+///
+/// A QuickSight `AccountName` is unique across all of Amazon Web Services, so the
+/// default is derived from the account id, which is what makes it unique. It matches
+/// the model's `AccountName` constraints (len 1..62, pattern
+/// `^(?!D-|d-)([\da-zA-Z]+)([-]*[\da-zA-Z])*$`), so a name this emulator reports is
+/// one `CreateAccountSubscription` would have accepted.
+pub fn default_account_name(aws_account_id: &str) -> String {
+    format!("quicksight-{aws_account_id}")
+}
+
+/// The `AccountSubscriptionStatus` of a QuickSight account that exists and is usable —
+/// the status AWS reports for a created account. The member is a free-form string in
+/// the model (`com.amazonaws.quicksight#AccountInfo$AccountSubscriptionStatus`), which
+/// declares no enum.
+pub const ACCOUNT_SUBSCRIPTION_STATUS_CREATED: &str = "ACCOUNT_CREATED";
+
+/// The edition reported for an account that never chose one, and stored for a sign-up
+/// that names no `Edition`.
+///
+/// `ENTERPRISE` (model enum `com.amazonaws.quicksight#Edition`) is the edition whose
+/// feature set this emulator serves: namespaces, groups, folders and themes are all
+/// Enterprise-edition features, and operations over them are part of this service.
+pub const DEFAULT_EDITION: &str = "ENTERPRISE";
+
+/// The authentication type reported for an account that never chose one: the method
+/// whose callers are the Amazon Web Services identities this emulator authenticates
+/// (model enum `com.amazonaws.quicksight#AuthenticationMethodOption`).
+pub const DEFAULT_AUTHENTICATION_METHOD: &str = "IAM_AND_QUICKSIGHT";
+
+/// The `AuthenticationMethodOption` values whose accounts are authenticated through
+/// IAM, which is what `SignupResponse$IAMUser` reports.
+pub const IAM_AUTHENTICATION_METHODS: &[&str] = &["IAM_AND_QUICKSIGHT", "IAM_ONLY"];
+
+/// The `AuthenticationMethodOption` that authenticates against an Active Directory,
+/// and so the one whose sign-up must name that directory.
+pub const AUTHENTICATION_METHOD_ACTIVE_DIRECTORY: &str = "ACTIVE_DIRECTORY";
+
+/// The `AuthenticationMethodOption` that authenticates against IAM Identity Center.
+pub const AUTHENTICATION_METHOD_IAM_IDENTITY_CENTER: &str = "IAM_IDENTITY_CENTER";
+
+/// The `Edition` whose sign-up also subscribes to QuickSight Q, and so the one whose
+/// `CreateAccountSubscription` requires the author's contact details.
+pub const EDITION_ENTERPRISE_AND_Q: &str = "ENTERPRISE_AND_Q";
+
+/// The TOTAL number of account subscriptions this emulator stores. The key is the
+/// request's `AwsAccountId`, so — as for data sources and data sets — the bound that
+/// holds for the process is a total one.
+pub const MAX_ACCOUNT_SUBSCRIPTIONS: usize = 10_000;
 
 /// A stored data source.
 ///

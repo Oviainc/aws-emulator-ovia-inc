@@ -9,7 +9,7 @@
 //! beside this one — shared service logic lives here rather than being copied into
 //! each operation file.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use ::aws_smithy_schema_server::constraints::{Violation, ViolationKind};
@@ -57,6 +57,38 @@ pub const EVENT_COMPLETED: &str = "COMPLETED";
 /// `WorkloadStatus` member the seeded catalogue entries carry, from
 /// `WORKLOAD_STATUS_VALUES`.
 pub const WORKLOAD_ACTIVE: &str = "ACTIVE";
+
+/// `WorkloadDeploymentPatternStatus` member the seeded deployment patterns carry,
+/// from `WORKLOAD_DEPLOYMENT_PATTERN_STATUS_VALUES`.
+pub const PATTERN_ACTIVE: &str = "ACTIVE";
+
+/// The two values `DeploymentSpecificationsField$required` carries.
+///
+/// The model types the member as a plain `String` and documents it as "Indicates if
+/// the deployment specification is required", so the vocabulary is not an enum: these
+/// are the `Yes` / `No` values Launch Wizard's deployment specifications use, the same
+/// pair the model's own `CreateDeployment` example submits for its boolean
+/// specifications (`DisableDeploymentRollback: "Yes"`, `SaveDeploymentArtifacts:
+/// "No"`).
+pub const REQUIRED_YES: &str = "Yes";
+/// See [`REQUIRED_YES`].
+pub const REQUIRED_NO: &str = "No";
+
+/// A `DeploymentConditionalField$comparator` value. The model documents the member as
+/// "Valid values: `Equal | NotEqual`".
+pub const COMPARATOR_EQUAL: &str = "Equal";
+/// See [`COMPARATOR_EQUAL`].
+pub const COMPARATOR_NOT_EQUAL: &str = "NotEqual";
+
+/// The version name every seeded catalogue entry reports for both
+/// `workloadVersionName` and `deploymentPatternVersionName`.
+///
+/// `WorkloadVersionName` / `DeploymentPatternVersionName` are len 5..30 with pattern
+/// `^(([A-Za-z0-9][a-zA-Z0-9-]*)|(\d+\.\d+\.\d+))$`; this is the dotted alternative at
+/// its shortest. The catalogue is service-owned (no API creates a workload or a
+/// pattern), so the emulator seeds ONE version per pattern; the
+/// deployment-pattern-version operations extend this when they are implemented.
+pub const CATALOGUE_VERSION: &str = "1.0.0";
 
 /// The message a deployment lookup that finds nothing carries.
 ///
@@ -112,14 +144,152 @@ pub const DEFAULT_PAGE_SIZE: usize = 100;
 /// caller-supplied input in the error channel.
 pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "NextToken is not valid.";
 
+/// One conditional on a deployment specification field: the OTHER field whose value
+/// decides whether this one is read.
+#[derive(Debug, Clone)]
+pub struct SpecificationConditional {
+    /// `DeploymentConditionalField$name` — the name of the field this condition reads.
+    pub name: String,
+    /// `DeploymentConditionalField$value`.
+    pub value: String,
+    /// `DeploymentConditionalField$comparator`, one of [`COMPARATOR_EQUAL`] /
+    /// [`COMPARATOR_NOT_EQUAL`].
+    pub comparator: String,
+}
+
+impl SpecificationConditional {
+    /// This conditional as the modelled `DeploymentConditionalField`.
+    pub fn to_field(&self) -> DeploymentConditionalField {
+        DeploymentConditionalField {
+            name: Some(self.name.clone()),
+            value: Some(self.value.clone()),
+            comparator: Some(self.comparator.clone()),
+        }
+    }
+}
+
+/// One field of a deployment pattern's specification schema: what a caller may put in
+/// `CreateDeployment`'s `specifications` map for this pattern.
+///
+/// `name` is a `DeploymentSpecifications` KEY (len 3..256, `^[a-zA-Z0-9-:]+$`), so a
+/// caller can submit the reported name as it stands.
+#[derive(Debug, Clone)]
+pub struct SpecificationField {
+    pub name: String,
+    pub description: String,
+    /// `DeploymentSpecificationsField$allowedValues`: empty when the field takes any
+    /// `ValueString`, in which case nothing is reported rather than an empty list.
+    pub allowed_values: Vec<String>,
+    /// Reported as [`REQUIRED_YES`] / [`REQUIRED_NO`].
+    pub required: bool,
+    /// `DeploymentSpecificationsField$conditionals`: empty when the field is read
+    /// unconditionally.
+    pub conditionals: Vec<SpecificationConditional>,
+}
+
+impl SpecificationField {
+    /// This field as the modelled `DeploymentSpecificationsField`.
+    pub fn to_field(&self) -> DeploymentSpecificationsField {
+        DeploymentSpecificationsField {
+            name: Some(self.name.clone()),
+            description: Some(self.description.clone()),
+            allowed_values: (!self.allowed_values.is_empty())
+                .then(|| self.allowed_values.clone()),
+            required: Some(
+                if self.required {
+                    REQUIRED_YES
+                } else {
+                    REQUIRED_NO
+                }
+                .to_string(),
+            ),
+            conditionals: (!self.conditionals.is_empty()).then(|| {
+                self.conditionals
+                    .iter()
+                    .map(SpecificationConditional::to_field)
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// A deployment pattern of a workload, in the seeded, read-only catalogue.
+///
+/// This is the single record `ListWorkloadDeploymentPatterns` (summaries) and
+/// `GetWorkloadDeploymentPattern` (the same members plus the specification schema)
+/// both report from, so the two can never disagree.
+#[derive(Debug, Clone)]
+pub struct DeploymentPattern {
+    /// The `WorkloadName` this pattern belongs to.
+    pub workload_name: String,
+    /// `DeploymentPatternName`: len 1..256, `^[A-Za-z0-9][a-zA-Z0-9-]*$`.
+    pub pattern_name: String,
+    /// `WorkloadDeploymentPatternData$displayName`.
+    pub display_name: String,
+    /// `WorkloadDeploymentPatternData$description`.
+    pub description: String,
+    /// One of `WORKLOAD_DEPLOYMENT_PATTERN_STATUS_VALUES`.
+    pub status: String,
+    /// `WorkloadDeploymentPatternData$statusMessage`: present only when the status
+    /// needs explaining, which [`PATTERN_ACTIVE`] does not.
+    pub status_message: Option<String>,
+    /// `workloadVersionName`, see [`CATALOGUE_VERSION`].
+    pub workload_version_name: String,
+    /// `deploymentPatternVersionName`, see [`CATALOGUE_VERSION`].
+    pub pattern_version_name: String,
+    /// The specification schema a `CreateDeployment` for this pattern fills in.
+    pub specifications: Vec<SpecificationField>,
+}
+
+impl DeploymentPattern {
+    /// This pattern as the `WorkloadDeploymentPatternDataSummary`
+    /// `ListWorkloadDeploymentPatterns` returns.
+    ///
+    /// `accountConstraints` is left absent for the same reason as on a workload: this
+    /// emulator models no account constraints, so reporting none is the honest answer.
+    pub fn to_summary(&self) -> WorkloadDeploymentPatternDataSummary {
+        WorkloadDeploymentPatternDataSummary {
+            workload_name: Some(self.workload_name.clone()),
+            deployment_pattern_name: Some(self.pattern_name.clone()),
+            workload_version_name: Some(self.workload_version_name.clone()),
+            deployment_pattern_version_name: Some(self.pattern_version_name.clone()),
+            display_name: Some(self.display_name.clone()),
+            description: Some(self.description.clone()),
+            status: Some(self.status.clone()),
+            status_message: self.status_message.clone(),
+            account_constraints: None,
+        }
+    }
+
+    /// This pattern as the `WorkloadDeploymentPatternData`
+    /// `GetWorkloadDeploymentPattern` returns: every member of the summary, plus the
+    /// specification schema only the detail view carries.
+    pub fn to_data(&self) -> WorkloadDeploymentPatternData {
+        WorkloadDeploymentPatternData {
+            workload_name: Some(self.workload_name.clone()),
+            deployment_pattern_name: Some(self.pattern_name.clone()),
+            workload_version_name: Some(self.workload_version_name.clone()),
+            deployment_pattern_version_name: Some(self.pattern_version_name.clone()),
+            display_name: Some(self.display_name.clone()),
+            description: Some(self.description.clone()),
+            status: Some(self.status.clone()),
+            status_message: self.status_message.clone(),
+            account_constraints: None,
+            specifications: Some(
+                self.specifications
+                    .iter()
+                    .map(SpecificationField::to_field)
+                    .collect(),
+            ),
+        }
+    }
+}
+
 /// A workload in the seeded, read-only catalogue `CreateDeployment` resolves against.
 ///
-/// `patterns` holds only the deployment-pattern NAMES, because naming a pattern is
-/// all the implemented slice does with them. The per-pattern metadata (display name,
-/// status, versions, specification fields) belongs to the operations that report it —
-/// `GetWorkloadDeploymentPattern`, `ListWorkloadDeploymentPatterns` and the
-/// deployment-pattern-version operations — which are still scaffolded, and which
-/// extend this struct when they are implemented.
+/// `patterns` holds the full per-pattern record (display name, description, status,
+/// versions and specification schema), keyed by `DeploymentPatternName`, so the
+/// operations that report a pattern and the one that deploys it read the SAME entry.
 #[derive(Debug, Clone)]
 pub struct Workload {
     /// `WorkloadName`: len 1..100, `^[A-Za-z][a-zA-Z0-9-_]*$`.
@@ -130,9 +300,9 @@ pub struct Workload {
     pub description: String,
     /// `WorkloadDataSummary$status`, one of `WORKLOAD_STATUS_VALUES`.
     pub status: String,
-    /// `DeploymentPatternName`s this workload supports: len 1..256,
-    /// `^[A-Za-z0-9][a-zA-Z0-9-]*$`.
-    pub patterns: BTreeSet<String>,
+    /// The `DeploymentPatternName`s this workload supports (len 1..256,
+    /// `^[A-Za-z0-9][a-zA-Z0-9-]*$`), each with its catalogue record.
+    pub patterns: BTreeMap<String, DeploymentPattern>,
 }
 
 impl Workload {
@@ -424,42 +594,226 @@ impl ComAmazonawsLaunchwizardLaunchwizardState {
     }
 }
 
+/// A specification field of the seeded schema.
+fn spec_field(
+    name: &str,
+    description: &str,
+    required: bool,
+    allowed_values: &[&str],
+) -> SpecificationField {
+    SpecificationField {
+        name: name.to_string(),
+        description: description.to_string(),
+        allowed_values: allowed_values.iter().map(|v| (*v).to_string()).collect(),
+        required,
+        conditionals: Vec::new(),
+    }
+}
+
+/// The specification fields EVERY seeded deployment pattern accepts.
+///
+/// The names are the infrastructure keys the model's own `CreateDeployment` example
+/// submits (`KeyPairName`, `VpcId`, `CreateSecurityGroup`,
+/// `DisableDeploymentRollback`, `SaveDeploymentArtifacts`), and each one is a valid
+/// `DeploymentSpecifications` key (len 3..256, `^[a-zA-Z0-9-:]+$`), so a caller can
+/// take a reported name straight to `CreateDeployment`.
+fn common_specification_fields() -> Vec<SpecificationField> {
+    let create_security_group = spec_field(
+        "CreateSecurityGroup",
+        "Whether the deployment creates a security group for the instances it launches.",
+        false,
+        &[REQUIRED_YES, REQUIRED_NO],
+    );
+    let existing_security_group = SpecificationField {
+        // Read only when the deployment is told NOT to create a security group, which
+        // is what a conditional on another field expresses.
+        conditionals: vec![SpecificationConditional {
+            name: create_security_group.name.clone(),
+            value: REQUIRED_NO.to_string(),
+            comparator: COMPARATOR_EQUAL.to_string(),
+        }],
+        ..spec_field(
+            "SecurityGroupId",
+            "The id of an existing security group to attach to the instances this \
+             deployment launches.",
+            false,
+            &[],
+        )
+    };
+    vec![
+        spec_field(
+            "KeyPairName",
+            "The name of the EC2 key pair used to access the instances this deployment \
+             launches.",
+            true,
+            &[],
+        ),
+        spec_field(
+            "VpcId",
+            "The id of the VPC the deployment launches its resources into.",
+            true,
+            &[],
+        ),
+        create_security_group,
+        existing_security_group,
+        spec_field(
+            "DisableDeploymentRollback",
+            "Whether the deployment keeps the resources it created when a step fails.",
+            false,
+            &[REQUIRED_YES, REQUIRED_NO],
+        ),
+        spec_field(
+            "SaveDeploymentArtifacts",
+            "Whether the deployment keeps the artifacts it generated after it finishes.",
+            false,
+            &[REQUIRED_YES, REQUIRED_NO],
+        ),
+    ]
+}
+
+/// The specification fields only `workload`'s patterns accept, on top of
+/// [`common_specification_fields`].
+///
+/// SAP's two are the SAP-specific keys the model's `CreateDeployment` example submits;
+/// the other seeded workloads add none, so their patterns are described by the common
+/// fields alone rather than by invented ones.
+fn workload_specification_fields(workload: &str) -> Vec<SpecificationField> {
+    match workload {
+        "SAP" => vec![
+            spec_field(
+                "SapSysGroupId",
+                "The group id of the SAP system's sapsys group.",
+                false,
+                &[],
+            ),
+            spec_field(
+                "EnableEbsVolumeEncryption",
+                "Whether the EBS volumes of the SAP instances are encrypted.",
+                false,
+                &[REQUIRED_YES, REQUIRED_NO],
+            ),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// One deployment pattern of the seeded catalogue, as the table in
+/// [`seeded_workloads`] spells it: its `DeploymentPatternName`, its display name and
+/// its description.
+type SeededPattern = (&'static str, &'static str, &'static str);
+
+/// One workload of the seeded catalogue: its `WorkloadName`, its display name, the
+/// description `GetWorkload` reports and the patterns it offers.
+type SeededWorkload = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [SeededPattern],
+);
+
 /// The workload catalogue the emulator seeds at first touch.
 ///
-/// Launch Wizard's catalogue is service-owned (there is no API to create a workload),
-/// so the emulator seeds it. The entries are the Launch Wizard applications AWS
-/// documents — SAP, Microsoft SQL Server and Microsoft Active Directory — with the
-/// deployment patterns each of those applications offers. The model constrains the
-/// shapes of these values: `WorkloadName` is `^[A-Za-z][a-zA-Z0-9-_]*$` (len 1..100)
-/// and `DeploymentPatternName` is `^[A-Za-z0-9][a-zA-Z0-9-]*$` (len 1..256).
+/// Launch Wizard's catalogue is service-owned (there is no API to create a workload or
+/// a deployment pattern), so the emulator seeds it. The entries are the Launch Wizard
+/// applications AWS documents — SAP, Microsoft SQL Server and Microsoft Active
+/// Directory — with the deployment patterns each of those applications offers, the
+/// specification schema each pattern accepts, and the one version of each. The model
+/// constrains the shapes of these values: `WorkloadName` is `^[A-Za-z][a-zA-Z0-9-_]*$`
+/// (len 1..100) and `DeploymentPatternName` is `^[A-Za-z0-9][a-zA-Z0-9-]*$` (len
+/// 1..256).
 ///
 /// `description` is the per-workload metadata `WorkloadData` (and therefore
-/// `GetWorkload`) reports: what the entry's application deploys.
+/// `GetWorkload`) reports: what the entry's application deploys; each pattern carries
+/// its own display name, description, specification schema and version.
 fn seeded_workloads() -> BTreeMap<String, Workload> {
-    let catalogue = [
+    let catalogue: [SeededWorkload; 3] = [
         (
             "SAP",
             "SAP",
             "Deploy SAP HANA and SAP NetWeaver applications on Amazon Web Services.",
-            &["SapHanaSingle", "SapHanaMultiNode", "SapNWOnHanaHA"][..],
+            &[
+                (
+                    "SapHanaSingle",
+                    "SAP HANA on a single instance",
+                    "Deploys an SAP HANA database on one instance.",
+                ),
+                (
+                    "SapHanaMultiNode",
+                    "SAP HANA on multiple nodes",
+                    "Deploys a scale-out SAP HANA database across several instances.",
+                ),
+                (
+                    "SapNWOnHanaHA",
+                    "SAP NetWeaver on SAP HANA, highly available",
+                    "Deploys SAP NetWeaver on an SAP HANA database across two \
+                     Availability Zones.",
+                ),
+            ][..],
         ),
         (
             "SQLServer",
             "Microsoft SQL Server",
             "Deploy Microsoft SQL Server, standalone or highly available, on Amazon Web Services.",
-            &["SqlServerSingle", "SqlServerHA"][..],
+            &[
+                (
+                    "SqlServerSingle",
+                    "Microsoft SQL Server on a single instance",
+                    "Deploys Microsoft SQL Server on one instance.",
+                ),
+                (
+                    "SqlServerHA",
+                    "Microsoft SQL Server, highly available",
+                    "Deploys a Microsoft SQL Server Always On availability group across \
+                     two Availability Zones.",
+                ),
+            ][..],
         ),
         (
             "ActiveDirectory",
             "Microsoft Active Directory",
             "Deploy AWS Managed Microsoft AD or self-managed Active Directory on Amazon Web \
              Services.",
-            &["AWSManagedAD", "SelfManagedAD"][..],
+            &[
+                (
+                    "AWSManagedAD",
+                    "AWS Managed Microsoft AD",
+                    "Deploys an AWS Directory Service managed Microsoft AD directory.",
+                ),
+                (
+                    "SelfManagedAD",
+                    "Self-managed Active Directory",
+                    "Deploys Active Directory domain controllers you administer yourself.",
+                ),
+            ][..],
         ),
     ];
     catalogue
         .into_iter()
         .map(|(workload_name, display_name, description, patterns)| {
+            let specifications = {
+                let mut fields = common_specification_fields();
+                fields.extend(workload_specification_fields(workload_name));
+                fields
+            };
+            let patterns = patterns
+                .iter()
+                .map(|(pattern_name, pattern_display, pattern_description)| {
+                    (
+                        (*pattern_name).to_string(),
+                        DeploymentPattern {
+                            workload_name: workload_name.to_string(),
+                            pattern_name: (*pattern_name).to_string(),
+                            display_name: (*pattern_display).to_string(),
+                            description: (*pattern_description).to_string(),
+                            status: PATTERN_ACTIVE.to_string(),
+                            status_message: None,
+                            workload_version_name: CATALOGUE_VERSION.to_string(),
+                            pattern_version_name: CATALOGUE_VERSION.to_string(),
+                            specifications: specifications.clone(),
+                        },
+                    )
+                })
+                .collect();
             (
                 workload_name.to_string(),
                 Workload {
@@ -467,7 +821,7 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                     display_name: display_name.to_string(),
                     description: description.to_string(),
                     status: WORKLOAD_ACTIVE.to_string(),
-                    patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
+                    patterns,
                 },
             )
         })

@@ -10,6 +10,11 @@
 //! * an EXPERIMENT, minted by `StartExperiment` from a template, read back by
 //!   `GetExperiment`, enumerated by `ListExperiments` and stopped by `StopExperiment`.
 //!
+//! An experiment template also owns a sub-resource: a TARGET ACCOUNT CONFIGURATION per
+//! targeted account, created by `CreateTargetAccountConfiguration` and read back by
+//! `GetTargetAccountConfiguration`. It is named by the (template, account) pair, so it
+//! is held on the template record and its count is derived from that map.
+//!
 //! Both records are the one copy every handler reads and writes, so a value a create
 //! call returns is the value a later read reports. An experiment also owes the clock a
 //! transition (`initiating` -> `running`, `stopping` -> `stopped`): the instant it falls
@@ -20,8 +25,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CreateExperimentTemplateActionInput, CreateExperimentTemplateExperimentOptionsInput,
-    CreateExperimentTemplateInput, CreateExperimentTemplateLogConfigurationInput,
+    ConflictException, CreateExperimentTemplateActionInput,
+    CreateExperimentTemplateExperimentOptionsInput, CreateExperimentTemplateInput,
+    CreateExperimentTemplateLogConfigurationInput,
     CreateExperimentTemplateReportConfigurationInput, CreateExperimentTemplateStopConditionInput,
     CreateExperimentTemplateTargetInput, Experiment, ExperimentAction,
     ExperimentCloudWatchLogsLogConfiguration, ExperimentLogConfiguration, ExperimentOptions,
@@ -42,8 +48,8 @@ use crate::ops::types::{
     ExperimentTemplateSummary, ExperimentTemplateTarget, ExperimentTemplateTargetFilter,
     ExperimentTemplateTargetInputFilter, ReportConfigurationCloudWatchDashboardInput,
     ReportConfigurationS3Output, ReportConfigurationS3OutputInput, ResourceNotFoundException,
-    ServiceQuotaExceededException, ValidationException, ACCOUNT_TARGETING_VALUES,
-    ACTIONS_MODE_VALUES, EMPTY_TARGET_RESOLUTION_MODE_VALUES,
+    ServiceQuotaExceededException, TargetAccountConfiguration, ValidationException,
+    ACCOUNT_TARGETING_VALUES, ACTIONS_MODE_VALUES, EMPTY_TARGET_RESOLUTION_MODE_VALUES,
 };
 
 /// What a handler reports when the engine it was built on carries no store for this
@@ -95,6 +101,14 @@ pub const MAX_EXPERIMENT_TEMPLATES: usize = 1_000;
 /// How many experiments the store holds before `StartExperiment` refuses with
 /// `ServiceQuotaExceededException`. See [`MAX_EXPERIMENT_TEMPLATES`].
 pub const MAX_EXPERIMENTS: usize = 1_000;
+
+/// How many target account configurations ONE experiment template holds before
+/// `CreateTargetAccountConfiguration` refuses with `ServiceQuotaExceededException`.
+///
+/// Like [`MAX_EXPERIMENT_TEMPLATES`] this is the emulator's OWN bound on its store
+/// rather than a claim about a quota AWS publishes, and it is checked only when a
+/// request would ADD a configuration.
+pub const MAX_TARGET_ACCOUNT_CONFIGURATIONS: usize = 1_000;
 
 /// The value FIS applies to `accountTargeting` when the request names none: the
 /// experiment targets the caller's own account (`AccountTargeting` is modelled
@@ -175,6 +189,75 @@ impl ExperimentStatus {
     }
 }
 
+/// One target account configuration of an experiment template, exactly as
+/// `CreateTargetAccountConfiguration` stored it.
+///
+/// A target account configuration is a SUB-RESOURCE of an experiment template, named by
+/// the (`experimentTemplateId`, `accountId`) pair rather than by an id the service mints
+/// — so it carries no id and no ARN, and it lives on the template record it belongs to.
+#[derive(Debug, Clone)]
+pub struct TargetAccountConfigurationRecord {
+    /// `TargetAccountId` — the account this configuration targets, and the second half
+    /// of its name.
+    pub account_id: String,
+    /// `RoleArn` — "the Amazon Resource Name (ARN) of an IAM role for the target
+    /// account", stored exactly as the request carried it.
+    pub role_arn: String,
+    /// `TargetAccountConfigurationDescription`, absent when the request named none.
+    ///
+    /// Held as an `Option` so a read reports what the caller actually sent: an absent
+    /// description stays absent and an empty one stays an empty string, rather than the
+    /// two collapsing into one value.
+    pub description: Option<String>,
+    /// The `@idempotencyToken` of the request that created this configuration, when it
+    /// carried one.
+    ///
+    /// This sub-resource is named by its (template, account) pair, so a token cannot be
+    /// resolved through [`ComAmazonawsFisFaultinjectionsimulatorState::idempotency`],
+    /// which maps a token to a single minted id; the token is kept on the record and
+    /// compared by [`TargetAccountConfigurationRecord::is_replay_of`] instead.
+    pub client_token: Option<String>,
+}
+
+impl TargetAccountConfigurationRecord {
+    /// The record `CreateTargetAccountConfiguration` persists for one account.
+    pub fn new(
+        account_id: String,
+        role_arn: String,
+        description: Option<String>,
+        client_token: Option<String>,
+    ) -> Self {
+        Self {
+            account_id,
+            role_arn,
+            description,
+            client_token,
+        }
+    }
+
+    /// True when a create request carrying `client_token` is a RETRY of the request that
+    /// created this record, rather than a second create for the same account.
+    ///
+    /// A request that carries no token is never a replay: there is nothing to match it
+    /// against, so a second create for the same account is a conflict.
+    pub fn is_replay_of(&self, client_token: Option<&str>) -> bool {
+        match (self.client_token.as_deref(), client_token) {
+            (Some(stored), Some(offered)) => stored == offered,
+            _ => false,
+        }
+    }
+
+    /// The `TargetAccountConfiguration` every target-account-configuration operation
+    /// returns: every member is the stored one.
+    pub fn to_target_account_configuration(&self) -> TargetAccountConfiguration {
+        TargetAccountConfiguration {
+            role_arn: Some(self.role_arn.clone()),
+            account_id: Some(self.account_id.clone()),
+            description: self.description.clone(),
+        }
+    }
+}
+
 /// One experiment template, exactly as `CreateExperimentTemplate` stored it.
 #[derive(Debug, Clone)]
 pub struct ExperimentTemplateRecord {
@@ -195,9 +278,12 @@ pub struct ExperimentTemplateRecord {
     /// Set to `creation_time` when the record is created, and moved only by a call that
     /// changes the template.
     pub last_update_time: SystemTime,
-    /// How many target account configurations this template carries. The operations that
-    /// create them are still 501, so a template created here carries none.
-    pub target_account_configurations_count: i64,
+    /// Every target account configuration of this template, keyed by its `accountId`.
+    /// `CreateTargetAccountConfiguration` adds one and
+    /// `targetAccountConfigurationsCount` is derived from this map, so the count a read
+    /// reports is the number of configurations the store actually holds. A `BTreeMap` is
+    /// what gives `ListTargetAccountConfigurations` a stable total order.
+    pub target_account_configurations: BTreeMap<String, TargetAccountConfigurationRecord>,
 }
 
 impl ExperimentTemplateRecord {
@@ -238,8 +324,15 @@ impl ExperimentTemplateRecord {
                 .map(template_report_configuration),
             creation_time: now,
             last_update_time: now,
-            target_account_configurations_count: 0,
+            target_account_configurations: BTreeMap::new(),
         }
+    }
+
+    /// `targetAccountConfigurationsCount` — how many target account configurations this
+    /// template holds, derived from the stored configurations rather than counted
+    /// separately.
+    pub fn target_account_configurations_count(&self) -> i64 {
+        i64::try_from(self.target_account_configurations.len()).unwrap_or(i64::MAX)
     }
 
     /// The `ExperimentTemplate` every template operation returns: every member is the
@@ -258,7 +351,7 @@ impl ExperimentTemplateRecord {
             tags: Some(self.tags.clone()),
             log_configuration: self.log_configuration.clone(),
             experiment_options: Some(self.experiment_options.clone()),
-            target_account_configurations_count: Some(self.target_account_configurations_count),
+            target_account_configurations_count: Some(self.target_account_configurations_count()),
             experiment_report_configuration: self.experiment_report_configuration.clone(),
         }
     }
@@ -300,8 +393,13 @@ pub struct ExperimentRecord {
     pub experiment_options: ExperimentOptions,
     pub log_configuration: Option<ExperimentLogConfiguration>,
     pub experiment_report_configuration: Option<ExperimentReportConfiguration>,
-    /// See [`ExperimentTemplateRecord::target_account_configurations_count`].
-    pub target_account_configurations_count: i64,
+    /// The target account configurations the template carried when this experiment was
+    /// started, keyed by `accountId`.
+    ///
+    /// A SNAPSHOT: an experiment runs against the accounts the template named at start
+    /// time, so a configuration added to or removed from the template afterwards does
+    /// not change this experiment. `targetAccountConfigurationsCount` is derived from it.
+    pub target_account_configurations: BTreeMap<String, TargetAccountConfigurationRecord>,
     pub creation_time: SystemTime,
     pub start_time: SystemTime,
     /// "The time that the experiment ended" — set when the experiment reaches a terminal
@@ -363,12 +461,18 @@ impl ExperimentRecord {
                 .experiment_report_configuration
                 .as_ref()
                 .map(experiment_report_configuration),
-            target_account_configurations_count: template.target_account_configurations_count,
+            target_account_configurations: template.target_account_configurations.clone(),
             creation_time: now,
             start_time: now,
             end_time: None,
             transition_due: Some(now + TRANSITION_DELAY),
         }
+    }
+
+    /// `targetAccountConfigurationsCount` — how many target account configurations this
+    /// experiment was started with, derived from the snapshot it carries.
+    pub fn target_account_configurations_count(&self) -> i64 {
+        i64::try_from(self.target_account_configurations.len()).unwrap_or(i64::MAX)
     }
 
     /// Materialise the transition the clock already owes at `now`, if it is due.
@@ -443,7 +547,7 @@ impl ExperimentRecord {
             tags: Some(self.tags.clone()),
             log_configuration: self.log_configuration.clone(),
             experiment_options: Some(self.experiment_options.clone()),
-            target_account_configurations_count: Some(self.target_account_configurations_count),
+            target_account_configurations_count: Some(self.target_account_configurations_count()),
             experiment_report_configuration: self.experiment_report_configuration.clone(),
             // `ExperimentReport` describes a report this emulator does not generate: the
             // report configuration is persisted, but no report is produced for it.
@@ -754,6 +858,35 @@ pub fn template_not_found(id: &str) -> ResourceNotFoundException {
 pub fn experiment_not_found(id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("No experiment found with id {id}")),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for a (template, account) pair that names no
+/// target account configuration — "the specified resource cannot be found".
+pub fn target_account_configuration_not_found(
+    experiment_template_id: &str,
+    account_id: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "No target account configuration found for account {account_id} \
+             in experiment template {experiment_template_id}"
+        )),
+    }
+}
+
+/// The `ConflictException` payload for a create that names an account the template
+/// already has a target account configuration for — "the request could not be processed
+/// because of a conflict".
+pub fn target_account_configuration_exists(
+    experiment_template_id: &str,
+    account_id: &str,
+) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "Experiment template {experiment_template_id} already has a target account \
+             configuration for account {account_id}"
+        )),
     }
 }
 

@@ -122,6 +122,25 @@ impl ComAmazonawsUxcAwsaccountuxsettingState {
     pub fn customization_mut(&mut self, account_id: &str) -> &mut AccountUxCustomization {
         self.customizations.entry(account_id.to_string()).or_default()
     }
+
+    /// Whether `service` names an entry of the catalog [`ListServices`] pages
+    /// over — which is what makes it a valid `visibleServices` value, since the
+    /// model documents that catalog as the source of valid identifiers.
+    ///
+    /// A READ: the catalog is fixed at construction, so membership never depends
+    /// on who asked. Binary search is sound because [`Default`] sorts the
+    /// catalog, which is also what makes paging over it coherent.
+    ///
+    /// [`ListServices`]: crate::ops::list_services::ListServices
+    pub fn is_catalog_service(&self, service: &str) -> bool {
+        debug_assert!(
+            self.service_catalog.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the catalog must stay sorted for membership to be decidable by binary search"
+        );
+        self.service_catalog
+            .binary_search_by(|entry| entry.as_str().cmp(service))
+            .is_ok()
+    }
 }
 
 /// The account a request is made by, which keys [`ComAmazonawsUxcAwsaccountuxsettingState::customizations`].

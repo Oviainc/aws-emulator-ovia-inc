@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTargetAccountConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTargetAccountConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTargetAccountConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a target account configuration for an experiment template: PERSISTS it on
+//! that template's record in
+//! [`crate::state::ExperimentTemplateRecord::target_account_configurations`], keyed by
+//! the `accountId` it configures, and returns it. The configuration is a sub-resource of
+//! the template, so a request naming a template the store does not hold answers
+//! `ResourceNotFoundException`, and one naming an account the template is already
+//! configured for answers `ConflictException` — unless it replays the
+//! `@idempotencyToken` that created that configuration, which reports it back.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +154,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTargetAccountConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTargetAccountConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTargetAccountConfiguration"))
+        // This operation mints no ARN and no id — a target account configuration is named
+        // by its (experimentTemplateId, accountId) pair — so nothing here reads the
+        // request's credential scope.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Every modelled constraint on this input — the required `experimentTemplateId`,
+        // `accountId` and `roleArn`, and the lengths and patterns on all four members —
+        // was already refused at the boundary, and the model states no further rule this
+        // handler could check.
+        let mut store = state.lock();
+
+        // The configuration belongs to an experiment template: with no such template
+        // there is nothing to configure.
+        let Some(template) = store
+            .experiment_templates
+            .get_mut(&input.experiment_template_id)
+        else {
+            return Err(
+                CreateTargetAccountConfigurationErrorModeled::ResourceNotFoundException(
+                    crate::state::template_not_found(&input.experiment_template_id),
+                )
+                .into(),
+            );
+        };
+
+        if let Some(existing) = template.target_account_configurations.get(&input.account_id) {
+            // `clientToken` is an `@idempotencyToken`: a retry of the request that
+            // created this configuration reports that configuration back, so a retried
+            // create never looks like a second one. Anything else naming an account the
+            // template is already configured for is a conflict.
+            if existing.is_replay_of(input.client_token.as_deref()) {
+                return Ok(CreateTargetAccountConfigurationOutput {
+                    target_account_configuration: Some(existing.to_target_account_configuration()),
+                });
+            }
+            return Err(
+                CreateTargetAccountConfigurationErrorModeled::ConflictException(
+                    crate::state::target_account_configuration_exists(
+                        &input.experiment_template_id,
+                        &input.account_id,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        if template.target_account_configurations.len()
+            >= crate::state::MAX_TARGET_ACCOUNT_CONFIGURATIONS
+        {
+            return Err(
+                CreateTargetAccountConfigurationErrorModeled::ServiceQuotaExceededException(
+                    crate::state::store_full(
+                        "target account configuration",
+                        crate::state::MAX_TARGET_ACCOUNT_CONFIGURATIONS,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let record = crate::state::TargetAccountConfigurationRecord::new(
+            input.account_id.clone(),
+            input.role_arn.clone(),
+            // Stored as the request carried it: an absent description stays absent and an
+            // empty one stays empty.
+            input.description.clone(),
+            input.client_token.clone(),
+        );
+        // Built from the record that is about to be stored, so what the caller sees is
+        // what a later `GetTargetAccountConfiguration` reads back.
+        let target_account_configuration = record.to_target_account_configuration();
+        template
+            .target_account_configurations
+            .insert(input.account_id.clone(), record);
+
+        Ok(CreateTargetAccountConfigurationOutput {
+            target_account_configuration: Some(target_account_configuration),
+        })
     }
 }

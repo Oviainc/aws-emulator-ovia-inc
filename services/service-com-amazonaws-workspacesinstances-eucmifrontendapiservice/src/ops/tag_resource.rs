@@ -148,10 +148,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         let Some(record) = state.instances.get_mut(&input.workspace_instance_id) else {
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                crate::state::instance_not_found(&input.workspace_instance_id),
-            )
-            .into());
+            return Err(crate::state::instance_not_found_error(
+                &input.workspace_instance_id,
+                TagResourceErrorModeled::ResourceNotFoundException,
+            ));
         };
 
         // Tagging MERGES onto what is already stored, and a key already present takes
@@ -169,10 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         if merged.len() > crate::state::MAX_TAGS_PER_INSTANCE {
+            // Names the member and the constraint it violated, and NONE of what the
+            // caller sent: this service does not reflect request values back into an
+            // error body, which is why the refusal renderer in `crate::service`
+            // states a boundary violation the same way.
             let why = format!(
-                "the request would leave WorkSpace Instance {} with {} tags; a resource holds at most {}",
-                input.workspace_instance_id,
-                merged.len(),
+                "the request would leave the WorkSpace Instance holding more than the {} tags a resource can hold",
                 crate::state::MAX_TAGS_PER_INSTANCE
             );
             return Err(TagResourceErrorModeled::ValidationException(ValidationException {

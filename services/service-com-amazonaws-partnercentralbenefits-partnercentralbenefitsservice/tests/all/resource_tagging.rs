@@ -14,6 +14,8 @@
 //! * `TagResource` merges the request's tags onto the tag set stored on the resource its
 //!   `resourceArn` names — a key the request carries takes its value, every other key
 //!   keeps its own — and `ListTagsForResource` reports exactly that merged set.
+//! * `UntagResource`'s side of the same state — the removal — is the sibling suite
+//!   `tests/all/resource_tags.rs`, which reuses the helpers below.
 //! * a `resourceArn` naming no resource the service holds is refused
 //!   `ResourceNotFoundException` (404) with the service's catalog-lookup message for the
 //!   `Catalog` the request named, which the tagging operations never name.
@@ -39,13 +41,13 @@ use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::
 use crate::benefit_application_lifecycle::{error_code, Harness};
 
 /// The region the harness signs for; the ARNs the service returns carry it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account id every emulated ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// Call one operation that must answer 200, and return its body.
-async fn ok(harness: &Harness, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ok(harness: &Harness, case: &str, operation: &str, body: &Value) -> Value {
     let (status, out) = harness.call(operation, body).await;
     assert_eq!(
         status, 200,
@@ -55,7 +57,7 @@ async fn ok(harness: &Harness, case: &str, operation: &str, body: &Value) -> Val
 }
 
 /// The id of the first benefit of `catalog`, which every create below applies for.
-async fn benefit_id(harness: &Harness, case: &str, catalog: &str) -> String {
+pub(crate) async fn benefit_id(harness: &Harness, case: &str, catalog: &str) -> String {
     let out = ok(harness, case, "ListBenefits", &json!({ "Catalog": catalog })).await;
     out["BenefitSummaries"]
         .as_array()
@@ -66,7 +68,7 @@ async fn benefit_id(harness: &Harness, case: &str, catalog: &str) -> String {
 }
 
 /// Create one benefit application in `catalog`, carrying `tags`, and return its ARN.
-async fn application_arn(
+pub(crate) async fn application_arn(
     harness: &Harness,
     case: &str,
     catalog: &str,
@@ -91,7 +93,11 @@ async fn application_arn(
 }
 
 /// The tag set `ListTagsForResource` reports for `resource_arn`.
-async fn tags_of(harness: &Harness, case: &str, resource_arn: &str) -> BTreeMap<String, String> {
+pub(crate) async fn tags_of(
+    harness: &Harness,
+    case: &str,
+    resource_arn: &str,
+) -> BTreeMap<String, String> {
     let out = ok(
         harness,
         case,
@@ -122,7 +128,7 @@ async fn tags_of(harness: &Harness, case: &str, resource_arn: &str) -> BTreeMap<
 }
 
 /// The modelled `Tags` list for `tags`, as the wire names its members.
-fn tag_payload(tags: &[(&str, &str)]) -> Value {
+pub(crate) fn tag_payload(tags: &[(&str, &str)]) -> Value {
     Value::Array(
         tags.iter()
             .map(|(key, value)| json!({ "Key": key, "Value": value }))
@@ -133,7 +139,7 @@ fn tag_payload(tags: &[(&str, &str)]) -> Value {
 /// The error message of a failure body, under either casing the protocols use: the
 /// framework's own refusals spell the member `message`, this service's modelled errors
 /// `Message`.
-fn error_message(body: &Value) -> String {
+pub(crate) fn error_message(body: &Value) -> String {
     ["message", "Message"]
         .into_iter()
         .find_map(|member| body.get(member).and_then(Value::as_str))
@@ -142,13 +148,13 @@ fn error_message(body: &Value) -> String {
 }
 
 /// The ARN this service gives the `resource` named `id` in `catalog`.
-fn expected_arn(catalog: &str, resource: &str, id: &str) -> String {
+pub(crate) fn expected_arn(catalog: &str, resource: &str, id: &str) -> String {
     format!("arn:aws:partnercentral:{REGION}:{ACCOUNT}:catalog/{catalog}/{resource}/{id}")
 }
 
 /// A key or value of exactly `len` characters, inside the modelled `TagKey` / `TagValue`
 /// pattern `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`.
-fn filler(len: usize) -> String {
+pub(crate) fn filler(len: usize) -> String {
     "k".repeat(len)
 }
 

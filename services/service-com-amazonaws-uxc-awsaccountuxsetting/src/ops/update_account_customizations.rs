@@ -4,7 +4,11 @@
 //!
 //! Implemented: merges the supplied settings into the calling account's
 //! persisted customization record and answers with the record read back out of
-//! state.
+//! state. A `visibleServices` identifier that names no service in the catalog
+//! `ListServices` pages over is refused here as the modelled
+//! `ValidationException`, before anything is written; a body that breaks a
+//! modelled SHAPE constraint never reaches this handler at all — this service's
+//! front door (`crate::service`) refuses it with HTTP 400 `BadRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -118,6 +122,40 @@ pub enum UpdateAccountCustomizationsErrorModeled {
 /// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
 pub type UpdateAccountCustomizationsError = crate::scaffolded::Scaffolded<UpdateAccountCustomizationsErrorModeled>;
 
+/// How many offending identifiers one refusal names in `fieldList`.
+///
+/// `visibleServices` holds up to 500 members, every one of which may be outside
+/// the catalog, and a caller controls each value — so a response that named them
+/// all would amplify one request into a body many times its size. The first few
+/// are what a caller needs to fix the request; the message states the class.
+const MAX_REPORTED_INVALID_SERVICES: usize = 10;
+
+/// The modelled `ValidationException` for `visibleServices` identifiers that name
+/// no service in the catalog, by their 1-based position in the request.
+///
+/// The message states the class of refusal rather than the members (no rule for
+/// its exact text is published, so it is worded once, generically); `fieldList`
+/// — the member the model declares for exactly this ("the list of fields that are
+/// invalid") — carries the offending positions and values, spelled with the same
+/// dotted `visibleServices.<n>.member` path the boundary validator uses.
+fn invalid_services(unknown: &[(usize, &str)]) -> UpdateAccountCustomizationsError {
+    let field_list = unknown
+        .iter()
+        .take(MAX_REPORTED_INVALID_SERVICES)
+        .map(|(position, service)| ValidationExceptionField {
+            path: format!("visibleServices.{position}.member"),
+            message: format!(
+                "Member must be a service identifier returned by ListServices, got '{service}'"
+            ),
+        })
+        .collect();
+    UpdateAccountCustomizationsErrorModeled::ValidationException(ValidationException {
+        message: "Invalid services provided".to_string(),
+        field_list: Some(field_list),
+    })
+    .into()
+}
+
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
 /// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
@@ -167,32 +205,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The write needs no request metadata beyond the calling account.
         let _ = ctx;
 
-        // The boundary validator has already refused an `accountColor` outside the
-        // modelled value set, every `visibleServices`/`visibleRegions` element
-        // outside its pattern, and a list longer than its `@length`. This check is
-        // the handler's own guard on the one invariant it depends on (a stored
-        // colour is always a modelled wire value), stated as the modelled
-        // `ValidationException` with the offending member's path.
-        if let Some(color) = input.account_color.as_deref() {
-            if !ACCOUNT_COLOR_VALUES.contains(&color) {
-                return Err(UpdateAccountCustomizationsErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "accountColor must be one of: {}",
-                            ACCOUNT_COLOR_VALUES.join(", ")
-                        ),
-                        field_list: Some(vec![ValidationExceptionField {
-                            path: "accountColor".to_string(),
-                            message: format!(
-                                "Member must satisfy enum value set: [{}]",
-                                ACCOUNT_COLOR_VALUES.join(", ")
-                            ),
-                        }]),
-                    },
-                )
-                .into());
-            }
-        }
+        // No enum / pattern / length guard lives here: a body that breaks a
+        // modelled shape constraint — an `accountColor` outside
+        // `ACCOUNT_COLOR_VALUES`, a `visibleServices`/`visibleRegions` element
+        // outside its pattern or length, a list longer than its `@length` — is
+        // refused by this service's front door (`crate::service`) with HTTP 400
+        // `BadRequestException` before any handler runs. A second guard here
+        // could only state that same malformed body as the modelled
+        // `ValidationException`, i.e. answer one request class with two
+        // different error codes depending on which layer caught it.
+        //
+        // What this handler owns is the rule the model states in prose only:
+        // `visibleServices` holds service identifiers, and "for valid service
+        // identifiers, call ListServices" — so membership in that catalog is
+        // part of a value's validity and is checked below, against the same
+        // catalog `ListServices` pages over, BEFORE anything is written.
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateAccountCustomizationsErrorModeled::InternalServerException(
@@ -206,7 +233,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Merge and read back under ONE guard: a second acquisition could observe
         // another caller's concurrent update, and then the body would describe
-        // state this request did not produce.
+        // state this request did not produce. The catalog check is taken under
+        // that same guard, so the membership decision and the write are made
+        // against one snapshot of the catalog.
         let stored = {
             // "Only the settings that you include in the request body are
             // modified. Omitted settings remain unchanged." At the typed boundary
@@ -214,6 +243,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // value alone; a colour is reset with the modelled `none` value and a
             // list by sending it empty.
             let mut guard = state.lock();
+
+            // Every supplied identifier must name a service the catalog holds.
+            // Refused BEFORE the write, so a request naming any non-member
+            // leaves the stored record exactly as it was.
+            if let Some(services) = input.visible_services.as_deref() {
+                let unknown: Vec<(usize, &str)> = services
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, service)| !guard.is_catalog_service(service))
+                    .map(|(index, service)| (index + 1, service.as_str()))
+                    .collect();
+                if !unknown.is_empty() {
+                    return Err(invalid_services(&unknown));
+                }
+            }
+
             let record = guard.customization_mut(account_id);
             if let Some(color) = input.account_color {
                 record.account_color = Some(color);

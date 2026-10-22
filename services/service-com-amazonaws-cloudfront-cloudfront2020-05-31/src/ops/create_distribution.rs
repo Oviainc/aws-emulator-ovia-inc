@@ -428,6 +428,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.allocate_distribution_id();
+        // The edge domain this distribution is served on. A MULTI-TENANT distribution
+        // does not report it (see `StoredDistribution::reported_domain_name`), but it is
+        // allocated and held all the same, so the record carries one domain for its whole
+        // life and no two distributions are served on the same one.
         let domain_name = store.allocate_domain_name();
         let etag = store.next_etag();
         let stored = StoredDistribution {

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateService
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateService`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateService::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Modifies a stored service: every member the request carries is applied to the record
+//! and every one it omits is left as it was. A changed task definition or
+//! `forceNewDeployment` starts a NEW deployment, which replaces the task set it
+//! inherited; `desiredCount` alone does not ("This parameter doesn't trigger a new
+//! service deployment") and only moves how many tasks the scheduler keeps running. An
+//! unknown service is refused with `ServiceNotFoundException` and a deleted one with
+//! `ServiceNotActiveException`.
 //!
 //! ## Shape of an operation
 //!
@@ -331,18 +329,277 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateService` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateServiceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateService"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateServiceErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        if input.desired_count.is_some_and(|count| count < 0) {
+            return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "desiredCount must not be negative; got {:?}",
+                        input.desired_count
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A service ARN carries the cluster that hosts it, so an ARN names the cluster
+        // too; `cluster` is what names it otherwise ("If you do not specify a cluster,
+        // the default cluster is assumed"). Naming two different clusters in one request
+        // names no service at all.
+        let (arn_cluster, name) = crate::state::cluster_and_service_from_reference(&input.service);
+        let cluster_name = match (&arn_cluster, input.cluster.as_deref()) {
+            (Some(from_arn), Some(requested))
+                if *from_arn != crate::state::cluster_name_from_reference(Some(requested)) =>
+            {
+                return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "the service ARN names cluster {from_arn:?} but cluster \
+                             {requested:?} was requested"
+                        )),
+                    },
+                )
+                .into());
+            }
+            (Some(from_arn), _) => from_arn.clone(),
+            (None, requested) => crate::state::cluster_name_from_reference(requested),
+        };
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        if !guard.clusters.contains_key(&cluster_name) {
+            return Err(UpdateServiceErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(format!("cluster {cluster_name:?} was not found")),
+                },
+            )
+            .into());
+        }
+
+        let key = (cluster_name.clone(), name.clone());
+        let Some(stored) = guard.services.get(&key) else {
+            return Err(UpdateServiceErrorModeled::ServiceNotFoundException(
+                ServiceNotFoundException {
+                    message: Some(format!(
+                        "service {name:?} was not found in cluster {cluster_name:?}"
+                    )),
+                },
+            )
+            .into());
+        };
+        // "The specified service isn't active. You can't update a service that's
+        // inactive."
+        if stored.status != crate::state::SERVICE_ACTIVE {
+            return Err(UpdateServiceErrorModeled::ServiceNotActiveException(
+                ServiceNotActiveException {
+                    message: Some(format!(
+                        "service {name:?} is {} and cannot be updated",
+                        stored.status
+                    )),
+                },
+            )
+            .into());
+        }
+        let snapshot = stored.clone();
+        let daemon = snapshot.scheduling_strategy == crate::state::SCHEDULING_DAEMON;
+
+        // "You can't change the cluster name" is the same rule for the controller: the
+        // deployment controller is chosen when the service is created.
+        if let Some(controller) = input.deployment_controller.as_ref() {
+            if controller.r#type != snapshot.controller() {
+                return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "the deployment controller of service {name:?} is {} and \
+                             cannot be changed to {}",
+                            snapshot.controller(),
+                            controller.r#type
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "The daemon scheduling strategy deploys exactly one task on each active
+        // container instance ... you don't need to specify a desired number of tasks":
+        // a daemon's count follows the cluster's capacity, so it is not the caller's to
+        // set.
+        if daemon && input.desired_count.is_some() {
+            return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "desiredCount cannot be updated on service {name:?}, which uses \
+                         the {} scheduling strategy",
+                        crate::state::SCHEDULING_DAEMON
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "If a revision isn't specified, the latest ACTIVE revision is used." The
+        // service keeps the revision it already runs when the request names none.
+        let definition = match input.task_definition.as_deref() {
+            Some(reference) => {
+                let Some((family, revision)) =
+                    crate::state::parse_task_definition_reference(reference)
+                else {
+                    return Err(UpdateServiceErrorModeled::ClientException(ClientException {
+                        message: Some(format!(
+                            "taskDefinition must be a family, family:revision or \
+                             task-definition ARN; got {reference:?}"
+                        )),
+                    })
+                    .into());
+                };
+                let found = match revision {
+                    Some(revision) => guard.task_definitions.get(&(family.clone(), revision)),
+                    None => guard.latest_active_revision(&family),
+                };
+                let Some(found) = found.cloned() else {
+                    return Err(UpdateServiceErrorModeled::ClientException(ClientException {
+                        message: Some(format!(
+                            "unable to describe task definition {reference:?}"
+                        )),
+                    })
+                    .into());
+                };
+                Some(found)
+            }
+            None => snapshot
+                .task_definition
+                .as_ref()
+                .and_then(|key| guard.task_definitions.get(key))
+                .cloned(),
+        };
+
+        // "Determines whether to force a new deployment of the service. ... You can use
+        // this option to start a new deployment with no service definition changes" —
+        // and a REQUESTED task definition that differs from the one the service runs
+        // starts one by itself ("When you update any of these parameters, Amazon ECS
+        // starts new tasks with the new configuration"). A request that names none
+        // changes nothing, whatever the store still holds for the stored revision.
+        let task_definition_changed = input.task_definition.is_some()
+            && definition.as_ref().map(|found| found.arn.clone()) != snapshot.task_definition_arn;
+        let redeploy = input.force_new_deployment || task_definition_changed;
+        let new_deployment_id = if redeploy {
+            Some(guard.next_deployment_id())
+        } else {
+            None
+        };
+
+        let updated_at = crate::state::now();
+        let service = guard
+            .services
+            .get_mut(&key)
+            .expect("the service was just found in this cluster");
+        if let Some(count) = input.desired_count {
+            service.desired_count = count;
+        }
+        if let Some(found) = definition.as_ref() {
+            service.task_definition_arn = Some(found.arn.clone());
+            service.task_definition = Some((found.family.clone(), found.revision));
+        }
+        // A service reports either a capacity-provider strategy or a launch type, so
+        // moving it onto a strategy takes the launch type off it.
+        if let Some(strategy) = input.capacity_provider_strategy.clone() {
+            if !strategy.is_empty() {
+                service.capacity_provider_strategy = strategy;
+                service.launch_type = None;
+            }
+        }
+        if let Some(configuration) = input.deployment_configuration.clone() {
+            service.deployment_configuration =
+                crate::state::deployment_configuration(Some(configuration), daemon);
+        }
+        // "For update service requests, when no value is specified for
+        // AvailabilityZoneRebalancing, Amazon ECS defaults to the existing service's
+        // AvailabilityZoneRebalancing value."
+        if let Some(rebalancing) = input.availability_zone_rebalancing.clone() {
+            service.availability_zone_rebalancing = rebalancing;
+        }
+        if input.network_configuration.is_some() {
+            service.network_configuration = input.network_configuration.clone();
+        }
+        if let Some(constraints) = input.placement_constraints.clone() {
+            service.placement_constraints = constraints;
+        }
+        if let Some(strategy) = input.placement_strategy.clone() {
+            service.placement_strategy = strategy;
+        }
+        if input.platform_version.is_some() {
+            service.platform_version = input.platform_version.clone();
+        }
+        if input.health_check_grace_period_seconds.is_some() {
+            service.health_check_grace_period_seconds = input.health_check_grace_period_seconds;
+        }
+        // "If you do not want to override the value that was set when the service was
+        // created, you can set this to null when performing this action."
+        if let Some(enabled) = input.enable_execute_command {
+            service.enable_execute_command = enabled;
+        }
+        if let Some(enabled) = input.enable_ecs_managed_tags {
+            service.enable_ecs_managed_tags = enabled;
+        }
+        if let Some(load_balancers) = input.load_balancers.clone() {
+            service.load_balancers = load_balancers;
+        }
+        if let Some(propagate) = input.propagate_tags.clone() {
+            service.propagate_tags = propagate;
+        }
+        if let Some(registries) = input.service_registries.clone() {
+            service.service_registries = registries;
+        }
+        if input.service_connect_configuration.is_some() {
+            service.service_connect_configuration = input.service_connect_configuration.clone();
+        }
+        if let Some(volumes) = input.volume_configurations.clone() {
+            service.volume_configurations = volumes;
+        }
+        if let Some(configurations) = input.vpc_lattice_configurations.clone() {
+            service.vpc_lattice_configurations = configurations;
+        }
+        if let Some(deployment_id) = new_deployment_id {
+            service.deployment_id = deployment_id;
+            service.deployment_created_at = updated_at;
+        }
+        service.deployment_updated_at = updated_at;
+
+        // The scheduler brings the task set back in line with what the service now
+        // wants. Nothing is changed when it does not fit, so the update is refused
+        // whole rather than half-applied.
+        if let Some(found) = definition.as_ref() {
+            if guard.scale_service(&key, found, &region, now).is_err() {
+                guard.services.insert(key.clone(), snapshot);
+                return Err(UpdateServiceErrorModeled::ClientException(ClientException {
+                    message: Some(format!(
+                        "this emulator holds at most {} tasks; stop some before scaling \
+                         service {name:?}",
+                        crate::state::MAX_TASKS
+                    )),
+                })
+                .into());
+            }
+        }
+
+        let stored = guard
+            .services
+            .get(&key)
+            .expect("the service was just updated");
+        // `UpdateService` has no `include` member to narrow the response with, so the
+        // service it just mutated is reported with its tags.
+        let view = guard.service_view(stored, crate::state::ServiceFields::all());
+        Ok(UpdateServiceOutput {
+            service: Some(view),
+        })
     }
 }
