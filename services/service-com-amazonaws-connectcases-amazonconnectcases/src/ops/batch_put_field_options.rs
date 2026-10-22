@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchPutFieldOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchPutFieldOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates and updates the field options of a single-select field, keyed by
+//! `FieldOption$value`: the value identifies the option within its field, so a
+//! value the field already holds is UPDATED (name and active flag) and one it
+//! does not hold is created. A value outside the character set the model's
+//! documentation states is reported in the response's per-option `errors` list
+//! and not persisted, so one bad option does not discard the rest.
+//!
+//! Two entries for ONE value in a single request are a different matter and are
+//! refused whole with the modelled `ValidationException`: which of the two the
+//! option would end up holding is undefined, so last-one-wins would be an
+//! arbitrary choice. That is the rule this crate's other write paths already
+//! apply to a repeated id (`state::duplicate_ids`), and it is deliberately not
+//! routed through the per-option `errors` list, which reports options the
+//! service can place a verdict on individually.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchPutFieldOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +163,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchPutFieldOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchPutFieldOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchPutFieldOptions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchPutFieldOptionsErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // Bound the caller-chosen work BEFORE the store lock is taken: the
+        // response carries at most one error per submitted option, so the list
+        // is held to the model's cap here as well as at the boundary.
+        if let Some(message) = crate::state::list_too_long(
+            "options",
+            input.options.len(),
+            crate::state::MAX_BATCH_FIELD_OPTIONS,
+        ) {
+            return Err(BatchPutFieldOptionsErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
+        // A value identifies the option it sets, so two entries for one value
+        // in a single request have no defined meaning — refused whole, as the
+        // crate's other write paths refuse a repeated id.
+        let duplicates =
+            crate::state::duplicate_ids(input.options.iter().map(|option| option.value.as_str()));
+        if !duplicates.is_empty() {
+            return Err(BatchPutFieldOptionsErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "options carries more than one entry for field option value(s) {}; a \
+                         value identifies the option it sets",
+                        crate::state::name_ids(&duplicates)
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Partial success: an option whose value is outside the documented
+        // character set is reported on its own and the rest are still written.
+        // Nothing here touches the store, so it is done before the lock.
+        let mut accepted: Vec<FieldOption> = Vec::with_capacity(input.options.len());
+        let mut errors: Vec<FieldOptionError> = Vec::new();
+        for option in input.options {
+            if crate::state::field_option_value_is_well_formed(&option.value) {
+                accepted.push(option);
+            } else {
+                errors.push(FieldOptionError {
+                    error_code: "ValidationException".to_string(),
+                    message: format!(
+                        "field option value {:?} must be 1 to {} characters of letters, digits, \
+                         hyphens and underscores",
+                        option.value,
+                        crate::state::MAX_FIELD_OPTION_TEXT_LEN
+                    ),
+                    value: option.value,
+                });
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let field = store
+            .domain_mut(&input.domain_id)
+            .map_err(BatchPutFieldOptionsErrorModeled::ResourceNotFoundException)?
+            .field_mut(&input.field_id)
+            .map_err(BatchPutFieldOptionsErrorModeled::ResourceNotFoundException)?;
+
+        // Field options belong to a single-select field, so a field of any
+        // other type has none to set.
+        if field.field_type != crate::state::FIELD_TYPE_SINGLE_SELECT {
+            return Err(BatchPutFieldOptionsErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "field {} is a {} field; field options can only be set on a {} field",
+                        input.field_id,
+                        field.field_type,
+                        crate::state::FIELD_TYPE_SINGLE_SELECT
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Only a value the field does not hold yet grows the option set.
+        let adding = accepted
+            .iter()
+            .filter(|option| !field.options.contains_key(&option.value))
+            .count();
+        field
+            .option_capacity(adding)
+            .map_err(BatchPutFieldOptionsErrorModeled::ServiceQuotaExceededException)?;
+
+        // Upsert on the value, and bump the field's modification time only when
+        // the stored set actually changed: re-putting the options a field
+        // already carries is the same request twice and leaves no trace.
+        let mut changed = false;
+        let mut written = 0usize;
+        for option in accepted {
+            let unchanged = field
+                .options
+                .get(&option.value)
+                .is_some_and(|held| held.name == option.name && held.active == option.active);
+            if !unchanged {
+                changed = true;
+                written += 1;
+                field.options.insert(option.value.clone(), option);
+            }
+        }
+        if changed {
+            field.last_modified_time = now;
+        }
+        let held = field.options.len();
+        drop(store);
+
+        // The audit record for a state-changing call: who asked, what it
+        // touched and what came of it. Never a credential — only the access key
+        // id the caller presented.
+        ::tracing::info!(
+            target: "emulator::audit",
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            domain_id = %input.domain_id,
+            field_id = %input.field_id,
+            options_written = written,
+            options_rejected = errors.len(),
+            options_held = held,
+            outcome = if changed { "updated" } else { "unchanged" },
+            "field options put"
+        );
+
+        Ok(BatchPutFieldOptionsOutput {
+            errors: Some(errors),
+        })
     }
 }

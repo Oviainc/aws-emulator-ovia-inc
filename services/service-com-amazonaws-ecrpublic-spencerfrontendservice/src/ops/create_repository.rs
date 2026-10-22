@@ -207,8 +207,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreateRepositoryErrorModeled::RepositoryAlreadyExistsException(
                     RepositoryAlreadyExistsException {
                         message: Some(format!(
-                            "Repository with name '{}' already exists in the registry with id \
-                             '{}'",
+                            "The repository with name '{}' already exists in the registry with \
+                             id '{}'",
                             input.repository_name, store.registry_id
                         )),
                     },

@@ -233,6 +233,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A component name identifies a component within its app environment, so
+        // a name a live component there already holds is a conflict with that
+        // existing resource rather than a malformed request:
+        // `ResourceConflictException` is what the model declares for it. The
+        // constraint is on live state only — deleting the component that holds a
+        // name frees it, and the identical create then succeeds.
+        if store
+            .component_named(&input.app_id, &input.environment_name, &data.name)
+            .is_some()
+        {
+            return Err(CreateComponentErrorModeled::ResourceConflictException(
+                crate::state::duplicate_component_name(
+                    &input.app_id,
+                    &input.environment_name,
+                    &data.name,
+                ),
+            )
+            .into());
+        }
+
         let id = store.mint_component_id(&key);
         let cursor = store.next_cursor();
         let component = crate::state::StoredComponent {

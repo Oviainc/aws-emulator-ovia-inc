@@ -176,6 +176,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove_component(&input.app_id, &input.environment_name, &input.id)
             .is_none()
         {
+            // The same two failures `GetComponent` tells apart: an id a DIFFERENT
+            // app environment owns is a wrong-scope request (the modelled
+            // `InvalidParameterException`, 400) and an id that names no component
+            // anywhere is absent (the modelled `ResourceNotFoundException`, 404).
+            if store.component_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
+                return Err(DeleteComponentErrorModeled::InvalidParameterException(
+                    crate::state::component_wrong_scope(
+                        &input.app_id,
+                        &input.environment_name,
+                        &input.id,
+                    ),
+                )
+                .into());
+            }
             return Err(DeleteComponentErrorModeled::ResourceNotFoundException(
                 crate::state::component_not_found(
                     &input.app_id,
