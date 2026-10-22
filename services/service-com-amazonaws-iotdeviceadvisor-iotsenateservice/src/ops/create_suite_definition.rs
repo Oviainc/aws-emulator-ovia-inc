@@ -156,17 +156,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let config = input.suite_definition_configuration;
 
         // The one rule the model states in prose but cannot express as a constraint
-        // (`SuiteDefinitionConfiguration$rootGroup`): "if intendedForQualification is set
-        // to true, rootGroup can be an empty string. If intendedForQualification is false,
-        // rootGroup cannot be an empty string."
-        if config.root_group.is_empty() && config.intended_for_qualification != Some(true) {
+        // (`SuiteDefinitionConfiguration$rootGroup`) — shared with every other operation
+        // that accepts a configuration; see `crate::state::root_group_violation`.
+        if let Some(violation) = crate::state::root_group_violation(&config) {
             return Err(CreateSuiteDefinitionErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(
-                        "suiteDefinitionConfiguration.rootGroup cannot be empty unless \
-                         intendedForQualification is true"
-                            .to_string(),
-                    ),
+                    message: Some(violation),
                 },
             )
             .into());

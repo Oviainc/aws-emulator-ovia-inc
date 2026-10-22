@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSuiteDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSuiteDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSuiteDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the given configuration as the suite definition's NEXT version in
+//! [`crate::state`] and advances `latestVersion` to it. The versions already stored keep
+//! their bytes, so a `GetSuiteDefinition` naming an earlier version still answers the
+//! configuration that version was recorded with, while an unqualified read answers the
+//! one this call stored. `createdAt` is the definition's own creation instant (an update
+//! never moves it) and `lastUpdatedAt` is the instant this call recorded.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +146,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSuiteDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSuiteDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSuiteDefinition"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateSuiteDefinitionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iotdeviceadvisor store is unavailable".to_string()),
+            })
+        })?;
+
+        // The prose rule on `SuiteDefinitionConfiguration$rootGroup` is a property of the
+        // SHAPE, so it holds for the configuration an update carries exactly as it does
+        // for the one a create carries.
+        if let Some(violation) =
+            crate::state::root_group_violation(&input.suite_definition_configuration)
+        {
+            return Err(UpdateSuiteDefinitionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(violation),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `smithy_query` lists no `ResourceNotFoundException` for this operation, so an
+        // update of a definition the store does not hold is refused with the modelled
+        // client-input error it does declare — the same way `StartSuiteRun` refuses one.
+        let Some(definition) = store.definitions.get_mut(&input.suite_definition_id) else {
+            return Err(UpdateSuiteDefinitionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "No suite definition with suiteDefinitionId {}",
+                        input.suite_definition_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        definition.record_version(input.suite_definition_configuration, now);
+
+        // Every member is read back off the STORED record, never off the request.
+        let stored = store
+            .definitions
+            .get(&input.suite_definition_id)
+            .ok_or_else(|| {
+                UpdateSuiteDefinitionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the updated suite definition could not be read back".to_string(),
+                        ),
+                    },
+                )
+            })?;
+        crate::state::audit(Self::NAME, ctx.parts(), &region, &stored.arn, "updated");
+        Ok(UpdateSuiteDefinitionOutput {
+            suite_definition_id: Some(stored.id.clone()),
+            suite_definition_arn: Some(stored.arn.clone()),
+            suite_definition_name: Some(stored.name().to_string()),
+            suite_definition_version: Some(stored.latest_version.clone()),
+            created_at: Some(stored.created_at.into()),
+            last_updated_at: Some(stored.last_modified_at.into()),
+        })
     }
 }

@@ -68,6 +68,17 @@ pub fn is_terminal(status: &str) -> bool {
 /// real service refuses a creation past its account quota.
 pub const MAX_SUITE_DEFINITIONS: usize = 100;
 
+/// How many configuration versions the store retains per suite definition.
+///
+/// The same occupancy bound as [`MAX_RUNS_PER_DEFINITION`], and again a RETENTION policy
+/// rather than a refusal: every `UpdateSuiteDefinition` records one more snapshot of a
+/// definition's configuration, so without a bound a caller could grow one definition's
+/// record without limit. [`SuiteDefinition::record_version`] drops the LOWEST-ordinal
+/// versions once a definition would hold more than this, so the most recent versions — the
+/// ones a read or a run names — stay addressable, and an aged-out version reads as the
+/// modelled "no such version" exactly as a version that never existed does.
+pub const MAX_VERSIONS_PER_DEFINITION: usize = 50;
+
 /// How many suite runs the store retains per definition.
 ///
 /// The same occupancy bound for runs, as a RETENTION policy rather than a refusal: a
@@ -186,6 +197,56 @@ impl SuiteDefinition {
     pub fn name(&self) -> &str {
         self.configuration(None)
             .map_or("", |config| config.suite_definition_name.as_str())
+    }
+
+    /// Record `configuration` as this definition's NEXT version and hand back that
+    /// version's label.
+    ///
+    /// A new version is APPENDED: every snapshot already stored keeps both its label and
+    /// its bytes, so a read naming an older version still answers the configuration that
+    /// version was recorded with. The next ordinal is one past the highest this definition
+    /// holds — not `versions.len()`, which would collide with a surviving label once
+    /// retention has dropped an older one — and
+    /// [`latest_version`](Self::latest_version) and `last_modified_at` move with it.
+    pub fn record_version(
+        &mut self,
+        configuration: SuiteDefinitionConfiguration,
+        now: SystemTime,
+    ) -> String {
+        let highest = self
+            .versions
+            .keys()
+            .filter_map(|label| version_ordinal(label))
+            .max()
+            .unwrap_or(0);
+        let label = version_label(highest + 1);
+        self.versions.insert(label.clone(), configuration);
+        self.latest_version = label.clone();
+        self.last_modified_at = now;
+        self.prune_versions(MAX_VERSIONS_PER_DEFINITION);
+        label
+    }
+
+    /// Retain at most `keep` versions, dropping the lowest-ordinal (oldest) ones.
+    ///
+    /// See [`MAX_VERSIONS_PER_DEFINITION`]. The current latest version is never dropped:
+    /// it carries the highest ordinal, and `keep` is at least one.
+    fn prune_versions(&mut self, keep: usize) {
+        let keep = keep.max(1);
+        if self.versions.len() <= keep {
+            return;
+        }
+        // Oldest first by ORDINAL, not by the keys' lexicographic order (`v10` < `v2`).
+        let mut labels: Vec<(usize, String)> = self
+            .versions
+            .keys()
+            .map(|label| (version_ordinal(label).unwrap_or(0), label.clone()))
+            .collect();
+        labels.sort();
+        let drop_count = self.versions.len() - keep;
+        for (_, label) in labels.into_iter().take(drop_count) {
+            self.versions.remove(&label);
+        }
     }
 }
 
@@ -507,6 +568,24 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
     }
 }
 
+/// The one rule the model states in prose for `SuiteDefinitionConfiguration$rootGroup`
+/// and cannot express as a constraint: "if intendedForQualification is set to true,
+/// rootGroup can be an empty string. If intendedForQualification is false, rootGroup
+/// cannot be an empty string."
+///
+/// `Some(message)` names the violation for the modelled `ValidationException`; `None`
+/// means the configuration satisfies the rule. The rule belongs to the SHAPE, so every
+/// operation that accepts a `SuiteDefinitionConfiguration` asks here rather than
+/// restating it.
+pub fn root_group_violation(configuration: &SuiteDefinitionConfiguration) -> Option<String> {
+    (configuration.root_group.is_empty() && configuration.intended_for_qualification != Some(true))
+        .then(|| {
+            "suiteDefinitionConfiguration.rootGroup cannot be empty unless \
+             intendedForQualification is true"
+                .to_string()
+        })
+}
+
 /// The version string for the `n`-th configuration a definition holds (1-based).
 ///
 /// `SuiteDefinitionVersion` is `len 2..255`, so a bare ordinal (`"1"`) is not a legal
@@ -514,6 +593,15 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
 /// `GetSuiteDefinition` accepts back on its `suiteDefinitionVersion` query.
 pub fn version_label(n: usize) -> String {
     format!("v{n}")
+}
+
+/// The ordinal inside a label [`version_label`] produced, or `None` for any other string.
+///
+/// The inverse of [`version_label`], and the only place the label's shape is decoded:
+/// ordering versions by ordinal is what keeps `v10` after `v2`, which their keys'
+/// lexicographic order does not.
+pub fn version_ordinal(label: &str) -> Option<usize> {
+    label.strip_prefix('v')?.parse().ok()
 }
 
 /// Record one state-changing call of this service in the emulator's audit trail.
