@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 //! Code more than one emulated service needs, as a path dependency.
 //!
-//! Today that is six things:
+//! Today that is eight things:
 //!
 //! * [`claims_request`], the request-claim rule a service whose SigV4 signing name is
 //!   SHARED with other services uses for its `Service::can_handle`;

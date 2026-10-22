@@ -170,14 +170,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => match crate::state::decode_next_token(token) {
-                Some(offset) => offset,
+        // The requested cursor: the offset it decodes to, and the token itself, kept so
+        // a later refusal can name the token the caller actually submitted rather than
+        // re-reading the option.
+        let (offset, token) = match input.next_token.clone() {
+            None => (0, String::new()),
+            Some(token) => match crate::state::decode_next_token(&token) {
+                Some(offset) => (offset, token),
                 None => {
                     return Err(DescribeAutoScalingGroupsErrorModeled::InvalidNextToken(
                         InvalidNextToken {
-                            message: Some(crate::state::invalid_next_token_message(token)),
+                            message: Some(crate::state::invalid_next_token_message(&token)),
                         },
                     )
                     .into())
@@ -231,13 +234,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|group| group_view(group, include_instances))
             .collect();
         // A token the service issued always points inside the list it was issued
-        // for; one that points past the end was not issued for this list.
+        // for; one that points past the end was not issued for this list. Only a
+        // decoded token reaches a non-zero offset, so `token` is the one submitted.
         if offset > 0 && offset >= matching.len() {
             return Err(DescribeAutoScalingGroupsErrorModeled::InvalidNextToken(
                 InvalidNextToken {
-                    message: Some(crate::state::invalid_next_token_message(
-                        input.next_token.as_deref().unwrap_or_default(),
-                    )),
+                    message: Some(crate::state::invalid_next_token_message(&token)),
                 },
             )
             .into());

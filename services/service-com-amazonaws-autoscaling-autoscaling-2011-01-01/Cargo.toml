@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Mints the `<RequestId>` the awsQuery error envelope carries (see
+# `service::query_error_envelope`), the same v4 UUID form the framework's query
+# renderer puts in a successful response's `ResponseMetadata/RequestId`.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
