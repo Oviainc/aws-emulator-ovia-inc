@@ -501,10 +501,24 @@ fn is_resource_arn_byte(byte: u8) -> bool {
 /// A caller-supplied resource ARN is judged on the INPUT, before any resource is
 /// looked up: an ARN of another vendor, or a value that is not a resource ARN at
 /// all, names nothing in this service's namespace however the store happens to be
-/// populated, so it is the modelled `ValidationException` (HTTP 400) naming the
-/// member — never the not-found a missing resource gets, which would tell a caller
-/// with a permanent input bug to retry or to create. Both refusals name
-/// [`RESOURCE_ARN_MEMBER`] in `fieldName`, which is the member the caller has to fix.
+/// populated, so it is a bad REQUEST (HTTP 400) — never the not-found a missing
+/// resource gets, which would tell a caller with a permanent input bug to retry or
+/// to create.
+///
+/// THE CODE that refusal carries is [`crate::scaffolded::BAD_REQUEST_CODE`], not the
+/// modelled `ValidationException`: reading a value as an ARN is the tagging
+/// front-end's own parse, which judges whether the API can address the named resource
+/// at all, ahead of this service's modelled input validation — and the recorded answer
+/// to a tagging request whose `resourceArn` is not one of this service's carries that
+/// generic identity rather than a shape this model declares. A violation of this
+/// service's OWN modelled input (an unsupported `catalog`, a tag outside `TagsMap`)
+/// stays the modelled `ValidationException`, which names the member in `fieldName`.
+/// Neither refusal echoes the ARN the caller sent.
+///
+/// Note that the tagging operations bind `resourceArn` to a plain `String`
+/// (`smithy_query(query="operation",operation="ListTagsForResource,TagResource,UntagResource")`),
+/// so NO modelled constraint refuses any value here ahead of this check: this is the
+/// whole judgement of the member.
 ///
 /// Two conditions, in the order the service applies them:
 ///
@@ -516,23 +530,19 @@ fn is_resource_arn_byte(byte: u8) -> bool {
 /// Everything that passes both is a resource ARN this API can address, and whether
 /// it names a stored record is then the store's question
 /// ([`parameter_not_found`]).
-pub fn validate_resource_arn(candidate: &str) -> Result<(), ValidationException> {
+pub fn validate_resource_arn(candidate: &str) -> Result<(), crate::scaffolded::BadRequest> {
     if !(1..=RESOURCE_ARN_MAX_LEN).contains(&candidate.len())
         || !candidate.bytes().all(is_resource_arn_byte)
     {
-        return Err(ValidationException {
-            message: format!(
-                "Invalid input resource arn: {RESOURCE_ARN_MEMBER} must be \
-                 1..{RESOURCE_ARN_MAX_LEN} characters of {RESOURCE_ARN_CHARACTER_CLASS}"
-            ),
-            field_name: RESOURCE_ARN_MEMBER.to_string(),
-        });
+        return Err(crate::scaffolded::BadRequest::new(format!(
+            "Invalid input resource arn: {RESOURCE_ARN_MEMBER} must be \
+             1..{RESOURCE_ARN_MAX_LEN} characters of {RESOURCE_ARN_CHARACTER_CLASS}"
+        )));
     }
     if !::service_common::arn::is_resource_arn_of(candidate, ARN_NAMESPACE) {
-        return Err(ValidationException {
-            message: format!("Invalid input resource arn: expected vendor {ARN_NAMESPACE}"),
-            field_name: RESOURCE_ARN_MEMBER.to_string(),
-        });
+        return Err(crate::scaffolded::BadRequest::new(format!(
+            "Invalid input resource arn: expected vendor {ARN_NAMESPACE}"
+        )));
     }
     Ok(())
 }

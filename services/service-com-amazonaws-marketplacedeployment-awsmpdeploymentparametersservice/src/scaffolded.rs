@@ -267,6 +267,83 @@ impl SerializableStruct for NotFound {
     }
 }
 
+/// The `message` member of the synthetic `BadRequestException` error shape.
+static BAD_REQUEST_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#BadRequestException$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `BadRequestException` error shape — the BODY of the refusal
+/// this service answers a `resourceArn` its API cannot address with.
+///
+/// In the `smithy.framework` namespace for the same reason as [`NOT_FOUND_SCHEMA`]:
+/// `BadRequestException` is NOT a shape this service's model declares (its modelled
+/// client-input error is `ValidationException`), so the shape must not collide with a
+/// modelled one. The schema only shapes the body (`{"message": …}`); the wire error code
+/// and the status travel beside it, from [`BAD_REQUEST_CODE`] / [`BAD_REQUEST_STATUS`].
+pub static BAD_REQUEST_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#BadRequestException",
+        "smithy.framework",
+        "BadRequestException",
+    ),
+    ShapeType::Structure,
+    &[&BAD_REQUEST_MESSAGE],
+);
+
+/// The wire error code this service answers a `resourceArn` its API cannot address with.
+///
+/// NOT the modelled `ValidationException`: the resource-ARN check is the TAGGING
+/// front-end's own ARN parse, which runs ahead of the service's modelled input
+/// validation, and its recorded answer carries this generic identity rather than a shape
+/// the model declares. The distinction is client-visible, because restJson1 resolves the
+/// error SHAPE from `x-amzn-errortype` (and the body's `__type`): an SDK unmarshals a
+/// modelled `ValidationException` into a typed error and this identity into a generic
+/// service error, so a caller's `catch ValidationException` must NOT fire here. The
+/// modelled `ValidationException` stays the answer to a violation of this service's OWN
+/// modelled input (an unsupported `catalog`, a tag outside `TagsMap`).
+pub const BAD_REQUEST_CODE: &str = "BadRequestException";
+
+/// The HTTP status of that refusal: 400, the status a client-input refusal carries.
+pub const BAD_REQUEST_STATUS: u16 = 400;
+
+/// The payload of that refusal: why the resource ARN names nothing this API addresses.
+#[derive(Debug, Clone)]
+pub struct BadRequest {
+    pub message: String,
+}
+
+impl BadRequest {
+    /// A bad-request refusal carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for BadRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{BAD_REQUEST_CODE}: {}", self.message)
+    }
+}
+
+impl std::error::Error for BadRequest {}
+
+impl SerializableStruct for BadRequest {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&BAD_REQUEST_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// The `message` member of the synthetic front-door refusal shape.
 static FRONT_DOOR_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
@@ -368,6 +445,10 @@ pub enum Scaffolded<E> {
     /// [`NOT_FOUND_CODE`], which the model does not declare — so it cannot travel as
     /// [`Modeled`](Self::Modeled).
     NotFound(NotFound),
+    /// The request named a resource ARN this API cannot address. Renders as HTTP 400
+    /// with the error code [`BAD_REQUEST_CODE`], which the model does not declare — so
+    /// it cannot travel as [`Modeled`](Self::Modeled) either.
+    BadRequest(BadRequest),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -399,6 +480,19 @@ impl<E> Scaffolded<E> {
         Self::NotFound(NotFound::new(NOT_FOUND_TEXT))
     }
 
+    /// Refuse a request whose resource ARN names nothing this API can address: HTTP 400
+    /// with the code [`BAD_REQUEST_CODE`] and `message`.
+    ///
+    /// Use this rather than the modelled `ValidationException` wherever a caller-supplied
+    /// resource ARN is judged as an ARN — its syntax, or the vendor whose resources this
+    /// API addresses: that judgement is the tagging front-end's ARN parse, whose recorded
+    /// answer carries the generic identity above and not a modelled shape name, and a
+    /// client branches on the code. A violation of this service's own modelled input
+    /// stays the modelled `ValidationException`.
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::BadRequest(BadRequest::new(message))
+    }
+
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.
     ///
     /// Reach for this when the request is wrong in a way the model cannot express,
@@ -418,12 +512,24 @@ impl<E> Scaffolded<E> {
     }
 }
 
+/// Lets `?` lift the resource-ARN refusal into ANY operation's error channel, so the one
+/// ARN check ([`crate::state::validate_resource_arn`]) is written once and every
+/// operation that resolves a caller-supplied resource ARN answers it identically. The
+/// refusal carries no modelled shape, so it cannot travel as
+/// [`Scaffolded::Modeled`](Scaffolded::Modeled) and needs this impl of its own.
+impl<E> From<BadRequest> for Scaffolded<E> {
+    fn from(refused: BadRequest) -> Self {
+        Self::BadRequest(refused)
+    }
+}
+
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::NotFound(e) => write!(f, "{e}"),
+            Self::BadRequest(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -437,6 +543,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::NotFound(e) => e.source(),
+            Self::BadRequest(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -452,6 +559,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::NotFound(e) => e,
+            Self::BadRequest(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -461,6 +569,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::NotFound(_) => &NOT_FOUND_SCHEMA,
+            Self::BadRequest(_) => &BAD_REQUEST_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -476,6 +585,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // The code this service's recorded not-found responses carry, which is
             // not the modelled `ResourceNotFoundException` shape name.
             Self::NotFound(_) => NOT_FOUND_CODE,
+            // The code the tagging front-end's ARN parse answers with, which is not the
+            // modelled `ValidationException` shape name.
+            Self::BadRequest(_) => BAD_REQUEST_CODE,
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -489,6 +601,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::NotFound(_) => NOT_FOUND_STATUS,
+            Self::BadRequest(_) => BAD_REQUEST_STATUS,
             Self::ValidationException(_) => 400,
         }
     }
@@ -503,6 +616,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // Same reason: the synthetic shape carries no `awsQueryError` trait —
             // and this service is restJson1, which has no query envelope at all.
             Self::NotFound(_) => None,
+            // Same reason: the synthetic shape carries no `awsQueryError` trait.
+            Self::BadRequest(_) => None,
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
         }

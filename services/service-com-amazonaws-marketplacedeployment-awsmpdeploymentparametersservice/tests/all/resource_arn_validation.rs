@@ -6,17 +6,29 @@
 //! before any resource is looked up — a value that is not a well-formed resource ARN
 //! of this service's own vendor (its `aws.api#service$arnNamespace`, which
 //! `state::ARN_NAMESPACE` holds) names nothing this API can address, so every
-//! operation binding `resourceArn` answers it with the modelled
-//! `ValidationException`: HTTP 400, a message naming the member and the vendor that
-//! was expected, and `fieldName` = `resourceArn`. A not-found is reserved for an ARN
-//! that IS one of this service's and names no stored record, which the
-//! `not_found_error_code` suite pins.
+//! operation binding `resourceArn` refuses it as a BAD REQUEST: HTTP 400 with the
+//! wire error code `BadRequestException` and a message naming the member and either
+//! the vendor that was expected or the syntax a resource ARN of this service takes.
+//! A not-found is reserved for an ARN that IS one of this service's and names no
+//! stored record, which the `not_found_error_code` suite pins.
 //!
-//! Why the two must not be confused: an SDK client branches on the error shape, and
-//! restJson1 resolves it from `x-amzn-errortype`. A permanent, caller-side input bug
-//! answered as "resource does not exist yet" invites a retry or a create, and the
-//! modelled `ValidationException$fieldName` that tells the caller WHICH member was
-//! wrong is never produced.
+//! Why THAT code and not the modelled `ValidationException`: reading a value as an
+//! ARN is the tagging front-end's own parse — it decides whether this API can address
+//! the named resource at all — and it runs ahead of the service's modelled input
+//! validation, so its recorded answer carries the front-end's generic identity rather
+//! than a shape this model declares (`scaffolded::BAD_REQUEST_CODE`). The difference
+//! is client-visible, because restJson1 resolves the error SHAPE from
+//! `x-amzn-errortype`: an SDK unmarshals the modelled `ValidationException` into a
+//! typed error, so a caller's `catch ValidationException` must NOT fire here, and the
+//! refusal carries no `fieldName` because it is not that shape. A violation of this
+//! service's OWN modelled input (an unsupported `catalog`, a tag outside `TagsMap`)
+//! stays the modelled `ValidationException`, which the `validation_messages` and
+//! `catalog_allowed_values` suites pin.
+//!
+//! Why the bad request and the not-found must not be confused: a client branches on
+//! the code. A permanent, caller-side input bug answered as "resource does not exist
+//! yet" invites a retry or a create, and a missing resource answered as a malformed
+//! input tells a caller to rewrite an ARN that was addressable all along.
 //!
 //! The three operations that bind `resourceArn` as a required `@httpLabel`
 //! (`smithy_query(query="operation",operation="ListTagsForResource,TagResource,UntagResource")`:
@@ -29,6 +41,7 @@
 //! `deployment_parameters` suite owns.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::scaffolded::BAD_REQUEST_CODE;
 use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::state::{
     ARN_NAMESPACE, RESOURCE_ARN_CHARACTER_CLASS, RESOURCE_ARN_MAX_LEN, RESOURCE_ARN_MEMBER,
 };
@@ -39,12 +52,19 @@ use crate::deployment_parameters::{
     REGION, SIGNING_NAME,
 };
 
-/// The status an input refusal carries — the modelled `ValidationException`'s
-/// `httpError`.
+/// The status a bad request carries.
 const EXPECTED_STATUS: u16 = 400;
-/// The wire error code it carries: the modelled shape name, which is what a
-/// restJson1 client resolves the typed error from.
-const EXPECTED_CODE: &str = "ValidationException";
+/// The wire error code it carries: the tagging front-end's generic bad-request
+/// identity, which this service's model does not declare. Written out rather than
+/// read from the crate so the assertion is not the implementation compared with
+/// itself.
+const EXPECTED_CODE: &str = "BadRequestException";
+/// The modelled client-input error this refusal must NOT be reported as: an SDK
+/// unmarshals that shape name into a typed error a caller catches.
+const MODELLED_INPUT_ERROR: &str = "ValidationException";
+/// The not-found code this refusal must not be confused with either (the
+/// `not_found_error_code` suite owns that path).
+const NOT_FOUND: &str = "NotFoundException";
 /// The member every refusal below is about, written out rather than read from the
 /// crate so the assertion is not the implementation compared with itself.
 const EXPECTED_FIELD: &str = "resourceArn";
@@ -134,6 +154,12 @@ async fn a_resource_arn_that_is_not_of_this_vendor_is_refused_on_the_input() {
         RESOURCE_ARN_MEMBER, EXPECTED_FIELD,
         "the refusal names the member the request carries, got {RESOURCE_ARN_MEMBER:?}"
     );
+    // The crate's own constant is the recorded code, so every row below is asserted
+    // against the recording rather than against the implementation.
+    assert_eq!(
+        BAD_REQUEST_CODE, EXPECTED_CODE,
+        "the ARN check's code must be the recorded one, got {BAD_REQUEST_CODE:?}"
+    );
     let (router, live) = emulator_with_one_parameter().await;
 
     // The class the rule generalises over: every value that is not a well-formed
@@ -172,6 +198,25 @@ async fn a_resource_arn_that_is_not_of_this_vendor_is_refused_on_the_input() {
         (
             "an identifier that is not an ARN at all",
             "dp-0000000000000001".to_string(),
+            true,
+        ),
+        (
+            // A vendor this service's namespace is a PREFIX of is a different vendor,
+            // not this one.
+            "an ARN of a vendor this namespace is a prefix of",
+            live.replace(SIGNING_NAME, &format!("{SIGNING_NAME}-catalog")),
+            true,
+        ),
+        (
+            "an ARN of another vendor in another partition",
+            format!("arn:aws-cn:launchwizard:cn-north-1:{ACCOUNT}:deployment/dp-0000000000000001"),
+            true,
+        ),
+        (
+            // The vendor is read from the third field whatever the resource field's own
+            // form, so a colon-form foreign ARN is refused by the same check.
+            "a colon-form ARN of another vendor",
+            format!("arn:aws:states:{REGION}:{ACCOUNT}:execution:machine:run"),
             true,
         ),
         (
@@ -233,10 +278,25 @@ async fn a_resource_arn_that_is_not_of_this_vendor_is_refused_on_the_input() {
                 Some(EXPECTED_CODE),
                 "case {case:?}/{operation}: expected x-amzn-errortype {EXPECTED_CODE}, got {header:?}"
             );
+            assert_ne!(
+                error_code(&answered),
+                MODELLED_INPUT_ERROR,
+                "case {case:?}/{operation}: the ARN check is not the modelled input error a \
+                 caller catches, got {answered:?}"
+            );
+            assert_ne!(
+                error_code(&answered),
+                NOT_FOUND,
+                "case {case:?}/{operation}: a value this API cannot address is not a missing \
+                 resource, got {answered:?}"
+            );
+            // The refusal is NOT the modelled `ValidationException`, whose required
+            // `fieldName` member travels beside its message — so the body carries none.
             assert_eq!(
                 field_name(&answered),
-                EXPECTED_FIELD,
-                "case {case:?}/{operation}: the refusal names the failing member, got {answered:?}"
+                "<no fieldName>",
+                "case {case:?}/{operation}: the front-end's refusal is not the modelled shape, \
+                 so it carries no fieldName, got {answered:?}"
             );
             let reported = message(&answered);
             assert!(
@@ -354,6 +414,12 @@ async fn a_resource_arn_of_this_vendor_is_judged_by_the_store_and_not_refused() 
         assert_ne!(
             error_code(&answered),
             EXPECTED_CODE,
+            "case {case:?}: a well-formed ARN of this vendor is not an input refusal, \
+             got {answered:?}"
+        );
+        assert_ne!(
+            error_code(&answered),
+            MODELLED_INPUT_ERROR,
             "case {case:?}: a well-formed ARN of this vendor is not an input refusal, \
              got {answered:?}"
         );

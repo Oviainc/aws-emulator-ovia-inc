@@ -11,9 +11,11 @@
 //! success carrying an empty tag map, which would mask a bad ARN as "no tags yet".
 //!
 //! A value that is NOT a resource ARN of this service's vendor never reaches this
-//! refusal at all: it is refused on the input with a 400 `ValidationException`,
-//! which the `resource_arn_validation` suite owns. The two suites partition the
-//! space of caller-supplied ARNs between them.
+//! refusal at all: it is refused one step earlier as a bad request — HTTP 400 with
+//! the tagging front-end's `BadRequestException` code — which the
+//! `resource_arn_validation` suite owns. The two suites partition the space of
+//! caller-supplied ARNs between them, and the two codes are what a client tells a
+//! permanently malformed input from a resource that is simply not there by.
 //!
 //! The three operations that bind `resourceArn` as an `@httpLabel`
 //! (`smithy_query(query="digest")`: `GET /tags/{resourceArn}`,
