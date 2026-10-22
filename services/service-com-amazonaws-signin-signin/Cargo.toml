@@ -31,7 +31,6 @@ sha2 = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
 hex = { workspace = true }
 
 [lints]
