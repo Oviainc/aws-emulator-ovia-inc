@@ -22,5 +22,9 @@ pub struct UntagResourceInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.ram#UntagResourceResponse")]
 #[derive(Debug, Clone, Default)]
 pub struct UntagResourceOutput {
+    /// The tags the call detached, one per key the request named that the resource
+    /// actually carried. The member was added to this service's on-disk model from the
+    /// recorded AWS responses; see the handler's module docs.
+    pub deleted_tags: Option<Vec<Tag>>,
 }
 

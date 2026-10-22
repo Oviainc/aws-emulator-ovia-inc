@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateResourceShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateResourceShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Tears down the associations between the stored resource share named by
+//! `resourceShareArn` and the resources, principals or sources the request names, and
+//! answers with those association records as they now stand.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateResourceShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The record SURVIVES the teardown: it keeps its place in the store in a terminal
+//! status, so `GetResourceShareAssociations` still reports the association and a
+//! caller polling for the teardown to finish sees it complete. How long that takes
+//! follows from what there was to revoke — see [`crate::state::ComAmazonawsRamAmazonresourcesharingState::disassociate`].
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +201,193 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateResourceShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateResourceShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateResourceShare"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisassociateResourceShareErrorModeled::ServerInternalException(
+                ServerInternalException {
+                    message: "the resource share store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        let resource_arns = input.resource_arns.clone().unwrap_or_default();
+        let principals = input.principals.clone().unwrap_or_default();
+        let sources = input.sources.clone().unwrap_or_default();
+
+        // Every refusal below is the one AssociateResourceShare words the same way:
+        // the two operations take the same three entity lists and the same share ARN,
+        // so what they accept is the same.
+        if let Some(why) =
+            crate::state::share_arn_rejection("resourceShareArn", &input.resource_share_arn)
+                .or_else(|| crate::state::resource_arn_rejection("resourceArns", &resource_arns))
+        {
+            return Err(
+                DisassociateResourceShareErrorModeled::MalformedArnException(
+                    MalformedArnException { message: why },
+                )
+                .into(),
+            );
+        }
+        if let Some(why) = crate::state::entity_value_rejection("principals", &principals)
+            .or_else(|| crate::state::entity_value_rejection("sources", &sources))
+            .or_else(|| {
+                (resource_arns.is_empty() && principals.is_empty() && sources.is_empty()).then(
+                    || {
+                        "at least one of resourceArns, principals or sources must name an entity \
+                         to disassociate"
+                            .to_string()
+                    },
+                )
+            })
+        {
+            return Err(
+                DisassociateResourceShareErrorModeled::InvalidParameterException(
+                    InvalidParameterException { message: why },
+                )
+                .into(),
+            );
+        }
+        if let Some(why) = crate::state::entity_count_rejection("resourceArns", resource_arns.len())
+            .or_else(|| crate::state::entity_count_rejection("principals", principals.len()))
+            .or_else(|| crate::state::entity_count_rejection("sources", sources.len()))
+        {
+            return Err(
+                DisassociateResourceShareErrorModeled::ResourceShareLimitExceededException(
+                    ResourceShareLimitExceededException { message: why },
+                )
+                .into(),
+            );
+        }
+        if let Some(why) = input
+            .client_token
+            .as_deref()
+            .and_then(crate::state::client_token_rejection)
+        {
+            return Err(
+                DisassociateResourceShareErrorModeled::InvalidClientTokenException(
+                    InvalidClientTokenException { message: why },
+                )
+                .into(),
+            );
+        }
+
+        // The entities this call disassociates, in the order the response reports
+        // them: resources, then principals, then sources — the order
+        // `AssociateResourceShare` reports the matching attach in.
+        let requested: Vec<(&str, &String)> = [
+            (crate::state::ASSOCIATION_TYPE_RESOURCE, &resource_arns),
+            (crate::state::ASSOCIATION_TYPE_PRINCIPAL, &principals),
+            (crate::state::ASSOCIATION_TYPE_SOURCE, &sources),
+        ]
+        .into_iter()
+        .flat_map(|(association_type, entities)| {
+            entities.iter().map(move |entity| (association_type, entity))
+        })
+        .collect();
+
+        let mut store = state.lock();
+        let now = store.tick();
+        store.settle_due_associations(now);
+
+        let fingerprint = crate::state::fingerprint(&[
+            &input.resource_share_arn,
+            &crate::state::fingerprint_list(&resource_arns),
+            &crate::state::fingerprint_list(&principals),
+            &crate::state::fingerprint_list(&sources),
+        ]);
+
+        if let Some(token) = input.client_token.clone() {
+            if let Some(record) = store.client_token_record(Self::NAME, &token) {
+                if record.fingerprint != fingerprint {
+                    return Err(
+                        DisassociateResourceShareErrorModeled::IdempotentParameterMismatchException(
+                            IdempotentParameterMismatchException {
+                                message: "clientToken was already used for a \
+                                          DisassociateResourceShare request with different \
+                                          parameters"
+                                    .to_string(),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                // A repeat tears nothing down again: the stored records answer it.
+                let associations = requested
+                    .iter()
+                    .filter_map(|(association_type, entity)| {
+                        store
+                            .associations
+                            .get(&(
+                                input.resource_share_arn.clone(),
+                                (*association_type).to_string(),
+                                (*entity).clone(),
+                            ))
+                            .map(crate::state::AssociationRecord::view)
+                    })
+                    .collect();
+                return Ok(DisassociateResourceShareOutput {
+                    resource_share_associations: Some(associations),
+                    client_token: Some(token),
+                });
+            }
+        }
+
+        let share_arn = store
+            .live_share(&input.resource_share_arn)
+            .map(|share| share.arn.clone())
+            .ok_or_else(|| {
+                DisassociateResourceShareErrorModeled::UnknownResourceException(
+                    UnknownResourceException {
+                        message: crate::state::unknown_share_message(&input.resource_share_arn),
+                    },
+                )
+            })?;
+
+        // An entity the share holds no association with cannot be removed from it:
+        // there is no such association to report, so the request names a resource
+        // this service cannot find. Every entity is checked BEFORE anything is torn
+        // down, so a refused call changes nothing.
+        if let Some((association_type, entity)) =
+            requested.iter().find(|(association_type, entity)| {
+                !store.associations.contains_key(&(
+                    share_arn.clone(),
+                    (*association_type).to_string(),
+                    (*entity).clone(),
+                ))
+            })
+        {
+            return Err(
+                DisassociateResourceShareErrorModeled::UnknownResourceException(
+                    UnknownResourceException {
+                        message: format!(
+                            "ResourceShare {share_arn} has no {association_type} association \
+                             with {entity}."
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let associations = requested
+            .iter()
+            .filter_map(|(association_type, entity)| {
+                store
+                    .disassociate(&share_arn, association_type, entity.as_str(), now)
+                    .as_ref()
+                    .map(crate::state::AssociationRecord::view)
+            })
+            .collect();
+
+        let client_token = match input.client_token {
+            Some(token) => token,
+            None => store.fresh_uuid(),
+        };
+        store.remember_client_token(Self::NAME, &client_token, fingerprint, share_arn);
+
+        Ok(DisassociateResourceShareOutput {
+            resource_share_associations: Some(associations),
+            client_token: Some(client_token),
+        })
     }
 }
