@@ -196,6 +196,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `Sort$sortBy`: "`StartTime` and `LastUpdateTime` are supported only
+        // when `PartyType` is `Proposer`" — so a search scoped to a party type
+        // may only sort on an attribute that party type supports, and the
+        // pairing is refused rather than silently answered in some other order.
+        // The scope is what the request's `PartyType` filter names: a search
+        // naming none is scoped to no party type, so there is no unsupported
+        // combination of filters to refuse.
+        let party_type = crate::state::party_type_scope(&filters);
+        if crate::state::PROPOSER_ONLY_SORT_BY.contains(&sort_by.as_str())
+            && party_type.is_some_and(|scope| scope != crate::state::PARTY_TYPE_PROPOSER)
+        {
+            return Err(SearchAgreementsErrorModeled::ValidationException(
+                crate::state::unsupported_filter_combination("sort.sortBy"),
+            )
+            .into());
+        }
+
         // A pure report: it reads the stored agreements and writes nothing.
         let store = state.lock();
         let mut matched: Vec<&crate::state::Agreement> = Vec::new();

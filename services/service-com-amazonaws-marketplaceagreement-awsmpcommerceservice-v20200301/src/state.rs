@@ -239,6 +239,12 @@ pub const SORT_BY_VALUES: &[&str] = &["EndTime", "StartTime", "LastUpdateTime"];
 /// `Sort$sortBy`'s documented default ("The default value is `EndTime`").
 pub const DEFAULT_SORT_BY: &str = "EndTime";
 
+/// The sort attributes `Sort$sortBy` restricts to one party type: "`StartTime`
+/// and `LastUpdateTime` are supported only when `PartyType` is `Proposer`"
+/// (repeated on `SearchAgreementsInput$sort`). `EndTime` carries no such
+/// restriction, so it is not listed here.
+pub const PROPOSER_ONLY_SORT_BY: &[&str] = &["StartTime", "LastUpdateTime"];
+
 /// `Sort$sortOrder`'s documented default ("The default value is `ASCENDING`").
 pub const SORT_ORDER_ASCENDING: &str = "ASCENDING";
 
@@ -1049,6 +1055,23 @@ pub fn validate_filters(filters: &[Filter]) -> Result<(), FilterRefusal> {
     Ok(())
 }
 
+/// The party type a search is scoped to: the value of its `PartyType` filter,
+/// or `None` when it names none.
+///
+/// `Sort$sortBy` restricts two of its attributes to one party type, so the
+/// attribute a search may sort on is decided by this scope rather than by the
+/// agreements the search happens to select. Call [`validate_filters`] first: a
+/// `PartyType` value it would refuse is not a scope.
+pub fn party_type_scope(filters: &[Filter]) -> Option<&str> {
+    filters
+        .iter()
+        .enumerate()
+        .find_map(|(index, filter)| match filter_parts(index, filter) {
+            Ok(("PartyType", value)) => Some(value),
+            _ => None,
+        })
+}
+
 /// Whether `agreement` matches every filter the search named.
 ///
 /// Several filters are an AND, which is what makes the documented combinations
@@ -1325,6 +1348,39 @@ fn violation_kind(violation: &::smithy_server_runtime::Violation) -> RefusalKind
     match violation.kind {
         ::smithy_server_runtime::ViolationKind::MissingRequiredMember => RefusalKind::Missing,
         _ => RefusalKind::Invalid,
+    }
+}
+
+/// How this service states a request whose filters cannot hold together with
+/// the rest of the request.
+///
+/// Not derived from a member the way [`validation_message`] derives its
+/// sentence: no single member of such a request is the wrong one, so the
+/// sentence is about the combination.
+pub const UNSUPPORTED_FILTER_COMBINATION_MESSAGE: &str =
+    "Provided combination of filters is not supported.";
+
+/// The `ValidationExceptionReason` for filters that are each acceptable but
+/// cannot hold together with the rest of the request
+/// (`smithy_query(query="shape", shape="ValidationExceptionReason")` lists
+/// `UNSUPPORTED_FILTERS`).
+pub const REASON_UNSUPPORTED_FILTERS: &str = "UNSUPPORTED_FILTERS";
+
+/// A `ValidationException` for a request whose members are each acceptable but
+/// cannot hold together — the modelled `UNSUPPORTED_FILTERS` reason.
+///
+/// `path` is the member whose pairing with the filters is unsupported, so a
+/// client still reads WHICH part of the request to change from `fields`, while
+/// `message` states the combination rather than one bad member.
+pub fn unsupported_filter_combination(path: impl Into<String>) -> ValidationException {
+    ValidationException {
+        request_id: None,
+        message: Some(UNSUPPORTED_FILTER_COMBINATION_MESSAGE.to_string()),
+        reason: Some(REASON_UNSUPPORTED_FILTERS.to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: path.into(),
+            message: FIELD_INVALID.to_string(),
+        }]),
     }
 }
 
