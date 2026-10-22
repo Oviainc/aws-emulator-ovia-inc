@@ -6,6 +6,10 @@
 //!
 //! Every assertion goes through the router, so nothing here can pass by reading a
 //! handler's internals: a response that is not computed from the shared store fails.
+//!
+//! The harness here ([`Emulator`], [`declaration`] and the stage builders) is
+//! `pub(crate)` so the other suites of this test target reuse it rather than growing a
+//! second copy; see `tests/all/update_pipeline.rs`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -18,7 +22,7 @@ const TARGET_PREFIX: &str = "CodePipeline_20150709";
 
 /// A `roleArn` satisfying `RoleArn`'s modelled pattern
 /// (`^arn:aws(-[\w]+)*:iam::[0-9]{12}:role/`).
-const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/service-role/cp";
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/service-role/cp";
 
 /// The canonical emulator account id every ARN carries
 /// (`emulator_server::EMULATOR_ACCOUNT_ID`).
@@ -26,12 +30,12 @@ const ACCOUNT_ID: &str = "000000000000";
 
 /// One emulator: the shared engine, the service mounted on it, and the router that
 /// dispatches to it — exactly how `core/router` assembles the production emulator.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -91,7 +95,7 @@ impl Emulator {
 
     /// The `__type` an error response carries (the awsJson error code clients match
     /// on), or `None` for a success.
-    async fn expect_error(&self, operation: &str, body: &Value) -> (u16, String) {
+    pub(crate) async fn expect_error(&self, operation: &str, body: &Value) -> (u16, String) {
         let (status, response) = self.call(operation, body).await;
         let code = response
             .get("__type")
@@ -101,7 +105,7 @@ impl Emulator {
         (status, code)
     }
 
-    async fn ok(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: &Value) -> Value {
         let (status, response) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -112,7 +116,7 @@ impl Emulator {
 }
 
 /// A one-stage, one-action declaration — the smallest thing that is a pipeline.
-fn declaration(name: &str) -> Value {
+pub(crate) fn declaration(name: &str) -> Value {
     json!({
         "name": name,
         "roleArn": ROLE_ARN,
@@ -121,7 +125,7 @@ fn declaration(name: &str) -> Value {
     })
 }
 
-fn source_stage(name: &str) -> Value {
+pub(crate) fn source_stage(name: &str) -> Value {
     json!({
         "name": name,
         "actions": [{
@@ -138,7 +142,7 @@ fn source_stage(name: &str) -> Value {
     })
 }
 
-fn build_stage(name: &str, action_count: usize) -> Value {
+pub(crate) fn build_stage(name: &str, action_count: usize) -> Value {
     let actions: Vec<Value> = (0..action_count)
         .map(|index| {
             json!({
@@ -158,7 +162,7 @@ fn build_stage(name: &str, action_count: usize) -> Value {
     json!({"name": name, "actions": actions})
 }
 
-fn stage_names(pipeline: &Value) -> Vec<String> {
+pub(crate) fn stage_names(pipeline: &Value) -> Vec<String> {
     pipeline["stages"]
         .as_array()
         .expect("stages is a list")

@@ -21,3 +21,5 @@ mod stage_transitions;
 mod state_roundtrip;
 #[path = "all/third_party_jobs.rs"]
 mod third_party_jobs;
+#[path = "all/update_pipeline.rs"]
+mod update_pipeline;
