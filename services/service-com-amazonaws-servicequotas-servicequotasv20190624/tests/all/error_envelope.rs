@@ -95,8 +95,9 @@ impl Client {
 /// The modelled `IllegalArgumentException` carries `Message` (its own modelled member),
 /// while the synthetic `ValidationException` the request validator answers with carries
 /// the protocol's generic lowercase `message`; a client reads whichever its SDK maps,
-/// so this reads both.
-fn error_of(body: &Value) -> (String, Option<String>) {
+/// so this reads both. Shared with the suites that read a refusal's wording
+/// (`resource_tags.rs`), so there is one reader of an error body in this crate.
+pub(crate) fn error_of(body: &Value) -> (String, Option<String>) {
     let code = body
         .get("__type")
         .and_then(Value::as_str)

@@ -2,8 +2,8 @@
 
 //! Engine state for the com-amazonaws-servicequotas-servicequotasv20190624 service.
 //!
-//! Service Quotas serves three kinds of data, and this module is the single owner of
-//! all three so every operation reads the same copy:
+//! Service Quotas serves four kinds of data, and this module is the single owner of
+//! all four so every operation reads the same copy:
 //!
 //! * the **service catalog** (`ListServices`) and the **AWS default quotas**
 //!   (`GetAWSDefaultServiceQuota`, `ListAWSDefaultServiceQuotas`) — seeded in
