@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNFSFileShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNFSFileShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNFSFileShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an NFS file share on an S3 File Gateway: every member the request carries is
+//! persisted in [`crate::state`], so `DescribeNFSFileShares` reports back exactly what was
+//! created, and the `ClientToken` is remembered so a repeat of the same create answers
+//! with the share it already made.
 //!
 //! ## Shape of an operation
 //!
@@ -250,18 +245,184 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNFSFileShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNFSFileShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNFSFileShare"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateNFSFileShareErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the storage gateway store is unavailable".to_string()),
+                    error: None,
+                },
+            )
+            .into());
+        };
+
+        // `EncryptionType` documents the cross-member rule the model cannot
+        // express: "the specified encryption methods must not conflict. For
+        // example, if EncryptionType is SseS3, then KMSEncrypted must be false. If
+        // EncryptionType is SseKms or DsseKms, then KMSEncrypted must be true."
+        let kms_backed = matches!(
+            input.encryption_type.as_deref(),
+            Some("SseKms" | "DsseKms")
+        );
+        if let (Some(encryption_type), Some(kms_encrypted)) =
+            (input.encryption_type.as_deref(), input.kms_encrypted)
+        {
+            if kms_backed != kms_encrypted {
+                return Err(
+                    CreateNFSFileShareErrorModeled::InvalidGatewayRequestException(
+                        crate::state::invalid_gateway_request(
+                            crate::state::ERROR_CODE_INVALID_PARAMETERS,
+                            format!(
+                                "EncryptionType {encryption_type} requires KMSEncrypted \
+                                 {kms_backed}."
+                            ),
+                        ),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `KMSKey`: "This value must be set if KMSEncrypted is true, or if
+        // EncryptionType is SseKms or DsseKms."
+        if (kms_backed || input.kms_encrypted == Some(true)) && input.kms_key.is_none() {
+            return Err(
+                CreateNFSFileShareErrorModeled::InvalidGatewayRequestException(
+                    crate::state::invalid_gateway_request(
+                        crate::state::ERROR_CODE_INVALID_PARAMETERS,
+                        "KMSKey must be set when the file share is encrypted with a KMS key.",
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // The share lives on a gateway, and only on an S3 File Gateway: "This
+        // operation is only supported for S3 File Gateways."
+        match store.gateways.get(&input.gateway_arn) {
+            None => {
+                return Err(
+                    CreateNFSFileShareErrorModeled::InvalidGatewayRequestException(
+                        crate::state::gateway_not_found(&input.gateway_arn),
+                    )
+                    .into(),
+                )
+            }
+            Some(gateway) if gateway.gateway_type != crate::state::S3_FILE_GATEWAY_TYPE => {
+                return Err(
+                    CreateNFSFileShareErrorModeled::InvalidGatewayRequestException(
+                        crate::state::invalid_gateway_request(
+                            crate::state::ERROR_CODE_NOT_SUPPORTED,
+                            format!(
+                                "CreateNFSFileShare is only supported for {} gateways.",
+                                crate::state::S3_FILE_GATEWAY_TYPE
+                            ),
+                        ),
+                    )
+                    .into(),
+                )
+            }
+            Some(_) => {}
+        }
+
+        // `ClientToken` is "used by S3 File Gateway to ensure idempotent file share
+        // creation": the same token on the same gateway names the share it already
+        // created, rather than minting a second one. The token is read off the
+        // shares themselves, so it is remembered exactly as long as its share is.
+        if let Some(existing) =
+            store.share_created_with(&input.gateway_arn, &input.client_token)
+        {
+            return Ok(CreateNFSFileShareOutput {
+                file_share_arn: Some(existing),
+            });
+        }
+
+        // The store is bounded: past either ceiling a create is refused rather than
+        // adding another record that lives for the life of the process. A repeat of
+        // a token already recorded answered above, so a retry still works at the
+        // cap.
+        let at_capacity = if store.file_shares.len() >= crate::state::MAX_FILE_SHARES {
+            Some(format!(
+                "This account already holds the maximum of {} file shares.",
+                crate::state::MAX_FILE_SHARES
+            ))
+        } else if store.file_shares_on(&input.gateway_arn)
+            >= crate::state::MAX_FILE_SHARES_PER_GATEWAY
+        {
+            Some(format!(
+                "This gateway already holds the maximum of {} file shares.",
+                crate::state::MAX_FILE_SHARES_PER_GATEWAY
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = at_capacity {
+            return Err(
+                CreateNFSFileShareErrorModeled::InvalidGatewayRequestException(
+                    crate::state::invalid_gateway_request(
+                        crate::state::ERROR_CODE_INVALID_PARAMETERS,
+                        message,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let file_share_id = store.mint_file_share_id();
+        let arn = crate::state::file_share_arn(&region, &file_share_id);
+        let share = crate::state::FileShare {
+            arn: arn.clone(),
+            file_share_id,
+            share_type: crate::state::FILE_SHARE_TYPE_NFS.to_string(),
+            // The gateway builds the share asynchronously, so it is reported
+            // `CREATING` until the clock owes it `AVAILABLE`.
+            status: crate::state::FILE_SHARE_STATUS_CREATING.to_string(),
+            pending: Some(crate::state::PendingTransition {
+                due: now + crate::state::FILE_SHARE_TRANSITION,
+                status: crate::state::FILE_SHARE_STATUS_AVAILABLE.to_string(),
+            }),
+            gateway_arn: input.gateway_arn,
+            client_token: input.client_token,
+            role: input.role,
+            location_arn: input.location_arn,
+            path: crate::state::FILE_SHARE_PATH.to_string(),
+            file_share_name: input.file_share_name,
+            default_storage_class: input
+                .default_storage_class
+                .unwrap_or_else(|| crate::state::DEFAULT_STORAGE_CLASS.to_string()),
+            object_acl: input
+                .object_acl
+                .unwrap_or_else(|| crate::state::DEFAULT_OBJECT_ACL.to_string()),
+            client_list: input.client_list.unwrap_or_default(),
+            squash: input
+                .squash
+                .unwrap_or_else(|| crate::state::DEFAULT_SQUASH.to_string()),
+            // `ReadOnly` and `RequesterPays` document no default; both are a
+            // setting that is off until the request turns it on.
+            read_only: input.read_only.unwrap_or(false),
+            guess_mime_type_enabled: input
+                .guess_mime_type_enabled
+                .unwrap_or(crate::state::DEFAULT_GUESS_MIME_TYPE_ENABLED),
+            requester_pays: input.requester_pays.unwrap_or(false),
+            kms_encrypted: input.kms_encrypted.unwrap_or(kms_backed),
+            kms_key: input.kms_key,
+            encryption_type: input.encryption_type,
+            nfs_defaults: crate::state::nfs_defaults_with_defaults(input.nfs_file_share_defaults),
+            cache_attributes: input.cache_attributes,
+            notification_policy: input.notification_policy,
+            vpc_endpoint_dns_name: input.vpc_endpoint_dns_name,
+            bucket_region: input.bucket_region,
+            audit_destination_arn: input.audit_destination_arn,
+            tags: input.tags.unwrap_or_default(),
+            created_at: now,
+        };
+        store.file_shares.insert(arn.clone(), share);
+
+        Ok(CreateNFSFileShareOutput {
+            file_share_arn: Some(arn),
+        })
     }
 }
