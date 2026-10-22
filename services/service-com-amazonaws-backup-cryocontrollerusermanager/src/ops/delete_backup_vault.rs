@@ -4,7 +4,8 @@
 //!
 //! Removes the vault from [`crate::state`]. AWS requires the vault be empty
 //! first, so a vault that still holds recovery points is refused with
-//! `InvalidRequestException`.
+//! `InvalidRequestException`; so is a vault whose creation has not settled yet,
+//! with the `Code` AWS Backup words that refusal with.
 //!
 //! ## Shape of an operation
 //!
@@ -166,6 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteBackupVaultErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
                 message: Some("the backup vault store is unavailable".to_string()),
@@ -200,6 +202,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "Backup vault {} not found",
                         input.backup_vault_name
                     )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+        // A vault whose creation the clock has already settled is deletable, so
+        // the transition owed at `settles_at` is materialised before the state
+        // guard below reads the state.
+        store.settle_vault(&input.backup_vault_name, now);
+        // A vault still being created is not deletable yet: that is a refusal
+        // the vault's STATE makes, so it is the modelled `InvalidRequestException`
+        // with the `Code` AWS Backup puts on it, not an absent resource. The
+        // distinction is what tells a client to retry once creation finishes.
+        if store
+            .vaults
+            .get(&input.backup_vault_name)
+            .is_some_and(|vault| {
+                vault.vault_state.as_deref() == Some(crate::state::VAULT_STATE_CREATING)
+            })
+        {
+            return Err(DeleteBackupVaultErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    code: Some(crate::state::ERROR_CODE_VAULT_STILL_CREATING.to_string()),
+                    message: Some(
+                        "Backup vault cannot be deleted because it's still in Creating state."
+                            .to_string(),
+                    ),
                     ..Default::default()
                 },
             )
