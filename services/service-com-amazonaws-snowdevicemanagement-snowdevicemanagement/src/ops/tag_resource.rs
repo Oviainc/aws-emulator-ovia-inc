@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Adds or replaces tags on a device or task — `POST /tags/{resourceArn}`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The resource is addressed by ARN, so this handler answers in the order the service
+//! does: a `resourceArn` this operation cannot parse as one of this service's ARNs is a
+//! bad request, one naming another account is denied, one that parses but names no
+//! device and no task is not found, and only once the ARN has resolved does the
+//! request's `tags` get looked at. That ordering is observable — a call carrying BOTH an
+//! unresolvable ARN and an unacceptable tag is answered about the ARN, never with the
+//! tag refusal. `UntagResource` answers the same classes the same way, through the same
+//! `crate::state::parse_tagged_resource_arn`.
 //!
 //! ## Shape of an operation
 //!
@@ -106,9 +107,19 @@ impl ::aws_smithy_schema::serde::SerializableStruct for TagResourceOutput {
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.snowdevicemanagement#TagResource")]
+// `extra_errors` widens the set with `AccessDeniedException` — a shape the SERVICE
+// models (`DescribeDevice`, `ListDevices` and the task operations all list it,
+// @httpError 403) that this operation's own error list omits: a `resourceArn` for an
+// account this emulator does not serve has to be refused as denied rather than reported
+// as absent, which would disclose whether the resource is there. `UntagResource` answers
+// the same class the same way.
+#[smithy_macros::operation_error(
+    "com.amazonaws.snowdevicemanagement#TagResource",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
@@ -165,18 +176,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the snow-device-management device store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        store.ensure_seeded(&region, now);
+        store.settle(now);
+
+        let resource = match crate::state::parse_tagged_resource_arn(&input.resource_arn) {
+            Ok(resource) => resource,
+            // Not an ARN of this service at all: the recorded answer of the tagging
+            // APIs to a `resourceArn` they cannot parse is HTTP 400
+            // `BadRequestException`, a code this service's model declares nowhere, so
+            // it comes from the error channel rather than a modeled shape. The wording
+            // is this operation's own recorded sentence (see
+            // `crate::state::TAG_RESOURCE_INVALID_ARN_MESSAGE`), one for the whole
+            // class, echoing no part of the request.
+            Err(crate::state::ArnRefusal::Malformed(_)) => {
+                return Err(crate::scaffolded::Scaffolded::bad_request(
+                    crate::state::TAG_RESOURCE_INVALID_ARN_MESSAGE,
+                ));
+            }
+            Err(crate::state::ArnRefusal::ForeignAccount(message)) => {
+                return Err(TagResourceErrorModeled::AccessDeniedException(
+                    AccessDeniedException { message },
+                )
+                .into());
+            }
+        };
+
+        // The tags of the addressed record, or the tagging APIs' recorded 404 for a
+        // `resourceArn` that parses but names no device and no task — not the model's
+        // `ResourceNotFoundException`, which is what the device and task operations
+        // answer with. The ARN is resolved BEFORE the request's `tags` is looked at, so
+        // a call carrying both an unresolvable ARN and an unacceptable tag is answered
+        // with this.
+        let existing = match resource.kind {
+            crate::state::TaggedResourceKind::Device => store
+                .devices
+                .get_mut(&resource.id)
+                .map(|device| &mut device.tags),
+            crate::state::TaggedResourceKind::Task => {
+                store.tasks.get_mut(&resource.id).map(|task| &mut task.tags)
+            }
+        };
+        let Some(existing) = existing else {
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                crate::state::TAGGING_NOT_FOUND_MESSAGE,
+            ));
+        };
+
+        // Only now the tags themselves. The whole map is checked before anything is
+        // written, so a refused call leaves the resource exactly as it was.
+        if let Some(violation) = crate::state::tag_violation(&input.tags, existing) {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: format!("1 validation error detected: {violation}"),
+            })
+            .into());
+        }
+
+        // "Adds or replaces tags": a key the resource already carries takes the
+        // request's value, every other tag it carries stays.
+        for (key, value) in input.tags {
+            existing.insert(key, value);
+        }
+        Ok(TagResourceOutput)
     }
 }

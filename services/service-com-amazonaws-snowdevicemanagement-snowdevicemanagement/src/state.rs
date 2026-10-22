@@ -62,6 +62,38 @@ pub const DEVICE_RESOURCE_TYPE: &str = "managed-device";
 /// The `resourceType` segment a not-found message names for a task.
 pub const TASK_RESOURCE_TYPE: &str = "task";
 
+/// The tag-key prefix AWS reserves for its own use.
+///
+/// "Do not use the `aws:` prefix in your tag names or values because it is reserved for
+/// Amazon Web Services use. You can't edit or delete tag names or values with this
+/// prefix." (AWS tagging documentation — the rule is service-independent, which is why
+/// the model carries no pattern for it.) [`tag_violation`] enforces it on the tag KEY,
+/// which is the half of the rule the recorded service refuses a request for.
+pub const RESERVED_TAG_PREFIX: &str = "aws:";
+
+/// How many tags one resource may carry: the AWS-wide tagging quota ("Maximum number of
+/// tags per resource: 50").
+pub const MAX_TAGS: usize = 50;
+
+/// The longest tag key AWS accepts ("Maximum key length: 128 Unicode characters in
+/// UTF-8").
+pub const MAX_TAG_KEY_LENGTH: usize = 128;
+
+/// The longest tag value AWS accepts ("Maximum value length: 256 Unicode characters in
+/// UTF-8").
+pub const MAX_TAG_VALUE_LENGTH: usize = 256;
+
+/// The message `TagResource` refuses a `resourceArn` it cannot parse with.
+///
+/// One sentence for the whole refusal class, echoing no part of the request. It is the
+/// wording the behavioural corpus recorded for THIS operation; `UntagResource`'s
+/// recorded wording for the same class carries a `: bad syntax` suffix
+/// ([`INVALID_RESOURCE_ARN_MESSAGE`]), so the two are kept apart rather than one being
+/// fitted to the other. What a client branches on is the 400 and the
+/// `BadRequestException` wire code (see [`crate::scaffolded::Scaffolded::bad_request`]),
+/// not this prose.
+pub const TAG_RESOURCE_INVALID_ARN_MESSAGE: &str = "Invalid input resource arn";
+
 /// What the device gate ([`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::gated_device`])
 /// is refused with.
 ///
@@ -694,6 +726,63 @@ pub fn task_arn(task_id: &str, region: &str) -> String {
         region,
         &format!("{TASK_RESOURCE_TYPE}/{task_id}"),
     )
+}
+
+/// Why a tag map cannot be applied to a resource that already carries `existing`, or
+/// `None` when every tag in it is acceptable.
+///
+/// The rules are the AWS-wide tagging ones ([`RESERVED_TAG_PREFIX`],
+/// [`MAX_TAG_KEY_LENGTH`], [`MAX_TAG_VALUE_LENGTH`], [`MAX_TAGS`]); the model constrains
+/// `TagMap` with none of them, so they are enforced here. The keys are walked in sorted
+/// order, so one request always gets one answer.
+pub fn tag_violation(
+    tags: &HashMap<String, String>,
+    existing: &BTreeMap<String, String>,
+) -> Option<String> {
+    let sorted: BTreeMap<&str, &str> = tags
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    for (key, value) in &sorted {
+        if key.is_empty() {
+            return Some(
+                "Value '' at 'tags' failed to satisfy constraint: A tag key must not be empty"
+                    .to_string(),
+            );
+        }
+        if key.to_ascii_lowercase().starts_with(RESERVED_TAG_PREFIX) {
+            return Some(format!(
+                "Value '{key}' at 'tags' failed to satisfy constraint: Tag keys must not \
+                 begin with the reserved prefix '{RESERVED_TAG_PREFIX}'"
+            ));
+        }
+        if key.chars().count() > MAX_TAG_KEY_LENGTH {
+            return Some(format!(
+                "Value '{key}' at 'tags' failed to satisfy constraint: Tag keys must have \
+                 length less than or equal to {MAX_TAG_KEY_LENGTH}"
+            ));
+        }
+        if value.chars().count() > MAX_TAG_VALUE_LENGTH {
+            return Some(format!(
+                "Value '{value}' at 'tags' failed to satisfy constraint: Tag values must \
+                 have length less than or equal to {MAX_TAG_VALUE_LENGTH}"
+            ));
+        }
+    }
+    // What the resource would end up carrying: its own keys the request does not
+    // replace, plus every key the request names.
+    let merged = existing
+        .keys()
+        .filter(|key| !tags.contains_key(key.as_str()))
+        .count()
+        + tags.len();
+    if merged > MAX_TAGS {
+        return Some(format!(
+            "Value '{merged} tags' at 'tags' failed to satisfy constraint: A resource must \
+             not carry more than {MAX_TAGS} tags"
+        ));
+    }
+    None
 }
 
 /// The region this request was signed for — what a minted ARN names.
