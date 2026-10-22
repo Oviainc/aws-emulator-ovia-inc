@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The AWS WAF Classic (regional) `Rule` lifecycle, end to end over the wire:
-//! `GetChangeToken`, `CreateRule`, `GetRule`.
+//! `GetChangeToken`, `CreateRule`, `GetRule`, `ListRules`.
 //!
 //! Every call goes through the real router (see `tests/all/wire.rs`), so what these
 //! tests assert is what an SDK client sees: each response is built from the persisted
@@ -47,6 +47,32 @@ async fn create_rule(router: &MultiServiceRouter, name: &str, metric_name: &str)
         "CreateRule must report the change token it consumed: {body}"
     );
     body
+}
+
+/// One page of `ListRules`, as `(RuleId, Name)` pairs plus the page's `NextMarker`.
+async fn list_rules_page(
+    router: &MultiServiceRouter,
+    limit: usize,
+    marker: Option<&str>,
+    label: &str,
+) -> (Vec<(String, String)>, Option<String>) {
+    let mut request = json!({"Limit": limit});
+    if let Some(marker) = marker {
+        request["NextMarker"] = json!(marker);
+    }
+    let page = ok_call(router, "ListRules", &request).await;
+    let summaries = page["Rules"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {label}: ListRules answered no Rules array: {page}"))
+        .iter()
+        .map(|summary| {
+            let id = summary["RuleId"].as_str().unwrap_or_default().to_string();
+            let name = summary["Name"].as_str().unwrap_or_default().to_string();
+            (id, name)
+        })
+        .collect();
+    let next = page["NextMarker"].as_str().map(str::to_string);
+    (summaries, next)
 }
 
 /// The `RuleId` of a `CreateRule` response.
@@ -431,6 +457,157 @@ async fn create_refuses_past_the_rule_quota() {
         token_status(&router, &token).await,
         "PROVISIONED",
         "a refused CreateRule must not consume the change token"
+    );
+}
+
+/// `ListRules` pages the stored rules: `Limit` bounds the page, `NextMarker` resumes
+/// it, and walking the pages yields every stored rule exactly once, in `RuleId` order.
+/// Each summary carries the stored record's own `RuleId` and `Name`.
+#[tokio::test]
+async fn list_rules_pages_by_limit_and_marker() {
+    let router = router();
+    // Rules differing in name length, case and the characters used, with one name
+    // deliberately repeated: `ResourceName` carries no uniqueness constraint, so two
+    // rules may share a name and must still be listed as two summaries.
+    let names: &[&str] = &[
+        "page-probe-0",
+        "x",
+        "Page_Probe.2",
+        "0123456789",
+        "two words",
+        "shared-name",
+        "shared-name",
+    ];
+    let mut created: Vec<(String, String)> = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        let body = create_rule(&router, name, &format!("pageProbe{index}")).await;
+        created.push((rule_id(&body), (*name).to_string()));
+    }
+    // The store is a `BTreeMap` keyed by `RuleId`, so the listing order is id order.
+    created.sort();
+
+    // `Limit` 0 is the model's declared default and asks for the service's own page
+    // size; 100 is its `@range` maximum. Each row walks every page.
+    for limit in [0_usize, 1, 2, 3, 7, 100] {
+        let label = format!("Limit {limit}");
+        let mut seen: Vec<(String, String)> = Vec::new();
+        let mut marker: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let (summaries, next) =
+                list_rules_page(&router, limit, marker.as_deref(), &label).await;
+            if limit > 0 {
+                assert!(
+                    summaries.len() <= limit,
+                    "case {label}: a page must hold at most {limit} summaries, got {}",
+                    summaries.len()
+                );
+            }
+            for (id, _) in &summaries {
+                assert!(
+                    is_resource_id(id),
+                    "case {label}: every summary must carry a minted RuleId, got {id:?}"
+                );
+            }
+            seen.extend(summaries);
+            marker = next;
+            pages += 1;
+            // The marker is present exactly when a rule remains past this page.
+            assert_eq!(
+                marker.is_some(),
+                seen.len() < created.len(),
+                "case {label}: NextMarker must be present only while rules remain, \
+                 got {marker:?} after {} of {} rules",
+                seen.len(),
+                created.len()
+            );
+            if marker.is_none() {
+                break;
+            }
+            assert!(
+                pages <= created.len() + 1,
+                "case {label}: paging did not terminate after {pages} pages"
+            );
+        }
+        assert_eq!(
+            seen, created,
+            "case {label}: paging must yield every stored rule exactly once, in id order, \
+             got {seen:?}"
+        );
+    }
+
+    // `PaginationLimit`'s modelled `@range` is 0..100, so one past either bound is
+    // refused before the handler runs.
+    for limit in [-1_i64, 101] {
+        let (status, body) = call(&router, "ListRules", &json!({"Limit": limit})).await;
+        assert_eq!(
+            status, 400,
+            "case Limit {limit}: a value outside 0..100 must be refused, got {status}: {body}"
+        );
+    }
+}
+
+/// Every `ListRules` summary is a projection of the record `GetRule` reads back, and a
+/// store holding no rules lists none — the listing is computed from state, not from the
+/// request.
+#[tokio::test]
+async fn list_rules_summarises_the_stored_records() {
+    let router = router();
+
+    // Nothing stored yet: an empty page and no marker.
+    let (summaries, marker) = list_rules_page(&router, 0, None, "an empty store").await;
+    assert!(
+        summaries.is_empty(),
+        "case an empty store: ListRules must list no rules, got {summaries:?}"
+    );
+    assert_eq!(
+        marker, None,
+        "case an empty store: ListRules must answer no NextMarker, got {marker:?}"
+    );
+
+    let cases: &[(&str, &str, &str)] = &[
+        ("a plain name", "summary-rule", "summaryRule"),
+        ("one character (the minimum length)", "y", "y"),
+        ("whitespace inside the resource name", "three word name", "threeWordName"),
+    ];
+    for (label, name, metric_name) in cases {
+        create_rule(&router, name, metric_name).await;
+
+        let (summaries, marker) = list_rules_page(&router, 100, None, label).await;
+        assert_eq!(
+            marker, None,
+            "case {label}: one page holds every rule, so there is no NextMarker, got {marker:?}"
+        );
+        for (id, listed_name) in &summaries {
+            let fetched = ok_call(&router, "GetRule", &json!({"RuleId": id})).await;
+            assert_eq!(
+                fetched["Rule"]["RuleId"].as_str(),
+                Some(id.as_str()),
+                "case {label}: the listed RuleId must name a stored rule, got {}",
+                fetched["Rule"]
+            );
+            assert_eq!(
+                fetched["Rule"]["Name"].as_str(),
+                Some(listed_name.as_str()),
+                "case {label}: the summary's Name must be the stored record's, got {}",
+                fetched["Rule"]
+            );
+        }
+    }
+
+    // Reading the list twice is a read: it changes nothing a later caller sees.
+    let first = list_rules_page(&router, 0, None, "a repeated read").await;
+    let second = list_rules_page(&router, 0, None, "a repeated read").await;
+    assert_eq!(
+        first, second,
+        "case a repeated read: ListRules must not change what a later caller sees, \
+         got {second:?} after {first:?}"
+    );
+    assert_eq!(
+        first.0.len(),
+        cases.len(),
+        "case a repeated read: every created rule must be listed, got {:?}",
+        first.0
     );
 }
 
