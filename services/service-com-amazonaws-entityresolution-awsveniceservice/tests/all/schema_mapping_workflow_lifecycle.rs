@@ -42,6 +42,7 @@ pub(crate) fn signed_for(region: &str) -> String {
 }
 
 /// The account id every emulated ARN carries, and the region the harness signs for.
+/// The account is private: [`account_id`] is the one accessor every other suite uses.
 const ACCOUNT_ID: &str = "000000000000";
 pub(crate) const REGION: &str = "us-east-1";
 
@@ -151,6 +152,19 @@ impl Emulator {
         self.call("POST", "/matchingworkflows", Some(request)).await
     }
 
+    /// `CreateIdNamespace` — `POST /idnamespaces`
+    /// (`smithy_query(query="operation",operation="CreateIdNamespace")`).
+    pub(crate) async fn create_id_namespace(&self, request: &Value) -> Reply {
+        self.call("POST", "/idnamespaces", Some(request)).await
+    }
+
+    /// `GetIdNamespace` — `GET /idnamespaces/{idNamespaceName}`, whose label is an
+    /// `EntityNameOrIdNamespaceArn`, so `id_namespace` is either a name or an ARN.
+    pub(crate) async fn get_id_namespace(&self, id_namespace: &str) -> Reply {
+        self.call("GET", &format!("/idnamespaces/{id_namespace}"), None)
+            .await
+    }
+
     pub(crate) async fn get_matching_workflow(&self, workflow_name: &str) -> Reply {
         self.call("GET", &format!("/matchingworkflows/{workflow_name}"), None)
             .await
@@ -194,6 +208,22 @@ pub(crate) fn string_member(record: &Value, member: &str) -> String {
         .to_string()
 }
 
+/// Assert `reply` is the modelled client failure `code` with HTTP `status`.
+///
+/// The ONE error-shape assertion in this crate's suites: `response_messages` adds its
+/// `message` check on top of this, and the ID-namespace suite uses it as it stands.
+pub(crate) fn assert_error_shape(case: &str, reply: &Reply, status: u16, code: &str) {
+    assert_eq!(
+        reply.status, status,
+        "case {case:?}: expected HTTP {status}, got {reply:?}"
+    );
+    assert_eq!(
+        reply.error_code.as_deref(),
+        Some(code),
+        "case {case:?}: expected {code}, got {reply:?}"
+    );
+}
+
 pub(crate) fn bool_member(record: &Value, member: &str) -> bool {
     record
         .get(member)
@@ -217,8 +247,9 @@ pub(crate) fn timestamp_member(record: &Value, member: &str) -> f64 {
 }
 
 /// The ARN Entity Resolution generates for `kind`/`name`, per the modelled
-/// `SchemaMappingArn` / `MatchingWorkflowArn` / `IdMappingWorkflowArn` patterns
-/// (`arn:aws:entityresolution:<region>:<account>:(schemamapping|matchingworkflow|idmappingworkflow)/<name>`).
+/// `SchemaMappingArn` / `MatchingWorkflowArn` / `IdMappingWorkflowArn` /
+/// `IdNamespaceArn` patterns (`arn:aws:entityresolution:<region>:<account>:
+/// (schemamapping|matchingworkflow|idmappingworkflow|idnamespace)/<name>`).
 pub(crate) fn expected_arn(kind: &str, name: &str) -> String {
     format!("arn:aws:entityresolution:{REGION}:{ACCOUNT_ID}:{kind}/{name}")
 }

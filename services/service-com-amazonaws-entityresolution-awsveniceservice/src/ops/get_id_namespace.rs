@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIdNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIdNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIdNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Serves one ID namespace out of
+//! [`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::id_namespaces`],
+//! field-for-field as `CreateIdNamespace` stored it, and answers the modelled
+//! `ResourceNotFoundException` (HTTP 404) when no namespace of that name exists. A
+//! pure read: `@readonly`, so nothing about the store changes and two consecutive
+//! calls answer identically. The `idNamespaceName` path member is an
+//! `EntityNameOrIdNamespaceArn`, so a caller may name the namespace by its name or by
+//! the ARN the create minted ([`crate::state::id_namespace_key`], which resolves an
+//! ARN only within the partition, region and account this request is served for).
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +171,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIdNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIdNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIdNamespace"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetIdNamespaceErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        let not_found = || {
+            GetIdNamespaceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::messages::GET_ID_NAMESPACE_NOT_FOUND.to_string()),
+            })
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let key = crate::state::id_namespace_key(&input.id_namespace_name, &region)
+            .ok_or_else(not_found)?;
+
+        // A pure read: nothing about the store changes, and two consecutive calls
+        // answer identically.
+        let store = state.lock();
+        let stored = store.id_namespaces.get(key).ok_or_else(not_found)?;
+
+        Ok(GetIdNamespaceOutput {
+            id_namespace_name: stored.id_namespace_name.clone(),
+            id_namespace_arn: stored.id_namespace_arn.clone(),
+            description: stored.description.clone(),
+            input_source_config: stored.input_source_config.clone(),
+            id_mapping_workflow_properties: stored.id_mapping_workflow_properties.clone(),
+            r#type: stored.r#type.clone(),
+            role_arn: stored.role_arn.clone(),
+            created_at: stored.created_at,
+            updated_at: stored.updated_at,
+            tags: stored.tags.clone(),
+        })
     }
 }

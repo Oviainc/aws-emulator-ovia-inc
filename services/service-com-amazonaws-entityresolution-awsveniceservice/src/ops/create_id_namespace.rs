@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIdNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIdNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIdNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an `idNamespaceArn` for a new ID namespace and PERSISTS the record, with its
+//! `createdAt`/`updatedAt` stamps, in
+//! [`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::id_namespaces`];
+//! every member of the response is read back out of the stored record, so
+//! `GetIdNamespace` cannot disagree with it. "Each ID namespace must have a unique
+//! name", so re-creating an existing `idNamespaceName` is refused with the modelled
+//! `ConflictException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +192,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIdNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIdNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIdNamespace"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateIdNamespaceErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // One instant for both stamps: a namespace that has only just been created has
+        // not been updated since, so `createdAt` and `updatedAt` are equal.
+        let created = crate::state::now();
+
+        let mut store = state.lock();
+
+        // The name is the primary key, so the conflict is decided BEFORE anything is
+        // minted or stored: a refused create leaves the store exactly as it was.
+        if store.id_namespaces.contains_key(&input.id_namespace_name) {
+            return Err(CreateIdNamespaceErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(
+                        crate::state::messages::CREATE_ID_NAMESPACE_CONFLICT.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The quota is enforced BEFORE anything is minted or stored, so the store can
+        // never grow past a fixed bound however many creates a caller issues, and a
+        // refused create leaves it exactly as it was. Deleting a namespace releases an
+        // entry, so the bound is self-healing.
+        if store.id_namespaces.len() >= crate::state::MAX_ID_NAMESPACES {
+            return Err(CreateIdNamespaceErrorModeled::ExceedsLimitException(
+                ExceedsLimitException {
+                    message: Some(format!(
+                        "The number of ID namespaces has reached the quota of {} for this \
+                         account and Region",
+                        crate::state::MAX_ID_NAMESPACES
+                    )),
+                    quota_name: Some(crate::state::ID_NAMESPACES_QUOTA_NAME.to_string()),
+                    quota_value: crate::state::quota_value(crate::state::MAX_ID_NAMESPACES),
+                },
+            )
+            .into());
+        }
+
+        let id_namespace_name = input.id_namespace_name;
+        let record = crate::state::IdNamespace {
+            id_namespace_arn: ::emulator_server::emulator_arn(
+                "entityresolution",
+                &region,
+                &format!(
+                    "{}{id_namespace_name}",
+                    crate::state::ID_NAMESPACE_RESOURCE_PREFIX
+                ),
+            ),
+            id_namespace_name: id_namespace_name.clone(),
+            description: input.description,
+            input_source_config: input.input_source_config,
+            id_mapping_workflow_properties: input.id_mapping_workflow_properties,
+            r#type: input.r#type,
+            role_arn: input.role_arn,
+            created_at: created,
+            updated_at: created,
+            tags: input.tags,
+        };
+        // Inserted through the vacant slot and answered from the STORED record, not
+        // from the request object, and without looking the key up a second time: a
+        // reader and this response therefore cannot disagree about what was created.
+        let stored = store
+            .id_namespaces
+            .entry(id_namespace_name)
+            .or_insert(record);
+        Ok(CreateIdNamespaceOutput {
+            id_namespace_name: stored.id_namespace_name.clone(),
+            id_namespace_arn: stored.id_namespace_arn.clone(),
+            description: stored.description.clone(),
+            input_source_config: stored.input_source_config.clone(),
+            id_mapping_workflow_properties: stored.id_mapping_workflow_properties.clone(),
+            r#type: stored.r#type.clone(),
+            role_arn: stored.role_arn.clone(),
+            created_at: stored.created_at,
+            updated_at: stored.updated_at,
+            tags: stored.tags.clone(),
+        })
     }
 }

@@ -29,7 +29,7 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use crate::schema_mapping_workflow_lifecycle::{
-    glue_table_arn, role_arn, string_member, Emulator, Reply,
+    assert_error_shape, glue_table_arn, role_arn, string_member, Emulator, Reply,
 };
 
 /// The message AWS returns for each path, as a literal here so this suite pins the
@@ -160,18 +160,9 @@ async fn create_referenced_schemas(emulator: &Emulator, case: &NameCase) -> Vec<
 }
 
 /// Assert `reply` is the modelled client failure `code` with `status` and carries
-/// exactly `message`.
+/// exactly `message`. The status/code half is the harness's shared assertion.
 fn assert_error(case: &str, reply: &Reply, status: u16, code: &str, message: &str) {
-    assert_eq!(
-        reply.status, status,
-        "case {case:?}: expected HTTP {status}, got {reply:?}"
-    );
-    assert_eq!(
-        reply.error_code.as_deref(),
-        Some(code),
-        "case {case:?}: expected {code}, got {:?}",
-        reply.error_code
-    );
+    assert_error_shape(case, reply, status, code);
     assert_eq!(
         string_member(&reply.body, "message"),
         message,

@@ -49,8 +49,9 @@ async fn get_id_mapping_workflow(emulator: &Emulator, workflow_name: &str) -> Re
 
 /// The values `IdMappingType` accepts on the wire, from
 /// `smithy_query(query="shape",shape="IdMappingType")`. Every entry is exercised by
-/// the table below.
-const ID_MAPPING_TYPES: &[&str] = &["PROVIDER", "RULE_BASED"];
+/// the table below. `pub(crate)` so the sibling ID-namespace suite spans the SAME
+/// catalog from this one declaration.
+pub(crate) const ID_MAPPING_TYPES: &[&str] = &["PROVIDER", "RULE_BASED"];
 
 /// The values `IdMappingWorkflowRuleDefinitionType` accepts on the wire, from
 /// `smithy_query(query="shape",shape="IdMappingRuleBasedProperties")`.
@@ -64,13 +65,15 @@ const ATTRIBUTE_MATCHING_MODELS: &[&str] = &["MANY_TO_MANY", "ONE_TO_ONE"];
 const RECORD_MATCHING_MODELS: &[&str] = &["ONE_SOURCE_TO_ONE_TARGET", "MANY_SOURCE_TO_ONE_TARGET"];
 
 /// The values `IdNamespaceType` accepts on `IdMappingWorkflowInputSource$type`, from
-/// `smithy_query(query="shape",shape="IdMappingWorkflowInputSource")`.
-const ID_NAMESPACE_TYPES: &[&str] = &["SOURCE", "TARGET"];
+/// `smithy_query(query="shape",shape="IdMappingWorkflowInputSource")`. `pub(crate)`
+/// so the sibling ID-namespace suite spans the SAME catalog from this one declaration.
+pub(crate) const ID_NAMESPACE_TYPES: &[&str] = &["SOURCE", "TARGET"];
 
 /// A `ProviderServiceArn`, which is modelled with an EMPTY account segment:
 /// `^arn:(aws|…):(entityresolution):(<region>)::providerservice/<provider>/<service>$`
-/// (`smithy_query(query="shape",shape="ProviderProperties")`).
-fn provider_service_arn(provider: &str, service: &str) -> String {
+/// (`smithy_query(query="shape",shape="ProviderProperties")`). `pub(crate)` so the
+/// sibling ID-namespace suite builds the same ARN from this one helper.
+pub(crate) fn provider_service_arn(provider: &str, service: &str) -> String {
     format!("arn:aws:entityresolution:{REGION}::providerservice/{provider}/{service}")
 }
 

@@ -2,10 +2,11 @@
 
 //! Engine state for the com-amazonaws-entityresolution-awsveniceservice service.
 //!
-//! Four control-plane collections are persisted here, and every member of each
+//! The control-plane collections are persisted here, and every member of each
 //! record is the MODELLED type of the member it is returned on, so a reader clones
 //! what the writer stored and the two cannot drift: `CreateSchemaMapping` followed by
-//! `GetSchemaMapping` returns the created record field-for-field.
+//! `GetSchemaMapping` returns the created record field-for-field, and so does
+//! `CreateIdNamespace` followed by `GetIdNamespace`.
 //!
 //! The provider-service collection — [`ProviderService`] — has no create API at all: a
 //! provider
@@ -34,11 +35,11 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     IdMappingIncrementalRunConfig, IdMappingTechniques, IdMappingWorkflowInputSource,
-    IdMappingWorkflowOutputSource, IncrementalRunConfig, InputSource, JobOutputSource,
-    OutputSource, ProviderComponentSchema, ProviderEndpointConfiguration,
-    ProviderIdNameSpaceConfiguration, ProviderIntermediateDataAccessConfiguration,
-    ProviderMarketplaceConfiguration, ProviderSchemaAttribute, ResolutionTechniques,
-    SchemaInputAttribute,
+    IdMappingWorkflowOutputSource, IdNamespaceIdMappingWorkflowProperties, IdNamespaceInputSource,
+    IncrementalRunConfig, InputSource, JobOutputSource, OutputSource, ProviderComponentSchema,
+    ProviderEndpointConfiguration, ProviderIdNameSpaceConfiguration,
+    ProviderIntermediateDataAccessConfiguration, ProviderMarketplaceConfiguration,
+    ProviderSchemaAttribute, ResolutionTechniques, SchemaInputAttribute,
 };
 
 /// One schema mapping as this service persists it.
@@ -72,6 +73,31 @@ pub struct MatchingWorkflow {
     pub resolution_techniques: ResolutionTechniques,
     pub incremental_run_config: Option<IncrementalRunConfig>,
     pub role_arn: String,
+    pub created_at: ::aws_smithy_types::DateTime,
+    pub updated_at: ::aws_smithy_types::DateTime,
+    pub tags: Option<HashMap<String, String>>,
+}
+
+/// One ID namespace as this service persists it.
+///
+/// Every optional member is `Option<..>` on both the create output and
+/// `GetIdNamespace`'s output, so what the create stored is exactly what a reader
+/// serves: a namespace created without a `roleArn` reads back without one, rather
+/// than with an invented value.
+#[derive(Debug, Clone)]
+pub struct IdNamespace {
+    /// The name the ID namespace is keyed by, as the caller supplied it.
+    pub id_namespace_name: String,
+    /// The ARN minted when the ID namespace was created.
+    pub id_namespace_arn: String,
+    pub description: Option<String>,
+    pub input_source_config: Option<Vec<IdNamespaceInputSource>>,
+    pub id_mapping_workflow_properties: Option<Vec<IdNamespaceIdMappingWorkflowProperties>>,
+    /// `IdNamespaceType`, one of `SOURCE` | `TARGET`
+    /// (`smithy_query(query="shape",shape="IdNamespaceType")`). The modelled enum is
+    /// refused at the boundary, so a stored value is always one of the two.
+    pub r#type: String,
+    pub role_arn: Option<String>,
     pub created_at: ::aws_smithy_types::DateTime,
     pub updated_at: ::aws_smithy_types::DateTime,
     pub tags: Option<HashMap<String, String>>,
@@ -334,6 +360,8 @@ pub struct ComAmazonawsEntityresolutionAwsveniceserviceState {
     pub schema_mappings: BTreeMap<String, SchemaMapping>,
     /// Every matching workflow that exists, keyed by `workflowName`.
     pub matching_workflows: BTreeMap<String, MatchingWorkflow>,
+    /// Every ID namespace that exists, keyed by `idNamespaceName`.
+    pub id_namespaces: BTreeMap<String, IdNamespace>,
     /// Every matching job that exists, keyed by its `jobId`, which is unique across
     /// workflows — the job's own `workflow_name` says which workflow it belongs to, so
     /// one map serves both the per-job read and the per-workflow listing.
@@ -358,6 +386,7 @@ impl Default for ComAmazonawsEntityresolutionAwsveniceserviceState {
         Self {
             schema_mappings: BTreeMap::new(),
             matching_workflows: BTreeMap::new(),
+            id_namespaces: BTreeMap::new(),
             matching_jobs: BTreeMap::new(),
             provider_services: provider_service_catalog(),
             id_mapping_workflows: BTreeMap::new(),
@@ -835,6 +864,20 @@ pub mod messages {
         format!("MatchingWorkflow {workflow_name} does not exist")
     }
 
+    /// `CreateIdNamespace`'s `ConflictException$message` (HTTP 400) when the
+    /// `idNamespaceName` is already taken — the refusal this operation's own doc
+    /// describes ("Each ID namespace must have a unique name"). Not itself recorded;
+    /// it is this operation's own constant, in the same form as the recorded
+    /// [`CREATE_SCHEMA_MAPPING_CONFLICT`] and spelled with the resource type the API
+    /// uses.
+    pub const CREATE_ID_NAMESPACE_CONFLICT: &str = "IdNamespace already exists.";
+
+    /// `GetIdNamespace`'s `ResourceNotFoundException$message` (HTTP 404). Not itself
+    /// recorded; this reader's own constant, in the same form as the recorded
+    /// [`GET_SCHEMA_MAPPING_NOT_FOUND`], and — like every other reader here — it does
+    /// NOT name the namespace that was asked for.
+    pub const GET_ID_NAMESPACE_NOT_FOUND: &str = "IdNamespace does not exist";
+
     /// `UpdateMatchingWorkflow`'s `ResourceNotFoundException$message` (HTTP 404) when
     /// no workflow carries the `workflowName` @httpLabel. Not itself recorded; it is
     /// this operation's own constant. `UpdateMatchingWorkflow` addresses the SAME
@@ -883,6 +926,19 @@ pub const MAX_MATCHING_WORKFLOWS: usize = 100;
 /// `ExceedsLimitException$quotaName`.
 pub const MATCHING_WORKFLOWS_QUOTA_NAME: &str = "Matching workflows";
 
+/// How many ID namespaces this emulator lets exist at once, past which
+/// `CreateIdNamespace` answers the modelled `ExceedsLimitException` (HTTP 402).
+///
+/// AWS Entity Resolution publishes an adjustable per-account, per-Region quota named
+/// "ID namespaces"; this is the default this emulator enforces for it. As with the
+/// other two bounds, deleting a namespace releases an entry, so the bound is
+/// self-healing and needs no TTL or eviction.
+pub const MAX_ID_NAMESPACES: usize = 100;
+
+/// The name of the quota [`MAX_ID_NAMESPACES`] enforces, reported on
+/// `ExceedsLimitException$quotaName`.
+pub const ID_NAMESPACES_QUOTA_NAME: &str = "ID namespaces";
+
 /// How many ID mapping workflows this emulator lets exist at once, past which
 /// `CreateIdMappingWorkflow` answers the modelled `ExceedsLimitException` (HTTP 402).
 ///
@@ -902,6 +958,38 @@ pub const ID_MAPPING_WORKFLOWS_QUOTA_NAME: &str = "ID mapping workflows";
 /// without a panic so a handler stays total.
 pub fn quota_value(maximum: usize) -> Option<i32> {
     i32::try_from(maximum).ok()
+}
+
+/// The resource-type segment every `IdNamespaceArn` carries
+/// (`arn:…:entityresolution:<region>:<account>:idnamespace/<name>`). Named here
+/// because the create mints an ARN with it and [`id_namespace_key`] matches one
+/// against it, so the two cannot drift.
+pub const ID_NAMESPACE_RESOURCE_PREFIX: &str = "idnamespace/";
+
+/// The `idNamespaceName` a request names, reduced to the key the store holds it
+/// under, or `None` when the value cannot name a namespace served for this request.
+///
+/// Every ID-namespace path member is an `EntityNameOrIdNamespaceArn`
+/// (`^[a-zA-Z_0-9-=+/]*$|^arn:(aws|aws-us-gov|aws-cn):entityresolution:<region>:<account>:idnamespace/[a-zA-Z_0-9-]{1,255}$`,
+/// `smithy_query(query="shape",shape="EntityNameOrIdNamespaceArn")`), so a caller may
+/// name a namespace either by its name or by the ARN the create minted. A name is the
+/// key itself; an ARN names a namespace only when it is EXACTLY the ARN this service
+/// mints for that name while serving this request, so one differing in its partition,
+/// service, account or region segment names NOTHING here rather than resolving to the
+/// local record of the same name. (The store is keyed by name, not by region, so this
+/// scopes an ARN against the request it arrived on; it is not isolation between
+/// regions, which this emulator does not model.)
+pub fn id_namespace_key<'a>(name_or_arn: &'a str, region: &str) -> Option<&'a str> {
+    if !name_or_arn.starts_with("arn:") {
+        return Some(name_or_arn);
+    }
+    let (_, name) = name_or_arn.rsplit_once(ID_NAMESPACE_RESOURCE_PREFIX)?;
+    let minted = ::emulator_server::emulator_arn(
+        "entityresolution",
+        region,
+        &format!("{ID_NAMESPACE_RESOURCE_PREFIX}{name}"),
+    );
+    (name_or_arn == minted).then_some(name)
 }
 
 /// The `ResolutionType` for which matching workflows have no incremental processing.
