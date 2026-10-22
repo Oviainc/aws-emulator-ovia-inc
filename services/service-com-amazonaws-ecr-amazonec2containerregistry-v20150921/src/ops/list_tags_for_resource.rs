@@ -4,8 +4,8 @@
 //!
 //! Reports the tags persisted on the resource `resourceArn` names. The resource is a
 //! repository ([`crate::state::repository_name_from_arn`]), and the tags are exactly
-//! the ones `CreateRepository` (and, once implemented, `TagResource`) stored on it:
-//! nothing here is derived from the request. A read, so it writes nothing.
+//! the ones `CreateRepository`, `TagResource` and `UntagResource` left on it: nothing
+//! here is derived from the request. A read, so it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -112,7 +112,8 @@ fn fault_error(fault: crate::state::Fault) -> ListTagsForResourceErrorModeled {
                 RepositoryNotFoundException { message },
             )
         }
-        // `ImageNotFound` cannot arise here: this operation reads no image.
+        // `ImageNotFound` and the tag faults cannot arise here: this operation reads no
+        // image and validates no tag.
         _ => ListTagsForResourceErrorModeled::InvalidParameterException(
             InvalidParameterException { message },
         ),

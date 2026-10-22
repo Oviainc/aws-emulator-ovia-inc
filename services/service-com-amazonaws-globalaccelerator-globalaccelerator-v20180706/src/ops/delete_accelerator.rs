@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAccelerator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAccelerator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAccelerator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the accelerator from [`crate::state`], after enforcing the two preconditions
+//! the model declares as errors: it must be disabled (`AcceleratorNotDisabledException`)
+//! and it must have no listener left (`AssociatedListenerFoundException`). After a
+//! successful delete a `DescribeAccelerator` answers `AcceleratorNotFoundException` and
+//! `ListAccelerators` no longer lists it.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +175,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAccelerator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAcceleratorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAccelerator"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteAcceleratorErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Global Accelerator store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let Some(record) = store.accelerators.get(&input.accelerator_arn) else {
+            return Err(DeleteAcceleratorErrorModeled::AcceleratorNotFoundException(
+                AcceleratorNotFoundException {
+                    message: Some(format!(
+                        "accelerator {} not found",
+                        input.accelerator_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "If the value is set to true, an accelerator cannot be deleted. If set to
+        // false, the accelerator can be deleted." (`Accelerator$Enabled`.)
+        if record.enabled {
+            return Err(DeleteAcceleratorErrorModeled::AcceleratorNotDisabledException(
+                AcceleratorNotDisabledException {
+                    message: Some(
+                        "the accelerator must be disabled before it can be deleted".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        if !record.listener_arns.is_empty() {
+            return Err(
+                DeleteAcceleratorErrorModeled::AssociatedListenerFoundException(
+                    AssociatedListenerFoundException {
+                        message: Some(
+                            "the accelerator still has associated listeners; delete them first"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store.accelerators.remove(&input.accelerator_arn);
+        store.accelerator_attributes.remove(&input.accelerator_arn);
+        // The idempotency record this accelerator's token minted is released with it,
+        // so a caller looping create/delete reclaims that memory too.
+        store.prune_idempotency();
+
+        Ok(DeleteAcceleratorOutput)
     }
 }

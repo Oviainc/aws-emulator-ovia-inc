@@ -21,6 +21,12 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `application/vnd.amazon.eventstream` frame encode/decode: this service's four
+# `Start*` operations carry a `@streaming` event-stream in BOTH directions.
+aws-smithy-eventstream = "0.60"
+# SessionId / RequestId minting (v4 UUIDs, the format `SessionId`'s `@pattern`
+# requires).
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

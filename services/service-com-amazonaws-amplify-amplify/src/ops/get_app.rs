@@ -140,7 +140,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // A pure read: the app record is returned exactly as `CreateApp` persisted it.
+        // A pure read: the app record is returned exactly as `CreateApp` persisted it,
+        // projected the way a read reports it.
         let store = state.lock();
         let app = store
             .apps
@@ -155,6 +156,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
 
-        Ok(GetAppOutput { app })
+        Ok(GetAppOutput {
+            app: AppProjection::reported(app),
+        })
     }
 }

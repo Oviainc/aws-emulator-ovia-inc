@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the jobs this service's store holds for one farm's queue, a page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +152,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListJobs"))
+        // A report: the only writes it makes are the lifecycle transitions the clock
+        // already made due on the jobs it reports.
+        let _ = ctx;
+        // `principalId` asks for the jobs one Identity Center principal is a member of.
+        // Job memberships are not persisted yet (AssociateMemberToJob / ListJobMembers are
+        // still scaffolded), so that filter cannot be answered from state.
+        if input.principal_id.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListJobs with a principalId filter (job memberships are not persisted yet)",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListJobsErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        if store.farm(&input.farm_id).is_none() {
+            return Err(ListJobsErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        let Some(queue) = store.queue(&input.farm_id, &input.queue_id) else {
+            return Err(ListJobsErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+            )
+            .into());
+        };
+
+        // Oldest first, with the id breaking a tie, so paging over the list is stable.
+        let mut ordered: Vec<(::std::time::SystemTime, String)> = queue
+            .jobs
+            .values()
+            .map(|job| (job.created_at, job.job_id.clone()))
+            .collect();
+        ordered.sort();
+        let ids: Vec<String> = ordered.into_iter().map(|(_, job_id)| job_id).collect();
+
+        let (page, next_token) =
+            crate::state::page_keys(&ids, input.next_token.as_deref(), input.max_results).map_err(
+                |message| {
+                    ListJobsError::from(ListJobsErrorModeled::ValidationException(
+                        crate::state::field_validation_failed("nextToken", &message),
+                    ))
+                },
+            )?;
+
+        let mut jobs = Vec::with_capacity(page.len());
+        for job_id in &page {
+            let Some(job) = store.settled_job(&input.farm_id, &input.queue_id, job_id) else {
+                continue;
+            };
+            jobs.push(JobSummary {
+                job_id: job.job_id.clone(),
+                name: job.name.clone(),
+                lifecycle_status: job.lifecycle_status.clone(),
+                lifecycle_status_message: job.lifecycle_status_message.clone(),
+                priority: job.priority,
+                created_at: crate::state::timestamp(job.created_at),
+                created_by: job.created_by.clone(),
+                updated_at: job.updated_at.map(crate::state::timestamp),
+                updated_by: job.updated_by.clone(),
+                started_at: job.started_at.map(crate::state::timestamp),
+                ended_at: job.ended_at.map(crate::state::timestamp),
+                // This slice persists no steps or tasks, so there is no task run status to
+                // aggregate; see the same note in `get_job`.
+                task_run_status: None,
+                target_task_run_status: Some(job.target_task_run_status.clone()),
+                task_run_status_counts: None,
+                task_failure_retry_count: None,
+                max_failed_tasks_count: Some(job.max_failed_tasks_count),
+                max_retries_per_task: Some(job.max_retries_per_task),
+                max_worker_count: job.max_worker_count,
+                source_job_id: job.source_job_id.clone(),
+            });
+        }
+
+        Ok(ListJobsOutput { jobs, next_token })
     }
 }

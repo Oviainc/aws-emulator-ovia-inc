@@ -14,11 +14,17 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 
+pub mod event_stream;
 pub mod get_medical_scribe_stream_types;
 pub mod shared_types;
+pub mod streaming_types;
 
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use event_stream::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_medical_scribe_stream_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use shared_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use streaming_types::*;
 

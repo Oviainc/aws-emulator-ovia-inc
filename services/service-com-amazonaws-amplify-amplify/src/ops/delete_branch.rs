@@ -168,6 +168,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `DeleteBranchResult$branch` is @required: the record as it existed at delete
         // time, which is the copy just taken out of state.
-        Ok(DeleteBranchOutput { branch: removed })
+        Ok(DeleteBranchOutput {
+            branch: BranchProjection::written(removed),
+        })
     }
 }

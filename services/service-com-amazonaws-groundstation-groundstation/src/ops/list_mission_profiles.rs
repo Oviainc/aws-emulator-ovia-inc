@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMissionProfiles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMissionProfiles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMissionProfiles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -143,20 +134,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMissionProfiles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMissionProfilesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMissionProfiles"))
+        /// Names this listing inside its pagination tokens, so a token another listing
+        /// issued is not accepted here.
+        const LISTING: &str = "missionprofiles";
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListMissionProfilesErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // A page boundary is only stable over a stable order, so the listing is ordered
+        // by mission profile id rather than by the map's own iteration order.
+        let guard = state.lock();
+        let mut ids: Vec<&String> = guard.mission_profiles.keys().collect();
+        ids.sort();
+        let items: Vec<MissionProfileListItem> = ids
+            .into_iter()
+            .filter_map(|id| guard.mission_profiles.get(id))
+            .map(|profile| MissionProfileListItem {
+                mission_profile_id: Some(profile.mission_profile_id.clone()),
+                mission_profile_arn: Some(profile.mission_profile_arn.clone()),
+                region: Some(profile.region.clone()),
+                name: Some(profile.name.clone()),
+            })
+            .collect();
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_page_token(LISTING, token).ok_or_else(|| {
+                ListMissionProfilesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            "nextToken was not issued by a previous ListMissionProfiles call"
+                                .to_string(),
+                        ),
+                        parameter_name: Some("nextToken".to_string()),
+                    },
+                )
+            })?,
+        };
+        let (page, next_token) = crate::state::paginate(LISTING, &items, input.max_results, offset);
+
+        Ok(ListMissionProfilesOutput {
+            next_token,
+            mission_profile_list: Some(page),
+        })
     }
 }

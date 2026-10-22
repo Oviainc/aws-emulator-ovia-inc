@@ -137,7 +137,10 @@ fn fault_error(fault: crate::state::Fault) -> PutImageScanningConfigurationError
                 RepositoryNotFoundException { message },
             )
         }
-        crate::state::Fault::InvalidParameter(_) | crate::state::Fault::ImageNotFound(_) => {
+        crate::state::Fault::InvalidParameter(_)
+        | crate::state::Fault::ImageNotFound(_)
+        | crate::state::Fault::InvalidTagParameter(_)
+        | crate::state::Fault::TooManyTags(_) => {
             PutImageScanningConfigurationErrorModeled::InvalidParameterException(
                 InvalidParameterException { message },
             )

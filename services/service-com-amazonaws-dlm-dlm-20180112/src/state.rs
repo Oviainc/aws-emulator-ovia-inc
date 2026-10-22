@@ -65,6 +65,88 @@ pub const DEFAULT_COPY_TAGS: bool = false;
 /// false."
 pub const DEFAULT_EXTEND_DELETION: bool = false;
 
+/// The error code Amazon Data Lifecycle Manager answers when the caller may not
+/// pass the `ExecutionRoleArn` it named.
+///
+/// It is not one of the errors the model lists for the operations that take an
+/// `ExecutionRoleArn` (those are `InternalServerException`,
+/// `InvalidRequestException`, `LimitExceededException` and, for the update,
+/// `ResourceNotFoundException`): the `iam:PassRole` authorization runs in the
+/// front door, ahead of the operation, so its denial is the generic AWS
+/// authorization failure rather than a modelled operation error.
+pub const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
+
+/// The HTTP status an AWS `AccessDeniedException` carries: the request was
+/// authenticated and then refused by authorization.
+pub const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The denial for an `ExecutionRoleArn` that names another account's IAM
+/// principal: Amazon Data Lifecycle Manager can only pass a role of the account
+/// the request is made in.
+pub const CROSS_ACCOUNT_PASS_ROLE_DENIED: &str = "Cross-account pass role is not allowed.";
+
+/// Why passing `execution_role_arn` is denied, or `None` when the caller may
+/// pass it.
+///
+/// Amazon Data Lifecycle Manager assumes the role the request names, so every
+/// operation that takes an `ExecutionRoleArn` first authorizes `iam:PassRole`
+/// for it. That authorization is about the role the ARN DENOTES, so it can only
+/// be asked of a value that denotes an IAM principal at all: an
+/// `ExecutionRoleArn` that is not a well-formed IAM ARN is left to the member's
+/// own `@pattern`, which refuses it as a malformed request instead.
+///
+/// Of the IAM ARNs, two cannot be passed: one in another account (Amazon Data
+/// Lifecycle Manager has no cross-account trust), and one that does not denote
+/// a role (a user, a group, an instance profile — `iam:PassRole` has no role to
+/// grant). The account is checked first, which is the order AWS answers in for
+/// an ARN that is both.
+pub fn pass_role_denial(execution_role_arn: &str) -> Option<String> {
+    let (account, resource) = iam_arn_parts(execution_role_arn)?;
+    if account != ::engine::emulator_account_id() {
+        return Some(CROSS_ACCOUNT_PASS_ROLE_DENIED.to_string());
+    }
+    let names_a_role = resource
+        .strip_prefix("role/")
+        .is_some_and(|name| !name.is_empty());
+    if names_a_role {
+        return None;
+    }
+    Some(format!(
+        "The role {execution_role_arn} cannot be passed: it does not identify an IAM role."
+    ))
+}
+
+/// The account id and the resource portion of `arn`, when `arn` is a well-formed
+/// IAM ARN — `arn:<partition>:iam::<account>:<resource>`.
+///
+/// IAM is a global service, so an IAM ARN names an empty region; the partition
+/// is the `aws(-[a-z]{1,3}){0,2}` family the `ExecutionRoleArn` `@pattern` also
+/// spells, and the account is digits. Anything else is not an ARN this service
+/// can resolve a principal from.
+fn iam_arn_parts(arn: &str) -> Option<(&str, &str)> {
+    // The resource portion may itself contain `:`, so it takes the remainder.
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    let partition = fields.next()?;
+    if partition != "aws" && !partition.starts_with("aws-") {
+        return None;
+    }
+    if fields.next()? != "iam" {
+        return None;
+    }
+    if !fields.next()?.is_empty() {
+        return None;
+    }
+    let account = fields.next()?;
+    if account.is_empty() || !account.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let resource = fields.next()?;
+    Some((account, resource))
+}
+
 /// How many policies the store holds before `CreateLifecyclePolicy` refuses with
 /// the modelled `LimitExceededException`.
 ///

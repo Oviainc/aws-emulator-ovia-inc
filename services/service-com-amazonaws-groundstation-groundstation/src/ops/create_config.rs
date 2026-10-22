@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +142,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfig"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateConfigErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // The config's type is not a request member: it is whichever member of the
+        // `ConfigTypeData` union the caller set.
+        let config_type = crate::state::config_type_of(&input.config_data).to_string();
+        let config_id = crate::state::new_uuid();
+        let config_arn = ::engine::emulator_arn(
+            crate::state::ARN_SERVICE,
+            &crate::state::request_region(ctx.parts()),
+            &format!("config/{config_type}/{config_id}"),
+        );
+
+        let stored = crate::state::Config {
+            config_id: config_id.clone(),
+            config_arn: config_arn.clone(),
+            name: input.name,
+            config_type: config_type.clone(),
+            config_data: input.config_data,
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        let mut guard = state.lock();
+
+        // An `uplinkEchoConfig` echoes a specific ANTENNA UPLINK config, named by ARN:
+        // like every ARN-valued reference it must resolve to a config that exists, and
+        // the config it names must be of the type the member is for — the member's own
+        // name and the `antenna-uplink` segment of a `ConfigArn` are what say so.
+        // Checked before the store bound below, so what the caller hears is what is
+        // wrong with the request.
+        if let ConfigTypeData::uplinkEchoConfig(echo) = &stored.config_data {
+            let echoed = guard.config_by_arn(&echo.antenna_uplink_config_arn);
+            if echoed.is_none_or(|config| config.config_type != "antenna-uplink") {
+                return Err(CreateConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No antenna-uplink config exists with ARN {}",
+                            echo.antenna_uplink_config_arn
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The store this emulator keeps is bounded, so a caller cannot grow it without
+        // limit; past the bound a create is refused the way the service refuses one
+        // that runs past an account limit.
+        if guard.configs.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(CreateConfigErrorModeled::ResourceLimitExceededException(
+                ResourceLimitExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} configs",
+                        crate::state::MAX_RECORDS_PER_STORE
+                    )),
+                    parameter_name: None,
+                },
+            )
+            .into());
+        }
+
+        guard.arn_index.insert(
+            config_arn.clone(),
+            crate::state::ResourceRef::Config {
+                config_type: config_type.clone(),
+                config_id: config_id.clone(),
+            },
+        );
+        guard
+            .configs
+            .insert((config_type.clone(), config_id.clone()), stored);
+
+        Ok(CreateConfigOutput {
+            config_id: Some(config_id),
+            config_type: Some(config_type),
+            config_arn: Some(config_arn),
+        })
     }
 }

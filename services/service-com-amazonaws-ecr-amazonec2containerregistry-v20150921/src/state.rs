@@ -92,6 +92,13 @@ pub const MAX_TAG_KEY_LEN: usize = 128;
 /// See [`MAX_TAG_KEY_LEN`].
 pub const MAX_TAG_VALUE_LEN: usize = 256;
 
+/// The tag-key namespace AWS keeps for itself: "the `aws:` prefix is reserved for AWS
+/// use [...] you can't edit or delete a tag key or value with this prefix" (AWS General
+/// Reference, "Tagging AWS resources"). A request that tries to create or remove a key
+/// in it is refused rather than stored, so no caller-supplied tag can ever impersonate
+/// one AWS set.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
 /// The region an unsigned request is served in: a request that carries no SigV4
 /// credential scope names no region, and ECR's ARNs and repository URIs are regional.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -107,13 +114,22 @@ pub enum Fault {
     InvalidParameter(String),
     /// An `imageIds` entry matches no stored image — `ImageNotFoundException`.
     ImageNotFound(String),
+    /// A tag key or value is longer than a tag may be — `InvalidTagParameterException`.
+    InvalidTagParameter(String),
+    /// The resource would end up carrying more tags than one may hold —
+    /// `TooManyTagsException`.
+    TooManyTags(String),
 }
 
 impl Fault {
     /// The message this failure renders with.
     pub fn message(&self) -> &str {
         match self {
-            Self::RepositoryNotFound(m) | Self::InvalidParameter(m) | Self::ImageNotFound(m) => m,
+            Self::RepositoryNotFound(m)
+            | Self::InvalidParameter(m)
+            | Self::ImageNotFound(m)
+            | Self::InvalidTagParameter(m)
+            | Self::TooManyTags(m) => m,
         }
     }
 }
@@ -266,6 +282,26 @@ impl Repo {
     /// The digest `tag` currently points at.
     pub fn digest_of_tag(&self, tag: &str) -> Option<&String> {
         self.tag_index.get(tag)
+    }
+
+    /// Apply `incoming` to this repository's metadata tags: a key the repository already
+    /// carries takes the new value where it stands, a key it does not carry is appended.
+    /// "Existing tags on a resource are not changed if they are not specified in the
+    /// request parameters" (`TagResource`), so nothing else is touched.
+    pub fn merge_tags(&mut self, incoming: Vec<Tag>) {
+        for tag in incoming {
+            match self.tags.iter_mut().find(|held| held.key == tag.key) {
+                Some(held) => held.value = tag.value,
+                None => self.tags.push(tag),
+            }
+        }
+    }
+
+    /// Remove every metadata tag whose key `keys` names. A key the repository does not
+    /// carry removes nothing: `UntagResource` names the keys to be removed, not an
+    /// assertion that they are held.
+    pub fn remove_tag_keys(&mut self, keys: &[String]) {
+        self.tags.retain(|held| !keys.contains(&held.key));
     }
 
     /// Attach `tag` to `digest`, detaching it from whatever held it before, so the tag
@@ -582,6 +618,70 @@ pub fn repository_name_from_arn(arn: &str) -> Result<String, Fault> {
         )));
     }
     Ok(name.to_string())
+}
+
+/// Refuse a tag key no caller may create or remove: one in AWS's reserved namespace, or
+/// one longer than a tag key may be.
+fn check_tag_key(key: &str) -> Result<(), Fault> {
+    if key.starts_with(RESERVED_TAG_KEY_PREFIX) {
+        return Err(Fault::InvalidParameter(format!(
+            "tag key '{key}' is reserved: keys beginning with \
+             '{RESERVED_TAG_KEY_PREFIX}' are for Amazon Web Services use and cannot be \
+             created or removed by a caller"
+        )));
+    }
+    let key_len = key.chars().count();
+    if key_len > MAX_TAG_KEY_LEN {
+        return Err(Fault::InvalidTagParameter(format!(
+            "tag key '{key}' is {key_len} characters; a tag key can have a maximum \
+             character length of {MAX_TAG_KEY_LEN}"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a `tags` list a resource may not be given, whatever it already carries: an
+/// unusable key (see [`check_tag_key`]) or an over-long value.
+pub fn check_tags(incoming: &[Tag]) -> Result<(), Fault> {
+    for tag in incoming {
+        check_tag_key(&tag.key)?;
+        let value_len = tag.value.chars().count();
+        if value_len > MAX_TAG_VALUE_LEN {
+            return Err(Fault::InvalidTagParameter(format!(
+                "the value of tag key '{}' is {value_len} characters; a tag value can \
+                 have a maximum length of {MAX_TAG_VALUE_LEN}",
+                tag.key
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a `tagKeys` list a caller may not name (see [`check_tag_key`]).
+pub fn check_tag_keys(keys: &[String]) -> Result<(), Fault> {
+    for key in keys {
+        check_tag_key(key)?;
+    }
+    Ok(())
+}
+
+/// Refuse an `incoming` list that would leave a resource already carrying `existing`
+/// over the tag limit. A tag is identified by its key, so a key already held is
+/// replaced rather than added and does not count twice.
+pub fn check_tag_count(existing: &[Tag], incoming: &[Tag]) -> Result<(), Fault> {
+    let total = existing
+        .iter()
+        .chain(incoming)
+        .map(|tag| tag.key.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    if total > MAX_TAGS {
+        return Err(Fault::TooManyTags(format!(
+            "the request would leave {total} tags on the resource; the maximum number \
+             of tags that can be applied to a repository is {MAX_TAGS}"
+        )));
+    }
+    Ok(())
 }
 
 /// The content digest of an image manifest: `sha256:<hex>` over the manifest bytes,

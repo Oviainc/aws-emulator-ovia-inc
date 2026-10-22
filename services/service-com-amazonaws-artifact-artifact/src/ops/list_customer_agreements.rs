@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCustomerAgreements
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCustomerAgreements`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Enumerates the calling account's customer-agreements in [`crate::state`] as
+//! `CustomerAgreementSummary`, in ascending customer-agreement-id order. The model
+//! documents the operation as "List active customer-agreements applicable to calling
+//! identity", so only an agreement in `CustomerAgreementState`'s `ACTIVE` state is
+//! reported: a terminated one stays in the store and out of the answer.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCustomerAgreements::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `@paginated(items: customerAgreements)`, so a page is cut at `maxResults` and
+//! `nextToken` carries the id the next page resumes at. `@readonly`: this handler only
+//! READS — the API has no operation that creates, accepts or terminates a
+//! customer-agreement, so the set is built by the state's `Default`.
+//!
+//! The emulator models no IAM, so the modelled `AccessDeniedException` is never raised
+//! here: every caller the emulator's signature check admits sees the account's
+//! agreements, and a pass here is not a statement about an AWS-side authorisation
+//! decision.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +154,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCustomerAgreements` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCustomerAgreementsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCustomerAgreements"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListCustomerAgreementsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the artifact customer-agreement store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // The token is the customer-agreement id the next page starts at, so anything
+        // that is not one was never issued by this operation.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_customer_agreement_id(token) {
+                return Err(ListCustomerAgreementsErrorModeled::ValidationException(
+                    crate::state::invalid_token(
+                        "nextToken is not a token returned by ListCustomerAgreements",
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let page_size = crate::state::page_size(input.max_results);
+
+        let store = state.lock();
+        let mut customer_agreements = Vec::new();
+        let mut next_token = None;
+        for (id, agreement) in &store.customer_agreements {
+            // Resume at the first id at or after the token, so a page is still served
+            // when the agreement the token named left the set meanwhile.
+            if input
+                .next_token
+                .as_deref()
+                .is_some_and(|token| id.as_str() < token)
+            {
+                continue;
+            }
+            // "List active customer-agreements applicable to calling identity": a
+            // terminated agreement is persisted but not reported. Filtering BEFORE the
+            // page-size check is what keeps a `nextToken` pointing at an agreement the
+            // next page will actually report.
+            if !agreement.is_active() {
+                continue;
+            }
+            if customer_agreements.len() >= page_size {
+                next_token = Some(id.clone());
+                break;
+            }
+            customer_agreements.push(agreement.to_summary(&region));
+        }
+
+        Ok(ListCustomerAgreementsOutput {
+            customer_agreements,
+            next_token,
+        })
     }
 }

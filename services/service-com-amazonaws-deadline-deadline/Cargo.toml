@@ -21,13 +21,18 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Mints the 32-hex-character resource ids the farm/queue/job label patterns require.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# `time` on top of the workspace features, for the one TEST that has to let the clock pass
+# a job's CREATE_IN_PROGRESS -> CREATE_COMPLETE due instant without blocking the runtime.
+# A dev-dependency, so the service's own build keeps the workspace feature set.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true
