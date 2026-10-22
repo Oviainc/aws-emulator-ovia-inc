@@ -39,7 +39,26 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! One of those seams is taken here: `override_operation` refuses a request whose Query
+//! envelope asks for an API version this service does not serve — see [`api_version`].
+//! The framework's `awsQuery` routing key reads the `Action` field alone, so without it a
+//! request for `Version=2099-01-01` would be served as though it had asked for
+//! `2014-10-31`.
+//!
+//! `can_handle` keeps the generated `rds` key. THREE mounted models resolve to it — this
+//! one, the Amazon DocumentDB view and the Amazon Neptune view — because all three
+//! publish one and the same wire identity (service shape `AmazonRDSv19`, version
+//! `2014-10-31`, `awsQuery`, endpointPrefix `rds`, sigv4 name `rds`, xmlNamespace
+//! `http://rds.amazonaws.com/doc/2014-10-31/`), differing only in `sdkId`; the shared key
+//! is this service's own identity, and the two subset models (DocumentDB's 55 and
+//! Neptune's 70 operations are each a strict subset of this model's 168) claim their own
+//! routing keys instead. That is also what AWS does: one RDS Query front door serves all
+//! three control planes, which is why their models share its endpoint prefix.
 
+pub mod api_version;
+
+use api_version::UnsupportedApiVersionOperation;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
@@ -52,6 +71,9 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The refusal served for a Query envelope naming another API version. Held in a
+    /// field, built once, because `override_operation` hands back a reference to it.
+    unsupported_api_version: UnsupportedApiVersionOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +83,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            unsupported_api_version: UnsupportedApiVersionOperation,
         }
     }
 }
@@ -101,12 +124,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // The ONE routing decision the model's key cannot make: an `awsQuery` envelope
+        // names an action AND the API version it is asked for, and the framework's
+        // routing key reads only the action. A request naming a version this service
+        // does not serve is refused here rather than served as if it had named this
+        // one; everything else is declined (`None`) and resolved by the generated
+        // routing table.
+        if api_version::serves_requested_version(req) {
+            return None;
+        }
+        Some(&self.unsupported_api_version)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

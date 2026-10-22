@@ -19,5 +19,7 @@ mod db_instances;
 mod option_groups;
 #[path = "all/orderable_db_instance_options.rs"]
 mod orderable_db_instance_options;
+#[path = "all/query_catalog_reads.rs"]
+mod query_catalog_reads;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
