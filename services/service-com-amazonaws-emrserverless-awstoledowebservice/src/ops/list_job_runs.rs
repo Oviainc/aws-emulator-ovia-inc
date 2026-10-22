@@ -189,10 +189,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .settled_mut(&input.application_id, now)
             .ok_or_else(|| {
                 ListJobRunsErrorModeled::ValidationException(ValidationException {
-                    message: format!(
-                        "Member must name an existing application: applicationId {}",
-                        input.application_id
-                    ),
+                    message: "Member must name an existing application: applicationId"
+                        .to_string(),
                 })
             })?;
 

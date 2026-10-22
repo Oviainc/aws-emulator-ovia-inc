@@ -498,18 +498,33 @@ pub fn decode_page_token(token: &str) -> Option<String> {
     is_resource_id(&id).then_some(id)
 }
 
+/// What a `ResourceNotFoundException` says when the application a request names does
+/// not exist.
+///
+/// EMR Serverless states a not-found refusal as the fixed phrase for the RESOURCE CLASS
+/// that was not found, naming no identifier: the same sentence comes back whichever
+/// operation refused and whatever id was asked for. Recorded responses show it on both
+/// an application report and a job submission, so the phrase belongs to the resource,
+/// not to the operation — hence one constant every handler shares.
+pub const APPLICATION_NOT_FOUND_MESSAGE: &str = "Application does not exist";
+
+/// The same, for the job run (or job run attempt) a request names.
+pub const JOB_RUN_NOT_FOUND_MESSAGE: &str = "Job Run with given ID doesn't exist";
+
 /// The `ResourceNotFoundException` payload for an application id that names none.
-pub fn application_not_found(application_id: &str) -> ResourceNotFoundException {
+///
+/// Takes no argument on purpose: the message states the resource class, so there is no
+/// way for a caller's id to reach the error body through here.
+pub fn application_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("Application {application_id} does not exist"),
+        message: APPLICATION_NOT_FOUND_MESSAGE.to_string(),
     }
 }
 
-/// The `ResourceNotFoundException` payload for a job run id that names none in the
-/// given application.
-pub fn job_run_not_found(application_id: &str, job_run_id: &str) -> ResourceNotFoundException {
+/// The `ResourceNotFoundException` payload for a job run id that names none.
+pub fn job_run_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("Job run {job_run_id} does not exist in application {application_id}"),
+        message: JOB_RUN_NOT_FOUND_MESSAGE.to_string(),
     }
 }
 

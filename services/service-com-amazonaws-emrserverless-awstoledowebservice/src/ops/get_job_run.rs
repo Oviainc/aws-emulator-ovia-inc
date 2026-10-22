@@ -155,28 +155,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .settled_mut(&input.application_id, now)
             .ok_or_else(|| {
                 GetJobRunErrorModeled::ResourceNotFoundException(
-                    crate::state::application_not_found(&input.application_id),
+                    crate::state::application_not_found(),
                 )
             })?;
         let job_run = record.job_runs.get(&input.job_run_id).ok_or_else(|| {
-            GetJobRunErrorModeled::ResourceNotFoundException(crate::state::job_run_not_found(
-                &input.application_id,
-                &input.job_run_id,
-            ))
+            GetJobRunErrorModeled::ResourceNotFoundException(crate::state::job_run_not_found())
         })?;
 
         // `attempt` selects one attempt of the job run. Only an application's own retry
         // policy creates a second attempt, and nothing here retries, so a job run has
-        // exactly the one attempt this record holds; any other number names none.
+        // exactly the one attempt this record holds; any other number names none — the
+        // same not-found refusal as an unknown job run, stated the same way.
         if let Some(requested) = input.attempt {
             if Some(requested) != job_run.job_run.attempt {
                 return Err(GetJobRunErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "Attempt {requested} of job run {} does not exist",
-                            input.job_run_id
-                        ),
-                    },
+                    crate::state::job_run_not_found(),
                 )
                 .into());
             }

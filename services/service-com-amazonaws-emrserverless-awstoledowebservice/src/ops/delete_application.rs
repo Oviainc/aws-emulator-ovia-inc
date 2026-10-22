@@ -145,7 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .settled_mut(&input.application_id, now)
             .ok_or_else(|| {
                 DeleteApplicationErrorModeled::ResourceNotFoundException(
-                    crate::state::application_not_found(&input.application_id),
+                    crate::state::application_not_found(),
                 )
             })?;
 
@@ -156,9 +156,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteApplicationErrorModeled::ValidationException(
                 ValidationException {
                     message: format!(
-                        "Application {} is in {application_state} state; an application has to \
-                         be in CREATED or STOPPED state in order to be deleted",
-                        input.application_id
+                        "Application is in {application_state} state; an application has to \
+                         be in CREATED or STOPPED state in order to be deleted"
                     ),
                 },
             )

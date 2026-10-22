@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .settled_mut(&input.application_id, now)
             .ok_or_else(|| {
                 GetApplicationErrorModeled::ResourceNotFoundException(
-                    crate::state::application_not_found(&input.application_id),
+                    crate::state::application_not_found(),
                 )
             })?;
 

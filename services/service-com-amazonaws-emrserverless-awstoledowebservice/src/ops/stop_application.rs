@@ -145,7 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .settled_mut(&input.application_id, now)
             .ok_or_else(|| {
                 StopApplicationErrorModeled::ResourceNotFoundException(
-                    crate::state::application_not_found(&input.application_id),
+                    crate::state::application_not_found(),
                 )
             })?;
 
@@ -156,10 +156,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "TERMINATED" => {
                 return Err(StopApplicationErrorModeled::ValidationException(
                     ValidationException {
-                        message: format!(
-                            "Application {} is in TERMINATED state and cannot be stopped",
-                            input.application_id
-                        ),
+                        message: "Application is in TERMINATED state and cannot be stopped"
+                            .to_string(),
                     },
                 )
                 .into())
@@ -175,8 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(StopApplicationErrorModeled::ValidationException(
                 ValidationException {
                     message: format!(
-                        "Application {} has job runs that are not completed or cancelled: {}",
-                        input.application_id,
+                        "Application has job runs that are not completed or cancelled: {}",
                         unfinished.join(", ")
                     ),
                 },

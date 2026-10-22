@@ -155,14 +155,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .settled_mut(&input.application_id, now)
             .ok_or_else(|| {
                 CancelJobRunErrorModeled::ResourceNotFoundException(
-                    crate::state::application_not_found(&input.application_id),
+                    crate::state::application_not_found(),
                 )
             })?;
         let job_run = record.job_runs.get_mut(&input.job_run_id).ok_or_else(|| {
-            CancelJobRunErrorModeled::ResourceNotFoundException(crate::state::job_run_not_found(
-                &input.application_id,
-                &input.job_run_id,
-            ))
+            CancelJobRunErrorModeled::ResourceNotFoundException(
+                crate::state::job_run_not_found(),
+            )
         })?;
 
         // A job run that has already finished cannot be cancelled; there is nothing
@@ -170,8 +169,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::is_terminal_job_run_state(&job_run.job_run.state) {
             return Err(CancelJobRunErrorModeled::ValidationException(ValidationException {
                 message: format!(
-                    "Job run {} is in {} state and cannot be cancelled",
-                    input.job_run_id, job_run.job_run.state
+                    "Job run is in {} state and cannot be cancelled",
+                    job_run.job_run.state
                 ),
             })
             .into());

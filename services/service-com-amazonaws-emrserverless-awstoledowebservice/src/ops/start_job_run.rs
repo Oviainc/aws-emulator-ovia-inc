@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .settled_mut(&input.application_id, now)
             .ok_or_else(|| {
                 StartJobRunErrorModeled::ResourceNotFoundException(
-                    crate::state::application_not_found(&input.application_id),
+                    crate::state::application_not_found(),
                 )
             })?;
 
@@ -215,9 +215,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(StartJobRunErrorModeled::ValidationException(
                     ValidationException {
                         message: format!(
-                            "Application {} is in {} state and does not start automatically on \
+                            "Application is in {} state and does not start automatically on \
                              job submission; call StartApplication first",
-                            input.application_id, record.application.state
+                            record.application.state
                         ),
                     },
                 )
@@ -240,8 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if record.job_runs.len() >= crate::state::MAX_JOB_RUNS_PER_APPLICATION {
             return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
                 message: format!(
-                    "Application {} already holds the maximum of {} job runs",
-                    input.application_id,
+                    "Application already holds the maximum of {} job runs",
                     crate::state::MAX_JOB_RUNS_PER_APPLICATION
                 ),
             })
