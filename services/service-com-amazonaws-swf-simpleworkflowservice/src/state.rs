@@ -1,11 +1,736 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-swf-simpleworkflowservice service.
+//!
+//! One map of domains; a domain owns its registered workflow/activity types and its
+//! workflow executions, and an execution owns its history event log. Every handler
+//! computes its response from what is stored here — nothing is canned and nothing is
+//! echoed back out of the request that asked for it.
+
+use std::collections::HashMap;
+
+use ::aws_smithy_types::DateTime;
+use ::sha2::{Digest, Sha256};
+
+use crate::ops::types::{
+    ActivityType, ActivityTypeInfo, DecisionTaskScheduledEventAttributes, DomainConfiguration,
+    DomainInfo, HistoryEvent, ResourceTag, TaskList, WorkflowExecution,
+    WorkflowExecutionConfiguration, WorkflowExecutionInfo, WorkflowExecutionOpenCounts,
+    WorkflowExecutionStartedEventAttributes, WorkflowExecutionTerminatedEventAttributes,
+    WorkflowType, WorkflowTypeConfiguration, WorkflowTypeInfo,
+};
+
+/// The region an ARN carries when the request is unsigned (so it has no SigV4
+/// credential scope to read a region from). `emulator_arn`'s own documented default.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The ARN namespace (and sigv4 signing name) of this service, as the model's
+/// `aws.api#service` trait records it (`arnNamespace: swf`).
+pub const ARN_NAMESPACE: &str = "swf";
+
+/// `RegistrationStatus` of a freshly registered domain or type. One of
+/// [`crate::ops::types::REGISTRATION_STATUS_VALUES`].
+pub const STATUS_REGISTERED: &str = "REGISTERED";
+
+/// `ExecutionStatus` of a running execution. One of
+/// [`crate::ops::types::EXECUTION_STATUS_VALUES`].
+pub const EXECUTION_STATUS_OPEN: &str = "OPEN";
+
+/// `ExecutionStatus` of an execution that has closed. One of
+/// [`crate::ops::types::EXECUTION_STATUS_VALUES`].
+pub const EXECUTION_STATUS_CLOSED: &str = "CLOSED";
+
+/// `CloseStatus` of an execution closed by `TerminateWorkflowExecution`. One of
+/// [`crate::ops::types::CLOSE_STATUS_VALUES`].
+pub const CLOSE_STATUS_TERMINATED: &str = "TERMINATED";
+
+/// The maximum `workflowExecutionRetentionPeriodInDays` RegisterDomain accepts. The
+/// member's own doc: "The maximum workflow execution retention period is 90 days."
+pub const MAX_RETENTION_PERIOD_IN_DAYS: u32 = 90;
+
+/// The largest value an execution start-to-close timeout may take, in seconds. The
+/// `executionStartToCloseTimeout` doc: "there is a one-year max limit on the time that
+/// a workflow execution can run."
+pub const MAX_EXECUTION_START_TO_CLOSE_SECONDS: u64 = 365 * 24 * 60 * 60;
+
+/// Tags one domain may carry; `RegisterDomain`'s modelled `TooManyTagsFault` ("You've
+/// exceeded the number of tags allowed for a domain") is the answer past it. Amazon SWF
+/// documents a limit of 50 tags per domain.
+pub const MAX_TAGS_PER_DOMAIN: usize = 50;
+
+/// How many domains this emulator holds. Emulator-chosen, so a caller cannot grow the
+/// in-memory store without limit; reported with the modelled `LimitExceededFault`
+/// ("Returned by any operation if a system imposed limitation has been reached").
+pub const MAX_DOMAINS: usize = 100;
+
+/// How many workflow types one domain holds. Emulator-chosen, for the same reason as
+/// [`MAX_DOMAINS`], and answered with the same modelled `LimitExceededFault`.
+pub const MAX_WORKFLOW_TYPES_PER_DOMAIN: usize = 1_000;
+
+/// How many workflow executions one domain retains. Emulator-chosen, for the same
+/// reason as [`MAX_DOMAINS`], and answered with the same modelled
+/// `LimitExceededFault`.
+pub const MAX_EXECUTIONS_PER_DOMAIN: usize = 1_000;
+
+/// The page size `GetWorkflowExecutionHistory` uses when the caller passes no
+/// `maximumPageSize` (the member defaults to `0`), so one unparameterised request
+/// cannot materialise a response that grows without bound. It is the modelled
+/// `PageSize` maximum (range 0..1000).
+pub const MAX_HISTORY_PAGE_SIZE: usize = 1_000;
+
+/// A registered workflow type, as `RegisterWorkflowType` left it. The `default_*`
+/// members are what `StartWorkflowExecution` falls back to when the start request
+/// does not override them.
+#[derive(Debug, Clone)]
+pub struct WorkflowTypeRecord {
+    pub name: String,
+    pub version: String,
+    pub description: Option<String>,
+    /// One of [`crate::ops::types::REGISTRATION_STATUS_VALUES`].
+    pub status: String,
+    pub creation_date: DateTime,
+    pub deprecation_date: Option<DateTime>,
+    pub default_task_list: Option<String>,
+    pub default_task_start_to_close_timeout: Option<String>,
+    pub default_execution_start_to_close_timeout: Option<String>,
+    pub default_task_priority: Option<String>,
+    pub default_child_policy: Option<String>,
+    pub default_lambda_role: Option<String>,
+}
+
+impl WorkflowTypeRecord {
+    /// The `WorkflowType` identity this record is keyed by.
+    pub fn workflow_type(&self) -> WorkflowType {
+        WorkflowType {
+            name: self.name.clone(),
+            version: self.version.clone(),
+        }
+    }
+
+    /// The `WorkflowTypeInfo` every workflow-type reader returns, built from what is
+    /// stored.
+    pub fn info(&self) -> WorkflowTypeInfo {
+        WorkflowTypeInfo {
+            workflow_type: self.workflow_type(),
+            status: self.status.clone(),
+            description: self.description.clone(),
+            creation_date: self.creation_date,
+            deprecation_date: self.deprecation_date,
+        }
+    }
+
+    /// The `WorkflowTypeConfiguration` `DescribeWorkflowType` reports: the
+    /// registration-time defaults, exactly as stored.
+    pub fn configuration(&self) -> WorkflowTypeConfiguration {
+        WorkflowTypeConfiguration {
+            default_task_start_to_close_timeout: self.default_task_start_to_close_timeout.clone(),
+            default_execution_start_to_close_timeout: self
+                .default_execution_start_to_close_timeout
+                .clone(),
+            default_task_list: self
+                .default_task_list
+                .clone()
+                .map(|name| TaskList { name }),
+            default_task_priority: self.default_task_priority.clone(),
+            default_child_policy: self.default_child_policy.clone(),
+            default_lambda_role: self.default_lambda_role.clone(),
+        }
+    }
+}
+
+/// A registered activity type. `RegisterActivityType` is still a 501 in this slice, so
+/// nothing writes this yet; the map it lives in is shaped now so the operation that
+/// implements it does not have to reshape the store.
+#[derive(Debug, Clone)]
+pub struct ActivityTypeRecord {
+    pub name: String,
+    pub version: String,
+    pub description: Option<String>,
+    /// One of [`crate::ops::types::REGISTRATION_STATUS_VALUES`].
+    pub status: String,
+    pub creation_date: DateTime,
+    pub deprecation_date: Option<DateTime>,
+}
+
+impl ActivityTypeRecord {
+    /// The `ActivityTypeInfo` every activity-type reader returns, built from what is
+    /// stored.
+    pub fn info(&self) -> ActivityTypeInfo {
+        ActivityTypeInfo {
+            activity_type: ActivityType {
+                name: self.name.clone(),
+                version: self.version.clone(),
+            },
+            status: self.status.clone(),
+            description: self.description.clone(),
+            creation_date: self.creation_date,
+            deprecation_date: self.deprecation_date,
+        }
+    }
+}
+
+/// The timeouts, task list and child policy an execution actually runs under:
+/// resolved ONCE at start (the request value where given, else the workflow type's
+/// registered default) and reported verbatim by `DescribeWorkflowExecution`, so a
+/// later re-registration of the type cannot change what a running execution reports.
+#[derive(Debug, Clone)]
+pub struct ExecutionConfig {
+    pub task_list: String,
+    pub task_priority: Option<String>,
+    pub task_start_to_close_timeout: String,
+    pub execution_start_to_close_timeout: String,
+    /// One of [`crate::ops::types::CHILD_POLICY_VALUES`].
+    pub child_policy: String,
+    pub lambda_role: Option<String>,
+}
+
+impl ExecutionConfig {
+    /// The `WorkflowExecutionConfiguration` `DescribeWorkflowExecution` reports.
+    pub fn configuration(&self) -> WorkflowExecutionConfiguration {
+        WorkflowExecutionConfiguration {
+            task_start_to_close_timeout: self.task_start_to_close_timeout.clone(),
+            execution_start_to_close_timeout: self.execution_start_to_close_timeout.clone(),
+            task_list: TaskList {
+                name: self.task_list.clone(),
+            },
+            task_priority: self.task_priority.clone(),
+            child_policy: self.child_policy.clone(),
+            lambda_role: self.lambda_role.clone(),
+        }
+    }
+}
+
+/// The attributes of one recorded history event. One variant per event type this slice
+/// records; the variant IS the event type, so a stored event can never carry the
+/// attributes of a different kind than its `eventType` claims.
+#[derive(Debug, Clone)]
+pub enum EventAttributes {
+    /// Boxed: `WorkflowExecutionStartedEventAttributes` is several times the size of
+    /// the other variants, and every stored history event pays for the largest one.
+    WorkflowExecutionStarted(Box<WorkflowExecutionStartedEventAttributes>),
+    DecisionTaskScheduled(DecisionTaskScheduledEventAttributes),
+    WorkflowExecutionTerminated(WorkflowExecutionTerminatedEventAttributes),
+}
+
+impl EventAttributes {
+    /// The `eventType` these attributes belong to — one of
+    /// [`crate::ops::types::EVENT_TYPE_VALUES`].
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            Self::WorkflowExecutionStarted(_) => "WorkflowExecutionStarted",
+            Self::DecisionTaskScheduled(_) => "DecisionTaskScheduled",
+            Self::WorkflowExecutionTerminated(_) => "WorkflowExecutionTerminated",
+        }
+    }
+}
+
+/// One event of a run's persisted history.
+#[derive(Debug, Clone)]
+pub struct HistoryEventRecord {
+    pub event_id: i64,
+    pub event_timestamp: DateTime,
+    pub attributes: EventAttributes,
+}
+
+impl HistoryEventRecord {
+    /// The modelled `HistoryEvent` for this record: the `eventType` the variant names,
+    /// and the one matching `*EventAttributes` member populated. Every other
+    /// attributes member stays absent — an event carries exactly one.
+    pub fn event(&self) -> HistoryEvent {
+        let mut event = blank_history_event(
+            self.event_id,
+            self.event_timestamp,
+            self.attributes.event_type(),
+        );
+        match &self.attributes {
+            EventAttributes::WorkflowExecutionStarted(attributes) => {
+                event.workflow_execution_started_event_attributes =
+                    Some(attributes.as_ref().clone());
+            }
+            EventAttributes::DecisionTaskScheduled(attributes) => {
+                event.decision_task_scheduled_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::WorkflowExecutionTerminated(attributes) => {
+                event.workflow_execution_terminated_event_attributes = Some(attributes.clone());
+            }
+        }
+        event
+    }
+}
+
+/// A `HistoryEvent` with its identity set and EVERY `*EventAttributes` member absent.
+/// `HistoryEvent` models no default (its `eventTimestamp`/`eventType`/`eventId` are
+/// required), and it carries one optional member per event type, so this is the single
+/// place that enumerates them — [`HistoryEventRecord::event`] then fills in the one
+/// that matches.
+fn blank_history_event(event_id: i64, event_timestamp: DateTime, event_type: &str) -> HistoryEvent {
+    HistoryEvent {
+        event_timestamp,
+        event_type: event_type.to_string(),
+        event_id,
+        workflow_execution_started_event_attributes: None,
+        workflow_execution_completed_event_attributes: None,
+        complete_workflow_execution_failed_event_attributes: None,
+        workflow_execution_failed_event_attributes: None,
+        fail_workflow_execution_failed_event_attributes: None,
+        workflow_execution_timed_out_event_attributes: None,
+        workflow_execution_canceled_event_attributes: None,
+        cancel_workflow_execution_failed_event_attributes: None,
+        workflow_execution_continued_as_new_event_attributes: None,
+        continue_as_new_workflow_execution_failed_event_attributes: None,
+        workflow_execution_terminated_event_attributes: None,
+        workflow_execution_cancel_requested_event_attributes: None,
+        decision_task_scheduled_event_attributes: None,
+        decision_task_started_event_attributes: None,
+        decision_task_completed_event_attributes: None,
+        decision_task_timed_out_event_attributes: None,
+        activity_task_scheduled_event_attributes: None,
+        activity_task_started_event_attributes: None,
+        activity_task_completed_event_attributes: None,
+        activity_task_failed_event_attributes: None,
+        activity_task_timed_out_event_attributes: None,
+        activity_task_canceled_event_attributes: None,
+        activity_task_cancel_requested_event_attributes: None,
+        workflow_execution_signaled_event_attributes: None,
+        marker_recorded_event_attributes: None,
+        record_marker_failed_event_attributes: None,
+        timer_started_event_attributes: None,
+        timer_fired_event_attributes: None,
+        timer_canceled_event_attributes: None,
+        start_child_workflow_execution_initiated_event_attributes: None,
+        child_workflow_execution_started_event_attributes: None,
+        child_workflow_execution_completed_event_attributes: None,
+        child_workflow_execution_failed_event_attributes: None,
+        child_workflow_execution_timed_out_event_attributes: None,
+        child_workflow_execution_canceled_event_attributes: None,
+        child_workflow_execution_terminated_event_attributes: None,
+        signal_external_workflow_execution_initiated_event_attributes: None,
+        external_workflow_execution_signaled_event_attributes: None,
+        signal_external_workflow_execution_failed_event_attributes: None,
+        external_workflow_execution_cancel_requested_event_attributes: None,
+        request_cancel_external_workflow_execution_initiated_event_attributes: None,
+        request_cancel_external_workflow_execution_failed_event_attributes: None,
+        schedule_activity_task_failed_event_attributes: None,
+        request_cancel_activity_task_failed_event_attributes: None,
+        start_timer_failed_event_attributes: None,
+        cancel_timer_failed_event_attributes: None,
+        start_child_workflow_execution_failed_event_attributes: None,
+        lambda_function_scheduled_event_attributes: None,
+        lambda_function_started_event_attributes: None,
+        lambda_function_completed_event_attributes: None,
+        lambda_function_failed_event_attributes: None,
+        lambda_function_timed_out_event_attributes: None,
+        schedule_lambda_function_failed_event_attributes: None,
+        start_lambda_function_failed_event_attributes: None,
+    }
+}
+
+/// One workflow execution — a `(workflowId, runId)` pair — and its history.
+#[derive(Debug, Clone)]
+pub struct Execution {
+    pub workflow_id: String,
+    pub run_id: String,
+    /// The `(name, version)` of the workflow type this run was started with.
+    pub workflow_type: (String, String),
+    /// One of [`crate::ops::types::EXECUTION_STATUS_VALUES`].
+    pub status: String,
+    /// One of [`crate::ops::types::CLOSE_STATUS_VALUES`], set only once closed.
+    pub close_status: Option<String>,
+    pub start_timestamp: DateTime,
+    pub close_timestamp: Option<DateTime>,
+    pub tag_list: Vec<String>,
+    pub cancel_requested: bool,
+    pub input: Option<String>,
+    pub effective_config: ExecutionConfig,
+    /// The persisted event log, oldest first. Append only through
+    /// [`Execution::append_event`], which is the single `event_id` allocator.
+    pub history: Vec<HistoryEventRecord>,
+    /// The id the NEXT appended event takes; ids therefore stay unique and strictly
+    /// increasing within a run. The first event of a run is `1`.
+    pub next_event_id: i64,
+    pub open_decision_tasks: i32,
+    pub open_activity_tasks: i32,
+    pub open_timers: i32,
+    pub open_child_executions: i32,
+    pub open_lambda_functions: i32,
+    pub latest_execution_context: Option<String>,
+    /// When an activity task of this run was last scheduled/started — what
+    /// `DescribeWorkflowExecution`'s `latestActivityTaskTimestamp` reports. Written by
+    /// the activity-task operations, which are tracked as their own gap issues.
+    pub latest_activity_task_timestamp: Option<DateTime>,
+}
+
+impl Execution {
+    /// Append one event to this run's history and return the id it was given. The ONLY
+    /// writer of `history`/`next_event_id`, so no two events of a run share an id.
+    pub fn append_event(&mut self, at: DateTime, attributes: EventAttributes) -> i64 {
+        let event_id = self.next_event_id;
+        self.next_event_id += 1;
+        self.history.push(HistoryEventRecord {
+            event_id,
+            event_timestamp: at,
+            attributes,
+        });
+        event_id
+    }
+
+    /// The `WorkflowExecution` identity this run is keyed by.
+    pub fn execution(&self) -> WorkflowExecution {
+        WorkflowExecution {
+            workflow_id: self.workflow_id.clone(),
+            run_id: self.run_id.clone(),
+        }
+    }
+
+    /// The `WorkflowExecutionInfo` every execution reader returns, built from what is
+    /// stored.
+    pub fn info(&self) -> WorkflowExecutionInfo {
+        WorkflowExecutionInfo {
+            execution: self.execution(),
+            workflow_type: WorkflowType {
+                name: self.workflow_type.0.clone(),
+                version: self.workflow_type.1.clone(),
+            },
+            start_timestamp: self.start_timestamp,
+            close_timestamp: self.close_timestamp,
+            execution_status: self.status.clone(),
+            close_status: self.close_status.clone(),
+            // Child executions are not startable in this slice (the decision
+            // operations are still 501), so no stored run has a parent to report.
+            parent: None,
+            tag_list: (!self.tag_list.is_empty()).then(|| self.tag_list.clone()),
+            cancel_requested: self.cancel_requested,
+        }
+    }
+
+    /// The `WorkflowExecutionOpenCounts` `DescribeWorkflowExecution` reports, counted
+    /// from this run's live state.
+    pub fn open_counts(&self) -> WorkflowExecutionOpenCounts {
+        WorkflowExecutionOpenCounts {
+            open_activity_tasks: self.open_activity_tasks,
+            open_decision_tasks: self.open_decision_tasks,
+            open_timers: self.open_timers,
+            open_child_workflow_executions: self.open_child_executions,
+            open_lambda_functions: self.open_lambda_functions,
+        }
+    }
+
+    /// Whether this run is still OPEN.
+    pub fn is_open(&self) -> bool {
+        self.status == EXECUTION_STATUS_OPEN
+    }
+}
+
+/// One registered domain and everything scoped to it.
+#[derive(Debug, Clone)]
+pub struct Domain {
+    pub name: String,
+    pub description: Option<String>,
+    pub retention_period_in_days: String,
+    /// One of [`crate::ops::types::REGISTRATION_STATUS_VALUES`].
+    pub status: String,
+    pub arn: String,
+    pub tags: Vec<ResourceTag>,
+    /// `(name, version)` -> the registered workflow type.
+    pub workflow_types: HashMap<(String, String), WorkflowTypeRecord>,
+    /// `(name, version)` -> the registered activity type. Written by
+    /// `RegisterActivityType`, which is tracked as its own gap issue.
+    pub activity_types: HashMap<(String, String), ActivityTypeRecord>,
+    /// `(workflowId, runId)` -> the execution.
+    pub executions: HashMap<(String, String), Execution>,
+    /// `workflowId` -> the `runId` of the one OPEN run with that id. This is what
+    /// makes a second start of a still-open `workflowId` a
+    /// `WorkflowExecutionAlreadyStartedFault`, and what resolves a
+    /// Terminate/Signal/Cancel call that omits `runId`.
+    pub open_by_workflow_id: HashMap<String, String>,
+    /// The ordinal the NEXT start in this domain takes, feeding
+    /// [`new_run_id`]. Strictly increasing and never reused, so no two runs of this
+    /// domain can be given the same `runId`.
+    pub next_run_sequence: u64,
+}
+
+impl Domain {
+    /// A domain registered now under `name`, with no types and no executions.
+    pub fn registered(name: &str, region: &str, retention_period_in_days: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            description: None,
+            retention_period_in_days: retention_period_in_days.to_string(),
+            status: STATUS_REGISTERED.to_string(),
+            arn: domain_arn(region, name),
+            tags: Vec::new(),
+            workflow_types: HashMap::new(),
+            activity_types: HashMap::new(),
+            executions: HashMap::new(),
+            open_by_workflow_id: HashMap::new(),
+            next_run_sequence: 0,
+        }
+    }
+
+    /// The `DomainInfo` every domain reader returns, built from what is stored.
+    pub fn info(&self) -> DomainInfo {
+        DomainInfo {
+            name: self.name.clone(),
+            status: self.status.clone(),
+            description: self.description.clone(),
+            arn: Some(self.arn.clone()),
+        }
+    }
+
+    /// The `DomainConfiguration` `DescribeDomain` reports: the retention period this
+    /// domain was registered with, exactly as stored.
+    pub fn configuration(&self) -> DomainConfiguration {
+        DomainConfiguration {
+            workflow_execution_retention_period_in_days: self.retention_period_in_days.clone(),
+        }
+    }
+
+    /// The `runId` a call naming `workflow_id` addresses: the one it gave, when a run
+    /// with that pair is stored, else the currently OPEN run of that `workflowId`.
+    /// `None` when neither resolves to a stored execution.
+    pub fn resolve_run_id(&self, workflow_id: &str, run_id: Option<&str>) -> Option<String> {
+        match run_id.filter(|id| !id.is_empty()) {
+            Some(id) => self
+                .executions
+                .contains_key(&(workflow_id.to_string(), id.to_string()))
+                .then(|| id.to_string()),
+            None => self.open_by_workflow_id.get(workflow_id).cloned(),
+        }
+    }
+}
 
 /// Per-service state for com-amazonaws-swf-simpleworkflowservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSwfSimpleworkflowserviceState {
-    // TODO: add service-specific state fields
+    /// Domain name -> the domain. Domain names are unique per region, and this
+    /// emulator serves one account, so the name is the whole key.
+    pub domains: HashMap<String, Domain>,
+}
+
+/// The ARN of a domain: `arn:aws:swf:<region>:<account>:/domain/<name>`.
+pub fn domain_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("/domain/{name}"))
+}
+
+/// The region this request was signed for, defaulting to [`DEFAULT_REGION`] when the
+/// request carries no SigV4 credential scope.
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Now, as the wire timestamp type every modelled timestamp member uses.
+pub fn now() -> DateTime {
+    DateTime::from(::std::time::SystemTime::now())
+}
+
+/// A freshly minted, unique `runId` for a start in `domain`.
+///
+/// `sequence` comes from [`Domain::next_run_sequence`], which is strictly increasing
+/// per domain, so `(domain, sequence)` is unique across the store and therefore so is
+/// this id — two starts in the same nanosecond still get different ones. The SHA-256
+/// hex digest is 64 characters, exactly the modelled `WorkflowRunId` maximum, and
+/// makes the id opaque the way the real service's run ids are: a caller cannot derive
+/// it from its own request.
+pub fn new_run_id(domain: &str, workflow_id: &str, sequence: u64, at: DateTime) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain.as_bytes());
+    digest.update([0u8]);
+    digest.update(workflow_id.as_bytes());
+    digest.update([0u8]);
+    digest.update(sequence.to_be_bytes());
+    digest.update(at.secs().to_be_bytes());
+    digest.update(at.subsec_nanos().to_be_bytes());
+    ::hex::encode(digest.finalize())
+}
+
+/// An optional string member, with an empty string read as "no value given".
+///
+/// The model draws exactly this distinction: every overridable duration targets
+/// `DurationInSecondsOptional` (length 0..8, so `""` is on the wire) while every
+/// duration that must carry a value targets `DurationInSeconds` (length 1..8). So an
+/// empty optional member is an absent one, and falls back to the registered default.
+pub fn non_empty(value: &Option<String>) -> Option<String> {
+    value.as_ref().filter(|text| !text.is_empty()).cloned()
+}
+
+/// `GetWorkflowExecutionHistory`'s `nextPageToken` for the next unread event: the
+/// ordering the page was read in, then the `eventId` the page ended on.
+///
+/// The token names an EVENT, not a position, so appending to the log between pages
+/// cannot shift what it addresses — which matters most under `reverseOrder`, where a
+/// newly appended event lands at the front of the ordering. The ordering is part of
+/// the token because "the event after this one" differs between the two orderings;
+/// carrying it lets a token replayed against the other ordering be refused instead of
+/// silently skipping or repeating events.
+pub fn encode_history_page_token(reverse_order: bool, last_event_id: i64) -> String {
+    format!("{}{last_event_id}", history_order_tag(reverse_order))
+}
+
+/// The `eventId` a `nextPageToken` resumes AFTER, for a request reading in
+/// `reverse_order`.
+pub fn decode_history_page_token(token: &str, reverse_order: bool) -> Result<i64, String> {
+    let expected = history_order_tag(reverse_order);
+    let event_id = token
+        .strip_prefix(expected)
+        .and_then(|event_id| event_id.parse::<i64>().ok());
+    event_id.ok_or_else(|| {
+        format!(
+            "nextPageToken {token:?} was not issued for a reverseOrder={reverse_order} read of \
+             this execution's history; pass the token back with the same reverseOrder"
+        )
+    })
+}
+
+/// The ordering tag [`encode_history_page_token`] stamps into a page token.
+fn history_order_tag(reverse_order: bool) -> &'static str {
+    if reverse_order {
+        "r"
+    } else {
+        "f"
+    }
+}
+
+/// Refuse a name SWF's own naming rule rejects, naming the member and what is wrong.
+///
+/// The rule is stated identically on every user-supplied SWF name (domain `name`,
+/// workflow type `name`/`version`, `workflowId`, task list `name`): "The specified
+/// string must not start or end with whitespace. It must not contain a `:` (colon),
+/// `/` (slash), `|` (vertical bar), or any control characters (`\u0000-\u001f` |
+/// `\u007f-\u009f`). Also, it must not be the literal string `arn`." The model cannot
+/// express it, so the boundary validator passes it and each handler applies this.
+pub fn validate_name(member: &str, value: &str) -> Result<(), String> {
+    if value.trim() != value {
+        return Err(format!(
+            "{member} must not start or end with whitespace, got {value:?}"
+        ));
+    }
+    if let Some(rejected) = value
+        .chars()
+        .find(|&c| matches!(c, ':' | '/' | '|' | '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}'))
+    {
+        return Err(format!(
+            "{member} must not contain {rejected:?} (a colon, slash, vertical bar or \
+             control character), got {value:?}"
+        ));
+    }
+    if value == "arn" {
+        return Err(format!(
+            "{member} must not be the literal string \"arn\""
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a `workflowExecutionRetentionPeriodInDays` outside the documented range.
+///
+/// The member's doc: "If you pass the value NONE or 0 (zero), then the workflow
+/// execution history isn't retained. ... The maximum workflow execution retention
+/// period is 90 days."
+pub fn validate_retention_period(value: &str) -> Result<(), String> {
+    if value == "NONE" {
+        return Ok(());
+    }
+    match decimal(value) {
+        Some(days) if days <= u64::from(MAX_RETENTION_PERIOD_IN_DAYS) => Ok(()),
+        _ => Err(format!(
+            "workflowExecutionRetentionPeriodInDays must be \"NONE\" or an integer from 0 to \
+             {MAX_RETENTION_PERIOD_IN_DAYS}, got {value:?}"
+        )),
+    }
+}
+
+/// Refuse a decision-task start-to-close duration that is neither a non-negative
+/// integer of seconds nor the literal `NONE`.
+///
+/// `defaultTaskStartToCloseTimeout`'s doc: "The duration is specified in seconds, an
+/// integer greater than or equal to 0. You can use NONE to specify unlimited
+/// duration."
+pub fn validate_task_duration(member: &str, value: &str) -> Result<(), String> {
+    if value == "NONE" || decimal(value).is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "{member} must be \"NONE\" or an integer number of seconds, got {value:?}"
+    ))
+}
+
+/// Refuse an execution start-to-close duration outside what the model documents.
+///
+/// `executionStartToCloseTimeout`'s doc: "The duration is specified in seconds; an
+/// integer greater than or equal to 0. Unlike some of the other timeout parameters in
+/// Amazon SWF, you cannot specify a value of \"NONE\" for this timeout; there is a
+/// one-year max limit on the time that a workflow execution can run."
+pub fn validate_execution_duration(member: &str, value: &str) -> Result<(), String> {
+    match decimal(value) {
+        Some(seconds) if seconds <= MAX_EXECUTION_START_TO_CLOSE_SECONDS => Ok(()),
+        _ => Err(format!(
+            "{member} must be an integer number of seconds from 0 to \
+             {MAX_EXECUTION_START_TO_CLOSE_SECONDS} (\"NONE\" is not accepted for this timeout), \
+             got {value:?}"
+        )),
+    }
+}
+
+/// A plain decimal string as a number, or `None` when it is not one.
+///
+/// Every SWF duration is documented as "an integer greater than or equal to 0", so a
+/// value must be decimal digits only: `str::parse` alone would also accept a signed
+/// `"+5"`, which is not that form and which the service stores and echoes back
+/// verbatim. Zero padding IS still that form (`"0007"` is seven), and the model
+/// constrains only the member's length, so it is accepted.
+fn decimal(value: &str) -> Option<u64> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<u64>().ok()
+}
+
+/// Refuse a domain tag outside the documented character set.
+///
+/// `ResourceTag`'s own doc: "Tags may only contain unicode letters, digits,
+/// whitespace, or these symbols: `_ . : / = + - @`". The key's and value's lengths are
+/// modelled (1..128 and 0..256) and so are refused at the boundary; the character set
+/// is not, so it is enforced here.
+pub fn validate_tag(key: &str, value: Option<&str>) -> Result<(), String> {
+    validate_tag_text("tags.key", key)?;
+    match value {
+        Some(value) => validate_tag_text("tags.value", value),
+        None => Ok(()),
+    }
+}
+
+/// One side of a tag pair, against the character set [`validate_tag`] documents.
+fn validate_tag_text(member: &str, text: &str) -> Result<(), String> {
+    if let Some(rejected) = text.chars().find(|c| {
+        !(c.is_alphabetic()
+            || c.is_numeric()
+            || c.is_whitespace()
+            || matches!(c, '_' | '.' | ':' | '/' | '=' | '+' | '-' | '@'))
+    }) {
+        return Err(format!(
+            "{member} may only contain unicode letters, digits, whitespace or the symbols \
+             _ . : / = + - @, got {rejected:?} in {text:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a child policy outside the model's `ChildPolicy` enumeration.
+///
+/// Every `childPolicy` / `defaultChildPolicy` member targets that closed enum, so the
+/// boundary validator already refuses anything outside it; this keeps a policy no
+/// reader could interpret out of the store even if that trait stops being enforced,
+/// and keeps the check identical on every handler that stores one.
+pub fn validate_child_policy(member: &str, value: &str) -> Result<(), String> {
+    if crate::ops::types::CHILD_POLICY_VALUES.contains(&value) {
+        return Ok(());
+    }
+    Err(format!(
+        "{member} must be one of {}, got {value:?}",
+        crate::ops::types::CHILD_POLICY_VALUES.join(", ")
+    ))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
