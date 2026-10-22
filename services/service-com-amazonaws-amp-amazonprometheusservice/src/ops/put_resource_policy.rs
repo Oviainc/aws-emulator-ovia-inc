@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or replaces the resource-based policy attached to a workspace, under the
+//! optimistic lock `revisionId` carries: every accepted put mints a fresh revision and
+//! the policy becomes `ACTIVE` once the clock owes that transition.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +169,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutResourcePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // The policy hangs off the workspace at `/workspaces/{workspaceId}/policy`, so
+        // an unknown workspace is the missing resource — ResourceNotFoundException (404).
+        let Some(workspace) = store.workspaces.get(&input.workspace_id) else {
+            return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Workspace not found: {}", input.workspace_id),
+                    resource_id: input.workspace_id.clone(),
+                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+        let workspace_status = workspace.status_code.clone();
+        let existing = workspace.policy.clone();
+
+        // `clientToken` carries `@idempotencyToken`: replaying the very call that
+        // produced the current revision answers with THAT revision — read off the
+        // stored policy, so the status it reports is the one the policy is in now —
+        // instead of minting a second one.
+        if let (Some(token), Some(policy)) = (input.client_token.as_deref(), existing.as_ref()) {
+            if policy.client_token.as_deref() == Some(token) {
+                return Ok(response_for(policy));
+            }
+        }
+
+        // "Update/Deletion is disallowed until Resource-based Policy is ACTIVE and
+        // Workspace is ACTIVE" (`WorkspacePolicyStatusCode`): putting over a policy that
+        // is still settling, or onto a workspace that is not active, would leave an
+        // inconsistent state — ConflictException (409).
+        if !crate::state::policy_mutation_allowed(workspace) {
+            let policy_status = existing
+                .as_ref()
+                .map_or("not attached", |policy| policy.status_code.as_str());
+            return Err(PutResourcePolicyErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Workspace {} is {} and its resource-based policy is {}; a put is \
+                         allowed only while the workspace is {} and any policy it holds is {}",
+                        input.workspace_id,
+                        workspace_status,
+                        policy_status,
+                        crate::state::STATUS_ACTIVE,
+                        crate::state::POLICY_STATUS_ACTIVE,
+                    ),
+                    resource_id: input.workspace_id.clone(),
+                    resource_type: crate::state::POLICY_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The optimistic lock: a `revisionId` that does not name the policy's current
+        // revision is a stale writer, and applying it would lose the revision in
+        // between — ConflictException (409).
+        if !crate::state::revision_matches(existing.as_ref(), input.revision_id.as_deref()) {
+            return Err(PutResourcePolicyErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "revisionId {} does not name the current revision of the \
+                         resource-based policy of workspace {}",
+                        input.revision_id.unwrap_or_default(),
+                        input.workspace_id,
+                    ),
+                    resource_id: input.workspace_id.clone(),
+                    resource_type: crate::state::POLICY_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Accepted: mint the next revision. A workspace that held no policy is CREATING
+        // one; one that held a policy is UPDATING it (`WorkspacePolicyStatusCode`), and
+        // either way the clock owes the move to ACTIVE at `transition_due`.
+        let revision_id = crate::state::mint_revision_id(&mut store.next_id);
+        let policy = crate::state::ResourcePolicy {
+            policy_document: input.policy_document,
+            status_code: if existing.is_some() {
+                crate::state::POLICY_STATUS_UPDATING.to_string()
+            } else {
+                crate::state::POLICY_STATUS_CREATING.to_string()
+            },
+            revision_id,
+            transition_due: Some(now + crate::state::TRANSITION_DELAY),
+            client_token: input.client_token,
+            delete_token: None,
+        };
+        let response = response_for(&policy);
+
+        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+            // Unreachable: the store is locked for this whole handler, so the workspace
+            // resolved above cannot have gone away. Answered rather than asserted, so a
+            // future refactor cannot turn it into a success that persisted nothing.
+            return Err(PutResourcePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!(
+                        "Workspace {} went away while its resource-based policy was written",
+                        input.workspace_id
+                    ),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        workspace.policy = Some(policy);
+        Ok(response)
+    }
+}
+
+/// The response for a stored policy: both members are read off the persisted record,
+/// never off the request.
+fn response_for(policy: &crate::state::ResourcePolicy) -> PutResourcePolicyOutput {
+    PutResourcePolicyOutput {
+        policy_status: policy.status_code.clone(),
+        revision_id: policy.revision_id.clone(),
     }
 }

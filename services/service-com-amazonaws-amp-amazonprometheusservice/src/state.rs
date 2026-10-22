@@ -114,9 +114,38 @@ pub const LOGGING_STATUS_ACTIVE: &str = "ACTIVE";
 /// [`WORKSPACE_RESOURCE_TYPE`] does for the workspace itself.
 pub const LOGGING_CONFIGURATION_RESOURCE_TYPE: &str = "AWS::APS::LoggingConfiguration";
 
+/// `WorkspacePolicyStatusCode` values a workspace's resource-based policy moves
+/// through here. Each is an entry of the modelled
+/// `com.amazonaws.amp#WorkspacePolicyStatusCode` enum, whose own documentation states
+/// the lifecycle rule this crate enforces — `CREATING`: "Resource-based Policy is
+/// being created. Update/Deletion is disallowed until Resource-based Policy is ACTIVE
+/// and Workspace is ACTIVE.", and `ACTIVE` / `UPDATING` / `DELETING` repeat that same
+/// sentence. (`crate::ops::types::WORKSPACE_POLICY_STATUS_CODE_VALUES` carries the
+/// full list.)
+pub const POLICY_STATUS_CREATING: &str = "CREATING";
+/// See [`POLICY_STATUS_CREATING`].
+pub const POLICY_STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`POLICY_STATUS_CREATING`].
+pub const POLICY_STATUS_UPDATING: &str = "UPDATING";
+/// See [`POLICY_STATUS_CREATING`].
+pub const POLICY_STATUS_DELETING: &str = "DELETING";
+
+/// The revision id a caller may name on the first put for a workspace that holds no
+/// resource-based policy: `PutResourcePolicyRequest$revisionId` documents "For the
+/// first PUT request on a workspace that doesn't have an existing resource policy, you
+/// can specify `NO_POLICY` as the revision ID."
+pub const NO_POLICY_REVISION_ID: &str = "NO_POLICY";
+
+/// The `resourceType` the modelled `ResourceNotFoundException` / `ConflictException`
+/// report for a workspace's resource-based policy. The member is a free-form `String`
+/// documented as "Type of the resource affected", so the emulator reports the
+/// resource's AWS type name.
+pub const POLICY_RESOURCE_TYPE: &str = "AWS::APS::ResourcePolicy";
+
 /// How long a workspace stays in a transient status before the clock owes the next
 /// transition (`CREATING` -> `ACTIVE`, `DELETING` -> removed, a workspace
-/// configuration's `UPDATING` -> `ACTIVE`).
+/// configuration's `UPDATING` -> `ACTIVE`), and the same for a resource-based policy
+/// (`CREATING`/`UPDATING` -> `ACTIVE`, `DELETING` -> removed).
 ///
 /// CHOSEN, not documented: Amazon Managed Service for Prometheus publishes no
 /// duration for any of these transitions, so this is the emulator's own span — long
@@ -260,6 +289,34 @@ const ARN_SERVICE: &str = "aps";
 /// the region the emulator's own generated client config defaults to.
 const DEFAULT_REGION: &str = "us-east-1";
 
+/// One stored resource-based policy: the members `DescribeResourcePolicy` reports,
+/// plus the bookkeeping its lifecycle and its optimistic lock need. It lives ON the
+/// workspace it is attached to (`/workspaces/{workspaceId}/policy`), so deleting the
+/// workspace releases the policy with it.
+#[derive(Debug, Clone)]
+pub struct ResourcePolicy {
+    /// The JSON policy document exactly as it was put — the service stores the
+    /// caller's document and reports it back.
+    pub policy_document: String,
+    /// One of [`POLICY_STATUS_CREATING`], [`POLICY_STATUS_ACTIVE`],
+    /// [`POLICY_STATUS_UPDATING`], [`POLICY_STATUS_DELETING`].
+    pub status_code: String,
+    /// The revision this document is at: minted by [`mint_revision_id`] on every put,
+    /// and what a later put or delete names to take the optimistic lock.
+    pub revision_id: String,
+    /// When the clock owes this policy's next lifecycle transition, if one is pending:
+    /// `CREATING`/`UPDATING` become `ACTIVE`, `DELETING` is removed.
+    pub transition_due: Option<SystemTime>,
+    /// The `clientToken` of the `PutResourcePolicy` call that produced this revision,
+    /// which is what makes that call idempotent per its `@idempotencyToken`: replaying
+    /// it answers with this revision instead of minting a second one.
+    pub client_token: Option<String>,
+    /// The `clientToken` of the `DeleteResourcePolicy` call that started a pending
+    /// deletion, so replaying that exact call stays idempotent rather than conflicting
+    /// with the deletion it already started.
+    pub delete_token: Option<String>,
+}
+
 /// One stored workspace: every member `WorkspaceDescription` / `WorkspaceSummary`
 /// report, plus the bookkeeping the lifecycle needs.
 #[derive(Debug, Clone)]
@@ -302,6 +359,10 @@ pub struct Workspace {
     /// but the workspace — so it lives ON the workspace record: a workspace that goes
     /// away takes its logging configuration with it.
     pub logging_configuration: Option<LoggingConfiguration>,
+    /// The resource-based policy attached to this workspace, if one is attached:
+    /// `PutResourcePolicy` creates or replaces it, `DescribeResourcePolicy` reads it
+    /// and `DeleteResourcePolicy` removes it.
+    pub policy: Option<ResourcePolicy>,
     /// This workspace's rule groups namespaces, keyed by `RuleGroupsNamespaceName`
     /// (unique within a workspace, which is what `CreateRuleGroupsNamespace` refuses a
     /// second time). They hang off the workspace record because the namespace is a
@@ -523,7 +584,8 @@ pub struct ComAmazonawsAmpAmazonprometheusserviceState {
     /// `clientToken -> workspaceId`, which is what makes `CreateWorkspace`
     /// idempotent per its `@idempotencyToken`.
     pub client_tokens: HashMap<String, String>,
-    /// Counts the ids this store has minted; see [`mint_workspace_id`].
+    /// Counts the identifiers this store has minted — workspace ids and resource-policy
+    /// revision ids both; see [`mint_workspace_id`] and [`mint_revision_id`].
     pub next_id: u64,
 }
 
@@ -576,6 +638,24 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
             if let Some(logging) = workspace.logging_configuration.as_mut() {
                 logging.materialize_due(now);
             }
+            // The attached policy's transition is owed on its own clock, independently
+            // of the workspace's: a policy put on an active workspace becomes ACTIVE
+            // without the workspace moving at all.
+            let policy_removed = match workspace.policy.as_mut() {
+                Some(policy) if policy.transition_due.is_some_and(|due| now >= due) => {
+                    policy.transition_due = None;
+                    if policy.status_code == POLICY_STATUS_DELETING {
+                        true
+                    } else {
+                        policy.status_code = POLICY_STATUS_ACTIVE.to_string();
+                        false
+                    }
+                }
+                _ => false,
+            };
+            if policy_removed {
+                workspace.policy = None;
+            }
             materialize_namespaces_due(&mut workspace.rule_groups_namespaces, now);
             let Some(due) = workspace.transition_due else {
                 continue;
@@ -624,6 +704,38 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
     /// The `workspaceId` the stored ARN `resource_arn` belongs to, if any.
     pub fn workspace_id_of_arn(&self, resource_arn: &str) -> Option<String> {
         self.arn_index.get(resource_arn).cloned()
+    }
+}
+
+/// Whether a workspace and its attached policy are in the state the modelled
+/// `WorkspacePolicyStatusCode` requires before a resource-policy put or delete may act.
+///
+/// Every entry of that enum documents the same rule: "Update/Deletion is disallowed
+/// until Resource-based Policy is ACTIVE and Workspace is ACTIVE." A workspace with no
+/// policy attached yet has nothing to wait for, so only the workspace's own status
+/// gates the first put.
+pub fn policy_mutation_allowed(workspace: &Workspace) -> bool {
+    workspace.status_code == STATUS_ACTIVE
+        && workspace
+            .policy
+            .as_ref()
+            .is_none_or(|policy| policy.status_code == POLICY_STATUS_ACTIVE)
+}
+
+/// Whether a request naming `revision_id` may act on the policy a workspace currently
+/// holds — the optimistic lock `PutResourcePolicyRequest$revisionId` and
+/// `DeleteResourcePolicyRequest$revisionId` describe.
+///
+/// "If you don't specify a revision ID, the policy is updated regardless of its current
+/// revision", so an absent id always matches. Otherwise the id must name the policy's
+/// current revision, and on a workspace that holds no policy the only id that matches
+/// is [`NO_POLICY_REVISION_ID`]: "For the first PUT request on a workspace that doesn't
+/// have an existing resource policy, you can specify `NO_POLICY` as the revision ID."
+pub fn revision_matches(policy: Option<&ResourcePolicy>, revision_id: Option<&str>) -> bool {
+    match (policy, revision_id) {
+        (_, None) => true,
+        (None, Some(revision_id)) => revision_id == NO_POLICY_REVISION_ID,
+        (Some(policy), Some(revision_id)) => revision_id == policy.revision_id,
     }
 }
 
@@ -712,12 +824,6 @@ pub fn prometheus_endpoint(region: &str, workspace_id: &str) -> String {
 /// which `WorkspaceId`'s pattern (`[0-9A-Za-z][-.0-9A-Z_a-z]*`, length 1..64)
 /// accepts and `WorkspaceDescription$workspaceId` shows ("For example,
 /// `ws-example1-1234-abcd-5678-ef90abcd1234`").
-///
-/// The UUID is a digest of this store's id counter (unique within the process) folded
-/// with a per-process seed (so two emulator processes do not mint the same ids), hashed
-/// so the id discloses neither. It takes the counter rather than `&mut self` so a
-/// handler holding a stored record borrowed can still mint — which is what lets it mint
-/// only AFTER every refusal has been answered.
 pub fn mint_workspace_id(counter: &mut u64) -> String {
     mint_id(b"workspace", "ws", counter)
 }
@@ -730,10 +836,31 @@ pub fn mint_anomaly_detector_id(counter: &mut u64) -> String {
     mint_id(b"anomalydetector", "ad", counter)
 }
 
+/// A fresh resource-policy revision id: the opaque, server-minted value
+/// `PutResourcePolicyResponse$revisionId` carries and a later put or delete names to
+/// take the optimistic lock. Every put mints a new one, so no two revisions of a
+/// policy — or of two policies — share an id. A revision names no resource kind, so it
+/// is the bare UUID [`mint_uuid`] mints rather than a prefixed id.
+pub fn mint_revision_id(counter: &mut u64) -> String {
+    mint_uuid(b"resource-policy-revision", counter)
+}
+
 /// `<prefix>-<uuid>` for one resource `domain`: the shared body of
 /// [`mint_workspace_id`] and [`mint_anomaly_detector_id`], so both kinds of id are
 /// minted by ONE rule.
 fn mint_id(domain: &[u8], prefix: &str, counter: &mut u64) -> String {
+    format!("{prefix}-{}", mint_uuid(domain, counter))
+}
+
+/// A fresh UUID for one of this store's minted identifiers, in the 8-4-4-4-12 hex form.
+///
+/// It is a digest of `domain` (so identifiers of different kinds never collide) and
+/// this store's id counter (unique within the process), folded with a per-process seed
+/// (so two emulator processes do not mint the same ids) and hashed so the identifier
+/// discloses neither. It takes the counter rather than `&mut self` so a handler holding
+/// a stored record borrowed can still mint — which is what lets it mint only AFTER
+/// every refusal has been answered.
+fn mint_uuid(domain: &[u8], counter: &mut u64) -> String {
     *counter += 1;
     let mut hasher = Sha256::new();
     hasher.update(domain);
@@ -742,7 +869,7 @@ fn mint_id(domain: &[u8], prefix: &str, counter: &mut u64) -> String {
     let digest: [u8; 32] = hasher.finalize().into();
     let hex = hex::encode(digest);
     format!(
-        "{prefix}-{}-{}-{}-{}-{}",
+        "{}-{}-{}-{}-{}",
         &hex[0..8],
         &hex[8..12],
         &hex[12..16],

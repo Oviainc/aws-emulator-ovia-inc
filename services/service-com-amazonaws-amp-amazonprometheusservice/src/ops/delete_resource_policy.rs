@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the resource-based policy attached to a workspace, under the same optimistic
+//! lock `revisionId` carries on a put: the policy becomes `DELETING` and is gone once
+//! the clock owes that transition.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +170,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteResourcePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        let Some(workspace) = store.workspaces.get(&input.workspace_id) else {
+            return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Workspace not found: {}", input.workspace_id),
+                    resource_id: input.workspace_id.clone(),
+                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+        let workspace_status = workspace.status_code.clone();
+
+        // Nothing to delete: the policy is the resource that doesn't exist (404). That
+        // includes a deletion that has already run to completion — the policy is gone,
+        // so a repeat of the call names a resource the workspace no longer holds.
+        let Some(policy) = workspace.policy.as_ref() else {
+            return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Workspace {} has no resource-based policy",
+                        input.workspace_id
+                    ),
+                    resource_id: input.workspace_id.clone(),
+                    resource_type: crate::state::POLICY_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `clientToken` carries `@idempotencyToken`: re-sending the very call that
+        // started the pending deletion is that same call, so it is accepted again.
+        let replays_pending_delete = input.client_token.is_some()
+            && policy.delete_token == input.client_token
+            && policy.status_code == crate::state::POLICY_STATUS_DELETING;
+
+        if !replays_pending_delete {
+            // "Update/Deletion is disallowed until Resource-based Policy is ACTIVE and
+            // Workspace is ACTIVE" (`WorkspacePolicyStatusCode`) — ConflictException (409).
+            if !crate::state::policy_mutation_allowed(workspace) {
+                return Err(DeleteResourcePolicyErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "Workspace {} is {} and its resource-based policy is {}; a \
+                             deletion is allowed only while the workspace is {} and the \
+                             policy is {}",
+                            input.workspace_id,
+                            workspace_status,
+                            policy.status_code,
+                            crate::state::STATUS_ACTIVE,
+                            crate::state::POLICY_STATUS_ACTIVE,
+                        ),
+                        resource_id: input.workspace_id.clone(),
+                        resource_type: crate::state::POLICY_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into());
+            }
+
+            // The same optimistic lock a put takes: a `revisionId` that does not name
+            // the policy's current revision would delete a revision the caller never
+            // read — ConflictException (409).
+            if !crate::state::revision_matches(Some(policy), input.revision_id.as_deref()) {
+                return Err(DeleteResourcePolicyErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "revisionId {} does not name the current revision of the \
+                             resource-based policy of workspace {}",
+                            input.revision_id.clone().unwrap_or_default(),
+                            input.workspace_id,
+                        ),
+                        resource_id: input.workspace_id.clone(),
+                        resource_type: crate::state::POLICY_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into());
+            }
+        }
+
+        if !replays_pending_delete {
+            let Some(policy) = store
+                .workspaces
+                .get_mut(&input.workspace_id)
+                .and_then(|workspace| workspace.policy.as_mut())
+            else {
+                // Unreachable: the store is locked for this whole handler, so the policy
+                // resolved above cannot have gone away. Answered rather than asserted, so
+                // a future refactor cannot turn it into a success that persisted nothing.
+                return Err(DeleteResourcePolicyErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!(
+                            "the resource-based policy of workspace {} went away while it \
+                             was being deleted",
+                            input.workspace_id
+                        ),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into());
+            };
+            // DELETING now; the clock owes the removal at `transition_due`, so a caller
+            // acting straight after this call still observes the transient status.
+            policy.status_code = crate::state::POLICY_STATUS_DELETING.to_string();
+            policy.transition_due = Some(now + crate::state::TRANSITION_DELAY);
+            policy.delete_token = input.client_token;
+        }
+
+        Ok(DeleteResourcePolicyOutput)
     }
 }
