@@ -41,3 +41,5 @@ mod resend_validation_email;
 mod state_roundtrip;
 #[path = "all/validation_domain_superdomain.rs"]
 mod validation_domain_superdomain;
+#[path = "all/validation_message_rendering.rs"]
+mod validation_message_rendering;

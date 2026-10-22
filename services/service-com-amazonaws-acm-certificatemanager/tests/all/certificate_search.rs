@@ -1003,38 +1003,41 @@ async fn an_unsatisfiable_request_is_refused() {
     }
 }
 
-/// RULE: a refusal says what was wrong with the request — the value, the member it
-/// sat on and the requirement it failed — so the caller can fix the request from the
-/// message alone.
+/// RULE: a refusal says what was wrong with the request — the member the offending
+/// value sat on and the requirement it failed — so the caller can fix the request
+/// from the message alone, WITHOUT echoing the value back (the service's constraint
+/// wording withholds it; see `crate::validation_message_rendering`).
 #[tokio::test]
 async fn a_refusal_names_the_member_and_its_requirement() {
     let router = router();
     let now = epoch_now();
 
-    // Each row: the request, and every fragment its message must carry.
-    let cases: Vec<(&str, Value, Vec<&str>)> = vec![
+    // Each row: the request, every fragment its message must carry, and every
+    // caller-submitted string the message must NOT carry.
+    let cases: Vec<(&str, Value, Vec<&str>, Vec<&str>)> = vec![
         (
-            "a Status outside its enum",
+            "a Status outside its enum, refused by this handler",
             json!({ "FilterStatement": { "Filter": { "AcmCertificateMetadataFilter": { "Status": "NOT_A_STATUS" } } } }),
             vec![
-                "NOT_A_STATUS",
                 "FilterStatement.Filter.AcmCertificateMetadataFilter.Status",
                 "PENDING_VALIDATION",
             ],
+            vec!["NOT_A_STATUS"],
         ),
         (
             "a ComparisonOperator outside its enum, refused by the boundary validator",
             json!({ "FilterStatement": { "Filter": { "X509AttributeFilter": { "Subject": { "CommonName": { "Value": "alpha.example.com", "ComparisonOperator": "STARTS_WITH" } } } } } }),
             vec![
-                "STARTS_WITH",
                 "filterStatement.filter.x509AttributeFilter.subject.commonName.comparisonOperator",
                 "CONTAINS, EQUALS",
             ],
+            vec!["STARTS_WITH"],
         ),
         (
             "a range bounding nothing",
             json!({ "FilterStatement": { "Filter": { "X509AttributeFilter": { "NotAfter": {} } } } }),
             vec!["FilterStatement.Filter.X509AttributeFilter.NotAfter", "Start"],
+            vec![],
         ),
         (
             "a range that can contain no instant",
@@ -1043,15 +1046,17 @@ async fn a_refusal_names_the_member_and_its_requirement() {
                 "FilterStatement.Filter.X509AttributeFilter.NotBefore",
                 "must not be after End",
             ],
+            vec![],
         ),
         (
             "a NextToken this service did not issue",
             json!({ "NextToken": "not-a-token" }),
             vec!["NextToken"],
+            vec![],
         ),
     ];
 
-    for (case, body, fragments) in cases {
+    for (case, body, fragments, withheld) in cases {
         let (status, response) = call(&router, "SearchCertificates", &body).await;
         assert_eq!(
             status, 400,
@@ -1062,6 +1067,12 @@ async fn a_refusal_names_the_member_and_its_requirement() {
             assert!(
                 message.contains(fragment),
                 "case {case}: expected the message to name {fragment:?}, got {message:?}"
+            );
+        }
+        for value in withheld {
+            assert!(
+                !message.contains(value),
+                "case {case}: the submitted value {value:?} must not be echoed, got {message:?}"
             );
         }
     }

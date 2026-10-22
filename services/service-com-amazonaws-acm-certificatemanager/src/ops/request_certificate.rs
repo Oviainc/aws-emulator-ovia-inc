@@ -456,7 +456,10 @@ const CERTIFICATE_LIMIT: usize = 2_500;
 /// "one or more values in the DomainValidationOption structure is incorrect":
 ///
 /// * its `DomainName` is not a domain the certificate covers, so there is nothing for
-///   the entry to configure;
+///   the entry to configure. The refusal names the domain the request asked to
+///   validate and the two places a covered domain may come from — the request's
+///   `DomainName` (the primary domain) and its `SubjectAlternativeNames` — so the
+///   caller can see which of the two it forgot to list it in;
 /// * its `ValidationDomain` is neither that domain nor a superdomain of it, which is
 ///   the rule `DomainValidationOption$ValidationDomain` states ("This must be the same
 ///   as the `DomainName` value or a superdomain of the `DomainName` value") — ACM mails
@@ -481,7 +484,8 @@ fn validation_domains(
                 RequestCertificateErrorModeled::InvalidDomainValidationOptionsException(
                     InvalidDomainValidationOptionsException {
                         message: Some(format!(
-                            "DomainValidationOptions names {}, which is not a domain name in this certificate request",
+                            "The domain specified in ValidationOptions, {}, is not the \
+                             PrimaryDomain or part of SubjectAlternativeNames.",
                             option.domain_name
                         )),
                     },

@@ -182,18 +182,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // specify SortOrder, you must also specify SortBy"
         // (`ListCertificatesRequest$SortOrder`). Either alone names no ordering — a
         // key with no direction, or a direction with no key — so it is refused rather
-        // than completed with an order the caller did not ask for.
+        // than completed with an order the caller did not ask for. The rule is
+        // symmetric, and so is the sentence that states it: it reports that exactly
+        // one of the pair arrived and that both are needed, without naming which one
+        // is missing.
         if input.sort_by.is_some() != input.sort_order.is_some() {
-            let missing = if input.sort_by.is_none() {
-                "SortBy"
-            } else {
-                "SortOrder"
-            };
             return Err(ListCertificatesErrorModeled::InvalidArgsException(
                 InvalidArgsException {
-                    message: Some(format!(
-                        "SortBy and SortOrder must be specified together; {missing} is missing"
-                    )),
+                    message: Some(SORT_PAIR_REQUIRED.to_string()),
                 },
             )
             .into());
@@ -291,6 +287,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// page size used when the caller names no `MaxItems`: the maximum the model allows
 /// for that member (`MaxItems`, `range 1..1000`).
 const MAX_PAGE_SIZE: usize = 1000;
+
+/// How `ListCertificates` states the paired-parameter rule its sort members carry
+/// ("If you specify SortBy, you must also specify SortOrder" /
+/// "If you specify SortOrder, you must also specify SortBy").
+///
+/// The sentence is the rule, not one request's text: it names neither value the
+/// caller sent nor which half of the pair arrived.
+const SORT_PAIR_REQUIRED: &str = "Request contains either SortBy or SortOrder. Both SortBy \
+                                      and SortOrder parameters need to specified in the request.";
 
 /// Whether a certificate passes every filter the request set.
 ///
