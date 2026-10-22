@@ -26,5 +26,8 @@ mod state_roundtrip;
 #[path = "all/workspace_authentication.rs"]
 mod workspace_authentication;
 
+#[path = "all/workspace_configuration.rs"]
+mod workspace_configuration;
+
 #[path = "all/workspace_lifecycle.rs"]
 mod workspace_lifecycle;

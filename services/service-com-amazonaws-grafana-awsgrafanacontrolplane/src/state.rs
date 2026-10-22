@@ -511,6 +511,18 @@ pub fn version_order(version: &str) -> Vec<u64> {
         .collect()
 }
 
+/// True when moving a workspace from `current` to `requested` is a DOWNGRADE.
+///
+/// `UpdateWorkspaceConfigurationRequest$grafanaVersion` "[c]an only be used to
+/// upgrade (for example, from 8.4 to 9.4), not downgrade (for example, from 9.4
+/// to 8.4)", so the version a workspace already runs is admitted and only a
+/// strictly older one is refused. It reads the SAME [`version_order`] key as
+/// [`upgrade_targets`], so the refusal and the catalogue `ListVersions` publishes
+/// can never disagree about which way round two versions are.
+pub fn is_downgrade(current: &str, requested: &str) -> bool {
+    version_order(requested) < version_order(current)
+}
+
 /// The versions a workspace running `current` can be upgraded to: the supported
 /// versions strictly newer than it, oldest first.
 ///
@@ -531,6 +543,30 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// True when `value` parses as a JSON document.
+///
+/// `OverridableConfigurationJson` is `@mediaType("application/json")`, so every
+/// member targeting it (`CreateWorkspaceRequest$configuration`,
+/// `UpdateWorkspaceConfigurationRequest$configuration`) carries a JSON document
+/// and one that does not parse is refused rather than stored.
+pub fn is_json_document(value: &str) -> bool {
+    ::serde_json::from_str::<::serde_json::Value>(value).is_ok()
+}
+
+/// The `ValidationException` payload for a `configuration` that is not a JSON
+/// document, shared by every operation that accepts the member so the two cannot
+/// refuse the same request in two different ways.
+pub fn configuration_not_json() -> ValidationException {
+    ValidationException {
+        message: "configuration must be a JSON document".to_string(),
+        reason: "FIELD_VALIDATION_FAILED".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "configuration".to_string(),
+            message: "not a JSON document".to_string(),
+        }]),
+    }
 }
 
 /// The `ConflictException` payload for a service-account name a workspace

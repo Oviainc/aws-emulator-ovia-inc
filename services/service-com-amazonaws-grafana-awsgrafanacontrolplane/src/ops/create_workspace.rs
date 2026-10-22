@@ -248,6 +248,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `OverridableConfigurationJson` is `@mediaType("application/json")`: the
+        // member carries a JSON document, so one that does not parse is refused
+        // rather than stored for `DescribeWorkspaceConfiguration` to report.
+        if let Some(configuration) = input.configuration.as_deref() {
+            if !crate::state::is_json_document(configuration) {
+                return Err(CreateWorkspaceErrorModeled::ValidationException(
+                    crate::state::configuration_not_json(),
+                )
+                .into());
+            }
+        }
+
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();

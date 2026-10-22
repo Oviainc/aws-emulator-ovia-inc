@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWorkspaceConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWorkspaceConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWorkspaceConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the `OverridableConfigurationJson` document the workspace record carries,
+//! and may move it to a later Grafana version. Accepted (HTTP 202), not finished: the
+//! workspace reports `UPDATING` until the clock owes it `ACTIVE` again, exactly as
+//! `UpdateWorkspace` leaves it.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +151,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWorkspaceConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWorkspaceConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWorkspaceConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateWorkspaceConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the grafana workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // `OverridableConfigurationJson` is `@mediaType("application/json")`: the
+        // member carries a JSON document, so one that does not parse is refused and
+        // nothing is stored. The length bounds are already enforced at the boundary.
+        if !crate::state::is_json_document(&input.configuration) {
+            return Err(UpdateWorkspaceConfigurationErrorModeled::ValidationException(
+                crate::state::configuration_not_json(),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(workspace) = store.settled_mut(&input.workspace_id, now) else {
+            return Err(UpdateWorkspaceConfigurationErrorModeled::ResourceNotFoundException(
+                crate::state::workspace_not_found(&input.workspace_id),
+            )
+            .into());
+        };
+
+        // The version member upgrades only, so a request naming an earlier version
+        // than the workspace runs is refused before anything is written. The ordering
+        // is `crate::state`'s, the one `ListVersions`' upgrade catalogue reads.
+        if let Some(requested) = input.grafana_version.as_deref() {
+            if crate::state::is_downgrade(&workspace.grafana_version, requested) {
+                let current = workspace.grafana_version.clone();
+                return Err(UpdateWorkspaceConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "grafanaVersion {requested} is earlier than the version this \
+                             workspace runs ({current}); the version can only be upgraded"
+                        ),
+                        reason: "FIELD_VALIDATION_FAILED".to_string(),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "grafanaVersion".to_string(),
+                            message: format!("cannot downgrade from {current}"),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        workspace.configuration = input.configuration;
+        // "If not specified, keeps the current version of the workspace."
+        if let Some(requested) = input.grafana_version {
+            workspace.grafana_version = requested;
+        }
+        workspace.modified = now;
+        // Accepted, not applied: the workspace restarts with the new configuration, so
+        // it reports `UPDATING` until the clock owes it `ACTIVE`.
+        workspace.status = "UPDATING".to_string();
+        workspace.pending = Some(crate::state::PendingTransition {
+            due: now + crate::state::LIFECYCLE_TRANSITION,
+            status: "ACTIVE".to_string(),
+        });
+
+        Ok(UpdateWorkspaceConfigurationOutput {})
     }
 }
