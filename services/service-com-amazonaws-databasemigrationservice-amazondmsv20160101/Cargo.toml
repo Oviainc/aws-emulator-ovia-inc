@@ -21,13 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Resource-id minting: SHA-256 over a per-store counter and the clock, folded into
+# the uppercase alphanumeric alphabet a DMS ARN's resource id uses.
+sha2 = { workspace = true }
+# Opaque pagination markers: a describe's `Marker` is the hex of the ARN it resumes at.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

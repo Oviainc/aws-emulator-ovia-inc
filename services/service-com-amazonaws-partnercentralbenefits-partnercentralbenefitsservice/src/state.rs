@@ -1,11 +1,830 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-partnercentralbenefits-partnercentralbenefitsservice service.
+//!
+//! The service has two resources in this slice:
+//!
+//! * the **benefit catalog** — service-owned, read-only data. The API models no
+//!   `CreateBenefit`, so the catalogs and the benefits inside them are seeded here, at
+//!   state init, and `ListBenefits` reports them from the store like any other read.
+//! * the **benefit application** — created, updated, submitted and cancelled by the
+//!   caller. Every application is stored exactly once, keyed by its
+//!   `benappl-[0-9a-z]{14}` id inside the catalog it was created in, so each operation
+//!   reads and writes the one record.
+//!
+//! Timestamps are stored as epoch MILLISECONDS (`i64`) and rendered into the modelled
+//! `date-time` members with [`timestamp`] on the way out. Keeping an integer in the
+//! store (rather than a `DateTime`) is what lets [`bump_millis`] guarantee an update is
+//! *observably* later than the write before it even when both land inside one clock
+//! tick.
+
+use std::collections::{BTreeMap, HashMap};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use ::aws_smithy_types::{Document, Number};
+
+use crate::ops::types::{Contact, FileDetail, FileInput, Tag};
+
+/// This service's ARN namespace, from
+/// `smithy_query(query="service_info")` -> `arnNamespace: partnercentral`.
+pub const ARN_SERVICE: &str = "partnercentral";
+
+/// The region an ARN carries when the request names none; the emulator's documented
+/// default region.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// What a handler reports when the shared store cannot be reached. Each handler still
+/// builds its own modelled error (the generated error enums are per-operation), so this
+/// is the one part of that answer they share.
+pub const STORE_UNAVAILABLE: &str =
+    "the benefit application store is unavailable; retry the request";
+
+/// The prefix a benefit id carries, from the modelled `BenefitSummary$Id` pattern
+/// `^ben-[0-9a-z]{14}$`.
+pub const BENEFIT_ID_PREFIX: &str = "ben-";
+
+/// The prefix a benefit-application id carries, from the modelled
+/// `BenefitApplicationId` pattern `^benappl-[0-9a-z]{14}$`.
+pub const APPLICATION_ID_PREFIX: &str = "benappl-";
+
+/// How many characters follow the prefix in either id, from those same patterns.
+pub const ID_BODY_LEN: usize = 14;
+
+/// The characters an id body is built from: `[0-9a-z]`, from those same patterns.
+const ID_ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+/// The `BenefitApplicationStatus` a freshly created application carries — the one the
+/// enum names for an application the partner has not submitted yet.
+pub const STATUS_PENDING_SUBMISSION: &str = "PENDING_SUBMISSION";
+
+/// The `BenefitApplicationStatus` a submitted application carries while AWS reviews it.
+pub const STATUS_IN_REVIEW: &str = "IN_REVIEW";
+
+/// The terminal `BenefitApplicationStatus` of a cancelled application.
+pub const STATUS_CANCELED: &str = "CANCELED";
+
+/// The two `BenefitStatus` values the model declares (see
+/// `crate::ops::types::BENEFIT_STATUS_VALUES`).
+pub const BENEFIT_STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`BENEFIT_STATUS_ACTIVE`].
+pub const BENEFIT_STATUS_INACTIVE: &str = "INACTIVE";
+
+/// The largest page either list operation builds, and the size applied when the request
+/// names no `MaxResults`. It is the maximum of the modelled `MaxResults` range
+/// (`range {min: 1, max: 100}`), which the centralized walk already refuses values
+/// outside of.
+pub const MAX_PAGE_SIZE: i32 = 100;
+
+/// The most benefit applications this emulator holds in one catalog.
+///
+/// `CreateBenefitApplication` is the only operation that grows the store, so this is the
+/// bound that keeps it finite. AWS publishes no quota for it, so the number is CHOSEN:
+/// large enough that ordinary use never reaches it, small enough that a caller cannot
+/// grow the process's memory without limit. `client_tokens` holds at most one entry per
+/// application created, so it is bounded by the same count.
+pub const MAX_APPLICATIONS_PER_CATALOG: usize = 500;
+
+/// The deepest `BenefitApplicationDetails` document this service stores.
+///
+/// The member is modelled as an unconstrained `Document`, so its nesting is entirely
+/// caller-controlled and every walk over it is recursive. This is the bound that keeps
+/// such a walk from exhausting the stack; a create or update carrying a deeper document
+/// is refused with the modelled `ValidationException` rather than stored. Emulator
+/// resource guard, NOT an AWS quota.
+pub const MAX_DETAILS_DEPTH: usize = 32;
+
+/// The catalogs this service serves.
+///
+/// PartnerCentral models `Catalog` as a required input on every operation and offers no
+/// operation that creates one, so the set is fixed: `AWS` is the production catalog and
+/// `Sandbox` the test catalog that PartnerCentral's APIs document. A request naming any
+/// other catalog resolves to no catalog, and the handlers answer the modelled
+/// `ResourceNotFoundException`.
+pub const SEEDED_CATALOGS: &[&str] = &["AWS", "Sandbox"];
+
+/// One benefit in the seeded catalog, before its per-catalog id is derived.
+struct SeededBenefit {
+    name: &'static str,
+    description: &'static str,
+    programs: &'static [&'static str],
+    fulfillment_types: &'static [&'static str],
+    status: &'static str,
+    /// `BenefitRequestSchema` members: the field name and the JSON type a request for
+    /// this benefit must put in `BenefitApplicationDetails`.
+    schema: &'static [(&'static str, &'static str)],
+}
+
+/// The benefits every catalog is seeded with.
+///
+/// Each `fulfillment_types` entry is a value of the model's `FulfillmentType` enum
+/// (`crate::ops::types::FULFILLMENT_TYPE_VALUES`) and each `status` a value of its
+/// `BenefitStatus` enum (`crate::ops::types::BENEFIT_STATUS_VALUES`); a `programs` entry
+/// satisfies the modelled `Program` constraint (len 1..255, `^[A-Za-z0-9_-]+$`). The set
+/// deliberately spans every fulfillment type and both statuses, so a filtered
+/// `ListBenefits` has something to include and something to exclude.
+const SEEDED_BENEFITS: &[SeededBenefit] = &[
+    SeededBenefit {
+        name: "Marketing Development Funds",
+        description: "Cash funding for partner-led marketing campaigns.",
+        programs: &["AWS_PARTNER_NETWORK"],
+        fulfillment_types: &["CASH"],
+        status: BENEFIT_STATUS_ACTIVE,
+        schema: &[("CampaignName", "string"), ("RequestedAmount", "number")],
+    },
+    SeededBenefit {
+        name: "Promotional Credits",
+        description: "AWS promotional credits for customer proofs of concept.",
+        programs: &["ISV_ACCELERATE"],
+        fulfillment_types: &["CREDITS"],
+        status: BENEFIT_STATUS_ACTIVE,
+        schema: &[("CustomerName", "string"), ("RequestedCredits", "number")],
+    },
+    SeededBenefit {
+        name: "Partner Training Access",
+        description: "Seats in AWS partner training and certification programs.",
+        programs: &["AWS_PARTNER_NETWORK"],
+        fulfillment_types: &["ACCESS"],
+        status: BENEFIT_STATUS_ACTIVE,
+        schema: &[("SeatCount", "number")],
+    },
+    SeededBenefit {
+        name: "Migration Acceleration Funding",
+        description: "Funding and credits for migration engagements.",
+        programs: &["MIGRATION_ACCELERATION_PROGRAM"],
+        fulfillment_types: &["CASH", "CREDITS"],
+        status: BENEFIT_STATUS_ACTIVE,
+        schema: &[("WorkloadName", "string"), ("RequestedAmount", "number")],
+    },
+    SeededBenefit {
+        name: "Retired Innovation Sandbox",
+        description: "A retired sandbox benefit, kept for applications that reference it.",
+        programs: &["ISV_ACCELERATE"],
+        fulfillment_types: &["ACCESS"],
+        status: BENEFIT_STATUS_INACTIVE,
+        schema: &[],
+    },
+];
+
+/// File extension -> the `FileType` a `FileDetail` reports for it.
+///
+/// Every value is one of the model's own `FileType` enum values, whose catalog is
+/// `crate::ops::types::FILE_TYPE_VALUES`
+/// (`smithy_query(query="shape",shape="FileType")`): the enum is a list of media types,
+/// so the file's type is the media type its extension names. An extension not listed
+/// here leaves `FileType` absent rather than guessing one.
+const FILE_TYPES_BY_EXTENSION: &[(&str, &str)] = &[
+    ("csv", "text/csv"),
+    ("doc", "application/msword"),
+    (
+        "docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ),
+    ("jpeg", "image/jpeg"),
+    ("jpg", "image/jpeg"),
+    ("pdf", "application/pdf"),
+    ("png", "image/png"),
+    (
+        "pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ),
+    ("svg", "image/svg+xml"),
+    (
+        "xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ),
+];
+
+/// One benefit the service offers: seeded, read-only catalog data.
+#[derive(Debug, Clone)]
+pub struct Benefit {
+    /// `ben-` + 14 `[0-9a-z]` characters, derived from the catalog and the benefit's
+    /// name, so the same benefit keeps the same id across runs and two catalogs never
+    /// share one.
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub programs: Vec<String>,
+    /// `FulfillmentType` values.
+    pub fulfillment_types: Vec<String>,
+    pub benefit_request_schema: Option<Document>,
+    /// A `BenefitStatus` value.
+    pub status: String,
+}
+
+/// One stored benefit application: the single source of truth for every application
+/// operation.
+#[derive(Debug, Clone)]
+pub struct BenefitApplication {
+    pub id: String,
+    pub arn: String,
+    pub catalog: String,
+    /// The `ben-...` id of the benefit this application requests.
+    pub benefit_id: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    /// `FulfillmentType` values, as requested on the create.
+    pub fulfillment_types: Vec<String>,
+    pub benefit_application_details: Option<Document>,
+    /// The partner programs this application belongs to: the programs of the benefit it
+    /// requests, not a caller-supplied value — the model binds no `Programs` member on
+    /// any application input.
+    pub programs: Vec<String>,
+    /// A `BenefitApplicationStatus` value.
+    pub status: String,
+    /// The workflow stage. AWS sets it as its own review workflow advances and no input
+    /// member carries one, so it stays absent in this emulator.
+    pub stage: Option<String>,
+    pub status_reason: Option<String>,
+    pub status_reason_codes: Vec<String>,
+    pub created_at_millis: i64,
+    pub updated_at_millis: i64,
+    /// The optimistic-concurrency revision, rendered on the wire by
+    /// [`BenefitApplication::revision_text`].
+    pub revision: u64,
+    /// The revision the create minted. Replaying the create's `ClientToken` answers with
+    /// THIS revision, so a retry sees the first call's response even if the application
+    /// has been updated since.
+    pub created_revision: u64,
+    pub associated_resources: Vec<String>,
+    pub partner_contacts: Vec<Contact>,
+    pub file_details: Vec<FileDetail>,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl BenefitApplication {
+    /// The current revision as the modelled `Revision` string.
+    pub fn revision_text(&self) -> String {
+        self.revision.to_string()
+    }
+
+    /// The revision the create returned, as the modelled `Revision` string.
+    pub fn created_revision_text(&self) -> String {
+        self.created_revision.to_string()
+    }
+
+    /// Advance `UpdatedAt` past the previous write, without changing the revision.
+    ///
+    /// The revision is the optimistic-concurrency token `UpdateBenefitApplication`
+    /// checks, so only a change to the application's own content moves it (see
+    /// [`BenefitApplication::revise`]); a status transition the caller asked for records
+    /// only the time.
+    pub fn touch(&mut self, now_millis: i64) {
+        self.updated_at_millis = bump_millis(self.updated_at_millis, now_millis);
+    }
+
+    /// Record a content change: bump the revision and advance `UpdatedAt`.
+    pub fn revise(&mut self, now_millis: i64) {
+        self.revision = self.revision.saturating_add(1);
+        self.touch(now_millis);
+    }
+
+    /// A list member, omitted from the wire when nothing was ever stored for it.
+    pub fn optional_list<T: Clone>(values: &[T]) -> Option<Vec<T>> {
+        (!values.is_empty()).then(|| values.to_vec())
+    }
+
+    /// `BenefitApplicationSummary$BenefitApplicationDetails`, which the model types as
+    /// `Attributes` (`map<String, String>`) while the full record carries a `Document`.
+    ///
+    /// The summary therefore reports the stored document's top-level members, each
+    /// rendered by [`document_text`]. A document that is not an object has no top-level
+    /// members, so the summary omits the member rather than inventing one.
+    pub fn summary_details(&self) -> Option<HashMap<String, String>> {
+        let Document::Object(members) = self.benefit_application_details.as_ref()? else {
+            return None;
+        };
+        Some(
+            members
+                .iter()
+                .map(|(name, value)| (name.clone(), document_text(value)))
+                .collect(),
+        )
+    }
+
+    /// Whether this application carries at least one of `arns` in its associated
+    /// resources. An empty filter matches everything.
+    pub fn matches_resource_arns(&self, arns: &[String]) -> bool {
+        arns.is_empty()
+            || arns
+                .iter()
+                .any(|wanted| self.associated_resources.contains(wanted))
+    }
+}
+
+/// One benefit catalog: its seeded benefits, the applications created in it, and the
+/// `ClientToken`s those creates were made with.
+#[derive(Debug, Clone, Default)]
+pub struct Catalog {
+    /// Benefits by `ben-...` id, in one stable order so `ListBenefits` can page.
+    pub benefits: BTreeMap<String, Benefit>,
+    /// Applications by `benappl-...` id, in one stable order so
+    /// `ListBenefitApplications` can page.
+    pub applications: BTreeMap<String, BenefitApplication>,
+    /// `ClientToken` -> the application id the create it completed minted.
+    pub client_tokens: BTreeMap<String, String>,
+}
+
+impl Catalog {
+    /// The catalog named `catalog`, with [`SEEDED_BENEFITS`] in it.
+    fn seeded(catalog: &str) -> Self {
+        let benefits = SEEDED_BENEFITS
+            .iter()
+            .map(|seed| {
+                let id = benefit_id(catalog, seed.name);
+                let benefit = Benefit {
+                    id: id.clone(),
+                    name: seed.name.to_string(),
+                    description: seed.description.to_string(),
+                    programs: seed.programs.iter().map(|p| (*p).to_string()).collect(),
+                    fulfillment_types: seed
+                        .fulfillment_types
+                        .iter()
+                        .map(|t| (*t).to_string())
+                        .collect(),
+                    benefit_request_schema: benefit_request_schema(seed.schema),
+                    status: seed.status.to_string(),
+                };
+                (id, benefit)
+            })
+            .collect();
+        Self {
+            benefits,
+            applications: BTreeMap::new(),
+            client_tokens: BTreeMap::new(),
+        }
+    }
+
+    /// The id of the benefit `identifier` names, accepting either form the modelled
+    /// `BenefitId` pattern allows (`^(arn:.+|ben-[0-9a-z]{14})$`): the bare id, or a
+    /// benefit ARN of this catalog. `None` when this catalog holds no such benefit.
+    pub fn resolve_benefit_id(&self, catalog: &str, identifier: &str) -> Option<String> {
+        let id = if identifier.starts_with("arn:") {
+            let (arn_catalog, arn_id) = parse_resource_arn(identifier, BENEFIT_RESOURCE)?;
+            if arn_catalog != catalog {
+                return None;
+            }
+            arn_id.to_string()
+        } else {
+            identifier.to_string()
+        };
+        self.benefits.contains_key(&id).then_some(id)
+    }
+}
+
+/// The resource-type segment a benefit ARN carries.
+pub const BENEFIT_RESOURCE: &str = "benefit";
+/// The resource-type segment a benefit-application ARN carries.
+pub const APPLICATION_RESOURCE: &str = "benefit-application";
 
 /// Per-service state for com-amazonaws-partnercentralbenefits-partnercentralbenefitsservice. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+///
+/// BOUNDED: `CreateBenefitApplication` refuses a create that would take a catalog past
+/// [`MAX_APPLICATIONS_PER_CATALOG`], the catalog set is fixed by [`SEEDED_CATALOGS`], and
+/// `arns` and `client_tokens` carry at most one entry per stored application — so no
+/// caller can grow this store without limit.
+#[derive(Debug)]
 pub struct ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
-    // TODO: add service-specific state fields
+    /// Every catalog, keyed by the `Catalog` input string.
+    pub catalogs: BTreeMap<String, Catalog>,
+    /// Application ARN -> (catalog, application id), so an `Identifier` given as an ARN
+    /// resolves to the same record as the bare id.
+    pub arns: HashMap<String, (String, String)>,
+    /// Monotonic counter feeding [`Self::mint_application_id`]; it is what makes a minted
+    /// id unique even within one clock tick.
+    id_sequence: u64,
+}
+
+impl Default for ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
+    /// The benefit catalog is service-owned — the API models no `CreateBenefit` — so it
+    /// is seeded here, where the engine first touches this service's state.
+    fn default() -> Self {
+        Self {
+            catalogs: SEEDED_CATALOGS
+                .iter()
+                .map(|name| ((*name).to_string(), Catalog::seeded(name)))
+                .collect(),
+            arns: HashMap::new(),
+            id_sequence: 0,
+        }
+    }
+}
+
+impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
+    /// The application `identifier` names inside `catalog`, accepting either form the
+    /// modelled `BenefitApplicationIdentifier` allows (`^(arn:.+|benappl-[0-9a-z]{14})$`).
+    ///
+    /// An ARN must match a stored ARN exactly, so an ARN naming another partition,
+    /// region or account resolves to nothing rather than to the application that happens
+    /// to share its id segment — and an ARN whose catalog is not the one the request
+    /// named resolves to nothing either.
+    pub fn resolve_application_id(&self, catalog: &str, identifier: &str) -> Option<String> {
+        if identifier.starts_with("arn:") {
+            return self
+                .arns
+                .get(identifier)
+                .filter(|(arn_catalog, _)| arn_catalog == catalog)
+                .map(|(_, id)| id.clone());
+        }
+        self.catalogs
+            .get(catalog)
+            .filter(|stored| stored.applications.contains_key(identifier))
+            .map(|_| identifier.to_string())
+    }
+
+    /// The application `identifier` names, for a reporting operation.
+    pub fn application(&self, catalog: &str, identifier: &str) -> Option<&BenefitApplication> {
+        let id = self.resolve_application_id(catalog, identifier)?;
+        self.catalogs.get(catalog)?.applications.get(&id)
+    }
+
+    /// The application `identifier` names, for an operation the spec says mutates it.
+    ///
+    /// `id`, `arn` and `catalog` are this record's identity — the store is keyed on the
+    /// id and `arns` on the ARN — so none of them may be reassigned through this handle.
+    /// No operation needs to: the model binds no member that moves an application
+    /// between catalogs.
+    pub fn application_mut(
+        &mut self,
+        catalog: &str,
+        identifier: &str,
+    ) -> Option<&mut BenefitApplication> {
+        let id = self.resolve_application_id(catalog, identifier)?;
+        self.catalogs.get_mut(catalog)?.applications.get_mut(&id)
+    }
+
+    /// Store a newly created application and index it by ARN and by `ClientToken`.
+    ///
+    /// `None` when the catalog does not exist, which a handler has already refused.
+    pub fn insert_application(&mut self, client_token: String, application: BenefitApplication) {
+        self.arns.insert(
+            application.arn.clone(),
+            (application.catalog.clone(), application.id.clone()),
+        );
+        if let Some(catalog) = self.catalogs.get_mut(&application.catalog) {
+            catalog
+                .client_tokens
+                .insert(client_token, application.id.clone());
+            catalog
+                .applications
+                .insert(application.id.clone(), application);
+        }
+    }
+
+    /// A `benappl-[0-9a-z]{14}` id no stored application is using.
+    ///
+    /// The sequence number makes two ids minted in the same millisecond differ, and the
+    /// mixing step keeps them from being consecutive, so a caller cannot derive the next
+    /// id from the last.
+    pub fn mint_application_id(&mut self, now_millis: i64) -> String {
+        for _ in 0..1024 {
+            self.id_sequence = self.id_sequence.wrapping_add(1);
+            let seed = splitmix64((now_millis as u64) ^ self.id_sequence.rotate_left(17));
+            let candidate = format!("{APPLICATION_ID_PREFIX}{}", id_body(seed));
+            if !self.holds_application(&candidate) {
+                return candidate;
+            }
+        }
+        // Bounded fallback, so a pathological clock can never spin here: the
+        // zero-padded decimals are also `[0-9a-z]{14}`, and there are always more of
+        // them than there are stored applications.
+        (0u64..=self.application_count() as u64)
+            .map(|n| format!("{APPLICATION_ID_PREFIX}{n:014}"))
+            .find(|candidate| !self.holds_application(candidate))
+            .unwrap_or_else(|| format!("{APPLICATION_ID_PREFIX}{:014}", self.application_count()))
+    }
+
+    fn holds_application(&self, id: &str) -> bool {
+        self.catalogs
+            .values()
+            .any(|catalog| catalog.applications.contains_key(id))
+    }
+
+    fn application_count(&self) -> usize {
+        self.catalogs
+            .values()
+            .map(|catalog| catalog.applications.len())
+            .sum()
+    }
+}
+
+/// The `BenefitRequestSchema` document for a seeded benefit's field list, or `None` when
+/// the benefit declares no fields.
+///
+/// A JSON-Schema-shaped object: `{"type":"object","properties":{"<field>":{"type":"<t>"}}}`.
+fn benefit_request_schema(fields: &[(&str, &str)]) -> Option<Document> {
+    if fields.is_empty() {
+        return None;
+    }
+    let properties: HashMap<String, Document> = fields
+        .iter()
+        .map(|(name, json_type)| {
+            let mut property = HashMap::new();
+            property.insert(
+                "type".to_string(),
+                Document::String((*json_type).to_string()),
+            );
+            ((*name).to_string(), Document::Object(property))
+        })
+        .collect();
+    let mut schema = HashMap::new();
+    schema.insert("type".to_string(), Document::String("object".to_string()));
+    schema.insert("properties".to_string(), Document::Object(properties));
+    Some(Document::Object(schema))
+}
+
+/// A document rendered as one string, for the `map<String, String>` the application
+/// summary models: a string is itself, a scalar is its literal text, and a nested array
+/// or object is its compact JSON text.
+pub fn document_text(value: &Document) -> String {
+    match value {
+        Document::String(text) => text.clone(),
+        other => document_json(other, MAX_DETAILS_DEPTH),
+    }
+}
+
+/// `value` as compact JSON text, with the levels this walk may still descend.
+///
+/// Bounded by `budget` so the recursion cannot exhaust the stack on a caller-supplied
+/// document; a create or update already refused anything deeper than
+/// [`MAX_DETAILS_DEPTH`], so the exhausted arm is unreachable for a stored document.
+fn document_json(value: &Document, budget: usize) -> String {
+    let Some(next) = budget.checked_sub(1) else {
+        return "null".to_string();
+    };
+    match value {
+        Document::Null => "null".to_string(),
+        Document::Bool(flag) => flag.to_string(),
+        Document::Number(number) => match number {
+            Number::PosInt(n) => n.to_string(),
+            Number::NegInt(n) => n.to_string(),
+            Number::Float(n) => n.to_string(),
+        },
+        Document::String(text) => {
+            // `serde_json` is this crate's JSON writer; a string is the one scalar that
+            // needs escaping.
+            ::serde_json::Value::String(text.clone()).to_string()
+        }
+        Document::Array(items) => {
+            let rendered: Vec<String> = items
+                .iter()
+                .map(|item| document_json(item, next))
+                .collect();
+            format!("[{}]", rendered.join(","))
+        }
+        Document::Object(members) => {
+            // Sorted, so the rendering of one document is stable between reads.
+            let mut rendered: Vec<String> = members
+                .iter()
+                .map(|(name, member)| {
+                    format!(
+                        "{}:{}",
+                        ::serde_json::Value::String(name.clone()),
+                        document_json(member, next)
+                    )
+                })
+                .collect();
+            rendered.sort();
+            format!("{{{}}}", rendered.join(","))
+        }
+    }
+}
+
+/// Why a supplied `BenefitApplicationDetails` cannot be stored, or `None` when it can.
+///
+/// The one rule: the document must nest no deeper than [`MAX_DETAILS_DEPTH`]. Both
+/// operations that accept the member apply it, each rendering the refusal as its own
+/// modelled `ValidationException`.
+pub fn details_rejection(details: Option<&Document>) -> Option<String> {
+    let fits = details.is_none_or(|document| document_fits(document, MAX_DETAILS_DEPTH));
+    (!fits).then(|| {
+        format!(
+            "BenefitApplicationDetails nests deeper than the {MAX_DETAILS_DEPTH} levels this service accepts"
+        )
+    })
+}
+
+/// Whether `value` nests no deeper than `budget` levels.
+fn document_fits(value: &Document, budget: usize) -> bool {
+    let Some(next) = budget.checked_sub(1) else {
+        return false;
+    };
+    match value {
+        Document::Array(items) => items.iter().all(|item| document_fits(item, next)),
+        Document::Object(members) => members.values().all(|member| document_fits(member, next)),
+        _ => true,
+    }
+}
+
+/// The stored `FileDetail` for one supplied `FileInput`.
+///
+/// `FileURI` and `BusinessUseCase` are the caller's own values; `FileName` and `FileType`
+/// are derived from the URI (see [`file_name_of`] and [`file_type_of`]); `CreatedBy` and
+/// `CreatedAt` record who attached the file and when. `FileStatus`/`FileStatusReason`
+/// stay absent: nothing in this emulator processes an attachment, so there is no status
+/// to report.
+pub fn file_detail(input: &FileInput, created_by: &str, now_millis: i64) -> FileDetail {
+    FileDetail {
+        file_uri: input.file_uri.clone(),
+        business_use_case: input.business_use_case.clone(),
+        file_name: file_name_of(&input.file_uri),
+        file_status: None,
+        file_status_reason: None,
+        file_type: file_type_of(&input.file_uri),
+        created_by: Some(created_by.to_string()),
+        created_at: Some(timestamp(now_millis)),
+    }
+}
+
+/// The last path segment of `uri`, which is the file's name, with any query or fragment
+/// removed. `None` when the URI names no segment, or one outside the modelled
+/// `FileDetail$FileName` length (1..255).
+pub fn file_name_of(uri: &str) -> Option<String> {
+    let path = uri
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(uri)
+        .trim_end_matches('/');
+    let name = path.rsplit('/').next()?;
+    (1..=255).contains(&name.len()).then(|| name.to_string())
+}
+
+/// The `FileType` the extension of `uri` names, or `None` for an extension
+/// [`FILE_TYPES_BY_EXTENSION`] does not list.
+pub fn file_type_of(uri: &str) -> Option<String> {
+    let name = file_name_of(uri)?;
+    let extension = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    FILE_TYPES_BY_EXTENSION
+        .iter()
+        .find(|(candidate, _)| *candidate == extension)
+        .map(|(_, file_type)| (*file_type).to_string())
+}
+
+/// The id of the benefit named `name` in `catalog`: `ben-` + 14 `[0-9a-z]` characters
+/// derived from both, so the id is stable across runs and distinct per catalog.
+fn benefit_id(catalog: &str, name: &str) -> String {
+    let seed = fnv1a64(format!("{catalog}/{name}").as_bytes());
+    format!("{BENEFIT_ID_PREFIX}{}", id_body(seed))
+}
+
+/// [`ID_BODY_LEN`] characters drawn from [`ID_ALPHABET`] by mixing `seed`.
+fn id_body(seed: u64) -> String {
+    let mut state = seed;
+    (0..ID_BODY_LEN)
+        .map(|_| {
+            state = splitmix64(state);
+            ID_ALPHABET[(state % ID_ALPHABET.len() as u64) as usize] as char
+        })
+        .collect()
+}
+
+/// FNV-1a, a standard 64-bit non-cryptographic hash. Used only to derive a seeded
+/// benefit's id from its name, so it must be STABLE across processes — which rules out
+/// `std`'s `DefaultHasher`, whose output is not specified.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// SplitMix64, a standard 64-bit mixing function: a bijection on `u64`, so distinct
+/// inputs always give distinct outputs. Used only to scatter minted identifiers.
+fn splitmix64(input: u64) -> u64 {
+    let mut z = input.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The current wall-clock instant as epoch milliseconds.
+pub fn now_millis() -> i64 {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// The new `UpdatedAt` for a record last written at `previous`.
+///
+/// `now` unless the clock has not advanced since `previous`, in which case one
+/// millisecond past `previous` — so an update is always observably later than the write
+/// before it, which is what a caller comparing two reads relies on.
+pub fn bump_millis(previous: i64, now: i64) -> i64 {
+    now.max(previous.saturating_add(1))
+}
+
+/// Render a stored epoch-millisecond instant as the modelled `date-time` timestamp.
+pub fn timestamp(millis: i64) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from_millis(millis)
+}
+
+/// The region this request was signed for, for the ARNs the response carries.
+///
+/// A signed AWS SDK request names it in the SigV4 credential scope; an unsigned one
+/// names none, so [`DEFAULT_REGION`] stands in. The scope is caller-controlled text and
+/// the value lands inside an ARN whose modelled pattern allows only
+/// `[a-z]{2}(-gov)?-[a-z]+-\d` there, so anything else is refused here and the default
+/// used instead: a generated ARN can never carry text the model does not admit.
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .filter(|region| is_modelled_region(region))
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Whether `region` is a value the modelled `Arn` pattern admits in its region field:
+/// `([a-z]{2}(-gov)?-[a-z]+-\d{1})?`.
+fn is_modelled_region(region: &str) -> bool {
+    let mut fields: Vec<&str> = region.split('-').collect();
+    let Some(digit) = fields.pop() else {
+        return false;
+    };
+    if digit.len() != 1 || !digit.as_bytes()[0].is_ascii_digit() {
+        return false;
+    }
+    let lowercase_alpha =
+        |field: &str| !field.is_empty() && field.bytes().all(|b| b.is_ascii_lowercase());
+    match fields.as_slice() {
+        [prefix, area] => prefix.len() == 2 && lowercase_alpha(prefix) && lowercase_alpha(area),
+        [prefix, gov, area] => {
+            prefix.len() == 2 && lowercase_alpha(prefix) && *gov == "gov" && lowercase_alpha(area)
+        }
+        _ => false,
+    }
+}
+
+/// The principal that attached a file, for `FileDetail$CreatedBy`.
+///
+/// Derived from the request's own SigV4 access key id, so the member reports who called
+/// rather than a fabricated identity. That id is caller-controlled text, so it is first
+/// reduced to the characters an access key id can hold; the rendering then satisfies the
+/// member's modelled 1..255 length by construction, whatever the header said.
+pub fn caller_principal(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    let raw = ::engine::extract_akid(&ctx.parts().headers);
+    let filtered: String = raw
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(64)
+        .collect();
+    let akid = if filtered.is_empty() {
+        "default"
+    } else {
+        filtered.as_str()
+    };
+    ::engine::emulator_arn("iam", "", &format!("user/{akid}"))
+}
+
+/// The ARN of the benefit application `id` of `catalog`, in `region`.
+pub fn application_arn(region: &str, catalog: &str, id: &str) -> String {
+    resource_arn(region, catalog, APPLICATION_RESOURCE, id)
+}
+
+/// The ARN of the benefit `id` of `catalog`, in `region`.
+pub fn benefit_arn(region: &str, catalog: &str, id: &str) -> String {
+    resource_arn(region, catalog, BENEFIT_RESOURCE, id)
+}
+
+/// `arn:aws:partnercentral:{region}:{account}:catalog/{catalog}/{resource}/{id}`.
+///
+/// The `catalog/...` resource shape is the one the modelled
+/// `ListTagsForResource$resourceArn` pattern declares for this service
+/// (`^arn:[\w+=/,.@-]+:partnercentral:[\w+=/,.@-]*:[0-9]{12}:catalog/([a-zA-Z]+)/[\w+=,.@-]+(/[\w+=,.@-]+)*$`),
+/// so one ARN form serves both the resource members and the tagging operations.
+fn resource_arn(region: &str, catalog: &str, resource: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("catalog/{catalog}/{resource}/{id}"),
+    )
+}
+
+/// The `(catalog, id)` an ARN of this service's `resource` type names, or `None` when
+/// `arn` is not one.
+pub fn parse_resource_arn<'a>(arn: &'a str, resource: &str) -> Option<(&'a str, &'a str)> {
+    let mut fields = arn.splitn(6, ':');
+    let (prefix, _partition, service, _region, _account, tail) = (
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+    );
+    if prefix != "arn" || service != ARN_SERVICE {
+        return None;
+    }
+    let mut segments = tail.split('/');
+    if segments.next()? != "catalog" {
+        return None;
+    }
+    let catalog = segments.next()?;
+    if segments.next()? != resource {
+        return None;
+    }
+    let id = segments.next()?;
+    (segments.next().is_none()).then_some((catalog, id))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -13,8 +832,89 @@ pub struct ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState 
 /// Answer `None` with a modelled server error, never with a fresh engine.
 pub fn service_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
-) -> Option<::engine::ServiceState<ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState>> {
+) -> Option<::engine::ServiceState<ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState>>
+{
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState>)
+}
+
+/// The tags a create supplied, as the store keeps them.
+pub fn tag_map(tags: Option<&Vec<Tag>>) -> BTreeMap<String, String> {
+    tags.map(|tags| {
+        tags.iter()
+            .map(|tag| (tag.key.clone(), tag.value.clone()))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Whether `values` carries at least one entry of `filter`. An empty or absent filter
+/// matches everything, which is what an omitted list filter means on the wire.
+pub fn matches_any(filter: Option<&Vec<String>>, values: &[String]) -> bool {
+    match filter {
+        None => true,
+        Some(filter) if filter.is_empty() => true,
+        Some(filter) => filter.iter().any(|wanted| values.contains(wanted)),
+    }
+}
+
+/// The `ValidationExceptionReason` a refusal of one input member carries; a value of the
+/// model's own `ValidationExceptionReason` enum (see
+/// `crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`).
+pub const VALIDATION_REASON_FIELD: &str = "fieldValidationFailed";
+
+/// The `ValidationExceptionField$Code` for a member whose value is not one this service
+/// accepts; a value of the model's own `ValidationExceptionErrorCode` enum (see
+/// `crate::ops::types::VALIDATION_EXCEPTION_ERROR_CODE_VALUES`).
+pub const VALIDATION_CODE_INVALID_VALUE: &str = "INVALID_VALUE";
+
+/// A one-member `FieldList` for a `ValidationException`, so a client can see WHICH
+/// member it must fix rather than only the message.
+pub fn validation_field(
+    name: &str,
+    message: &str,
+    code: &str,
+) -> Vec<crate::ops::types::ValidationExceptionField> {
+    vec![crate::ops::types::ValidationExceptionField {
+        name: name.to_string(),
+        message: message.to_string(),
+        code: Some(code.to_string()),
+    }]
+}
+
+/// The page size a list operation uses, from the `MaxResults` the request asked for.
+///
+/// `MaxResults` is modelled `range(1..100)`, so the centralized walk is the enforcement
+/// point and has already refused anything outside it; the modelled maximum stands in when
+/// the request names none. The clamp is belt-and-braces for that unreachable case, so a
+/// page can never be zero-sized (an empty page carrying a `NextToken` would make a paging
+/// caller loop forever).
+pub fn page_size(max_results: Option<i32>) -> usize {
+    let requested = max_results.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE);
+    usize::try_from(requested).unwrap_or(1)
+}
+
+/// A pagination token naming the record the NEXT page starts at.
+///
+/// The modelled `NextToken` is opaque, so the id is hex-encoded rather than handed back
+/// in the clear — opaque to a caller, not secret: hex is trivially reversible and the
+/// token carries nothing beyond a record id. The characters it produces sit well inside
+/// the member's modelled 1..2048 length.
+pub fn encode_page_token(id: &str) -> String {
+    ::hex::encode(id)
+}
+
+/// The record id a pagination token names, or `None` when the token is not one this
+/// service issued for a record of `prefix`'s kind.
+pub fn decode_page_token(token: &str, prefix: &str) -> Option<String> {
+    let decoded = ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())?;
+    let body = decoded.strip_prefix(prefix)?;
+    (body.len() == ID_BODY_LEN
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+    .then_some(decoded)
 }

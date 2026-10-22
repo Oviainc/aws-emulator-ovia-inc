@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMigrationTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMigrationTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMigrationTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: enumerates the migration tasks persisted in the store held by
+//! [`crate::state`], one page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +166,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMigrationTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMigrationTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMigrationTasks"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListMigrationTasksErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "the Migration Hub progress update stream store is unavailable".into(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // The cursor names the LAST key the previous page returned, so this page
+        // resumes strictly after it. An absent or empty token starts at the beginning
+        // (the modelled `Token` shape has length 0..2048, so "" is a legal value); a
+        // token this service did not issue is a bad input, not an empty page.
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => match crate::state::decode_cursor(token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListMigrationTasksErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                "NextToken is not a pagination token issued by ListMigrationTasks"
+                                    .into(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // `MaxResults` is modelled with range 1..100 and no default, so the modelled
+        // maximum is the page size a caller who names none gets. The clamp is
+        // belt-and-braces: the boundary validator already refuses values outside it.
+        const MAX_RESULTS_LIMIT: i32 = 100;
+        let page_size = input
+            .max_results
+            .unwrap_or(MAX_RESULTS_LIMIT)
+            .clamp(1, MAX_RESULTS_LIMIT) as usize;
+
+        let mut summaries: Vec<MigrationTaskSummary> = Vec::new();
+        let mut last_key: Option<(String, String)> = None;
+        let mut next_token: Option<String> = None;
+
+        for task in state.tasks_in_key_order() {
+            // `ResourceName` filters by DISCOVERED RESOURCE name, so a task matches
+            // only through an association `AssociateDiscoveredResource` recorded (that
+            // operation is still scaffolded, so today the filter selects nothing).
+            if let Some(resource_name) = input.resource_name.as_deref() {
+                if !task
+                    .discovered_resources
+                    .iter()
+                    .any(|resource| resource.configuration_id == resource_name)
+                {
+                    continue;
+                }
+            }
+
+            let key = (
+                task.progress_update_stream.as_str(),
+                task.migration_task_name.as_str(),
+            );
+            if let Some((stream, name)) = resume_after.as_ref() {
+                if key <= (stream.as_str(), name.as_str()) {
+                    continue;
+                }
+            }
+
+            if summaries.len() == page_size {
+                // There is at least one more match beyond this page, so hand back a
+                // cursor on the last key returned. The last page gets no token.
+                next_token = last_key
+                    .as_ref()
+                    .map(|(stream, name)| crate::state::encode_cursor(stream, name));
+                break;
+            }
+
+            summaries.push(MigrationTaskSummary {
+                progress_update_stream: Some(task.progress_update_stream.clone()),
+                migration_task_name: Some(task.migration_task_name.clone()),
+                // Every summary field is DERIVED from the state the task's last
+                // notification stored; a task never notified reports none of them.
+                status: task.task.as_ref().map(|state| state.status.clone()),
+                progress_percent: task.task.as_ref().and_then(|state| state.progress_percent),
+                status_detail: task
+                    .task
+                    .as_ref()
+                    .and_then(|state| state.status_detail.clone()),
+                update_date_time: task.update_date_time,
+            });
+            last_key = Some((
+                task.progress_update_stream.clone(),
+                task.migration_task_name.clone(),
+            ));
+        }
+
+        Ok(ListMigrationTasksOutput {
+            next_token,
+            migration_task_summary_list: Some(summaries),
+        })
     }
 }

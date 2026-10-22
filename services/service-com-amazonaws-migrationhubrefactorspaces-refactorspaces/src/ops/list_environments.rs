@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEnvironments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEnvironments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEnvironments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `EnvironmentSummary` per stored environment, in creation order, cut into
+//! the page `maxResults` and `nextToken` name.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +147,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEnvironments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEnvironmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEnvironments"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEnvironmentsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Refactor Spaces store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+        // Reporting only: see the note in `get_environment.rs`.
+        state.materialise_due_states();
+
+        let page = crate::state::page(
+            &state.environments,
+            |environment| environment.environment_id.as_str(),
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|error| {
+            ListEnvironmentsErrorModeled::ValidationException(ValidationException {
+                message: match error {
+                    crate::state::PageError::UnknownToken => {
+                        "nextToken does not resume a listing of this account's environments"
+                            .to_string()
+                    }
+                    crate::state::PageError::MaxResultsNotPositive => {
+                        "maxResults must be between 1 and 100".to_string()
+                    }
+                },
+            })
+        })?;
+
+        Ok(ListEnvironmentsOutput {
+            // An empty store answers an empty list, not an error.
+            environment_summary_list: Some(page.items.iter().map(summary_of).collect()),
+            next_token: page.next_token,
+        })
+    }
+}
+
+/// Project a stored environment onto the `EnvironmentSummary` this listing reports.
+fn summary_of(environment: &crate::state::Environment) -> EnvironmentSummary {
+    EnvironmentSummary {
+        name: Some(environment.name.clone()),
+        arn: Some(environment.arn.clone()),
+        description: environment.description.clone(),
+        environment_id: Some(environment.environment_id.clone()),
+        network_fabric_type: Some(environment.network_fabric_type.clone()),
+        owner_account_id: Some(environment.owner_account_id.clone()),
+        transit_gateway_id: environment.transit_gateway_id.clone(),
+        state: Some(environment.state.clone()),
+        tags: (!environment.tags.is_empty())
+            .then(|| environment.tags.clone().into_iter().collect()),
+        // `Error` reports a failure attached to the resource; a stored environment this
+        // emulator never fails carries none.
+        error: None,
+        last_updated_time: Some(environment.last_updated_time),
+        created_time: Some(environment.created_time),
     }
 }

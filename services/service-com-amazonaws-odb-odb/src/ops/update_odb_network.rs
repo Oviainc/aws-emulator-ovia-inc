@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateOdbNetwork
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateOdbNetwork`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateOdbNetwork::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the persisted ODB network a `ResourceIdOrArn` addresses — display name,
+//! peered CIDRs, access flags, policy documents and cross-Region restore sources — so a
+//! following `GetOdbNetwork` reports the change.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +177,230 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateOdbNetwork` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateOdbNetworkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateOdbNetwork"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateOdbNetworkErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the odb emulator is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // `displayName`'s `@pattern` is written with a negative lookahead, which the
+        // boundary validator's regex engine cannot compile — it passes such a pattern
+        // unchecked, so the constraint is enforced here.
+        if let Some(display_name) = input.display_name.as_deref() {
+            if !crate::state::display_name_matches(display_name) {
+                return Err(field_validation(
+                    "displayName",
+                    &format!(
+                        "Value '{}' does not satisfy the constraint: Member must satisfy regular \
+                         expression pattern: {}",
+                        display_name,
+                        crate::state::RESOURCE_DISPLAY_NAME_PATTERN
+                    ),
+                ));
+            }
+        }
+
+        // The access flags drive the `managedServices` view a read answers with, so an
+        // unmodelled value cannot be stored.
+        let s3_access = checked_access("s3Access", input.s3_access.as_deref())?;
+        let zero_etl_access = checked_access("zeroEtlAccess", input.zero_etl_access.as_deref())?;
+        let sts_access = checked_access("stsAccess", input.sts_access.as_deref())?;
+        let kms_access = checked_access("kmsAccess", input.kms_access.as_deref())?;
+
+        // A cross-Region restore source names an Amazon Web Services Region; an
+        // arbitrary caller string is refused rather than persisted.
+        let restore_sources_to_enable =
+            region_names("crossRegionS3RestoreSourcesToEnable", input
+                .cross_region_s3_restore_sources_to_enable
+                .as_deref())?;
+
+        let mut guard = state.lock();
+        let Some(record) = guard.odb_network_mut(&input.odb_network_id) else {
+            return Err(UpdateOdbNetworkErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("ODB network {} was not found", input.odb_network_id),
+                    resource_id: input.odb_network_id.clone(),
+                    resource_type: crate::state::ODB_NETWORK_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A peered CIDR is the CIDR range of a VPC being connected to the ODB network,
+        // and the model documents that such a range "must not overlap with the CIDR
+        // range of the client subnet" (nor of the backup subnet). Each range is stored
+        // in its canonical form, so two spellings of one range are one entry.
+        let subnets: Vec<(&str, String)> = [
+            ("clientSubnetCidr", Some(record.client_subnet_cidr.clone())),
+            ("backupSubnetCidr", record.backup_subnet_cidr.clone()),
+        ]
+        .into_iter()
+        .filter_map(|(member, cidr)| cidr.map(|cidr| (member, cidr)))
+        .collect();
+        let mut peered_to_add: Vec<String> = Vec::new();
+        for candidate in input.peered_cidrs_to_be_added.iter().flatten() {
+            let Some(peered) = crate::state::parse_cidr(candidate) else {
+                return Err(field_validation(
+                    "peeredCidrsToBeAdded",
+                    &format!("Value '{candidate}' is not an IPv4 CIDR range"),
+                ));
+            };
+            for (member, subnet) in &subnets {
+                let overlaps = crate::state::parse_cidr(subnet)
+                    .is_some_and(|subnet| crate::state::cidrs_overlap(peered, subnet));
+                if overlaps {
+                    return Err(field_validation(
+                        "peeredCidrsToBeAdded",
+                        &format!(
+                            "CIDR range {candidate} overlaps {member} {subnet} of this ODB network"
+                        ),
+                    ));
+                }
+            }
+            peered_to_add.push(peered.to_string());
+        }
+
+        if let Some(display_name) = input.display_name.as_deref() {
+            record.display_name = display_name.to_string();
+        }
+        // Removals are applied before additions, so a range named in both lists ends up
+        // peered. A removal is matched in canonical form too, since that is how the
+        // range was stored.
+        if let Some(removed) = input.peered_cidrs_to_be_removed.as_ref() {
+            let removed: Vec<String> = removed
+                .iter()
+                .filter_map(|cidr| crate::state::canonical_cidr(cidr))
+                .collect();
+            record
+                .peered_cidrs
+                .retain(|peered| !removed.contains(peered));
+        }
+        let Some(peered_cidrs) = crate::state::extended_within(
+            &record.peered_cidrs,
+            &peered_to_add,
+            crate::state::MAX_PEERED_CIDRS_PER_ODB_NETWORK,
+        ) else {
+            return Err(field_validation(
+                "peeredCidrsToBeAdded",
+                &format!(
+                    "An ODB network holds at most {} peered CIDR ranges",
+                    crate::state::MAX_PEERED_CIDRS_PER_ODB_NETWORK
+                ),
+            ));
+        };
+        record.peered_cidrs = peered_cidrs;
+        if let Some(access) = s3_access {
+            record.s3_access = access;
+        }
+        if let Some(access) = zero_etl_access {
+            record.zero_etl_access = access;
+        }
+        if let Some(access) = sts_access {
+            record.sts_access = access;
+        }
+        if let Some(access) = kms_access {
+            record.kms_access = access;
+        }
+        if let Some(document) = input.s3_policy_document.as_deref() {
+            record.s3_policy_document = Some(document.to_string());
+        }
+        if let Some(document) = input.sts_policy_document.as_deref() {
+            record.sts_policy_document = Some(document.to_string());
+        }
+        if let Some(document) = input.kms_policy_document.as_deref() {
+            record.kms_policy_document = Some(document.to_string());
+        }
+        if let Some(disabled) = input.cross_region_s3_restore_sources_to_disable.as_ref() {
+            record
+                .cross_region_s3_restore_sources
+                .retain(|region| !disabled.contains(region));
+        }
+        let Some(restore_sources) = crate::state::extended_within(
+            &record.cross_region_s3_restore_sources,
+            &restore_sources_to_enable,
+            crate::state::MAX_CROSS_REGION_RESTORE_SOURCES_PER_ODB_NETWORK,
+        ) else {
+            return Err(field_validation(
+                "crossRegionS3RestoreSourcesToEnable",
+                &format!(
+                    "An ODB network holds at most {} cross-Region Amazon S3 restore sources",
+                    crate::state::MAX_CROSS_REGION_RESTORE_SOURCES_PER_ODB_NETWORK
+                ),
+            ));
+        };
+        record.cross_region_s3_restore_sources = restore_sources;
+
+        // The network is `UPDATING` while the change is applied; the clock owes it
+        // `AVAILABLE` after `TRANSITION_SPAN`.
+        record.begin_transition(crate::state::STATUS_UPDATING);
+
+        Ok(UpdateOdbNetworkOutput {
+            odb_network_id: record.odb_network_id.clone(),
+            display_name: Some(record.display_name.clone()),
+            status: Some(record.status.clone()),
+            status_reason: record.status_reason.clone(),
+        })
+    }
+}
+
+/// A modelled `ValidationException` (HTTP 400) naming the member that failed and the
+/// constraint it failed, the way the service's own boundary validator words one.
+fn field_validation(member: &str, message: &str) -> UpdateOdbNetworkError {
+    UpdateOdbNetworkErrorModeled::ValidationException(ValidationException {
+        message: format!("{member}: {message}"),
+        reason: "fieldValidationFailed".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: message.to_string(),
+        }]),
+    })
+    .into()
+}
+
+/// The Region names a cross-Region restore-source member carries, refusing a value that
+/// is not an Amazon Web Services Region name.
+fn region_names(
+    member: &str,
+    values: Option<&[String]>,
+) -> Result<Vec<String>, UpdateOdbNetworkError> {
+    let mut regions = Vec::new();
+    for value in values.unwrap_or_default() {
+        if !crate::state::is_region_name(value) {
+            return Err(field_validation(
+                member,
+                &format!(
+                    "Value '{value}' is not an Amazon Web Services Region name (pattern: {})",
+                    crate::state::AWS_REGION_PATTERN
+                ),
+            ));
+        }
+        regions.push(value.clone());
+    }
+    Ok(regions)
+}
+
+/// The `Access` value this member carries, or `None` when the request leaves the access
+/// configuration alone — an update replaces only what it names.
+fn checked_access(
+    member: &str,
+    value: Option<&str>,
+) -> Result<Option<String>, UpdateOdbNetworkError> {
+    match value {
+        None => Ok(None),
+        Some(value) if ACCESS_VALUES.contains(&value) => Ok(Some(value.to_string())),
+        Some(value) => Err(field_validation(
+            member,
+            &format!(
+                "Value '{}' is not a member of Access: {}",
+                value,
+                ACCESS_VALUES.join(" | ")
+            ),
+        )),
     }
 }

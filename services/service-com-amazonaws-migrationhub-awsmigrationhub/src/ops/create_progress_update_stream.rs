@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProgressUpdateStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProgressUpdateStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProgressUpdateStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: registers the named progress update stream in the registry held by
+//! [`crate::state`], so the stream is a resource later calls resolve against.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +153,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProgressUpdateStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProgressUpdateStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateProgressUpdateStreamErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "the Migration Hub progress update stream store is unavailable".into(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `DryRun` asks only whether the call would be permitted. The modelled answer
+        // to an authorized dry run is `DryRunOperation`, and NOTHING is written — so
+        // this returns before the registry is touched at all.
+        if input.dry_run {
+            return Err(CreateProgressUpdateStreamErrorModeled::DryRunOperation(
+                DryRunOperation {
+                    message: Some(format!(
+                        "dry run: creating progress update stream {} would have succeeded",
+                        input.progress_update_stream_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The stream's NAME is its identity, so creating one that already exists is
+        // idempotent: the existing stream — and every migration task recorded under
+        // it — is left exactly as it was.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProgressUpdateStream"))
+        // A new name grows the registry, so the registry is CAPPED
+        // (`crate::state::MAX_PROGRESS_UPDATE_STREAMS`): at its bound a further new
+        // stream is refused with the modelled `ServiceUnavailableException` — the
+        // error this service models for a resource the back end cannot serve — rather
+        // than letting a caller grow the store without limit.
+        if state
+            .lock()
+            .create_stream(&input.progress_update_stream_name)
+            .is_err()
+        {
+            return Err(
+                CreateProgressUpdateStreamErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} progress update streams",
+                            crate::state::MAX_PROGRESS_UPDATE_STREAMS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(CreateProgressUpdateStreamOutput {})
     }
 }

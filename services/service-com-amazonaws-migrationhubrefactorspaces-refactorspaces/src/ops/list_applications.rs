@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApplications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApplications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `ApplicationSummary` per application of the environment named by the path
+//! label — only that environment's — cut into the page `maxResults` and `nextToken` name.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +155,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApplications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApplicationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApplications"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListApplicationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Refactor Spaces store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+        // Reporting only: see the note in `get_environment.rs`.
+        state.materialise_due_states();
+
+        let Some(environment) = state.environment(&input.environment_identifier) else {
+            return Err(ListApplicationsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "EnvironmentIdentifier {} does not name an environment",
+                        input.environment_identifier
+                    ),
+                    resource_id: input.environment_identifier.clone(),
+                    resource_type: crate::state::RESOURCE_TYPE_ENVIRONMENT.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Scoped to THIS environment's applications, so one created in another
+        // environment can never appear here.
+        let page = crate::state::page(
+            &environment.applications,
+            |application| application.application_id.as_str(),
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|error| {
+            ListApplicationsErrorModeled::ValidationException(ValidationException {
+                message: match error {
+                    crate::state::PageError::UnknownToken => {
+                        "nextToken does not resume a listing of this environment's applications"
+                            .to_string()
+                    }
+                    crate::state::PageError::MaxResultsNotPositive => {
+                        "maxResults must be between 1 and 100".to_string()
+                    }
+                },
+            })
+        })?;
+
+        Ok(ListApplicationsOutput {
+            application_summary_list: Some(page.items.iter().map(summary_of).collect()),
+            next_token: page.next_token,
+        })
+    }
+}
+
+/// Project a stored application onto the `ApplicationSummary` this listing reports.
+fn summary_of(application: &crate::state::Application) -> ApplicationSummary {
+    ApplicationSummary {
+        name: Some(application.name.clone()),
+        arn: Some(application.arn.clone()),
+        owner_account_id: Some(application.owner_account_id.clone()),
+        created_by_account_id: Some(application.created_by_account_id.clone()),
+        application_id: Some(application.application_id.clone()),
+        environment_id: Some(application.environment_id.clone()),
+        vpc_id: Some(application.vpc_id.clone()),
+        proxy_type: Some(application.proxy_type.clone()),
+        api_gateway_proxy: application
+            .api_gateway_proxy
+            .as_ref()
+            .map(|proxy| ApiGatewayProxySummary {
+                // The members describing resources the real service PROVISIONS
+                // (`ProxyUrl`, `ApiGatewayId`, `VpcLinkId`, `NlbArn`, `NlbName`) stay
+                // absent: this emulator creates no API Gateway, VPC link or load
+                // balancer, so it has no ids for them to report.
+                proxy_url: None,
+                api_gateway_id: None,
+                vpc_link_id: None,
+                nlb_arn: None,
+                nlb_name: None,
+                endpoint_type: Some(proxy.endpoint_type.clone()),
+                stage_name: Some(proxy.stage_name.clone()),
+            }),
+        state: Some(application.state.clone()),
+        tags: (!application.tags.is_empty())
+            .then(|| application.tags.clone().into_iter().collect()),
+        // `Error` reports a failure attached to the resource; a stored application this
+        // emulator never fails carries none.
+        error: None,
+        last_updated_time: Some(application.last_updated_time),
+        created_time: Some(application.created_time),
     }
 }

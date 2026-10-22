@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints an endpoint and persists it in [`crate::state`], so
+//! `DescribeEndpoints` and `CreateReplicationTask` read the same record. The notes
+//! below are the scaffold's, kept for the next reader.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The request's `Password` and the engine-specific settings structures are NOT
+//! persisted: this slice stores the endpoint members every engine shares, and several
+//! of those structures carry a password a response must never echo.
 //!
 //! ## Shape of an operation
 //!
@@ -269,18 +267,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+
+        // "Identifiers must begin with a letter and must contain only ASCII letters,
+        // digits, and hyphens. They can't end with a hyphen, or contain two consecutive
+        // hyphens" (`EndpointIdentifier` doc), which publishes no maximum length.
+        let identifier = input.endpoint_identifier;
+        if let Some(refusal) =
+            crate::state::identifier_refusal("EndpointIdentifier", &identifier, None)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(refusal));
+        }
+
+        if let Some(resource_identifier) = &input.resource_identifier {
+            if let Some(refusal) = crate::state::identifier_refusal(
+                "ResourceIdentifier",
+                resource_identifier,
+                Some(crate::state::RESOURCE_IDENTIFIER_MAX_LEN),
+            ) {
+                return Err(crate::scaffolded::Scaffolded::validation(refusal));
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        store.settle(now);
+
+        if let Some(existing) = store.endpoint_arn_by_identifier.get(&identifier) {
+            return Err(CreateEndpointErrorModeled::ResourceAlreadyExistsFault(
+                ResourceAlreadyExistsFault {
+                    message: Some(format!(
+                        "endpoint {identifier} already exists as {existing}"
+                    )),
+                    resource_arn: Some(existing.clone()),
+                },
+            )
+            .into());
+        }
+
+        // The emulator keeps every endpoint in memory for the life of the process and
+        // this is the only operation that adds one, so the store keeps a ceiling on
+        // itself.
+        if store.endpoints.len() >= crate::state::MAX_ENDPOINTS {
+            return Err(CreateEndpointErrorModeled::ResourceQuotaExceededFault(
+                ResourceQuotaExceededFault {
+                    message: Some(format!(
+                        "this emulator already holds the maximum of {} endpoints",
+                        crate::state::MAX_ENDPOINTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let resource_id = match input.resource_identifier {
+            Some(resource_identifier) => resource_identifier,
+            None => store.mint_resource_id("endpoint"),
+        };
+        let arn = crate::state::dms_arn(&region, "endpoint", &resource_id);
+        if store.endpoints.contains_key(&arn) {
+            return Err(CreateEndpointErrorModeled::ResourceAlreadyExistsFault(
+                ResourceAlreadyExistsFault {
+                    message: Some(format!("{arn} already names an endpoint")),
+                    resource_arn: Some(arn),
+                },
+            )
+            .into());
+        }
+
+        let sequence = store.next_sequence();
+        let record = crate::state::EndpointRecord {
+            arn: arn.clone(),
+            identifier: identifier.clone(),
+            endpoint_type: input.endpoint_type,
+            engine_name: input.engine_name,
+            // DMS provisions nothing for an endpoint, so it is created ready: there is
+            // no transient status the clock owes a transition out of.
+            status: crate::state::ENDPOINT_ACTIVE.to_string(),
+            username: input.username,
+            server_name: input.server_name,
+            port: input.port,
+            database_name: input.database_name,
+            extra_connection_attributes: input.extra_connection_attributes,
+            // "The default is none" (`SslMode` doc).
+            ssl_mode: input
+                .ssl_mode
+                .unwrap_or_else(|| crate::state::DEFAULT_SSL_MODE.to_string()),
+            kms_key_id: input.kms_key_id,
+            certificate_arn: input.certificate_arn,
+            service_access_role_arn: input.service_access_role_arn,
+            external_table_definition: input.external_table_definition,
+            tags: crate::state::tags_for(&arn, input.tags),
+            sequence,
+        };
+
+        let endpoint = record.to_shape();
+        store.endpoint_arn_by_identifier.insert(identifier, arn.clone());
+        store.endpoints.insert(arn, record);
+
+        Ok(CreateEndpointOutput {
+            endpoint: Some(endpoint),
+        })
     }
+}
+
+/// The DMS model declares no server-side fault, and this emulator always mounts the
+/// in-memory engine, so the unreachable "no store" branch is answered with the state
+/// error the operation does model rather than a 501, which would claim the operation
+/// is unimplemented.
+fn store_unavailable() -> CreateEndpointError {
+    CreateEndpointErrorModeled::InvalidResourceStateFault(InvalidResourceStateFault {
+        message: Some(
+            "the dms emulator is mounted on an engine that holds no state for it".to_string(),
+        ),
+    })
+    .into()
 }
