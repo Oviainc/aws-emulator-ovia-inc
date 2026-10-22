@@ -17,40 +17,69 @@
 //!   tag map, and `ListTagsForResource` reports exactly what those writes left;
 //! * an ARN naming no stored record is a modelled `ResourceNotFoundException`,
 //!   and a request outside the modelled constraints a `ValidationException`.
+//!
+//! The harness below (the router, the signed request, and the per-operation
+//! callers) is `pub(crate)` because the sibling suites in this target —
+//! `put_deployment_parameter_target` and `validation_messages` — drive the same
+//! wire path and reuse it rather than restating it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::state::{
-    MAX_CLIENT_TOKENS, MAX_TAGS_PER_RESOURCE, TAG_KEY_MAX_LEN, TAG_VALUE_MAX_LEN,
+    seed_agreements, ProvisionedAgreement, MAX_CLIENT_TOKENS, MAX_TAGS_PER_RESOURCE,
+    TAG_KEY_MAX_LEN, TAG_VALUE_MAX_LEN,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request below signs for; every minted ARN must carry it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 /// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`) every ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 /// This service's ARN namespace and sigv4 signing name, from the model's
 /// `aws.api#service$arnNamespace` / `aws.auth#sigv4$name`.
-const SIGNING_NAME: &str = "aws-marketplace";
+pub(crate) const SIGNING_NAME: &str = "aws-marketplace";
 /// The longest `DeploymentParameterName` the model admits (`length 1..400`).
-const PARAMETER_NAME_MAX_LEN: usize = 400;
+pub(crate) const PARAMETER_NAME_MAX_LEN: usize = 400;
 /// The longest `SecretString` the model admits (`length 1..15000`).
-const SECRET_MAX_LEN: usize = 15_000;
+pub(crate) const SECRET_MAX_LEN: usize = 15_000;
 /// The second parameter name every lifecycle row writes under its own identity,
 /// to prove a different name mints a different resource.
 const ALTERNATE_NAME: &str = "AlternateParameter";
 
-/// One emulator with an empty store, mounted exactly as the router mounts it.
-fn emulator() -> MultiServiceRouter {
+/// One emulator with an empty store, mounted exactly as the router mounts it,
+/// beside the engine that store lives in.
+///
+/// The engine is handed back so a test can [`provision`] the agreements a write
+/// targets: `PutDeploymentParameter` writes against an agreement of the account,
+/// and this API models no operation that creates one.
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
-        service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::EmulatedService::new(engine),
+        service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::EmulatedService::new(engine.clone()),
     );
-    router
+    (router, engine)
+}
+
+/// Record `agreement_id` of `catalog` as covering `product_ids` — the out-of-band
+/// provisioning a deployment-parameter write is targeted at.
+pub(crate) fn provision(
+    engine: &engine::InMemoryEngine,
+    catalog: &str,
+    agreement_id: &str,
+    product_ids: &[&str],
+) {
+    let agreement = product_ids.iter().fold(
+        ProvisionedAgreement::new(catalog, agreement_id),
+        |agreement, product_id| agreement.with_product(*product_id),
+    );
+    assert!(
+        seed_agreements(engine, [agreement]).is_some(),
+        "the shared engine must hold this service's store"
+    );
 }
 
 /// A request signed for `aws-marketplace` in [`REGION`]: the signal the router
@@ -78,7 +107,7 @@ fn request(method: &str, uri: &str, body: Option<&Value>) -> http::Request<bytes
 }
 
 /// Status and parsed body of one call. An empty body reads as `Value::Null`.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -108,7 +137,7 @@ async fn call(
 }
 
 /// The modelled error shape a failed call reported.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -123,7 +152,7 @@ fn error_code(body: &Value) -> String {
 /// or one `@httpQuery` value: everything outside RFC 3986's unreserved set. A
 /// non-greedy label may not carry a raw `/`, and a query value may not carry a
 /// raw `+` (which decodes to a space) or `&`.
-fn pct(value: &str) -> String {
+pub(crate) fn pct(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
@@ -135,7 +164,7 @@ fn pct(value: &str) -> String {
     out
 }
 
-async fn put(
+pub(crate) async fn put(
     router: &MultiServiceRouter,
     catalog: &str,
     product_id: &str,
@@ -154,11 +183,11 @@ async fn put(
     .await
 }
 
-async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> (u16, Value) {
+pub(crate) async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> (u16, Value) {
     call(router, "GET", &format!("/tags/{}", pct(resource_arn)), None).await
 }
 
-async fn tag(
+pub(crate) async fn tag(
     router: &MultiServiceRouter,
     resource_arn: &str,
     tags: &BTreeMap<String, String>,
@@ -178,7 +207,7 @@ async fn tag(
     .await
 }
 
-async fn untag(
+pub(crate) async fn untag(
     router: &MultiServiceRouter,
     resource_arn: &str,
     tag_keys: &[String],
@@ -199,7 +228,7 @@ async fn untag(
 
 /// The `tags` member of a response, as a comparable map. An absent member reads
 /// as the empty map.
-fn tags_of(body: &Value) -> BTreeMap<String, String> {
+pub(crate) fn tags_of(body: &Value) -> BTreeMap<String, String> {
     body.get("tags")
         .and_then(Value::as_object)
         .map(|map| {
@@ -216,7 +245,7 @@ fn tags_of(body: &Value) -> BTreeMap<String, String> {
 }
 
 /// A tag map from `(key, value)` pairs.
-fn tag_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+pub(crate) fn tag_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -224,13 +253,13 @@ fn tag_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 }
 
 /// The ARN this emulator must mint for the deployment parameter `id`.
-fn expected_arn(id: &str) -> String {
+pub(crate) fn expected_arn(id: &str) -> String {
     format!("arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT}:deployment-parameter/{id}")
 }
 
 /// Whether `id` satisfies the modelled `DeploymentParameterResourceIdentifier`
 /// (`length 1..32`, `^dp-[a-zA-Z0-9]+$`).
-fn is_parameter_id(id: &str) -> bool {
+pub(crate) fn is_parameter_id(id: &str) -> bool {
     let Some(suffix) = id.strip_prefix("dp-") else {
         return false;
     };
@@ -351,10 +380,11 @@ impl Lifecycle {
 
 #[tokio::test]
 async fn a_deployment_parameter_is_one_record_that_put_tag_untag_and_list_all_answer_from() {
-    let router = emulator();
+    let (router, engine) = emulator();
     let mut minted: BTreeSet<String> = BTreeSet::new();
 
     for row in lifecycle_table() {
+        provision(&engine, &row.catalog, &row.agreement_id, &[&row.product_id]);
         let case = row.case;
 
         // --- create -------------------------------------------------------
@@ -547,7 +577,8 @@ async fn a_deployment_parameter_is_one_record_that_put_tag_untag_and_list_all_an
 
 #[tokio::test]
 async fn an_arn_that_names_no_record_is_not_found_on_every_tag_operation() {
-    let router = emulator();
+    let (router, engine) = emulator();
+    provision(&engine, "AWSMarketplace", "agmt-present", &["prod-present"]);
 
     // A record that DOES exist, so a 404 below is about the ARN and not about an
     // empty store.
@@ -642,7 +673,15 @@ async fn an_arn_that_names_no_record_is_not_found_on_every_tag_operation() {
 
 #[tokio::test]
 async fn a_put_outside_the_modelled_constraints_is_refused() {
-    let router = emulator();
+    let (router, engine) = emulator();
+    // Every row below is aimed at a target the account holds, so what each one
+    // observes is the modelled constraint it breaks and not a missing agreement.
+    // The tag-key and tag-value rows need this: the centralized walk does not
+    // report map-key constraints, so those two are refused by the handler's own
+    // tag check, which runs after the target is resolved.
+    provision(&engine, "AWSMarketplace", "a1", &["prod-1"]);
+    // The one legal row at the end of this test writes against this target.
+    provision(&engine, "c", "a", &["p"]);
 
     let too_many: serde_json::Map<String, Value> = (0..=MAX_TAGS_PER_RESOURCE)
         .map(|i| (format!("key-{i:02}"), json!("v")))
@@ -824,7 +863,8 @@ async fn a_put_outside_the_modelled_constraints_is_refused() {
 
 #[tokio::test]
 async fn a_tag_write_the_service_could_not_report_is_refused_and_stores_nothing() {
-    let router = emulator();
+    let (router, engine) = emulator();
+    provision(&engine, "AWSMarketplace", "agmt-tags", &["prod-tags"]);
 
     let (status, created) = put(
         &router,
@@ -921,7 +961,17 @@ async fn a_tag_write_the_service_could_not_report_is_refused_and_stores_nothing(
 
 #[tokio::test]
 async fn a_client_token_identifies_exactly_one_write() {
-    let router = emulator();
+    let (router, engine) = emulator();
+    // Every identity this test aims the token at is a target the account holds, so
+    // what the rows below observe is the token rule and not a missing agreement.
+    provision(
+        &engine,
+        "AWSMarketplace",
+        "agmt-token",
+        &["prod-token", "prod-other"],
+    );
+    provision(&engine, "AWSMarketplace", "agmt-other", &["prod-token"]);
+    provision(&engine, "OtherMarketplace", "agmt-token", &["prod-token"]);
     // 36 characters of `^[a-zA-Z0-9/_+=.:@-]+$`, inside `ClientToken`'s len 32..64.
     let token = "0123456789abcdef0123456789abcdef0123";
 
@@ -1040,7 +1090,8 @@ async fn a_client_token_identifies_exactly_one_write() {
 
 #[tokio::test]
 async fn the_client_token_ledger_is_bounded_and_evicts_the_oldest_token() {
-    let router = emulator();
+    let (router, engine) = emulator();
+    provision(&engine, "AWSMarketplace", "agmt-ledger", &["prod-ledger"]);
 
     /// The i-th distinct token: 32 characters of `^[a-zA-Z0-9/_+=.:@-]+$`, the
     /// minimum `ClientToken` length.
@@ -1139,7 +1190,8 @@ async fn the_client_token_ledger_is_bounded_and_evicts_the_oldest_token() {
 
 #[tokio::test]
 async fn interleaved_tag_and_untag_calls_track_an_independent_tag_model() {
-    let router = emulator();
+    let (router, engine) = emulator();
+    provision(&engine, "AWSMarketplace", "agmt-model", &["prod-model"]);
     let (status, created) = put(
         &router,
         "AWSMarketplace",

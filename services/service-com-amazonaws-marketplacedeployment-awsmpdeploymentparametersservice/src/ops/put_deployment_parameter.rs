@@ -18,6 +18,15 @@
 //! ignored if the resource already exists" — and the response's `tags` is the
 //! resource's stored tag map, which `TagResource` and `UntagResource` also write.
 //!
+//! A write is TARGETED: the operation "is targeted by `catalog` and
+//! `agreementId`" for the product its URI names, so a request whose
+//! product/agreement pair this account does not hold is answered with the
+//! modelled `ResourceNotFoundException` (HTTP 404) and stores nothing. The
+//! agreements the account holds live in [`crate::state::ProvisionedAgreement`],
+//! created out of band of this API through
+//! [`crate::state::seed_agreements`] — this model declares no operation that
+//! creates a product or an agreement.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -194,6 +203,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        // The write TARGET first: `PutDeploymentParameter` "creates or updates a
+        // deployment parameter and is targeted by catalog and agreementId" for
+        // the product the URI addresses, and the model declares
+        // `ResourceNotFoundException` (HTTP 404) on it. A product/agreement pair
+        // this account does not hold names no target to write against, however
+        // well-formed its identifiers are — `ResourceId` is `length 1..64` of
+        // `^[A-Za-z0-9_/-]+$`, which a value that names nothing satisfies just as
+        // easily — so the check comes BEFORE the idempotency replay and before
+        // anything is minted or rewritten. The agreements themselves are created
+        // out of band of this API (`crate::state::seed_agreements`).
+        //
+        // The modelled input constraints (`tags` at most 50 entries,
+        // `secretString` `length 1..15000`, every `@pattern`) are already refused
+        // with `ValidationException` (HTTP 400) by the centralized validate step
+        // that runs before this handler, so a malformed request is a 400 and a
+        // well-formed one aimed at nothing is this 404.
+        if let Some(missing) =
+            store.missing_target(&input.catalog, &input.product_id, &input.agreement_id)
+        {
+            return Err(PutDeploymentParameterErrorModeled::ResourceNotFoundException(
+                crate::state::target_not_found(missing),
+            )
+            .into());
+        }
 
         // `clientToken` is the `@idempotencyToken`: a token already bound to a write
         // replays that write rather than performing it again, and the SAME token aimed
