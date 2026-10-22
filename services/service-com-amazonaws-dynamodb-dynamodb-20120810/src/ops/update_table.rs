@@ -6,13 +6,22 @@
 //! class and its deletion protection, and reports the table back as a
 //! `TableDescription` read from the stored table.
 //!
-//! `UpdateTable` is asynchronous — "while it's executing, the table status changes
-//! from ACTIVE to UPDATING" (the doc below) — so the table is reported `UPDATING` and
+//! Only the part of an update that asks DynamoDB to MOVE CAPACITY is asynchronous —
+//! the table's capacity mode, its provisioned throughput, its table class or one of
+//! its secondary indexes. Such a request leaves the table `UPDATING` ("while it's
+//! executing, the table status changes from ACTIVE to UPDATING" — the doc below) and
 //! the clock owes it the move back to `ACTIVE` [`crate::state::STATUS_TRANSITION`]
 //! later; a second `UpdateTable` inside that span is refused with
-//! `ResourceInUseException`, while item operations keep being served. The NEW
-//! throughput is in effect from the moment the call returns, which is what
-//! `DescribeTable` and the capacity accounting report.
+//! `ResourceInUseException`, while item operations keep being served. A request that
+//! only flips a flag the service applies with the call — deletion protection — moves
+//! no capacity, so it leaves nothing for the clock to finish and the table is reported
+//! `ACTIVE`, which is what the recorded service answers and what lets consecutive
+//! control-plane calls through. Either way the NEW configuration is in effect from the
+//! moment the call returns, which is what `DescribeTable` and the capacity accounting
+//! report.
+//!
+//! A request that names NO updatable member at all is refused as a `ValidationException`
+//! before any of that: it is permanently invalid rather than a transient conflict.
 //!
 //! Members this slice does not store (streams, SSE, replicas, witnesses, on-demand and
 //! warm throughput, multi-region consistency and vector indexes) are refused with the
@@ -265,6 +274,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
         let region = crate::state::request_region(ctx.parts());
 
+        // A request that asks for no change is permanently invalid, whatever the
+        // table's status, so it is refused before the table is even looked up: a
+        // conflict answer would tell a client to retry a request that can never
+        // succeed.
+        if !names_an_update(&input) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                empty_update_message(),
+            ));
+        }
         if let Some(member) = unsupported_member(&input) {
             return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                 "UpdateTable with {member}"
@@ -350,6 +368,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             table.throughput_history.record(now, &before, &after);
         }
+        // An update that moves capacity finishes later — the clock owes the move back
+        // to ACTIVE; one that moves none is finished when it returns, so it leaves the
+        // table settled and the next control-plane call is served.
+        let moves_capacity = asks_to_move_capacity(&input);
+        let settles_at = if moves_capacity {
+            now + crate::state::STATUS_TRANSITION
+        } else {
+            now
+        };
+        table.updated_at = moves_capacity.then_some(settles_at);
+        // "The time when PAY_PER_REQUEST was last set as the read/write capacity mode"
+        // (`BillingModeSummary$LastUpdateToPayPerRequestDateTime`) is the instant the
+        // SWITCH takes effect, so a request that re-states the mode the table is
+        // already in records nothing new.
+        if billing_mode == "PAY_PER_REQUEST" && table.billing_mode != "PAY_PER_REQUEST" {
+            table.pay_per_request_at = Some(settles_at);
+        }
         table.billing_mode = billing_mode;
         table.provisioned_throughput = table_throughput;
         table.attribute_definitions = definitions;
@@ -360,7 +395,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(protection) = input.deletion_protection_enabled {
             table.deletion_protection_enabled = protection;
         }
-        table.updated_at = Some(now + crate::state::STATUS_TRANSITION);
 
         Ok(UpdateTableOutput {
             table_description: Some(table.describe(now)),
@@ -389,6 +423,101 @@ fn lift(error: crate::state::RequestError) -> UpdateTableError {
             crate::scaffolded::Scaffolded::validation(message)
         }
     }
+}
+
+/// One input member that can ASK FOR A CHANGE: its name, and the test for whether this
+/// request names it.
+type UpdatableMember = (&'static str, fn(&UpdateTableInput) -> bool);
+
+/// Every input member that asks for a change, in the order the refusal below lists them.
+///
+/// These are the members of the operation's input shape
+/// (`smithy_query(query="operation",operation="UpdateTable")`) except `TableName`,
+/// which names the table to change, and `AttributeDefinitions`, which only declares the
+/// attributes another member's key schema uses and changes nothing on its own. A
+/// request naming none of these asks for nothing and is refused.
+///
+/// ONE list drives both the emptiness test and the message, so a member added to the
+/// model cannot end up in the message but not in the test, or the other way round. A
+/// list member asks for a change only when it carries an entry: an empty list requests
+/// no index, no replica and no witness update.
+const UPDATABLE_MEMBERS: &[UpdatableMember] = &[
+    ("ProvisionedThroughput", |input| {
+        input.provisioned_throughput.is_some()
+    }),
+    ("BillingMode", |input| input.billing_mode.is_some()),
+    ("GlobalSecondaryIndexUpdates", |input| {
+        list_named(input.global_secondary_index_updates.as_ref())
+    }),
+    ("StreamSpecification", |input| {
+        input.stream_specification.is_some()
+    }),
+    ("SSESpecification", |input| {
+        input.sse_specification.is_some()
+    }),
+    ("ReplicaUpdates", |input| {
+        list_named(input.replica_updates.as_ref())
+    }),
+    ("GlobalTableWitnessUpdates", |input| {
+        list_named(input.global_table_witness_updates.as_ref())
+    }),
+    ("VectorIndexUpdates", |input| {
+        list_named(input.vector_index_updates.as_ref())
+    }),
+    ("OnDemandThroughput", |input| {
+        input.on_demand_throughput.is_some()
+    }),
+    ("WarmThroughput", |input| input.warm_throughput.is_some()),
+    ("MultiRegionConsistency", |input| {
+        input.multi_region_consistency.is_some()
+    }),
+    ("GlobalTableSettingsReplicationMode", |input| {
+        input.global_table_settings_replication_mode.is_some()
+    }),
+    ("DisassociationProtectionEnabled", |input| {
+        input.disassociation_protection_enabled.is_some()
+    }),
+    ("DeletionProtectionEnabled", |input| {
+        input.deletion_protection_enabled.is_some()
+    }),
+    ("TableClass", |input| input.table_class.is_some()),
+];
+
+/// Whether a list member carries an entry at all.
+fn list_named<T>(list: Option<&Vec<T>>) -> bool {
+    list.is_some_and(|entries| !entries.is_empty())
+}
+
+/// Whether this request names any member that asks for a change.
+fn names_an_update(input: &UpdateTableInput) -> bool {
+    UPDATABLE_MEMBERS.iter().any(|(_, named)| named(input))
+}
+
+/// The refusal for a request that names no updatable member: it lists the alternatives,
+/// so the caller can fix the request from the message alone.
+fn empty_update_message() -> String {
+    let names: Vec<&str> = UPDATABLE_MEMBERS.iter().map(|(name, _)| *name).collect();
+    match names.split_last() {
+        Some((last, rest)) => format!("At least one of {} or {last} is required", rest.join(", ")),
+        None => "At least one updatable member is required".to_string(),
+    }
+}
+
+/// Whether this request asks DynamoDB to MOVE CAPACITY, which is the part of an
+/// `UpdateTable` that finishes after the call returns.
+///
+/// The table's capacity mode and provisioned throughput, its table class and its
+/// secondary indexes are all backed by provisioned capacity or stored data, so changing
+/// one is the asynchronous update the doc describes ("while it's executing, the table
+/// status changes from ACTIVE to UPDATING"). Deletion protection is a guard flag with
+/// no capacity behind it: the service applies it with the call and answers with the
+/// table still `ACTIVE`, so nothing is left for the clock to finish and the next
+/// control-plane call is served.
+fn asks_to_move_capacity(input: &UpdateTableInput) -> bool {
+    input.billing_mode.is_some()
+        || input.provisioned_throughput.is_some()
+        || input.table_class.is_some()
+        || list_named(input.global_secondary_index_updates.as_ref())
 }
 
 /// The first input member present that this slice does not store, if any.

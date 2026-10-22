@@ -7,11 +7,15 @@
 //! elapsed: until then `DescribeTable` reports `DELETING` and every item operation
 //! answers `ResourceNotFoundException`, and afterwards so does `DescribeTable`.
 //!
-//! A table that is still `CREATING` is refused with `ResourceInUseException` — "You
-//! tried to delete a table currently in the CREATING state" (the
-//! `ResourceInUseException` doc) — while a table already `DELETING` is reported back
-//! as it stands, because "If table is already in the DELETING state, no error is
-//! returned".
+//! A table that is still `CREATING` or `UPDATING` is refused with
+//! `ResourceInUseException` — "You tried to delete a table currently in the CREATING
+//! state" (the `ResourceInUseException` doc) — and so is a table that is ALREADY
+//! `DELETING`: a delete cannot be accepted twice. The model's prose says "If table is
+//! already in the DELETING state, no error is returned", but the recorded service
+//! answers the second `DeleteTable` with 400 `ResourceInUseException` ("a resource
+//! which is still in use"), which is the behaviour a client serializing control-plane
+//! changes on that error depends on, so the observed answer is the one implemented
+//! here.
 //!
 //! ## Shape of an operation
 //!
@@ -208,12 +212,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
             crate::state::TableStatus::Deleting => {
-                // "If table is already in the DELETING state, no error is returned"
-                // (the doc below): a retried DeleteTable reports the table as it
-                // stands and leaves the removal already owed by the clock alone.
-                return Ok(DeleteTableOutput {
-                    table_description: Some(table.describe(now)),
-                });
+                // A delete already in flight is not accepted again: the table is "a
+                // resource which is still in use" until the deletion completes, and
+                // the recorded service answers this second call with
+                // `ResourceInUseException` rather than a fresh acceptance.
+                return Err(DeleteTableErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(format!(
+                            "Attempt to change a resource which is still in use: Table is being \
+                             deleted: {name}"
+                        )),
+                    },
+                )
+                .into());
             }
             crate::state::TableStatus::Active => {}
         }

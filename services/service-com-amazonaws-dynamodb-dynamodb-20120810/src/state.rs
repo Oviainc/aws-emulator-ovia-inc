@@ -973,8 +973,23 @@ pub struct Table {
     /// When the clock owes this table its `CREATING` -> `ACTIVE` transition.
     pub active_at: SystemTime,
     /// When the clock owes this table the end of an `UpdateTable` — its `UPDATING` ->
-    /// `ACTIVE` transition. `None` once no update is in flight.
+    /// `ACTIVE` transition. `None` once no update is in flight, which is also the case
+    /// for an update that asks for no capacity work at all (see `UpdateTable`).
     pub updated_at: Option<SystemTime>,
+    /// When `PAY_PER_REQUEST` TAKES EFFECT as this table's read/write capacity mode,
+    /// which is what `BillingModeSummary.LastUpdateToPayPerRequestDateTime` reports:
+    /// "Represents the time when `PAY_PER_REQUEST` was last set as the read/write
+    /// capacity mode" (that member's doc). `None` for a table that has never been
+    /// on-demand.
+    ///
+    /// The instant stored is when the mode takes effect — the end of the `CreateTable`
+    /// or `UpdateTable` that set it, not the instant that call was accepted — so a
+    /// description taken while the table is still becoming on-demand reports no
+    /// timestamp yet ([`Table::describe`] withholds a future one), and every later
+    /// description reports the same instant. It survives a switch back to
+    /// `PROVISIONED`, because the member records when the mode was LAST SET rather than
+    /// which mode is current.
+    pub pay_per_request_at: Option<SystemTime>,
     /// When the clock owes this table its removal, set by `DeleteTable`.
     pub removed_at: Option<SystemTime>,
     pub items: BTreeMap<ItemKey, Item>,
@@ -1378,7 +1393,13 @@ impl Table {
             table_size_bytes: Some(self.table_size_bytes()),
             billing_mode_summary: Some(BillingModeSummary {
                 billing_mode: Some(self.billing_mode.clone()),
-                last_update_to_pay_per_request_date_time: None,
+                // Reported only once the mode it records is in effect: the stored
+                // instant is when the call that set `PAY_PER_REQUEST` settles, so while
+                // that call is still settling there is nothing to report yet.
+                last_update_to_pay_per_request_date_time: self
+                    .pay_per_request_at
+                    .filter(|in_effect_at| now >= *in_effect_at)
+                    .map(::aws_smithy_types::DateTime::from),
             }),
             provisioned_throughput: Some(ProvisionedThroughputDescription {
                 // A PAY_PER_REQUEST table reports zeroes: it has no provisioned

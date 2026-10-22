@@ -63,6 +63,16 @@ pub async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> 
     call_in(router, REGION, operation, body).await
 }
 
+/// [`call`] for an operation that must succeed, returning its parsed body.
+pub async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+    let (status, parsed) = call(router, operation, body.clone()).await;
+    assert_eq!(
+        status, 200,
+        "case {operation} {body}: expected HTTP 200, got {status} with {parsed}"
+    );
+    parsed
+}
+
 /// The wire error code of a refusal: the shape name the `__type` field carries, which
 /// is what an SDK client matches an error on.
 pub fn error_code(body: &Value) -> String {

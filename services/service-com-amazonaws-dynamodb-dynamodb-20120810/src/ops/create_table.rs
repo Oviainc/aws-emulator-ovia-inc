@@ -341,6 +341,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        let active_at = now + crate::state::STATUS_TRANSITION;
+        // A table created on-demand has `PAY_PER_REQUEST` set as its capacity mode by
+        // this call, and the mode takes effect when the table does, so the instant
+        // `BillingModeSummary.LastUpdateToPayPerRequestDateTime` reports is the one the
+        // table becomes ACTIVE at — this response still reports the table CREATING and
+        // therefore carries no timestamp yet.
+        let pay_per_request_at = (billing_mode == "PAY_PER_REQUEST").then_some(active_at);
         let table = crate::state::Table {
             arn: crate::state::table_arn(&region, &name),
             name: name.clone(),
@@ -356,8 +363,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
             tags,
             creation_date_time: now,
-            active_at: now + crate::state::STATUS_TRANSITION,
+            active_at,
             updated_at: None,
+            pay_per_request_at,
             removed_at: None,
             items: ::std::collections::BTreeMap::new(),
             stored_bytes: 0,
