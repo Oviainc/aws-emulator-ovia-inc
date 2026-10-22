@@ -1447,9 +1447,9 @@ async fn the_deployment_status_settles_once_the_clock_owes_it() {
 #[tokio::test]
 async fn the_operations_this_slice_does_not_cover_still_answer_501() {
     let router = emulator();
-    let cases: [(&str, &str, Option<Value>); 4] = [
-        ("GET", "/serviceSettings", None),
-        ("GET", "/listQuickSetupTypes", None),
+    // `GET /serviceSettings` and `GET /listQuickSetupTypes` are no longer here: both
+    // are implemented, and `tests/all/service_settings_and_types.rs` covers them.
+    let cases: [(&str, &str, Option<Value>); 2] = [
         ("GET", "/getConfiguration/some-configuration-id", None),
         (
             "GET",
