@@ -599,6 +599,137 @@ pub fn is_valid_termination_policy(policy: &str) -> bool {
     TERMINATION_POLICIES.contains(&policy) || policy.starts_with(TERMINATION_POLICY_LAMBDA_PREFIX)
 }
 
+// ---------------------------------------------------------------------------
+// The reference-data catalogs
+//
+// Amazon EC2 Auto Scaling publishes a handful of fixed catalogs through
+// zero-input describes (`DescribeScalingProcessTypes`,
+// `DescribeTerminationPolicyTypes`, `DescribeAdjustmentTypes`,
+// `DescribeAutoScalingNotificationTypes`, `DescribeLifecycleHookTypes`,
+// `DescribeMetricCollectionTypes`). They are SERVICE data, not per-account
+// state: the same answer for every caller, in every region, whatever the store
+// holds — so they live here as constants and the handlers that report them take
+// no lock and write nothing.
+//
+// Each catalog's doc comment names the model member whose documentation
+// publishes its membership, and its ordering.
+// ---------------------------------------------------------------------------
+
+/// The processes `SuspendProcesses` and `ResumeProcesses` name, and the catalog
+/// `DescribeScalingProcessTypes` reports.
+///
+/// Membership from the model's own documentation for `ProcessType$ProcessName`
+/// ("One of the following processes: Launch, Terminate, AddToLoadBalancer,
+/// AlarmNotification, AZRebalance, HealthCheck, InstanceRefresh,
+/// ReplaceUnhealthy, ScheduledActions"). Held in ASCII order, which is the order
+/// the service reports the catalog in.
+pub const SCALING_PROCESS_TYPES: &[&str] = &[
+    "AZRebalance",
+    "AddToLoadBalancer",
+    "AlarmNotification",
+    "HealthCheck",
+    "InstanceRefresh",
+    "Launch",
+    "ReplaceUnhealthy",
+    "ScheduledActions",
+    "Terminate",
+];
+
+/// The type name the custom termination policy is published under.
+///
+/// [`TERMINATION_POLICIES`] lists the policies a group may name literally and
+/// [`TERMINATION_POLICY_LAMBDA_PREFIX`] accepts the ARN form beside them; the
+/// catalog names that form by its TYPE rather than by any one function's ARN.
+pub const TERMINATION_POLICY_TYPE_LAMBDA: &str = "Lambda";
+
+/// The catalog `DescribeTerminationPolicyTypes` reports: every policy
+/// [`TERMINATION_POLICIES`] accepts by name, plus
+/// [`TERMINATION_POLICY_TYPE_LAMBDA`] for the Lambda-ARN form the same model
+/// documentation ends with, in ASCII order.
+pub const TERMINATION_POLICY_TYPES: &[&str] = &[
+    "AllocationStrategy",
+    "ClosestToNextInstanceHour",
+    "Default",
+    TERMINATION_POLICY_TYPE_LAMBDA,
+    "NewestInstance",
+    "OldestInstance",
+    "OldestLaunchConfiguration",
+    "OldestLaunchTemplate",
+];
+
+/// The catalog `DescribeAdjustmentTypes` reports, from the model's own
+/// documentation for `AdjustmentType$AdjustmentType`: "The policy adjustment
+/// type. The valid values are ChangeInCapacity, ExactCapacity, and
+/// PercentChangeInCapacity." In ASCII order.
+pub const ADJUSTMENT_TYPES: &[&str] = &[
+    "ChangeInCapacity",
+    "ExactCapacity",
+    "PercentChangeInCapacity",
+];
+
+/// The catalog `DescribeLifecycleHookTypes` reports: the lifecycle transitions a
+/// lifecycle hook may name, from the model's own documentation for
+/// `PutLifecycleHookType$LifecycleTransition` ("To create a lifecycle hook for
+/// scale-out events, specify autoscaling:EC2_INSTANCE_LAUNCHING. To create a
+/// lifecycle hook for scale-in events, specify
+/// autoscaling:EC2_INSTANCE_TERMINATING"). In ASCII order.
+pub const LIFECYCLE_HOOK_TYPES: &[&str] = &[
+    "autoscaling:EC2_INSTANCE_LAUNCHING",
+    "autoscaling:EC2_INSTANCE_TERMINATING",
+];
+
+/// The catalog `DescribeAutoScalingNotificationTypes` reports: the event types a
+/// group can notify about, from the model's own documentation for
+/// `NotificationConfiguration$NotificationType` ("One of the following event
+/// notification types: …"), in the order that documentation publishes them.
+///
+/// The lifecycle transitions of [`LIFECYCLE_HOOK_TYPES`] are a SEPARATE catalog,
+/// published by `DescribeLifecycleHookTypes`, even though the model carries both
+/// through the one `AutoScalingNotificationTypes` list shape (it is the target of
+/// this operation's output member and of that one's alike): a transition is what a
+/// lifecycle hook is created for, not an event a group notifies about, and the
+/// model documents each list on its own member.
+pub const AUTO_SCALING_NOTIFICATION_TYPES: &[&str] = &[
+    "autoscaling:EC2_INSTANCE_LAUNCH",
+    "autoscaling:EC2_INSTANCE_LAUNCH_ERROR",
+    "autoscaling:EC2_INSTANCE_TERMINATE",
+    "autoscaling:EC2_INSTANCE_TERMINATE_ERROR",
+    "autoscaling:TEST_NOTIFICATION",
+];
+
+/// The catalog `DescribeMetricCollectionTypes` reports as `Metrics`: the group
+/// metrics `EnableMetricsCollection` and `DisableMetricsCollection` name, from
+/// the model's own documentation for `MetricCollectionType$Metric` ("One of the
+/// following metrics: …"), in the order that documentation publishes them —
+/// sizes, then instance counts, then capacities, then the warm pool.
+pub const METRIC_COLLECTION_TYPES: &[&str] = &[
+    "GroupMinSize",
+    "GroupMaxSize",
+    "GroupDesiredCapacity",
+    "GroupInServiceInstances",
+    "GroupPendingInstances",
+    "GroupStandbyInstances",
+    "GroupTerminatingInstances",
+    "GroupTotalInstances",
+    "GroupInServiceCapacity",
+    "GroupPendingCapacity",
+    "GroupStandbyCapacity",
+    "GroupTerminatingCapacity",
+    "GroupTotalCapacity",
+    "WarmPoolDesiredCapacity",
+    "WarmPoolWarmedCapacity",
+    "WarmPoolPendingCapacity",
+    "WarmPoolTerminatingCapacity",
+    "WarmPoolTotalCapacity",
+    "GroupAndWarmPoolDesiredCapacity",
+    "GroupAndWarmPoolTotalCapacity",
+];
+
+/// The catalog `DescribeMetricCollectionTypes` reports as `Granularities`, from
+/// the model's own documentation for `MetricGranularityType$Granularity`: "The
+/// granularity. The only valid value is 1Minute."
+pub const METRIC_GRANULARITIES: &[&str] = &["1Minute"];
+
 /// The units a `DesiredCapacityType` may name, from the model's own documentation
 /// for `CreateAutoScalingGroup$DesiredCapacityType`: "Valid values: units | vcpu |
 /// memory-mib".

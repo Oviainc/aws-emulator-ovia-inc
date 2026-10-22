@@ -33,19 +33,26 @@ pub mod delete_policy_types;
 pub mod delete_scheduled_action_types;
 pub mod delete_tags_types;
 pub mod delete_warm_pool_types;
+pub mod describe_account_limits_types;
 pub mod describe_account_settings_types;
+pub mod describe_adjustment_types_types;
 pub mod describe_auto_scaling_groups_types;
 pub mod describe_auto_scaling_instances_types;
+pub mod describe_auto_scaling_notification_types_types;
 pub mod describe_instance_refreshes_types;
 pub mod describe_launch_configurations_types;
+pub mod describe_lifecycle_hook_types_types;
 pub mod describe_lifecycle_hooks_types;
 pub mod describe_load_balancer_target_groups_types;
 pub mod describe_load_balancers_types;
+pub mod describe_metric_collection_types_types;
 pub mod describe_notification_configurations_types;
 pub mod describe_policies_types;
 pub mod describe_scaling_activities_types;
+pub mod describe_scaling_process_types_types;
 pub mod describe_scheduled_actions_types;
 pub mod describe_tags_types;
+pub mod describe_termination_policy_types_types;
 pub mod describe_traffic_sources_types;
 pub mod describe_warm_pool_types;
 pub mod detach_instances_types;
@@ -115,15 +122,23 @@ pub use delete_tags_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use delete_warm_pool_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
+pub use describe_account_limits_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_account_settings_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use describe_adjustment_types_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_auto_scaling_groups_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_auto_scaling_instances_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
+pub use describe_auto_scaling_notification_types_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_instance_refreshes_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_launch_configurations_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use describe_lifecycle_hook_types_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_lifecycle_hooks_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
@@ -131,15 +146,21 @@ pub use describe_load_balancer_target_groups_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_load_balancers_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
+pub use describe_metric_collection_types_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_notification_configurations_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_policies_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_scaling_activities_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
+pub use describe_scaling_process_types_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_scheduled_actions_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_tags_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use describe_termination_policy_types_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_traffic_sources_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
