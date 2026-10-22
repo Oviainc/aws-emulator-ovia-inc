@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateService
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateService`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateService::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies each PRESENT member to the stored service, leaving absent members untouched,
+//! and returns the merged record. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +155,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateService` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateServiceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateService"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateServiceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(record) = store.services.get_mut(&input.service_arn) else {
+            return Err(UpdateServiceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("No service found for {}", input.service_arn),
+                    resource_id: Some(input.service_arn.clone()),
+                    resource_type: Some("Service".to_string()),
+                },
+            )
+            .into());
+        };
+        // Settle anything the clock already owed before merging, so this call's own
+        // changes are applied on top of the record's current state.
+        record.materialise(now);
+
+        // Every member of this request except `serviceArn` is optional, and an absent one
+        // means "leave it alone" — only the members the caller sent are applied.
+        if let Some(description) = input.description {
+            record.description = Some(description);
+        }
+        if let Some(associated_systems) = input.associated_systems {
+            record.associated_systems = associated_systems;
+        }
+        if let Some(policy_arn) = input.policy_arn {
+            record.policy_arn = Some(policy_arn);
+        }
+        if let Some(regions) = input.regions {
+            record.regions = regions;
+        }
+        if let Some(permission_model) = input.permission_model {
+            record.permission_model = Some(permission_model);
+        }
+        if let Some(report_configuration) = input.report_configuration {
+            record.report_configuration = Some(report_configuration);
+        }
+        if let Some(requested) = input.dependency_discovery.as_deref() {
+            record.set_dependency_discovery(requested, now);
+        }
+        if let Some(requested) = input.dev_ops_agent_configuration.as_ref() {
+            record.link_dev_ops_agent(requested, now);
+        }
+        record.updated_at = now;
+
+        Ok(UpdateServiceOutput {
+            service: record.to_service(),
+        })
     }
 }
