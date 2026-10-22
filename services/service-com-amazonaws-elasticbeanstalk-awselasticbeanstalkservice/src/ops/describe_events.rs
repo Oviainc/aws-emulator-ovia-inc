@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports this service's event log — the events the lifecycle
+//! operations append as they run — filtered by the members the model names,
+//! newest first and paginated. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +163,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeEventsError::internal_failure("the Elastic Beanstalk store is unavailable")
+        })?;
+        let mut store = state.lock();
+        // This operation only REPORTS. The one write it performs is the clock's
+        // own: a status change that was already due, the event that completed
+        // change owes, and the events the 6-week window has carried out of
+        // scope. All three were owed at the same instant whether or not anybody
+        // called, so materialising them here shows no caller a state the clock
+        // had not already reached.
+        store.materialize_due_transitions();
+
+        // "If specified, limits the events returned from this call to include
+        // only those with the specified severity or higher." "Higher" is the
+        // order the model declares `EventSeverity` in; see the ladder in
+        // `crate::state`.
+        let minimum_severity = match input.severity.as_deref() {
+            Some(severity) => Some(crate::state::severity_rank(severity).ok_or_else(|| {
+                DescribeEventsError::invalid_parameter_value(format!(
+                    "Severity must be one of {}: '{severity}' is not an EventSeverity.",
+                    crate::state::EVENT_SEVERITY_LADDER.join(", ")
+                ))
+            })?),
+            None => None,
+        };
+
+        // "StartTime: … those that occur on or after this time" (inclusive);
+        // "EndTime: … up to, but not including, the EndTime" (exclusive).
+        let start_time = input.start_time.map(|at| at.as_secs_f64());
+        let end_time = input.end_time.map(|at| at.as_secs_f64());
+
+        // "Specifies the maximum number of events that can be returned,
+        // beginning with the most recent event": the answer is ordered by the
+        // `EventDate` it reports, newest first, with the append `sequence`
+        // breaking a tie so the order is total even for two events recorded
+        // inside one clock tick. Ordering by the date rather than by the append
+        // order is what keeps a BACKDATED event — one a clock-owed transition
+        // records when a later call observes it as due — in its own place in
+        // time rather than at the head of the log.
+        let mut matching: Vec<&crate::state::Event> = store
+            .events
+            .iter()
+            .filter(|event| {
+                input
+                    .application_name
+                    .as_ref()
+                    .is_none_or(|name| event.subject.application_name.as_ref() == Some(name))
+            })
+            .filter(|event| {
+                input
+                    .version_label
+                    .as_ref()
+                    .is_none_or(|label| event.subject.version_label.as_ref() == Some(label))
+            })
+            .filter(|event| {
+                input
+                    .template_name
+                    .as_ref()
+                    .is_none_or(|name| event.subject.template_name.as_ref() == Some(name))
+            })
+            .filter(|event| {
+                input
+                    .environment_id
+                    .as_ref()
+                    .is_none_or(|id| event.subject.environment_id.as_ref() == Some(id))
+            })
+            .filter(|event| {
+                input
+                    .environment_name
+                    .as_ref()
+                    .is_none_or(|name| event.subject.environment_name.as_ref() == Some(name))
+            })
+            .filter(|event| {
+                input
+                    .platform_arn
+                    .as_ref()
+                    .is_none_or(|arn| event.subject.platform_arn.as_ref() == Some(arn))
+            })
+            .filter(|event| {
+                input
+                    .request_id
+                    .as_ref()
+                    .is_none_or(|request_id| event.request_id == *request_id)
+            })
+            .filter(|event| {
+                minimum_severity.is_none_or(|minimum| {
+                    crate::state::severity_rank(&event.severity)
+                        .is_some_and(|rank| rank >= minimum)
+                })
+            })
+            .filter(|event| {
+                let at = event.event_date.as_secs_f64();
+                start_time.is_none_or(|start| at >= start) && end_time.is_none_or(|end| at < end)
+            })
+            .collect();
+        matching.sort_by(|left, right| {
+            right
+                .event_date
+                .as_secs_f64()
+                .total_cmp(&left.event_date.as_secs_f64())
+                .then_with(|| right.sequence.cmp(&left.sequence))
+        });
+
+        // "Pagination token. If specified, the events return the next batch of
+        // results." The token names the first event of the next page by its
+        // `sequence`, which the log never renumbers, and the page starts at the
+        // first event that is NOT NEWER than that event in the reported order.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEvents"))
+        // Resolving it by ORDER rather than by position in the previous answer
+        // is what makes it stable: an event recorded between two page calls —
+        // including a clock-owed completion backdated into the middle of the
+        // date order — cannot shift the boundary and so cannot make the next
+        // page repeat or skip an event. A token whose event the log does not
+        // hold at all is refused rather than read as page one.
+        let offset = match input.next_token.as_deref() {
+            Some(token) => {
+                let boundary = token
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|sequence| {
+                        store.events.iter().find(|event| event.sequence == sequence)
+                    })
+                    .map(|event| (event.event_date.as_secs_f64(), event.sequence))
+                    .ok_or_else(|| {
+                        DescribeEventsError::invalid_parameter_value(format!(
+                            "Invalid NextToken: {token}"
+                        ))
+                    })?;
+                matching
+                    .iter()
+                    .position(|event| (event.event_date.as_secs_f64(), event.sequence) <= boundary)
+                    // Every event this answer holds is newer than the boundary,
+                    // so the next page is empty.
+                    .unwrap_or(matching.len())
+            }
+            None => 0,
+        };
+        let page = &matching[offset..];
+        // "This action returns the most recent 1,000 events from the specified
+        // NextToken", which is also `MaxRecords`' modelled maximum, so that is
+        // the page size when the caller names none. `MaxRecords` is modelled
+        // `range 1..1000`, so the boundary validator has already refused
+        // anything outside that; the guard keeps a future widening of the range
+        // from inventing an empty page with a continuation token.
+        let max_records = input
+            .max_records
+            .and_then(|max_records| usize::try_from(max_records).ok())
+            .filter(|max_records| *max_records > 0)
+            .unwrap_or(crate::state::DEFAULT_EVENT_PAGE_SIZE);
+        let (page, next_token) = if page.len() > max_records {
+            // "If returned, this indicates that there are more results to
+            // obtain."
+            (
+                &page[..max_records],
+                Some(page[max_records].sequence.to_string()),
+            )
+        } else {
+            (page, None)
+        };
+
+        let events = page.iter().map(|event| event.to_description()).collect();
+        Ok(DescribeEventsOutput {
+            events: Some(events),
+            next_token,
+        })
     }
 }
