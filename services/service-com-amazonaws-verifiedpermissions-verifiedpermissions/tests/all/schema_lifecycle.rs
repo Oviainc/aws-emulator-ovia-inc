@@ -84,12 +84,15 @@ async fn a_strict_store_bounds_the_statement_before_it_validates_it() {
                 "case {case:?}: expected a ValidationException, got {body}"
             );
             assert!(
-                body["message"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("bytes a policy may carry"),
+                body["fieldList"]
+                    .as_array()
+                    .and_then(|fields| fields.first())
+                    .filter(|field| field["path"] == json!("/definition/static/statement"))
+                    .and_then(|field| field["message"].as_str())
+                    .is_some_and(|reason| reason.contains("bytes a policy may carry")),
                 "case {case:?}: the size bound must refuse it before any parse or \
-                 validation, got {body}"
+                 validation, and say so in the fieldList entry for the statement, \
+                 got {body}"
             );
         }
 

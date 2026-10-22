@@ -83,7 +83,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-verifiedpermissions-ver
 /// store cannot be reached, which is a server fault and not a bad request.
 #[smithy_macros::operation_error(
     "com.amazonaws.verifiedpermissions#CreateIdentitySource",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum CreateIdentitySourceErrorModeled {
@@ -91,12 +91,14 @@ pub enum CreateIdentitySourceErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::create_identity_source::CreateIdentitySourceError`). The wrapper also carries
-/// the 400 `ValidationException` this handler answers with for a provider
-/// reference it cannot resolve.
+/// (`crate::ops::create_identity_source::CreateIdentitySourceError`). A provider
+/// reference it cannot resolve, and an omitted `principalEntityType` it cannot
+/// default, are answered with the MODELLED 400 `ValidationException`, whose
+/// `fieldList` names the member — see [`crate::ops::validation_exception`].
 pub type CreateIdentitySourceError = crate::scaffolded::Scaffolded<CreateIdentitySourceErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
@@ -128,12 +130,12 @@ impl<Eng> CreateIdentitySource<Eng> {
 }
 
 /// Reduce the request's `Configuration` to what state persists, refusing a
-/// provider reference this emulator cannot resolve. The `Err` is the refusal
-/// text, which names the member the caller has to fix.
+/// provider reference this emulator cannot resolve. The `Err` names the member
+/// the caller has to fix, for the modelled `ValidationException`'s `fieldList`.
 pub(crate) fn persisted_configuration(
     configuration: &Configuration,
     request_region: &str,
-) -> Result<crate::state::IdentitySourceConfiguration, String> {
+) -> Result<crate::state::IdentitySourceConfiguration, crate::ops::InvalidInput> {
     match configuration {
         Configuration::cognitoUserPoolConfiguration(cognito) => {
             let (region, user_pool_id) =
@@ -222,12 +224,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "the service state store is unavailable".to_string(),
             })
         };
+        // A member of the request this service refuses on its own checks answers
+        // with the model's own `ValidationException`, whose `fieldList` names it.
+        let invalid = |invalid: crate::ops::InvalidInput| -> CreateIdentitySourceError {
+            CreateIdentitySourceErrorModeled::ValidationException(
+                crate::ops::validation_exception([invalid]),
+            )
+            .into()
+        };
 
         // The provider reference is resolved before any state is touched: a
         // request this service cannot resolve must change nothing.
         let region = crate::state::request_region(ctx.parts());
         let configuration = persisted_configuration(&input.configuration, &region)
-            .map_err(crate::scaffolded::Scaffolded::validation)?;
+            .map_err(invalid)?;
 
         // `principalEntityType` is optional on the create and REQUIRED on every
         // read (`GetIdentitySourceOutput`, `IdentitySourceItem`), so an omitted
@@ -251,10 +261,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::DEFAULT_COGNITO_PRINCIPAL_ENTITY_TYPE.to_string()
             }
             (None, crate::state::IdentitySourceConfiguration::OpenIdConnect(_)) => {
-                return Err(crate::scaffolded::Scaffolded::validation(
-                    "principalEntityType: an OpenID Connect identity source generates \
-                     principals of the entity type the request names, so it cannot be omitted",
-                ));
+                return Err(invalid(crate::ops::InvalidInput::new(
+                    crate::ops::paths::PRINCIPAL_ENTITY_TYPE,
+                    "an OpenID Connect identity source generates principals of the entity type \
+                     the request names, so it cannot be omitted",
+                )));
             }
         };
 

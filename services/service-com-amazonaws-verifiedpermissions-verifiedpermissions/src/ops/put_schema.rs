@@ -63,7 +63,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-verifiedpermissions-ver
 // service's common error set for an unreachable state store.
 #[smithy_macros::operation_error(
     "com.amazonaws.verifiedpermissions#PutSchema",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum PutSchemaErrorModeled {
@@ -71,6 +71,7 @@ pub enum PutSchemaErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -180,7 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // delete the schema, run PutSchema with `{}` for this parameter"): it is
         // stored, and reports no namespaces.
         let parsed = crate::state::cedar::parse_schema(definition).map_err(|e| {
-            crate::scaffolded::Scaffolded::validation(format!("definition.cedarJson: {e}"))
+            // The schema text is one request member, so the refusal names it in
+            // `fieldList` rather than only describing it in prose.
+            PutSchemaErrorModeled::ValidationException(crate::ops::validation_exception([
+                crate::ops::InvalidInput::new(crate::ops::paths::SCHEMA_CEDAR_JSON, e),
+            ]))
         })?;
 
         let store = state

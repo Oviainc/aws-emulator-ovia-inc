@@ -30,14 +30,27 @@ fn namespaces(value: &Value) -> Vec<String> {
 }
 
 /// The schema used wherever a test needs a real one: one namespace, two entity
-/// types, and one action whose context declares a single boolean attribute.
+/// types, and two actions whose context declares a single boolean attribute.
 ///
 /// The shape of this document is the Cedar schema JSON format that
 /// `SchemaDefinition$cedarJson` documents ("The schema definition must be written
 /// in Cedar schema JSON"): an object keyed by namespace, each namespace holding
 /// `entityTypes` and `actions`, and an action's `appliesTo` naming its
 /// `principalTypes`, `resourceTypes` and `context` record type.
+///
+/// `pub(crate)` so a sibling suite in this test target reaches the same schema
+/// rather than declaring a second one. The two actions differ only in name, so a
+/// suite can vary how MANY actions a policy's scope names without varying
+/// anything else.
 pub(crate) fn photo_app_schema() -> String {
+    let applies_to = json!({
+        "principalTypes": ["User"],
+        "resourceTypes": ["Photo"],
+        "context": {
+            "type": "Record",
+            "attributes": { "authenticated": { "type": "Boolean" } },
+        },
+    });
     serde_json::to_string(&json!({
         "PhotoApp": {
             "entityTypes": {
@@ -45,16 +58,8 @@ pub(crate) fn photo_app_schema() -> String {
                 "Photo": { "shape": { "type": "Record", "attributes": {} } },
             },
             "actions": {
-                "viewPhoto": {
-                    "appliesTo": {
-                        "principalTypes": ["User"],
-                        "resourceTypes": ["Photo"],
-                        "context": {
-                            "type": "Record",
-                            "attributes": { "authenticated": { "type": "Boolean" } },
-                        },
-                    },
-                },
+                "viewPhoto": { "appliesTo": applies_to },
+                "sharePhoto": { "appliesTo": applies_to },
             },
         },
     }))

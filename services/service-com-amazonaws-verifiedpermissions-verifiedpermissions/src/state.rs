@@ -444,8 +444,9 @@ pub enum OpenIdConnectTokens {
 /// carries the region it was created in (`<region>_<suffix>`), so an id that
 /// disagrees with its own ARN names no pool either.
 ///
-/// The `Err` is the text of the refusal, so the caller is told which segment of
-/// the ARN it has to fix.
+/// The `Err` is an [`crate::ops::InvalidInput`] naming
+/// `configuration.cognitoUserPoolConfiguration.userPoolArn`, so the caller is
+/// told which member — and which segment of the ARN in it — to fix.
 ///
 /// What this CANNOT check: whether a pool with that id was ever created. The
 /// cognito-idp emulator holds its user pools in its own state struct, and
@@ -454,51 +455,50 @@ pub enum OpenIdConnectTokens {
 /// service), and no shared crate publishes a pool registry. The partition, the
 /// account, the region and the region the pool id names are therefore the whole
 /// of the resolution this service can perform.
-pub fn resolve_user_pool_arn(arn: &str, request_region: &str) -> Result<(String, String), String> {
+pub fn resolve_user_pool_arn(
+    arn: &str,
+    request_region: &str,
+) -> Result<(String, String), crate::ops::InvalidInput> {
+    let invalid = |reason: String| {
+        crate::ops::InvalidInput::new(crate::ops::paths::COGNITO_USER_POOL_ARN, reason)
+    };
     let fields: Vec<&str> = arn.splitn(6, ':').collect();
     let ["arn", partition, "cognito-idp", region, account, resource] = fields[..] else {
-        return Err(format!(
-            "configuration.cognitoUserPoolConfiguration.userPoolArn: {arn} is not an \
-             Amazon Cognito user pool ARN"
-        ));
+        return Err(invalid(format!(
+            "{arn} is not an Amazon Cognito user pool ARN"
+        )));
     };
     let Some(user_pool_id) = resource.strip_prefix("userpool/") else {
-        return Err(format!(
-            "configuration.cognitoUserPoolConfiguration.userPoolArn: {arn} does not name a \
-             user pool"
-        ));
+        return Err(invalid(format!("{arn} does not name a user pool")));
     };
     // A resource in another partition is not reachable from this one at all, so
     // the partition is resolved like the account and the region below.
     let own_partition = emulator_partition();
     if partition != own_partition {
-        return Err(format!(
-            "configuration.cognitoUserPoolConfiguration.userPoolArn: no Amazon Cognito user \
-             pool {user_pool_id} exists in partition {partition}; an identity source can only \
-             reference a user pool in partition {own_partition}"
-        ));
+        return Err(invalid(format!(
+            "no Amazon Cognito user pool {user_pool_id} exists in partition {partition}; an \
+             identity source can only reference a user pool in partition {own_partition}"
+        )));
     }
     let own_account = ::engine::emulator_account_id();
     if account != own_account {
-        return Err(format!(
-            "configuration.cognitoUserPoolConfiguration.userPoolArn: no Amazon Cognito user \
-             pool {user_pool_id} exists in account {account}; an identity source can only \
-             reference a user pool in account {own_account}"
-        ));
+        return Err(invalid(format!(
+            "no Amazon Cognito user pool {user_pool_id} exists in account {account}; an \
+             identity source can only reference a user pool in account {own_account}"
+        )));
     }
     if region != request_region {
-        return Err(format!(
-            "configuration.cognitoUserPoolConfiguration.userPoolArn: no Amazon Cognito user \
-             pool {user_pool_id} exists in region {region}; an identity source can only \
-             reference a user pool in its policy store's region {request_region}"
-        ));
+        return Err(invalid(format!(
+            "no Amazon Cognito user pool {user_pool_id} exists in region {region}; an identity \
+             source can only reference a user pool in its policy store's region \
+             {request_region}"
+        )));
     }
     if !user_pool_id.starts_with(&format!("{region}_")) {
-        return Err(format!(
-            "configuration.cognitoUserPoolConfiguration.userPoolArn: no Amazon Cognito user \
-             pool {user_pool_id} exists in region {region}; a user pool id names the region \
-             the pool was created in"
-        ));
+        return Err(invalid(format!(
+            "no Amazon Cognito user pool {user_pool_id} exists in region {region}; a user pool \
+             id names the region the pool was created in"
+        )));
     }
     Ok((region.to_string(), user_pool_id.to_string()))
 }

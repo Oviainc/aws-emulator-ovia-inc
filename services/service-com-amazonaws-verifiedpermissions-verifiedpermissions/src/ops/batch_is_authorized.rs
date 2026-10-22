@@ -89,12 +89,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-verifiedpermissions-ver
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.verifiedpermissions#BatchIsAuthorized",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum BatchIsAuthorizedErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -161,11 +162,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request, not of any store, so it costs a length check rather than a
         // state read.
         if input.requests.len() > crate::state::cedar::MAX_BATCH_REQUESTS {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "requests carries {} authorization requests, more than the {} a batch \
-                 may carry",
-                input.requests.len(),
-                crate::state::cedar::MAX_BATCH_REQUESTS
+            return Err(invalid(crate::ops::InvalidInput::new(
+                crate::ops::paths::REQUESTS,
+                format!(
+                    "it carries {} authorization requests, more than the {} a batch may carry",
+                    input.requests.len(),
+                    crate::state::cedar::MAX_BATCH_REQUESTS
+                ),
             )));
         }
 
@@ -186,43 +189,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each request is evaluated as a complete Cedar triple, so every member of
         // every request must be present; an absent one is refused by naming the
-        // request's index, rather than answered with a deny that would read as
-        // "evaluated and denied".
-        let required = |member: String| {
-            crate::scaffolded::Scaffolded::validation(format!(
-                "{member} is required to evaluate an authorization request"
-            ))
+        // request's index in the error's `fieldList`, rather than answered with a
+        // deny that would read as "evaluated and denied".
+        let required = |index: usize, member: &str| {
+            invalid(
+                crate::ops::InvalidInput::new(
+                    member,
+                    "it is required to evaluate an authorization request",
+                )
+                .within_batch_request(index),
+            )
         };
         let mut triples: Vec<Triple> = Vec::with_capacity(input.requests.len());
         let mut contexts: Vec<serde_json::Value> = Vec::with_capacity(input.requests.len());
         for (index, item) in input.requests.iter().enumerate() {
             triples.push(Triple {
                 principal: crate::state::cedar::request_entity(item.principal.as_ref())
-                    .ok_or_else(|| required(format!("requests[{index}].principal")))?,
+                    .ok_or_else(|| required(index, crate::ops::paths::PRINCIPAL))?,
                 action: crate::state::cedar::request_action(item.action.as_ref())
-                    .ok_or_else(|| required(format!("requests[{index}].action")))?,
+                    .ok_or_else(|| required(index, crate::ops::paths::ACTION))?,
                 resource: crate::state::cedar::request_entity(item.resource.as_ref())
-                    .ok_or_else(|| required(format!("requests[{index}].resource")))?,
+                    .ok_or_else(|| required(index, crate::ops::paths::RESOURCE))?,
             });
             contexts.push(
-                crate::state::cedar::context_to_cedar_json(item.context.as_ref()).map_err(
-                    |e| crate::scaffolded::Scaffolded::validation(format!("requests[{index}]: {e}")),
-                )?,
+                crate::state::cedar::context_to_cedar_json(item.context.as_ref())
+                    // The conversion names the member within ONE request's
+                    // `context`; the batch says which request that was.
+                    .map_err(|e| invalid(e.within_batch_request(index)))?,
             );
         }
 
         if !shares_principal_or_resource(&triples) {
-            return Err(crate::scaffolded::Scaffolded::validation(
+            return Err(invalid(crate::ops::InvalidInput::new(
+                crate::ops::paths::REQUESTS,
                 "either the principal or the resource must be identical across all of \
                  the requests in a batch",
-            ));
+            )));
         }
 
         // `entities` is a property of the BATCH, not of one request: one entity
         // slice is built once and every request is evaluated against it, typed by
-        // the store's schema when it holds one.
+        // the store's schema when it holds one. A refusal here names `/entities`
+        // itself, with no request index, because that is where the member lives.
         let entities = crate::state::cedar::entities_to_cedar_json(input.entities.as_ref())
-            .map_err(crate::scaffolded::Scaffolded::validation)?;
+            .map_err(invalid)?;
 
         let prepared = crate::state::cedar::load_policies(
             &store.policies,
@@ -231,22 +241,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is made against it rather than untyped.
             store.schema.as_ref().map(|schema| schema.cedar_json.as_str()),
         )
-        .map_err(crate::scaffolded::Scaffolded::validation)?;
+        .map_err(refused)?;
 
-        let entities = crate::state::cedar::build_entities(entities, prepared.schema())
-            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        let entities =
+            crate::state::cedar::build_entities(entities, prepared.schema()).map_err(invalid)?;
 
         let mut results = Vec::with_capacity(input.requests.len());
-        for ((item, triple), context) in input.requests.iter().zip(&triples).zip(contexts) {
+        for (index, ((item, triple), context)) in input
+            .requests
+            .iter()
+            .zip(&triples)
+            .zip(contexts)
+            .enumerate()
+        {
             let verdict = crate::state::cedar::evaluate(
                 &prepared,
                 &triple.principal,
                 &triple.action,
                 &triple.resource,
-                context,
+                crate::state::cedar::RequestContext {
+                    json: context,
+                    path: crate::state::cedar::context_path(item.context.as_ref()),
+                },
                 &entities,
             )
-            .map_err(crate::scaffolded::Scaffolded::validation)?;
+            // The evaluation names the member within ONE request; the batch says
+            // which request that was.
+            .map_err(|e| invalid(e.within_batch_request(index)))?;
 
             results.push(BatchIsAuthorizedOutputItem {
                 // "The authorization request that initiated the decision": the
@@ -278,6 +299,29 @@ struct Triple {
     principal: crate::state::ScopeEntity,
     action: crate::state::ScopeEntity,
     resource: crate::state::ScopeEntity,
+}
+
+/// One offending request member as this operation's modelled
+/// `ValidationException`, whose `fieldList` names it.
+fn invalid(invalid: crate::ops::InvalidInput) -> BatchIsAuthorizedError {
+    BatchIsAuthorizedErrorModeled::ValidationException(crate::ops::validation_exception([invalid]))
+        .into()
+}
+
+/// A Cedar refusal as this operation's answer: a bad request member is the
+/// modelled `ValidationException`, and service-side state the caller cannot fix
+/// — a stored schema that will not parse, a store holding more Cedar than one
+/// request evaluates — is a server fault rather than a bad request.
+fn refused(refusal: crate::state::cedar::Refusal) -> BatchIsAuthorizedError {
+    match refusal {
+        crate::state::cedar::Refusal::InvalidInput(field) => invalid(field),
+        crate::state::cedar::Refusal::ServiceFault(message) => {
+            BatchIsAuthorizedErrorModeled::InternalServerException(InternalServerException {
+                message,
+            })
+            .into()
+        }
+    }
 }
 
 /// Whether the batch satisfies this operation's documented rule: "Either the

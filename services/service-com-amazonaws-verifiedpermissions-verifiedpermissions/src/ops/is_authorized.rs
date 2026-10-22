@@ -87,12 +87,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-verifiedpermissions-ver
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.verifiedpermissions#IsAuthorized",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum IsAuthorizedErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -156,23 +157,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Cedar evaluates a request against a complete triple, so each of the
         // three must be present. Refused as a bad request rather than answered
-        // with a deny, which would read as "evaluated and denied".
-        let required = |member: &str| {
-            crate::scaffolded::Scaffolded::validation(format!(
-                "{member} is required to evaluate an authorization request"
-            ))
-        };
+        // with a deny, which would read as "evaluated and denied" — and the
+        // refusal names the absent member in `fieldList`.
+        let required = |path: &str| invalid(crate::ops::InvalidInput::new(path, REQUIRED_FOR_EVALUATION));
         let principal = crate::state::cedar::request_entity(input.principal.as_ref())
-            .ok_or_else(|| required("principal"))?;
+            .ok_or_else(|| required(crate::ops::paths::PRINCIPAL))?;
         let resource = crate::state::cedar::request_entity(input.resource.as_ref())
-            .ok_or_else(|| required("resource"))?;
+            .ok_or_else(|| required(crate::ops::paths::RESOURCE))?;
         let action = crate::state::cedar::request_action(input.action.as_ref())
-            .ok_or_else(|| required("action"))?;
+            .ok_or_else(|| required(crate::ops::paths::ACTION))?;
 
-        let context = crate::state::cedar::context_to_cedar_json(input.context.as_ref())
-            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        // The context travels with the member it came from, so a refusal the
+        // evaluation raises about it names the union arm the client sent.
+        let context = crate::state::cedar::RequestContext {
+            json: crate::state::cedar::context_to_cedar_json(input.context.as_ref())
+                .map_err(invalid)?,
+            path: crate::state::cedar::context_path(input.context.as_ref()),
+        };
         let entities = crate::state::cedar::entities_to_cedar_json(input.entities.as_ref())
-            .map_err(crate::scaffolded::Scaffolded::validation)?;
+            .map_err(invalid)?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             IsAuthorizedErrorModeled::InternalServerException(InternalServerException {
@@ -197,7 +200,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // it rather than untyped.
             store.schema.as_ref().map(|schema| schema.cedar_json.as_str()),
         )
-        .map_err(crate::scaffolded::Scaffolded::validation)?;
+        .map_err(|refusal| match refusal {
+            // A request member the caller can fix is the modelled
+            // `ValidationException`; service-side state it cannot — a stored
+            // schema that will not parse, a store holding more Cedar than one
+            // request evaluates — is a server fault, not a bad request.
+            crate::state::cedar::Refusal::InvalidInput(field) => invalid(field),
+            crate::state::cedar::Refusal::ServiceFault(message) => {
+                IsAuthorizedErrorModeled::InternalServerException(InternalServerException {
+                    message,
+                })
+                .into()
+            }
+        })?;
 
         Ok(IsAuthorizedOutput {
             decision: verdict.decision,
@@ -215,4 +230,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
         })
     }
+}
+
+/// Why an absent member of the authorization triple is refused. The three
+/// members are modelled optional, so the boundary validator cannot require them
+/// and this is the place that does.
+const REQUIRED_FOR_EVALUATION: &str = "it is required to evaluate an authorization request";
+
+/// One offending request member as this operation's modelled
+/// `ValidationException`.
+fn invalid(invalid: crate::ops::InvalidInput) -> IsAuthorizedError {
+    IsAuthorizedErrorModeled::ValidationException(crate::ops::validation_exception([invalid])).into()
 }

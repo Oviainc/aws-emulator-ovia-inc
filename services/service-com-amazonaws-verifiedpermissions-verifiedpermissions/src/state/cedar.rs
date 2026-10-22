@@ -43,8 +43,31 @@ use crate::ops::types::{
     ActionIdentifier, AttributeValue, CedarTagValue, ContextDefinition, EntitiesDefinition,
     EntityIdentifier, EntityItem,
 };
+use crate::ops::{paths, InvalidInput};
 
 use super::{Policy, ScopeEntity};
+
+/// Why a Cedar operation refused to answer.
+///
+/// The two arms are two different HTTP answers, and keeping them apart is what
+/// stops a fault in SERVICE-side state being reported as the caller's mistake: a
+/// store whose stored schema will not parse, or one holding more Cedar than a
+/// request evaluates, is nothing the caller can fix from the request it sent.
+#[derive(Debug, Clone)]
+pub enum Refusal {
+    /// A member of the request is invalid — the modelled `ValidationException`,
+    /// with this member in its `fieldList`.
+    InvalidInput(InvalidInput),
+    /// Service-side state cannot answer this request — the modelled
+    /// `InternalServerException`, carrying this text.
+    ServiceFault(String),
+}
+
+impl From<InvalidInput> for Refusal {
+    fn from(invalid: InvalidInput) -> Self {
+        Self::InvalidInput(invalid)
+    }
+}
 
 /// How many entities one `IsAuthorized` request may carry. The published
 /// Verified Permissions quota is *Entities per authorization request* — 100.
@@ -177,26 +200,37 @@ pub struct StaticScope {
 /// schema validation. Called by every path that hands a caller's statement to
 /// Cedar ([`parse_static_policy`], [`validate_static_policy`]) and, before any
 /// of them, by the handler, so the bound dominates whichever runs first.
-pub fn check_statement_size(statement: &str) -> Result<(), String> {
+///
+/// The model puts no upper `@length` on `PolicyStatement`, so the boundary
+/// validator cannot refuse an over-long one and this is the place that does.
+pub fn check_statement_size(statement: &str) -> Result<(), InvalidInput> {
     if statement.len() > MAX_STATEMENT_BYTES {
-        return Err(format!(
-            "definition.static.statement is {} bytes, more than the {MAX_STATEMENT_BYTES} \
-             bytes a policy may carry",
-            statement.len()
+        return Err(InvalidInput::new(
+            paths::STATIC_STATEMENT,
+            format!(
+                "the statement is {} bytes, more than the {MAX_STATEMENT_BYTES} bytes a \
+                 policy may carry",
+                statement.len()
+            ),
         ));
     }
     Ok(())
 }
 
 /// Parse one Cedar static policy and read its effect and scope off the parsed
-/// form. `Err` carries the parser's diagnostics, for a `ValidationException`.
+/// form. `Err` names [`paths::STATIC_STATEMENT`] and carries the parser's
+/// diagnostics, for a `ValidationException`.
 ///
 /// Refuses a statement past [`MAX_STATEMENT_BYTES`] BEFORE handing it to the
 /// parser, so an over-long payload costs a length check rather than a parse.
-pub fn parse_static_policy(statement: &str) -> Result<StaticScope, String> {
+pub fn parse_static_policy(statement: &str) -> Result<StaticScope, InvalidInput> {
     check_statement_size(statement)?;
-    let policy = cedar_policy::Policy::parse(None, statement)
-        .map_err(|e| format!("the policy statement is not valid Cedar: {e}"))?;
+    let policy = cedar_policy::Policy::parse(None, statement).map_err(|e| {
+        InvalidInput::new(
+            paths::STATIC_STATEMENT,
+            format!("the policy statement is not valid Cedar: {e}"),
+        )
+    })?;
 
     let effect = match policy.effect() {
         cedar_policy::Effect::Permit => "Permit",
@@ -276,18 +310,36 @@ pub fn parse_schema(text: &str) -> Result<ParsedSchema, String> {
 /// the schema gives it.
 ///
 /// `schema_json` is the text the store holds (already accepted by
-/// [`parse_schema`]); `Err` carries the validator's diagnostics, for a
-/// `ValidationException`.
-pub fn validate_static_policy(schema_json: &str, statement: &str) -> Result<(), String> {
+/// [`parse_schema`]); an `Err` carrying [`Refusal::InvalidInput`] names the
+/// statement, and one carrying [`Refusal::ServiceFault`] says the store's own
+/// schema is what could not be read.
+pub fn validate_static_policy(schema_json: &str, statement: &str) -> Result<(), Refusal> {
     // The statement is bounded BEFORE the schema is parsed and before Cedar sees
     // the statement, so the cheap check dominates both parses.
     check_statement_size(statement)?;
-    let parsed = parse_schema(schema_json)?;
-    let policy = cedar_policy::Policy::parse(None, statement)
-        .map_err(|e| format!("the policy statement is not valid Cedar: {e}"))?;
+    // The schema is text this service already accepted from `PutSchema`, so a
+    // parse failure here is service-side state the caller cannot fix, not a bad
+    // request — it is reported as a server fault rather than blamed on the
+    // statement.
+    let parsed = parse_schema(schema_json).map_err(|e| {
+        Refusal::ServiceFault(format!(
+            "the policy store's schema could not be parsed, so a static policy cannot be \
+             validated against it: {e}"
+        ))
+    })?;
+    let policy = cedar_policy::Policy::parse(None, statement).map_err(|e| {
+        InvalidInput::new(
+            paths::STATIC_STATEMENT,
+            format!("the policy statement is not valid Cedar: {e}"),
+        )
+    })?;
     let mut set = cedar_policy::PolicySet::new();
-    set.add(policy)
-        .map_err(|e| format!("the policy statement could not be loaded: {e}"))?;
+    set.add(policy).map_err(|e| {
+        InvalidInput::new(
+            paths::STATIC_STATEMENT,
+            format!("the policy statement could not be loaded: {e}"),
+        )
+    })?;
 
     let result = cedar_policy::Validator::new(parsed.schema)
         .validate(&set, cedar_policy::ValidationMode::Strict);
@@ -305,10 +357,14 @@ pub fn validate_static_policy(schema_json: &str, statement: &str) -> Result<(), 
         // message.
         diagnostics.push("the policy does not validate against the schema".to_string());
     }
-    Err(format!(
-        "the policy does not validate against the schema in this policy store: {}",
-        diagnostics.join("; ")
-    ))
+    Err(InvalidInput::new(
+        paths::STATIC_STATEMENT,
+        format!(
+            "the policy does not validate against the schema in this policy store: {}",
+            diagnostics.join("; ")
+        ),
+    )
+    .into())
 }
 
 /// A Cedar `Type::"id"` as the API's `entityType`/`entityId` pair.
@@ -385,7 +441,7 @@ impl PreparedPolicies {
 pub fn load_policies(
     policies: &BTreeMap<String, Policy>,
     schema_json: Option<&str>,
-) -> Result<PreparedPolicies, String> {
+) -> Result<PreparedPolicies, Refusal> {
     let mut set = cedar_policy::PolicySet::new();
     let mut errors: Vec<String> = Vec::new();
     let mut parsed_bytes = 0usize;
@@ -401,13 +457,15 @@ pub fn load_policies(
         if parsed_bytes > super::MAX_POLICY_BYTES_PER_STORE
             || parsed_count > super::MAX_POLICIES_PER_STORE
         {
-            return Err(format!(
-                "policy store {} holds more Cedar text than one authorization request \
+            // Service-side state, not the request: the store holds more Cedar
+            // than one request evaluates, so no request against it can be
+            // answered and there is no member for the caller to fix.
+            return Err(Refusal::ServiceFault(format!(
+                "the policy store holds more Cedar text than one authorization request \
                  evaluates ({} bytes / {} policies)",
-                policy.policy_store_id,
                 super::MAX_POLICY_BYTES_PER_STORE,
                 super::MAX_POLICIES_PER_STORE
-            ));
+            )));
         }
         match cedar_policy::Policy::parse(
             Some(cedar_policy::PolicyId::new(policy_id)),
@@ -422,7 +480,17 @@ pub fn load_policies(
         }
     }
     let schema = match schema_json {
-        Some(text) => Some(parse_schema(text)?.schema),
+        Some(text) => Some(
+            parse_schema(text)
+                .map_err(|e| {
+                    // The store's own schema was accepted by `PutSchema`, so this
+                    // is service-side state the caller cannot fix.
+                    Refusal::ServiceFault(format!(
+                        "the policy store's schema could not be parsed: {e}"
+                    ))
+                })?
+                .schema,
+        ),
         None => None,
     };
     Ok(PreparedPolicies {
@@ -434,13 +502,29 @@ pub fn load_policies(
 
 /// Build the Cedar entity store one API call evaluates against, from the Cedar
 /// JSON [`entities_to_cedar_json`] already bounded, type-checked against the
-/// store's schema when it holds one.
+/// store's schema when it holds one. The refusal names the `entities` member.
 pub fn build_entities(
     entities: serde_json::Value,
     schema: Option<&cedar_policy::Schema>,
-) -> Result<cedar_policy::Entities, String> {
-    cedar_policy::Entities::from_json_value(entities, schema)
-        .map_err(|e| format!("entities are not a valid Cedar entity store: {e}"))
+) -> Result<cedar_policy::Entities, InvalidInput> {
+    cedar_policy::Entities::from_json_value(entities, schema).map_err(|e| {
+        InvalidInput::new(
+            paths::ENTITIES,
+            format!("the entities are not a valid Cedar entity store: {e}"),
+        )
+    })
+}
+
+/// One call's `context`: the Cedar JSON an evaluation reads, and the member of
+/// the request it came from — which is the member a refusal about it names.
+///
+/// The two travel together because `ContextDefinition` is a union: the JSON
+/// alone no longer says which arm the client sent.
+pub struct RequestContext<'a> {
+    /// The context as Cedar JSON, from [`context_to_cedar_json`].
+    pub json: serde_json::Value,
+    /// Where it came from, from [`context_path`].
+    pub path: &'a str,
 }
 
 /// Evaluate ONE authorization request against an already-parsed policy set.
@@ -450,20 +534,27 @@ pub fn build_entities(
 /// request itself is built against the store's schema when it holds one, so an
 /// entity type, action or context attribute the schema does not declare is
 /// refused rather than evaluated.
+///
+/// `context_path` is where the call's `context` came from ([`context_path`]), so
+/// a refusal about it names the union arm the client actually sent.
 pub fn evaluate(
     prepared: &PreparedPolicies,
     principal: &ScopeEntity,
     action: &ScopeEntity,
     resource: &ScopeEntity,
-    context: serde_json::Value,
+    context: RequestContext<'_>,
     entities: &cedar_policy::Entities,
-) -> Result<Verdict, String> {
-    let principal_uid = entity_uid(principal, "principal")?;
-    let action_uid = entity_uid(action, "action")?;
-    let resource_uid = entity_uid(resource, "resource")?;
+) -> Result<Verdict, InvalidInput> {
+    let principal_uid = entity_uid(principal, paths::PRINCIPAL)?;
+    let action_uid = entity_uid(action, paths::ACTION)?;
+    let resource_uid = entity_uid(resource, paths::RESOURCE)?;
 
-    let context = cedar_policy::Context::from_json_value(context, None)
-        .map_err(|e| format!("context is not a valid Cedar context: {e}"))?;
+    let context = cedar_policy::Context::from_json_value(context.json, None).map_err(|e| {
+        InvalidInput::new(
+            context.path,
+            format!("the context is not a valid Cedar context: {e}"),
+        )
+    })?;
 
     let request = cedar_policy::Request::new(
         principal_uid,
@@ -472,7 +563,16 @@ pub fn evaluate(
         context,
         prepared.schema(),
     )
-    .map_err(|e| format!("the authorization request is not valid: {e}"))?;
+    .map_err(|e| {
+        // A request is checked against the schema's declaration for the ACTION:
+        // `appliesTo` is what says which principal and resource types that
+        // action accepts and what its context record holds, so the action is the
+        // member a refusal here names.
+        InvalidInput::new(
+            paths::ACTION,
+            format!("the authorization request does not match the schema: {e}"),
+        )
+    })?;
 
     let response = cedar_policy::Authorizer::new().is_authorized(&request, &prepared.set, entities);
 
@@ -513,13 +613,15 @@ pub fn authorize(
     principal: &ScopeEntity,
     action: &ScopeEntity,
     resource: &ScopeEntity,
-    context: serde_json::Value,
+    context: RequestContext<'_>,
     entities: serde_json::Value,
     schema_json: Option<&str>,
-) -> Result<Verdict, String> {
+) -> Result<Verdict, Refusal> {
     let prepared = load_policies(policies, schema_json)?;
     let entities = build_entities(entities, prepared.schema())?;
-    evaluate(&prepared, principal, action, resource, context, &entities)
+    Ok(evaluate(
+        &prepared, principal, action, resource, context, &entities,
+    )?)
 }
 
 /// An `EntityIdentifier` request member as a state scope entity. `None` for an
@@ -542,10 +644,20 @@ pub fn request_action(action: Option<&ActionIdentifier>) -> Option<ScopeEntity> 
     })
 }
 
-/// Build a Cedar entity uid from an `entityType`/`entityId` pair.
-pub fn entity_uid(entity: &ScopeEntity, member: &str) -> Result<cedar_policy::EntityUid, String> {
-    let type_name = cedar_policy::EntityTypeName::from_str(&entity.entity_type)
-        .map_err(|e| format!("{member}.entityType is not a valid Cedar entity type: {e}"))?;
+/// Build a Cedar entity uid from an `entityType`/`entityId` pair. `path` is the
+/// JSON pointer of the member that carried the pair, and it is the member the
+/// refusal names: the pair arrives as one member value, so that is the location
+/// a client is pointed at.
+pub fn entity_uid(
+    entity: &ScopeEntity,
+    path: &str,
+) -> Result<cedar_policy::EntityUid, InvalidInput> {
+    let type_name = cedar_policy::EntityTypeName::from_str(&entity.entity_type).map_err(|e| {
+        InvalidInput::new(
+            path,
+            format!("its type is not a valid Cedar entity type: {e}"),
+        )
+    })?;
     Ok(cedar_policy::EntityUid::from_type_name_and_id(
         type_name,
         cedar_policy::EntityId::new(&entity.entity_id),
@@ -554,20 +666,22 @@ pub fn entity_uid(entity: &ScopeEntity, member: &str) -> Result<cedar_policy::En
 
 /// Refuse a value that nests past [`MAX_VALUE_DEPTH`], so the conversions below
 /// never recurse further than that many frames.
-fn check_depth(depth: usize, member: &str) -> Result<(), String> {
+fn check_depth(depth: usize, path: &str) -> Result<(), InvalidInput> {
     if depth > MAX_VALUE_DEPTH {
-        return Err(format!(
-            "{member} nests more than {MAX_VALUE_DEPTH} levels deep"
+        return Err(InvalidInput::new(
+            path,
+            format!("the value nests more than {MAX_VALUE_DEPTH} levels deep"),
         ));
     }
     Ok(())
 }
 
 /// Refuse a collection longer than [`MAX_COLLECTION_LEN`].
-fn check_len(len: usize, member: &str) -> Result<(), String> {
+fn check_len(len: usize, path: &str) -> Result<(), InvalidInput> {
     if len > MAX_COLLECTION_LEN {
-        return Err(format!(
-            "{member} carries {len} elements, more than the {MAX_COLLECTION_LEN} allowed"
+        return Err(InvalidInput::new(
+            path,
+            format!("it carries {len} elements, more than the {MAX_COLLECTION_LEN} allowed"),
         ));
     }
     Ok(())
@@ -580,34 +694,34 @@ fn check_len(len: usize, member: &str) -> Result<(), String> {
 /// `__extn` escapes, so Cedar parses them as the value they denote rather than as
 /// a record that happens to look like one.
 ///
-/// `depth` is this value's nesting level and `member` names it for the refusal
-/// message; a set or record recurses one level deeper and is refused at
-/// [`MAX_VALUE_DEPTH`].
+/// `depth` is this value's nesting level and `path` is the JSON pointer of the
+/// member that carries it, which a refusal names; a set or record recurses one
+/// level deeper and is refused at [`MAX_VALUE_DEPTH`].
 pub fn attribute_value_to_cedar_json(
     value: &AttributeValue,
     depth: usize,
-    member: &str,
-) -> Result<serde_json::Value, String> {
-    check_depth(depth, member)?;
+    path: &str,
+) -> Result<serde_json::Value, InvalidInput> {
+    check_depth(depth, path)?;
     Ok(match value {
         AttributeValue::Boolean(b) => serde_json::Value::Bool(*b),
         AttributeValue::Long(n) => serde_json::Value::from(*n),
         AttributeValue::String(s) => serde_json::Value::String(s.clone()),
         AttributeValue::Set(items) => {
-            check_len(items.len(), member)?;
+            check_len(items.len(), path)?;
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                out.push(attribute_value_to_cedar_json(item, depth + 1, member)?);
+                out.push(attribute_value_to_cedar_json(item, depth + 1, path)?);
             }
             serde_json::Value::Array(out)
         }
         AttributeValue::Record(members) => {
-            check_len(members.len(), member)?;
+            check_len(members.len(), path)?;
             let mut out = serde_json::Map::new();
             for (key, value) in members {
                 out.insert(
                     key.clone(),
-                    attribute_value_to_cedar_json(value, depth + 1, member)?,
+                    attribute_value_to_cedar_json(value, depth + 1, path)?,
                 );
             }
             serde_json::Value::Object(out)
@@ -625,29 +739,26 @@ pub fn attribute_value_to_cedar_json(
 pub fn tag_value_to_cedar_json(
     value: &CedarTagValue,
     depth: usize,
-    member: &str,
-) -> Result<serde_json::Value, String> {
-    check_depth(depth, member)?;
+    path: &str,
+) -> Result<serde_json::Value, InvalidInput> {
+    check_depth(depth, path)?;
     Ok(match value {
         CedarTagValue::Boolean(b) => serde_json::Value::Bool(*b),
         CedarTagValue::Long(n) => serde_json::Value::from(*n),
         CedarTagValue::String(s) => serde_json::Value::String(s.clone()),
         CedarTagValue::Set(items) => {
-            check_len(items.len(), member)?;
+            check_len(items.len(), path)?;
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                out.push(tag_value_to_cedar_json(item, depth + 1, member)?);
+                out.push(tag_value_to_cedar_json(item, depth + 1, path)?);
             }
             serde_json::Value::Array(out)
         }
         CedarTagValue::Record(members) => {
-            check_len(members.len(), member)?;
+            check_len(members.len(), path)?;
             let mut out = serde_json::Map::new();
             for (key, value) in members {
-                out.insert(
-                    key.clone(),
-                    tag_value_to_cedar_json(value, depth + 1, member)?,
-                );
+                out.insert(key.clone(), tag_value_to_cedar_json(value, depth + 1, path)?);
             }
             serde_json::Value::Object(out)
         }
@@ -674,35 +785,41 @@ fn extn_json(function: &str, argument: &str) -> serde_json::Value {
 /// Parse a caller-supplied `cedarJson` payload, bounded by size first and by
 /// nesting depth after: `serde_json` stops at its own recursion limit, and this
 /// pins the depth to the same [`MAX_VALUE_DEPTH`] the modelled arms obey.
-fn parse_cedar_json(text: &str, member: &str) -> Result<serde_json::Value, String> {
+fn parse_cedar_json(text: &str, path: &str) -> Result<serde_json::Value, InvalidInput> {
     if text.len() > MAX_CEDAR_JSON_BYTES {
-        return Err(format!(
-            "{member} is {} bytes, more than the {MAX_CEDAR_JSON_BYTES} bytes a request \
-             may carry",
-            text.len()
+        return Err(InvalidInput::new(
+            path,
+            format!(
+                "it is {} bytes, more than the {MAX_CEDAR_JSON_BYTES} bytes a request may carry",
+                text.len()
+            ),
         ));
     }
     let value: serde_json::Value = serde_json::from_str(text)
-        .map_err(|e| format!("{member} is not valid JSON: {e}"))?;
-    check_json_depth(&value, 0, member)?;
+        .map_err(|e| InvalidInput::new(path, format!("it is not valid JSON: {e}")))?;
+    check_json_depth(&value, 0, path)?;
     Ok(value)
 }
 
 /// Depth-check an already-parsed JSON value. Recursion is bounded by
 /// [`MAX_VALUE_DEPTH`] because it returns at the bound instead of descending.
-fn check_json_depth(value: &serde_json::Value, depth: usize, member: &str) -> Result<(), String> {
-    check_depth(depth, member)?;
+fn check_json_depth(
+    value: &serde_json::Value,
+    depth: usize,
+    path: &str,
+) -> Result<(), InvalidInput> {
+    check_depth(depth, path)?;
     match value {
         serde_json::Value::Array(items) => {
-            check_len(items.len(), member)?;
+            check_len(items.len(), path)?;
             for item in items {
-                check_json_depth(item, depth + 1, member)?;
+                check_json_depth(item, depth + 1, path)?;
             }
         }
         serde_json::Value::Object(members) => {
-            check_len(members.len(), member)?;
+            check_len(members.len(), path)?;
             for item in members.values() {
-                check_json_depth(item, depth + 1, member)?;
+                check_json_depth(item, depth + 1, path)?;
             }
         }
         _ => {}
@@ -713,21 +830,34 @@ fn check_json_depth(value: &serde_json::Value, depth: usize, member: &str) -> Re
 /// The request's `context` as Cedar JSON. An absent context is the empty record.
 pub fn context_to_cedar_json(
     context: Option<&ContextDefinition>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, InvalidInput> {
     match context {
         None => Ok(serde_json::json!({})),
         Some(ContextDefinition::contextMap(map)) => {
-            check_len(map.len(), "context.contextMap")?;
+            let path = paths::CONTEXT_MAP;
+            check_len(map.len(), path)?;
             let mut out = serde_json::Map::new();
             for (key, value) in map {
-                out.insert(
-                    key.clone(),
-                    attribute_value_to_cedar_json(value, 1, "context.contextMap")?,
-                );
+                out.insert(key.clone(), attribute_value_to_cedar_json(value, 1, path)?);
             }
             Ok(serde_json::Value::Object(out))
         }
-        Some(ContextDefinition::cedarJson(text)) => parse_cedar_json(text, "context.cedarJson"),
+        Some(ContextDefinition::cedarJson(text)) => {
+            parse_cedar_json(text, paths::CONTEXT_CEDAR_JSON)
+        }
+    }
+}
+
+/// Where the `context` a call carried lives in the request, which is the member
+/// a refusal about it names.
+///
+/// `ContextDefinition` is a union of two arms, so a client is pointed at the one
+/// it actually sent. An absent context evaluates as the empty record, which is
+/// the modelled map arm.
+pub fn context_path(context: Option<&ContextDefinition>) -> &'static str {
+    match context {
+        Some(ContextDefinition::cedarJson(_)) => paths::CONTEXT_CEDAR_JSON,
+        Some(ContextDefinition::contextMap(_)) | None => paths::CONTEXT_MAP,
     }
 }
 
@@ -739,7 +869,16 @@ pub fn context_to_cedar_json(
 /// published quota.
 pub fn entities_to_cedar_json(
     entities: Option<&EntitiesDefinition>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, InvalidInput> {
+    let too_many = |count: usize| {
+        InvalidInput::new(
+            paths::ENTITIES,
+            format!(
+                "it carries {count} entities, more than the {MAX_ENTITIES_PER_REQUEST} an \
+                 authorization request may carry"
+            ),
+        )
+    };
     let value = match entities {
         None => serde_json::Value::Array(Vec::new()),
         Some(EntitiesDefinition::entityList(items)) => {
@@ -748,28 +887,23 @@ pub fn entities_to_cedar_json(
                 out.push(entity_item_to_cedar_json(item)?);
             }
             if items.len() > MAX_ENTITIES_PER_REQUEST {
-                return Err(format!(
-                    "entities carries {} entities, more than the {MAX_ENTITIES_PER_REQUEST} \
-                     an authorization request may carry",
-                    items.len()
-                ));
+                return Err(too_many(items.len()));
             }
             serde_json::Value::Array(out)
         }
-        Some(EntitiesDefinition::cedarJson(text)) => parse_cedar_json(text, "entities.cedarJson")?,
+        Some(EntitiesDefinition::cedarJson(text)) => {
+            parse_cedar_json(text, paths::ENTITIES_CEDAR_JSON)?
+        }
     };
     let count = value.as_array().map_or(0, Vec::len);
     if count > MAX_ENTITIES_PER_REQUEST {
-        return Err(format!(
-            "entities carries {count} entities, more than the {MAX_ENTITIES_PER_REQUEST} \
-             an authorization request may carry"
-        ));
+        return Err(too_many(count));
     }
     Ok(value)
 }
 
 /// One `EntityItem` as Cedar's entity JSON form.
-fn entity_item_to_cedar_json(item: &EntityItem) -> Result<serde_json::Value, String> {
+fn entity_item_to_cedar_json(item: &EntityItem) -> Result<serde_json::Value, InvalidInput> {
     let mut entity = serde_json::Map::new();
     entity.insert(
         "uid".to_string(),
@@ -781,19 +915,17 @@ fn entity_item_to_cedar_json(item: &EntityItem) -> Result<serde_json::Value, Str
 
     let mut attrs = serde_json::Map::new();
     if let Some(given) = item.attributes.as_ref() {
-        check_len(given.len(), "entities.entityList.attributes")?;
+        let path = paths::ENTITY_LIST_ATTRIBUTES;
+        check_len(given.len(), path)?;
         for (key, value) in given {
-            attrs.insert(
-                key.clone(),
-                attribute_value_to_cedar_json(value, 1, "entities.entityList.attributes")?,
-            );
+            attrs.insert(key.clone(), attribute_value_to_cedar_json(value, 1, path)?);
         }
     }
     entity.insert("attrs".to_string(), serde_json::Value::Object(attrs));
 
     let mut parents = Vec::new();
     if let Some(given) = item.parents.as_ref() {
-        check_len(given.len(), "entities.entityList.parents")?;
+        check_len(given.len(), paths::ENTITY_LIST_PARENTS)?;
         for parent in given {
             parents.push(serde_json::json!({
                 "type": parent.entity_type,
@@ -804,13 +936,11 @@ fn entity_item_to_cedar_json(item: &EntityItem) -> Result<serde_json::Value, Str
     entity.insert("parents".to_string(), serde_json::Value::Array(parents));
 
     if let Some(given) = item.tags.as_ref() {
-        check_len(given.len(), "entities.entityList.tags")?;
+        let path = paths::ENTITY_LIST_TAGS;
+        check_len(given.len(), path)?;
         let mut tags = serde_json::Map::new();
         for (key, value) in given {
-            tags.insert(
-                key.clone(),
-                tag_value_to_cedar_json(value, 1, "entities.entityList.tags")?,
-            );
+            tags.insert(key.clone(), tag_value_to_cedar_json(value, 1, path)?);
         }
         entity.insert("tags".to_string(), serde_json::Value::Object(tags));
     }

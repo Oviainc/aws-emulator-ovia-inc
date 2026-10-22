@@ -4,6 +4,138 @@
 
 include!(concat!(env!("OUT_DIR"), "/com_amazonaws_verifiedpermissions_verifiedpermissions_ops_generated.rs"));
 
+/// The sentence a `ValidationException` this service raises carries in its
+/// required `message`.
+///
+/// It is a FIXED, identifier-free sentence on purpose: `ValidationException`'s
+/// own model documentation says "The request failed because one or more input
+/// parameters don't satisfy their constraint requirements. The output is
+/// provided as a list of fields and a reason for each field that isn't valid",
+/// so the specifics belong in `fieldList`, which is parseable, and not spliced
+/// into prose a client can only regex. The same split is what this service's
+/// other errors do — `ResourceNotFoundException` reports the identifier in
+/// `resourceId`, not in its message.
+pub const INVALID_INPUT_MESSAGE: &str = "Invalid input";
+
+/// One offending request member: the JSON-pointer `path` of the member at fault
+/// and the `reason` it was refused.
+///
+/// This is what every service-side input check in this crate fails with, so the
+/// member's location survives all the way to the wire instead of being flattened
+/// into a message string. [`validation_exception`] turns it into the modelled
+/// error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidInput {
+    /// The member's location in the request, as a JSON pointer
+    /// (`/definition/static/statement`), which is the form
+    /// `ValidationExceptionField$path` carries.
+    pub path: String,
+    /// Why the member was refused — the text that becomes
+    /// `ValidationExceptionField$message`.
+    pub reason: String,
+}
+
+impl InvalidInput {
+    /// An [`InvalidInput`] naming `path` and explaining it with `reason`.
+    pub fn new(path: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// This member, re-rooted under one request of a batch.
+    ///
+    /// A check that evaluates ONE authorization request names the member as that
+    /// request carries it (`/principal`); inside a batch the same member lives at
+    /// `/requests/1/principal`, so the check keeps one implementation and the
+    /// batch says which of its requests it was. Pointer construction stays here
+    /// rather than at each call site.
+    pub fn within_batch_request(mut self, index: usize) -> Self {
+        self.path = format!("{}/{index}{}", paths::REQUESTS, self.path);
+        self
+    }
+}
+
+impl std::fmt::Display for InvalidInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path, self.reason)
+    }
+}
+
+/// The modelled `ValidationException` for one or more offending request members.
+///
+/// Prefer this over `crate::scaffolded::Scaffolded::validation`: this service's
+/// model declares its OWN `ValidationException` on every operation, and that
+/// shape carries `fieldList`, so a client reading `fieldList` to point at the
+/// bad member gets it. The synthetic scaffold shape has a `message` and nothing
+/// else.
+pub fn validation_exception(
+    invalid: impl IntoIterator<Item = InvalidInput>,
+) -> types::ValidationException {
+    let field_list: Vec<types::ValidationExceptionField> = invalid
+        .into_iter()
+        .map(|field| types::ValidationExceptionField {
+            path: field.path,
+            message: field.reason,
+        })
+        .collect();
+    types::ValidationException {
+        message: INVALID_INPUT_MESSAGE.to_string(),
+        // `fieldList` is optional in the model, and an error that names no field
+        // is not one this service raises — every caller passes at least one — but
+        // an empty list would still be a lie about the shape, so it stays absent
+        // rather than being serialized as `[]`.
+        field_list: (!field_list.is_empty()).then_some(field_list),
+    }
+}
+
+/// The JSON-pointer path of every request member this service's own input checks
+/// can refuse — ONE home for the paths rule (b) names, so a member is spelled the
+/// same way wherever it is refused from. Each is the member's location in the
+/// request body as the model names it (`smithy_query(query="operation", ...)`).
+pub mod paths {
+    /// `CreatePolicy`/`UpdatePolicy`'s Cedar policy text.
+    pub const STATIC_STATEMENT: &str = "/definition/static/statement";
+    /// `PutSchema`'s Cedar schema JSON.
+    pub const SCHEMA_CEDAR_JSON: &str = "/definition/cedarJson";
+    /// The `policyStoreId` every operation in this service takes.
+    pub const POLICY_STORE_ID: &str = "/policyStoreId";
+    /// `ListPolicies`' pagination cursor.
+    pub const NEXT_TOKEN: &str = "/nextToken";
+    /// `CreatePolicyStoreAlias`' alias name.
+    pub const ALIAS_NAME: &str = "/aliasName";
+    /// `CreateIdentitySource`/`UpdateIdentitySource`'s principal entity type.
+    pub const PRINCIPAL_ENTITY_TYPE: &str = "/principalEntityType";
+    /// The Cognito user pool an identity source's configuration references.
+    pub const COGNITO_USER_POOL_ARN: &str =
+        "/configuration/cognitoUserPoolConfiguration/userPoolArn";
+    /// An authorization request's `principal`.
+    pub const PRINCIPAL: &str = "/principal";
+    /// An authorization request's `action`.
+    pub const ACTION: &str = "/action";
+    /// An authorization request's `resource`.
+    pub const RESOURCE: &str = "/resource";
+    /// An authorization request's `context`, and each arm of that union.
+    pub const CONTEXT_MAP: &str = "/context/contextMap";
+    /// `context`'s Cedar-JSON arm.
+    pub const CONTEXT_CEDAR_JSON: &str = "/context/cedarJson";
+    /// An authorization request's `entities`, whichever arm it carries.
+    pub const ENTITIES: &str = "/entities";
+    /// `entities`' Cedar-JSON arm.
+    pub const ENTITIES_CEDAR_JSON: &str = "/entities/cedarJson";
+    /// An `entityList` item's attribute map.
+    pub const ENTITY_LIST_ATTRIBUTES: &str = "/entities/entityList/attributes";
+    /// An `entityList` item's parent list.
+    pub const ENTITY_LIST_PARENTS: &str = "/entities/entityList/parents";
+    /// An `entityList` item's tag map.
+    pub const ENTITY_LIST_TAGS: &str = "/entities/entityList/tags";
+
+    /// A batch operation's request list. One member of one request in it is
+    /// named by [`super::InvalidInput::within_batch_request`].
+    pub const REQUESTS: &str = "/requests";
+}
+
 /// The modelled `ResourceNotFoundException` for a reference that names no live
 /// resource: the constant [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`], with the
 /// identity of what was not found in the members that model it.

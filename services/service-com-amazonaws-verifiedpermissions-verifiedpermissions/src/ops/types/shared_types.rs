@@ -59,6 +59,30 @@ pub struct InvalidStateException {
     pub message: String,
 }
 
+/// The model's own client-input error, which every operation in this service
+/// declares. Beside the required `message` it carries `fieldList` — "the list of
+/// fields that aren't valid" — which is the machine-readable half of the error:
+/// the model documents the output as "a list of fields and a reason for each
+/// field that isn't valid", so the member at fault belongs in there rather than
+/// only in the message prose. Built through
+/// [`crate::ops::validation_exception`].
+#[smithy_macros::smithy(shape = "com.amazonaws.verifiedpermissions#ValidationException")]
+#[derive(Debug, Clone, Default)]
+pub struct ValidationException {
+    pub message: String,
+    pub field_list: Option<Vec<ValidationExceptionField>>,
+}
+
+/// One entry of [`ValidationException::field_list`]: `path` is "the path to the
+/// specific element that Verified Permissions found to be not valid" and
+/// `message` "describes the policy validation error". Both are required.
+#[smithy_macros::smithy(shape = "com.amazonaws.verifiedpermissions#ValidationExceptionField")]
+#[derive(Debug, Clone, Default)]
+pub struct ValidationExceptionField {
+    pub path: String,
+    pub message: String,
+}
+
 #[smithy_macros::smithy(union_for = "com.amazonaws.verifiedpermissions#EntitiesDefinition")]
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
