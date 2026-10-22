@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the jobs of ONE queue (or the children of one array / multi-node parent, which
+//! is what the model documents: exactly one of `jobQueue`, `arrayJobId` and
+//! `multiNodeJobId`, and naming none or more than one is a `ClientException`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Results are built from the persisted jobs, newest first by `createdAt`, and
+//! paginated through `maxResults`/`nextToken`. Filtering follows the model's own docs:
+//! with no `filters`, `jobStatus` selects the status and only `RUNNING` jobs are returned
+//! when it is absent; with a `filters` entry, `jobStatus` is ignored except alongside
+//! `SHARE_IDENTIFIER`, only one filter may be used at a time, and the documented filter
+//! names are `JOB_NAME` (case-insensitive, `*` suffix matches a prefix), `JOB_DEFINITION`
+//! (name — any revision — or exact ARN, case-sensitive, `*` suffix matches a prefix),
+//! `BEFORE_CREATED_AT`, `AFTER_CREATED_AT` and `SHARE_IDENTIFIER`.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,6 +153,38 @@ impl From<ListJobsErrorModeled> for ListJobsError {
     }
 }
 
+/// Whether `candidate` matches a filter `value` the way the model documents `JOB_NAME`:
+/// case-insensitively, and matching any candidate that begins with the text before a
+/// trailing `*`.
+fn matches_ignoring_case(candidate: &str, value: &str) -> bool {
+    match value.strip_suffix('*') {
+        // Compared byte-wise rather than through two lowercased copies: a job name is
+        // ASCII (`^[A-Za-z0-9][A-Za-z0-9_-]*$`), and `is_char_boundary` keeps the slice
+        // valid for anything else.
+        Some(prefix) => {
+            candidate.len() >= prefix.len()
+                && candidate.is_char_boundary(prefix.len())
+                && candidate[..prefix.len()].eq_ignore_ascii_case(prefix)
+        }
+        None => candidate.eq_ignore_ascii_case(value),
+    }
+}
+
+/// Whether the job definition `arn` a job ran matches a `JOB_DEFINITION` filter value,
+/// the way the model documents it: an ARN matches that exact revision (no `*`), while a
+/// name matches every revision of it, case-sensitively, with a trailing `*` matching any
+/// name that begins with the text before it.
+fn matches_job_definition(arn: &str, value: &str) -> bool {
+    if value.starts_with("arn:") {
+        return arn == value;
+    }
+    let name = crate::state::job_definition_reference_name(arn);
+    match value.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => name == value,
+    }
+}
+
 /// The `ListJobs` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -184,18 +221,178 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListJobs"))
+        use crate::state as batch;
+
+        let _ = ctx;
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(ListJobsErrorModeled::ServerException(batch::unreachable_state()).into());
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        let selectors = [
+            input.job_queue.as_deref(),
+            input.array_job_id.as_deref(),
+            input.multi_node_job_id.as_deref(),
+        ];
+        if selectors.iter().filter(|selector| selector.is_some()).count() != 1 {
+            return Err(ListJobsErrorModeled::ClientException(batch::client_exception(
+                "You must specify only one of jobQueue, arrayJobId or multiNodeJobId",
+            ))
+            .into());
+        }
+
+        let mut jobs: Vec<batch::Job> = if let Some(reference) = input.job_queue.as_deref() {
+            let Some(queue) = state.job_queue(reference) else {
+                return Err(ListJobsErrorModeled::ClientException(batch::client_exception(
+                    format!("Job queue {reference} does not exist"),
+                ))
+                .into());
+            };
+            let queue_arn = queue.arn.clone();
+            state
+                .jobs_by_queue
+                .get(&queue_arn)
+                .into_iter()
+                .flatten()
+                .filter_map(|id| state.jobs.get(id))
+                .cloned()
+                .collect()
+        } else {
+            let parent = input
+                .array_job_id
+                .as_deref()
+                .or(input.multi_node_job_id.as_deref())
+                .unwrap_or_default();
+            if !state.jobs.contains_key(parent) {
+                return Err(ListJobsErrorModeled::ClientException(batch::client_exception(
+                    format!("Job {parent} does not exist"),
+                ))
+                .into());
+            }
+            // The children of an array or multi-node parent. `SubmitJob` does not
+            // create any (it answers 501 for `arrayProperties`/`nodeOverrides`), so a
+            // job that exists has no children to list.
+            Vec::new()
+        };
+
+        let filters = input.filters.unwrap_or_default();
+        if filters.len() > 1 {
+            return Err(ListJobsErrorModeled::ClientException(batch::client_exception(
+                "Only one filter can be used at a time",
+            ))
+            .into());
+        }
+        let mut status_filter_applies = true;
+        if let Some(filter) = filters.first() {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let values = filter.values.clone().unwrap_or_default();
+            match name {
+                "JOB_NAME" => {
+                    jobs.retain(|job| {
+                        values
+                            .iter()
+                            .any(|value| matches_ignoring_case(&job.job_name, value))
+                    });
+                    status_filter_applies = false;
+                }
+                "JOB_DEFINITION" => {
+                    jobs.retain(|job| {
+                        values
+                            .iter()
+                            .any(|value| matches_job_definition(&job.job_definition_arn, value))
+                    });
+                    status_filter_applies = false;
+                }
+                "BEFORE_CREATED_AT" | "AFTER_CREATED_AT" => {
+                    let mut bounds = Vec::with_capacity(values.len());
+                    for value in &values {
+                        let Ok(bound) = value.parse::<i64>() else {
+                            return Err(ListJobsErrorModeled::ClientException(
+                                batch::client_exception(format!(
+                                    "The {name} filter value {value} is not a number of milliseconds since the epoch"
+                                )),
+                            )
+                            .into());
+                        };
+                        bounds.push(bound);
+                    }
+                    if name == "BEFORE_CREATED_AT" {
+                        jobs.retain(|job| bounds.iter().any(|bound| job.created_at <= *bound));
+                    } else {
+                        jobs.retain(|job| bounds.iter().any(|bound| job.created_at >= *bound));
+                    }
+                    status_filter_applies = false;
+                }
+                // The one filter the model documents as usable together with `jobStatus`.
+                "SHARE_IDENTIFIER" => {
+                    jobs.retain(|job| {
+                        job.share_identifier
+                            .as_deref()
+                            .is_some_and(|identifier| values.iter().any(|value| value == identifier))
+                    });
+                }
+                other => {
+                    return Err(ListJobsErrorModeled::ClientException(batch::client_exception(
+                        format!("Unknown filter name {other}"),
+                    ))
+                    .into());
+                }
+            }
+        }
+        if status_filter_applies {
+            // The model's own doc for `jobStatus`: "If you don't specify a status, only
+            // RUNNING jobs are returned."
+            let status = input.job_status.as_deref().unwrap_or(batch::JOB_RUNNING);
+            jobs.retain(|job| job.status == status);
+        }
+
+        jobs.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then(left.job_id.cmp(&right.job_id))
+        });
+
+        let (page, next_token) =
+            batch::paginate(jobs, input.max_results, input.next_token.as_deref()).map_err(
+                |message| {
+                    ListJobsError::from(ListJobsErrorModeled::ClientException(
+                        batch::client_exception(message),
+                    ))
+                },
+            )?;
+
+        let job_summary_list = page
+            .into_iter()
+            .map(|job| JobSummary {
+                job_arn: Some(job.job_arn),
+                job_id: job.job_id,
+                job_name: job.job_name,
+                capacity_usage: None,
+                created_at: Some(job.created_at),
+                scheduled_at: None,
+                share_identifier: job.share_identifier,
+                status: Some(job.status),
+                status_reason: job.status_reason,
+                started_at: job.started_at,
+                stopped_at: job.stopped_at,
+                container: job.container.map(|container| ContainerSummary {
+                    exit_code: container.exit_code,
+                    reason: container.reason,
+                }),
+                array_properties: None,
+                node_properties: None,
+                job_definition: Some(job.job_definition_arn),
+                is_cancelled: Some(job.is_cancelled),
+                is_terminated: Some(job.is_terminated),
+            })
+            .collect();
+
+        Ok(ListJobsOutput {
+            job_summary_list,
+            next_token,
+        })
     }
 }

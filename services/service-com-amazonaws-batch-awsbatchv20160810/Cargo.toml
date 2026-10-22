@@ -21,14 +21,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Opaque, URL-safe encoding for the pagination cursors this service vends.
+# Hashes the entropy behind the UUID-shaped `jobId`/compute environment `uuid` this
+# service mints (`state::new_uuid`).
+sha2 = { workspace = true }
+# Opaque, URL-safe encoding for the pagination cursors this service vends, and for the
+# hex groups of those ids.
 hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
 
 [lints]
 workspace = true

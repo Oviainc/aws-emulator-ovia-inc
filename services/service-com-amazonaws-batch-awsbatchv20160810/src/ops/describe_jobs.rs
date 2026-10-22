@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one `JobDetail` per KNOWN job id, built from the persisted record: the job's
+//! name, its queue's ARN, the ARN of the job definition revision it resolved to, its
+//! status and `statusReason`, `createdAt`/`stoppedAt` in epoch milliseconds, its
+//! parameters, tags and the effective container the definition and the submit overrides
+//! added up to. An id nothing stored is omitted silently, as AWS Batch does, rather than
+//! failing the whole call.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It is a REPORTING operation: it materialises only the job transitions the clock
+//! already owed (see [`crate::state`]), so repeated describes report a status that only
+//! moves forward with time and never because somebody looked.
+//!
+//! No attempt, `startedAt` or `exitCode` is reported: this emulator has no container
+//! runtime, nothing ran, and the engine contract forbids inventing a result for work
+//! that did not happen. The run ends in the modelled `FAILED` status whose
+//! `statusReason` says exactly that.
+//!
+//! `JobDetail$startedAt` is a KNOWN DEPARTURE forced by the model: it is `@required`
+//! (`smithy_query(query="shape",shape="JobDetail")`), so a value is always serialized,
+//! and a job that never started has none to report. It is therefore `0` — the Long
+//! default, a documented sentinel for "never started" rather than a fabricated start
+//! instant — and no job here reports a non-zero `startedAt` until something actually
+//! starts one. The crate's integration tests pin this.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +154,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeJobs"))
+        use crate::state as batch;
+
+        let _ = ctx;
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(
+                DescribeJobsErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        let mut seen = ::std::collections::HashSet::new();
+        let details: Vec<JobDetail> = input
+            .jobs
+            .iter()
+            .filter_map(|id| state.jobs.get(id))
+            .filter(|job| seen.insert(job.job_id.clone()))
+            .map(|job| JobDetail {
+                job_arn: Some(job.job_arn.clone()),
+                job_name: job.job_name.clone(),
+                job_id: job.job_id.clone(),
+                job_queue: job.job_queue_arn.clone(),
+                status: job.status.clone(),
+                share_identifier: job.share_identifier.clone(),
+                scheduling_priority: job.scheduling_priority,
+                // Nothing ran, so there is no attempt to report.
+                attempts: None,
+                status_reason: job.status_reason.clone(),
+                created_at: Some(job.created_at),
+                retry_strategy: job.retry_strategy.clone(),
+                // Modelled as required, so it is always serialized; 0 until the job
+                // starts, which a job whose container never ran never does.
+                started_at: job.started_at.unwrap_or_default(),
+                stopped_at: job.stopped_at,
+                depends_on: job.depends_on.clone(),
+                job_definition: job.job_definition_arn.clone(),
+                parameters: job.parameters.clone(),
+                container: job.container.clone(),
+                node_details: None,
+                node_properties: job.node_properties.clone(),
+                array_properties: None,
+                timeout: job.timeout.clone(),
+                tags: job.tags.clone(),
+                propagate_tags: job.propagate_tags,
+                platform_capabilities: job.platform_capabilities.clone(),
+                eks_properties: None,
+                eks_attempts: None,
+                ecs_properties: None,
+                is_cancelled: Some(job.is_cancelled),
+                is_terminated: Some(job.is_terminated),
+                consumable_resource_properties: job.consumable_resource_properties.clone(),
+            })
+            .collect();
+
+        Ok(DescribeJobsOutput {
+            jobs: Some(details),
+        })
     }
 }

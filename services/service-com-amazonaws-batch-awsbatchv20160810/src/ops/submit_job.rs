@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SubmitJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SubmitJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Submits a job and persists it in [`crate::state`].
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SubmitJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `jobQueue` resolves by name or ARN and `jobDefinition` by name, `name:revision` or
+//! ARN, both against persisted state: an unknown queue, an unknown definition or an
+//! unknown `dependsOn` job id is a `ClientException`, never a 200 carrying an id nothing
+//! stored. The job id is a fresh UUID, and the record keeps the queue ARN, the resolved
+//! revision's ARN, `createdAt` in epoch milliseconds, the parameters (the definition's
+//! defaults with the request's applied over them), the effective container
+//! (`containerProperties` with `containerOverrides` applied) and the submit request's own
+//! members, so `DescribeJobs` reports exactly what was submitted.
+//!
+//! The job is returned in the non-terminal `SUBMITTED` status; the clock owns every move
+//! out of it (see [`crate::state`]).
+//!
+//! Parts of the surface this slice does NOT implement answer 501 rather than accept a
+//! request they would then answer wrongly: `arrayProperties` and `nodeOverrides` (an
+//! array or multi-node parent whose children nothing would create), and
+//! `ecsPropertiesOverride`/`eksPropertiesOverride` or a job definition whose body is
+//! `ecsProperties`/`eksProperties` (their detail projection is not built here).
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -222,18 +234,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SubmitJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SubmitJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SubmitJob"))
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(SubmitJobErrorModeled::ServerException(batch::unreachable_state()).into());
+        };
+        let region = batch::request_region(ctx);
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        if input
+            .array_properties
+            .as_ref()
+            .and_then(|properties| properties.size)
+            .is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SubmitJob with arrayProperties",
+            ));
+        }
+        if input.node_overrides.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SubmitJob with nodeOverrides",
+            ));
+        }
+        if input.ecs_properties_override.is_some() || input.eks_properties_override.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SubmitJob with ecsPropertiesOverride or eksPropertiesOverride",
+            ));
+        }
+
+        let Some(queue) = state.job_queue(&input.job_queue) else {
+            return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
+                format!("Job queue {} does not exist", input.job_queue),
+            ))
+            .into());
+        };
+        let queue_arn = queue.arn.clone();
+
+        let Some(definition) = state.job_definition(&input.job_definition) else {
+            return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
+                format!("Job definition {} does not exist", input.job_definition),
+            ))
+            .into());
+        };
+        let definition = definition.clone();
+        if definition.status.as_deref() != Some(batch::STATUS_ACTIVE) {
+            return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
+                format!(
+                    "Job definition {} is not ACTIVE",
+                    definition.job_definition_arn
+                ),
+            ))
+            .into());
+        }
+        if definition.container_properties.is_none() && definition.node_properties.is_none() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SubmitJob against an ecsProperties or eksProperties job definition",
+            ));
+        }
+
+        // AWS documents the bound on `SubmitJob$dependsOn`: "A job can depend upon a
+        // maximum of 20 jobs." Checked before the ids are resolved, so one request can
+        // never add an unbounded number of dependency edges to the store.
+        let dependency_count = input.depends_on.as_ref().map_or(0, Vec::len);
+        if dependency_count > batch::limits::MAX_JOB_DEPENDENCIES {
+            return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
+                batch::quota_message(
+                    "dependsOn entries for one job",
+                    batch::limits::MAX_JOB_DEPENDENCIES,
+                ),
+            ))
+            .into());
+        }
+        for dependency in input.depends_on.iter().flatten() {
+            let Some(dependency_id) = dependency.job_id.as_deref() else {
+                continue;
+            };
+            if !state.jobs.contains_key(dependency_id) {
+                return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
+                    format!("Dependent job {dependency_id} does not exist"),
+                ))
+                .into());
+            }
+        }
+
+        let job_id = state.new_uuid();
+        let arn = batch::job_arn(&region, &job_id);
+        let job = batch::Job {
+            job_id: job_id.clone(),
+            job_arn: arn.clone(),
+            job_name: input.job_name.clone(),
+            job_queue_arn: queue_arn,
+            job_definition_arn: definition.job_definition_arn.clone(),
+            status: batch::JOB_SUBMITTED.to_string(),
+            status_reason: None,
+            created_at: now,
+            started_at: None,
+            stopped_at: None,
+            next_phase_due_at: Some(now + batch::JOB_PHASE_MILLIS),
+            is_cancelled: false,
+            is_terminated: false,
+            parameters: batch::merged_parameters(
+                definition.parameters.as_ref(),
+                input.parameters.as_ref(),
+            ),
+            container: batch::effective_container(
+                definition.container_properties.as_ref(),
+                input.container_overrides.as_ref(),
+            ),
+            node_properties: definition.node_properties.clone(),
+            retry_strategy: input.retry_strategy.or(definition.retry_strategy),
+            timeout: input.timeout.or(definition.timeout),
+            depends_on: input.depends_on,
+            share_identifier: input.share_identifier,
+            scheduling_priority: input
+                .scheduling_priority_override
+                .or(definition.scheduling_priority),
+            propagate_tags: input.propagate_tags.or(definition.propagate_tags),
+            platform_capabilities: definition.platform_capabilities.clone(),
+            consumable_resource_properties: input
+                .consumable_resource_properties_override
+                .or(definition.consumable_resource_properties),
+            tags: input.tags,
+        };
+        // The jobs store is bounded (`state::limits::MAX_JOBS`): room is made by
+        // evicting the jobs that have been terminal longest, and a store full of live
+        // jobs refuses the submit with the modelled 400 rather than growing.
+        state.insert_job(job).map_err(|message| {
+            SubmitJobError::from(SubmitJobErrorModeled::ClientException(
+                batch::client_exception(message),
+            ))
+        })?;
+
+        Ok(SubmitJobOutput {
+            job_arn: Some(arn),
+            job_name: input.job_name,
+            job_id,
+        })
     }
 }
