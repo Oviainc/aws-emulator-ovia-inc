@@ -1,11 +1,282 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7 service.
+//!
+//! The primary resource is the Classic load balancer (the model's `AccessPoint`):
+//! [`LoadBalancer`], keyed by `LoadBalancerName` in a [`BTreeMap`] so
+//! `DescribeLoadBalancers` has one stable order to paginate over.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::SystemTime;
+
+/// The scheme a load balancer gets when the request names none.
+///
+/// From `CreateLoadBalancer`'s own documentation: "By default, Elastic Load Balancing
+/// creates an Internet-facing load balancer".
+pub const SCHEME_INTERNET_FACING: &str = "internet-facing";
+
+/// The only other scheme `CreateLoadBalancer` documents: "Specify internal to create a
+/// load balancer with a DNS name that resolves to private IP addresses."
+pub const SCHEME_INTERNAL: &str = "internal";
+
+/// The region an emulated request is attributed to when it carries no SigV4 scope.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The maximum number of load balancers one account holds in one region.
+///
+/// From `CreateLoadBalancer`'s own documentation: "You can create up to 20 load
+/// balancers per region per account."
+pub const MAX_LOAD_BALANCERS_PER_REGION: usize = 20;
+
+/// The largest number of DISTINCT load balancers one `DescribeLoadBalancers` request may
+/// name.
+///
+/// AWS publishes no quota for the member and accepts a list that repeats a name, so the
+/// handler deduplicates first and applies this to the distinct names only, after each one
+/// is known to exist. A region holds at most [`MAX_LOAD_BALANCERS_PER_REGION`] load
+/// balancers, so a request whose names all exist can never reach this bound: it is the
+/// backstop that keeps the work one request can ask for bounded by the store rather than
+/// by the caller.
+pub const MAX_LOAD_BALANCER_NAMES_PER_REQUEST: usize = MAX_LOAD_BALANCERS_PER_REGION;
+
+/// The listener protocols the model documents for `Listener$Protocol` /
+/// `Listener$InstanceProtocol`: "The load balancer transport protocol to use for
+/// routing: HTTP, HTTPS, TCP, or SSL."
+pub const LISTENER_PROTOCOLS: &[&str] = &["HTTP", "HTTPS", "TCP", "SSL"];
+
+/// Published Classic Load Balancer quotas, from the "Elastic Load Balancing endpoints
+/// and quotas" page of the AWS General Reference. Each one bounds a collection a
+/// CALLER drives; together with [`MAX_REGIONS`], which bounds the one store dimension
+/// AWS publishes no quota for, the store a request can grow is bounded too.
+///
+/// "Listeners per load balancer: 100".
+pub const MAX_LISTENERS_PER_LOAD_BALANCER: usize = 100;
+
+/// "Registered instances per load balancer: 1,000".
+pub const MAX_INSTANCES_PER_LOAD_BALANCER: usize = 1_000;
+
+/// "Tags per load balancer: 10".
+pub const MAX_TAGS_PER_LOAD_BALANCER: usize = 10;
+
+/// "Security groups per load balancer: 5".
+pub const MAX_SECURITY_GROUPS_PER_LOAD_BALANCER: usize = 5;
+
+/// The largest `AvailabilityZones` or `Subnets` list a create accepts.
+///
+/// AWS states this quota structurally ("one subnet per Availability Zone") rather than
+/// as a number, and this emulator models no region topology, so this is a bound the
+/// emulator chooses: comfortably above the Availability Zone count of any AWS region,
+/// and low enough that one request cannot grow the store without limit.
+pub const MAX_PLACEMENTS_PER_LOAD_BALANCER: usize = 50;
+
+/// The largest `Instances` list one register/deregister/describe-health request may
+/// carry: the same bound as the set it can grow, so the per-request work is bounded by
+/// a constant rather than by the caller.
+pub const MAX_INSTANCES_PER_REQUEST: usize = MAX_INSTANCES_PER_LOAD_BALANCER;
+
+/// The number of distinct regions this store will hold records for.
+///
+/// Every published quota above is per region or per load balancer, so the region
+/// dimension is the one a caller could otherwise multiply freely: the region comes from
+/// the request's SigV4 credential scope, which the caller writes. AWS publishes no
+/// quota here (a region is not a resource an account creates), so this is a bound the
+/// emulator chooses, comfortably above the number of regions AWS publishes across all
+/// partitions. A create that would open one region past it is refused.
+pub const MAX_REGIONS: usize = 64;
+
+/// The registered-instance set of one load balancer: deduplicated, in registration
+/// order, with membership answered from an index rather than by scanning.
+///
+/// The ordered `Vec` is what `DescribeLoadBalancers` and `DescribeInstanceHealth`
+/// report; the `BTreeSet` makes each membership test O(log n), so a batched request
+/// costs O(batch x log n) instead of O(batch x n).
+#[derive(Debug, Clone, Default)]
+pub struct InstanceSet {
+    order: Vec<String>,
+    index: BTreeSet<String>,
+}
+
+impl InstanceSet {
+    /// Add `instance_id` unless it is already registered. Answers whether it was added.
+    pub fn insert(&mut self, instance_id: &str) -> bool {
+        if !self.index.insert(instance_id.to_string()) {
+            return false;
+        }
+        self.order.push(instance_id.to_string());
+        true
+    }
+
+    /// Remove every id in `ids` in ONE pass over the ordered set, so a batch costs
+    /// O(n log |ids|) rather than O(|ids| x n). Answers how many were registered.
+    pub fn remove_all(&mut self, ids: &BTreeSet<String>) -> usize {
+        let before = self.order.len();
+        self.order.retain(|held| !ids.contains(held));
+        for id in ids {
+            self.index.remove(id);
+        }
+        before - self.order.len()
+    }
+
+    pub fn contains(&self, instance_id: &str) -> bool {
+        self.index.contains(instance_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    /// The registered ids in registration order.
+    pub fn iter(&self) -> impl Iterator<Item = &String> {
+        self.order.iter()
+    }
+}
+
+/// One listener of a load balancer, keyed logically by its `LoadBalancerPort`.
+#[derive(Debug, Clone)]
+pub struct ListenerEntry {
+    pub protocol: String,
+    pub load_balancer_port: i32,
+    /// Defaults to `protocol` when the create request omitted it.
+    pub instance_protocol: String,
+    pub instance_port: i32,
+    pub ssl_certificate_id: Option<String>,
+    pub policy_names: Vec<String>,
+}
+
+/// A load balancer's health-check configuration.
+///
+/// Seeded at create with the Classic Load Balancer defaults so
+/// `DescribeLoadBalancers` reports a real `HealthCheck` before anyone calls
+/// `ConfigureHealthCheck`.
+#[derive(Debug, Clone)]
+pub struct HealthCheckConfig {
+    pub target: String,
+    pub interval: i32,
+    pub timeout: i32,
+    pub unhealthy_threshold: i32,
+    pub healthy_threshold: i32,
+}
+
+impl HealthCheckConfig {
+    /// The default health check of a newly created load balancer: a TCP check against
+    /// the instance port of its first listener.
+    pub fn default_for_instance_port(instance_port: i32) -> Self {
+        Self {
+            target: format!("TCP:{instance_port}"),
+            interval: 30,
+            timeout: 5,
+            unhealthy_threshold: 2,
+            healthy_threshold: 10,
+        }
+    }
+}
+
+/// One Classic load balancer, as persisted by `CreateLoadBalancer` and read back by
+/// every other operation.
+#[derive(Debug, Clone)]
+pub struct LoadBalancer {
+    pub name: String,
+    /// Generated once at create and kept for the record's lifetime.
+    pub dns_name: String,
+    pub canonical_hosted_zone_name: String,
+    pub canonical_hosted_zone_name_id: String,
+    pub scheme: String,
+    pub created_time: SystemTime,
+    pub listeners: Vec<ListenerEntry>,
+    pub availability_zones: Vec<String>,
+    pub subnets: Vec<String>,
+    pub security_groups: Vec<String>,
+    pub vpc_id: Option<String>,
+    /// Registered `InstanceId`s, deduplicated, in registration order, bounded by
+    /// [`MAX_INSTANCES_PER_LOAD_BALANCER`].
+    pub instances: InstanceSet,
+    pub health_check: HealthCheckConfig,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl LoadBalancer {
+    /// Register `instance_id`, keeping the set deduplicated and in registration order.
+    /// Answers whether the id was newly added.
+    pub fn register_instance(&mut self, instance_id: &str) -> bool {
+        self.instances.insert(instance_id)
+    }
+
+    /// Deregister every id in `ids`. Answers how many had been registered.
+    pub fn deregister_instances(&mut self, ids: &BTreeSet<String>) -> usize {
+        self.instances.remove_all(ids)
+    }
+
+    /// Whether `instance_id` is currently registered with this load balancer.
+    pub fn has_instance(&self, instance_id: &str) -> bool {
+        self.instances.contains(instance_id)
+    }
+
+    /// How many ids of `requested` are not registered yet — what registering them all
+    /// would add to the stored set.
+    pub fn new_instance_count<'a>(
+        &self,
+        requested: impl IntoIterator<Item = &'a String>,
+    ) -> usize {
+        let mut unseen: BTreeSet<&str> = BTreeSet::new();
+        for id in requested {
+            if !self.instances.contains(id) {
+                unseen.insert(id.as_str());
+            }
+        }
+        unseen.len()
+    }
+}
 
 /// Per-service state for com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7. A handler reaches it through [`service_state`].
+///
+/// A load balancer is a REGIONAL resource: one `LoadBalancerName` is unique within one
+/// region (the same name may name a different load balancer in another), a describe
+/// signed for one region does not see another's, and the documented "20 load balancers
+/// per region per account" quota is counted per region. The store is therefore keyed by
+/// region first, and each region's own map is keyed by name.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsElasticloadbalancingElasticloadbalancingV7State {
-    // TODO: add service-specific state fields
+    /// Region -> (`LoadBalancerName` -> record). `BTreeMap`s throughout, so
+    /// `DescribeLoadBalancers` paginates one stable order.
+    pub regions: BTreeMap<String, BTreeMap<String, LoadBalancer>>,
+}
+
+impl ComAmazonawsElasticloadbalancingElasticloadbalancingV7State {
+    /// The load balancers of `region`, or `None` when it holds none.
+    pub fn load_balancers_in(&self, region: &str) -> Option<&BTreeMap<String, LoadBalancer>> {
+        self.regions.get(region)
+    }
+
+    /// The load balancers of `region` for mutation, or `None` when it holds none. Does
+    /// NOT create the region's map, so a read or a no-op delete leaves the store as it
+    /// found it.
+    pub fn load_balancers_in_mut(
+        &mut self,
+        region: &str,
+    ) -> Option<&mut BTreeMap<String, LoadBalancer>> {
+        self.regions.get_mut(region)
+    }
+
+    /// The load balancers of `region` for insertion, creating the region's (empty) map
+    /// if this is the first record stored there. For a create path only, AFTER the
+    /// request is known to be acceptable.
+    ///
+    /// `None` when the store already holds [`MAX_REGIONS`] regions and `region` is not
+    /// one of them: the region comes from the caller's own credential scope, so the
+    /// number of per-region budgets it can open is capped.
+    pub fn region_entry(
+        &mut self,
+        region: &str,
+    ) -> Option<&mut BTreeMap<String, LoadBalancer>> {
+        if !self.regions.contains_key(region) && self.regions.len() >= MAX_REGIONS {
+            return None;
+        }
+        Some(self.regions.entry(region.to_string()).or_default())
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -17,4 +288,125 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsElasticloadbalancingElasticloadbalancingV7State>)
+}
+
+/// The region this request is attributed to: the region field of its SigV4 credential
+/// scope when it names a region, else [`DEFAULT_REGION`].
+///
+/// The scope is caller-written and the vendored parser accepts any non-empty field
+/// there, so a value that is not shaped like an AWS region name is not treated as one:
+/// it is attributed to the default region rather than opening a store partition of its
+/// own.
+pub fn region_from_request(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| looks_like_region(region))
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Whether `region` is shaped like a published AWS region name: three or four
+/// hyphen-separated segments, the last a one- or two-digit number and the rest
+/// lower-case letters — `us-east-1`, `ap-southeast-2`, `us-gov-west-1`, `cn-north-1`.
+fn looks_like_region(region: &str) -> bool {
+    let segments: Vec<&str> = region.split('-').collect();
+    if !(3..=4).contains(&segments.len()) {
+        return false;
+    }
+    let Some((number, words)) = segments.split_last() else {
+        return false;
+    };
+    let words_look_right = words.iter().all(|word| {
+        (1..=10).contains(&word.len()) && word.bytes().all(|byte| byte.is_ascii_lowercase())
+    });
+    let number_looks_right =
+        (1..=2).contains(&number.len()) && number.bytes().all(|byte| byte.is_ascii_digit());
+    words_look_right && number_looks_right
+}
+
+/// The first 16 bytes of SHA-256 over `label` and `region`, as one integer: a stable
+/// per-region value to derive a generated id from.
+fn region_digest(region: &str, label: &str) -> u128 {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(label.as_bytes());
+    hasher.update(b"/");
+    hasher.update(region.as_bytes());
+    let digest = hasher.finalize();
+    let mut head = [0u8; 16];
+    head.copy_from_slice(&digest[..16]);
+    u128::from_be_bytes(head)
+}
+
+/// A stable 10-digit id for a load balancer's DNS name, derived from the region and
+/// name so the same record in the same region always resolves to the same host.
+fn dns_suffix(region: &str, name: &str) -> u64 {
+    // A 10-digit value, the shape Elastic Load Balancing's own DNS names carry.
+    let value = (region_digest(region, name) % 9_000_000_000) as u64;
+    1_000_000_000 + value
+}
+
+/// The DNS name of a load balancer: `<name>-<id>.<region>.elb.amazonaws.com`, prefixed
+/// `internal-` for the `internal` scheme (whose name resolves to private addresses).
+pub fn dns_name(region: &str, name: &str, scheme: &str) -> String {
+    let suffix = dns_suffix(region, name);
+    if scheme == SCHEME_INTERNAL {
+        format!("internal-{name}-{suffix}.{region}.elb.amazonaws.com")
+    } else {
+        format!("{name}-{suffix}.{region}.elb.amazonaws.com")
+    }
+}
+
+/// The published Route 53 hosted zone id of the Elastic Load Balancing (Classic)
+/// endpoint in each region.
+///
+/// Source: the "Elastic Load Balancing endpoints and quotas" page of the AWS General
+/// Reference, which publishes one hosted zone id per region for Classic Load Balancers.
+const CLASSIC_ELB_HOSTED_ZONE_IDS: &[(&str, &str)] = &[
+    ("af-south-1", "Z268VQBMOI5EKX"),
+    ("ap-east-1", "Z3DQVH9N71FHZ0"),
+    ("ap-northeast-1", "Z14GRHDCWA56QT"),
+    ("ap-northeast-2", "ZWKZPGTI48KDX"),
+    ("ap-northeast-3", "Z5LXEXXYQ4HTP"),
+    ("ap-south-1", "ZP97RAFLXTNZK"),
+    ("ap-southeast-1", "Z1LMS91P8CMLE5"),
+    ("ap-southeast-2", "Z1GM3OXH4ZPM65"),
+    ("ca-central-1", "ZQSVJUPU6J1EY"),
+    ("eu-central-1", "Z215JYRZR1TBD5"),
+    ("eu-north-1", "Z23TAZ6LKFMNIO"),
+    ("eu-south-1", "Z3ULH7SSC9OV64"),
+    ("eu-west-1", "Z32O12XQLNTSW2"),
+    ("eu-west-2", "ZHURV8PSTC4K8"),
+    ("eu-west-3", "Z3Q77PNBQS71R4"),
+    ("me-south-1", "ZS929ML54UICD"),
+    ("sa-east-1", "Z2P70J7HTTTPLU"),
+    ("us-east-1", "Z35SXDOTRQ7X7K"),
+    ("us-east-2", "Z3AADJGX6KTTL2"),
+    ("us-west-1", "Z368ELLRRE2KJ0"),
+    ("us-west-2", "Z1H1FL5HABSF5"),
+];
+
+/// The hosted zone id to report for a load balancer in `region`.
+///
+/// A region the published table above does not cover still gets a well-formed,
+/// region-stable id (`Z` + 13 upper-case alphanumerics), because every load balancer
+/// has exactly one hosted zone id and the field is not nullable in practice.
+pub fn hosted_zone_id(region: &str) -> String {
+    if let Some((_, id)) = CLASSIC_ELB_HOSTED_ZONE_IDS
+        .iter()
+        .find(|(candidate, _)| *candidate == region)
+    {
+        return (*id).to_string();
+    }
+
+    // 13 base-36 digits taken from one 128-bit digest of the region (36^13 < 2^128), so
+    // an uncovered region always reports the same well-formed id.
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut value = region_digest(region, "hosted-zone");
+    let mut id = String::from("Z");
+    for _ in 0..13 {
+        id.push(char::from(ALPHABET[(value % 36) as usize]));
+        value /= 36;
+    }
+    id
 }
