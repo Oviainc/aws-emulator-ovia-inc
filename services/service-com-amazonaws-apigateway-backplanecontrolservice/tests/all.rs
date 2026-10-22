@@ -15,6 +15,8 @@
 mod api_key_collection_members;
 #[path = "all/api_key_lifecycle.rs"]
 mod api_key_lifecycle;
+#[path = "all/delete_lifecycle.rs"]
+mod delete_lifecycle;
 #[path = "all/patch_updates.rs"]
 mod patch_updates;
 #[path = "all/rest_api_defaults.rs"]
@@ -23,5 +25,7 @@ mod rest_api_defaults;
 mod rest_api_lifecycle;
 #[path = "all/service_claim.rs"]
 mod service_claim;
+#[path = "all/stage_lifecycle.rs"]
+mod stage_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMethod
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMethod`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMethod::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the `Method` stored under `httpMethod` on the resource named by
+//! `resourceId`, so a later `GetMethod` for that verb no longer finds one.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +159,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMethod` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMethodErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMethod"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+
+        // Every identifier the request carries is resolved against stored state before
+        // anything is removed, each naming its own record so the refusal says which one
+        // was not found.
+        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+            DeleteMethodErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+            })
+        })?;
+        let resource = api.resources.get_mut(&input.resource_id).ok_or_else(|| {
+            DeleteMethodErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_RESOURCE.to_string()),
+            })
+        })?;
+        // A verb names at most one method on a resource, under the same key
+        // `PutMethod` stored it with; removing it is what makes a later read answer
+        // `NotFoundException`.
+        if resource
+            .methods
+            .remove(&super::put_method::method_key(&input.http_method))
+            .is_none()
+        {
+            return Err(DeleteMethodErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_METHOD.to_string()),
+            })
+            .into());
+        }
+        Ok(DeleteMethodOutput)
     }
 }

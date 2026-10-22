@@ -18,6 +18,7 @@
 use serde_json::{json, Value};
 
 use crate::rest_api_lifecycle::{create_api, string_member, Answer, Gateway};
+use crate::stage_lifecycle::create_deployed_stage;
 
 /// AWS's published length range for an API key value a caller supplies
 /// (`CreateApiKey$value`, "Specifies a value of the API key"): 20 to 128 characters.
@@ -53,20 +54,9 @@ pub(crate) async fn get_key(gateway: &Gateway, id: &str, include_value: bool) ->
     gateway.call("GET", &uri, None).await
 }
 
-/// Assert `answer` is the modelled failure `(status, code)`.
-pub(crate) fn assert_failure(answer: &Answer, status: u16, code: &str, case: &str) {
-    assert_eq!(
-        answer.status, status,
-        "case {case}: expected {status}, got {} with {:?}",
-        answer.status, answer.body
-    );
-    assert_eq!(
-        answer.error.as_deref(),
-        Some(code),
-        "case {case}: expected {code}, got {:?}",
-        answer.error
-    );
-}
+/// This crate's one modelled-failure assertion, re-exported here because the sibling
+/// suites that grew up around this one import it from this module.
+pub(crate) use crate::rest_api_lifecycle::assert_failure;
 
 /// A tag map of `count` entries.
 fn tag_map(count: usize) -> Value {
@@ -312,12 +302,19 @@ async fn two_api_keys_cannot_share_one_value() {
 }
 
 #[tokio::test]
-async fn stage_keys_are_stored_as_api_and_stage_pairs_and_must_name_a_stored_api() {
+async fn stage_keys_must_name_a_stored_stage_and_are_stored_as_api_and_stage_pairs() {
     let gateway = Gateway::new();
     let (first, _) = create_api(&gateway, "stage-keys-one").await;
     let (second, _) = create_api(&gateway, "stage-keys-two").await;
 
-    // Accepted rows differ in how many stages one key is associated with.
+    // A stage key must name a stage, so each one this case associates is deployed
+    // first — over the wire, through `CreateDeployment`.
+    create_deployed_stage(&gateway, &first, "prod").await;
+    create_deployed_stage(&gateway, &first, "beta").await;
+    create_deployed_stage(&gateway, &second, "canary").await;
+
+    // Accepted rows differ in how many stages one key is associated with, and whether
+    // they belong to one API or several.
     let accepted: Vec<(&str, Vec<(String, &str)>)> = vec![
         ("one stage", vec![(first.clone(), "prod")]),
         (
@@ -361,8 +358,10 @@ async fn stage_keys_are_stored_as_api_and_stage_pairs_and_must_name_a_stored_api
         );
     }
 
-    // A stage key naming no stored API is the modelled NotFoundException; one that does
-    // not name a stage at all is a bad request.
+    // A stage key that names no stored stage — because the API is unknown, or because
+    // that API has no such stage — is the modelled NotFoundException; one that does not
+    // name a stage at all is a bad request. Rows put the offending entry alone, beside a
+    // valid one, and in either order.
     let refused: Vec<(&str, Value, u16, &str)> = vec![
         (
             "unknown restApiId",
@@ -371,10 +370,31 @@ async fn stage_keys_are_stored_as_api_and_stage_pairs_and_must_name_a_stored_api
             "NotFoundException",
         ),
         (
-            "an unknown api beside a known one",
+            "an unknown api beside a known stage",
             json!([
                 { "restApiId": first, "stageName": "prod" },
                 { "restApiId": "zzzzzzzzzz", "stageName": "prod" },
+            ]),
+            404,
+            "NotFoundException",
+        ),
+        (
+            "a stage no api has",
+            json!([{ "restApiId": first, "stageName": "nosuchstage" }]),
+            404,
+            "NotFoundException",
+        ),
+        (
+            "a stage of the other api",
+            json!([{ "restApiId": first, "stageName": "canary" }]),
+            404,
+            "NotFoundException",
+        ),
+        (
+            "an unknown stage before a known one",
+            json!([
+                { "restApiId": second, "stageName": "prod" },
+                { "restApiId": second, "stageName": "canary" },
             ]),
             404,
             "NotFoundException",

@@ -91,6 +91,25 @@ pub fn child_path(parent_path: &str, path_part: &str) -> String {
     }
 }
 
+/// The `ConflictException` message for a `pathPart` another child of the same parent
+/// already holds.
+///
+/// Built from the request: it names the segment that collides, which is the one thing
+/// the caller has to change. Shared with `UpdateResource`, which refuses the same clash
+/// when a rename or a re-parent would create it, so one rule has one message.
+pub fn sibling_clash_message(path_part: &str) -> String {
+    format!("Another resource with the same parent already has this name: {path_part}")
+}
+
+/// Whether a request's `embed` query parameter asks for `token`.
+///
+/// Every `embed` member of this service documents the same form: "The query parameter
+/// value must be a single-valued list and contain the `"<token>"` string" — so one
+/// parser serves every operation that takes one.
+pub fn embeds(embed: Option<&Vec<String>>, token: &str) -> bool {
+    embed.is_some_and(|values| values.iter().any(|value| value == token))
+}
+
 /// Whether a request's `embed` query parameter asks for the embedded `Method`
 /// resources.
 ///
@@ -98,7 +117,7 @@ pub fn child_path(parent_path: &str, path_part: &str) -> String {
 /// the embedded Method resources this way. The query parameter value must be a
 /// single-valued list and contain the `"methods"` string."
 pub fn embeds_methods(embed: Option<&Vec<String>>) -> bool {
-    embed.is_some_and(|values| values.iter().any(|value| value == "methods"))
+    embeds(embed, "methods")
 }
 
 /// The `resourceMethods` map a `Resource` body reports.
@@ -278,10 +297,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
             if taken {
                 return Err(CreateResourceErrorModeled::ConflictException(ConflictException {
-                    message: Some(format!(
-                        "Another child resource with the path part '{}' already exists for this resource",
-                        input.path_part
-                    )),
+                    message: Some(sibling_clash_message(&input.path_part)),
                 })
                 .into());
             }
