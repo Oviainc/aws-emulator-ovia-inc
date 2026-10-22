@@ -211,7 +211,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         snapshot.description = input.description.or(snapshot.description);
         snapshot.created_at = now;
         snapshot.updated_at = now;
-        snapshot.begin_transition(crate::state::STATUS_VERSIONING, now);
 
         let id = guardrail.id.clone();
         let version = snapshot.version.clone();

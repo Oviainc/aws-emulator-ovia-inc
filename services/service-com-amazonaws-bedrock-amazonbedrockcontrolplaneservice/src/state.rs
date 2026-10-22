@@ -15,7 +15,7 @@
 //! live there).
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use crate::ops::types::{
     GuardrailAutomatedReasoningPolicy, GuardrailAutomatedReasoningPolicyConfig,
@@ -37,25 +37,26 @@ use crate::ops::types::{
 /// (`^DRAFT$`) spells it.
 pub const DRAFT_VERSION: &str = "DRAFT";
 
-/// `GuardrailStatus` — a guardrail that is serving. The terminal status of every
-/// revision this emulator mints.
-pub const STATUS_READY: &str = "READY";
-/// `GuardrailStatus` — a guardrail whose creation is not complete yet.
-pub const STATUS_CREATING: &str = "CREATING";
-/// `GuardrailStatus` — a guardrail whose DRAFT update is not complete yet.
-pub const STATUS_UPDATING: &str = "UPDATING";
-/// `GuardrailStatus` — a numbered version that is still being snapshotted.
-pub const STATUS_VERSIONING: &str = "VERSIONING";
-
-/// How long a revision reports its transient status before the clock owes it
-/// `READY`.
+/// `GuardrailStatus` — a guardrail that is serving. The status every revision this
+/// emulator mints carries, from the call that mints it onwards.
 ///
-/// A CHOSEN span, not a documented one: AWS publishes no duration for the
-/// CREATING/UPDATING/VERSIONING window, so this emulator uses the top of the
-/// 250–750 ms band the project fixes for a clock-owed transition. It is never
-/// zero, so a caller that reads straight back still observes the transient
-/// status; nothing sleeps for it — the due instant is stored and compared.
-const TRANSITION: Duration = Duration::from_millis(700);
+/// `CreateGuardrail`, `UpdateGuardrail` and `CreateGuardrailVersion` return no status
+/// member at all, and the first read that follows any of them reports `READY`, so a
+/// guardrail is never observed in a non-terminal status: there is no transition for the
+/// clock to owe, and nothing asynchronous for this emulator to wait on. The other
+/// `GuardrailStatus` values (`CREATING`, `UPDATING`, `VERSIONING`, `DELETING`, `FAILED`)
+/// name states no call here produces, so none of them is minted.
+pub const STATUS_READY: &str = "READY";
+
+/// `GuardrailContentFiltersTierName` / `GuardrailTopicsTierName` /
+/// `GuardrailContextualGroundingTierName` — the tier a policy block reports when the
+/// request configured none.
+///
+/// All three enums are `[CLASSIC, STANDARD]`, and the model documents `STANDARD` as the
+/// opt-in tier that "requires that your guardrail use cross-Region inference" while
+/// `CLASSIC` "provides established guardrails functionality" — so `CLASSIC` is the tier a
+/// guardrail is on until a request names the other one.
+pub const TIER_CLASSIC: &str = "CLASSIC";
 
 /// The most guardrails this account may hold at once, past which a create is
 /// refused with `ServiceQuotaExceededException`.
@@ -105,20 +106,24 @@ pub struct GuardrailRevision {
     pub cross_region_details: Option<GuardrailCrossRegionDetails>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
-    /// The status this revision reports until [`GuardrailRevision::ready_at`].
-    pub pending_status: &'static str,
-    /// The instant at which the clock owes this revision [`STATUS_READY`].
-    pub ready_at: SystemTime,
+    /// This revision's `GuardrailStatus`. [`STATUS_READY`] for every revision this
+    /// emulator mints; see that constant for why no other value is reachable.
+    pub status: &'static str,
+    /// `statusReasons` — why the guardrail failed to be created, updated, versioned or
+    /// deleted. Empty for a revision that is not `FAILED`, which is every revision here,
+    /// and reported as the empty list rather than omitted.
+    pub status_reasons: Vec<String>,
+    /// `failureRecommendations` — what to do before retrying. Empty alongside
+    /// [`GuardrailRevision::status_reasons`], and reported the same way.
+    pub failure_recommendations: Vec<String>,
 }
 
 impl GuardrailRevision {
-    /// A revision carrying only the two required messaging strings, starting its
-    /// `pending_status` window at `now`.
+    /// A revision carrying only the two required messaging strings, created at `now`.
     pub fn new(
         version: impl Into<String>,
         blocked_input_messaging: String,
         blocked_outputs_messaging: String,
-        pending_status: &'static str,
         now: SystemTime,
     ) -> Self {
         Self {
@@ -135,25 +140,9 @@ impl GuardrailRevision {
             cross_region_details: None,
             created_at: now,
             updated_at: now,
-            pending_status,
-            ready_at: now + TRANSITION,
-        }
-    }
-
-    /// Open a fresh transient-status window: this revision reports
-    /// `pending_status` until `TRANSITION` after `now`.
-    pub fn begin_transition(&mut self, pending_status: &'static str, now: SystemTime) {
-        self.pending_status = pending_status;
-        self.ready_at = now + TRANSITION;
-    }
-
-    /// The status to report at `now`: the transient one until the clock owes
-    /// `READY`, then `READY` forever.
-    pub fn status_at(&self, now: SystemTime) -> &'static str {
-        if now < self.ready_at {
-            self.pending_status
-        } else {
-            STATUS_READY
+            status: STATUS_READY,
+            status_reasons: Vec::new(),
+            failure_recommendations: Vec::new(),
         }
     }
 
@@ -396,15 +385,30 @@ fn base36(mut value: u64, width: usize) -> String {
     String::from_utf8(out).expect("base-36 digits are ASCII")
 }
 
+/// How a policy block's members are reported, which both conversions below and the
+/// response construction in `ops/get_guardrail.rs` follow:
+///
+/// * A LIST member whose `@length` admits zero entries is always PRESENT — the empty list
+///   when the request configured none — because the wire form of "nothing configured" for
+///   such a member is `[]`, not an absent key. A list whose `@length` has `min: 1`
+///   (`GuardrailContentPolicy$filters`, `GuardrailWordPolicy$words`,
+///   `GuardrailSensitiveInformationPolicy$piiEntities`,
+///   `GuardrailContextualGroundingPolicy$filters`) cannot be reported empty, so it stays
+///   absent until the request configures it.
+/// * A TIER member is always present on a block that models one, carrying the tier the
+///   request named or [`TIER_CLASSIC`] when it named none.
 fn topic_policy_of(config: &GuardrailTopicPolicyConfig) -> GuardrailTopicPolicy {
     GuardrailTopicPolicy {
         topics: config.topics_config.iter().map(topic_of).collect(),
-        tier: config
-            .tier_config
-            .as_ref()
-            .map(|tier: &GuardrailTopicsTierConfig| GuardrailTopicsTier {
-                tier_name: tier.tier_name.clone(),
-            }),
+        tier: Some(GuardrailTopicsTier {
+            tier_name: config
+                .tier_config
+                .as_ref()
+                .map_or_else(
+                    || TIER_CLASSIC.to_string(),
+                    |tier: &GuardrailTopicsTierConfig| tier.tier_name.clone(),
+                ),
+        }),
     }
 }
 
@@ -412,7 +416,9 @@ fn topic_of(config: &GuardrailTopicConfig) -> GuardrailTopic {
     GuardrailTopic {
         name: config.name.clone(),
         definition: config.definition.clone(),
-        examples: config.examples.clone(),
+        // `GuardrailTopicExamples` is `@length(min: 0)`, so a topic with no examples
+        // carries the empty list.
+        examples: Some(config.examples.clone().unwrap_or_default()),
         r#type: Some(config.r#type.clone()),
         input_action: config.input_action.clone(),
         output_action: config.output_action.clone(),
@@ -430,12 +436,12 @@ fn content_policy_of(config: &GuardrailContentPolicyConfig) -> GuardrailContentP
                 .map(content_filter_of)
                 .collect(),
         ),
-        tier: config
-            .tier_config
-            .as_ref()
-            .map(|tier: &GuardrailContentFiltersTierConfig| GuardrailContentFiltersTier {
-                tier_name: tier.tier_name.clone(),
-            }),
+        tier: Some(GuardrailContentFiltersTier {
+            tier_name: config.tier_config.as_ref().map_or_else(
+                || TIER_CLASSIC.to_string(),
+                |tier: &GuardrailContentFiltersTierConfig| tier.tier_name.clone(),
+            ),
+        }),
     }
 }
 
@@ -467,8 +473,11 @@ fn word_policy_of(config: &GuardrailWordPolicyConfig) -> GuardrailWordPolicy {
                 })
                 .collect()
         }),
-        managed_word_lists: config.managed_word_lists_config.as_ref().map(|lists| {
-            lists
+        managed_word_lists: Some(
+            config
+                .managed_word_lists_config
+                .as_deref()
+                .unwrap_or_default()
                 .iter()
                 .map(|list: &GuardrailManagedWordsConfig| GuardrailManagedWords {
                     r#type: list.r#type.clone(),
@@ -477,8 +486,8 @@ fn word_policy_of(config: &GuardrailWordPolicyConfig) -> GuardrailWordPolicy {
                     input_enabled: list.input_enabled,
                     output_enabled: list.output_enabled,
                 })
-                .collect()
-        }),
+                .collect(),
+        ),
     }
 }
 
@@ -499,8 +508,11 @@ fn sensitive_information_policy_of(
                 })
                 .collect()
         }),
-        regexes: config.regexes_config.as_ref().map(|regexes| {
-            regexes
+        regexes: Some(
+            config
+                .regexes_config
+                .as_deref()
+                .unwrap_or_default()
                 .iter()
                 .map(|regex: &GuardrailRegexConfig| GuardrailRegex {
                     name: regex.name.clone(),
@@ -512,8 +524,8 @@ fn sensitive_information_policy_of(
                     input_enabled: regex.input_enabled,
                     output_enabled: regex.output_enabled,
                 })
-                .collect()
-        }),
+                .collect(),
+        ),
     }
 }
 
@@ -535,11 +547,12 @@ fn contextual_grounding_policy_of(
                 },
             )
             .collect(),
-        tier: config.tier_config.as_ref().map(
-            |tier: &GuardrailContextualGroundingTierConfig| GuardrailContextualGroundingTier {
-                tier_name: tier.tier_name.clone(),
-            },
-        ),
+        tier: Some(GuardrailContextualGroundingTier {
+            tier_name: config.tier_config.as_ref().map_or_else(
+                || TIER_CLASSIC.to_string(),
+                |tier: &GuardrailContextualGroundingTierConfig| tier.tier_name.clone(),
+            ),
+        }),
     }
 }
 

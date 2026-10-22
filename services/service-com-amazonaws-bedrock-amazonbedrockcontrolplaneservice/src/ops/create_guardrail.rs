@@ -245,7 +245,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::DRAFT_VERSION,
             input.blocked_input_messaging,
             input.blocked_outputs_messaging,
-            crate::state::STATUS_CREATING,
             now,
         );
         draft.description = input.description;

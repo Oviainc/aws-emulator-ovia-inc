@@ -8,8 +8,8 @@
 //! pattern admits both. An identifier or version this store does not hold is
 //! `ResourceNotFoundException`.
 //!
-//! This operation is `@readonly`: it reports status from the stored due instant and
-//! writes nothing.
+//! This operation is `@readonly`: it reports the stored revision's status and writes
+//! nothing.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -182,7 +182,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let now = ::std::time::SystemTime::now();
         let store = state.lock();
 
         let not_found = || {
@@ -207,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             guardrail_id: guardrail.id.clone(),
             guardrail_arn: guardrail.arn.clone(),
             version: revision.version.clone(),
-            status: revision.status_at(now).to_string(),
+            status: revision.status.to_string(),
             topic_policy: revision.topic_policy.clone(),
             content_policy: revision.content_policy.clone(),
             word_policy: revision.word_policy.clone(),
@@ -217,10 +216,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cross_region_details: revision.cross_region_details.clone(),
             created_at: crate::state::date_time(revision.created_at),
             updated_at: crate::state::date_time(revision.updated_at),
-            // `statusReasons` and `failureRecommendations` appear only for a FAILED
-            // guardrail; no revision this emulator mints reaches FAILED.
-            status_reasons: None,
-            failure_recommendations: None,
+            // `statusReasons` and `failureRecommendations` diagnose a FAILED guardrail,
+            // and are the EMPTY list — present, not absent — for every other status:
+            // both are modelled lists whose `@length` admits zero entries, so `[]` is
+            // the wire form of "nothing to report". No revision this emulator mints
+            // reaches FAILED, so both are read back empty from the stored revision.
+            status_reasons: Some(revision.status_reasons.clone()),
+            failure_recommendations: Some(revision.failure_recommendations.clone()),
             blocked_input_messaging: revision.blocked_input_messaging.clone(),
             blocked_outputs_messaging: revision.blocked_outputs_messaging.clone(),
             kms_key_arn: guardrail.kms_key_arn.clone(),
