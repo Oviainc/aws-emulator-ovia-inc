@@ -6,6 +6,10 @@
 //!
 //! Every assertion reads a RESPONSE BODY, so a handler that answered 2xx without
 //! persisting anything fails here.
+//!
+//! The request harness below (`emulator`, `call`, `as_label`, `text`,
+//! `application_body` and the resource helpers) is `pub(crate)` so the other suites
+//! in this test target reuse it instead of growing a second copy.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -112,7 +116,10 @@ pub(crate) fn application_body(description: &str) -> Value {
 }
 
 /// Create an application and wait until the clock has made it `READY`.
-async fn ready_application(router: &MultiServiceRouter, description: &str) -> (String, String) {
+pub(crate) async fn ready_application(
+    router: &MultiServiceRouter,
+    description: &str,
+) -> (String, String) {
     let (status, created) = call(
         router,
         "POST",
@@ -132,7 +139,7 @@ async fn ready_application(router: &MultiServiceRouter, description: &str) -> (S
 }
 
 /// Create an `ACTIVE` stream group whose default application is `application`.
-async fn active_stream_group(
+pub(crate) async fn active_stream_group(
     router: &MultiServiceRouter,
     description: &str,
     application: &str,

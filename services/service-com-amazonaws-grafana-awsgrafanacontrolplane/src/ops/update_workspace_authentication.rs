@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWorkspaceAuthentication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWorkspaceAuthentication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWorkspaceAuthentication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The one writer of a workspace's authentication: it replaces the stored
+//! provider list and, when the request carries one, the stored SAML
+//! configuration — which is what moves a SAML workspace's
+//! `samlConfigurationStatus` from `NOT_CONFIGURED` to `CONFIGURED`.
+//! `DescribeWorkspaceAuthentication` reports that same record.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +160,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWorkspaceAuthentication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWorkspaceAuthenticationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWorkspaceAuthentication"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateWorkspaceAuthenticationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the grafana workspace store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(workspace) = store.settled_mut(&input.workspace_id, now) else {
+            return Err(
+                UpdateWorkspaceAuthenticationErrorModeled::ResourceNotFoundException(
+                    crate::state::workspace_not_found(&input.workspace_id),
+                )
+                .into(),
+            );
+        };
+
+        // `authenticationProviders` is `@required`, so it REPLACES the stored
+        // list: it "specifies whether this workspace uses SAML 2.0, IAM Identity
+        // Center, or both" after this call.
+        workspace.authentication_providers = input.authentication_providers;
+        // `samlConfiguration` is optional, so a request that carries none leaves
+        // the stored configuration (and therefore the SAML status) as it was.
+        if let Some(configuration) = input.saml_configuration {
+            workspace.saml_configuration = Some(configuration);
+        }
+        workspace.modified = now;
+
+        // No clock-owed transition: this operation answers 200 with the
+        // authentication "after the update is made", and `SamlConfigurationStatus`
+        // has no transient value to pass through (only CONFIGURED and
+        // NOT_CONFIGURED), so the record it returns is already settled.
+        Ok(UpdateWorkspaceAuthenticationOutput {
+            authentication: workspace.to_authentication_description(),
+        })
     }
 }

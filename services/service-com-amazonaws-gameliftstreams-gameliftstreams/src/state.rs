@@ -64,6 +64,16 @@ pub const APPLICATION_QUOTA: usize = 1_000;
 /// and its client tokens.
 pub const STREAM_GROUP_QUOTA: usize = 1_000;
 
+/// How many tags ONE resource holds.
+///
+/// The Amazon Web Services General Reference's tag restrictions — which
+/// `TagResource` points at ("Tagging Amazon Web Services Resources in the Amazon
+/// Web Services General Reference") — give a maximum of 50 tags per resource, and
+/// the model mirrors that bound on every tagging operation's `Tags` map
+/// (`length 1..50`). A request that would take a resource past it is refused, so
+/// the stored tag map cannot grow without end.
+pub const TAGS_PER_RESOURCE: usize = 50;
+
 /// How many stream sessions ONE stream group holds at a time.
 ///
 /// A stream session occupies a compute resource the stream group allocated, so the
@@ -596,6 +606,24 @@ impl ComAmazonawsGameliftstreamsGameliftstreamsState {
             return Some(&application.tags);
         }
         self.stream_group(resource_arn).map(|group| &group.tags)
+    }
+
+    /// The tags of the taggable resource an `Arn` names, for mutation — the same
+    /// resolution as [`Self::tags_of`], for the operations that assign or remove
+    /// tags rather than report them.
+    pub fn tags_of_mut(&mut self, resource_arn: &str) -> Option<&mut HashMap<String, String>> {
+        if !resource_arn.starts_with("arn:") {
+            return None;
+        }
+        // Which store holds it is decided by an immutable lookup first, so only one
+        // mutable borrow of `self` is ever live.
+        if self.application(resource_arn).is_some() {
+            return self
+                .application_mut(resource_arn)
+                .map(|application| &mut application.tags);
+        }
+        self.stream_group_mut(resource_arn)
+            .map(|group| &mut group.tags)
     }
 
     /// The id of the resource a replayed `ClientToken` already created, if the

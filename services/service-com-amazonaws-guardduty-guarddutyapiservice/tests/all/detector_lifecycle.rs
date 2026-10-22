@@ -128,7 +128,7 @@ pub(crate) fn error_code(body: &Value) -> String {
     String::new()
 }
 
-async fn create_detector(router: &Router, body: Value) -> (u16, Value) {
+pub(crate) async fn create_detector(router: &Router, body: Value) -> (u16, Value) {
     call(router, "POST", "/detector", Some(body)).await
 }
 
@@ -360,15 +360,16 @@ async fn a_detector_reports_back_the_configuration_it_was_created_with() {
             json!(expected_frequency),
             "case {case:?}: expected frequency {expected_frequency}, got {got:?}"
         );
-        // A disabled detector ingests nothing, so every data source reports DISABLED;
-        // CloudTrail, VPC flow logs and DNS logs are the foundational sources an
-        // enabled detector always consumes.
-        let expected_source = expected_status;
+        // The detector's own `status` carries whether the detector is enabled; the
+        // dataSources view carries the CONFIGURATION, which survives disabling.
+        // CloudTrail management events, VPC flow logs and DNS logs have no switch at
+        // all — no `DetectorFeature` member and no `DataSourceConfigurations` member
+        // names them — so they report ENABLED for either value of `enable`.
         for source in ["cloudTrail", "dnsLogs", "flowLogs"] {
             assert_eq!(
                 got["dataSources"][source]["status"],
-                json!(expected_source),
-                "case {case:?}: dataSources.{source}.status expected {expected_source}, got {got:?}"
+                json!("ENABLED"),
+                "case {case:?}: dataSources.{source}.status expected ENABLED, got {got:?}"
             );
         }
     }
@@ -520,17 +521,21 @@ async fn a_feature_list_the_service_cannot_accept_is_refused() {
     );
 
     // "When you don't specify any features, with an exception to RUNTIME_MONITORING,
-    // all the optional features are enabled by default."
-    assert_eq!(
-        feature_status(&before, "RUNTIME_MONITORING"),
-        "DISABLED",
-        "RUNTIME_MONITORING is the one feature a bare create leaves off: got {before:?}"
-    );
+    // all the optional features are enabled by default." RDS Protection
+    // (RDS_LOGIN_EVENTS) is opt-in the same way RUNTIME_MONITORING is — see
+    // `crate::detector_data_sources_projection` for the default feature set as a
+    // whole.
+    for feature in ["RUNTIME_MONITORING", "RDS_LOGIN_EVENTS"] {
+        assert_eq!(
+            feature_status(&before, feature),
+            "DISABLED",
+            "feature {feature} is opt-in, so a bare create leaves it off: got {before:?}"
+        );
+    }
     for feature in [
         "S3_DATA_EVENTS",
         "EKS_AUDIT_LOGS",
         "EBS_MALWARE_PROTECTION",
-        "RDS_LOGIN_EVENTS",
         "LAMBDA_NETWORK_LOGS",
         "EKS_RUNTIME_MONITORING",
         "AI_PROTECTION",

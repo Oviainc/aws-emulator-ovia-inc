@@ -568,6 +568,22 @@ impl ComAmazonawsS3Amazons3State {
 pub const NO_SUCH_BUCKET_CODE: &str = "NoSuchBucket";
 /// See [`NO_SUCH_BUCKET_CODE`].
 pub const NO_SUCH_BUCKET_MESSAGE: &str = "The specified bucket does not exist";
+/// "The specified key does not exist." — what a read of an object no bucket holds
+/// answers with.
+pub const NO_SUCH_KEY_CODE: &str = "NoSuchKey";
+/// See [`NO_SUCH_KEY_CODE`].
+pub const NO_SUCH_KEY_MESSAGE: &str = "The specified key does not exist.";
+/// The code S3 answers a write whose `Content-MD5` is not the digest of the bytes it
+/// carried: "The Content-MD5 or checksum value that you specified did not match what the
+/// server received."
+pub const BAD_DIGEST_CODE: &str = "BadDigest";
+/// The code S3 answers a write whose body is larger than one request may carry
+/// ([`MAX_OBJECT_BYTES`]).
+pub const ENTITY_TOO_LARGE_CODE: &str = "EntityTooLarge";
+/// The code S3 answers a conditional write whose precondition does not hold, with HTTP
+/// 412 (`PutObjectRequest$IfMatch`: "If the ETag values do not match, the operation
+/// returns a 412 Precondition Failed error").
+pub const PRECONDITION_FAILED_CODE: &str = "PreconditionFailed";
 /// "The bucket policy does not exist."
 pub const NO_SUCH_BUCKET_POLICY_CODE: &str = "NoSuchBucketPolicy";
 /// See [`NO_SUCH_BUCKET_POLICY_CODE`].
