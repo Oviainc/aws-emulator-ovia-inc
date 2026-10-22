@@ -31,6 +31,15 @@
 //! ([`crate::state::MAX_TABLE_SIZE_BYTES`] and friends, enforced by
 //! [`crate::state::ComAmazonawsDynamodbDynamodb20120810State::put_item`]).
 //!
+//! The VALUES a request carries are held to the documented rules for their type before
+//! the write lands too: a key attribute's size and emptiness
+//! ([`crate::state::Table::check_key_limits`], the documented 2048/1024-byte key
+//! limits), and every value's own rules anywhere in the item
+//! ([`crate::state::canonicalize_item`] — non-empty sets with distinct members,
+//! numbers inside the documented precision and exponent range). A table whose
+//! resource-based policy denies the caller `dynamodb:PutItem` is answered
+//! `AccessDeniedException` instead of written to.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -368,10 +377,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // Every value the item carries is held to the documented rules for its type as
+        // it is canonicalized above (set emptiness and duplicate members, numeric
+        // precision and range), BEFORE any table is looked up, because none of those
+        // rules depends on the table.
+
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let key = {
             let table = store.active_table(&region, &name, now).map_err(lift)?;
+            // A table whose resource-based policy denies the caller this action is not
+            // written to at all: authorization is decided before the item is keyed.
+            if let Some(denial) = crate::state::policy_denial(table, "dynamodb:PutItem", now) {
+                return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+            }
+            // The key attributes are bounded by the documented key-value limits, for
+            // this table's own key schema (inside `key_of_item`) and for every index
+            // key the item would be projected into.
+            table.check_index_key_limits(&item).map_err(lift)?;
             table.key_of_item(&item).map_err(lift)?
         };
         // The store enforces its own budgets here: the only growth site this

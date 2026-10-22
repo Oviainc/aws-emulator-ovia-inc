@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a connector: the RECORD of the parameters of a connection to a partner's
+//! AS2 or SFTP endpoint, readable back through `DescribeConnector`. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +183,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConnector"))
+        use crate::state as st;
+
+        // `EgressType` is resolved FIRST: it is the member the documented cross-member
+        // requirements below are stated against, so a request that names no
+        // `EgressConfig` selects the modelled default `SERVICE_MANAGED` — which is what
+        // makes `Url` required — rather than leaving those requirements unevaluated.
+        let egress_type = st::connector_egress_type(input.egress_config.as_ref());
+
+        // A connector the service would never hold is refused BEFORE the state write,
+        // with the modelled `InvalidRequestException` (HTTP 400) the model documents as
+        // "thrown when the client submits a malformed request" — so a caller never gets
+        // back a `ConnectorId` for a connector that cannot exist.
+        let config = st::ConnectorConfig {
+            url: input.url.as_deref(),
+            as2_config: input.as2_config.as_ref(),
+            sftp_config: input.sftp_config.as_ref(),
+            egress_type,
+        };
+        if let Some(message) = config.cross_member_violation() {
+            return Err(CreateConnectorErrorModeled::InvalidRequestException(
+                InvalidRequestException { message },
+            )
+            .into());
+        }
+
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            CreateConnectorErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+        let region = st::request_region(ctx.parts());
+
+        let mut guard = state.lock();
+
+        // The store is BOUNDED: past its capacity a create is refused rather than
+        // adding another record. The modelled `ServiceUnavailableException` is the
+        // refusal that says the service cannot take this request; the capacity is
+        // released by `DeleteConnector`.
+        if !guard.has_connector_capacity() {
+            return Err(CreateConnectorErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some(format!(
+                        "this emulator already holds the maximum of {} connectors; \
+                         delete one before creating another",
+                        st::MAX_STORED_CONNECTORS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let connector_id = guard.mint_id("c");
+
+        let connector = st::Connector {
+            arn: st::connector_arn(&region, &connector_id),
+            url: st::connector_url(input.url.as_deref()),
+            as2_config: input.as2_config,
+            // Defaulted ONCE, here: every nested member the model documents a default
+            // for is materialised at create time, so no reader has to re-apply one and
+            // a configuration read-back reports the connector as configured.
+            sftp_config: input.sftp_config.map(st::resolve_sftp_connector_config),
+            access_role: input.access_role,
+            logging_role: input.logging_role,
+            security_policy_name: input.security_policy_name,
+            egress_config: input.egress_config.map(st::resolve_connector_egress_config),
+            egress_type: egress_type.to_string(),
+            ip_address_type: input.ip_address_type,
+            // A connector records connection parameters and is usable as soon as this
+            // call answers — see `state::CONNECTOR_STATUS_ACTIVE`.
+            status: st::CONNECTOR_STATUS_ACTIVE.to_string(),
+            tags: input.tags.unwrap_or_default(),
+            connector_id: connector_id.clone(),
+        };
+        guard.connectors.insert(connector_id.clone(), connector);
+        drop(guard);
+
+        Ok(CreateConnectorOutput { connector_id })
     }
 }

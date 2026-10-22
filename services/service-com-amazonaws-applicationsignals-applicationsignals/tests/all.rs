@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/error_identity.rs"]
 mod error_identity;
+#[path = "all/get_service.rs"]
+mod get_service;
 #[path = "all/grouping_configuration.rs"]
 mod grouping_configuration;
 #[path = "all/sli_metric_type.rs"]

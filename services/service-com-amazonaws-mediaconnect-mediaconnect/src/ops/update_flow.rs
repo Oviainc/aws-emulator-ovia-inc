@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFlow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFlow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFlow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the flow-level settings the request carries to the STORED flow and answers
+//! with the stored record read back, so DescribeFlow / ListFlows report exactly what
+//! this operation wrote.
+//!
+//! The operation is a PARTIAL update (`@idempotent`, every input member but `FlowArn`
+//! optional): a member the request carries replaces that setting on the stored flow and
+//! a member it omits leaves the stored setting untouched. The two request-only wrapper
+//! shapes — `UpdateFailoverConfig` and `UpdateMaintenance`, whose members are each
+//! individually optional — are merged the same way, member by member, into the
+//! `FailoverConfig` / `Maintenance` the flow holds. The members whose target IS the
+//! stored shape (`MonitoringConfig`, `NdiConfig`, `EncodingConfig`) carry the whole
+//! setting, so the value in the request becomes the setting.
+//!
+//! A request is refused with `BadRequestException` only for something IT carries: a
+//! maintenance window outside the documented formats, an NDI state the resulting flow size
+//! cannot support, failover switched off under a failover pair, or a primary source the
+//! flow does not have. A request that does not touch a setting is never refused for a
+//! value already in the store.
+//!
+//! The model gives UpdateFlow no status member and documents no status change for it
+//! (`Flow.Status` is "the current status of the flow", and the transient statuses belong
+//! to StartFlow / StopFlow / DeleteFlow), so this operation leaves the flow's status
+//! alone — it only settles a transition the clock had already made due, exactly as the
+//! reporting operations do.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +112,143 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `FlowSize` enum values that ARE large enough for NDI® (`smithy_query(query="shape",
+/// shape="FlowSize")`: MEDIUM | LARGE | LARGE_4X). The capable sizes are named as an
+/// ALLOW-list, so a flow whose size was never set to one of them is not NDI-capable
+/// either: this operation's own doc says a MEDIUM flow must be upgraded to LARGE before
+/// its source can become NDI, and `CreateFlow$FlowSize` says "set this optional parameter
+/// to LARGE if you want to enable NDI sources or outputs on the flow".
+const NDI_CAPABLE_FLOW_SIZES: [&str; 2] = ["LARGE", "LARGE_4X"];
+
+/// `NdiState` / `State` enum value (`smithy_query(query="shape",shape="NdiState")`:
+/// ENABLED | DISABLED). `NdiConfig$NdiState` is "a setting that controls whether NDI®
+/// sources or outputs can be used in the flow… This value must be set as ENABLED for your
+/// flow to support NDI sources or outputs".
+const STATE_ENABLED: &str = "ENABLED";
+
+/// See [`STATE_ENABLED`]. `UpdateFailoverConfig$State` is "the state of source failover on
+/// the flow. If the state is inactive, the flow can have only one source. If the state is
+/// active, the flow can have one or two sources."
+const STATE_DISABLED: &str = "DISABLED";
+
+/// The maintenance start hour applied to a flow whose maintenance window names a day but
+/// no hour: "UTC time when the maintenance will happen. Use 24-hour HH:MM format. Minutes
+/// must be 00. Example: 13:00. The default value is 02:00."
+/// (`smithy_query(query="doc",shape="UpdateMaintenance",member="MaintenanceStartHour")`).
+const DEFAULT_MAINTENANCE_START_HOUR: &str = "02:00";
+
+/// Whether `hour` is a maintenance start hour: "UTC time when the maintenance will happen.
+/// Use 24-hour HH:MM format. Minutes must be 00. Example: 13:00."
+/// (`smithy_query(query="doc",shape="UpdateMaintenance",member="MaintenanceStartHour")`).
+fn is_maintenance_start_hour(hour: &str) -> bool {
+    let Some((hours, minutes)) = hour.split_once(':') else {
+        return false;
+    };
+    hours.len() == 2
+        && minutes == "00"
+        && hours.bytes().all(|byte| byte.is_ascii_digit())
+        && hours
+            .parse::<u8>()
+            .is_ok_and(|hours| (0..=23).contains(&hours))
+}
+
+/// Whether `date` is a scheduled maintenance date: "a scheduled date in ISO UTC format
+/// when the maintenance will happen. Use YYYY-MM-DD format. Example: 2021-01-30."
+/// (`smithy_query(query="doc",shape="UpdateMaintenance",member="MaintenanceScheduledDate")`).
+/// The day is bounded by the longest month rather than by the month named, which is as far
+/// as the documented format goes.
+fn is_maintenance_scheduled_date(date: &str) -> bool {
+    let parts: Vec<&str> = date.split('-').collect();
+    let [year, month, day] = parts.as_slice() else {
+        return false;
+    };
+    year.len() == 4
+        && month.len() == 2
+        && day.len() == 2
+        && [year, month, day]
+            .iter()
+            .all(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
+        && year.parse::<u16>().is_ok()
+        && month
+            .parse::<u8>()
+            .is_ok_and(|month| (1..=12).contains(&month))
+        && day.parse::<u8>().is_ok_and(|day| (1..=31).contains(&day))
+}
+
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error".
+fn bad_request(message: impl Into<String>) -> UpdateFlowError {
+    UpdateFlowErrorModeled::BadRequestException(BadRequestException {
+        message: message.into(),
+    })
+    .into()
+}
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
+/// in the request does not exist in the system".
+fn not_found(message: impl Into<String>) -> UpdateFlowError {
+    UpdateFlowErrorModeled::NotFoundException(NotFoundException {
+        message: message.into(),
+    })
+    .into()
+}
+
+/// The maintenance setting the flow holds after `update` is applied to `stored`.
+///
+/// `UpdateMaintenance`'s members are each individually optional, so this is a member-wise
+/// merge: a member the request carries replaces its counterpart, one it omits keeps the
+/// stored value. `Maintenance$MaintenanceDeadline` has no counterpart in the request shape
+/// — it is the service's own deadline for a window that is actually scheduled — so it is
+/// carried over untouched unless the window is rescheduled.
+///
+/// The documented default hour is reachable only from here: `AddMaintenance`, the shape
+/// CreateFlow takes, declares both the day and the hour REQUIRED, so a window the create
+/// path stored always names its hour.
+fn merged_maintenance(stored: Option<&Maintenance>, update: &UpdateMaintenance) -> Maintenance {
+    let mut merged = stored.cloned().unwrap_or_default();
+    if let Some(day) = update.maintenance_day.clone() {
+        merged.maintenance_day = Some(day);
+    }
+    if let Some(date) = update.maintenance_scheduled_date.clone() {
+        merged.maintenance_scheduled_date = Some(date);
+        // The deadline belongs to the window it was issued for: a window that is
+        // rescheduled has no deadline until the service issues one for the new date.
+        merged.maintenance_deadline = None;
+    }
+    if let Some(hour) = update.maintenance_start_hour.clone() {
+        merged.maintenance_start_hour = Some(hour);
+    }
+    // A window that names a day but no hour happens at the documented default hour.
+    if merged.maintenance_day.is_some() && merged.maintenance_start_hour.is_none() {
+        merged.maintenance_start_hour = Some(DEFAULT_MAINTENANCE_START_HOUR.to_string());
+    }
+    merged
+}
+
+/// The failover setting the flow holds after `update` is applied to `stored`.
+///
+/// `UpdateFailoverConfig` mirrors `FailoverConfig` member for member and every member is
+/// optional, so this is the same member-wise merge as [`merged_maintenance`].
+fn merged_failover_config(
+    stored: Option<&FailoverConfig>,
+    update: &UpdateFailoverConfig,
+) -> FailoverConfig {
+    let mut merged = stored.cloned().unwrap_or_default();
+    if let Some(mode) = update.failover_mode.clone() {
+        merged.failover_mode = Some(mode);
+    }
+    if let Some(window) = update.recovery_window {
+        merged.recovery_window = Some(window);
+    }
+    if let Some(priority) = update.source_priority.clone() {
+        merged.source_priority = Some(priority);
+    }
+    if let Some(state) = update.state.clone() {
+        merged.state = Some(state);
+    }
+    merged
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -169,18 +322,167 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFlow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFlowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateFlowErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect flow store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write this operation owes beyond the request: a status change the
+        // clock already made due is materialised before the flow is read or written.
+        store.settle_due_transitions(now);
+
+        let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
+            return Err(not_found(format!(
+                "Flow with ARN {} was not found.",
+                input.flow_arn
+            )));
+        };
+
+        // What each setting becomes once this request is applied: the request's value
+        // where it carries one, the stored value where it does not.
+        let flow_size = input.flow_size.clone().or_else(|| flow.flow_size.clone());
+        let maintenance = match input.maintenance.as_ref() {
+            Some(update) => Some(merged_maintenance(flow.maintenance.as_ref(), update)),
+            None => flow.maintenance.clone(),
+        };
+        let source_failover_config = match input.source_failover_config.as_ref() {
+            Some(update) => Some(merged_failover_config(
+                flow.source_failover_config.as_ref(),
+                update,
+            )),
+            None => flow.source_failover_config.clone(),
+        };
+        let source_monitoring_config = input
+            .source_monitoring_config
+            .clone()
+            .or_else(|| flow.source_monitoring_config.clone());
+        let ndi_config = input
+            .ndi_config
+            .clone()
+            .or_else(|| flow.ndi_config.clone());
+        let encoding_config = input
+            .encoding_config
+            .clone()
+            .or_else(|| flow.encoding_config.clone());
+
+        // The maintenance window the request asks for has to be expressible as one: the
+        // two members the request shape leaves free-form carry documented formats.
+        if let Some(update) = input.maintenance.as_ref() {
+            if let Some(hour) = update
+                .maintenance_start_hour
+                .as_deref()
+                .filter(|hour| !is_maintenance_start_hour(hour))
+            {
+                return Err(bad_request(format!(
+                    "Invalid MaintenanceStartHour {hour:?}. Use 24-hour HH:MM format with \
+                     minutes 00, for example 13:00."
+                )));
+            }
+            if let Some(date) = update
+                .maintenance_scheduled_date
+                .as_deref()
+                .filter(|date| !is_maintenance_scheduled_date(date))
+            {
+                return Err(bad_request(format!(
+                    "Invalid MaintenanceScheduledDate {date:?}. Use YYYY-MM-DD format, for \
+                     example 2021-01-30."
+                )));
+            }
+        }
+
+        // Every refusal below reads the members THIS request carries, not the merged
+        // result: a request that does not touch a setting may not be refused for a stored
+        // value it did not introduce.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFlow"))
+        // NDI needs the larger flow: "if you have a MEDIUM flow and you want to change the
+        // flow source to NDI: first, use the UpdateFlow operation to upgrade the flow size
+        // to LARGE" (this operation's own documentation). Both the request that enables NDI
+        // and the one that changes the size are checked, against the size and NDI state the
+        // flow ends up with, because either member alone can break the pair.
+        if input.ndi_config.is_some() || input.flow_size.is_some() {
+            let ndi_enabled = ndi_config
+                .as_ref()
+                .and_then(|config| config.ndi_state.as_deref())
+                == Some(STATE_ENABLED);
+            let ndi_capable = flow_size
+                .as_deref()
+                .is_some_and(|size| NDI_CAPABLE_FLOW_SIZES.contains(&size));
+            if ndi_enabled && !ndi_capable {
+                return Err(bad_request(format!(
+                    "NdiConfig.NdiState {STATE_ENABLED} needs a flow of size {}; this flow's \
+                     size is {}. Upgrade the flow size first.",
+                    NDI_CAPABLE_FLOW_SIZES.join(" or "),
+                    flow_size.as_deref().unwrap_or("unset")
+                )));
+            }
+            // The source type is the other half of the same pair: "if you're switching
+            // from an NDI source to a transport stream (TS) source and want to downgrade
+            // the flow size: first, use the UpdateFlowSource operation to change the flow
+            // source type" (this operation's own documentation). Only a request that
+            // changes the size is refused for it.
+            if input.flow_size.is_some()
+                && !ndi_capable
+                && flow.sources.iter().any(|source| {
+                    source
+                        .transport
+                        .as_ref()
+                        .is_some_and(|transport| transport.ndi_source_settings.is_some())
+                })
+            {
+                return Err(bad_request(format!(
+                    "A flow with an NDI source needs a flow of size {}; change the source \
+                     type with UpdateFlowSource before downgrading the flow size.",
+                    NDI_CAPABLE_FLOW_SIZES.join(" or ")
+                )));
+            }
+        }
+
+        // "If the state is inactive, the flow can have only one source"
+        // (`UpdateFailoverConfig$State`), so failover cannot be switched off under a flow
+        // that is ingesting a failover pair.
+        let requested_failover = input.source_failover_config.as_ref();
+        if requested_failover.and_then(|config| config.state.as_deref()) == Some(STATE_DISABLED)
+            && flow.sources.len() > 1
+        {
+            return Err(bad_request(format!(
+                "Source failover cannot be {STATE_DISABLED} on a flow with {} sources: a \
+                 flow whose failover is {STATE_DISABLED} can have only one source.",
+                flow.sources.len()
+            )));
+        }
+
+        // `SourcePriority$PrimarySource` is "the name of the source you choose as the
+        // primary source for this flow", so it has to name a source the flow has.
+        if let Some(primary) = requested_failover
+            .and_then(|config| config.source_priority.as_ref())
+            .and_then(|priority| priority.primary_source.as_deref())
+        {
+            if !flow.sources.iter().any(|source| source.name == primary) {
+                return Err(bad_request(format!(
+                    "Source {primary:?} is not a source of this flow, so it cannot be its \
+                     primary source."
+                )));
+            }
+        }
+
+        flow.flow_size = flow_size;
+        flow.maintenance = maintenance;
+        flow.source_failover_config = source_failover_config;
+        flow.source_monitoring_config = source_monitoring_config;
+        flow.ndi_config = ndi_config;
+        flow.encoding_config = encoding_config;
+
+        // The response is the STORED record — `flow` is the record in the store, so this
+        // reads back exactly what was just written, never the request.
+        Ok(UpdateFlowResponse {
+            flow: Some(flow.to_flow()),
+        })
     }
 }
