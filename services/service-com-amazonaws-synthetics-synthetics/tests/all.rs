@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/canary_lifecycle.rs"]
 mod canary_lifecycle;
+#[path = "all/missing_resource_errors.rs"]
+mod missing_resource_errors;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

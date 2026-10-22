@@ -83,7 +83,7 @@
 use super::types::*;
 use std::time::SystemTime;
 
-use crate::state::STORE_UNAVAILABLE;
+use crate::state::{CANARY_NOT_FOUND, DRY_RUN_NOT_FOUND, STORE_UNAVAILABLE};
 
 /// `GetCanaryRunsRequest$MaxResults`: "If you omit this parameter, the default of 100 is
 /// used." (which is also the member's modelled maximum).
@@ -228,20 +228,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let canary = guard.canaries.get(&input.name).ok_or_else(|| {
             GetCanaryRunsError::from(GetCanaryRunsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Canary {} not found", input.name)),
+                    // The missing-canary message is a fixed sentence, not built from
+                    // the lookup key: see `state::CANARY_NOT_FOUND`.
+                    message: Some(CANARY_NOT_FOUND.to_string()),
                 },
             ))
         })?;
 
-        if let Some(dry_run_id) = input.dry_run_id.as_deref() {
+        if input.dry_run_id.is_some() {
             // This emulator performs no dry runs, so it has minted no dry run id and any
-            // id a caller presents names a dry run that does not exist.
+            // id a caller presents names a dry run that does not exist. Same rule as the
+            // missing canary above: the message names the kind of resource that was not
+            // found, never the identifier the request asked for.
             return Err(GetCanaryRunsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Dry run {dry_run_id} not found for canary {}",
-                        input.name
-                    )),
+                    message: Some(DRY_RUN_NOT_FOUND.to_string()),
                 },
             )
             .into());

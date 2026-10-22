@@ -66,7 +66,7 @@
 use super::types::*;
 use std::time::SystemTime;
 
-use crate::state::STORE_UNAVAILABLE;
+use crate::state::{CANARY_NOT_FOUND, STORE_UNAVAILABLE};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -173,7 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetCanaryError::from(GetCanaryErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("Canary {} not found", input.name)),
+                        // The missing-canary message is a fixed sentence, not built
+                        // from the lookup key: see `state::CANARY_NOT_FOUND`.
+                        message: Some(CANARY_NOT_FOUND.to_string()),
                     },
                 ))
             })?
