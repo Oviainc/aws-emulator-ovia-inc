@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRegistry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRegistry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRegistry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: moves the stored registry into `DELETING` and answers that status.
+//! Deletion is asynchronous, so the clock owes the removal of the registry and of its
+//! records; after it, `GetRegistry` answers 404.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +148,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRegistry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRegistryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRegistry"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteRegistryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the agent registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.materialise_due_transitions();
+
+        let registry_id = crate::state::identifier_to_id(&input.registry_id).to_string();
+        let Some(registry) = state.registries.get_mut(&registry_id) else {
+            return Err(DeleteRegistryErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("registry {registry_id} was not found")),
+                },
+            )
+            .into());
+        };
+
+        // @idempotent: a registry already on its way out keeps the status and the
+        // removal instant the first call set.
+        if registry.status != crate::state::REGISTRY_DELETING {
+            registry.status = crate::state::REGISTRY_DELETING.to_string();
+            registry.updated_at = crate::state::now();
+            // Deletion is asynchronous: the model documents the registry transitioning
+            // to DELETING and then being removed along with its records.
+            let pending = crate::state::DueTransition::after_async_span(
+                crate::state::RegistryTransition::Removed,
+            );
+            let due_at = pending.due_at;
+            registry.pending = Some(pending);
+            let status = registry.status.clone();
+            state.arm_transition(due_at);
+            return Ok(DeleteRegistryOutput { status });
+        }
+
+        Ok(DeleteRegistryOutput {
+            status: registry.status.clone(),
+        })
     }
 }

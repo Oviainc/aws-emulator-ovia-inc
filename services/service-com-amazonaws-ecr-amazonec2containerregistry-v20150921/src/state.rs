@@ -3,7 +3,8 @@
 //! Engine state for the com-amazonaws-ecr-amazonec2containerregistry-v20150921 service.
 //!
 //! One registry (this emulator's account) holding repositories by name, each holding
-//! its images by digest plus a tag index. Everything an operation answers with is
+//! its images by digest plus a tag index, plus the registry-wide settings a caller can
+//! configure (today: its replication rules). Everything an operation answers with is
 //! derived from here; nothing is re-synthesised from a request.
 
 use std::collections::btree_map::Entry;
@@ -12,8 +13,8 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     EncryptionConfiguration, ImageDetail, ImageIdentifier, ImageScanningConfiguration,
-    ImageTagMutabilityExclusionFilter, Repository, RepositoryScanningConfiguration,
-    SigningConfiguration, Tag,
+    ImageTagMutabilityExclusionFilter, ReplicationConfiguration, ReplicationRule, Repository,
+    RepositoryScanningConfiguration, SigningConfiguration, Tag,
 };
 
 /// `CreateRepository`'s documented default: "If this parameter is omitted, the default
@@ -385,6 +386,16 @@ pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// Repositories by name. A `BTreeMap` so every listing — and therefore every
     /// pagination token — has one deterministic order.
     pub repositories: BTreeMap<String, Repo>,
+    /// The registry's replication rules, exactly as the last
+    /// `PutReplicationConfiguration` persisted them, in the order that call listed
+    /// them. Empty until one is made: a registry nobody has configured replication for
+    /// reports an empty rule list, which is what `DescribeRegistry` answers with.
+    ///
+    /// Registry-wide, like the single registry this store models: a put made against
+    /// one Region's endpoint is the configuration every later read reports, while the
+    /// "a registry cannot replicate to itself" refusal is evaluated per call, against
+    /// the Region that call was made against.
+    pub replication_rules: Vec<ReplicationRule>,
     /// The registry permissions policy, as `PutRegistryPolicy` stored it: the document
     /// text exactly as it arrived, so a read returns it byte for byte. `None` is "this
     /// registry has no associated registry policy", which the registry-policy read and
@@ -418,6 +429,16 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
         self.repositories
             .get_mut(name)
             .ok_or_else(|| Fault::RepositoryNotFound(repository_not_found_message(name)))
+    }
+
+    /// The registry's replication configuration: the stored rules, which is the empty
+    /// list before any `PutReplicationConfiguration` call. ECR reports the
+    /// configuration either way — an unconfigured registry has no rules rather than no
+    /// configuration.
+    pub fn replication_configuration(&self) -> ReplicationConfiguration {
+        ReplicationConfiguration {
+            rules: self.replication_rules.clone(),
+        }
     }
 }
 
