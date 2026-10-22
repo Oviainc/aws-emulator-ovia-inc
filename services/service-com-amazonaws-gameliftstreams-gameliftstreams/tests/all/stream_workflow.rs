@@ -20,14 +20,14 @@ use service_com_amazonaws_gameliftstreams_gameliftstreams::EmulatedService;
 
 /// Longer than `crate::state::TRANSITION` (500 ms), so a wait of this length is
 /// past every transition the clock owes after one call.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+pub(crate) const PAST_TRANSITION: Duration = Duration::from_millis(900);
 
 /// The region every request below signs for, and therefore the region segment of
 /// every ARN the emulator mints for them.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The canonical emulator account id (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// A `ClientToken` is modelled `length 32..128, pattern ^[\x21-\x7E]+$`.
 const TOKEN_A: &str = "client-token-aaaaaaaaaaaaaaaaaaaaaaaa";
@@ -35,7 +35,7 @@ const TOKEN_B: &str = "client-token-bbbbbbbbbbbbbbbbbbbbbbbb";
 
 /// One emulator with one shared engine, reached exactly as the production router
 /// reaches it.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Deterministic regardless of the process-wide authentication switch: these
@@ -49,7 +49,7 @@ fn emulator() -> MultiServiceRouter {
 ///
 /// The `Authorization` credential scope is what routes the request to this
 /// service and what names the region its ARNs carry.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     path_and_query: &str,
@@ -89,11 +89,11 @@ async fn call(
 
 /// Percent-encode the `/` separators of an ARN so it survives as one URI path
 /// segment.
-fn as_label(arn: &str) -> String {
+pub(crate) fn as_label(arn: &str) -> String {
     arn.replace('/', "%2F")
 }
 
-fn text(value: &Value, pointer: &str, case: &str) -> String {
+pub(crate) fn text(value: &Value, pointer: &str, case: &str) -> String {
     value
         .pointer(pointer)
         .and_then(Value::as_str)
@@ -102,7 +102,7 @@ fn text(value: &Value, pointer: &str, case: &str) -> String {
 }
 
 /// A minimal `CreateApplication` body with `Description`.
-fn application_body(description: &str) -> Value {
+pub(crate) fn application_body(description: &str) -> Value {
     json!({
         "Description": description,
         "RuntimeEnvironment": {"Type": "PROTON", "Version": "20250516"},

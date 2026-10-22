@@ -577,6 +577,27 @@ impl ComAmazonawsGameliftstreamsGameliftstreamsState {
         self.stream_groups.get_mut(&id)
     }
 
+    /// The tags of the taggable resource an `Arn` names.
+    ///
+    /// "You can assign tags to the following Amazon GameLift Streams resource
+    /// types: Application StreamGroup" (`TagResource`'s documentation), so the ARN
+    /// is resolved against those two stores and nothing else: an ARN of any other
+    /// resource type (a stream session, say) names nothing taggable and answers
+    /// `None`, as does an ARN whose resource this store no longer holds.
+    ///
+    /// An `Arn` is always the full ARN form (`pattern
+    /// ^arn:aws:gameliftstreams:([^: ]*):([0-9]{12}):([^: ]*)$`) — unlike an
+    /// `Identifier`, a bare id is not one, so a non-ARN resolves nothing.
+    pub fn tags_of(&self, resource_arn: &str) -> Option<&HashMap<String, String>> {
+        if !resource_arn.starts_with("arn:") {
+            return None;
+        }
+        if let Some(application) = self.application(resource_arn) {
+            return Some(&application.tags);
+        }
+        self.stream_group(resource_arn).map(|group| &group.tags)
+    }
+
     /// The id of the resource a replayed `ClientToken` already created, if the
     /// resource is still there.
     pub fn replayed(&self, operation: &str, client_token: Option<&str>) -> Option<String> {
