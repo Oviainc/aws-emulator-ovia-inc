@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the connector `CreateConnector` stored, as identified by its
+//! `ConnectorId`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +139,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConnector"))
+        use crate::state as st;
+
+        // A pure read: this operation reports the stored connector and writes nothing.
+        // It reads no request metadata either; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            DescribeConnectorErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let guard = state.lock();
+        let Some(stored) = guard.connectors.get(&input.connector_id) else {
+            return Err(st::not_found(
+                DescribeConnectorErrorModeled::ResourceNotFoundException(st::unknown_connector(
+                    &input.connector_id,
+                )),
+            ));
+        };
+
+        let connector = DescribedConnector {
+            arn: stored.arn.clone(),
+            connector_id: Some(stored.connector_id.clone()),
+            url: stored.url.clone(),
+            as2_config: stored.as2_config.clone(),
+            access_role: Some(stored.access_role.clone()),
+            logging_role: stored.logging_role.clone(),
+            // The connector's tag set, as a list — EMPTY when nothing is tagged, which
+            // is what the service reports for an untagged resource. `Tags`' modelled
+            // `len 1..50` bounds what a caller may SEND on a tagging request, not what
+            // a description of the connector reports.
+            tags: Some(stored.tags.clone()),
+            sftp_config: stored.sftp_config.clone(),
+            // "These IP addresses are assigned automatically when you create the
+            // connector" — this emulator runs no AS2 or SFTP egress and so assigns
+            // none, and an invented address would claim a network path that does not
+            // exist. Same reading `DescribeServer` gives the server's egress IPs.
+            service_managed_egress_ip_addresses: None,
+            security_policy_name: stored.security_policy_name.clone(),
+            egress_config: stored.egress_config.clone().map(|config| {
+                DescribedConnectorEgressConfig::VpcLattice(
+                    DescribedConnectorVpcLatticeEgressConfig {
+                        resource_configuration_arn: config.resource_configuration_arn,
+                        port_number: config.port_number,
+                    },
+                )
+            }),
+            egress_type: stored.egress_type.clone(),
+            // `ErrorMessage` carries "details when the connector is in ERRORED status";
+            // nothing here leaves a connector in that status, so there is none.
+            error_message: None,
+            status: stored.status.clone(),
+            ip_address_type: stored.ip_address_type.clone(),
+        };
+
+        Ok(DescribeConnectorOutput { connector })
     }
 }
