@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/error_responses.rs"]
 mod error_responses;
+#[path = "all/packaging_group_update.rs"]
+mod packaging_group_update;
 #[path = "all/packaging_lifecycle.rs"]
 mod packaging_lifecycle;
 #[path = "all/state_roundtrip.rs"]
