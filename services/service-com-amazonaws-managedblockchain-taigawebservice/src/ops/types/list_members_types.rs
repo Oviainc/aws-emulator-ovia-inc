@@ -29,7 +29,10 @@ pub struct ListMembersOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchain#MemberSummary")]
+// `MemberSummary`'s schema is written out by hand for the same single reason as
+// `Network`'s — `@timestampFormat("date-time")` on `CreationDate`'s target shape, which
+// the vendored codegen does not emit — and mirrors the macro's output in every other
+// respect. See the note above `Network` in `get_network_types.rs`.
 #[derive(Debug, Clone, Default)]
 pub struct MemberSummary {
     pub id: Option<String>,
@@ -39,5 +42,155 @@ pub struct MemberSummary {
     pub creation_date: Option<::aws_smithy_types::DateTime>,
     pub is_owned: Option<bool>,
     pub arn: Option<String>,
+}
+
+#[allow(non_upper_case_globals)]
+impl MemberSummary {
+    const SHAPE_ID: &'static str = "com.amazonaws.managedblockchain#MemberSummary";
+    const NAMESPACE: &'static str = "com.amazonaws.managedblockchain";
+
+    pub const M_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#MemberSummary$Id",
+            Self::NAMESPACE,
+            "Id",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Id",
+        0,
+    );
+    pub const M_NAME: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#MemberSummary$Name",
+            Self::NAMESPACE,
+            "Name",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Name",
+        1,
+    );
+    pub const M_DESCRIPTION: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#MemberSummary$Description",
+                Self::NAMESPACE,
+                "Description",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "Description",
+            2,
+        );
+    pub const M_STATUS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#MemberSummary$Status",
+            Self::NAMESPACE,
+            "Status",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Status",
+        3,
+    );
+    /// `@timestampFormat("date-time")` from `Timestamp` — the chain the macro cannot
+    /// emit.
+    pub const M_CREATION_DATE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#MemberSummary$CreationDate",
+                Self::NAMESPACE,
+                "CreationDate",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "CreationDate",
+            4,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    pub const M_IS_OWNED: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#MemberSummary$IsOwned",
+            Self::NAMESPACE,
+            "IsOwned",
+        ),
+        ::aws_smithy_schema::ShapeType::Boolean,
+        "IsOwned",
+        5,
+    );
+    pub const M_ARN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#MemberSummary$Arn",
+            Self::NAMESPACE,
+            "Arn",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Arn",
+        6,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(Self::SHAPE_ID, Self::NAMESPACE, "MemberSummary"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ID,
+            &Self::M_NAME,
+            &Self::M_DESCRIPTION,
+            &Self::M_STATUS,
+            &Self::M_CREATION_DATE,
+            &Self::M_IS_OWNED,
+            &Self::M_ARN,
+        ],
+    );
+}
+
+pub static MEMBER_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema = &MemberSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for MemberSummary {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.id.as_ref() {
+            s.write_string(&Self::M_ID, v.as_str())?;
+        }
+        if let Some(v) = self.name.as_ref() {
+            s.write_string(&Self::M_NAME, v.as_str())?;
+        }
+        if let Some(v) = self.description.as_ref() {
+            s.write_string(&Self::M_DESCRIPTION, v.as_str())?;
+        }
+        if let Some(v) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, v.as_str())?;
+        }
+        if let Some(v) = self.creation_date.as_ref() {
+            s.write_timestamp(&Self::M_CREATION_DATE, v)?;
+        }
+        if let Some(v) = self.is_owned.as_ref() {
+            s.write_boolean(&Self::M_IS_OWNED, *v)?;
+        }
+        if let Some(v) = self.arn.as_ref() {
+            s.write_string(&Self::M_ARN, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for MemberSummary {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.id = Some(d.read_string(&Self::M_ID)?),
+                Some(1) => out.name = Some(d.read_string(&Self::M_NAME)?),
+                Some(2) => out.description = Some(d.read_string(&Self::M_DESCRIPTION)?),
+                Some(3) => out.status = Some(d.read_string(&Self::M_STATUS)?),
+                Some(4) => out.creation_date = Some(d.read_timestamp(&Self::M_CREATION_DATE)?),
+                Some(5) => out.is_owned = Some(d.read_boolean(&Self::M_IS_OWNED)?),
+                Some(6) => out.arn = Some(d.read_string(&Self::M_ARN)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 

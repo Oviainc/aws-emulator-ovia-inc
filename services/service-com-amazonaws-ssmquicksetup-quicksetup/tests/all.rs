@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/configuration_managers.rs"]
 mod configuration_managers;
+#[path = "all/service_settings_and_types.rs"]
+mod service_settings_and_types;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

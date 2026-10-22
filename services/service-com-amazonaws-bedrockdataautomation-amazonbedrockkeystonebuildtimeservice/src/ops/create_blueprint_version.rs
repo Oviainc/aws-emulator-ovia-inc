@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBlueprintVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBlueprintVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBlueprintVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +145,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBlueprintVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBlueprintVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBlueprintVersion"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBlueprintVersionError::Modeled(
+                CreateBlueprintVersionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the Bedrock Data Automation store is unavailable".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        let not_found = || {
+            CreateBlueprintVersionError::Modeled(
+                CreateBlueprintVersionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "blueprint {} does not exist",
+                            input.blueprint_arn
+                        )),
+                    },
+                ),
+            )
+        };
+
+        // An `@idempotencyToken` replay returns the version the first call cut
+        // rather than cutting a second one. A token resolves only against the
+        // blueprint the request names: the same token aimed at another blueprint
+        // is a fresh call on that blueprint, never another one's version.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some((arn, version)) = store
+                .version_idempotency
+                .get(token)
+                .filter(|(arn, _)| *arn == input.blueprint_arn)
+                .cloned()
+            {
+                if let Some(blueprint) = store
+                    .blueprints
+                    .get(&arn)
+                    .and_then(|record| record.to_blueprint_version(version))
+                {
+                    return Ok(CreateBlueprintVersionOutput { blueprint });
+                }
+            }
+        }
+
+        let record = store
+            .blueprints
+            .get_mut(&input.blueprint_arn)
+            .ok_or_else(not_found)?;
+
+        // A version cut copies the whole live schema, so the snapshot count is
+        // bounded: past the quota the cut is refused rather than allowed to grow
+        // the record without end. Checked BEFORE the insert.
+        if record.versions.len() >= crate::state::BLUEPRINT_VERSION_QUOTA {
+            return Err(CreateBlueprintVersionErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the quota of {} versions per blueprint has been reached; \
+                         delete a version before creating another",
+                        crate::state::BLUEPRINT_VERSION_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+        // Version numbers come from the record's own monotonic counter, which a
+        // delete never rolls back, so one number never names two schemas.
+        let version = record.take_next_version();
+        record.versions.insert(
+            version,
+            crate::state::BlueprintVersionSnapshot {
+                schema: record.schema.clone(),
+                created_at: crate::state::now(),
+            },
+        );
+        let blueprint = record.to_blueprint_version(version).ok_or_else(|| {
+            CreateBlueprintVersionError::Modeled(
+                CreateBlueprintVersionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the blueprint version could not be read back after it was cut"
+                                .to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+
+        if let Some(token) = input.client_token {
+            store
+                .version_idempotency
+                .insert(token, (input.blueprint_arn, version));
+        }
+
+        Ok(CreateBlueprintVersionOutput { blueprint })
     }
 }

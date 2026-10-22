@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     ConfigurationDefinition, ConfigurationDefinitionSummary, ConfigurationManagerSummary,
-    ConfigurationSummary, Filter, StatusSummary,
+    ConfigurationSummary, Filter, ServiceSettings, StatusSummary,
 };
 
 /// The signing name, endpoint prefix and ARN namespace of this service, all three
@@ -123,6 +123,100 @@ pub const CONFIGURATION_FILTER_KEYS: &[&str] = &[
     "Account",
     "Region",
 ];
+
+/// How many regions' service settings this store will hold.
+///
+/// The settings record is keyed by the region the request was signed for, which is
+/// caller-controlled text (bounded by [`request_region`] but not enumerated), so an
+/// update naming an unseen region would otherwise grow this store without bound.
+/// Emulator resource guard, NOT a published AWS quota: an update past it is refused
+/// rather than stored. Far above the number of regions AWS publishes.
+pub const MAX_SETTINGS_REGIONS: usize = 100;
+
+/// One entry of the Quick Setup type catalog `ListQuickSetupTypes` publishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuickSetupTypeEntry {
+    /// A `QuickSetupTypeOutput$Type`: the type a `ConfigurationDefinitionInput`
+    /// names. Satisfies that member's modelled `^[a-zA-Z0-9_\-.:/]{3,200}$` pattern.
+    pub type_: &'static str,
+    /// A `QuickSetupTypeOutput$LatestVersion`: the newest configuration version
+    /// this service offers for `type_`, in the form `TypeVersion` takes.
+    pub latest_version: &'static str,
+}
+
+/// The configuration version this emulator's catalog publishes for every type it
+/// offers.
+///
+/// AWS advances a type's `LatestVersion` as it ships new configuration versions of
+/// that type; the model publishes no version catalog, so this emulator offers
+/// exactly one version of each type — the first — and says so here rather than
+/// inventing a different number per type. It satisfies the modelled
+/// `ConfigurationDefinition$TypeVersion` `@length(1, 128)`, which is the only
+/// constraint the model puts on a type version.
+pub const CATALOG_LATEST_VERSION: &str = "1.0";
+
+/// The Quick Setup configuration types this service publishes, in a fixed order so
+/// two reads of the catalog report the same list.
+///
+/// Source: the configuration types this service's own model documents, from
+/// `smithy_query(query="doc", shape="ConfigurationDefinitionInput",
+/// member="Parameters")` — its parameter tables are titled
+/// `<name> (Type: AWSQuickSetupType-<type>)`, one per supported type (the doc text
+/// renders `AWS` as `Amazon Web Services`). `AWSQuickSetupType-SSM` is the Quick
+/// Setup default configuration type, which that member's tables do not itemise; it
+/// is published too because configuration definitions name it.
+///
+/// This is the DISCOVERY catalog, not an allow-list: `Type` is modelled as a
+/// patterned string with no enum, so `CreateConfigurationManager` accepts any value
+/// matching that pattern and this list does not narrow it.
+pub const QUICK_SETUP_TYPE_CATALOG: &[QuickSetupTypeEntry] = &[
+    // Conformance Packs
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-CFGCPacks", latest_version: CATALOG_LATEST_VERSION },
+    // Config Recording
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-CFGRecording", latest_version: CATALOG_LATEST_VERSION },
+    // Default Host Management Configuration
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-DHMC", latest_version: CATALOG_LATEST_VERSION },
+    // DevOps Guru
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-DevOpsGuru", latest_version: CATALOG_LATEST_VERSION },
+    // Distributor
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-Distributor", latest_version: CATALOG_LATEST_VERSION },
+    // Patch Policy
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-PatchPolicy", latest_version: CATALOG_LATEST_VERSION },
+    // Resource Explorer
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-ResourceExplorer", latest_version: CATALOG_LATEST_VERSION },
+    // Quick Setup default configuration
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-SSM", latest_version: CATALOG_LATEST_VERSION },
+    // Change Manager
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-SSMChangeMgr", latest_version: CATALOG_LATEST_VERSION },
+    // Host Management
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-SSMHostMgmt", latest_version: CATALOG_LATEST_VERSION },
+    // OpsCenter
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-SSMOpsCenter", latest_version: CATALOG_LATEST_VERSION },
+    // Resource Scheduler
+    QuickSetupTypeEntry { type_: "AWSQuickSetupType-Scheduler", latest_version: CATALOG_LATEST_VERSION },
+];
+
+/// The settings Quick Setup holds for ONE account and region: what the last
+/// successful `UpdateServiceSettings` wrote there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceSettingsRecord {
+    /// `ServiceSettings$ExplorerEnablingRoleArn`, or `None` while no update has
+    /// named one.
+    pub explorer_enabling_role_arn: Option<String>,
+    /// When the record was last written. Not on the wire — the modelled
+    /// `ServiceSettings` carries no timestamp — it is what distinguishes one write
+    /// of the record from the next.
+    pub last_modified_at: SystemTime,
+}
+
+impl ServiceSettingsRecord {
+    /// The modelled `ServiceSettings` for this record.
+    pub fn to_service_settings(&self) -> ServiceSettings {
+        ServiceSettings {
+            explorer_enabling_role_arn: self.explorer_enabling_role_arn.clone(),
+        }
+    }
+}
 
 /// A status change the clock owes a status summary: where it lands, and when.
 #[derive(Debug, Clone)]
@@ -353,6 +447,14 @@ pub struct ComAmazonawsSsmquicksetupQuicksetupState {
     pub managers: BTreeMap<String, ConfigurationManagerRecord>,
     /// Every configuration, keyed by its service-generated id, for the same reason.
     pub configurations: BTreeMap<String, ConfigurationRecord>,
+    /// The service settings record of each region one has been written for.
+    ///
+    /// Quick Setup's settings are per-account and per-Region, and this emulator
+    /// serves one account, so the region the request was signed for
+    /// ([`request_region`]) is the key. A region with no entry has never been
+    /// configured, which `GetServiceSettings` reports by carrying no
+    /// `ServiceSettings` at all. Bounded by [`MAX_SETTINGS_REGIONS`].
+    pub service_settings: BTreeMap<String, ServiceSettingsRecord>,
     /// Monotonic counter backing configuration-definition id assignment.
     next_definition_id: u64,
     /// Monotonic counter backing uuid assignment (see [`Self::fresh_uuid`]).
@@ -416,6 +518,65 @@ impl ComAmazonawsSsmquicksetupQuicksetupState {
             .retain(|_, configuration| configuration.manager_arn != manager_arn);
         Some(manager)
     }
+}
+
+/// Why the value of an `IAMRoleArn` member is unacceptable, or `None` when it is an
+/// IAM role ARN.
+///
+/// `IAMRoleArn` is modelled as a plain string carrying
+/// `@aws.api#arnReference(type: "AWS::IAM::Role")` and no `@pattern` or `@length`, so
+/// the boundary validator admits any text; what the reference says the value IS, this
+/// checks: the six-field ARN form `arn:<partition>:iam:<region>:<account>:role/<name>`
+/// with the `iam` service and a `role` resource. The region and account fields are not
+/// constrained here — an IAM ARN leaves the region empty and the account may be any
+/// account the caller can name a role in — so only the parts the reference fixes are
+/// required.
+///
+/// The one place the rule lives, so every `IAMRoleArn` member of this service refuses
+/// the same values: `UpdateServiceSettings$ExplorerEnablingRoleArn` and
+/// `ConfigurationDefinitionInput$LocalDeploymentAdministrationRoleArn`.
+///
+/// The message names the member, the requirement and the value, the way the boundary
+/// validator's own refusals do. The echoed value is bounded for the reason
+/// [`MAX_ECHOED_ARN`] gives.
+pub fn iam_role_arn_rejection(member: &str, value: &str) -> Option<String> {
+    let fields: Vec<&str> = value.split(':').collect();
+    let well_formed = match fields.as_slice() {
+        ["arn", partition, "iam", _region, _account, resource] => {
+            !partition.is_empty()
+                && resource
+                    .strip_prefix("role/")
+                    .is_some_and(|name| !name.is_empty())
+        }
+        _ => false,
+    };
+    (!well_formed).then(|| {
+        format!(
+            "{member} must be the ARN of an IAM role \
+             (arn:<partition>:iam::<account>:role/<name>), got '{}'",
+            echoed_arn(value)
+        )
+    })
+}
+
+/// Longest caller-supplied value echoed in a refusal message.
+///
+/// The value is caller-controlled, so an unelided echo would amplify one request into
+/// an arbitrarily long response. The same bound the framework's own constraint walk
+/// applies.
+const MAX_ECHOED_ARN: usize = 256;
+
+/// `value` as it may appear in a refusal message: itself when short, otherwise a
+/// character-boundary-safe prefix plus the elision the framework's renderer appends.
+fn echoed_arn(value: &str) -> String {
+    if value.len() <= MAX_ECHOED_ARN {
+        return value.to_string();
+    }
+    let mut end = MAX_ECHOED_ARN;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... [{} bytes]", &value[..end], value.len())
 }
 
 /// Why a `Filters` list is unacceptable, or `None` when this operation can serve it.

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/scalable_target_lifecycle.rs"]
 mod scalable_target_lifecycle;
+#[path = "all/scheduled_action_lifecycle.rs"]
+mod scheduled_action_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tags.rs"]

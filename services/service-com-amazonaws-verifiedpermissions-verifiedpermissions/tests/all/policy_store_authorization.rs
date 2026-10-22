@@ -60,18 +60,25 @@ pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Valu
     parsed
 }
 
-/// Create a store with validation mode `OFF` and return its `policyStoreId`.
-async fn store_with_validation_off(router: &MultiServiceRouter) -> String {
+/// Create a store with the given validation `mode` and return its
+/// `policyStoreId`. The ONE store-creation helper this test crate has; every
+/// suite reaches a store through it.
+pub(crate) async fn store_with_mode(router: &MultiServiceRouter, mode: &str) -> String {
     let created = ok(
         router,
         "CreatePolicyStore",
-        &json!({ "validationSettings": { "mode": "OFF" } }),
+        &json!({ "validationSettings": { "mode": mode } }),
     )
     .await;
     created["policyStoreId"]
         .as_str()
         .expect("policyStoreId is required on the CreatePolicyStore response")
         .to_string()
+}
+
+/// Create a store with validation mode `OFF` and return its `policyStoreId`.
+async fn store_with_validation_off(router: &MultiServiceRouter) -> String {
+    store_with_mode(router, "OFF").await
 }
 
 /// The error code an awsJson1_0 fault carries in `__type`, without its namespace.

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBlueprint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBlueprint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBlueprint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +149,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBlueprint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBlueprintErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBlueprint"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBlueprintError::Modeled(CreateBlueprintErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Bedrock Data Automation store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = state.lock();
+
+        // An `@idempotencyToken` replay returns the blueprint the first call
+        // created rather than creating a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(arn) = store.create_idempotency.get(token).cloned() {
+                if let Some(record) = store.blueprints.get(&arn) {
+                    return Ok(CreateBlueprintOutput {
+                        blueprint: record.to_blueprint(),
+                    });
+                }
+            }
+        }
+
+        // `blueprintName` is the user-visible identity of a blueprint, so a
+        // second blueprint under a name already taken is a conflict.
+        if store.blueprint_names.contains_key(&input.blueprint_name) {
+            return Err(CreateBlueprintErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "a blueprint named {} already exists in this account",
+                    input.blueprint_name
+                )),
+            })
+            .into());
+        }
+
+        // The store is bounded: past the quota a create is refused rather than
+        // allowed to grow the state without end. Checked BEFORE any insert, so a
+        // refused call leaves nothing behind.
+        if store.blueprints.len() >= crate::state::BLUEPRINT_QUOTA {
+            return Err(CreateBlueprintErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the quota of {} blueprints per account has been reached; \
+                         delete a blueprint before creating another",
+                        crate::state::BLUEPRINT_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let (kms_key_id, kms_encryption_context) = match input.encryption_configuration {
+            Some(config) => (Some(config.kms_key_id), config.kms_encryption_context),
+            None => (None, None),
+        };
+        let created_at = crate::state::now();
+        let sequence = store.take_arn_sequence();
+        let record = crate::state::BlueprintRecord {
+            blueprint_arn: crate::state::mint_blueprint_arn(
+                &crate::state::request_region(ctx),
+                created_at,
+                sequence,
+            ),
+            blueprint_name: input.blueprint_name.clone(),
+            r#type: input.r#type,
+            schema: input.schema,
+            blueprint_stage: input
+                .blueprint_stage
+                .unwrap_or_else(|| crate::state::DEFAULT_BLUEPRINT_STAGE.to_string()),
+            creation_time: created_at,
+            last_modified_time: created_at,
+            kms_key_id,
+            kms_encryption_context,
+            versions: ::std::collections::BTreeMap::new(),
+            next_version: 1,
+            tags: input.tags.unwrap_or_default(),
+        };
+        let arn = record.blueprint_arn.clone();
+
+        store.blueprint_names.insert(input.blueprint_name, arn.clone());
+        if let Some(token) = input.client_token {
+            store.create_idempotency.insert(token, arn.clone());
+        }
+        store.blueprints.insert(arn.clone(), record);
+
+        // Build the response from the record that is now PERSISTED, not from the
+        // request: a later GetBlueprint must answer with exactly these values.
+        let blueprint = store
+            .blueprints
+            .get(&arn)
+            .map(crate::state::BlueprintRecord::to_blueprint)
+            .ok_or_else(|| {
+                CreateBlueprintError::Modeled(
+                    CreateBlueprintErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: Some(
+                                "the blueprint could not be read back after it was stored"
+                                    .to_string(),
+                            ),
+                        },
+                    ),
+                )
+            })?;
+        Ok(CreateBlueprintOutput { blueprint })
     }
 }

@@ -15,7 +15,9 @@
 //! Every store here is BOUNDED, because it lives in memory for the life of the
 //! process and grows on request: a create past a resource quota is refused with the
 //! modelled `ResourceLimitExceeded` (`MAX_NAMESPACES`,
-//! `MAX_SERVICES_PER_NAMESPACE`, `MAX_INSTANCES_PER_SERVICE`), and the two stores no
+//! `MAX_SERVICES_PER_NAMESPACE`, `MAX_INSTANCES_PER_SERVICE`), an attribute past the
+//! documented per-service quota with `ServiceAttributesLimitExceededException`
+//! (`MAX_SERVICE_ATTRIBUTES`), and the two stores no
 //! API can ever shrink — the operation records and the remembered idempotency tokens
 //! — evict their oldest entry instead (`MAX_RETAINED_OPERATIONS`,
 //! `MAX_RETAINED_IDEMPOTENCY_TOKENS`).
@@ -26,7 +28,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     DnsConfig, HealthCheckConfig, HealthCheckCustomConfig, HttpProperties, Instance, Namespace,
-    NamespaceProperties, Operation, Service, Tag, SOA,
+    NamespaceProperties, Operation, Service, ServiceAttributes, Tag, SOA,
 };
 
 /// The region an ARN carries when the request is unsigned, matching the region a
@@ -85,6 +87,41 @@ pub const MAX_SERVICES_PER_NAMESPACE: usize = 1_000;
 /// gives. Re-registering an instance that already exists is a replace, so it is never
 /// refused by this bound.
 pub const MAX_INSTANCES_PER_SERVICE: usize = 1_000;
+
+/// How many service-level attributes one service holds, from the documentation of
+/// `ServiceAttributes$Attributes`: "You can specify a total of 30 attributes." The
+/// same number is the `length` bound the model puts on `ServiceAttributesMap`, which
+/// caps ONE request; this constant caps the TOTAL a service accumulates across
+/// requests, which is what `ServiceAttributesLimitExceededException` reports.
+pub const MAX_SERVICE_ATTRIBUTES: usize = 30;
+
+/// The `length` bound the model puts on `ServiceAttributeKey` (0..255).
+///
+/// A `ServiceAttributesMap` KEY is the one place this bound is not checked for the
+/// handlers: the centralized request walk covers a collection's entry count and a
+/// scalar list ELEMENT's or map VALUE's own constraints, but "Map *keys* are not
+/// covered" (`vendor/smithy-schema-server/src/constraints.rs`). So
+/// `UpdateServiceAttributes`, whose keys are map keys, checks it with
+/// [`attribute_key_too_long`], while `DeleteServiceAttributes`, whose keys are list
+/// elements, has it checked for it before the handler runs.
+pub const MAX_SERVICE_ATTRIBUTE_KEY_LEN: usize = 255;
+
+/// The `InvalidInput` text for an attribute key longer than its modelled `length`
+/// bound, or `None` when the key fits.
+///
+/// `InvalidInput` is documented for exactly this case — "a string value might exceed
+/// length constraints" — and the message is built from the request: the bound and the
+/// length supplied. Smithy measures a string's `length` in Unicode code points, so a
+/// multi-byte key is measured as the caller wrote it rather than in bytes.
+pub fn attribute_key_too_long(key: &str) -> Option<String> {
+    let actual = key.chars().count();
+    (actual > MAX_SERVICE_ATTRIBUTE_KEY_LEN).then(|| {
+        format!(
+            "An attribute key must be at most {MAX_SERVICE_ATTRIBUTE_KEY_LEN} characters long, \
+             but the request supplies one of {actual}."
+        )
+    })
+}
 
 /// What a handler reports when this service was mounted on an engine that holds no
 /// state at all.
@@ -157,6 +194,11 @@ pub struct ServiceRecord {
     /// Keyed by `InstanceId`; a `BTreeMap` so every read orders identically.
     pub instances: BTreeMap<String, InstanceRecord>,
     pub instances_revision: i64,
+    /// The service-level attributes `UpdateServiceAttributes` writes,
+    /// `GetServiceAttributes` reads and `DeleteServiceAttributes` removes keys from.
+    /// A `BTreeMap` so every read orders identically; bounded by
+    /// [`MAX_SERVICE_ATTRIBUTES`].
+    pub attributes: BTreeMap<String, String>,
 }
 
 impl ServiceRecord {
@@ -689,6 +731,31 @@ pub fn service_view(record: &ServiceRecord) -> Service {
         create_date: Some(timestamp(record.create_date)),
         creator_request_id: record.creator_request_id.clone(),
         created_by_account: None,
+    }
+}
+
+/// The modelled `ServiceAttributes` for a stored service.
+///
+/// `ServiceAttributesMap` is modelled `length 1..30`, so a service carrying no
+/// attributes reports the member ABSENT rather than an empty map, which no value of
+/// that shape can be.
+pub fn service_attributes_view(record: &ServiceRecord) -> ServiceAttributes {
+    ServiceAttributes {
+        service_arn: Some(record.arn.clone()),
+        // Set only for a namespace shared from another account, which this emulator
+        // never produces — as for `Service$ResourceOwner`.
+        resource_owner: None,
+        attributes: if record.attributes.is_empty() {
+            None
+        } else {
+            Some(
+                record
+                    .attributes
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            )
+        },
     }
 }
 

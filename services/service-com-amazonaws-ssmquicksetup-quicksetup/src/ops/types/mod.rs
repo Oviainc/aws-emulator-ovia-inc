@@ -18,8 +18,10 @@ pub mod create_configuration_manager_types;
 pub mod delete_configuration_manager_types;
 pub mod get_configuration_manager_types;
 pub mod get_configuration_types;
+pub mod get_service_settings_types;
 pub mod list_configuration_managers_types;
 pub mod list_configurations_types;
+pub mod list_quick_setup_types_types;
 pub mod list_tags_for_resource_types;
 pub mod shared_types;
 pub mod tag_resource_types;
@@ -37,9 +39,13 @@ pub use get_configuration_manager_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_configuration_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
+pub use get_service_settings_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_configuration_managers_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_configurations_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use list_quick_setup_types_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_tags_for_resource_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
