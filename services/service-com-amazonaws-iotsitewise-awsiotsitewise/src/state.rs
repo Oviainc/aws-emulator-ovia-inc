@@ -375,9 +375,14 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     }
 
     /// Append `value` to the `(asset_id, property_id)` series, keeping it sorted
-    /// ascending by timestamp. A value at an already-stored timestamp replaces
-    /// that sample rather than duplicating it, so "the latest value" stays
-    /// single-valued.
+    /// ascending by timestamp.
+    ///
+    /// A value at an already-stored timestamp is QUALITY-AWARE: "For each asset
+    /// property, IoT SiteWise overwrites TQVs with duplicate timestamps unless the
+    /// newer TQV has a different quality" (the `BatchPutAssetPropertyValue` model
+    /// doc), so the stored sample is replaced only when the two name the same
+    /// quality, and a differing quality leaves the series exactly as it was. Either
+    /// way the series stays single-valued at that timestamp.
     ///
     /// The series is BOUNDED at [`MAX_SAMPLES_PER_SERIES`]: past that many samples
     /// the oldest goes, so no sequence of writes can grow one series without
@@ -397,18 +402,23 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .entry(property_id.to_string())
             .or_default();
         let key = timestamp_key(&value.timestamp);
-        match series.last().map(|last| timestamp_key(&last.timestamp)) {
-            Some(newest) if newest < key => series.push(value),
-            Some(newest) if newest == key => {
-                let at = series.len() - 1;
-                series[at] = value;
-            }
-            _ => {
-                match series.binary_search_by(|existing| timestamp_key(&existing.timestamp).cmp(&key))
-                {
-                    Ok(at) => series[at] = value,
-                    Err(at) => series.insert(at, value),
+        if series
+            .last()
+            .is_none_or(|last| timestamp_key(&last.timestamp) < key)
+        {
+            series.push(value);
+        } else {
+            match series.binary_search_by(|existing| timestamp_key(&existing.timestamp).cmp(&key))
+            {
+                Ok(at) => {
+                    if quality_of(&series[at]) != quality_of(&value) {
+                        // Accepted and discarded: the stored TQV wins at a
+                        // timestamp a differing-quality TQV re-puts.
+                        return;
+                    }
+                    series[at] = value;
                 }
+                Err(at) => series.insert(at, value),
             }
         }
         if series.len() > MAX_SAMPLES_PER_SERIES {
@@ -464,6 +474,23 @@ pub fn timestamp_key(timestamp: &TimeInNanos) -> (i64, i32) {
         timestamp.time_in_seconds,
         timestamp.offset_in_nanos.unwrap_or(0),
     )
+}
+
+/// The `Quality` a TQV that names none carries.
+///
+/// `AssetPropertyValue$quality` is optional and the enum's values are `GOOD`,
+/// `BAD` and `UNCERTAIN` (`smithy_query(query="shape", shape="Quality")`). An
+/// ordinary device reading is `GOOD`, so a TQV ingested without an explicit
+/// quality is treated as `GOOD`: an omitted quality and an explicit `GOOD` name
+/// the SAME quality, and neither can shadow the other at a timestamp the series
+/// already holds.
+pub const DEFAULT_QUALITY: &str = "GOOD";
+
+/// The quality `value` names, with [`DEFAULT_QUALITY`] standing in for an absent
+/// one. This is the comparison the quality-aware write in
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::record_property_value`] makes.
+pub fn quality_of(value: &AssetPropertyValue) -> &str {
+    value.quality.as_deref().unwrap_or(DEFAULT_QUALITY)
 }
 
 /// A wall-clock instant as the modelled `Timestamp` type.
