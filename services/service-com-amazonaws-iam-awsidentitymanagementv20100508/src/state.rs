@@ -61,6 +61,18 @@ pub const DEFAULT_MAX_SESSION_DURATION_SECONDS: i32 = 3_600;
 /// the limit exceeded".
 pub const MAX_USERS_PER_ACCOUNT: usize = 5_000;
 
+/// The status a key IAM has just minted carries. `CreateAccessKey`'s
+/// documentation states "the default status for new keys is Active", and `Active`
+/// is one of the three values `statusType` declares
+/// (`smithy_query(query="shape", shape="statusType")`: Active, Inactive, Expired).
+pub const ACCESS_KEY_ACTIVE_STATUS: &str = "Active";
+
+/// How many access keys one IAM user may hold. AWS's "IAM and STS quotas" page
+/// gives the quota "Access keys per IAM user: 2", and a create past it is refused
+/// with `LimitExceededException`, whose documentation says "the error message
+/// describes the limit exceeded".
+pub const MAX_ACCESS_KEYS_PER_USER: usize = 2;
+
 /// The aggregate size, in characters, of all inline policies embedded in one IAM
 /// user. AWS's "IAM and STS quotas" page gives the quota "User policy size cannot
 /// exceed 2,048 characters"; a put that would carry the user past it is refused
@@ -306,6 +318,27 @@ pub struct InlinePolicy {
     pub policy_document: String,
 }
 
+/// One access key an IAM user holds, keyed in [`ComAmazonawsIamAwsidentitymanagementv20100508State::access_keys`]
+/// by the access key id.
+///
+/// The id and its secret are minted by the emulator's credential store, which is
+/// the only thing that creates credential material; the secret is never stored
+/// here, because `AccessKey$SecretAccessKey` "is returned only in response to
+/// CreateAccessKey" (the `AccessKey` shape's documentation) and nothing may hand
+/// it out again. The owning user's name is not copied in either: it is read from
+/// the user the record's [`user_key`](AccessKeyRecord::user_key) names, so the
+/// name lives in exactly one place.
+#[derive(Debug, Clone)]
+pub struct AccessKeyRecord {
+    /// [`name_key`] of the IAM user that owns the key.
+    pub user_key: String,
+    /// The key's `statusType` value: [`ACCESS_KEY_ACTIVE_STATUS`] when it was
+    /// minted, until an update moves it.
+    pub status: String,
+    /// The instant the key was minted, reported unchanged by every later read.
+    pub create_date: ::aws_smithy_types::DateTime,
+}
+
 /// Per-service state for com-amazonaws-iam-awsidentitymanagementv20100508. A handler reaches it through [`service_state`].
 ///
 /// Every map is a `BTreeMap` so enumeration order is total and stable, which is
@@ -335,10 +368,10 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// reason: "user, group, role, and policy names must be unique within the
     /// account. Names are not distinguished by case."
     pub role_inline_policies: BTreeMap<String, BTreeMap<String, InlinePolicy>>,
-    /// Access key id -> [`name_key`] of the user that owns it. `GetUser` with no
-    /// `UserName` resolves the caller through this map; `CreateAccessKey` (still a
-    /// stub) is what will populate it.
-    pub access_keys: BTreeMap<String, String>,
+    /// Access key id -> the key's record, including [`name_key`] of the user that
+    /// owns it. `GetUser` with no `UserName` resolves the caller through this map,
+    /// and `CreateAccessKey` is what populates it.
+    pub access_keys: BTreeMap<String, AccessKeyRecord>,
     /// The persisted service-specific credentials, keyed by their
     /// `ServiceSpecificCredentialId` — the handle every other operation on one takes
     /// (`ListServiceSpecificCredentials` reports it,
@@ -393,6 +426,18 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     pub fn next_role_id(&mut self) -> String {
         self.role_id_seq += 1;
         unique_id(ROLE_ID_PREFIX, self.role_id_seq)
+    }
+
+    /// How many access keys the user keyed by `user_key` holds.
+    ///
+    /// This is the measure IAM's access-keys-per-user quota
+    /// ([`MAX_ACCESS_KEYS_PER_USER`]) is taken against, and what tells a delete
+    /// that credentials still depend on the user.
+    pub fn access_keys_held_by(&self, user_key: &str) -> usize {
+        self.access_keys
+            .values()
+            .filter(|record| record.user_key == user_key)
+            .count()
     }
 
     /// Materialise the status changes the clock has already made due: a
