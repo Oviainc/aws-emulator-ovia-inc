@@ -358,6 +358,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let warm_throughput = crate::state::resolved_warm_throughput(
             input.warm_throughput.as_ref(),
             &table.warm_throughput,
+            table_throughput.as_ref(),
             now + crate::state::STATUS_TRANSITION,
         )
         .map_err(lift)?;

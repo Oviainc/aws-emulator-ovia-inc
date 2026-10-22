@@ -85,10 +85,11 @@ const TABLE_ROWS: &[TableRow] = &[
         warm: None,
         expected_billing_mode: "PROVISIONED",
         expected_capacity: (7, 3),
-        expected_warm: (
-            DEFAULT_WARM_READ_UNITS_PER_SECOND,
-            DEFAULT_WARM_WRITE_UNITS_PER_SECOND,
-        ),
+        // Warm throughput is "the minimum provisioned capacity maintained for immediate
+        // data access" (`TableWarmThroughputDescription`), so a table nobody named one
+        // for keeps warm the capacity it IS provisioned for — the recorded description of
+        // a provisioned table reports its own units, not the on-demand default pair.
+        expected_warm: (7, 3),
         pay_per_request_set: false,
     },
     TableRow {

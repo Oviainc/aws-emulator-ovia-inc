@@ -80,6 +80,18 @@ pub async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Va
     parsed
 }
 
+/// The `GlobalSecondaryIndexes` entry of a description by index name, or `Null` when
+/// that description carries no index by that name.
+pub fn index_named(description: &Value, name: &str) -> Value {
+    description["GlobalSecondaryIndexes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|index| index["IndexName"] == serde_json::json!(name))
+        .unwrap_or(Value::Null)
+}
+
 /// The wire error code of a refusal: the shape name the `__type` field carries, which
 /// is what an SDK client matches an error on.
 pub fn error_code(body: &Value) -> String {

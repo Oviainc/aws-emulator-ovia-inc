@@ -34,6 +34,9 @@ mod table_control_plane;
 #[path = "all/table_description_members.rs"]
 mod table_description_members;
 
+#[path = "all/table_description_shape.rs"]
+mod table_description_shape;
+
 #[path = "all/table_items.rs"]
 mod table_items;
 

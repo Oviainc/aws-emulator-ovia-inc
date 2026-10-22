@@ -308,10 +308,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key_schema = validated_key_schema(&input).map_err(lift)?;
         let (billing_mode, provisioned_throughput) = validated_throughput(&input).map_err(lift)?;
         // The warm throughput the table starts life with: the request's values where it
-        // named them, the documented default pair otherwise, in force from creation.
+        // named them, otherwise the pair the table's own capacity keeps warm, in force
+        // from creation.
         let warm_throughput = crate::state::resolved_warm_throughput(
             input.warm_throughput.as_ref(),
             &crate::state::WarmThroughputSettings::default_at(now),
+            provisioned_throughput.as_ref(),
             now,
         )
         .map_err(lift)?;
