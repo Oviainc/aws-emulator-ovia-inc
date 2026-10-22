@@ -73,8 +73,13 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// `src/ops/<operation>.rs`), followed by the member at fault so the caller can
 /// fix the request from the message alone.
 fn refusal_for(violation: &Violation) -> Option<Refused> {
-    // A nested path names its top-level member first (`tags.aws:x.member`).
+    // A nested path names its top-level member first (`tags.aws:x.member`), and a
+    // member of a nested shape is its LAST segment
+    // (`location.relativeFileVersion`); CodeCommit names the error for the member
+    // actually at fault, so the table below is keyed on the top-level member and,
+    // for a nested shape's own member, on that leaf.
     let member = violation.path.split('.').next().unwrap_or_default();
+    let leaf = violation.path.rsplit('.').next().unwrap_or_default();
     let missing = matches!(violation.kind, ViolationKind::MissingRequiredMember);
     let (code, requirement) = match (member, &violation.kind) {
         ("repositoryName", _) if missing => (
@@ -137,6 +142,18 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         ("commitId" | "afterCommitId" | "beforeCommitId", _) => {
             ("InvalidCommitIdException", "The specified commit ID is not valid.")
         }
+        ("commentId", _) if missing => (
+            "CommentIdRequiredException",
+            "The comment ID is missing or null. A comment ID is required.",
+        ),
+        ("commentId", _) => (
+            "InvalidCommentIdException",
+            "The comment ID is not in a valid format.",
+        ),
+        ("reactionValue", _) if missing => (
+            "ReactionValueRequiredException",
+            "A reaction value is required.",
+        ),
         ("blobId", _) if missing => (
             "BlobIdRequiredException",
             "A blob ID is required, but was not specified.",
@@ -162,7 +179,9 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
             "CommentContentSizeLimitExceededException",
             "The comment is too large. Comments are limited to 10,240 characters.",
         ),
-        ("relativeFileVersion", ViolationKind::EnumValue(_)) => (
+        // `relativeFileVersion` is a member of the nested `Location` shape, so it
+        // is the path's LEAF rather than its top-level member.
+        (_, ViolationKind::EnumValue(_)) if leaf == "relativeFileVersion" => (
             "InvalidRelativeFileVersionEnumException",
             "Either the enum is not in a valid format, or the specified file version enum is not valid in respect to the current file version.",
         ),

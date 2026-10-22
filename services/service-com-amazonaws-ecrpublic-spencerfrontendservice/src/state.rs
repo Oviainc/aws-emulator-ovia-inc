@@ -118,13 +118,38 @@ pub const MAX_LAYER_UPLOADS: usize = 1_000;
 /// fit under that cap.
 pub const REPORTED_LAYER_PART_SIZE: i64 = 10 * 1024 * 1024;
 
+/// The published ceiling on ONE layer part, in bytes: the model caps
+/// `UploadLayerPart$layerPartBlob` at `@length(0..20971520)` and the operation's own doc
+/// states it in words — "The maximum size of each image layer part can be 20971520 bytes
+/// (about 20MB)". The boundary validator already refuses a blob longer than this before
+/// a handler runs; the constant is what lets `UploadLayerPart` refuse a *declared* byte
+/// range wider than any admissible part, and what a test reads the bound from.
+pub const MAX_LAYER_PART_BYTES: i64 = 20_971_520;
+
+/// The most bytes ONE in-flight layer upload accumulates before further parts are
+/// refused with the `LimitExceededException` `UploadLayerPart` models.
+///
+/// A layer is held in memory until `CompleteLayerUpload` consumes it, and a part upload
+/// is caller-driven, so the bytes one upload may accrue need a ceiling. AWS publishes an
+/// adjustable quota rather than a fixed maximum layer size, so no single number is the
+/// contract and this is the emulator's own bound — set well above any layer a test or an
+/// ordinary `docker push` sends.
+pub const MAX_LAYER_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+/// The same bound across EVERY in-flight upload at once: [`MAX_LAYER_UPLOADS`] uploads
+/// each holding [`MAX_LAYER_UPLOAD_BYTES`] would be far more than this registry keeps in
+/// memory, so the total is capped too, and a part that would carry the store past it is
+/// refused with the same `LimitExceededException`. The emulator's own bound, for the same
+/// reason as [`MAX_LAYER_UPLOAD_BYTES`].
+pub const MAX_IN_FLIGHT_LAYER_BYTES: usize = 256 * 1024 * 1024;
+
 /// One in-flight layer upload: what `InitiateLayerUpload` opened, addressed by the
 /// upload id it handed the client.
 ///
-/// `UploadLayerPart` and `CompleteLayerUpload` are the operations that consume one (both
-/// still 501 stubs with issues of their own), so what is kept here is what opening the
-/// upload decided: which repository it is for, the part size the client was told to send
-/// parts in, and when it was opened.
+/// `UploadLayerPart` appends to it and `CompleteLayerUpload` consumes it, so what is kept
+/// here is what opening the upload decided — which repository it is for, the part size
+/// the client was told to send parts in, and when it was opened — plus the layer bytes
+/// received so far.
 #[derive(Debug, Clone)]
 pub struct LayerUpload {
     /// The repository the upload was opened against. An upload id is only valid for the
@@ -132,10 +157,39 @@ pub struct LayerUpload {
     pub repository_name: String,
     /// The `partSize` reported to the client when the upload was opened.
     pub part_size: i64,
-    /// When `InitiateLayerUpload` opened it. Nothing reads it yet: the first operation
-    /// that does — `UploadLayerPart` or `CompleteLayerUpload`, each a 501 stub with its
-    /// own issue — is the one to decide whether an upload also expires with age.
+    /// When `InitiateLayerUpload` opened it. Read by nothing that answers a request: AWS
+    /// publishes no lifetime for an in-flight upload, so this registry expires none and
+    /// the stamp is the audit record of when the upload was opened.
     pub started_at: SystemTime,
+    /// The layer bytes accepted so far, in layer order.
+    ///
+    /// `UploadLayerPart` accepts a part only when its first byte is consecutive to the
+    /// last byte already received (`InvalidLayerPartException`: "the first byte specified
+    /// isn't consecutive to the last byte of a previous layer part upload"), so this is
+    /// always the layer's leading bytes and its length is the offset the next part must
+    /// start at. The bytes are kept verbatim: the layer `CompleteLayerUpload` digests is
+    /// exactly what the parts carried.
+    pub received: Vec<u8>,
+}
+
+impl LayerUpload {
+    /// The offset the next layer part must declare as its `partFirstByte`: the number of
+    /// bytes accepted so far, which is 0 for an upload that has received nothing.
+    pub fn next_part_first_byte(&self) -> i64 {
+        // A part is refused unless it fits under `MAX_LAYER_UPLOAD_BYTES`, which is far
+        // inside `i64`, so the cast cannot wrap.
+        self.received.len() as i64
+    }
+
+    /// The position of the last byte accepted for this upload — `lastByteReceived` on a
+    /// success and `lastValidByteReceived` on a refusal — or `None` while the upload has
+    /// received nothing and so has no last byte.
+    pub fn last_byte_received(&self) -> Option<i64> {
+        self.received
+            .len()
+            .checked_sub(1)
+            .map(|position| position as i64)
+    }
 }
 
 /// How many levels of manifest list [`StoredRepository::refresh_image_sizes`] resolves
@@ -498,6 +552,15 @@ impl ComAmazonawsEcrpublicSpencerfrontendserviceState {
         RegistryCatalogData {
             display_name: self.registry_display_name.clone(),
         }
+    }
+
+    /// How many layer bytes every in-flight upload holds between them, which is what
+    /// [`MAX_IN_FLIGHT_LAYER_BYTES`] bounds.
+    pub fn in_flight_layer_bytes(&self) -> usize {
+        self.uploads
+            .values()
+            .map(|upload| upload.received.len())
+            .sum()
     }
 
     /// Whether `registry_id` — a request's `registryId`, which the model lets be either

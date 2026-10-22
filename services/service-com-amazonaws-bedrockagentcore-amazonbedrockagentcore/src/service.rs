@@ -45,6 +45,17 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The host-style endpoint this service is addressed by:
+/// `bedrock-agentcore.<region>.amazonaws.com`.
+///
+/// Source: `smithy_query(query="service_info", model_path="services/\
+/// service-com-amazonaws-bedrockagentcore-amazonbedrockagentcore/smithy-model/\
+/// com-amazonaws-bedrockagentcore-amazonbedrockagentcore.json")` — `awsService.
+/// endpointPrefix` is `bedrock-agentcore`, which here equals `sigv4Name`. Stated
+/// anyway, and beside the claim it feeds, so the claim does not silently change meaning
+/// if either name ever does.
+const ENDPOINT_PREFIX: &str = "bedrock-agentcore";
+
 /// The `com-amazonaws-bedrockagentcore-amazonbedrockagentcore` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +85,33 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `bedrock-agentcore` — a signing name it SHARES with the
+        // AgentCore CONTROL plane
+        // (`services/…-bedrockagentcorecontrol-amazonbedrockagentcorecontrol`), whose
+        // endpoint is `bedrock-agentcore-control` while this one's is
+        // `bedrock-agentcore`. The router resolves a request's routing key from its SigV4
+        // credential scope first, so BOTH services see the key `bedrock-agentcore`:
+        // claiming on the signing name alone makes each claim the other's traffic, and
+        // the router — which refuses rather than guesses — answers `500 AmbiguousService`
+        // for every AgentCore request, a code no AWS model carries.
+        //
+        // Nor can a path segment separate them: the two models publish the SAME first
+        // segment for nine resource families (`/memories/…`, `/runtimes/…`,
+        // `/browsers/…`, `/code-interpreters/…`, `/identities/…`,
+        // `/capacity-providers/…`, `/harnesses/…`, `/payments/…`,
+        // `/browser-profiles/…`), and they collide at deeper indexes too.
+        //
+        // What separates them is what AWS itself dispatches on: the endpoint host, then
+        // the `restJson1` route. So this service claims a request whose routing key names
+        // THIS endpoint and whose method + URI its OWN model binds a route for, by the
+        // one rule `service-common` states for every service under a shared signing name.
+        // The two models bind no identical method + URI pattern, so exactly one of them
+        // claims every AgentCore request.
+        service_common::claims_modeled_route(
+            parts,
+            &[self.entry.identity().signing_name(), ENDPOINT_PREFIX],
+            self.definition(),
+        )
     }
 
     fn override_operation(
