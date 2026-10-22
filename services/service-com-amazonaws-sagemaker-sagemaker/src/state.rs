@@ -586,6 +586,11 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// Lineage artifacts, keyed by `ArtifactArn` — the only identifier `DescribeArtifact`
     /// resolves one by, and the one `CreateArtifact` mints.
     pub artifacts: BTreeMap<String, Artifact>,
+    /// Lineage actions, keyed by `ActionArn` — the identifier that carries both the
+    /// Region and the name, which is what `ActionName` is documented unique within, so a
+    /// name taken in one Region leaves it free in another. See [`Action`], at the end of
+    /// this module with the rest of the lineage-action slice.
+    pub actions: BTreeMap<String, Action>,
     /// Keyed by `AIWorkloadConfigName`. See [`AIWorkloadConfig`], at the end of this
     /// module with the rest of the AI-benchmarking workload-configuration slice.
     pub ai_workload_configs: BTreeMap<String, AIWorkloadConfig>,
@@ -929,6 +934,69 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// order against each other without going through a lossy float.
 pub fn timestamp_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
     (at.secs(), at.subsec_nanos())
+}
+
+// ---------------------------------------------------------------------------
+// Lineage actions (`CreateAction` / `DescribeAction` / `DeleteAction`).
+//
+// Kept together at the end of the file, rather than interleaved with the stores
+// above, so this slice is one block to read — and one block to merge.
+// ---------------------------------------------------------------------------
+
+/// See [`MODEL_QUOTA`]. Bounds the lineage actions `CreateAction` registers; every
+/// record it holds is released by `DeleteAction`.
+pub const ACTION_QUOTA: usize = 1_000;
+
+/// A lineage action created by `CreateAction`, as `DescribeAction` replays it and
+/// `DeleteAction` releases it.
+///
+/// Every optional member is held as an `Option` rather than flattened to a default, so
+/// a reader can tell "the caller sent nothing" from "the caller sent an empty value";
+/// `properties` is a `BTreeMap` so the map serialises in one stable order whatever
+/// order the request arrived in.
+#[derive(Debug, Clone)]
+pub struct Action {
+    pub name: String,
+    pub arn: String,
+    /// The Region the ARN names, i.e. the one the creating request signed for. Held
+    /// separately so the lineage group reported for this action does not have to be
+    /// parsed back out of the ARN.
+    pub region: String,
+    pub source: crate::ops::types::ActionSource,
+    pub action_type: String,
+    pub description: Option<String>,
+    pub status: Option<String>,
+    pub properties: Option<BTreeMap<String, String>>,
+    pub metadata_properties: Option<MetadataProperties>,
+    /// What the create carried, so a later `ListTags`/`AddTags` reports it; no
+    /// implemented operation surfaces it yet (`DescribeAction` models no `Tags` member).
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+}
+
+impl ComAmazonawsSagemakerSagemakerState {
+    /// Whether another lineage action fits, i.e. the store is below [`ACTION_QUOTA`].
+    pub fn actions_below_quota(&self) -> bool {
+        self.actions.len() < ACTION_QUOTA
+    }
+
+    /// The key [`ComAmazonawsSagemakerSagemakerState::actions`] holds an action under,
+    /// for an identifier the caller gave as either a name or an ARN (the lineage
+    /// readers' `ExperimentEntityNameOrArn`).
+    ///
+    /// The store is keyed by `ActionArn`, which carries both the Region the name is
+    /// unique within and the name itself — so a bare name is resolved against `region`,
+    /// the Region this request signed for, while an ARN is matched as a WHOLE: it
+    /// addresses the one action that ARN names, and one differing in the entity kind,
+    /// the account, the partition or the Region addresses a different action.
+    pub fn action_key(region: &str, identifier: &str) -> String {
+        if identifier.starts_with("arn:") {
+            identifier.to_string()
+        } else {
+            resource_arn(region, "action", identifier)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

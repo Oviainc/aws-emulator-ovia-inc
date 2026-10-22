@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: registers a lineage action in `crate::state` under its `ActionName`,
+//! minting the `ActionArn` from the request's region, and refuses a name already in
+//! use. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +147,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAction"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(&region, "action", &input.action_name);
+
+        let mut store = state.lock();
+        // The store is bounded, so a caller varying `ActionName` cannot grow it without
+        // end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.actions_below_quota() {
+            return Err(CreateActionErrorModeled::ResourceLimitExceeded(ResourceLimitExceeded {
+                message: Some(format!(
+                    "The account-level service limit for actions is {}, with current \
+                     utilization of {} and a request delta of 1.",
+                    crate::state::ACTION_QUOTA,
+                    store.actions.len()
+                )),
+            })
+            .into());
+        }
+        // `ActionName` must be unique to the account in the REGION (the member's own
+        // documentation), and the ARN carries both — so the store is keyed by it and a
+        // name already in use in this Region is refused rather than overwritten:
+        // otherwise the caller reads a 200 for an action it did not create, and the one
+        // it did create is gone. The same name in another Region is free.
+        if store.actions.contains_key(&arn) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Cannot create already existing action \"{}\".",
+                input.action_name
+            )));
+        }
+
+        // One instant for both times: an action nothing has modified reports a
+        // `LastModifiedTime` equal to its `CreationTime`.
+        let now = ::std::time::SystemTime::now();
+        store.actions.insert(
+            arn.clone(),
+            crate::state::Action {
+                name: input.action_name,
+                arn: arn.clone(),
+                region,
+                source: input.source,
+                action_type: input.action_type,
+                description: input.description,
+                status: input.status,
+                // An absent map stays absent and an empty one stays empty: the two are
+                // distinguishable on the wire, so the store keeps them distinct.
+                properties: input
+                    .properties
+                    .map(|properties| properties.into_iter().collect()),
+                metadata_properties: input.metadata_properties,
+                tags: input.tags.unwrap_or_default(),
+                creation_time: now,
+                last_modified_time: now,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateActionOutput {
+            action_arn: Some(arn),
+        })
     }
 }

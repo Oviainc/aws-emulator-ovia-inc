@@ -23,6 +23,8 @@ mod code_repositories;
 mod endpoint_config_deletion;
 #[path = "all/inference_deployment_lifecycle.rs"]
 mod inference_deployment_lifecycle;
+#[path = "all/lineage_action_lifecycle.rs"]
+mod lineage_action_lifecycle;
 #[path = "all/model_package_group_lifecycle.rs"]
 mod model_package_group_lifecycle;
 #[path = "all/model_package_registry.rs"]

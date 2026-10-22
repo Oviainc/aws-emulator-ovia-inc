@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAction`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: reconstructs the action from `crate::state`, accepting either its name
+//! or its ARN, and refuses an unknown one with the modelled `ResourceNotFound`. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +153,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAction"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `ActionName` is an `ExperimentEntityNameOrArn`, so the caller may give the
+        // action's name or its ARN; `action_key` resolves either against the store's ARN
+        // key, and documents the rule it applies.
+        let key = crate::state::ComAmazonawsSagemakerSagemakerState::action_key(
+            &crate::state::request_region(ctx),
+            &input.action_name,
+        );
+
+        let store = state.lock();
+        let Some(action) = store.actions.get(&key) else {
+            // Never a 200 with empty fields: a caller cannot tell that from an action
+            // that exists and carries nothing. The message quotes the identifier the
+            // CALLER passed, never an ARN this service synthesised for it.
+            return Err(DescribeActionErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!(
+                    "Could not find action \"{}\".",
+                    input.action_name
+                )),
+            })
+            .into());
+        };
+
+        Ok(DescribeActionOutput {
+            action_name: Some(action.name.clone()),
+            action_arn: Some(action.arn.clone()),
+            source: Some(action.source.clone()),
+            action_type: Some(action.action_type.clone()),
+            description: action.description.clone(),
+            status: action.status.clone(),
+            // Replayed as stored: absent when the create omitted the member, and the
+            // empty map when the create sent one.
+            properties: action.properties.as_ref().map(|properties| {
+                properties
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+            creation_time: Some(crate::state::timestamp(action.creation_time)),
+            last_modified_time: Some(crate::state::timestamp(action.last_modified_time)),
+            metadata_properties: action.metadata_properties.clone(),
+            // The emulator models neither a Studio user profile nor the IAM identity
+            // details SageMaker fills in for model packages and projects only, so the
+            // user context is reported with no members rather than invented ones — the
+            // same answer `DescribeArtifact` gives for the sibling lineage entity.
+            created_by: Some(UserContext::default()),
+            last_modified_by: Some(UserContext::default()),
+            // Every lineage entity belongs to the Region's one default lineage group.
+            lineage_group_arn: Some(crate::state::lineage_group_arn(&action.region)),
+        })
     }
 }
