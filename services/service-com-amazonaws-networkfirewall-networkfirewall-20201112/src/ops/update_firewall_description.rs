@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFirewallDescription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFirewallDescription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFirewallDescription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the new description onto the stored `FirewallRecord` and
+//! re-mints its `UpdateToken`, so a following `DescribeFirewall` shows the change.
+//! A stale token is refused with `InvalidTokenException`.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +176,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFirewallDescription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFirewallDescriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFirewallDescription"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateFirewallDescriptionErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the firewall store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        let key = state
+            .resolve_firewall(
+                input.firewall_name.as_deref(),
+                input.firewall_arn.as_deref(),
+            )
+            .map_err(update_lookup_error)?;
+        let Some(record) = state.firewalls.get_mut(&key) else {
+            return Err(UpdateFirewallDescriptionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Firewall {key} does not exist.")),
+                },
+            )
+            .into());
+        };
+
+        // The `PROVISIONING` -> `READY` move the clock owed at `ready_at()` is
+        // materialised here too, so every handler that touches the record sees
+        // the same status a reader would, not a stale one.
+        record.settle(::std::time::SystemTime::now());
+
+        // `UpdateToken` is the resource's optimistic lock: when the caller sends
+        // one it must be the token the resource currently carries, so a caller
+        // that read the firewall before someone else changed it is refused rather
+        // than overwriting that change.
+        if let Some(token) = &input.update_token {
+            if token != &record.update_token {
+                return Err(UpdateFirewallDescriptionErrorModeled::InvalidTokenException(
+                    InvalidTokenException {
+                        message: Some(
+                            "The UpdateToken you provided is no longer current for this firewall. \
+                             Retrieve the current token and retry."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        record.description = input.description;
+        record.update_token = crate::state::new_uuid();
+
+        Ok(UpdateFirewallDescriptionOutput {
+            firewall_arn: Some(record.firewall_arn.clone()),
+            firewall_name: Some(record.firewall_name.clone()),
+            description: record.description.clone(),
+            update_token: Some(record.update_token.clone()),
+        })
     }
 }
+
+crate::state::impl_resolve_error!(
+    update_lookup_error -> UpdateFirewallDescriptionError, UpdateFirewallDescriptionErrorModeled,
+    resource = "firewall", plural = "firewalls",
+    name_member = "FirewallName", arn_member = "FirewallArn"
+);
