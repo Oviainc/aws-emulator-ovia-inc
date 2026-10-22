@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(feed) = state.feeds.get(&input.id) else {
             return Err(GetFeedErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("No feed with id {} exists.", input.id),
+                    message: crate::state::NOT_FOUND_MESSAGE.to_string(),
                 },
             )
             .into());

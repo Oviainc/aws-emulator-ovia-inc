@@ -199,6 +199,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let (outpost_id, sequence) = store.mint_id("op");
+        // AWS resolves the Availability Zone identity the caller did not name from
+        // the one they did ("You can specify either an Availability one or an AZ
+        // ID"), so the stored Outpost carries BOTH forms and every later read of it
+        // reports both. A zone the pair cannot be resolved from — a name with no
+        // zone letter, an id whose region abbreviation names no region — leaves the
+        // other member absent rather than carrying a made-up value.
+        let availability_zone = crate::state::non_empty(input.availability_zone);
+        let availability_zone_id = crate::state::non_empty(input.availability_zone_id)
+            .or_else(|| {
+                availability_zone
+                    .as_deref()
+                    .and_then(crate::state::availability_zone_id)
+            });
+        let availability_zone = availability_zone.or_else(|| {
+            availability_zone_id
+                .as_deref()
+                .and_then(crate::state::availability_zone)
+        });
         let outpost = Outpost {
             outpost_id: Some(outpost_id.clone()),
             owner_id: Some(::engine::emulator_account_id().to_string()),
@@ -206,9 +224,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             site_id: Some(site_id),
             name: Some(input.name),
             description: input.description,
-            life_cycle_status: Some(crate::state::LIFE_CYCLE_STATUS_ACTIVE.to_string()),
-            availability_zone: crate::state::non_empty(input.availability_zone),
-            availability_zone_id: crate::state::non_empty(input.availability_zone_id),
+            // A just-created Outpost is still being provisioned, so it reports the
+            // pending status until the transition the clock owes falls due; every
+            // read materialises it through `settle_outposts`.
+            life_cycle_status: Some(crate::state::LIFE_CYCLE_STATUS_PENDING.to_string()),
+            availability_zone,
+            availability_zone_id,
             tags: crate::state::tags_member(&input.tags.unwrap_or_default()),
             site_arn: Some(site_arn),
             // `SupportedHardwareType` is optional and the model documents no
@@ -227,6 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::OutpostRecord {
                 sequence,
                 outpost: outpost.clone(),
+                active_at: Some(std::time::Instant::now() + crate::state::OUTPOST_PROVISIONING),
             },
         );
 

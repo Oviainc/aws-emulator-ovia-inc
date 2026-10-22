@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRoutingControlStates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRoutingControlStates`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: applies every entry of the batch to the stored routing controls
+//! ATOMICALLY — every entry is validated first, then all are committed under ONE
+//! state guard, so a refused batch leaves no partial mutation. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRoutingControlStates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! More than [`crate::state::MAX_UPDATE_ROUTING_CONTROL_STATE_ENTRIES`] entries is a
+//! `ServiceLimitExceededException` (402); a duplicate ARN in one batch, entries spanning
+//! more than one cluster, or a state outside the modelled `On`/`Off` value set is a
+//! `ValidationException` (400); an ARN the registry does not hold is a
+//! `ResourceNotFoundException` (404). `SafetyRulesToOverride` is accepted and IGNORED in
+//! this first slice: safety-rule assertion and gating is left to its own gap issue.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +174,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRoutingControlStates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRoutingControlStatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRoutingControlStates"))
+        // `ctx` carries request metadata; the audit record below reads the caller's
+        // presented access-key id from it.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // `SafetyRulesToOverride` is accepted and ignored in this slice (see the
+        // module header): no safety rule is asserted yet, so there is none to override.
+        let _ = &input.safety_rules_to_override;
+
+        let entries = &input.update_routing_control_state_entries;
+
+        // The batch cap is a request-shape rule, so it is answered before the
+        // registry is even consulted.
+        if entries.len() > crate::state::MAX_UPDATE_ROUTING_CONTROL_STATE_ENTRIES {
+            return Err(
+                UpdateRoutingControlStatesErrorModeled::ServiceLimitExceededException(
+                    ServiceLimitExceededException {
+                        message: format!(
+                            "The request can't update {} routing control states at the same \
+                             time. Try again with at most {} routing control states.",
+                            entries.len(),
+                            crate::state::MAX_UPDATE_ROUTING_CONTROL_STATE_ENTRIES
+                        ),
+                        resource_id: None,
+                        resource_type: Some("RoutingControl".to_string()),
+                        limit_code: "UpdateRoutingControlStateEntries".to_string(),
+                        service_code: "route53-recovery-cluster".to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateRoutingControlStatesError::from(
+                UpdateRoutingControlStatesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the routing control registry is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                ),
+            )
+        })?;
+
+        // ONE guard for the whole batch: validate every entry, then commit. Nothing
+        // is written until the last entry has been accepted, and no other request
+        // can observe the registry in between.
+        let mut guard = state.lock();
+
+        let mut resolved: Vec<(String, crate::state::RoutingControlState)> =
+            Vec::with_capacity(entries.len());
+        let mut batch_cluster: Option<String> = None;
+
+        for entry in entries {
+            let Some(new_state) =
+                crate::state::RoutingControlState::from_wire(&entry.routing_control_state)
+            else {
+                return Err(validation_exception(
+                    format!(
+                        "RoutingControlState must satisfy enum value set: [{}]",
+                        ROUTING_CONTROL_STATE_VALUES.join(", ")
+                    ),
+                    "fieldValidationFailed",
+                    "UpdateRoutingControlStateEntries.RoutingControlState",
+                ));
+            };
+
+            if resolved
+                .iter()
+                .any(|(arn, _)| *arn == entry.routing_control_arn)
+            {
+                return Err(validation_exception(
+                    format!(
+                        "Routing control {} appears more than once in the request",
+                        entry.routing_control_arn
+                    ),
+                    "other",
+                    "UpdateRoutingControlStateEntries.RoutingControlArn",
+                ));
+            }
+
+            let Some(cluster) = guard.cluster_of(&entry.routing_control_arn) else {
+                return Err(
+                    UpdateRoutingControlStatesErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: format!(
+                                "Routing control {} was not found",
+                                entry.routing_control_arn
+                            ),
+                            resource_id: entry.routing_control_arn.clone(),
+                            resource_type: "RoutingControl".to_string(),
+                        },
+                    )
+                    .into(),
+                );
+            };
+
+            // A cluster endpoint only serves its own cluster, so one batch cannot
+            // span two of them.
+            match &batch_cluster {
+                Some(first) if first != cluster => {
+                    return Err(validation_exception(
+                        format!(
+                            "All routing controls in the request must be in cluster {first}"
+                        ),
+                        "other",
+                        "UpdateRoutingControlStateEntries.RoutingControlArn",
+                    ));
+                }
+                Some(_) => {}
+                None => batch_cluster = Some(cluster.to_string()),
+            }
+
+            resolved.push((entry.routing_control_arn.clone(), new_state));
+        }
+
+        // Commit: every ARN above resolved through this same guard, so each lookup
+        // succeeds.
+        for (arn, new_state) in resolved {
+            if let Some(control) = guard.routing_controls.get_mut(&arn) {
+                let previous_state = control.state;
+                control.state = new_state;
+                // Audit record per committed entry: the caller's presented
+                // access-key id (never a secret), the resource, and the transition.
+                tracing::info!(
+                    operation = "UpdateRoutingControlStates",
+                    caller_akid = %caller_akid,
+                    routing_control_arn = %arn,
+                    previous_state = previous_state.as_wire(),
+                    new_state = new_state.as_wire(),
+                    "routing control state updated"
+                );
+            }
+        }
+
+        // The modelled output carries no members: the state changes ARE the result.
+        Ok(UpdateRoutingControlStatesOutput {})
     }
+}
+
+/// A modelled `ValidationException` (HTTP 400) naming the member that was wrong, in
+/// the shape the boundary validator reports one: a message, the `reason` code, and
+/// the offending member in `fields`.
+fn validation_exception(
+    message: String,
+    reason: &str,
+    field: &str,
+) -> UpdateRoutingControlStatesError {
+    UpdateRoutingControlStatesErrorModeled::ValidationException(ValidationException {
+        message: message.clone(),
+        reason: Some(reason.to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: field.to_string(),
+            message,
+        }]),
+    })
+    .into()
 }

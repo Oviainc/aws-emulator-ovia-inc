@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(dictionary) = state.dictionaries.get(&input.id) else {
             return Err(GetDictionaryErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("No dictionary with id {} exists.", input.id),
+                    message: crate::state::NOT_FOUND_MESSAGE.to_string(),
                 },
             )
             .into());

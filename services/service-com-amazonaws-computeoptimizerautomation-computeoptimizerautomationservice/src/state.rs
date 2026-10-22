@@ -3,11 +3,12 @@
 //! Engine state for the com-amazonaws-computeoptimizerautomation-computeoptimizerautomationservice service.
 //!
 //! This module owns everything the handlers share: the stored form of an
-//! automation rule, the enrollment configuration, the client-token (idempotency)
-//! ledger, and the pure helpers that mint a rule id, build an opaque page token
-//! and decide whether a rule matches a `ListAutomationRules` filter. Handlers
-//! live in `src/ops/`, one file per operation, and build their own output shapes
-//! from what they read back out of here.
+//! automation rule and of an automation event, the enrollment configuration,
+//! the client-token (idempotency) ledger, and the pure helpers that mint a rule
+//! id, build an opaque page token, bound a queried time range and decide
+//! whether a rule or an event matches a list filter. Handlers live in
+//! `src/ops/`, one file per operation, and build their own output shapes from
+//! what they read back out of here.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,7 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AutomationRule, Criteria, Filter, OrganizationConfiguration, Schedule, Tag,
+    AutomationEvent, AutomationEventFilter, AutomationRule, Criteria, EstimatedMonthlySavings,
+    Filter, OrganizationConfiguration, Schedule, Tag, AUTOMATION_EVENT_FILTER_NAME_VALUES,
 };
 
 /// The ARN namespace this service stamps on a rule ARN, from the model's
@@ -42,6 +44,22 @@ pub const DEFAULT_MAX_RESULTS: i32 = 100;
 /// The number of `ruleId` characters, from the `RuleId` pattern
 /// `^[0-9A-Za-z]{16}$`.
 const RULE_ID_LEN: usize = 16;
+
+/// How far back an automation event stays reportable. `ListAutomationEvents`
+/// documents "You can retrieve events that were created within the past year"
+/// (`smithy_query(query="doc",shape="ListAutomationEvents")`), so an event
+/// created before that window is outside every query's reach however far back
+/// the caller's `startTimeInclusive` points.
+pub const EVENT_RETRIEVAL_WINDOW: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// How many automation events the store remembers.
+///
+/// CHOSEN bound, for the same reason [`MAX_RULES_PER_ACCOUNT`] is one: neither
+/// the model nor the operation docs give a stored-event limit, and this store
+/// lives in memory, so the oldest event is evicted to make room instead of
+/// letting the process grow with every started event. [`EVENT_RETRIEVAL_WINDOW`]
+/// does not bound it on its own: it only decides what a query may report.
+pub const MAX_STORED_EVENTS: usize = 1_000;
 
 /// How many automation rules one account may hold before `CreateAutomationRule`
 /// answers the modelled `ServiceQuotaExceededException` ("The request would
@@ -225,6 +243,172 @@ impl RuleStore {
     }
 }
 
+/// An automation event as stored: the run of ONE recommended action, which is
+/// what `ListAutomationEvents` and the event readers report. Every response
+/// member is built from one of these, never from the request that asked for it.
+#[derive(Debug, Clone)]
+pub struct StoredEvent {
+    pub event_id: String,
+    pub event_description: Option<String>,
+    pub event_type: String,
+    pub event_status: String,
+    pub event_status_reason: Option<String>,
+    pub resource_arn: Option<String>,
+    pub resource_id: Option<String>,
+    pub recommended_action_id: Option<String>,
+    pub account_id: String,
+    pub region: Option<String>,
+    pub rule_id: Option<String>,
+    pub resource_type: String,
+    pub created_timestamp: ::aws_smithy_types::DateTime,
+    pub completed_timestamp: Option<::aws_smithy_types::DateTime>,
+    pub estimated_monthly_savings: Option<EstimatedMonthlySavings>,
+}
+
+impl StoredEvent {
+    /// This event as the `AutomationEvent` the list and get operations return.
+    pub fn to_automation_event(&self) -> AutomationEvent {
+        AutomationEvent {
+            event_id: Some(self.event_id.clone()),
+            event_description: self.event_description.clone(),
+            event_type: Some(self.event_type.clone()),
+            event_status: Some(self.event_status.clone()),
+            event_status_reason: self.event_status_reason.clone(),
+            resource_arn: self.resource_arn.clone(),
+            resource_id: self.resource_id.clone(),
+            recommended_action_id: self.recommended_action_id.clone(),
+            account_id: Some(self.account_id.clone()),
+            region: self.region.clone(),
+            rule_id: self.rule_id.clone(),
+            resource_type: Some(self.resource_type.clone()),
+            created_timestamp: Some(self.created_timestamp),
+            completed_timestamp: self.completed_timestamp,
+            estimated_monthly_savings: self.estimated_monthly_savings.clone(),
+        }
+    }
+}
+
+/// The automation events of this service, in creation order, keyed by the
+/// `eventId` every event-scoped operation takes. Keeping the order beside the
+/// index is what lets a list page over a stable sequence; `insert` is the only
+/// writer, and it is what keeps the store bounded by [`MAX_STORED_EVENTS`].
+#[derive(Debug, Default)]
+pub struct EventStore {
+    /// `eventId`s in creation order, oldest first, so the store can evict.
+    order: VecDeque<String>,
+    by_id: HashMap<String, StoredEvent>,
+}
+
+impl EventStore {
+    /// Store an event, appending it to the creation order the first time its id
+    /// is seen so a re-stored event keeps its place in the sequence. Evicts the
+    /// oldest events once the store is full: an evicted event is the one no
+    /// query can still reach first.
+    pub fn insert(&mut self, event: StoredEvent) {
+        let event_id = event.event_id.clone();
+        if self.by_id.insert(event_id.clone(), event).is_none() {
+            self.order.push_back(event_id);
+        }
+        while self.order.len() > MAX_STORED_EVENTS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_id.remove(&oldest);
+            }
+        }
+    }
+
+    /// Every stored event, in creation order.
+    pub fn iter_in_order(&self) -> impl Iterator<Item = &StoredEvent> {
+        self.order.iter().filter_map(|id| self.by_id.get(id))
+    }
+}
+
+/// A total order key for a wire timestamp: `DateTime` carries seconds and
+/// sub-second nanos, so comparing the pair orders two instants exactly.
+pub fn instant_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
+    (at.secs(), at.subsec_nanos())
+}
+
+/// Is `at` inside the half-open window `[start, end)`? An absent bound leaves
+/// that side unbounded, and the member names fix which side is which:
+/// `startTimeInclusive` is included, `endTimeExclusive` is not.
+pub fn within_window(
+    at: ::aws_smithy_types::DateTime,
+    start: Option<::aws_smithy_types::DateTime>,
+    end: Option<::aws_smithy_types::DateTime>,
+) -> bool {
+    let at = instant_key(at);
+    start.is_none_or(|start| at >= instant_key(start))
+        && end.is_none_or(|end| at < instant_key(end))
+}
+
+/// Is the queried time range a window that can hold anything?
+///
+/// `endTimeExclusive` is exclusive, so a range whose end does not come after
+/// its start describes an empty — or inverted — window and selects nothing; the
+/// service refuses such a request instead of reporting an empty page. A range
+/// with only one bound is always valid: the other side is unbounded.
+pub fn time_range_is_valid(
+    start: Option<::aws_smithy_types::DateTime>,
+    end: Option<::aws_smithy_types::DateTime>,
+) -> bool {
+    match (start, end) {
+        (Some(start), Some(end)) => instant_key(start) < instant_key(end),
+        _ => true,
+    }
+}
+
+/// What the service says when [`time_range_is_valid`] refuses a range: one
+/// constant sentence, carrying neither bound's value, so every refused range
+/// reports the same text. Recorded from the service itself.
+pub const INVALID_TIME_RANGE_MESSAGE: &str = "Start date must be before end date";
+
+/// The effective start of the window an event query reports over: the LATER of
+/// the caller's `startTimeInclusive` and the oldest retrievable instant
+/// ([`EVENT_RETRIEVAL_WINDOW`] before `now`), so an event created outside the
+/// retrieval window is never reported however far back the caller asks.
+pub fn effective_window_start(
+    requested: Option<::aws_smithy_types::DateTime>,
+    now: SystemTime,
+) -> ::aws_smithy_types::DateTime {
+    let floor = ::aws_smithy_types::DateTime::from(
+        now.checked_sub(EVENT_RETRIEVAL_WINDOW).unwrap_or(UNIX_EPOCH),
+    );
+    match requested {
+        Some(start) if instant_key(start) > instant_key(floor) => start,
+        _ => floor,
+    }
+}
+
+/// Does `event` satisfy every `ListAutomationEvents` filter?
+///
+/// Same rule as [`rule_matches_filters`]: a filter matches when the event's
+/// corresponding field equals any of that filter's values, and several filters
+/// are ANDed. The names are the model's `AutomationEventFilterName` value set,
+/// and an unrecognised one is reported by [`unknown_event_filter_name`] rather
+/// than silently ignored.
+pub fn event_matches_filters(event: &StoredEvent, filters: &[AutomationEventFilter]) -> bool {
+    filters.iter().all(|filter| {
+        let field: Option<&str> = match filter.name.as_str() {
+            "AccountId" => Some(event.account_id.as_str()),
+            "ResourceType" => Some(event.resource_type.as_str()),
+            "EventType" => Some(event.event_type.as_str()),
+            "EventStatus" => Some(event.event_status.as_str()),
+            // An unknown name never reaches here: the caller refuses it first.
+            _ => None,
+        };
+        field.is_some_and(|value| filter.values.iter().any(|candidate| candidate == value))
+    })
+}
+
+/// The first filter name that is not one of the model's
+/// `AutomationEventFilterName` values, if any.
+pub fn unknown_event_filter_name(filters: &[AutomationEventFilter]) -> Option<&str> {
+    filters
+        .iter()
+        .map(|filter| filter.name.as_str())
+        .find(|name| !AUTOMATION_EVENT_FILTER_NAME_VALUES.contains(name))
+}
+
 /// What a client token already in the ledger says about the request carrying it.
 #[derive(Debug)]
 pub enum TokenOutcome {
@@ -258,6 +442,9 @@ pub struct ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationservi
     pub enrollments: HashMap<String, EnrollmentConfig>,
     /// Every automation rule, in creation order.
     pub rules: RuleStore,
+    /// Every automation event, in creation order. Written by the operations
+    /// that start and roll back an event; read by the event readers.
+    pub events: EventStore,
     /// `clientToken` -> what the call that first used it did. Bounded by
     /// [`MAX_IDEMPOTENCY_ENTRIES`] and [`IDEMPOTENCY_TTL`].
     pub idempotency: HashMap<String, IdempotencyRecord>,

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the persisted cluster named by the `@httpLabel` `identifier`, or the
+//! modelled `ResourceNotFoundException` (404) when this service holds no such
+//! cluster. `@readonly`: the only write it performs is settling a status change the
+//! clock already owed at this instant.
 //!
 //! ## Shape of an operation
 //!
@@ -96,10 +92,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // here — hence the `GetClusterError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dsql#GetCluster")]
+// The operation's MODELED errors, plus the service-common `InternalServerException`
+// widened in with `extra_errors`: the service declares it for every operation (its
+// `common_errors` are AccessDenied / InternalServer / Throttling / Validation), but the
+// per-operation list the macro checks against does not repeat it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.dsql#GetCluster",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetClusterErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -153,18 +157,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCluster"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the dsql cluster store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+        state.settle(std::time::SystemTime::now());
+
+        let Some(cluster) = state.clusters.get(&input.identifier) else {
+            return Err(GetClusterErrorModeled::ResourceNotFoundException(
+                crate::state::cluster_not_found(&input.identifier),
+            )
+            .into());
+        };
+
+        Ok(GetClusterOutput {
+            identifier: cluster.identifier.clone(),
+            arn: cluster.arn.clone(),
+            status: cluster.status.clone(),
+            creation_time: ::aws_smithy_types::DateTime::from(cluster.creation_time),
+            deletion_protection_enabled: cluster.deletion_protection_enabled,
+            multi_region_properties: cluster.multi_region_properties.clone(),
+            // `tags` is modelled as an optional map, and a cluster created without
+            // tags has none to report; a tagged cluster reports exactly what it holds.
+            tags: (!cluster.tags.is_empty()).then(|| {
+                cluster
+                    .tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+            encryption_details: cluster.encryption_details.clone(),
+            endpoint: cluster.endpoint.clone(),
+        })
     }
 }

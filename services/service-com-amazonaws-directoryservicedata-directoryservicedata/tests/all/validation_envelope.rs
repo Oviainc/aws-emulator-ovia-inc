@@ -1,0 +1,506 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! How Directory Service Data refuses a request whose member falls outside a modelled
+//! constraint, end to end over HTTP.
+//!
+//! The rule under test: a request refused before any handler runs is answered in this
+//! service's own modelled `ValidationException` — HTTP 400, error type
+//! `ValidationException`, and the prose in the member the model names, `Message`
+//! (`smithy_query(query="shape", shape="ValidationException")` — members
+//! `Message`/`Reason`) — and that prose names the rejected value, the member path and
+//! the constraint it failed. The table below walks the constraint classes the model
+//! declares (`@pattern`, `@range`, `@length` on a string and on a list, an enum's
+//! value set, `@required`, and a constraint on a list's MEMBER) across seven
+//! operations; the recorded `DescribeUser` case is one row of it.
+
+use std::sync::Arc;
+
+use bytes::Bytes;
+use serde_json::{json, Value};
+use service_com_amazonaws_directoryservicedata_directoryservicedata::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// A `DirectoryId` satisfying `^d-[0-9a-f]{10}$`.
+const DIRECTORY: &str = "d-1234567890";
+
+/// The error code every refusal below carries: the shape
+/// `com.amazonaws.directoryservicedata#ValidationException`, `@httpError` 400.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// `DirectoryId`'s `@pattern`, as the refusal states it: the model declares
+/// `^d-[0-9a-f]{10}$` (`smithy_query(query="shape", shape="DirectoryId")`) and the
+/// anchors bracketing it are not part of the stated expression.
+const DIRECTORY_ID_PATTERN: &str = "d-[0-9a-f]{10}";
+
+/// `GroupName`'s `@pattern`, stated the same way; model: `^[^:;|=+"*?<>/\\,\[\]@]+$`
+/// (`smithy_query(query="shape", shape="GroupName")`).
+const GROUP_NAME_PATTERN: &str = r#"[^:;|=+"*?<>/\\,\[\]@]+"#;
+
+/// `Realm`'s `@pattern`; model: `^([a-zA-Z0-9]+[\\.-])+([a-zA-Z0-9])+[.]?$`
+/// (`smithy_query(query="shape", shape="Realm")`).
+const REALM_PATTERN: &str = r"([a-zA-Z0-9]+[\\.-])+([a-zA-Z0-9])+[.]?";
+
+/// `LdapDisplayName`'s `@pattern` — the constraint on the MEMBER of
+/// `LdapDisplayNameList`; model: `^[A-Za-z*][A-Za-z-*]*$`
+/// (`smithy_query(query="shape", shape="LdapDisplayName")`).
+const LDAP_DISPLAY_NAME_PATTERN: &str = "[A-Za-z*][A-Za-z-*]*";
+
+/// `MaxResults`' `@range` (`smithy_query(query="shape", shape="MaxResults")`).
+const MAX_RESULTS_FLOOR: i64 = 1;
+const MAX_RESULTS_CEILING: i64 = 250;
+
+/// `LdapDisplayNameList`'s own `@length`
+/// (`smithy_query(query="shape", shape="LdapDisplayNameList")`).
+const SEARCH_ATTRIBUTES_FLOOR: usize = 1;
+const SEARCH_ATTRIBUTES_CEILING: usize = 25;
+
+/// `SearchString`'s `@length` maximum, from `SearchUsers`' input
+/// (`smithy_query(query="operation", operation="SearchUsers")` — len 1..64).
+const SEARCH_STRING_CEILING: usize = 64;
+
+/// A SigV4 credential scope naming this service: `ds-data` is its `sigv4Name`, and the
+/// route key is what claims the request for this service.
+const SIGNED_FOR_DS_DATA: &str = "AWS4-HMAC-SHA256 \
+     Credential=AKIDEXAMPLE/20260101/us-east-1/ds-data/aws4_request, \
+     SignedHeaders=host, Signature=abc";
+
+/// One emulator: a router carrying only this service, over one shared engine.
+fn emulator() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(engine));
+    router
+}
+
+/// What the emulator answered: the status, the `x-amzn-errortype` header and the body.
+struct Answer {
+    status: u16,
+    error_type: String,
+    body: Value,
+}
+
+impl Answer {
+    /// The wire error code (`__type`), or the empty string on a success.
+    fn error_code(&self) -> &str {
+        self.body["__type"].as_str().unwrap_or_default()
+    }
+
+    /// The `Message` member of the answer, or `None` when the body carries none.
+    fn message(&self) -> Option<&str> {
+        self.body.get("Message").and_then(Value::as_str)
+    }
+}
+
+/// Every operation of this service is `POST <route>` with a JSON body; `DirectoryId`
+/// rides in the query string (`@httpQuery`).
+async fn call(router: &MultiServiceRouter, route: &str, directory: &str, body: &Value) -> Answer {
+    let uri = format!("{route}?DirectoryId={directory}");
+    let request = ::http::Request::builder()
+        .method("POST")
+        .uri(&uri)
+        .header("host", "ds-data.us-east-1.amazonaws.com")
+        .header("authorization", SIGNED_FOR_DS_DATA)
+        .header("content-type", "application/json")
+        .body(Bytes::from(body.to_string()))
+        .expect("the test request is well formed");
+
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let error_type = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let bytes = response.into_body();
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "POST {uri} answered a body that is not JSON ({error}): {:?}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
+    };
+    Answer {
+        status,
+        error_type,
+        body,
+    }
+}
+
+/// The envelope a single-violation refusal states, built the way the service builds it.
+fn one_violation(value: &str, member: &str, requirement: &str) -> String {
+    format!(
+        "1 validation error detected: Value {value} at '{member}' \
+         failed to satisfy constraint: {requirement}"
+    )
+}
+
+/// One row of the table: a request with exactly one member outside its constraint, and
+/// the whole `Message` the refusal must carry.
+struct Case {
+    what: &'static str,
+    route: &'static str,
+    directory: String,
+    body: Value,
+    message: String,
+}
+
+/// The table: one row per constraint class the model declares for this service, spread
+/// over the operations that declare them.
+fn cases() -> Vec<Case> {
+    let longest_search_string = "x".repeat(SEARCH_STRING_CEILING + 1);
+    // Attribute names inside `LdapDisplayName`'s pattern and length, so only the list's
+    // own `@length` is violated.
+    let over_long_attributes: Vec<String> = ('a'..='z')
+        .take(SEARCH_ATTRIBUTES_CEILING + 1)
+        .map(|letter| letter.to_string())
+        .collect();
+
+    vec![
+        Case {
+            what: "a DirectoryId outside its @pattern",
+            route: "/Users/DescribeUser",
+            directory: "not-a-directory-id".to_string(),
+            body: json!({"SAMAccountName": "jdoe"}),
+            message: one_violation(
+                "'not-a-directory-id'",
+                "directoryId",
+                &format!("Member must satisfy regular expression pattern: {DIRECTORY_ID_PATTERN}"),
+            ),
+        },
+        Case {
+            what: "a group SAMAccountName outside its @pattern",
+            route: "/Groups/DescribeGroup",
+            directory: DIRECTORY.to_string(),
+            body: json!({"SAMAccountName": "sim2real;group"}),
+            message: one_violation(
+                "'sim2real;group'",
+                "sAMAccountName",
+                &format!("Member must satisfy regular expression pattern: {GROUP_NAME_PATTERN}"),
+            ),
+        },
+        Case {
+            what: "a Realm outside its @pattern",
+            route: "/Groups/ListGroups",
+            directory: DIRECTORY.to_string(),
+            body: json!({"Realm": "not a realm!"}),
+            message: one_violation(
+                "'not a realm!'",
+                "realm",
+                &format!("Member must satisfy regular expression pattern: {REALM_PATTERN}"),
+            ),
+        },
+        Case {
+            what: "a MaxResults one above its @range ceiling",
+            route: "/Users/ListUsers",
+            directory: DIRECTORY.to_string(),
+            body: json!({"MaxResults": MAX_RESULTS_CEILING + 1}),
+            message: one_violation(
+                &format!("'{}'", MAX_RESULTS_CEILING + 1),
+                "maxResults",
+                &format!("Member must have value less than or equal to {MAX_RESULTS_CEILING}"),
+            ),
+        },
+        Case {
+            what: "a MaxResults one below its @range floor",
+            route: "/Groups/ListGroups",
+            directory: DIRECTORY.to_string(),
+            body: json!({"MaxResults": MAX_RESULTS_FLOOR - 1}),
+            message: one_violation(
+                &format!("'{}'", MAX_RESULTS_FLOOR - 1),
+                "maxResults",
+                &format!("Member must have value greater than or equal to {MAX_RESULTS_FLOOR}"),
+            ),
+        },
+        Case {
+            what: "a GroupType outside the enum's value set",
+            route: "/Groups/CreateGroup",
+            directory: DIRECTORY.to_string(),
+            body: json!({"SAMAccountName": "engineering", "GroupType": "NotAGroupType"}),
+            message: one_violation(
+                "'NotAGroupType'",
+                "groupType",
+                // `GroupType`'s modelled values, in model order
+                // (`smithy_query(query="shape", shape="GroupType")`).
+                "Member must satisfy enum value set: [Distribution, Security]",
+            ),
+        },
+        Case {
+            what: "a GroupScope outside the enum's value set",
+            route: "/Groups/CreateGroup",
+            directory: DIRECTORY.to_string(),
+            body: json!({"SAMAccountName": "engineering", "GroupScope": "Planetary"}),
+            message: one_violation(
+                "'Planetary'",
+                "groupScope",
+                // `GroupScope`'s modelled values, in model order
+                // (`smithy_query(query="shape", shape="GroupScope")`).
+                "Member must satisfy enum value set: [DomainLocal, Global, Universal, BuiltinLocal]",
+            ),
+        },
+        Case {
+            what: "a SearchAttributes element outside the list MEMBER's @pattern",
+            route: "/Users/SearchUsers",
+            directory: DIRECTORY.to_string(),
+            body: json!({"SearchString": "j", "SearchAttributes": ["1BadAttribute"]}),
+            message: one_violation(
+                "'1BadAttribute'",
+                // The element, not the list: the path names the position that failed.
+                "searchAttributes.1.member",
+                &format!(
+                    "Member must satisfy regular expression pattern: {LDAP_DISPLAY_NAME_PATTERN}"
+                ),
+            ),
+        },
+        Case {
+            what: "a SearchAttributes list one above its @length ceiling",
+            route: "/Groups/SearchGroups",
+            directory: DIRECTORY.to_string(),
+            body: json!({"SearchString": "e", "SearchAttributes": over_long_attributes}),
+            message: one_violation(
+                &format!("'{} items'", SEARCH_ATTRIBUTES_CEILING + 1),
+                "searchAttributes",
+                &format!(
+                    "Member must have length less than or equal to {SEARCH_ATTRIBUTES_CEILING}"
+                ),
+            ),
+        },
+        Case {
+            what: "a SearchAttributes list one below its @length floor",
+            route: "/Users/SearchUsers",
+            directory: DIRECTORY.to_string(),
+            body: json!({"SearchString": "j", "SearchAttributes": []}),
+            message: one_violation(
+                &format!("'{} items'", SEARCH_ATTRIBUTES_FLOOR - 1),
+                "searchAttributes",
+                &format!(
+                    "Member must have length greater than or equal to {SEARCH_ATTRIBUTES_FLOOR}"
+                ),
+            ),
+        },
+        Case {
+            what: "a SearchString one character over its @length ceiling",
+            route: "/Users/SearchUsers",
+            directory: DIRECTORY.to_string(),
+            body: json!({
+                "SearchString": longest_search_string.clone(),
+                "SearchAttributes": ["cn"],
+            }),
+            message: one_violation(
+                &format!("'{longest_search_string}'"),
+                "searchString",
+                &format!("Member must have length less than or equal to {SEARCH_STRING_CEILING}"),
+            ),
+        },
+        Case {
+            what: "a @required member absent altogether",
+            route: "/Users/CreateUser",
+            directory: DIRECTORY.to_string(),
+            body: json!({"GivenName": "J"}),
+            // An absent member has no value to echo, so the clause says `null`.
+            message: one_violation("null", "sAMAccountName", "Member must not be null"),
+        },
+    ]
+}
+
+/// Every member-constraint refusal answers 400 `ValidationException` with a `Message`
+/// naming the value, the member and the constraint — in the member the model names.
+#[tokio::test]
+async fn every_member_constraint_refusal_states_its_reason_in_message() {
+    let router = emulator();
+
+    for case in cases() {
+        let what = case.what;
+        let refused = call(&router, case.route, &case.directory, &case.body).await;
+
+        assert_eq!(
+            refused.status, 400,
+            "case {what:?}: expected HTTP 400, got {} with {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code(),
+            VALIDATION_EXCEPTION,
+            "case {what:?}: expected error type {VALIDATION_EXCEPTION}, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.error_type, VALIDATION_EXCEPTION,
+            "case {what:?}: expected x-amzn-errortype {VALIDATION_EXCEPTION}, got {:?}",
+            refused.error_type
+        );
+        assert_eq!(
+            refused.message(),
+            Some(case.message.as_str()),
+            "case {what:?}: expected Message {:?}, got {:?}",
+            case.message,
+            refused.body
+        );
+        // The model names this member `Message`: a body carrying the prose anywhere
+        // else leaves an SDK's `ValidationException` with an empty reason.
+        assert!(
+            refused.body.get("message").is_none(),
+            "case {what:?}: the prose must ride in Message alone, got {:?}",
+            refused.body
+        );
+        // `Reason` names a rule beyond the modelled constraints; a constraint refusal
+        // has none, and an absent member is not a null one.
+        assert!(
+            refused.body.get("Reason").is_none(),
+            "case {what:?}: a constraint refusal states no Reason, got {:?}",
+            refused.body
+        );
+    }
+}
+
+/// A value INSIDE every constraint is served, so the refusal above is the constraint's
+/// doing and not the envelope's: each published bound of `MaxResults` is accepted and
+/// carries no error member at all.
+#[tokio::test]
+async fn a_value_inside_every_constraint_is_served() {
+    let router = emulator();
+
+    for (what, max_results) in [
+        ("the @range floor", MAX_RESULTS_FLOOR),
+        ("the @range ceiling", MAX_RESULTS_CEILING),
+        ("a page size between the bounds", MAX_RESULTS_CEILING / 2),
+    ] {
+        let served = call(
+            &router,
+            "/Users/ListUsers",
+            DIRECTORY,
+            &json!({"MaxResults": max_results}),
+        )
+        .await;
+        assert_eq!(
+            served.status, 200,
+            "case {what:?}: expected HTTP 200, got {} with {:?}",
+            served.status, served.body
+        );
+        assert!(
+            served.message().is_none() && served.body.get("__type").is_none(),
+            "case {what:?}: a served request carries no error member, got {:?}",
+            served.body
+        );
+    }
+}
+
+/// A refusal a HANDLER states keeps its own envelope: the modelled `ValidationException`
+/// carries both `Message` and the `Reason` the handler chose, so re-rendering a
+/// framework refusal has not flattened the modelled one.
+#[tokio::test]
+async fn a_handler_stated_validation_exception_keeps_its_reason() {
+    let router = emulator();
+
+    let refused = call(
+        &router,
+        "/Users/ListUsers",
+        DIRECTORY,
+        &json!({"NextToken": "not-a-token-this-listing-issued"}),
+    )
+    .await;
+
+    assert_eq!(
+        refused.status, 400,
+        "a token this listing did not issue must be refused, got {} with {:?}",
+        refused.status, refused.body
+    );
+    assert_eq!(
+        refused.error_code(),
+        VALIDATION_EXCEPTION,
+        "expected error type {VALIDATION_EXCEPTION}, got {:?}",
+        refused.body
+    );
+    assert_eq!(
+        refused.body.get("Reason").and_then(Value::as_str),
+        Some("INVALID_NEXT_TOKEN"),
+        "the handler's Reason must survive, got {:?}",
+        refused.body
+    );
+    assert!(
+        refused.message().is_some_and(|m| !m.is_empty()),
+        "the handler's Message must survive, got {:?}",
+        refused.body
+    );
+}
+
+/// A request that names no modelled operation still answers the routing default: the
+/// envelope wrapper claims only what the generated routing table answers for.
+#[tokio::test]
+async fn a_request_naming_no_modelled_operation_is_not_claimed() {
+    let router = emulator();
+
+    let answer = call(&router, "/Users/NoSuchOperation", DIRECTORY, &json!({})).await;
+    assert_eq!(
+        answer.status, 501,
+        "an unmodelled route must keep the framework's routing answer, got {} with {:?}",
+        answer.status, answer.body
+    );
+}
+
+/// EVERY operation this service binds states its refusal the same way, so none is
+/// left answering the framework's `Message`-less envelope.
+///
+/// One row per route in `OPERATIONS.md` (17 of them), each sending its `@required`
+/// members inside their constraints and only `DirectoryId` outside its `@pattern`, so
+/// every row must answer the one same clause.
+#[tokio::test]
+async fn every_bound_operation_states_the_same_refusal() {
+    let router = emulator();
+
+    // `@required` members per route, from `OPERATIONS.md`; every value here is inside
+    // its own constraint so `DirectoryId` is the only violation.
+    let group = json!({"SAMAccountName": "engineering"});
+    let user = json!({"SAMAccountName": "jdoe"});
+    let membership = json!({"GroupName": "engineering", "MemberName": "jdoe"});
+    let member_name = json!({"SAMAccountName": "jdoe"});
+    let search = json!({"SearchString": "j", "SearchAttributes": ["cn"]});
+    let routes: [(&str, &Value); 17] = [
+        ("/GroupMemberships/AddGroupMember", &membership),
+        ("/GroupMemberships/ListGroupMembers", &group),
+        ("/GroupMemberships/ListGroupsForMember", &member_name),
+        ("/GroupMemberships/RemoveGroupMember", &membership),
+        ("/Groups/CreateGroup", &group),
+        ("/Groups/DeleteGroup", &group),
+        ("/Groups/DescribeGroup", &group),
+        ("/Groups/ListGroups", &Value::Null),
+        ("/Groups/SearchGroups", &search),
+        ("/Groups/UpdateGroup", &group),
+        ("/Users/CreateUser", &user),
+        ("/Users/DeleteUser", &user),
+        ("/Users/DescribeUser", &user),
+        ("/Users/DisableUser", &user),
+        ("/Users/ListUsers", &Value::Null),
+        ("/Users/SearchUsers", &search),
+        ("/Users/UpdateUser", &user),
+    ];
+    let expected = one_violation(
+        "'not-a-directory-id'",
+        "directoryId",
+        &format!("Member must satisfy regular expression pattern: {DIRECTORY_ID_PATTERN}"),
+    );
+
+    for (route, required) in routes {
+        let body = if required.is_null() {
+            json!({})
+        } else {
+            required.clone()
+        };
+        let refused = call(&router, route, "not-a-directory-id", &body).await;
+        assert_eq!(
+            refused.status, 400,
+            "route {route:?}: expected HTTP 400, got {} with {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.message(),
+            Some(expected.as_str()),
+            "route {route:?}: expected Message {expected:?}, got {:?}",
+            refused.body
+        );
+    }
+}

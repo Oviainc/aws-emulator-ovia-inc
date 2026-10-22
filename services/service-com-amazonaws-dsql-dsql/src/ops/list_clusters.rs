@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListClusters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListClusters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListClusters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the persisted clusters as `ClusterSummary` items in identifier order,
+//! `maxResults` per page, resuming from the opaque `nextToken` the previous page
+//! emitted. The last page carries no `nextToken`. `@readonly`: the only write it
+//! performs is settling status changes the clock already owed at this instant.
 //!
 //! ## Shape of an operation
 //!
@@ -85,10 +81,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // here — hence the `ListClustersError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dsql#ListClusters")]
+// The operation's MODELED errors, plus the service-common `InternalServerException`
+// widened in with `extra_errors`: the service declares it for every operation (its
+// `common_errors` are AccessDenied / InternalServer / Throttling / Validation), but the
+// per-operation list the macro checks against does not repeat it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.dsql#ListClusters",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListClustersErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -142,18 +146,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListClusters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListClustersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListClusters"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListClustersErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the dsql cluster store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // The cursor names the last identifier the previous page returned; this page
+        // starts at the first identifier after it.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_next_token(token).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(format!(
+                    "nextToken is not a cursor this service issued: {token}"
+                ))
+            })?),
+            None => None,
+        };
+
+        // `maxResults` carries `@default: 20` and `@range(1..100)`, both enforced
+        // before this handler runs. The conversion and clamp cover only a caller that
+        // reached the handler some other way (an in-process call that built the input
+        // directly): a negative value falls back to the modelled default, and anything
+        // outside the modelled range is pulled back into it.
+        let page_size = usize::try_from(input.max_results)
+            .unwrap_or(MAX_RESULTS_DEFAULT)
+            .clamp(MAX_RESULTS_MIN, MAX_RESULTS_MAX);
+
+        let mut state = state.lock();
+        state.settle(std::time::SystemTime::now());
+
+        let mut page: Vec<ClusterSummary> = state
+            .clusters
+            .iter()
+            .filter(|(identifier, _)| {
+                resume_after
+                    .as_ref()
+                    .is_none_or(|cursor| *identifier > cursor)
+            })
+            // One past the page, so the token is emitted only when something remains.
+            .take(page_size + 1)
+            .map(|(_, cluster)| ClusterSummary {
+                identifier: cluster.identifier.clone(),
+                arn: cluster.arn.clone(),
+            })
+            .collect();
+
+        let next_token = (page.len() > page_size).then(|| {
+            page.truncate(page_size);
+            encode_next_token(&page[page_size - 1].identifier)
+        });
+
+        Ok(ListClustersOutput {
+            next_token,
+            clusters: page,
+        })
     }
+}
+
+/// `maxResults`' modelled default and `@range` bounds, from
+/// `smithy_query(query="operation", operation="ListClusters")`: `@default: 20`,
+/// `@range(min: 1, max: 100)`.
+const MAX_RESULTS_DEFAULT: usize = 20;
+/// See [`MAX_RESULTS_DEFAULT`].
+const MAX_RESULTS_MIN: usize = 1;
+/// See [`MAX_RESULTS_DEFAULT`].
+const MAX_RESULTS_MAX: usize = 100;
+
+/// The length `ClusterId`'s `^[a-z0-9]{26}$` fixes.
+const CLUSTER_ID_LEN: usize = 26;
+
+/// Encode a pagination cursor: the last identifier the page returned, hex-encoded so
+/// the token a client round-trips is opaque rather than a resource name.
+fn encode_next_token(last_identifier: &str) -> String {
+    ::hex::encode(last_identifier.as_bytes())
+}
+
+/// Decode a cursor produced by [`encode_next_token`]: a hex-encoded `ClusterId`.
+///
+/// `None` for anything this service did not issue — not only a token that is not
+/// hex, but also one that decodes to anything other than a value `ClusterId`'s
+/// `^[a-z0-9]{26}$` accepts, so a fabricated cursor is refused rather than served
+/// as a page starting after some arbitrary key.
+fn decode_next_token(token: &str) -> Option<String> {
+    let decoded = ::hex::decode(token).ok()?;
+    let cursor = String::from_utf8(decoded).ok()?;
+    let is_cluster_id = cursor.len() == CLUSTER_ID_LEN
+        && cursor
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    is_cluster_id.then_some(cursor)
 }

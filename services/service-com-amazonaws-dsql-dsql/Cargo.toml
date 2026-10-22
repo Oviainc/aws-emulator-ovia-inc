@@ -21,13 +21,18 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Hashes the entropy half of a minted cluster identifier (a ULID).
+sha2 = { workspace = true }
+# Encodes the opaque `nextToken` cursor ListClusters pages with.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# `time` on top of the workspace features: the clock-settling tests await the due
+# instant rather than blocking the runtime thread.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

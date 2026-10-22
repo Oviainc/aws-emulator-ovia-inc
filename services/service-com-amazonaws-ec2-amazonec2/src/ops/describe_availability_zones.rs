@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAvailabilityZones
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAvailabilityZones`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAvailabilityZones::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the zones of the Region this request was signed for.
+//!
+//! A Region's Availability Zones are facts of that Region, not resources a caller
+//! creates, so they are derived from the Region name by
+//! [`crate::state::availability_zones_in_region`] and this handler writes NOTHING:
+//! the describe is a pure read, and two calls in one Region answer the same zones.
+//!
+//! What the request chooses is which of those zones are reported:
+//!
+//! * `ZoneNames` / `ZoneIds` name zones to report (a zone named by either is
+//!   reported); a name or id that is not a zone of the Region is refused with
+//!   `InvalidParameterValue`, as the real service refuses one.
+//! * `Filters` are ANDed with each other and ORed over each filter's values, with
+//!   EC2's `*` / `?` wildcards; a filter this operation does not document is refused
+//!   with `InvalidParameterValue`.
+//! * `DryRun` performs nothing and answers 412 `DryRunOperation`, the answer the real
+//!   service gives a caller that holds the action's permissions.
+//! * `AllAvailabilityZones` changes nothing here: every zone this emulator serves is
+//!   an Availability Zone, whose opt-in status is always `opt-in-not-required`, and
+//!   those are reported either way. The emulator serves no Local or Wavelength Zones,
+//!   which are the only zones an opt-in status can withhold.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +167,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAvailabilityZones` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAvailabilityZonesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAvailabilityZones"))
+        // This operation reports a Region's zones and persists nothing, so it never
+        // reaches the engine on `self`.
+        let _ = &self.engine;
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request... If you have the required permissions, the
+        // error response is DryRunOperation." Every caller of this emulator holds
+        // them, so the describe below does not run at all.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        // The Region the caller signed for is the Region whose zones it is asking
+        // about: EC2 is a regional service reached through a regional endpoint.
+        let region = crate::state::request_region(ctx.parts());
+        let zones = crate::state::availability_zones_in_region(&region);
+
+        // `ZoneNames` and `ZoneIds` select by the two identifiers one zone has, so a
+        // zone named by either selector is reported. Each entry must name a zone of
+        // this Region; one that does not is the caller's mistake, not an empty result.
+        let named = input.zone_names.as_deref().unwrap_or_default();
+        let identified = input.zone_ids.as_deref().unwrap_or_default();
+        for zone_name in named {
+            if !zones.iter().any(|zone| &zone.zone_name == zone_name) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "Invalid availability zone: [{zone_name}]"
+                )));
+            }
+        }
+        for zone_id in identified {
+            if !zones.iter().any(|zone| &zone.zone_id == zone_id) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "Invalid availability zone: [{zone_id}]"
+                )));
+            }
+        }
+        let selected_by_identifier = |zone: &crate::state::AvailabilityZoneRecord| {
+            (named.is_empty() && identified.is_empty())
+                || named.contains(&zone.zone_name)
+                || identified.contains(&zone.zone_id)
+        };
+
+        // "If you specify multiple filters, the filters are joined with an AND"; and
+        // within one filter, "If you specify multiple values for a filter, the values
+        // are joined with an OR" (the `Filter` shape's own doc). A filter whose name
+        // this operation does not document is refused rather than ignored, so a
+        // misspelled filter cannot read as "everything matched".
+        let filters = input.filters.as_deref().unwrap_or_default();
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !crate::state::AVAILABILITY_ZONE_FILTERS.contains(&name) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+        }
+        let matches_every_filter = |zone: &crate::state::AvailabilityZoneRecord| {
+            filters.iter().all(|filter| {
+                let name = filter.name.as_deref().unwrap_or_default();
+                let zone_values = zone.filter_values(name).unwrap_or_default();
+                filter
+                    .values
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|wanted| {
+                        zone_values
+                            .iter()
+                            .any(|value| crate::state::filter_value_matches(wanted, value))
+                    })
+            })
+        };
+
+        Ok(DescribeAvailabilityZonesOutput {
+            availability_zones: Some(
+                zones
+                    .iter()
+                    .filter(|zone| selected_by_identifier(zone) && matches_every_filter(zone))
+                    .map(crate::state::AvailabilityZoneRecord::to_availability_zone)
+                    .collect(),
+            ),
+        })
     }
 }

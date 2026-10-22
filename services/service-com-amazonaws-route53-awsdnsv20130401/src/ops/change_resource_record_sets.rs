@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ChangeResourceRecordSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ChangeResourceRecordSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ChangeResourceRecordSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +106,136 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    dns_sort_key, name_is_in_zone, normalize_dns_name, normalize_zone_id, RecordKey,
+    MAX_CHANGES_PER_BATCH, MAX_RECORD_SETS_PER_ZONE, MAX_REPORTED_CHANGE_PROBLEMS,
+};
+use std::collections::BTreeMap;
+
+/// An `InvalidChangeBatch` naming one problem per refused change.
+///
+/// The shape carries both a `Messages` list (one entry per change the real
+/// service could not apply) and the single `message` an SDK surfaces, so both
+/// are filled from the same list.
+fn invalid_change_batch(problems: Vec<String>) -> InvalidChangeBatch {
+    InvalidChangeBatch {
+        message: Some(problems.join(" ")),
+        messages: Some(problems),
+    }
+}
+
+/// Record one problem, up to [`MAX_REPORTED_CHANGE_PROBLEMS`]; past that only
+/// count it, so a thousand-change batch cannot amplify the error body.
+#[derive(Debug, Default)]
+struct Problems {
+    reported: Vec<String>,
+    suppressed: usize,
+}
+
+impl Problems {
+    fn push(&mut self, problem: String) {
+        if self.reported.len() < MAX_REPORTED_CHANGE_PROBLEMS {
+            self.reported.push(problem);
+        } else {
+            self.suppressed += 1;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.reported.is_empty()
+    }
+
+    /// The messages to report, with a final line counting what was suppressed.
+    fn into_messages(mut self) -> Vec<String> {
+        if self.suppressed > 0 {
+            self.reported.push(format!(
+                "and {} further problems not reported",
+                self.suppressed
+            ));
+        }
+        self.reported
+    }
+}
+
+/// How a change names itself in an `InvalidChangeBatch` message: the same
+/// `[Action=…, Name=…, Type=…, SetIdentifier=…]` tuple Route 53 quotes back, so a
+/// caller with several changes in one batch can tell which one was refused.
+fn change_label(action: &str, record: &ResourceRecordSet) -> String {
+    let set_identifier = record.set_identifier.as_deref().unwrap_or("null");
+    format!(
+        "[Action={action}, Name={}, Type={}, SetIdentifier={set_identifier}]",
+        record.name, record.r#type
+    )
+}
+
+/// The record data values of a record set, sorted, for comparing two sets of
+/// values independently of the order they were written in.
+fn sorted_values(record: &ResourceRecordSet) -> Vec<String> {
+    let mut values: Vec<String> = record
+        .resource_records
+        .iter()
+        .flatten()
+        .map(|rr| rr.value.clone())
+        .collect();
+    values.sort();
+    values
+}
+
+/// Why this record set cannot be written, if it cannot.
+///
+/// A record set routes either to record data of its own (`ResourceRecords`, with
+/// the `TTL` that data is cached for) or to an `AliasTarget`; one of the two has
+/// to be there for the record set to answer a query at all.
+fn rdata_problem(action: &str, record: &ResourceRecordSet) -> Option<String> {
+    let has_records = record.resource_records.iter().flatten().next().is_some();
+    if record.alias_target.is_some() {
+        return None;
+    }
+    if !has_records {
+        return Some(format!(
+            "Invalid request: Expected exactly one of [AliasTarget, all of [TTL, and \
+             ResourceRecords]], but found none in Change with {}",
+            change_label(action, record)
+        ));
+    }
+    if record.ttl.is_none() {
+        return Some(format!(
+            "Invalid request: Expected a TTL alongside ResourceRecords in Change with {}",
+            change_label(action, record)
+        ));
+    }
+    None
+}
+
+/// Why this DELETE does not name the record set it is deleting, if it does not.
+///
+/// "To delete a resource record set, you must specify all the same values that
+/// you specified when you created it", so a DELETE naming different record data,
+/// a different TTL or a different alias target than the stored record set is not
+/// a delete of that record set at all.
+fn delete_mismatch(stored: &ResourceRecordSet, named: &ResourceRecordSet) -> Option<&'static str> {
+    if sorted_values(named) != sorted_values(stored) {
+        return Some("the values provided do not match the current values");
+    }
+    if named.ttl != stored.ttl {
+        return Some("the TTL provided does not match the current TTL");
+    }
+    let alias_matches = match (&named.alias_target, &stored.alias_target) {
+        (None, None) => true,
+        (Some(named), Some(stored)) => {
+            named.hosted_zone_id == stored.hosted_zone_id
+                // A DNS name is case-insensitive, so an alias target's is too.
+                && named.dns_name.eq_ignore_ascii_case(&stored.dns_name)
+                && named.evaluate_target_health == stored.evaluate_target_health
+        }
+        _ => false,
+    };
+    if !alias_matches {
+        return Some("the alias target provided does not match the current alias target");
+    }
+    None
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -185,20 +306,212 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ChangeResourceRecordSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ChangeResourceRecordSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ChangeResourceRecordSets"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            ChangeResourceRecordSetsErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // BOUND THE BATCH BEFORE ANY WORK, and before the shared state lock is
+        // taken: the model puts no length constraint on `Changes`, so the batch
+        // length is wholly caller-chosen. Everything below is O(batch), so this
+        // is what keeps one request's memory, CPU, lock hold and error body
+        // bounded.
+        if input.change_batch.changes.len() > MAX_CHANGES_PER_BATCH {
+            return Err(ChangeResourceRecordSetsErrorModeled::InvalidChangeBatch(
+                invalid_change_batch(vec![format!(
+                    "The change batch contains {} changes, more than the maximum of \
+                     {MAX_CHANGES_PER_BATCH} changes in a single \
+                     ChangeResourceRecordSets request",
+                    input.change_batch.changes.len()
+                )]),
+            )
+            .into());
+        }
+
+        let zone_id = normalize_zone_id(&input.hosted_zone_id).to_string();
+        let mut store = state.lock();
+        let zone = store.zones.get(&zone_id).ok_or_else(|| {
+            ChangeResourceRecordSetsErrorModeled::NoSuchHostedZone(NoSuchHostedZone {
+                message: Some(format!(
+                    "no hosted zone exists with the ID {}",
+                    input.hosted_zone_id
+                )),
+            })
+        })?;
+
+        // A health check has to exist to be referenced, and this emulator mints
+        // none (CreateHealthCheck is not implemented). Checked AFTER the zone
+        // lookup, so a request against a zone that does not exist answers
+        // NoSuchHostedZone rather than a missing dependency of its changes.
+        if let Some(health_check_id) = input
+            .change_batch
+            .changes
+            .iter()
+            .filter_map(|change| change.resource_record_set.health_check_id.as_deref())
+            .find(|id| !id.is_empty())
+        {
+            return Err(ChangeResourceRecordSetsErrorModeled::NoSuchHealthCheck(
+                NoSuchHealthCheck {
+                    message: Some(format!(
+                        "no health check exists with the ID {health_check_id}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The batch is staged as an OVERLAY on the stored zone — `Some(record)`
+        // to write, `None` to remove — and committed only once every change has
+        // validated, so either the whole batch lands or none of it does and a
+        // later change in the batch sees the earlier ones. The overlay is sized
+        // by the (bounded) batch, not by the zone, so a large zone is never
+        // copied to serve one request.
+        let zone_name = zone.name.clone();
+        // The zone's own delegation records live at this name: `DeleteHostedZone`
+        // calls the apex NS and SOA records "the default SOA and NS records", and
+        // a zone cannot be stripped of them through a change batch.
+        let apex = dns_sort_key(&zone_name);
+        let mut staged: BTreeMap<RecordKey, Option<ResourceRecordSet>> = BTreeMap::new();
+        let mut problems = Problems::default();
+        let mut record_count = zone.records.len();
+
+        for change in &input.change_batch.changes {
+            let mut record = change.resource_record_set.clone();
+            record.name = normalize_dns_name(&record.name);
+            let action = change.action.as_str();
+            let key = RecordKey::of_record(&record);
+
+            if !name_is_in_zone(&record.name, &zone_name) {
+                problems.push(format!(
+                    "RRSet with DNS name {} is not permitted in zone {zone_name}",
+                    record.name
+                ));
+                continue;
+            }
+
+            // What this key holds right now: the staged value if the batch has
+            // already touched it, else the stored one. At most one record set is
+            // cloned per change, so this is bounded by the batch length.
+            let current = match staged.get(&key) {
+                Some(pending) => pending.clone(),
+                None => zone.records.get(&key).cloned(),
+            };
+
+            match action {
+                "CREATE" => {
+                    if current.is_some() {
+                        problems.push(format!(
+                            "Tried to create resource record set {} but it already exists",
+                            change_label(action, &record)
+                        ));
+                    } else if let Some(problem) = rdata_problem(action, &record) {
+                        problems.push(problem);
+                    } else {
+                        record_count += 1;
+                        staged.insert(key, Some(record));
+                    }
+                }
+                "UPSERT" => {
+                    if let Some(problem) = rdata_problem(action, &record) {
+                        problems.push(problem);
+                    } else {
+                        if current.is_none() {
+                            record_count += 1;
+                        }
+                        staged.insert(key, Some(record));
+                    }
+                }
+                "DELETE" => match &current {
+                    None => problems.push(format!(
+                        "Tried to delete resource record set {} but it was not found",
+                        change_label(action, &record)
+                    )),
+                    // The zone's own delegation records are not the caller's to
+                    // remove: deleting the apex NS or SOA record would leave a
+                    // zone that answers no delegation query and would also let
+                    // DeleteHostedZone's "only the default SOA and NS records"
+                    // rule pass on a zone that no longer has them.
+                    Some(_)
+                        if key.name_sort_key == apex
+                            && key.set_identifier.is_none()
+                            && matches!(key.rr_type.as_str(), "NS" | "SOA") =>
+                    {
+                        problems.push(format!(
+                            "Tried to delete resource record set {} but it is one of the hosted \
+                             zone's own default NS and SOA records, which cannot be deleted",
+                            change_label(action, &record)
+                        ));
+                    }
+                    // "To delete a resource record set, you must specify all the
+                    // same values that you specified when you created it" — so a
+                    // DELETE has to carry the record's data, and it has to be
+                    // the data the zone holds.
+                    Some(stored) => {
+                        if let Some(problem) = rdata_problem(action, &record) {
+                            problems.push(problem);
+                        } else if let Some(reason) = delete_mismatch(stored, &record) {
+                            problems.push(format!(
+                                "Tried to delete resource record set {} but {reason}",
+                                change_label(action, &record)
+                            ));
+                        } else {
+                            record_count -= 1;
+                            staged.insert(key, None);
+                        }
+                    }
+                },
+                // Defence in depth: `ChangeAction` is a modelled enum, so the
+                // boundary validator refuses an unknown action before this
+                // handler runs and this arm is unreachable today.
+                other => problems.push(format!(
+                    "Invalid Action: {other} is not one of CREATE, DELETE or UPSERT"
+                )),
+            }
+        }
+
+        // The zone's own quota: a zone cannot be grown past it by repeated
+        // CREATE/UPSERT.
+        if record_count > MAX_RECORD_SETS_PER_ZONE {
+            problems.push(format!(
+                "The hosted zone {} would hold {record_count} resource record sets, more than \
+                 the maximum of {MAX_RECORD_SETS_PER_ZONE} per hosted zone",
+                input.hosted_zone_id
+            ));
+        }
+
+        if !problems.is_empty() {
+            return Err(ChangeResourceRecordSetsErrorModeled::InvalidChangeBatch(
+                invalid_change_batch(problems.into_messages()),
+            )
+            .into());
+        }
+
+        // Every change validated: commit the overlay and persist the change, so
+        // GetChange can report its status. The state lock has been held since
+        // the zone lookup, so the zone cannot have gone away under us.
+        let zone = store
+            .zones
+            .get_mut(&zone_id)
+            .expect("the hosted zone validated above must still be present");
+        for (key, pending) in staged {
+            match pending {
+                Some(record) => {
+                    zone.records.insert(key, record);
+                }
+                None => {
+                    zone.records.remove(&key);
+                }
+            }
+        }
+        let change = store.submit_change(input.change_batch.comment.clone());
+
+        Ok(ChangeResourceRecordSetsOutput {
+            change_info: change.to_change_info(),
+        })
     }
 }

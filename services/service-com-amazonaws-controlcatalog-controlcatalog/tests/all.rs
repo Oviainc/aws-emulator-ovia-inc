@@ -21,3 +21,5 @@ mod control_mappings;
 mod ontology_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_messages.rs"]
+mod validation_messages;

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHostedZone
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateHostedZone`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateHostedZone::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -163,6 +154,83 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    normalize_dns_name, RecordKey, StoredZone, HOSTED_ZONE_PREFIX, MAX_HOSTED_ZONES,
+};
+use std::collections::BTreeMap;
+
+/// The TTL, in seconds, of the NS record Route 53 creates at a new zone's apex.
+///
+/// From the Route 53 Developer Guide page the operation's documentation points at,
+/// "NS and SOA Records that Route 53 Creates for a Hosted Zone": the NS record
+/// Route 53 creates has a TTL of 172800 seconds (two days).
+const NS_RECORD_TTL: i64 = 172_800;
+
+/// The TTL, in seconds, of the SOA record Route 53 creates at a new zone's apex.
+///
+/// Same Developer Guide page: the SOA record Route 53 creates has a TTL of 900
+/// seconds (fifteen minutes).
+const SOA_RECORD_TTL: i64 = 900;
+
+/// The SOA record's RDATA after its primary name server: the hostmaster mailbox
+/// and the serial, refresh, retry, expire and minimum fields Route 53 writes into
+/// a new zone's SOA record (same Developer Guide page).
+const SOA_RDATA_TAIL: &str = "awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400";
+
+/// The host a `Location` URL falls back to when the request carried no `Host`
+/// header to build it from.
+const DEFAULT_ENDPOINT_HOST: &str = "route53.amazonaws.com";
+
+/// The default SOA record and NS record (carrying all four name servers) that
+/// Route 53 creates at a new hosted zone's apex.
+///
+/// The operation's own documentation: "For public hosted zones, Route 53
+/// automatically creates a default SOA record and four NS records for the zone."
+/// Route 53 writes the same two records into a private hosted zone, so every
+/// zone starts with them and `DeleteHostedZone`'s "only the default SOA and NS
+/// records" rule means one thing for both kinds of zone.
+fn default_apex_records(zone_name: &str, name_servers: &[String]) -> Vec<ResourceRecordSet> {
+    // A name server is reported bare in the delegation set and fully qualified
+    // (trailing dot) inside DNS record data.
+    let fqdn = |server: &String| format!("{server}.");
+    let ns = ResourceRecordSet {
+        name: zone_name.to_string(),
+        r#type: "NS".to_string(),
+        ttl: Some(NS_RECORD_TTL),
+        resource_records: Some(
+            name_servers
+                .iter()
+                .map(|server| ResourceRecord { value: fqdn(server) })
+                .collect(),
+        ),
+        ..ResourceRecordSet::default()
+    };
+    let primary = name_servers.first().map(fqdn).unwrap_or_default();
+    let soa = ResourceRecordSet {
+        name: zone_name.to_string(),
+        r#type: "SOA".to_string(),
+        ttl: Some(SOA_RECORD_TTL),
+        resource_records: Some(vec![ResourceRecord {
+            value: format!("{primary} {SOA_RDATA_TAIL}"),
+        }]),
+        ..ResourceRecordSet::default()
+    };
+    vec![soa, ns]
+}
+
+/// The `Location` URL of a newly created hosted zone, built from the endpoint
+/// the caller actually addressed so the URL it gets back is one it can follow.
+fn location_of(ctx: &smithy_server_runtime::OperationContext<'_>, zone_id: &str) -> String {
+    let host = ctx
+        .parts()
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_ENDPOINT_HOST);
+    format!("https://{host}/2013-04-01/hostedzone/{zone_id}")
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -239,18 +307,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateHostedZone` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateHostedZoneErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateHostedZone"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`; `InvalidInput` is the only error this
+            // operation models that can carry the reason at all.
+            CreateHostedZoneErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        let name = normalize_dns_name(&input.name);
+        // "You can't create a hosted zone for a top-level domain (TLD) such as
+        // .com." A zone name therefore needs at least two labels.
+        if name.trim_end_matches('.').split('.').count() < 2 {
+            return Err(CreateHostedZoneErrorModeled::InvalidDomainName(InvalidDomainName {
+                message: Some(format!(
+                    "{} is not a valid hosted zone name: a hosted zone cannot be created for a \
+                     top-level domain",
+                    input.name
+                )),
+            })
+            .into());
+        }
+
+        // A reusable delegation set has to exist before a zone can be created in
+        // it, and this emulator mints none (CreateReusableDelegationSet is not
+        // implemented), so no id a caller can pass names one.
+        if let Some(set_id) = input.delegation_set_id.as_deref().filter(|id| !id.is_empty()) {
+            return Err(CreateHostedZoneErrorModeled::NoSuchDelegationSet(NoSuchDelegationSet {
+                message: Some(format!(
+                    "no reusable delegation set exists with the ID {set_id}"
+                )),
+            })
+            .into());
+        }
+
+        let private_zone = input
+            .hosted_zone_config
+            .as_ref()
+            .is_some_and(|config| config.private_zone);
+        let comment = input
+            .hosted_zone_config
+            .as_ref()
+            .and_then(|config| config.comment.clone());
+
+        // A private hosted zone exists to serve a VPC, so the first association
+        // is made at creation: "If you are associating a VPC with a hosted zone
+        // with this request, the paramaters VPCId and VPCRegion are also
+        // required." A private zone with no VPC has nothing to answer for, and
+        // a VPC belongs to no PUBLIC zone at all: "(Private hosted zones only) A
+        // complex type that contains information about the Amazon VPC that
+        // you're associating with this hosted zone."
+        let absent =
+            |member: Option<&String>| member.map(String::as_str).unwrap_or_default().is_empty();
+        let vpc = input
+            .vpc
+            .as_ref()
+            .filter(|vpc| !absent(vpc.vpc_id.as_ref()) || !absent(vpc.vpc_region.as_ref()));
+        if private_zone {
+            if vpc.is_none_or(|vpc| absent(vpc.vpc_id.as_ref()) || absent(vpc.vpc_region.as_ref()))
+            {
+                return Err(CreateHostedZoneErrorModeled::InvalidInput(InvalidInput {
+                    message: Some(
+                        "Invalid request: a private hosted zone must be created with a VPC, \
+                         naming both VPC.VPCId and VPC.VPCRegion"
+                            .to_string(),
+                    ),
+                })
+                .into());
+            }
+        } else if vpc.is_some() {
+            return Err(CreateHostedZoneErrorModeled::InvalidInput(InvalidInput {
+                message: Some(
+                    "Invalid request: a VPC can be associated only with a private hosted zone, \
+                     so HostedZoneConfig.PrivateZone must be true when VPC is given"
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // The account's own quota: a caller chooses `CallerReference` freely, so
+        // without this the store would grow for every distinct one it sends.
+        if store.zones.len() >= MAX_HOSTED_ZONES {
+            return Err(CreateHostedZoneErrorModeled::TooManyHostedZones(TooManyHostedZones {
+                message: Some(format!(
+                    "the current account has reached the limit of {MAX_HOSTED_ZONES} hosted zones"
+                )),
+            })
+            .into());
+        }
+
+        // CallerReference is the idempotency token: "You must use a unique
+        // CallerReference string every time you submit a CreateHostedZone
+        // request." A repeat is refused rather than served.
+        if let Some(existing) = store.zone_by_caller_reference.get(&input.caller_reference) {
+            return Err(CreateHostedZoneErrorModeled::HostedZoneAlreadyExists(
+                HostedZoneAlreadyExists {
+                    message: Some(format!(
+                        "a hosted zone has already been created with CallerReference \
+                         {}: {HOSTED_ZONE_PREFIX}{existing}",
+                        input.caller_reference
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_zone_id();
+        let name_servers = store.mint_name_servers();
+        let mut records = BTreeMap::new();
+        for record in default_apex_records(&name, &name_servers) {
+            records.insert(RecordKey::of_record(&record), record);
+        }
+        let zone = StoredZone {
+            id: id.clone(),
+            name,
+            caller_reference: input.caller_reference.clone(),
+            comment,
+            private_zone,
+            name_servers,
+            vpcs: vpc.cloned().into_iter().collect(),
+            records,
+        };
+
+        let change = store.submit_change(None);
+        store
+            .zone_by_caller_reference
+            .insert(input.caller_reference, id.clone());
+        store.zones.insert(id.clone(), zone);
+
+        // Read the response back out of the store, so what the caller is told
+        // is what a later GetHostedZone will tell it.
+        let stored = store
+            .zones
+            .get(&id)
+            .expect("the hosted zone just inserted must be present");
+        Ok(CreateHostedZoneOutput {
+            hosted_zone: stored.to_hosted_zone(),
+            change_info: change.to_change_info(),
+            delegation_set: stored.to_delegation_set(),
+            vpc: stored.vpcs.first().cloned(),
+            location: location_of(ctx, &id),
+        })
     }
 }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourceRecordSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourceRecordSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourceRecordSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -135,6 +126,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{dns_sort_key, normalize_zone_id, RecordKey};
+
+/// The most record sets one response carries.
+///
+/// The operation's own documentation: "ListResourceRecordSets returns up to 300
+/// resource record sets at a time in ASCII order, beginning at a position
+/// specified by the name and type elements."
+const MAX_PAGE_SIZE: i32 = 300;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -202,20 +202,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourceRecordSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourceRecordSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourceRecordSets"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            ListResourceRecordSetsErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        let start_name = input
+            .start_record_name
+            .as_deref()
+            .filter(|name| !name.is_empty());
+        // "If you specify Type but not Name: Amazon Route 53 returns the
+        // InvalidInput error." Type only orders records that share a name.
+        if start_name.is_none() && input.start_record_type.is_some() {
+            return Err(ListResourceRecordSetsErrorModeled::InvalidInput(InvalidInput {
+                message: Some(
+                    "StartRecordType was specified without StartRecordName; type only sorts \
+                     between records with the same record name"
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
+        let page_size = input
+            .max_items
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        // Route 53 echoes the `maxitems` the caller asked for; the clamped
+        // `page_size` above only bounds the work and the response size.
+        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);
+        // "The results begin with the first resource record set in the list whose
+        // name is greater than or equal to Name, and whose type is greater than
+        // or equal to Type."
+        let start = start_name.map(|name| RecordKey {
+            name_sort_key: dns_sort_key(name),
+            rr_type: input.start_record_type.clone().unwrap_or_default(),
+            set_identifier: input.start_record_identifier.clone(),
+        });
+
+        let zone_id = normalize_zone_id(&input.hosted_zone_id);
+        let store = state.lock();
+        let zone = store.zones.get(zone_id).ok_or_else(|| {
+            ListResourceRecordSetsErrorModeled::NoSuchHostedZone(NoSuchHostedZone {
+                message: Some(format!(
+                    "no hosted zone exists with the ID {}",
+                    input.hosted_zone_id
+                )),
+            })
+        })?;
+
+        // The zone's records live in a BTreeMap keyed by RecordKey, whose Ord is
+        // the documented sort order: DNS name with the labels reversed, then
+        // type, then set identifier. Walking it in order IS the listing.
+        let ordered = zone
+            .records
+            .iter()
+            .filter(|(key, _)| start.as_ref().is_none_or(|from| *key >= from));
+
+        let mut resource_record_sets = Vec::new();
+        let mut next = None;
+        for (_, record) in ordered {
+            if resource_record_sets.len() >= page_size as usize {
+                next = Some(record);
+                break;
+            }
+            resource_record_sets.push(record.clone());
+        }
+
+        Ok(ListResourceRecordSetsOutput {
+            resource_record_sets,
+            is_truncated: next.is_some(),
+            next_record_name: next.map(|record| record.name.clone()),
+            next_record_type: next.map(|record| record.r#type.clone()),
+            next_record_identifier: next.and_then(|record| record.set_identifier.clone()),
+            // Route 53 echoes the `maxitems` the caller asked for, so a request
+            // outside the documented range reads its own value back while the
+            // page itself stays clamped to MAX_PAGE_SIZE.
+            max_items: reported_max_items,
+        })
     }
 }

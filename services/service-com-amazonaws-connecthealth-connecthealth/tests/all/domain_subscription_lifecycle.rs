@@ -1,0 +1,1073 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end HTTP coverage of the Domain -> Subscription lifecycle.
+//!
+//! Every case drives the service the way a client does — a signed restJson1 request
+//! through the router's own dispatch — and asserts the RULE the operations follow
+//! rather than one recorded response: a response member is whatever the store holds,
+//! so a value written by one request is what a later request reads back.
+//!
+//! The id / ARN patterns and the `maxResults` range asserted here are the model's own
+//! (`smithy_query(query="shape", shape="DomainId,SubscriptionId")`,
+//! `smithy_query(query="operation", operation="ListDomains")`), quoted beside each
+//! constant.
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
+
+use service_com_amazonaws_connecthealth_connecthealth::EmulatedService;
+
+/// `DomainId`: length 20..25, pattern `^(hai-|dom-)[a-z0-9]+$`.
+const DOMAIN_ID_PATTERN: &str = r"^(hai-|dom-)[a-z0-9]+$";
+/// `SubscriptionId`: length 25..25, pattern `^sub-[a-zA-Z0-9]{21}$`.
+const SUBSCRIPTION_ID_PATTERN: &str = r"^sub-[a-zA-Z0-9]{21}$";
+/// `DomainArn`'s pattern.
+const DOMAIN_ARN_PATTERN: &str =
+    r"^arn:aws:health-agent:[a-z0-9-]+:[0-9]{12}:domain/(hai-|dom-)[a-z0-9]+$";
+/// `SubscriptionArn`'s pattern.
+const SUBSCRIPTION_ARN_PATTERN: &str = r"^arn:aws:health-agent:[a-z0-9-]+:[0-9]{12}:domain/(hai-|dom-)[a-z0-9]+/subscription/sub-[a-zA-Z0-9]{21}$";
+/// The page-size bound both list operations enforce themselves — THIS EMULATOR's cap
+/// on one page (`smithy_query` reports a `range {min: 1, max: 100}` for `maxResults`,
+/// which the generated contract header does not restate). Asserted below at each end
+/// and one past each.
+const MAX_RESULTS_RANGE: (i64, i64) = (1, 100);
+/// Long enough for the `DELETING` -> purged transition `state::DOMAIN_DELETION_SPAN`
+/// owes to have fallen due.
+const PAST_THE_DELETION_SPAN: Duration = Duration::from_millis(900);
+
+/// One emulator: the shared engine, this service mounted on it, and the region every
+/// request is signed for.
+struct Emulator {
+    router: MultiServiceRouter,
+    region: String,
+}
+
+impl Emulator {
+    fn new(region: &str) -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.register_service(EmulatedService::new(engine));
+        Self {
+            router,
+            region: region.to_string(),
+        }
+    }
+
+    /// Dispatch one request and return its status and parsed JSON body.
+    async fn send(&self, method: &str, path: &str, body: Option<&Value>) -> (u16, Value) {
+        let payload = body
+            .map(|body| serde_json::to_vec(body).expect("a serializable body"))
+            .unwrap_or_default();
+        let credential = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{}/health-agent/aws4_request, \
+             SignedHeaders=host, Signature=0000",
+            self.region
+        );
+        let request = http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("authorization", credential)
+            .body(Bytes::from(payload))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let bytes = response.into_body();
+        let parsed = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        (status, parsed)
+    }
+
+    /// `CreateDomain`, asserting it was accepted, and the created domain's id.
+    async fn create_domain(&self, body: &Value) -> Value {
+        let (status, created) = self.send("POST", "/domain", Some(body)).await;
+        assert_eq!(status, 201, "CreateDomain {body}: got {created:?}");
+        created
+    }
+}
+
+/// The wire error code (`__type`), without any namespace prefix.
+fn error_code(body: &Value) -> String {
+    body.get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .split('#')
+        .next_back()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A required string member of a response.
+fn string_at(body: &Value, member: &str) -> String {
+    body.get(member)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("member {member} must be a string in {body:?}"))
+        .to_string()
+}
+
+fn matches(pattern: &str, value: &str) -> bool {
+    // The four patterns this suite checks, matched by hand rather than with a regex
+    // engine (the sibling suites in this workspace do the same, and it keeps the
+    // build's dependency set unchanged). Each arm follows its pattern constant above
+    // literally, anchored at both ends.
+    match pattern {
+        DOMAIN_ID_PATTERN => {
+            let body = value
+                .strip_prefix("dom-")
+                .or_else(|| value.strip_prefix("hai-"));
+            body.is_some_and(|body| {
+                !body.is_empty()
+                    && body
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            })
+        }
+        SUBSCRIPTION_ID_PATTERN => value.strip_prefix("sub-").is_some_and(|body| {
+            body.len() == 21 && body.bytes().all(|b| b.is_ascii_alphanumeric())
+        }),
+        DOMAIN_ARN_PATTERN => arn_resource(value).is_some_and(|resource| {
+            resource
+                .strip_prefix("domain/")
+                .is_some_and(|id| matches(DOMAIN_ID_PATTERN, id))
+        }),
+        SUBSCRIPTION_ARN_PATTERN => arn_resource(value).is_some_and(|resource| {
+            let Some(rest) = resource.strip_prefix("domain/") else {
+                return false;
+            };
+            let Some((domain_id, subscription_id)) = rest.split_once("/subscription/") else {
+                return false;
+            };
+            matches(DOMAIN_ID_PATTERN, domain_id)
+                && matches(SUBSCRIPTION_ID_PATTERN, subscription_id)
+        }),
+        other => panic!("no hand-written matcher for pattern {other:?}"),
+    }
+}
+
+/// The resource portion of `arn:aws:health-agent:<region>:<account>:<resource>`, when
+/// the five leading fields are the ones every ARN pattern in this model declares:
+/// literal `arn:aws:health-agent`, a `[a-z0-9-]+` region and a 12-digit account.
+fn arn_resource(value: &str) -> Option<&str> {
+    let mut fields = value.splitn(6, ':');
+    let (Some("arn"), Some("aws"), Some("health-agent"), Some(region), Some(account), Some(resource)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return None;
+    };
+    let region_ok = !region.is_empty()
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    let account_ok = account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit());
+    (region_ok && account_ok).then_some(resource)
+}
+
+/// A `tags` map of `count` distinct entries, each key `key_len` and each value
+/// `value_len` characters long.
+fn tag_map(count: usize, key_len: usize, value_len: usize) -> Value {
+    let mut tags = serde_json::Map::new();
+    for index in 0..count {
+        let stem = format!("k{index}-");
+        let padding = "a".repeat(key_len.saturating_sub(stem.len()));
+        tags.insert(
+            format!("{stem}{padding}"),
+            Value::String("v".repeat(value_len)),
+        );
+    }
+    Value::Object(tags)
+}
+
+#[tokio::test]
+async fn create_domain_persists_every_member_and_get_domain_reads_it_back() {
+    // The rows differ along what CreateDomain generalises over: which optional members
+    // are present, the size of `name`, and how many tags are supplied. The issue's own
+    // case ({"name": "clinic-a"}) is just the first row.
+    let kms_key = "arn:aws:kms:us-west-2:000000000000:key/abcdef01-2345-6789-abcd-ef0123456789";
+    let web_app = json!({
+        "ehrRole": "arn:aws:iam::000000000000:role/ehr-operations",
+        "idcInstanceId": "ssoins-72230ed02aa4b4ea",
+        "idcRegion": "us-east-1",
+    });
+    let cases: Vec<(&str, Value)> = vec![
+        ("minimal", json!({ "name": "clinic-a" })),
+        ("name at the modelled minimum (1)", json!({ "name": "c" })),
+        ("name at the modelled maximum (64)", json!({ "name": "c".repeat(64) })),
+        (
+            "customer-managed key",
+            json!({ "name": "clinic-kms", "kmsKeyArn": kms_key }),
+        ),
+        (
+            "one tag",
+            json!({ "name": "clinic-tag", "tags": { "env": "test" } }),
+        ),
+        (
+            "three tags",
+            json!({ "name": "clinic-tags", "tags": { "env": "test", "team": "cardio", "cost": "42" } }),
+        ),
+        (
+            "web app set up",
+            json!({ "name": "clinic-web", "webAppSetupConfiguration": web_app }),
+        ),
+        (
+            "every optional member at once",
+            json!({
+                "name": "clinic-everything",
+                "kmsKeyArn": kms_key,
+                "tags": { "env": "prod" },
+                "webAppSetupConfiguration": web_app,
+            }),
+        ),
+    ];
+
+    let emulator = Emulator::new("us-west-2");
+    let mut minted: BTreeSet<String> = BTreeSet::new();
+
+    for (case, request) in &cases {
+        let created = emulator.create_domain(request).await;
+
+        let domain_id = string_at(&created, "domainId");
+        assert!(
+            matches(DOMAIN_ID_PATTERN, &domain_id) && (20..=25).contains(&domain_id.len()),
+            "case {case:?}: domainId must match {DOMAIN_ID_PATTERN} with length 20..25, got {domain_id:?}"
+        );
+        assert!(
+            minted.insert(domain_id.clone()),
+            "case {case:?}: domainId {domain_id} was minted twice"
+        );
+        let arn = string_at(&created, "arn");
+        assert_eq!(
+            arn,
+            format!("arn:aws:health-agent:us-west-2:000000000000:domain/{domain_id}"),
+            "case {case:?}: the ARN must name the minted domain"
+        );
+        assert_eq!(
+            created.get("status").and_then(Value::as_str),
+            Some("ACTIVE"),
+            "case {case:?}: a new domain is ACTIVE, got {created:?}"
+        );
+        assert!(
+            created.get("createdAt").and_then(Value::as_f64).unwrap_or(0.0) > 0.0,
+            "case {case:?}: createdAt must be set, got {created:?}"
+        );
+
+        // The derived members: encryption follows the key the caller named, and a web
+        // app exists only where one was asked for.
+        let wanted_kms = request.get("kmsKeyArn").and_then(Value::as_str);
+        let wanted_encryption = if wanted_kms.is_some() {
+            "CUSTOMER_MANAGED_KEY"
+        } else {
+            "AWS_OWNED_KEY"
+        };
+        assert_eq!(
+            created
+                .get("encryptionContext")
+                .and_then(|context| context.get("encryptionType"))
+                .and_then(Value::as_str),
+            Some(wanted_encryption),
+            "case {case:?}: encryptionType must follow kmsKeyArn, got {created:?}"
+        );
+        assert_eq!(
+            created.get("kmsKeyArn").and_then(Value::as_str),
+            wanted_kms,
+            "case {case:?}: kmsKeyArn must be the key the caller named, got {created:?}"
+        );
+        match request.get("webAppSetupConfiguration") {
+            None => {
+                assert!(
+                    created.get("webAppConfiguration").is_none()
+                        && created.get("webAppUrl").is_none(),
+                    "case {case:?}: no web app was asked for, got {created:?}"
+                );
+            }
+            Some(setup) => {
+                let configured = created
+                    .get("webAppConfiguration")
+                    .unwrap_or_else(|| panic!("case {case:?}: webAppConfiguration in {created:?}"));
+                assert_eq!(
+                    configured.get("ehrRole"),
+                    setup.get("ehrRole"),
+                    "case {case:?}: the stored ehrRole is the one supplied"
+                );
+                assert_eq!(
+                    configured.get("idcRegion"),
+                    setup.get("idcRegion"),
+                    "case {case:?}: the stored idcRegion is the one supplied"
+                );
+                let application_id = string_at(configured, "idcApplicationId");
+                assert!(
+                    !application_id.is_empty()
+                        && Some(application_id.as_str())
+                            != setup.get("idcInstanceId").and_then(Value::as_str),
+                    "case {case:?}: the Identity Center APPLICATION id is created by the \
+                     service, not the instance id it was given, got {application_id:?}"
+                );
+                let url = string_at(&created, "webAppUrl");
+                assert!(
+                    url.starts_with("https://") && url.contains(&domain_id),
+                    "case {case:?}: webAppUrl must name the domain, got {url:?}"
+                );
+            }
+        }
+
+        // The round trip: GetDomain reports the PERSISTED record, member for member.
+        let (status, fetched) = emulator
+            .send("GET", &format!("/domain/{domain_id}"), None)
+            .await;
+        assert_eq!(status, 200, "case {case:?}: GetDomain got {fetched:?}");
+        for member in [
+            "domainId",
+            "arn",
+            "name",
+            "kmsKeyArn",
+            "status",
+            "createdAt",
+            "encryptionContext",
+            "webAppUrl",
+            "webAppConfiguration",
+        ] {
+            assert_eq!(
+                fetched.get(member),
+                created.get(member),
+                "case {case:?}: GetDomain must report the stored {member}"
+            );
+        }
+        assert_eq!(
+            fetched.get("name").and_then(Value::as_str),
+            request.get("name").and_then(Value::as_str),
+            "case {case:?}: the stored name is the one supplied"
+        );
+        assert_eq!(
+            fetched.get("tags"),
+            request.get("tags"),
+            "case {case:?}: GetDomain must report the tags CreateDomain stored"
+        );
+    }
+
+    // Every domain created above is listed, exactly once.
+    let (status, listed) = emulator.send("GET", "/domain", None).await;
+    assert_eq!(status, 200, "ListDomains got {listed:?}");
+    let listed_ids: BTreeSet<String> = listed
+        .get("domains")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("domains must be a list in {listed:?}"))
+        .iter()
+        .map(|summary| string_at(summary, "domainId"))
+        .collect();
+    assert_eq!(
+        listed_ids, minted,
+        "ListDomains must report one summary per persisted domain"
+    );
+}
+
+#[tokio::test]
+async fn minted_ids_and_arns_match_the_model_patterns_in_every_signed_region() {
+    // The rule generalises over the region the request is signed for: the ARN carries
+    // that region, and whatever the request says, the minted ARN still satisfies the
+    // model's own pattern (a region outside the pattern's `[a-z0-9-]+` falls back).
+    let cases: [(&str, Option<&str>); 5] = [
+        ("us-east-1", Some("us-east-1")),
+        ("us-west-2", Some("us-west-2")),
+        ("eu-central-1", Some("eu-central-1")),
+        ("ap-southeast-4", Some("ap-southeast-4")),
+        ("US_WEST_2", None),
+    ];
+
+    for (signed_region, expected_region) in cases {
+        let emulator = Emulator::new(signed_region);
+        let created = emulator.create_domain(&json!({ "name": "clinic" })).await;
+        let domain_id = string_at(&created, "domainId");
+        let domain_arn = string_at(&created, "arn");
+        assert!(
+            matches(DOMAIN_ARN_PATTERN, &domain_arn),
+            "case {signed_region:?}: {domain_arn:?} must match {DOMAIN_ARN_PATTERN}"
+        );
+        if let Some(region) = expected_region {
+            assert_eq!(
+                domain_arn,
+                format!("arn:aws:health-agent:{region}:000000000000:domain/{domain_id}"),
+                "case {signed_region:?}: the ARN carries the region the request was signed for"
+            );
+        }
+
+        let (status, subscription) = emulator
+            .send(
+                "POST",
+                &format!("/domains/{domain_id}/subscriptions"),
+                Some(&json!({})),
+            )
+            .await;
+        assert_eq!(
+            status, 201,
+            "case {signed_region:?}: CreateSubscription got {subscription:?}"
+        );
+        let subscription_id = string_at(&subscription, "subscriptionId");
+        assert!(
+            matches(SUBSCRIPTION_ID_PATTERN, &subscription_id) && subscription_id.len() == 25,
+            "case {signed_region:?}: subscriptionId must match {SUBSCRIPTION_ID_PATTERN} with \
+             length 25, got {subscription_id:?}"
+        );
+        let subscription_arn = string_at(&subscription, "arn");
+        assert!(
+            matches(SUBSCRIPTION_ARN_PATTERN, &subscription_arn),
+            "case {signed_region:?}: {subscription_arn:?} must match {SUBSCRIPTION_ARN_PATTERN}"
+        );
+        assert_eq!(
+            subscription_arn,
+            format!("{domain_arn}/subscription/{subscription_id}"),
+            "case {signed_region:?}: a subscription ARN extends its domain's"
+        );
+        assert_eq!(
+            subscription.get("status").and_then(Value::as_str),
+            Some("INACTIVE"),
+            "case {signed_region:?}: a new subscription is INACTIVE, got {subscription:?}"
+        );
+        assert_eq!(
+            subscription.get("createdAt"),
+            subscription.get("lastUpdatedAt"),
+            "case {signed_region:?}: an untouched subscription was last updated when it was \
+             created, got {subscription:?}"
+        );
+        assert!(
+            subscription.get("activatedAt").is_none()
+                && subscription.get("deactivatedAt").is_none(),
+            "case {signed_region:?}: a subscription that was never activated carries neither \
+             stamp, got {subscription:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn subscription_status_transitions_are_persisted_and_idempotent() {
+    // The rows differ along the sequence of transitions applied — including repeats,
+    // which `@idempotent` says must not error or change the stored record.
+    let cases: [(&str, &[&str], &str, bool, bool); 6] = [
+        ("no transition", &[], "INACTIVE", false, false),
+        ("activate", &["activate"], "ACTIVE", true, false),
+        ("activate twice", &["activate", "activate"], "ACTIVE", true, false),
+        ("deactivate first", &["deactivate"], "INACTIVE", false, false),
+        (
+            "activate then deactivate",
+            &["activate", "deactivate"],
+            "INACTIVE",
+            true,
+            true,
+        ),
+        (
+            "activate, deactivate, activate again",
+            &["activate", "deactivate", "activate"],
+            "ACTIVE",
+            true,
+            true,
+        ),
+    ];
+
+    let emulator = Emulator::new("us-west-2");
+    let domain_id = string_at(
+        &emulator.create_domain(&json!({ "name": "clinic-subs" })).await,
+        "domainId",
+    );
+
+    for (case, transitions, expected_status, activated, deactivated) in cases {
+        let created = emulator
+            .send(
+                "POST",
+                &format!("/domains/{domain_id}/subscriptions"),
+                Some(&json!({})),
+            )
+            .await
+            .1;
+        let subscription_id = string_at(&created, "subscriptionId");
+        let path = format!("/domains/{domain_id}/subscriptions/{subscription_id}");
+
+        let mut last = created.clone();
+        let mut first_activated_at: Option<Value> = None;
+        for transition in transitions {
+            let (status, answered) = emulator
+                .send("POST", &format!("{path}/{transition}"), Some(&json!({})))
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: {transition} got {answered:?}"
+            );
+            last = answered
+                .get("subscription")
+                .cloned()
+                .unwrap_or_else(|| panic!("case {case:?}: subscription in {answered:?}"));
+            if *transition == "activate" && first_activated_at.is_none() {
+                first_activated_at = last.get("activatedAt").cloned();
+            }
+        }
+
+        assert_eq!(
+            last.get("status").and_then(Value::as_str),
+            Some(expected_status),
+            "case {case:?}: the stored status after {transitions:?} is wrong, got {last:?}"
+        );
+        assert_eq!(
+            last.get("activatedAt").is_some(),
+            activated,
+            "case {case:?}: activatedAt presence after {transitions:?} is wrong, got {last:?}"
+        );
+        assert_eq!(
+            last.get("deactivatedAt").is_some(),
+            deactivated,
+            "case {case:?}: deactivatedAt presence after {transitions:?} is wrong, got {last:?}"
+        );
+        if transitions == ["activate", "activate"] {
+            assert_eq!(
+                last.get("activatedAt").cloned(),
+                first_activated_at,
+                "case {case:?}: repeating an idempotent activate must not restamp activatedAt"
+            );
+        }
+
+        // A read observes exactly what the transitions wrote.
+        let (status, fetched) = emulator.send("GET", &path, None).await;
+        assert_eq!(status, 200, "case {case:?}: GetSubscription got {fetched:?}");
+        assert_eq!(
+            fetched.get("subscription"),
+            Some(&last),
+            "case {case:?}: GetSubscription must report the stored subscription"
+        );
+
+        // And so does the list of the domain's subscriptions.
+        let (status, listed) = emulator
+            .send(
+                "GET",
+                &format!("/domains/{domain_id}/subscriptions?maxResults=100"),
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "case {case:?}: ListSubscriptions got {listed:?}");
+        let found = listed
+            .get("subscriptions")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {case:?}: subscriptions in {listed:?}"))
+            .iter()
+            .find(|entry| string_at(entry, "subscriptionId") == subscription_id)
+            .cloned();
+        assert_eq!(
+            found.as_ref(),
+            Some(&last),
+            "case {case:?}: ListSubscriptions must report the stored subscription"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_domains_pages_deterministically_and_filters_by_status() {
+    let emulator = Emulator::new("eu-west-1");
+    let mut created: BTreeSet<String> = BTreeSet::new();
+    for index in 0..5 {
+        let domain = emulator
+            .create_domain(&json!({ "name": format!("clinic-{index}") }))
+            .await;
+        created.insert(string_at(&domain, "domainId"));
+    }
+
+    // Every page size from 1 to one past the number of domains walks the whole set
+    // exactly once, in one deterministic order.
+    for page_size in 1..=6 {
+        let mut seen: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let path = match &token {
+                None => format!("/domain?maxResults={page_size}"),
+                Some(token) => format!("/domain?maxResults={page_size}&nextToken={token}"),
+            };
+            let (status, page) = emulator.send("GET", &path, None).await;
+            assert_eq!(status, 200, "page size {page_size}: got {page:?}");
+            let entries = page
+                .get("domains")
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| panic!("page size {page_size}: domains in {page:?}"));
+            assert!(
+                entries.len() <= page_size,
+                "page size {page_size}: a page returned {} entries",
+                entries.len()
+            );
+            seen.extend(entries.iter().map(|entry| string_at(entry, "domainId")));
+            pages += 1;
+            assert!(pages <= 10, "page size {page_size}: pagination did not finish");
+            token = page
+                .get("nextToken")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            if token.is_none() {
+                break;
+            }
+        }
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            seen.len(),
+            "page size {page_size}: a domain was returned twice across pages ({seen:?})"
+        );
+        assert_eq!(
+            seen.iter().cloned().collect::<BTreeSet<_>>(),
+            created,
+            "page size {page_size}: paging must cover every persisted domain"
+        );
+        assert_eq!(
+            seen, sorted,
+            "page size {page_size}: pages must follow one deterministic order"
+        );
+    }
+
+    // Filtering keys on the stored status, and the required list is present even when
+    // nothing matches.
+    for (case, status_filter, expected) in [
+        ("ACTIVE matches every live domain", "ACTIVE", 5),
+        ("DELETING matches none yet", "DELETING", 0),
+        ("DELETED matches none yet", "DELETED", 0),
+    ] {
+        let (status, page) = emulator
+            .send("GET", &format!("/domain?status={status_filter}"), None)
+            .await;
+        assert_eq!(status, 200, "case {case:?}: got {page:?}");
+        assert_eq!(
+            page.get("domains").and_then(Value::as_array).map(Vec::len),
+            Some(expected),
+            "case {case:?}: got {page:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_domains_refuses_a_max_results_outside_the_modelled_range() {
+    let emulator = Emulator::new("us-east-1");
+    emulator.create_domain(&json!({ "name": "clinic" })).await;
+
+    let (min, max) = MAX_RESULTS_RANGE;
+    // Each published bound, and one past each.
+    let cases: [(i64, u16); 4] = [(min - 1, 400), (min, 200), (max, 200), (max + 1, 400)];
+    for (max_results, expected) in cases {
+        let (status, body) = emulator
+            .send("GET", &format!("/domain?maxResults={max_results}"), None)
+            .await;
+        assert_eq!(
+            status, expected,
+            "case maxResults={max_results}: got {status} {body:?}"
+        );
+        if expected == 400 {
+            assert_eq!(
+                error_code(&body),
+                "ValidationException",
+                "case maxResults={max_results}: got {body:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn list_subscriptions_pages_through_every_persisted_subscription() {
+    let emulator = Emulator::new("us-east-1");
+    let domain_id = string_at(
+        &emulator.create_domain(&json!({ "name": "clinic" })).await,
+        "domainId",
+    );
+    let mut created: BTreeSet<String> = BTreeSet::new();
+    for _ in 0..4 {
+        let (status, subscription) = emulator
+            .send(
+                "POST",
+                &format!("/domains/{domain_id}/subscriptions"),
+                Some(&json!({})),
+            )
+            .await;
+        assert_eq!(status, 201, "CreateSubscription got {subscription:?}");
+        created.insert(string_at(&subscription, "subscriptionId"));
+    }
+    assert_eq!(created.len(), 4, "every subscription id must be distinct");
+
+    for page_size in [1, 2, 3, 4, 5] {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut token: Option<String> = None;
+        loop {
+            let base = format!("/domains/{domain_id}/subscriptions?maxResults={page_size}");
+            let path = match &token {
+                None => base,
+                Some(token) => format!("{base}&nextToken={token}"),
+            };
+            let (status, page) = emulator.send("GET", &path, None).await;
+            assert_eq!(status, 200, "page size {page_size}: got {page:?}");
+            for entry in page
+                .get("subscriptions")
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| panic!("page size {page_size}: subscriptions in {page:?}"))
+            {
+                assert!(
+                    seen.insert(string_at(entry, "subscriptionId")),
+                    "page size {page_size}: a subscription was returned twice"
+                );
+            }
+            token = page
+                .get("nextToken")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen, created,
+            "page size {page_size}: paging must cover every persisted subscription"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unknown_resources_are_404_and_ids_outside_the_model_are_400() {
+    let emulator = Emulator::new("us-east-1");
+    let domain_id = string_at(
+        &emulator.create_domain(&json!({ "name": "clinic" })).await,
+        "domainId",
+    );
+    let subscription_id = string_at(
+        &emulator
+            .send(
+                "POST",
+                &format!("/domains/{domain_id}/subscriptions"),
+                Some(&json!({})),
+            )
+            .await
+            .1,
+        "subscriptionId",
+    );
+    // A well-formed id (len 21, `^dom-[a-z0-9]+$`) that names nothing.
+    let absent_domain = "dom-doesnotexist00000";
+    let absent_subscription = "sub-000000000000000000000";
+
+    let not_found: [(&str, &str, &str); 7] = [
+        ("GetDomain", "GET", &format!("/domain/{absent_domain}")),
+        ("DeleteDomain", "DELETE", &format!("/domain/{absent_domain}")),
+        (
+            "CreateSubscription under an absent domain",
+            "POST",
+            &format!("/domains/{absent_domain}/subscriptions"),
+        ),
+        (
+            "GetSubscription of an absent subscription",
+            "GET",
+            &format!("/domains/{domain_id}/subscriptions/{absent_subscription}"),
+        ),
+        (
+            "ActivateSubscription of an absent subscription",
+            "POST",
+            &format!("/domains/{domain_id}/subscriptions/{absent_subscription}/activate"),
+        ),
+        (
+            "DeactivateSubscription under an absent domain",
+            "POST",
+            &format!("/domains/{absent_domain}/subscriptions/{subscription_id}/deactivate"),
+        ),
+        (
+            "ListSubscriptions of an absent domain",
+            "GET",
+            &format!("/domains/{absent_domain}/subscriptions"),
+        ),
+    ];
+    for (case, method, path) in not_found {
+        let (status, body) = emulator.send(method, path, Some(&json!({}))).await;
+        assert_eq!(status, 404, "case {case:?}: got {status} {body:?}");
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: got {body:?}"
+        );
+    }
+
+    // A `domainId` outside the model's length/pattern is a refusal, never a 404 and
+    // never a 200: each row breaks one rule the model states.
+    let malformed: [(&str, &str); 5] = [
+        ("too short (19)", "dom-aaaaaaaaaaaaaaa"),
+        ("too long (26)", "dom-aaaaaaaaaaaaaaaaaaaaaa"),
+        ("uppercase, outside the character class", "dom-AAAAAAAAAAAAAAAA"),
+        ("underscore, outside the character class", "dom-aaaaaaaaaaaa_aaa"),
+        ("an unmodelled prefix", "zzz-aaaaaaaaaaaaaaaa"),
+    ];
+    for (case, bad_id) in malformed {
+        let (status, body) = emulator
+            .send("GET", &format!("/domain/{bad_id}"), None)
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?} ({bad_id}): got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?} ({bad_id}): got {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn store_growth_is_bounded_and_refused_with_the_modelled_errors() {
+    use service_com_amazonaws_connecthealth_connecthealth::state::{
+        MAX_DOMAINS, MAX_SUBSCRIPTIONS_PER_DOMAIN, MAX_TAGS_PER_RESOURCE, MAX_TAG_KEY_LEN,
+        MAX_TAG_VALUE_LEN,
+    };
+
+    // A domain store that is full refuses the next create with the operation's own
+    // quota error, and holds exactly the cap.
+    let emulator = Emulator::new("us-east-1");
+    for index in 0..MAX_DOMAINS {
+        let (status, body) = emulator
+            .send(
+                "POST",
+                "/domain",
+                Some(&json!({ "name": format!("clinic-{index}") })),
+            )
+            .await;
+        assert_eq!(status, 201, "domain {index} of the cap: got {status} {body:?}");
+    }
+    let (status, body) = emulator
+        .send("POST", "/domain", Some(&json!({ "name": "one-too-many" })))
+        .await;
+    assert_eq!(
+        status, 402,
+        "the domain past the cap of {MAX_DOMAINS}: got {status} {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ServiceQuotaExceededException",
+        "the domain past the cap: got {body:?}"
+    );
+
+    // And so does a domain whose subscriptions are at the per-domain cap.
+    let emulator = Emulator::new("us-east-1");
+    let domain_id = string_at(
+        &emulator.create_domain(&json!({ "name": "clinic" })).await,
+        "domainId",
+    );
+    let path = format!("/domains/{domain_id}/subscriptions");
+    for index in 0..MAX_SUBSCRIPTIONS_PER_DOMAIN {
+        let (status, body) = emulator.send("POST", &path, Some(&json!({}))).await;
+        assert_eq!(
+            status, 201,
+            "subscription {index} of the cap: got {status} {body:?}"
+        );
+    }
+    let (status, body) = emulator.send("POST", &path, Some(&json!({}))).await;
+    assert_eq!(
+        status, 402,
+        "the subscription past the cap of {MAX_SUBSCRIPTIONS_PER_DOMAIN}: got {status} {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ServiceQuotaExceededException",
+        "the subscription past the cap: got {body:?}"
+    );
+
+    // The tag store is bounded the same way: each published tagging limit is accepted
+    // and one past it is refused.
+    let cases: [(&str, usize, usize, usize, u16); 6] = [
+        ("tags at the maximum count", MAX_TAGS_PER_RESOURCE, 8, 8, 201),
+        (
+            "one tag past the maximum count",
+            MAX_TAGS_PER_RESOURCE + 1,
+            8,
+            8,
+            402,
+        ),
+        ("a key at the maximum length", 1, MAX_TAG_KEY_LEN, 8, 201),
+        (
+            "a key one past the maximum length",
+            1,
+            MAX_TAG_KEY_LEN + 1,
+            8,
+            400,
+        ),
+        ("a value at the maximum length", 1, 8, MAX_TAG_VALUE_LEN, 201),
+        (
+            "a value one past the maximum length",
+            1,
+            8,
+            MAX_TAG_VALUE_LEN + 1,
+            400,
+        ),
+    ];
+    let emulator = Emulator::new("us-east-1");
+    for (case, count, key_len, value_len, expected) in cases {
+        let request = json!({
+            "name": "clinic-tagged",
+            "tags": tag_map(count, key_len, value_len),
+        });
+        let (status, body) = emulator.send("POST", "/domain", Some(&request)).await;
+        assert_eq!(status, expected, "case {case:?}: got {status} {body:?}");
+        match expected {
+            201 => {
+                // Accepted at the bound, and every stored tag is readable back.
+                let domain_id = string_at(&body, "domainId");
+                let (status, fetched) = emulator
+                    .send("GET", &format!("/domain/{domain_id}"), None)
+                    .await;
+                assert_eq!(status, 200, "case {case:?}: GetDomain got {fetched:?}");
+                assert_eq!(
+                    fetched
+                        .get("tags")
+                        .and_then(Value::as_object)
+                        .map(serde_json::Map::len),
+                    Some(count),
+                    "case {case:?}: every stored tag must be reported, got {fetched:?}"
+                );
+            }
+            402 => assert_eq!(
+                error_code(&body),
+                "ServiceQuotaExceededException",
+                "case {case:?}: got {body:?}"
+            ),
+            _ => assert_eq!(
+                error_code(&body),
+                "ValidationException",
+                "case {case:?}: got {body:?}"
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn delete_domain_moves_the_domain_to_deleting_then_purges_it() {
+    let emulator = Emulator::new("us-west-2");
+    let created = emulator
+        .create_domain(&json!({ "name": "clinic-doomed", "tags": { "env": "test" } }))
+        .await;
+    let domain_id = string_at(&created, "domainId");
+    let arn = string_at(&created, "arn");
+    let (status, subscription) = emulator
+        .send(
+            "POST",
+            &format!("/domains/{domain_id}/subscriptions"),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 201, "CreateSubscription got {subscription:?}");
+    let subscription_id = string_at(&subscription, "subscriptionId");
+
+    // The delete starts the transition; the response reports the stored record.
+    let (status, deleted) = emulator
+        .send("DELETE", &format!("/domain/{domain_id}"), None)
+        .await;
+    assert_eq!(status, 200, "DeleteDomain got {deleted:?}");
+    assert_eq!(
+        (
+            deleted.get("domainId").and_then(Value::as_str),
+            deleted.get("arn").and_then(Value::as_str),
+            deleted.get("status").and_then(Value::as_str),
+        ),
+        (Some(domain_id.as_str()), Some(arn.as_str()), Some("DELETING")),
+        "DeleteDomain must report the domain it moved out of ACTIVE, got {deleted:?}"
+    );
+
+    // Straight after the call the transient state is observable, and `@idempotent`
+    // means repeating the delete neither errors nor changes it.
+    let (status, fetched) = emulator
+        .send("GET", &format!("/domain/{domain_id}"), None)
+        .await;
+    assert_eq!(status, 200, "GetDomain got {fetched:?}");
+    assert_eq!(
+        fetched.get("status").and_then(Value::as_str),
+        Some("DELETING"),
+        "GetDomain must report the stored deletion, got {fetched:?}"
+    );
+    let (status, repeated) = emulator
+        .send("DELETE", &format!("/domain/{domain_id}"), None)
+        .await;
+    assert_eq!(status, 200, "a repeated DeleteDomain got {repeated:?}");
+    assert_eq!(
+        repeated, deleted,
+        "a repeated DeleteDomain must answer exactly as the first did"
+    );
+    let (status, listed) = emulator
+        .send("GET", "/domain?status=DELETING", None)
+        .await;
+    assert_eq!(status, 200, "ListDomains got {listed:?}");
+    assert_eq!(
+        listed
+            .get("domains")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1),
+        "a domain being deleted is listed under DELETING, got {listed:?}"
+    );
+
+    // ONE liveness rule across every subscription operation: a domain that is being
+    // deleted no longer serves its subscriptions, so nothing can be enumerated that
+    // cannot then be read.
+    let subscriptions_path = format!("/domains/{domain_id}/subscriptions");
+    let subscription_path = format!("{subscriptions_path}/{subscription_id}");
+    let gone: [(&str, &str, &str); 5] = [
+        ("ListSubscriptions", "GET", &subscriptions_path),
+        ("CreateSubscription", "POST", &subscriptions_path),
+        ("GetSubscription", "GET", &subscription_path),
+        (
+            "ActivateSubscription",
+            "POST",
+            &format!("{subscription_path}/activate"),
+        ),
+        (
+            "DeactivateSubscription",
+            "POST",
+            &format!("{subscription_path}/deactivate"),
+        ),
+    ];
+    for (case, method, path) in gone {
+        let (status, body) = emulator.send(method, path, Some(&json!({}))).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?} under a domain being deleted: got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?} under a domain being deleted: got {body:?}"
+        );
+    }
+
+    // Once the span the clock owes has elapsed, the domain is purged: it is gone from
+    // the list and every read of it is a 404.
+    // Real elapsed time is required (the handlers read `SystemTime::now()`), and the
+    // workspace `tokio` dependency does not enable the `time` feature, so this is a
+    // plain blocking sleep rather than `tokio::time::sleep(..).await`.
+    std::thread::sleep(PAST_THE_DELETION_SPAN);
+    let (status, fetched) = emulator
+        .send("GET", &format!("/domain/{domain_id}"), None)
+        .await;
+    assert_eq!(status, 404, "GetDomain after the purge got {fetched:?}");
+    assert_eq!(
+        error_code(&fetched),
+        "ResourceNotFoundException",
+        "GetDomain after the purge got {fetched:?}"
+    );
+    let (status, listed) = emulator.send("GET", "/domain", None).await;
+    assert_eq!(status, 200, "ListDomains got {listed:?}");
+    assert_eq!(
+        listed
+            .get("domains")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0),
+        "a purged domain is listed nowhere, got {listed:?}"
+    );
+    let (status, body) = emulator
+        .send("DELETE", &format!("/domain/{domain_id}"), None)
+        .await;
+    assert_eq!(status, 404, "DeleteDomain after the purge got {body:?}");
+}
