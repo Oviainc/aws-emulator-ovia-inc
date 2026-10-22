@@ -181,74 +181,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(str::to_string);
         let status = input.status.clone();
 
-        let mut matching: Vec<&crate::state::JobRecord> = state
-            .jobs
-            .values()
-            .filter(|job| queue.as_deref().is_none_or(|name| job.queue == name))
-            .filter(|job| status.as_deref().is_none_or(|want| job.status == want))
-            .collect();
-        // "your most recently created jobs": ordered by creation time, newest first
-        // unless the caller asked for ASCENDING. The id breaks ties so the order is
-        // total and a page boundary cannot repeat or skip a job.
-        matching.sort_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        let order = input
-            .order
-            .as_deref()
-            .unwrap_or(crate::state::ORDER_DESCENDING);
-        if order == crate::state::ORDER_DESCENDING {
-            matching.reverse();
-        }
-
-        let ascending = order == crate::state::ORDER_ASCENDING;
-
-        let start = match input.next_token.as_deref() {
-            None => 0,
+        // The ordering, the cursor and the page size are the state module's, shared with
+        // every other paged reader of the job set.
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
             Some(token) => {
-                let Some((nanos, id)) = crate::state::decode_cursor(token) else {
+                let Some(anchor) = crate::state::decode_cursor(token) else {
                     return Err(ListJobsErrorModeled::BadRequestException(BadRequestException {
-                        message: Some(
-                            "nextToken is not a token this service issued.".to_string(),
-                        ),
+                        message: Some("nextToken is not a token this service issued.".to_string()),
                     })
                     .into());
                 };
-                let anchor = (nanos, id.as_str());
-                // Resume at the first job strictly past the anchor key in this
-                // direction. The anchor itself need not still be in the result set, so a
-                // job whose status changed between pages is skipped, not an error.
-                matching
-                    .iter()
-                    .position(|job| {
-                        if ascending {
-                            job.ordering_key() > anchor
-                        } else {
-                            job.ordering_key() < anchor
-                        }
-                    })
-                    .unwrap_or(matching.len())
+                Some(anchor)
             }
         };
 
-        // `maxResults` carries the model's own 1..20 range, so the framework has already
-        // refused anything outside it; the fallback only covers the absent case.
-        let page_size =
-            usize::try_from(input.max_results.unwrap_or(crate::state::DEFAULT_PAGE_SIZE))
-                .unwrap_or(crate::state::DEFAULT_PAGE_SIZE as usize);
-        let page = &matching[start.min(matching.len())..];
-        let page = &page[..page_size.min(page.len())];
-        // A token only when there is a further page to fetch.
-        let next_token = (start + page.len() < matching.len())
-            .then(|| page.last().map(|job| job.cursor()))
-            .flatten();
-        let jobs = page.iter().map(|job| job.view(&region)).collect();
+        let page = crate::state::page_of_jobs(
+            state
+                .jobs
+                .values()
+                .filter(|job| queue.as_deref().is_none_or(|name| job.queue == name))
+                .filter(|job| status.as_deref().is_none_or(|want| job.status == want)),
+            input.order.as_deref(),
+            resume_from.as_ref(),
+            input.max_results,
+        );
+
+        let jobs = page.jobs.iter().map(|job| job.view(&region)).collect();
 
         Ok(ListJobsOutput {
             jobs: Some(jobs),
-            next_token,
+            next_token: page.next_token,
         })
     }
 }

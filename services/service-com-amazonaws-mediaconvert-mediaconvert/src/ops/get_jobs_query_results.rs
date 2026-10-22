@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetJobsQueryResults
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetJobsQueryResults`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Read back a jobs query `StartJobsQuery` started: its status, and — once the query has
+//! completed — the page of jobs it matched and the cursor for the batch after it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetJobsQueryResults::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting only: the one write on this path is
+//! [`crate::state::ComAmazonawsMediaconvertMediaconvertState::settle`], materialising the
+//! transitions the clock had already made due. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +154,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetJobsQueryResults` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetJobsQueryResultsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetJobsQueryResults"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetJobsQueryResultsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("this service's state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Reporting only: the one write is materialising the transitions the clock had
+        // already made due at `now` — this query's own completion among them — which were
+        // owed whether or not anybody polled.
+        state.settle(now);
+
+        let Some(query) = state.jobs_queries.get(&input.id) else {
+            return Err(GetJobsQueryResultsErrorModeled::NotFoundException(
+                NotFoundException {
+                    // The refusal names the request member the lookup read, `Id`.
+                    message: Some(crate::state::not_found_message("id")),
+                },
+            )
+            .into());
+        };
+
+        // The matched page is the one the query stored when it was started, so the jobs a
+        // caller polls do not shift under them. A query that has not completed yet
+        // reports no page at all, only its status.
+        let complete = query.status == crate::state::JOBS_QUERY_STATUS_COMPLETE;
+        let status = Some(query.status.clone());
+        let next_token = query.result_next_token.clone();
+        let matched = query.matched.clone();
+        let jobs = complete.then(|| {
+            matched
+                .iter()
+                .filter_map(|id| state.jobs.get(id))
+                .map(|job| job.view(&region))
+                .collect()
+        });
+
+        Ok(GetJobsQueryResultsOutput {
+            jobs,
+            next_token,
+            status,
+        })
     }
 }
