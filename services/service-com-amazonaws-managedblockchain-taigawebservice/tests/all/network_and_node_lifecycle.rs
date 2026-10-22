@@ -25,26 +25,26 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the test signs for; the service reads it off the credential scope, so it
 /// must appear in every ARN and endpoint it mints.
-const REGION: &str = "eu-west-1";
+pub(crate) const REGION: &str = "eu-west-1";
 
 /// The account id every emulated ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// Comfortably longer than [`TRANSITION_SPAN`], so a transition the clock owes has come
 /// due by the time the next call is made.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+pub(crate) const PAST_TRANSITION: Duration = Duration::from_millis(900);
 
 /// One answer from the emulator.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
-    error_type: String,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) error_type: String,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// One member of the body, as a string (empty when absent).
-    fn text(&self, path: &[&str]) -> String {
+    pub(crate) fn text(&self, path: &[&str]) -> String {
         let mut value = &self.body;
         for key in path {
             value = &value[*key];
@@ -55,7 +55,12 @@ impl Answer {
 
 /// A router with only this service mounted, over a fresh engine.
 fn new_router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    router_over(Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// A router with only this service mounted, over `engine` — so a caller that needs to
+/// reach the same store the handlers write to can keep a handle on it.
+pub(crate) fn router_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     // Signature verification is the emulator's own concern and is exercised elsewhere;
     // these cases are about this service's behaviour.
@@ -65,7 +70,7 @@ fn new_router() -> MultiServiceRouter {
 }
 
 /// Send one request and return what the emulator answered.
-async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Option<Value>) -> Answer {
+pub(crate) async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Option<Value>) -> Answer {
     let payload = body.map_or_else(Bytes::new, |value| {
         Bytes::from(serde_json::to_vec(&value).expect("the request body serializes"))
     });
@@ -115,7 +120,7 @@ async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Optio
 }
 
 /// A `MemberConfiguration` naming `name`, with the admin user every Fabric member needs.
-fn member_configuration(name: &str) -> Value {
+pub(crate) fn member_configuration(name: &str) -> Value {
     json!({
         "Name": name,
         "FrameworkConfiguration": {
@@ -125,7 +130,7 @@ fn member_configuration(name: &str) -> Value {
 }
 
 /// A minimal valid `CreateNetwork` request body.
-fn create_network_body(token: &str, name: &str) -> Value {
+pub(crate) fn create_network_body(token: &str, name: &str) -> Value {
     json!({
         "ClientRequestToken": token,
         "Name": name,
@@ -144,7 +149,7 @@ fn create_network_body(token: &str, name: &str) -> Value {
 }
 
 /// Create one network and return `(NetworkId, MemberId)`.
-async fn create_network(router: &MultiServiceRouter, body: Value) -> (String, String) {
+pub(crate) async fn create_network(router: &MultiServiceRouter, body: Value) -> (String, String) {
     let answer = call(router, "POST", "/networks", Some(body.clone())).await;
     assert_eq!(
         answer.status, 200,
@@ -191,7 +196,7 @@ async fn create_node(
 
 /// Whether `value` is an ISO-8601 date-time string, the format
 /// `com.amazonaws.managedblockchain#Timestamp` carries (`@timestampFormat("date-time")`).
-fn is_date_time(value: &Value) -> bool {
+pub(crate) fn is_date_time(value: &Value) -> bool {
     value.as_str().is_some_and(|text| {
         aws_smithy_types::DateTime::from_str(text, aws_smithy_types::date_time::Format::DateTime)
             .is_ok()
@@ -201,7 +206,7 @@ fn is_date_time(value: &Value) -> bool {
 /// Whether `id` has the shape every Managed Blockchain resource id takes: a prefix, a
 /// hyphen, then 26 characters of the base-32 alphabet, within `ResourceIdString`'s
 /// `@length(1, 32)`.
-fn is_resource_id(id: &str, prefix: &str) -> bool {
+pub(crate) fn is_resource_id(id: &str, prefix: &str) -> bool {
     let Some(suffix) = id.strip_prefix(&format!("{prefix}-")) else {
         return false;
     };
