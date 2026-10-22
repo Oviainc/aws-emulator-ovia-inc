@@ -203,12 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "WAFNonexistentItemException",
             );
             return Err(DeleteWebACLErrorModeled::WAFNonexistentItemException(
-                WAFNonexistentItemException {
-                    message: Some(format!(
-                        "No WebACL named {:?} with id {:?} exists in scope {}",
-                        input.name, input.id, input.scope
-                    )),
-                },
+                crate::state::nonexistent_item_exception(),
             )
             .into());
         };
@@ -221,13 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "WAFOptimisticLockException",
             );
             return Err(DeleteWebACLErrorModeled::WAFOptimisticLockException(
-                WAFOptimisticLockException {
-                    message: Some(
-                        "The WebACL has changed since you last retrieved it; get it again and \
-                         retry with the new LockToken"
-                            .to_string(),
-                    ),
-                },
+                crate::state::optimistic_lock_exception(),
             )
             .into());
         }

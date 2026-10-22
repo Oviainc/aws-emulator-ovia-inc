@@ -194,12 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "WAFNonexistentItemException",
             );
             return Err(DeleteIPSetErrorModeled::WAFNonexistentItemException(
-                WAFNonexistentItemException {
-                    message: Some(format!(
-                        "No IPSet named {:?} with id {:?} exists in scope {}",
-                        input.name, input.id, input.scope
-                    )),
-                },
+                crate::state::nonexistent_item_exception(),
             )
             .into());
         };
@@ -212,13 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "WAFOptimisticLockException",
             );
             return Err(DeleteIPSetErrorModeled::WAFOptimisticLockException(
-                WAFOptimisticLockException {
-                    message: Some(
-                        "The IPSet has changed since you last retrieved it; get it again and \
-                         retry with the new LockToken"
-                            .to_string(),
-                    ),
-                },
+                crate::state::optimistic_lock_exception(),
             )
             .into());
         }
@@ -230,15 +219,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.scope,
                 &input.name,
                 &input.id,
-                "WAFAssociatedItemException",
+                // Which web ACL still references the set is a diagnostic, so it is
+                // recorded here; the refusal itself carries the exception type's
+                // constant sentence.
+                &format!("WAFAssociatedItemException: referenced by WebACL {referrer_name:?}"),
             );
             return Err(DeleteIPSetErrorModeled::WAFAssociatedItemException(
-                WAFAssociatedItemException {
-                    message: Some(format!(
-                        "The IPSet {arn} is referenced by the WebACL {referrer_name:?} and \
-                         cannot be deleted"
-                    )),
-                },
+                crate::state::associated_item_exception(),
             )
             .into());
         }

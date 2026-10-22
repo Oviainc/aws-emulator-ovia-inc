@@ -178,12 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
         let Some(entry) = state.ip_set(&input.scope, &input.name, &input.id) else {
             return Err(GetIPSetErrorModeled::WAFNonexistentItemException(
-                WAFNonexistentItemException {
-                    message: Some(format!(
-                        "No IPSet named {:?} with id {:?} exists in scope {}",
-                        input.name, input.id, input.scope
-                    )),
-                },
+                crate::state::nonexistent_item_exception(),
             )
             .into());
         };

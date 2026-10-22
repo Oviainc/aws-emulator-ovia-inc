@@ -19,15 +19,18 @@ use service_com_amazonaws_wafv2_awswaf_20190729::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the harness signs for unless a case asks for another one.
-const TEST_REGION: &str = "us-west-2";
+pub(crate) const TEST_REGION: &str = "us-west-2";
 
 /// One emulator with the wafv2 service mounted on a single shared engine.
-struct Waf {
+///
+/// Shared with the sibling suites in `tests/all/`, so every suite drives the
+/// service through the same front door.
+pub(crate) struct Waf {
     router: MultiServiceRouter,
 }
 
 impl Waf {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These tests exercise the service, not SigV4: the `Authorization` header
@@ -71,12 +74,12 @@ impl Waf {
     }
 
     /// [`Self::call_in`] for [`TEST_REGION`].
-    async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
         self.call_in(TEST_REGION, operation, body).await
     }
 
     /// The call must answer 200; answers its parsed body.
-    async fn ok(&self, operation: &str, body: Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -86,7 +89,13 @@ impl Waf {
     }
 
     /// The call must be refused with HTTP 400 and the error code `code`.
-    async fn refused(&self, operation: &str, body: Value, code: &str, case: &str) -> Value {
+    pub(crate) async fn refused(
+        &self,
+        operation: &str,
+        body: Value,
+        code: &str,
+        case: &str,
+    ) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 400,
@@ -120,7 +129,7 @@ fn is_model_uuid(value: &str) -> bool {
 }
 
 /// A minimal valid `VisibilityConfig` for a rule or web ACL.
-fn visibility(metric: &str) -> Value {
+pub(crate) fn visibility(metric: &str) -> Value {
     json!({
         "SampledRequestsEnabled": true,
         "CloudWatchMetricsEnabled": true,
@@ -129,7 +138,7 @@ fn visibility(metric: &str) -> Value {
 }
 
 /// A blocking rule wrapping `statement`.
-fn rule(name: &str, statement: Value) -> Value {
+pub(crate) fn rule(name: &str, statement: Value) -> Value {
     json!({
         "Name": name,
         "Priority": 0,
@@ -160,7 +169,11 @@ fn xss_statement() -> Value {
 }
 
 /// Create an IPSet in `scope` and answer `(id, arn, lock token)`.
-async fn create_ip_set(waf: &Waf, scope: &str, name: &str) -> (String, String, String) {
+pub(crate) async fn create_ip_set(
+    waf: &Waf,
+    scope: &str,
+    name: &str,
+) -> (String, String, String) {
     let created = waf
         .ok(
             "CreateIPSet",
@@ -185,7 +198,7 @@ async fn create_ip_set(waf: &Waf, scope: &str, name: &str) -> (String, String, S
 }
 
 /// Create a WebACL in `scope` with `rules` and answer `(id, arn, lock token)`.
-async fn create_web_acl(
+pub(crate) async fn create_web_acl(
     waf: &Waf,
     scope: &str,
     name: &str,
