@@ -190,9 +190,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.accelerators.get(&input.accelerator_arn) else {
             return Err(DeleteAcceleratorErrorModeled::AcceleratorNotFoundException(
                 AcceleratorNotFoundException {
-                    message: Some(format!(
-                        "accelerator {} not found",
-                        input.accelerator_arn
+                    message: Some(crate::state::accelerator_not_found_message(
+                        &input.accelerator_arn,
                     )),
                 },
             )
@@ -204,9 +203,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if record.enabled {
             return Err(DeleteAcceleratorErrorModeled::AcceleratorNotDisabledException(
                 AcceleratorNotDisabledException {
-                    message: Some(
-                        "the accelerator must be disabled before it can be deleted".to_string(),
-                    ),
+                    message: Some(crate::state::accelerator_not_disabled_message(
+                        &input.accelerator_arn,
+                    )),
                 },
             )
             .into());
@@ -215,10 +214,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteAcceleratorErrorModeled::AssociatedListenerFoundException(
                     AssociatedListenerFoundException {
-                        message: Some(
-                            "the accelerator still has associated listeners; delete them first"
-                                .to_string(),
-                        ),
+                        message: Some(crate::state::associated_listener_found_message(
+                            &input.accelerator_arn,
+                        )),
                     },
                 )
                 .into(),

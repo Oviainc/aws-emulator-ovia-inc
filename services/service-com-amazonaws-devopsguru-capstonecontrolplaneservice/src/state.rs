@@ -9,16 +9,19 @@
 //!
 //! Insights are produced by DevOps Guru's own analysis, never by a client call, so
 //! [`ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::insights`] is the map
-//! that analysis would write and the insight READS (`ListInsights` today) report:
-//! this emulator runs no analysis, so the map stays empty for an account whose
-//! insights nothing produced, and a read over it reports nothing rather than
-//! inventing an insight.
+//! that analysis would write and the insight READS (`ListInsights` and
+//! `DescribeInsight`) report: this emulator runs no analysis, so the map stays empty
+//! for an account whose insights nothing produced, and a read over it reports
+//! nothing rather than inventing an insight. An `InsightId` the map does not hold
+//! names no insight, which is what `DescribeInsight` refuses with
+//! `ResourceNotFoundException`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
-    CloudFormationCollection, InsightTimeRange, PredictionTimeRange, ProactiveInsightSummary,
-    ReactiveInsightSummary, ResourceCollection, ServiceCollection, TagCollection,
+    CloudFormationCollection, InsightTimeRange, PredictionTimeRange, ProactiveInsight,
+    ProactiveInsightSummary, ReactiveInsight, ReactiveInsightSummary, ResourceCollection,
+    ServiceCollection, TagCollection,
 };
 
 /// Per-service state for com-amazonaws-devopsguru-capstonecontrolplaneservice. A handler reaches it through [`service_state`].
@@ -44,7 +47,8 @@ pub struct ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
 
 /// One insight, as the insight reads report it.
 ///
-/// Holds every member `ProactiveInsightSummary` and `ReactiveInsightSummary` carry;
+/// Holds every member `ProactiveInsightSummary` and `ReactiveInsightSummary` carry,
+/// plus the two the DETAIL shapes `ProactiveInsight` and `ReactiveInsight` add;
 /// [`InsightRecord::insight_type`] is what decides which of the two a read renders.
 #[derive(Debug, Clone, Default)]
 pub struct InsightRecord {
@@ -79,9 +83,57 @@ pub struct InsightRecord {
     pub service_names: Vec<String>,
     /// `AssociatedResourceArns`, empty when the insight names no resource ARN.
     pub associated_resource_arns: Vec<String>,
+    /// `SsmOpsItemId`, present only when OpsCenter opened an OpsItem for this
+    /// insight. Carried by the DETAIL shapes (`DescribeInsight`) only — the summary
+    /// shapes model no such member.
+    pub ssm_ops_item_id: Option<String>,
+    /// `Description` — what the insight says. Carried by the DETAIL shapes only.
+    pub description: Option<String>,
 }
 
 impl InsightRecord {
+    /// `InsightType`'s `PROACTIVE` member, as the model spells it.
+    pub const PROACTIVE: &'static str = "PROACTIVE";
+
+    /// Whether this record is reported as a PROACTIVE insight — the response member
+    /// a detail read renders it on, and the summary shape a listing renders it as.
+    pub fn is_proactive(&self) -> bool {
+        self.insight_type == Self::PROACTIVE
+    }
+
+    /// This record as the modelled `ProactiveInsight`, the DETAIL shape
+    /// `DescribeInsight` reports. Built from the SAME record as
+    /// [`InsightRecord::to_proactive_summary`], so a listed insight and the one a
+    /// caller then describes cannot disagree.
+    pub fn to_proactive_insight(&self) -> ProactiveInsight {
+        ProactiveInsight {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            severity: Some(self.severity.clone()),
+            status: Some(self.status.clone()),
+            insight_time_range: Some(self.insight_time_range()),
+            prediction_time_range: self.prediction_time_range(),
+            resource_collection: self.wire_resource_collection(),
+            ssm_ops_item_id: self.ssm_ops_item_id.clone(),
+            description: self.description.clone(),
+        }
+    }
+
+    /// This record as the modelled `ReactiveInsight`, which carries no
+    /// `PredictionTimeRange`: only a proactive insight predicts a window.
+    pub fn to_reactive_insight(&self) -> ReactiveInsight {
+        ReactiveInsight {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            severity: Some(self.severity.clone()),
+            status: Some(self.status.clone()),
+            insight_time_range: Some(self.insight_time_range()),
+            resource_collection: self.wire_resource_collection(),
+            ssm_ops_item_id: self.ssm_ops_item_id.clone(),
+            description: self.description.clone(),
+        }
+    }
+
     /// This record as the modelled `ProactiveInsightSummary`.
     pub fn to_proactive_summary(&self) -> ProactiveInsightSummary {
         ProactiveInsightSummary {
@@ -161,6 +213,27 @@ impl InsightRecord {
         (!self.associated_resource_arns.is_empty())
             .then(|| self.associated_resource_arns.clone())
     }
+}
+
+/// The account an insight read resolves against: the `AccountId` the request
+/// carries, or this emulator's own account when it carries none.
+pub fn requested_account_id(account_id: Option<&str>) -> String {
+    match account_id {
+        Some(account_id) => account_id.to_string(),
+        None => ::engine::emulator_account_id().to_string(),
+    }
+}
+
+/// Whether the caller may read `account_id`'s insights.
+///
+/// DevOps Guru serves another account's insights only through an organization
+/// relationship — the `AccountId` member is "The ID of the member account in the
+/// organization". A generated emulator serves ONE account
+/// ([`::engine::emulator_account_id`]) and is in no organization, so no other
+/// account is accessible to it and a request naming one is an authorization
+/// refusal (`AccessDeniedException`), not a lookup that happens to miss.
+pub fn account_is_accessible(account_id: &str) -> bool {
+    account_id == ::engine::emulator_account_id()
 }
 
 /// A stored instant as the modelled `Timestamp`.
@@ -264,6 +337,11 @@ pub const OPT_IN_STATUS_DISABLED: &str = "DISABLED";
 /// `ResourceNotFoundException` reports. `ResourceIdType` is an unconstrained string,
 /// so this value names the kind of resource the reported `ResourceId` belongs to.
 pub const NOTIFICATION_CHANNEL_RESOURCE_TYPE: &str = "NOTIFICATION_CHANNEL";
+
+/// The `ResourceType` an insight-shaped `ResourceNotFoundException` reports — the
+/// kind of resource the refused `ResourceId` would have named. See
+/// [`NOTIFICATION_CHANNEL_RESOURCE_TYPE`].
+pub const INSIGHT_RESOURCE_TYPE: &str = "INSIGHT";
 
 /// Before any `UpdateServiceIntegration`, every integration is opted out: a
 /// client that never enabled OpsCenter, log anomaly detection or customer-managed
@@ -473,7 +551,9 @@ fn page_at<T: Clone>(
     if offset > items.len() {
         return None;
     }
-    let end = (offset + page_size).min(items.len());
+    // Saturating, so a page size a caller pushed past the modelled maximum cannot
+    // wrap the end of the slice below its start.
+    let end = offset.saturating_add(page_size).min(items.len());
     let next = if end < items.len() {
         encode_page_token(scope, end)
     } else {

@@ -45,6 +45,10 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// How this service words a request the framework refused before any handler ran: the
+/// tag APIs' own error taxonomy, and the AWS constraint envelope for everything else.
+pub mod validation;
+
 /// The `com-amazonaws-licensemanagerlinuxsubscriptions-licensemanagerlinuxsubscriptions` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -97,16 +101,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. This service does reword every input-constraint refusal: the
+        // rules, and the one formatter that applies them, live in `validation`, so no
+        // operation words a refusal its own way. Both the code and the message are
+        // replaced, because a client branches on the code — the tagging surface's
+        // refusals name `BadRequestException` rather than `ValidationException`.
+        validation::refused(refusal)
     }
 
     fn override_routing_error(

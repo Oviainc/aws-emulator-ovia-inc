@@ -4,9 +4,10 @@
 //!
 //! One `Certificate` record per ACM certificate, keyed by its ARN, plus the
 //! idempotency index `RequestCertificate` consults. Every operation's response is
-//! projected from these records — see [`certificate_detail`] and
-//! [`certificate_summary`] — so `DescribeCertificate` and `ListCertificates` report
-//! what `RequestCertificate` stored rather than echoing their own input.
+//! projected from these records — see [`certificate_detail`], [`certificate_summary`]
+//! and [`certificate_search_result`] — so `DescribeCertificate`, `ListCertificates`
+//! and `SearchCertificates` report what `RequestCertificate` stored rather than
+//! echoing their own input.
 //!
 //! Beside the certificates sits the account-level singleton
 //! [`AccountConfiguration`]: `PutAccountConfiguration` writes it and
@@ -22,8 +23,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CertificateDetail, CertificateOptions, CertificateSummary, DomainValidation,
-    ExpiryEventsConfiguration, ExtendedKeyUsage, HttpRedirect, KeyUsage, ResourceRecord, Tag,
+    AcmCertificateMetadata, CertificateDetail, CertificateMetadata, CertificateOptions,
+    CertificateSearchResult, CertificateSummary, DistinguishedName, DomainValidation,
+    ExpiryEventsConfiguration, ExtendedKeyUsage, GeneralName, HttpRedirect, KeyUsage,
+    ResourceRecord, Tag, X509Attributes,
 };
 
 /// This service's SigV4 signing name, and the `acm` segment of every ARN it mints.
@@ -934,5 +937,70 @@ pub fn certificate_summary(cert: &Certificate) -> CertificateSummary {
         managed_by: cert.managed_by.clone(),
         certificate_key_pair_origin: Some(cert.key_pair_origin.clone()),
         ..CertificateSummary::default()
+    }
+}
+
+/// A stored certificate as `SearchCertificates`' `CertificateSearchResult`: the same
+/// record `certificate_detail` and `certificate_summary` project, split into the
+/// X.509 attributes and the ACM metadata that operation's filters select on.
+///
+/// Members that belong to something this service never does stay absent, and are the
+/// members the search filters correspondingly keep nothing on:
+///
+/// * `X509Attributes.Issuer` and `X509Attributes.SerialNumber` are minted by the
+///   certificate authority that signs an X.509 certificate, and this emulator signs
+///   none — the same reason [`certificate_detail`] reports no `Issuer` or `Serial`.
+/// * `AcmCertificateMetadata.ImportedAt` dates an import, `RenewalStatus` belongs to
+///   a renewal ACM has started, and the ACME members to a certificate obtained
+///   through an ACME endpoint; no stored record carries any of them. `RevokedAt` is
+///   reported, and is absent exactly when the record carries no revocation, which
+///   "exists only when the certificate status is REVOKED"
+///   (`CertificateDetail$RevokedAt` doc).
+pub fn certificate_search_result(cert: &Certificate) -> CertificateSearchResult {
+    CertificateSearchResult {
+        certificate_arn: Some(cert.arn.clone()),
+        x509_attributes: Some(X509Attributes {
+            // The subject common name of an ACM certificate is the domain name the
+            // certificate was requested for.
+            subject: Some(DistinguishedName {
+                common_name: Some(cert.domain_name.clone()),
+                ..DistinguishedName::default()
+            }),
+            // The name set the certificate covers, each as the DNS name it is.
+            subject_alternative_names: Some(
+                cert.subject_alternative_names
+                    .iter()
+                    .map(|name| GeneralName::DnsName(name.clone()))
+                    .collect(),
+            ),
+            key_algorithm: Some(cert.key_algorithm.clone()),
+            // The X.509 key-usage extensions of an issued certificate; absent while
+            // the record carries none.
+            key_usages: (!cert.key_usages.is_empty()).then(|| cert.key_usages.clone()),
+            extended_key_usages: (!cert.extended_key_usages.is_empty())
+                .then(|| cert.extended_key_usages.clone()),
+            not_before: cert.not_before.map(to_date_time),
+            not_after: cert.not_after.map(to_date_time),
+            ..X509Attributes::default()
+        }),
+        certificate_metadata: Some(CertificateMetadata::AcmCertificateMetadata(
+            AcmCertificateMetadata {
+                created_at: Some(to_date_time(cert.created_at)),
+                exported: Some(cert.exported),
+                in_use: Some(!cert.in_use_by.is_empty()),
+                issued_at: cert.issued_at.map(to_date_time),
+                // The revocation instant, which exists only beside the `REVOKED`
+                // status the same record carries.
+                revoked_at: cert.revoked_at.map(to_date_time),
+                renewal_eligibility: Some(cert.renewal_eligibility.clone()),
+                status: Some(cert.status.clone()),
+                r#type: Some(cert.cert_type.clone()),
+                export_option: Some(export_option(cert)),
+                managed_by: cert.managed_by.clone(),
+                validation_method: cert.validation_method.clone(),
+                certificate_key_pair_origin: Some(cert.key_pair_origin.clone()),
+                ..AcmCertificateMetadata::default()
+            },
+        )),
     }
 }

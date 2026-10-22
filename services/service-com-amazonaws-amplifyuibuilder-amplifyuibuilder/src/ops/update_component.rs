@@ -74,6 +74,9 @@
 //!   for the input parameter.
 //! * `ResourceConflictException` (HTTP 409) — The resource specified in the request conflicts
 //!   with an existing resource.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see below):
+//!   the shape is this service's own, declared for the same id lookup by `GetComponent` and
+//!   `DeleteComponent`.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -89,12 +92,25 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-amplifyuibuilder-amplif
 // here — hence the `UpdateComponentError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.amplifyuibuilder#UpdateComponent")]
+//
+// `ResourceNotFoundException` is widened in through `extra_errors`: `id` is an
+// `@httpLabel` naming a component that may not exist, every sibling operation
+// addressed the same way (`GetComponent`, `DeleteComponent`) declares that shape
+// for exactly this case, and this operation's own `errors` list omits it. So an
+// id that names no component is reported missing rather than dressed up as an
+// invalid parameter. The shape is this service's own
+// (`com.amazonaws.amplifyuibuilder#ResourceNotFoundException`, HTTP 404),
+// declared in `types/shared_types.rs`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.amplifyuibuilder#UpdateComponent",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum UpdateComponentErrorModeled {
     InternalServerException(InternalServerException),
     InvalidParameterException(InvalidParameterException),
     ResourceConflictException(ResourceConflictException),
+    ResourceNotFoundException(ResourceNotFoundException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -230,16 +246,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        // The target is resolved before anything is merged, and the two ways it
+        // can fail to resolve are the two `GetComponent` and `DeleteComponent`
+        // tell apart: an id a DIFFERENT app environment owns is a wrong-scope
+        // request (the modelled `InvalidParameterException`, 400) and an id that
+        // names no component anywhere is absent (`ResourceNotFoundException`,
+        // 404 — widened in above). Nothing is created either way: an update is
+        // not an upsert.
+        if store
+            .component(&input.app_id, &input.environment_name, &input.id)
+            .is_none()
+        {
+            if store.component_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
+                return Err(UpdateComponentErrorModeled::InvalidParameterException(
+                    crate::state::component_wrong_scope(
+                        &input.app_id,
+                        &input.environment_name,
+                        &input.id,
+                    ),
+                )
+                .into());
+            }
+            return Err(UpdateComponentErrorModeled::ResourceNotFoundException(
+                crate::state::component_not_found(
+                    &input.app_id,
+                    &input.environment_name,
+                    &input.id,
+                ),
+            )
+            .into());
+        }
+
+        // A component name identifies a component within its app environment, so
+        // a rename onto a name ANOTHER live component there holds is refused with
+        // the same `ResourceConflictException` a duplicate create is: the
+        // constraint is on the stored set, not on which call would introduce the
+        // duplicate. Renaming a component to the name it already has changes
+        // nothing and is not a conflict.
+        if let Some(name) = patch.name.as_deref() {
+            if store
+                .component_named(&input.app_id, &input.environment_name, name)
+                .is_some_and(|holder| holder.id != input.id)
+            {
+                return Err(UpdateComponentErrorModeled::ResourceConflictException(
+                    crate::state::duplicate_component_name(
+                        &input.app_id,
+                        &input.environment_name,
+                        name,
+                    ),
+                )
+                .into());
+            }
+        }
+
         let Some(component) =
             store.component_mut(&input.app_id, &input.environment_name, &input.id)
         else {
-            return Err(UpdateComponentErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(format!(
-                        "id {:?} does not name a component in app {:?} environment {:?}",
-                        input.id, input.app_id, input.environment_name
-                    )),
-                },
+            // Unreachable: the lookup above found this id under the same lock.
+            return Err(UpdateComponentErrorModeled::ResourceNotFoundException(
+                crate::state::component_not_found(
+                    &input.app_id,
+                    &input.environment_name,
+                    &input.id,
+                ),
             )
             .into());
         };

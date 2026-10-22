@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWebApps
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWebApps`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWebApps::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the stored web apps in `BTreeMap` (`WebAppId`) order, with the same page
+//! bound and opaque-token contract as `ListServers` and `ListUsers`: at most
+//! `MaxResults` records, a `NextToken` only while more remain, and a token this
+//! service did not issue refused with `InvalidNextTokenException`. A pure read: a web
+//! app has no clock-due transition to materialise, so this handler writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +149,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWebApps` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWebAppsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWebApps"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            ListWebAppsErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        // A token this service did not issue never silently restarts the listing.
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(st::decode_page_token(token).ok_or_else(|| {
+                ListWebAppsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+                    message: "The NextToken is not valid".to_string(),
+                })
+            })?),
+            None => None,
+        };
+
+        let guard = state.lock();
+        // ONE walk of the web app map for the page's records: the map is keyed by
+        // `WebAppId`, so its iteration order is already the stable paging order.
+        let stored: Vec<&st::WebApp> = guard.web_apps.values().collect();
+        let ids: Vec<&str> = stored
+            .iter()
+            .map(|web_app| web_app.web_app_id.as_str())
+            .collect();
+        let (page, next_key) =
+            st::page_bounds(&ids, after.as_deref(), st::page_limit(input.max_results));
+
+        let web_apps = stored
+            .get(page)
+            .unwrap_or_default()
+            .iter()
+            .map(|stored| ListedWebApp {
+                arn: stored.arn.clone(),
+                web_app_id: stored.web_app_id.clone(),
+                // Both URLs are resolved on the record at create time (the caller's
+                // custom `AccessEndpoint` or the default one), so the listing reports
+                // them rather than re-deriving either.
+                access_endpoint: Some(stored.access_endpoint.clone()),
+                web_app_endpoint: Some(stored.web_app_endpoint.clone()),
+                endpoint_type: Some(stored.endpoint_type.clone()),
+            })
+            .collect();
+
+        Ok(ListWebAppsOutput {
+            // A token only when a further page remains.
+            next_token: next_key.as_deref().map(st::encode_page_token),
+            web_apps,
+        })
     }
 }
+

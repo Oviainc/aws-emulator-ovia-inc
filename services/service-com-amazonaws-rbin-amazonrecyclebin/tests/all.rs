@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/retention_rule_lifecycle.rs"]
 mod retention_rule_lifecycle;
+#[path = "all/rule_lock_transitions.rs"]
+mod rule_lock_transitions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

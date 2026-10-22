@@ -126,7 +126,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{dns_sort_key, normalize_zone_id, RecordKey};
+use crate::state::{dns_sort_key, no_such_hosted_zone, normalize_zone_id, RecordKey};
 
 /// The most record sets one response carries.
 ///
@@ -248,12 +248,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let zone_id = normalize_zone_id(&input.hosted_zone_id);
         let store = state.lock();
         let zone = store.zones.get(zone_id).ok_or_else(|| {
-            ListResourceRecordSetsErrorModeled::NoSuchHostedZone(NoSuchHostedZone {
-                message: Some(format!(
-                    "no hosted zone exists with the ID {}",
-                    input.hosted_zone_id
-                )),
-            })
+            ListResourceRecordSetsErrorModeled::NoSuchHostedZone(no_such_hosted_zone(
+                &input.hosted_zone_id,
+            ))
         })?;
 
         // The zone's records live in a BTreeMap keyed by RecordKey, whose Ord is
