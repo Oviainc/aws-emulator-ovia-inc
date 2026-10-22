@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in a mounted emulator (the router hands every service the
@@ -212,6 +212,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the MemoryDB store is unreachable on this engine",
             ));
         };
+
+        // The engine and version an update moves the cluster to are checked against
+        // the catalog this service publishes, exactly as `CreateCluster` checks them:
+        // the same values cannot be accepted by one write path and refused by the
+        // other. `Engine` is an enum-like VALUE rather than a resource name, so it is
+        // compared exactly as the request spelled it; the version has to wait until the
+        // cluster is resolved, because the engine it must belong to is the one the
+        // cluster will be left running.
+        let engine = input.engine.clone();
+        if let Some(message) = crate::state::engine_rejection(engine.as_deref()) {
+            return Err(UpdateClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // Every name this request carries is folded the way the stores are keyed, so a
+        // reference written in mixed case resolves to the one resource.
+        let cluster_name = crate::state::fold_name(&input.cluster_name);
+        let requested_acl_name = input.acl_name.as_deref().map(crate::state::fold_name);
+        let requested_parameter_group_name = input
+            .parameter_group_name
+            .as_deref()
+            .map(crate::state::fold_name);
 
         if let Some(shards) = input.shard_configuration.as_ref() {
             // BOUND THE LAYOUT BEFORE ANYTHING IS BUILT OR LOCKED. Like
@@ -260,18 +285,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::Instant::now();
         let mut state = state.lock();
         state.settle(now);
+        // The ACLs the account ALREADY HAD before any call — the built-in
+        // `open-access` ACL — are materialised on first touch, so repointing a cluster
+        // at it resolves instead of being refused as not found.
+        state.ensure_builtins(&crate::state::request_region(ctx));
 
-        if !state.clusters.contains_key(&input.cluster_name) {
+        if !state.clusters.contains_key(&cluster_name) {
             return Err(UpdateClusterErrorModeled::ClusterNotFoundFault(
                 ClusterNotFoundFault {
-                    message: Some(format!("Cluster {} not found.", input.cluster_name)),
+                    message: Some(format!("Cluster {cluster_name} not found.")),
                 },
             )
             .into());
         }
+        // The engine a new `EngineVersion` must belong to is the one this update LEAVES
+        // the cluster on: the request's `Engine` when it names one, else the engine the
+        // cluster already runs. Resolved here rather than before the lock, so a version
+        // cannot be accepted against an engine the cluster is not running.
+        let effective_engine = engine.clone().or_else(|| {
+            state
+                .clusters
+                .get(&cluster_name)
+                .and_then(|cluster| cluster.engine.clone())
+        });
+        if let Some(message) = crate::state::engine_version_rejection(
+            effective_engine.as_deref(),
+            input.engine_version.as_deref(),
+        ) {
+            return Err(
+                UpdateClusterErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
         // A new ACL must exist before the cluster can point at it, the same resolution
         // `CreateCluster` applies to `ACLName`.
-        if let Some(acl_name) = input.acl_name.as_deref() {
+        if let Some(acl_name) = requested_acl_name.as_deref() {
             if !state.acls.contains_key(acl_name) {
                 return Err(UpdateClusterErrorModeled::ACLNotFoundFault(ACLNotFoundFault {
                     message: Some(format!("ACL {acl_name} not found.")),
@@ -282,7 +334,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let cluster = state
             .clusters
-            .get_mut(&input.cluster_name)
+            .get_mut(&cluster_name)
             .expect("the cluster was just resolved under the same lock");
 
         // Each supplied member replaces the stored one; an absent member leaves the
@@ -315,7 +367,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cluster.sns_topic_status = Some(sns_topic_status);
             applied += 1;
         }
-        if let Some(parameter_group_name) = input.parameter_group_name {
+        if let Some(parameter_group_name) = requested_parameter_group_name {
             cluster.parameter_group_name = Some(parameter_group_name);
             applied += 1;
         }
@@ -331,7 +383,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cluster.node_type = node_type;
             applied += 1;
         }
-        if let Some(engine) = input.engine {
+        if let Some(engine) = engine {
             cluster.engine = Some(engine);
             applied += 1;
         }
@@ -339,7 +391,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cluster.engine_version = Some(engine_version);
             applied += 1;
         }
-        if let Some(acl_name) = input.acl_name {
+        if let Some(acl_name) = requested_acl_name {
             cluster.acl_name = acl_name;
             applied += 1;
         }

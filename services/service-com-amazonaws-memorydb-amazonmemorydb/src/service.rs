@@ -45,6 +45,28 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The error code MemoryDB states a refused request value with.
+///
+/// This service's model declares NO `ValidationException` — for any operation — and
+/// declares `InvalidParameterValueException` ("The specified parameter value is not
+/// valid.", HTTP 400, awsQuery code `InvalidParameterValue`) on every write that takes
+/// a value. So a request this service refuses because a VALUE breaks a rule is stated
+/// with that shape, whether the rule was caught by the handler or by the boundary
+/// validator: a client branching on the error code sees ONE code for one logical
+/// failure rather than a modelled one from the handler and a synthetic one from the
+/// framework.
+///
+/// IN SCOPE, and the whole of it: a violation of a rule the MODEL declares on a VALUE —
+/// a `@pattern` (`UserName`, `AccessString`), a `@length` (a name, a filter's value
+/// list, a tag list), a `@range`, an enum's value set, `@uniqueItems`. Those are the
+/// same rules this service enforces itself one notch tighter (see
+/// `crate::state::resource_name_rejection` and `max_results_rejection`), which is why
+/// one code has to cover both. OUT OF SCOPE: a member that is absent altogether, left
+/// to the framework's own wording because nothing in the model or this service's
+/// recorded behaviour says which code MemoryDB answers that with; and an
+/// authentication refusal, which is the emulator's rather than this service's.
+const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValueException";
+
 /// The `com-amazonaws-memorydb-amazonmemorydb` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -97,16 +119,46 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
+        //
+        // A value that failed a rule the MODEL declares is the same logical failure as
+        // one that failed a rule only the service enforces — an out-of-range name, a
+        // value outside a declared pattern — so both are stated with
+        // [`INVALID_PARAMETER_VALUE`], the shape this service models for exactly that
+        // (see the constant). An absent required member is left to the framework's
+        // default wording: nothing in the model or the service's traces says which code
+        // MemoryDB answers that with, and guessing one would be worse than the
+        // framework's.
+        match refusal {
+            Refusal::Invalid(violations) => {
+                let value_violations: Vec<&smithy_server_runtime::Violation> = violations
+                    .iter()
+                    .filter(|violation| {
+                        !matches!(
+                            violation.kind,
+                            smithy_server_runtime::ViolationKind::MissingRequiredMember
+                        )
+                    })
+                    .collect();
+                if value_violations.is_empty() {
+                    return None;
+                }
+                Some(Refused {
+                    code: INVALID_PARAMETER_VALUE.to_string(),
+                    // Each violation already states the member it refused and the
+                    // requirement that member broke, so the message is those clauses
+                    // and nothing invented here.
+                    message: value_violations
+                        .iter()
+                        .map(|violation| violation.message())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                })
+            }
+            // Authentication is the emulator's, not this service's, to word.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

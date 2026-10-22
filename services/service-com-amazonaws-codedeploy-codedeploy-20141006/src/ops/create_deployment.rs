@@ -307,7 +307,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        if revision_location_is_empty(&revision) {
+        // The revision's own identity, which is also what refuses one that names
+        // nowhere to deploy from.
+        let Some(revision_key) = crate::state::revision_key(&revision) else {
             return Err(CreateDeploymentErrorModeled::InvalidRevisionException(
                 InvalidRevisionException {
                     message: Some(
@@ -318,7 +320,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        }
+        };
 
         let application_name = input.application_name;
         let requested_config = input.deployment_config_name;
@@ -346,6 +348,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let compute_platform = application.compute_platform.clone();
             let group_config = group.deployment_config_name.clone();
             let group_style = group.deployment_style.clone();
+            // What this deployment owes the original environment: a blue/green
+            // group that terminates its instances holds the deployment open for
+            // the wait it configured.
+            let (terminates_original_instances, termination_wait_millis) =
+                crate::state::termination_wait(group);
             // The deployment it ran its predecessor from, which is what CodeDeploy
             // reports as this deployment's `previousRevision`.
             let previous_revision = state
@@ -381,6 +388,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             let create_time_ms = crate::state::now_ms();
             let deployment_id = state.mint_deployment_id();
+            let used_revision = revision.clone();
             // `record_deployment` indexes it as the newest and drops the oldest
             // history past the store's retention bound.
             state.record_deployment(crate::state::Deployment {
@@ -389,6 +397,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 deployment_group_name: Some(deployment_group_name.clone()),
                 deployment_config_name,
                 revision: Some(revision),
+                revision_key: Some(revision_key.clone()),
                 previous_revision,
                 // The deployment has only just been asked for; the clock owes it
                 // its start and then its terminal status.
@@ -413,8 +422,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 start_time_ms: None,
                 complete_time_ms: None,
                 starts_at_ms: crate::state::deployment_start_due(create_time_ms),
-                completes_at_ms: crate::state::deployment_completion_due(create_time_ms),
+                completes_at_ms: crate::state::deployment_completion_due(create_time_ms)
+                    + termination_wait_millis,
+                terminates_original_instances,
+                termination_wait_millis,
+                instance_termination_wait_time_started: false,
             });
+            // Deploying a revision is also how CodeDeploy learns it: the
+            // application's registry records this use, registering the revision
+            // when nobody had registered it.
+            if let Some(application) = state.applications.get_mut(&application_name) {
+                application.record_revision_use(revision_key, used_revision, create_time_ms);
+            }
             Ok(deployment_id)
         })
         .ok_or_else(|| {
@@ -425,19 +444,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deployment_id: Some(outcome?),
         })
     }
-}
-
-/// Whether a `RevisionLocation` names nowhere to deploy from.
-///
-/// The model's `RevisionLocation` holds one location per `revisionType`
-/// (`smithy_query(query="shape",shape="RevisionLocation")`: s3Location,
-/// gitHubLocation, string, appSpecContent), and `revisionType` itself only says
-/// which of them to read. A revision carrying none of the four is what
-/// `InvalidRevisionException` describes; the stored record keeps the caller's
-/// own revision either way, so this inspects it without rewriting it.
-fn revision_location_is_empty(revision: &RevisionLocation) -> bool {
-    revision.s3_location.is_none()
-        && revision.git_hub_location.is_none()
-        && revision.string.is_none()
-        && revision.app_spec_content.is_none()
 }

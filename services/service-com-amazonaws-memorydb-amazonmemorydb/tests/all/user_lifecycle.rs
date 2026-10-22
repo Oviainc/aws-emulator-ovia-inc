@@ -12,9 +12,11 @@
 //!   name, access string, authentication type, password count and ARN;
 //! * a user's passwords are never reported: only `Authentication$PasswordCount`, whose
 //!   documented maximum is two, so a request carrying more passwords is refused;
-//! * a password is accepted exactly when it is printable ASCII, between 16 and 128
-//!   characters long, and carries none of `,` `"` `/` `@` — tested at each published
-//!   bound and one past it, and on punctuation the rule does NOT exclude;
+//! * a password is accepted exactly when it is printable ASCII and between 16 and 128
+//!   characters long — tested at each published bound and one past it, and on the
+//!   punctuation the Developer Guide's prose excludes but the service accepts;
+//! * a resource name is a case-insensitive identifier: the create echoes the folded
+//!   spelling and either spelling reads the one user back;
 //! * `AuthenticationMode.Type` and `AuthenticationMode.Passwords` must agree: a
 //!   password user needs passwords, an IAM user accepts none;
 //! * ACL membership is stored once (on the ACL) and reported on both sides, so
@@ -114,14 +116,18 @@ pub(crate) fn user_names(body: &Value) -> Vec<String> {
 #[tokio::test]
 async fn a_created_user_is_read_back_from_state() {
     let router = router();
-    // (user name, access string, AuthenticationMode, expected Authentication) — rows
-    // differ in authentication type, password count and access string.
-    let cases: Vec<(&str, &str, Value, Value)> = vec![
+    // (user name, access string, AuthenticationMode, expected Authentication, expected
+    // stored AccessString, expected MinimumEngineVersion) — rows differ in
+    // authentication type, password count, access string, the case the name was written
+    // in, and whether the access string already names its pub/sub channels.
+    let cases: Vec<(&str, &str, Value, Value, &str, &str)> = vec![
         (
             "one-password-user",
             FULL_ACCESS,
             password_mode(&[&password_of_length(MIN_PASSWORD_LEN)]),
             json!({ "Type": "password", "PasswordCount": 1 }),
+            FULL_ACCESS,
+            "6.2",
         ),
         (
             "two-password-user",
@@ -131,17 +137,29 @@ async fn a_created_user_is_read_back_from_state() {
                 &password_of_length(MAX_PASSWORD_LEN),
             ]),
             json!({ "Type": "password", "PasswordCount": 2 }),
+            // The service canonicalises the rule list, which always states the pub/sub
+            // channel permission.
+            "on ~app:* resetchannels +@read",
+            "6.2",
         ),
         (
             "IamUser1",
             "off ~* +@admin",
             json!({ "Type": "iam" }),
             json!({ "Type": "iam" }),
+            "off ~* resetchannels +@admin",
+            // IAM authentication arrived with engine version 7.0.
+            "7.0",
         ),
     ];
 
-    for (name, access_string, mode, expected_authentication) in &cases {
+    for (name, access_string, mode, expected_authentication, expected_access, expected_version) in
+        &cases
+    {
         let case = format!("create {name}");
+        // A MemoryDB resource name is a case-insensitive identifier: the service stores
+        // and reports the folded spelling.
+        let stored_name = name.to_ascii_lowercase();
         let created = ok(
             &router,
             "CreateUser",
@@ -157,13 +175,13 @@ async fn a_created_user_is_read_back_from_state() {
         let user = &created["User"];
         assert_eq!(
             user["Name"],
-            json!(name),
-            "case {case:?}: expected Name {name:?}, got {user}"
+            json!(stored_name),
+            "case {case:?}: expected Name {stored_name:?}, got {user}"
         );
         assert_eq!(
             user["AccessString"],
-            json!(access_string),
-            "case {case:?}: expected AccessString {access_string:?}, got {user}"
+            json!(expected_access),
+            "case {case:?}: expected AccessString {expected_access:?}, got {user}"
         );
         assert_eq!(
             user["Status"],
@@ -175,8 +193,15 @@ async fn a_created_user_is_read_back_from_state() {
             "case {case:?}: expected Authentication {expected_authentication}, got {user}"
         );
         assert_eq!(
+            user["MinimumEngineVersion"],
+            json!(expected_version),
+            "case {case:?}: expected MinimumEngineVersion {expected_version:?}, got {user}"
+        );
+        assert_eq!(
             user["ARN"],
-            json!(format!("arn:aws:memorydb:{REGION}:{ACCOUNT}:user/{name}")),
+            json!(format!(
+                "arn:aws:memorydb:{REGION}:{ACCOUNT}:user/{stored_name}"
+            )),
             "case {case:?}: the ARN must carry the request's region and the user name, \
              got {user}"
         );
@@ -195,19 +220,23 @@ async fn a_created_user_is_read_back_from_state() {
             );
         }
 
-        // The round trip: the describe reports exactly what the create persisted.
-        let described = ok(
-            &router,
-            "DescribeUsers",
-            &json!({ "UserName": name }),
-            &case,
-        )
-        .await;
-        assert_eq!(
-            described["Users"],
-            json!([user]),
-            "case {case:?}: the describe must answer with the stored user, got {described}"
-        );
+        // The round trip: the describe reports exactly what the create persisted, and
+        // finds the user under either spelling of its name.
+        for spelling in [*name, stored_name.as_str()] {
+            let described = ok(
+                &router,
+                "DescribeUsers",
+                &json!({ "UserName": spelling }),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                described["Users"],
+                json!([user]),
+                "case {case:?}: the describe of {spelling:?} must answer with the stored \
+                 user, got {described}"
+            );
+        }
     }
 
     // And the unfiltered listing holds every one of them, in name order, beside the
@@ -215,7 +244,7 @@ async fn a_created_user_is_read_back_from_state() {
     let listed = ok(&router, "DescribeUsers", &json!({}), "listing").await;
     let mut expected: Vec<String> = cases
         .iter()
-        .map(|(name, ..)| name.to_string())
+        .map(|(name, ..)| name.to_ascii_lowercase())
         .chain([DEFAULT_USER.to_string()])
         .collect();
     expected.sort();
@@ -226,9 +255,10 @@ async fn a_created_user_is_read_back_from_state() {
     );
 }
 
-/// A password is accepted exactly when it is printable ASCII, between
-/// [`MIN_PASSWORD_LEN`] and [`MAX_PASSWORD_LEN`] characters long, and carries none of
-/// `,` `"` `/` `@`. Each bound is exercised AT the bound and one past it.
+/// A password is accepted exactly when it is printable ASCII and between
+/// [`MIN_PASSWORD_LEN`] and [`MAX_PASSWORD_LEN`] characters long. Each bound is
+/// exercised AT the bound and one past it, and the punctuation the Developer Guide's
+/// prose excludes but the SERVICE accepts is exercised character by character.
 #[tokio::test]
 async fn a_password_is_accepted_only_when_it_meets_every_documented_rule() {
     let router = router();
@@ -236,24 +266,47 @@ async fn a_password_is_accepted_only_when_it_meets_every_documented_rule() {
     let at_max = password_of_length(MAX_PASSWORD_LEN);
     let below_min = password_of_length(MIN_PASSWORD_LEN - 1);
     let above_max = password_of_length(MAX_PASSWORD_LEN + 1);
-    // Punctuation the documented rule does NOT exclude, so it must be accepted: the
-    // printable ASCII graphic characters other than `,` `"` `/` `@`.
-    let punctuation = "Aa1!#$%^&*()-_=+[]{}|;:'<>.?~`\\$";
-    // (case, password, accepted) — rows differ in length, in which excluded character
-    // they carry, and in whether they are ASCII at all.
-    let cases: Vec<(&str, String, bool)> = vec![
-        ("at the minimum length", at_min.clone(), true),
-        ("at the maximum length", at_max, true),
-        ("one below the minimum length", below_min, false),
-        ("one above the maximum length", above_max, false),
-        ("accepted punctuation", punctuation.to_string(), true),
-        ("comma", format!("{at_min},comma"), false),
-        ("double quote", format!("{at_min}\"quote"), false),
-        ("forward slash", format!("{at_min}/slash"), false),
-        ("at sign", format!("{at_min}@sign"), false),
-        ("a control character", format!("{at_min}\tTab"), false),
-        ("a non-ASCII character", format!("{at_min}café"), false),
+    // Every printable ASCII graphic character, plus the space: the only character rule
+    // is that a password holds nothing outside this set.
+    let punctuation = "Aa1!#$%^&*()-_=+[]{}|;:'<>.?~`\\$,\"/@ ";
+    // (case, password, accepted) — rows differ in length, in which punctuation they
+    // carry, and in whether they are printable ASCII at all.
+    let mut cases: Vec<(String, String, bool)> = vec![
+        ("at the minimum length".to_string(), at_min.clone(), true),
+        ("at the maximum length".to_string(), at_max, true),
+        ("one below the minimum length".to_string(), below_min, false),
+        ("one above the maximum length".to_string(), above_max, false),
+        (
+            "every accepted character at once".to_string(),
+            punctuation.to_string(),
+            true,
+        ),
+        (
+            "a control character".to_string(),
+            format!("{at_min}\tTab"),
+            false,
+        ),
+        (
+            "a non-ASCII character".to_string(),
+            format!("{at_min}café"),
+            false,
+        ),
+        (
+            "the DEL control character".to_string(),
+            format!("{at_min}\u{7f}"),
+            false,
+        ),
     ];
+    // The punctuation the Developer Guide's prose says a password "cannot contain",
+    // which the service accepts: one row per character, so no one of them is excused
+    // by another.
+    for character in [',', '"', '/', '@', ' ', '\\'] {
+        cases.push((
+            format!("a password containing {character:?}"),
+            format!("{at_min}{character}x"),
+            true,
+        ));
+    }
 
     for (index, (case, password, accepted)) in cases.iter().enumerate() {
         let name = format!("pw-user-{index}");
@@ -468,7 +521,8 @@ async fn acl_membership_is_reflected_on_the_user() {
 async fn the_listing_pages_and_filters_over_every_user() {
     let router = router();
     // Names deliberately NOT created in sorted order, so a page order that follows the
-    // calls rather than the names fails.
+    // calls rather than the names fails. `IamFiltered` is written in mixed case: the
+    // service stores the folded spelling, which is what the listing reports.
     let names = ["user-d", "user-a", "user-c", "user-b", "IamFiltered"];
     for name in names {
         if name == "IamFiltered" {
@@ -496,7 +550,7 @@ async fn the_listing_pages_and_filters_over_every_user() {
     .await;
     let mut sorted: Vec<String> = names
         .iter()
-        .map(|name| name.to_string())
+        .map(|name| name.to_ascii_lowercase())
         // The built-in user the account already had pages with the created ones.
         .chain([DEFAULT_USER.to_string()])
         .collect();
@@ -582,8 +636,9 @@ async fn the_listing_pages_and_filters_over_every_user() {
 
     // A filter naming no property of `User`, or carrying no value at all, is refused
     // rather than silently answered with an unfiltered or empty page. The empty-values
-    // case is caught at the boundary (`FilterValueList` is `len 1..`), so it answers
-    // the framework's `ValidationException` rather than a modelled fault.
+    // case is caught at the boundary (`FilterValueList` is `len 1..`), and this service
+    // states a refused VALUE with the one error code it models for that, whether the
+    // rule was the model's or its own.
     for (case, filters, expected_code) in [
         (
             "unknown filter",
@@ -593,7 +648,7 @@ async fn the_listing_pages_and_filters_over_every_user() {
         (
             "filter with no values",
             json!([{ "Name": "UserName", "Values": [] }]),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
     ] {
         let (status, body) = call(&router, "DescribeUsers", &json!({ "Filters": filters })).await;

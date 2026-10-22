@@ -228,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account already had before any call — so the ARN of a built-in user resolves
         // here exactly as it does for `DescribeUsers`.
         state.settle(std::time::Instant::now());
-        state.ensure_builtin_users(&region);
+        state.ensure_builtins(&region);
 
         // Tags belong to a resource: an ARN that resolves to nothing is the modelled
         // refusal, never an empty tag list.

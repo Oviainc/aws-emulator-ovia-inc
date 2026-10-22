@@ -42,13 +42,16 @@ const PAST_THE_DELETION_SPAN: Duration = Duration::from_millis(900);
 
 /// One emulator: the shared engine, this service mounted on it, and the region every
 /// request is signed for.
-struct Emulator {
+///
+/// `pub(crate)` so the sibling suites of this test target drive the service exactly the
+/// way this one does, rather than each growing its own copy of the harness.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     region: String,
 }
 
 impl Emulator {
-    fn new(region: &str) -> Self {
+    pub(crate) fn new(region: &str) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(engine));
@@ -59,7 +62,7 @@ impl Emulator {
     }
 
     /// Dispatch one request and return its status and parsed JSON body.
-    async fn send(&self, method: &str, path: &str, body: Option<&Value>) -> (u16, Value) {
+    pub(crate) async fn send(&self, method: &str, path: &str, body: Option<&Value>) -> (u16, Value) {
         let payload = body
             .map(|body| serde_json::to_vec(body).expect("a serializable body"))
             .unwrap_or_default();
@@ -87,7 +90,7 @@ impl Emulator {
     }
 
     /// `CreateDomain`, asserting it was accepted, and the created domain's id.
-    async fn create_domain(&self, body: &Value) -> Value {
+    pub(crate) async fn create_domain(&self, body: &Value) -> Value {
         let (status, created) = self.send("POST", "/domain", Some(body)).await;
         assert_eq!(status, 201, "CreateDomain {body}: got {created:?}");
         created
@@ -95,7 +98,7 @@ impl Emulator {
 }
 
 /// The wire error code (`__type`), without any namespace prefix.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -106,7 +109,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// A required string member of a response.
-fn string_at(body: &Value, member: &str) -> String {
+pub(crate) fn string_at(body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("member {member} must be a string in {body:?}"))
@@ -394,10 +397,13 @@ async fn create_domain_persists_every_member_and_get_domain_reads_it_back() {
             request.get("name").and_then(Value::as_str),
             "case {case:?}: the stored name is the one supplied"
         );
+        // The tag map is ALWAYS reported — empty for a domain created without tags,
+        // never absent.
+        let stored_tags = request.get("tags").cloned().unwrap_or_else(|| json!({}));
         assert_eq!(
             fetched.get("tags"),
-            request.get("tags"),
-            "case {case:?}: GetDomain must report the tags CreateDomain stored"
+            Some(&stored_tags),
+            "case {case:?}: GetDomain must report the tags CreateDomain stored, got {fetched:?}"
         );
     }
 
@@ -1020,8 +1026,19 @@ async fn store_growth_is_bounded_and_refused_with_the_modelled_errors() {
 #[tokio::test]
 async fn delete_domain_moves_the_domain_to_deleting_then_purges_it() {
     let emulator = Emulator::new("us-west-2");
+    // A domain with a web application is the case whose deletion cannot finish inside
+    // the call (the Identity Center application it owns lives in another service), so
+    // it is the one that passes through the non-terminal `DELETING`.
     let created = emulator
-        .create_domain(&json!({ "name": "clinic-doomed", "tags": { "env": "test" } }))
+        .create_domain(&json!({
+            "name": "clinic-doomed",
+            "tags": { "env": "test" },
+            "webAppSetupConfiguration": {
+                "ehrRole": "arn:aws:iam::000000000000:role/ehr-operations",
+                "idcInstanceId": "ssoins-72230ed02aa4b4ea",
+                "idcRegion": "us-east-1",
+            },
+        }))
         .await;
     let domain_id = string_at(&created, "domainId");
     let arn = string_at(&created, "arn");

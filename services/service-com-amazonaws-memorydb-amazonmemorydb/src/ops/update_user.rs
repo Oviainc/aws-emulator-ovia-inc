@@ -157,20 +157,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx);
+        // A user name is a case-insensitive identifier, so the name this request
+        // updates is folded exactly as the store is keyed.
+        let user_name = crate::state::fold_name(&input.user_name);
         let now = std::time::Instant::now();
         let mut state = state.lock();
         state.settle(now);
-        // The users the account ALREADY HAD before any call (MemoryDB's built-in
-        // `default` user) are materialised on first touch, exactly as `DescribeUsers`
-        // does, so an update naming one of them finds it instead of reporting it absent.
-        state.ensure_builtin_users(&region);
+        // The resources the account ALREADY HAD before any call (MemoryDB's built-in
+        // `default` user and the `open-access` ACL holding it) are materialised on first
+        // touch, exactly as `DescribeUsers` does, so an update naming one of them finds
+        // it instead of reporting it absent.
+        state.ensure_builtins(&region);
+
+        // The user every MemoryDB account already has is the service's, not the
+        // caller's: neither its access string nor its authentication can be changed.
+        // The recorded behaviour is explicit for this operation — an `UpdateUser`
+        // naming the built-in `default` user answers
+        // `InvalidParameterValueException`, exactly as a `DeleteUser` naming it does.
+        if user_name == crate::state::DEFAULT_USER_NAME {
+            return Err(UpdateUserErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "User {user_name} is a default user and cannot be modified."
+                    )),
+                },
+            )
+            .into());
+        }
 
         // WHICH USER FIRST, then what the request asks of it: a request naming a user
         // state does not hold is answered not-found whatever else it carries, rather
         // than reporting a parameter problem for a resource that does not exist.
-        let Some(stored) = state.users.get(&input.user_name) else {
+        let Some(stored) = state.users.get(&user_name) else {
             return Err(UpdateUserErrorModeled::UserNotFoundFault(UserNotFoundFault {
-                message: Some(format!("User {} not found.", input.user_name)),
+                message: Some(format!("User {user_name} not found.")),
             })
             .into());
         };
@@ -245,18 +265,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // second copy of it.
         let acl_names = state
             .user_membership()
-            .remove(input.user_name.as_str())
+            .remove(user_name.as_str())
             .unwrap_or_default();
         let user = state
             .users
-            .get_mut(&input.user_name)
+            .get_mut(&user_name)
             .expect("the user was just resolved under the same lock");
 
         // Each supplied member replaces the stored one; an absent member leaves the
         // stored value alone, so an update is a patch and never a re-create. Every
         // refusal is already behind us, so from here the update is applied in full.
         if let Some(access_string) = input.access_string {
-            user.access_string = access_string;
+            // The service canonicalises the ACL rule list before storing it, through
+            // the one rule `CreateUser` stores it with, so the form a user reports does
+            // not depend on which call last wrote it.
+            user.access_string = crate::state::normalise_access_string(&access_string);
         }
         if let Some((authentication_type, password_count)) = authentication {
             // Only the password COUNT is kept: the passwords themselves are secrets

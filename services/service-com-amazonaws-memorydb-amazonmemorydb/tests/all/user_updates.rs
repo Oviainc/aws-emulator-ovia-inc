@@ -20,6 +20,8 @@
 //! * `AuthenticationMode` is refused on an update exactly where it is refused on a
 //!   create — the same values, the same modelled error codes — and a refused update
 //!   leaves the stored user exactly as it was;
+//! * the user every account ALREADY HAD is the service's, not the caller's: an update
+//!   naming it is refused and it keeps its documented access string;
 //! * a request naming no member to change is the modelled
 //!   `InvalidParameterCombinationException`, and a name state does not hold is the
 //!   modelled `UserNotFoundFault` — whatever else the request carries, the user is
@@ -47,9 +49,13 @@ const REGION: &str = "us-west-2";
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// The built-in user MemoryDB creates in every account
-/// (`crate::state::DEFAULT_USER_NAME`): a user that is in state without any create, so
-/// an update must find it like any other.
+/// (`crate::state::DEFAULT_USER_NAME`): a user that is in state without any create, and
+/// the service's rather than the caller's, so an update naming it is refused.
 const DEFAULT_USER: &str = "default";
+
+/// The access string the built-in user carries
+/// (`crate::state::DEFAULT_USER_ACCESS_STRING`), which no update can move.
+const DEFAULT_USER_ACCESS_STRING: &str = "on ~* &* +@all";
 
 /// Longer than the span the service keeps a changed resource in its transient status
 /// (`crate::state::SETTLE_AFTER`), so a call made after this sleep is owed the terminal
@@ -92,7 +98,9 @@ async fn an_update_patches_only_the_members_it_supplies() {
             created_access_string: FULL_ACCESS,
             created_mode: password_mode(&[&one_password]),
             update: json!({ "AccessString": "on ~app:* +@read" }),
-            expected_access_string: "on ~app:* +@read",
+            // The service canonicalises the rule list, which always states the pub/sub
+            // channel permission.
+            expected_access_string: "on ~app:* resetchannels +@read",
             // Untouched: the request named no authentication mode.
             expected_authentication: password_authentication(1),
         },
@@ -101,8 +109,9 @@ async fn an_update_patches_only_the_members_it_supplies() {
             created_access_string: "on ~metrics:* +get",
             created_mode: password_mode(&[&one_password]),
             update: json!({ "AuthenticationMode": { "Type": "iam" } }),
-            // Untouched: the request named no access string.
-            expected_access_string: "on ~metrics:* +get",
+            // Untouched: the request named no access string, so the user keeps the
+            // canonical form the create stored.
+            expected_access_string: "on ~metrics:* resetchannels +get",
             expected_authentication: json!({ "Type": "iam" }),
         },
         Patch {
@@ -115,7 +124,7 @@ async fn an_update_patches_only_the_members_it_supplies() {
                     "Passwords": [one_password.clone(), other_password.clone()],
                 },
             }),
-            expected_access_string: "off ~* -@all",
+            expected_access_string: "off ~* resetchannels -@all",
             expected_authentication: password_authentication(2),
         },
         Patch {
@@ -264,9 +273,9 @@ async fn an_update_refuses_every_authentication_mode_a_create_refuses() {
             Some("InvalidParameterValueException"),
         ),
         (
-            "a password carrying an excluded character",
+            "a password carrying punctuation the service accepts",
             password_mode(&[&format!("{password}@host")]),
-            Some("InvalidParameterValueException"),
+            None,
         ),
         (
             "a password user with no passwords",
@@ -392,29 +401,47 @@ async fn an_update_needs_an_existing_user_in_a_valid_state() {
          {status} with {body}"
     );
 
-    // The built-in user the account already had is in state without any create, so an
-    // update finds it like any other user.
+    // The built-in user the account already had is the SERVICE's, not the caller's: an
+    // update naming it is refused whatever it asks for, and it keeps its documented
+    // access string.
     let case = "the built-in user";
-    let updated = ok(
-        &router,
-        "UpdateUser",
-        &json!({ "UserName": DEFAULT_USER, "AccessString": "on ~* +@read" }),
-        case,
-    )
-    .await;
+    for spelling in [DEFAULT_USER, "Default"] {
+        let (status, body) = call(
+            &router,
+            "UpdateUser",
+            &json!({ "UserName": spelling, "AccessString": "on ~* +@read" }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidParameterValueException"),
+            "case {case:?}: {spelling:?} must refuse the update, got {status} with {body}"
+        );
+    }
+    let described = describe_user(&router, DEFAULT_USER, case).await;
     assert_eq!(
-        updated["User"]["AccessString"],
-        json!("on ~* +@read"),
-        "case {case:?}: expected the built-in user to take the new access string, got \
-         {updated}"
+        described["AccessString"],
+        json!(DEFAULT_USER_ACCESS_STRING),
+        "case {case:?}: the refused update must leave the built-in user alone, got \
+         {described}"
     );
 
     // A second update before the first has settled: the user is not in a valid state.
+    let name = "settling-user";
+    create_user(&router, name).await;
+    let case = "an update that settles";
+    ok(
+        &router,
+        "UpdateUser",
+        &json!({ "UserName": name, "AccessString": "on ~* +@read" }),
+        case,
+    )
+    .await;
     let case = "an update while modifying";
     let (status, body) = call(
         &router,
         "UpdateUser",
-        &json!({ "UserName": DEFAULT_USER, "AccessString": FULL_ACCESS }),
+        &json!({ "UserName": name, "AccessString": FULL_ACCESS }),
     )
     .await;
     assert_eq!(
@@ -426,10 +453,10 @@ async fn an_update_needs_an_existing_user_in_a_valid_state() {
         "InvalidUserStateFault",
         "case {case:?}: expected the modelled invalid-state fault, got {body}"
     );
-    let described = describe_user(&router, DEFAULT_USER, case).await;
+    let described = describe_user(&router, name, case).await;
     assert_eq!(
         described["AccessString"],
-        json!("on ~* +@read"),
+        json!("on ~* resetchannels +@read"),
         "case {case:?}: the refused update must not have changed the stored user, got \
          {described}"
     );
@@ -440,7 +467,7 @@ async fn an_update_needs_an_existing_user_in_a_valid_state() {
     let updated = ok(
         &router,
         "UpdateUser",
-        &json!({ "UserName": DEFAULT_USER, "AccessString": FULL_ACCESS }),
+        &json!({ "UserName": name, "AccessString": FULL_ACCESS }),
         case,
     )
     .await;

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateACL
-//! IMPLEMENTED: inserts the ACL into [`crate::state`] keyed by `ACLName` and answers
-//! with the stored record, so `DescribeACLs` reports exactly what was persisted.
+//! IMPLEMENTED: inserts the ACL into [`crate::state`] keyed by its FOLDED `ACLName` (a
+//! MemoryDB resource name is a case-insensitive identifier, refused outright when it
+//! breaks the service's name rule) and answers with the stored record, so
+//! `DescribeACLs` reports exactly what was persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -156,6 +158,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let region = crate::state::request_region(ctx);
+        // An ACL name is the same case-insensitive identifier a user name is, bounded
+        // by the same rule, so it is checked and folded before anything is persisted.
+        if let Some(message) = crate::state::resource_name_rejection("ACLName", &input.acl_name) {
+            return Err(CreateACLErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // The request's tag keys are refused before the ACL is created: `Tag$Key` may
         // not be null, and the `aws:` prefix is reserved for AWS.
         if let Some(message) = crate::state::tags_rejection(input.tags.as_ref()) {
@@ -166,14 +178,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        let acl_name = crate::state::fold_name(&input.acl_name);
+        // `UserNames` is `len 1..` — a minimum with no maximum — and it SIZES the stored
+        // membership, so the list is bounded before a single name is folded, exactly as
+        // `UpdateACL` bounds the lists it takes: the two write paths of one membership
+        // refuse the same sizes.
+        let requested_members = input.user_names.unwrap_or_default();
+        if let Some(message) =
+            crate::state::member_count_rejection("UserNames", requested_members.len())
+        {
+            return Err(CreateACLErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // `UserNames` names users, so each entry is folded the way the user store is
+        // keyed: a member written in mixed case is the same user as the lower-case
+        // spelling, on both sides of the membership. A name listed twice is refused
+        // rather than stored twice, the same refusal `UpdateACL` makes.
+        let mut user_names: Vec<String> = Vec::with_capacity(requested_members.len());
+        for name in &requested_members {
+            let name = crate::state::fold_name(name);
+            if user_names.contains(&name) {
+                return Err(CreateACLErrorModeled::DuplicateUserNameFault(
+                    DuplicateUserNameFault {
+                        message: Some(format!("UserNames names user {name} more than once.")),
+                    },
+                )
+                .into());
+            }
+            user_names.push(name);
+        }
         let now = std::time::Instant::now();
         let mut state = state.lock();
         state.settle(now);
+        // The resources the account ALREADY HAD before any call — the built-in
+        // `default` user and the `open-access` ACL holding it — are materialised on
+        // first touch, so a create naming one of them collides with it instead of
+        // replacing it.
+        state.ensure_builtins(&region);
 
-        if state.acls.contains_key(&input.acl_name) {
+        if state.acls.contains_key(&acl_name) {
             return Err(CreateACLErrorModeled::ACLAlreadyExistsFault(
                 ACLAlreadyExistsFault {
-                    message: Some(format!("ACL with name {} already exists.", input.acl_name)),
+                    message: Some(format!("ACL with name {acl_name} already exists.")),
                 },
             )
             .into());
@@ -191,14 +241,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let arn = crate::state::acl_arn(&region, &input.acl_name);
+        let arn = crate::state::acl_arn(&region, &acl_name);
         let acl = crate::state::StoredAcl {
-            name: input.acl_name.clone(),
+            name: acl_name.clone(),
             // A newly created ACL is not active yet: it reports `creating`, and the
             // clock owes it `active` once `SETTLE_AFTER` has passed.
             status: crate::state::acl_status::CREATING.to_string(),
             settles_at: Some(now + crate::state::SETTLE_AFTER),
-            user_names: input.user_names.unwrap_or_default(),
+            user_names,
             arn: arn.clone(),
         };
 
@@ -208,9 +258,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.set_tags(&arn, crate::state::tag_map(input.tags.as_ref()));
         // No cluster can reference an ACL that did not exist until now, but the list
         // is derived rather than assumed empty, so one rule computes `ACL$Clusters`.
-        let clusters = state.clusters_using_acl(&input.acl_name);
-        let response = acl.to_api(clusters);
-        state.acls.insert(input.acl_name, acl);
+        let clusters = state.clusters_using_acl(&acl_name);
+        // `ACL$MinimumEngineVersion` is derived from the members, through the one rule
+        // `DescribeACLs` reads it with.
+        let minimum_engine_version = state.acl_minimum_engine_version(&acl.user_names);
+        let response = acl.to_api(clusters, minimum_engine_version);
+        state.acls.insert(acl_name, acl);
         Ok(CreateACLOutput {
             acl: Some(response),
         })

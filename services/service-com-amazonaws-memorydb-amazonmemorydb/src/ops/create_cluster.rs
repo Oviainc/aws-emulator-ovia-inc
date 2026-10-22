@@ -250,6 +250,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the MemoryDB store is unreachable on this engine",
             ));
         };
+        // A cluster name is the same case-insensitive identifier a user or ACL name is,
+        // bounded by the same service rule, so it is checked and folded before anything
+        // is built or persisted.
+        if let Some(message) =
+            crate::state::resource_name_rejection("ClusterName", &input.cluster_name)
+        {
+            return Err(CreateClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        let cluster_name = crate::state::fold_name(&input.cluster_name);
+        // `ACLName` names an ACL, so it is bounded by the same name rule before it is
+        // resolved: a malformed name is a VALUE the service refuses, not an ACL that
+        // happens not to exist.
+        if let Some(message) = crate::state::resource_name_rejection("ACLName", &input.acl_name) {
+            return Err(CreateClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // The engine the cluster runs, checked against the catalog this service
+        // publishes. `Engine` is an enum-like VALUE rather than a resource name, so it
+        // is compared exactly as the request spelled it: an engine this service does not
+        // run is a value it cannot serve, and a version belonging to ANOTHER engine is a
+        // combination that names no engine version at all.
+        let engine = input.engine.clone();
+        if let Some(message) = crate::state::engine_rejection(engine.as_deref()) {
+            return Err(CreateClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        if let Some(message) = crate::state::engine_version_rejection(
+            engine.as_deref(),
+            input.engine_version.as_deref(),
+        ) {
+            return Err(
+                CreateClusterErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
         let number_of_shards = input.num_shards.unwrap_or(crate::state::DEFAULT_NUM_SHARDS);
         let num_replicas_per_shard = input
             .num_replicas_per_shard
@@ -307,29 +359,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let port = input.port.unwrap_or(crate::state::DEFAULT_PORT);
         let created_at = std::time::SystemTime::now();
-        let arn = crate::state::cluster_arn(&region, &input.cluster_name);
+        let arn = crate::state::cluster_arn(&region, &cluster_name);
         // The layout is laid out BEFORE the store is locked, so no other caller waits
         // on this request's bounded-but-not-free work.
         let shards = crate::state::build_shards(
             &region,
-            &input.cluster_name,
+            &cluster_name,
             number_of_shards,
             num_replicas_per_shard,
             port,
             created_at,
         );
+        // The names this request POINTS AT are folded the way their own stores are
+        // keyed, so a reference written in mixed case resolves to the one resource.
+        let acl_name = crate::state::fold_name(&input.acl_name);
+        let parameter_group_name = input
+            .parameter_group_name
+            .as_deref()
+            .map(crate::state::fold_name);
 
         let now = std::time::Instant::now();
         let mut state = state.lock();
         state.settle(now);
+        // The ACLs the account ALREADY HAD before any call — MemoryDB's built-in
+        // `open-access` ACL — are materialised on first touch, so a cluster created
+        // with it resolves instead of being refused as not found.
+        state.ensure_builtins(&region);
 
-        if state.clusters.contains_key(&input.cluster_name) {
+        if state.clusters.contains_key(&cluster_name) {
             return Err(CreateClusterErrorModeled::ClusterAlreadyExistsFault(
                 ClusterAlreadyExistsFault {
-                    message: Some(format!(
-                        "Cluster with name {} already exists.",
-                        input.cluster_name
-                    )),
+                    message: Some(format!("Cluster with name {cluster_name} already exists.")),
                 },
             )
             .into());
@@ -350,15 +410,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // The cluster's access control list must already exist: `ACLName` names a
         // resource, so an unknown one is resolved against state, not accepted.
-        if !state.acls.contains_key(&input.acl_name) {
+        if !state.acls.contains_key(&acl_name) {
             return Err(CreateClusterErrorModeled::ACLNotFoundFault(ACLNotFoundFault {
-                message: Some(format!("ACL {} not found.", input.acl_name)),
+                message: Some(format!("ACL {acl_name} not found.")),
             })
             .into());
         }
 
         let cluster = crate::state::StoredCluster {
-            name: input.cluster_name.clone(),
+            name: cluster_name.clone(),
             region: region.clone(),
             description: input.description,
             // A cluster AWS has only just accepted is not serving yet: it reports
@@ -369,9 +429,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             node_type: input.node_type,
             number_of_shards,
             num_replicas_per_shard,
-            acl_name: input.acl_name,
+            acl_name,
             multi_region_cluster_name: input.multi_region_cluster_name,
-            parameter_group_name: input.parameter_group_name,
+            parameter_group_name,
             subnet_group_name: input.subnet_group_name,
             security_group_ids: input.security_group_ids.unwrap_or_default(),
             maintenance_window: input.maintenance_window,
@@ -386,17 +446,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|_| crate::state::SNS_TOPIC_ACTIVE.to_string()),
             tls_enabled: input.tls_enabled,
             kms_key_id: input.kms_key_id,
-            engine: input.engine,
+            engine,
             engine_version: input.engine_version,
             auto_minor_version_upgrade: input.auto_minor_version_upgrade,
             data_tiering: input.data_tiering,
             network_type: input.network_type,
             ip_discovery: input.ip_discovery,
             port,
-            endpoint_address: crate::state::cluster_endpoint_address(
-                &region,
-                &input.cluster_name,
-            ),
+            endpoint_address: crate::state::cluster_endpoint_address(&region, &cluster_name),
             arn: arn.clone(),
             shards,
             created_at,
@@ -409,7 +466,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CreateCluster` has no `ShowShardDetails` member, so the shards it just laid
         // out are reported here; `DescribeClusters` gates them on that flag.
         let response = cluster.to_api(true);
-        state.clusters.insert(input.cluster_name, cluster);
+        state.clusters.insert(cluster_name, cluster);
         Ok(CreateClusterOutput {
             cluster: Some(response),
         })

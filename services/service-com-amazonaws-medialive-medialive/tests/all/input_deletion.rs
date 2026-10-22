@@ -347,11 +347,15 @@ async fn deleting_an_unknown_input_is_not_found() {
 /// Rule: the resources an input references report what is CURRENTLY using them
 /// (`InputSecurityGroup$Inputs` is "The list of inputs currently using this
 /// Input Security Group"; `SdiSource$Inputs` is "The list of inputs that are
-/// currently using this SDI source"), so a deleted input is no longer one of
-/// their users and a resource left with none goes back to `IDLE`.
+/// currently using this SDI source"), so an input whose deletion has been
+/// accepted — in the transient `DELETING` state as much as in the terminal
+/// `DELETED` one — is no longer one of their users, and a resource left with
+/// none goes back to `IDLE`.
 ///
 /// The rows span the two resource kinds an input references by id, because the
-/// rule is about deletion ending a reference, not about either one of them.
+/// rule is about deletion ending a reference, not about either one of them, and
+/// each is read both inside the `DELETING` window and after the clock has
+/// settled the input into `DELETED`.
 #[tokio::test]
 async fn a_deleted_input_stops_using_the_resources_it_referenced() {
     let router = medialive();
@@ -364,7 +368,7 @@ async fn a_deleted_input_stops_using_the_resources_it_referenced() {
     )
     .await;
     assert_eq!(
-        status, 200,
+        status, 201,
         "CreateInputSecurityGroup: got {status}: {group}"
     );
     let group_id = group["securityGroup"]["id"]
@@ -436,6 +440,33 @@ async fn a_deleted_input_stops_using_the_resources_it_referenced() {
 
     let (status, deleted) = delete_input(&router, &input_id).await;
     assert_eq!(status, 200, "DeleteInput: got {status}: {deleted}");
+
+    // The reference ends when the DELETE is ACCEPTED, not when the clock settles
+    // it: while the input is still in the transient `DELETING` state it is
+    // already no longer "currently using" either resource.
+    assert_eq!(
+        state_of(&router, "referencing input", &input_id).await,
+        "DELETING",
+        "expected the input to be in the transient state the delete starts"
+    );
+    for (case, uri, member) in &referenced {
+        let (status, read) = call(&router, "GET", uri, None).await;
+        assert_eq!(status, 200, "case {case:?}: got {status}: {read}");
+        let body = member.map_or_else(|| read.clone(), |name| read[name].clone());
+        assert_eq!(
+            body["state"],
+            json!("IDLE"),
+            "case {case:?}: expected IDLE as soon as the delete was accepted, got {:?}",
+            body["state"]
+        );
+        assert_eq!(
+            body["inputs"],
+            json!([]),
+            "case {case:?}: expected an input being deleted to stop being a current user, got {:?}",
+            body["inputs"]
+        );
+    }
+
     wait_for_the_clock();
     assert_eq!(
         state_of(&router, "referencing input", &input_id).await,
@@ -459,5 +490,231 @@ async fn a_deleted_input_stops_using_the_resources_it_referenced() {
             "case {case:?}: expected a deleted input to stop being a current user, got {:?}",
             body["inputs"]
         );
+    }
+}
+
+/// Rule: `DeleteInput` answers with the deleted input's own representation — the
+/// flat projection `DescribeInputResponse` models, carrying the `State` the
+/// delete just put the input in — not an empty body, so a delete-then-wait flow
+/// reads its starting state straight off the delete.
+///
+/// The rows differ along what the rule generalises over: the SHAPE of the input
+/// being deleted (which per-pipeline list its `InputType` family ingests
+/// through, how many entries it has, which optional members it carries, whether
+/// it has tags or a security group), because the rule is about projecting
+/// whatever input was deleted rather than about any one input type. Each row is
+/// checked member by member against what `DescribeInput` reported for the same
+/// input immediately before the delete — identical but for `State`.
+#[tokio::test]
+async fn deleting_an_input_answers_with_the_deleted_input() {
+    // Every member `DescribeInputResponse` declares
+    // (`smithy_query(query="operation", operation="DescribeInput")`), as the
+    // wire names them; the ones a row does not set are reported empty or absent,
+    // which is itself part of the projection.
+    const ALWAYS_REPORTED: [&str; 15] = [
+        "arn",
+        "id",
+        "name",
+        "type",
+        "state",
+        "securityGroups",
+        "destinations",
+        "inputClass",
+        "inputNetworkLocation",
+        "inputSourceType",
+        "sources",
+        "mediaConnectFlows",
+        "inputDevices",
+        "attachedChannels",
+        "inputPartnerIds",
+    ];
+
+    // (case, the CreateInput body)
+    let table: [(&str, Value); 5] = [
+        (
+            "rtmp push with two destinations, a security group and tags",
+            json!({
+                "name": "push-deleted",
+                "type": "RTMP_PUSH",
+                "destinations": [{ "streamName": "live/a" }, { "streamName": "live/b" }],
+                "tags": { "env": "test" },
+            }),
+        ),
+        (
+            "url pull with one source",
+            json!({
+                "name": "pull-deleted",
+                "type": "URL_PULL",
+                "sources": [source("https://example.com/a.m3u8")],
+            }),
+        ),
+        (
+            "mediaconnect with a flow and a role",
+            json!({
+                "name": "flow-deleted",
+                "type": "MEDIACONNECT",
+                "mediaConnectFlows": [
+                    { "flowArn": "arn:aws:mediaconnect:us-west-2:111122223333:flow:1:a" },
+                ],
+                "roleArn": "arn:aws:iam::111122223333:role/MediaLiveAccessRole",
+            }),
+        ),
+        (
+            "on-premises sdi input",
+            json!({
+                "name": "sdi-deleted",
+                "type": "SDI",
+                "sdiSources": ["sdi-a", "sdi-b"],
+                "inputNetworkLocation": "ON_PREMISES",
+            }),
+        ),
+        (
+            "an input carrying nothing but a name and a type",
+            json!({ "name": "bare", "type": "URL_PULL" }),
+        ),
+    ];
+
+    for (case, body) in table {
+        let router = medialive();
+        let created = create_input(&router, case, body).await;
+        let id = created["id"].as_str().unwrap_or_default().to_string();
+
+        // What the reader says about the input one instant before the delete.
+        let (status, before) = describe_input(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeInput: expected 200, got {status}: {before}"
+        );
+        assert_eq!(
+            before["state"],
+            json!("DETACHED"),
+            "case {case:?}: expected a detached input before the delete, got {:?}",
+            before["state"]
+        );
+
+        let (status, deleted) = delete_input(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DeleteInput: expected 200, got {status}: {deleted}"
+        );
+
+        // The body is the input, not an empty object.
+        assert!(
+            deleted.as_object().is_some_and(|members| !members.is_empty()),
+            "case {case:?}: expected the deleted input's representation, got {deleted}"
+        );
+        assert_eq!(
+            deleted["state"],
+            json!("DELETING"),
+            "case {case:?}: expected the delete to report the state it just entered, got {:?}",
+            deleted["state"]
+        );
+        for member in ALWAYS_REPORTED {
+            assert!(
+                !deleted[member].is_null(),
+                "case {case:?}: expected the delete to report {member}, got {deleted}"
+            );
+            if member != "state" {
+                assert_eq!(
+                    deleted[member], before[member],
+                    "case {case:?}: expected the delete's {member} to be the input's own {:?}, got {:?}",
+                    before[member], deleted[member]
+                );
+            }
+        }
+        // Every member the reader reports, the delete reports identically —
+        // `State` excepted, which the delete moved.
+        for (member, value) in before.as_object().expect("the describe body is an object") {
+            if member == "state" {
+                continue;
+            }
+            assert_eq!(
+                &deleted[member], value,
+                "case {case:?}: expected the delete to report the same {member} as the reader, got {:?}",
+                deleted[member]
+            );
+        }
+
+        // The body was not assembled out of thin air: the reader agrees the input
+        // is DELETING, and once the clock has run both the reader and a repeated
+        // delete report the terminal DELETED.
+        assert_eq!(
+            state_of(&router, case, &id).await,
+            "DELETING",
+            "case {case:?}: expected the reader to agree the input is DELETING"
+        );
+        wait_for_the_clock();
+        let (status, again) = delete_input(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected a repeated delete to succeed, got {status}: {again}"
+        );
+        assert_eq!(
+            again["state"],
+            json!("DELETED"),
+            "case {case:?}: expected a repeated delete to report the terminal DELETED, got {:?}",
+            again["state"]
+        );
+        assert_eq!(
+            again["id"], deleted["id"],
+            "case {case:?}: expected a repeated delete to report the same input, got {:?}",
+            again["id"]
+        );
+    }
+}
+
+/// Rule: a refused `DeleteInput` answers with its modelled error and no input
+/// representation at all — the body of a success is the deleted input, so a
+/// refusal must not carry one.
+#[tokio::test]
+async fn a_refused_delete_carries_no_input() {
+    let router = medialive();
+    let created = create_input(
+        &router,
+        "attached",
+        json!({
+            "name": "attached",
+            "type": "URL_PULL",
+            "sources": [source("https://example.com/a.m3u8")],
+        }),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap_or_default().to_string();
+
+    let (status, channel) = call(
+        &router,
+        "POST",
+        "/prod/channels",
+        Some(json!({
+            "name": "attaching",
+            "inputAttachments": [{ "inputId": id, "inputAttachmentName": "slot-0" }],
+        })),
+    )
+    .await;
+    assert_eq!(status, 201, "CreateChannel: expected 201, got {status}: {channel}");
+
+    // (case, the id to delete, the expected status and error code)
+    let table: [(&str, &str, u16, &str); 2] = [
+        ("a channel attaches it", id.as_str(), 409, "ConflictException"),
+        ("no input has that id", "9999999", 404, "NotFoundException"),
+    ];
+
+    for (case, target, expected_status, expected_code) in table {
+        let (status, body) = delete_input(&router, target).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected {expected_status}, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(status, &body),
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
+        );
+        for member in ["id", "arn", "state"] {
+            assert!(
+                body[member].is_null(),
+                "case {case:?}: expected a refusal to carry no {member}, got {body}"
+            );
+        }
     }
 }

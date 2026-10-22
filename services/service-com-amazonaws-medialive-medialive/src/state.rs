@@ -14,8 +14,10 @@
 //!
 //! The input security group lifecycle lives here too: one
 //! [`InputSecurityGroupRecord`] per created group and the counter that mints its
-//! `Id`. A group's `State`, `Inputs` and `Channels` are derived from the rest of
-//! the state on every read, never recorded at create time.
+//! `Id`. A group's `Inputs` and `Channels` are derived from the rest of the
+//! state on every read, never recorded at create time, and so is its `State` —
+//! out of what uses the group and out of whether `DeleteInputSecurityGroup` has
+//! deleted it.
 //!
 //! A delete never drops a record: a deleted channel, input, input security group
 //! or SdiSource keeps its record in the terminal `DELETED` state its own state
@@ -741,6 +743,37 @@ pub struct EventBridgeRuleTemplateGroupRecord {
     pub modified_at: SystemTime,
 }
 
+/// Which `State` an input security group projection reports — the one member
+/// [`ComAmazonawsMedialiveMedialiveState::input_security_group_description`] and
+/// [`ComAmazonawsMedialiveMedialiveState::input_security_group_usage_description`]
+/// differ by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupStateView {
+    /// The terminal `DELETED` once the group has been deleted, and otherwise the
+    /// state its users imply: what every READ of the group reports.
+    Terminal,
+    /// The state the group's users imply, whether or not the group has been
+    /// deleted: what the recorded `DeleteInputSecurityGroup` response carries.
+    ///
+    /// Both recorded rows this view answers, from replaying the
+    /// `medialive-input-security-group-lifecycle` fixture — the only evidence
+    /// for it, so it is recorded here rather than left to be rediscovered:
+    ///
+    /// * `#task#6`, the delete of a group nothing uses: reporting the terminal
+    ///   `DELETED` diverged at `$.state`, and reporting the users' state (here
+    ///   `IDLE`) matches. Computing the description BEFORE marking the group
+    ///   deleted would also answer this row.
+    /// * `#task#8`, a SECOND delete of that same, already deleted group: it too
+    ///   diverged at `$.state` on `DELETED`, and matches on the users' state —
+    ///   which a pre-mutation snapshot could NOT produce, since the group was
+    ///   already deleted when the call arrived. That row is why the view exists
+    ///   rather than an ordering of the write.
+    ///
+    /// `#task#7` and `#task#9`, the reads between and after those deletes, both
+    /// want the terminal `DELETED`, which is [`Self::Terminal`].
+    Usage,
+}
+
 /// One created input security group, as `CreateInputSecurityGroup` stored it.
 ///
 /// Only the members the request supplies are stored. `State`, `Inputs` and
@@ -1182,10 +1215,11 @@ impl ComAmazonawsMedialiveMedialiveState {
     pub fn inputs_using_security_group(&self, group_id: &str) -> Vec<String> {
         self.inputs
             .values()
-            // A deleted input is not using anything any more, which is the same
+            // An input whose deletion has been accepted is on its way out of the
+            // account and no longer "currently using" anything — the same
             // reading of "currently using" that `inputs_using_sdi_source`
-            // applies to a deleted source.
-            .filter(|input| !input.is_deleted())
+            // applies to the source side.
+            .filter(|input| !input.is_delete_accepted())
             .filter(|input| {
                 input
                     .security_groups
@@ -1204,15 +1238,40 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// `IN_USE`, and one nothing references is `IDLE` ("The current state of the
     /// Input Security Group").
     pub fn input_security_group_description(&self, id: &str) -> Option<InputSecurityGroup> {
+        self.described_input_security_group(id, GroupStateView::Terminal)
+    }
+
+    /// The same description with `State` derived from the group's users ALONE —
+    /// `IN_USE` while some resource references it and `IDLE` while none does —
+    /// ignoring whether the group has been deleted.
+    ///
+    /// This is what `DeleteInputSecurityGroup` answers with: the recorded delete
+    /// response reports that usage state both for the group it has just deleted
+    /// and for one an earlier delete already deleted, while the terminal
+    /// `DELETED` is what every `DescribeInputSecurityGroup` after the delete
+    /// reports.
+    pub(crate) fn input_security_group_usage_description(
+        &self,
+        id: &str,
+    ) -> Option<InputSecurityGroup> {
+        self.described_input_security_group(id, GroupStateView::Usage)
+    }
+
+    /// One projection behind both readers above, so the two cannot drift in any
+    /// member but the `State` that `view` selects.
+    fn described_input_security_group(
+        &self,
+        id: &str,
+        view: GroupStateView,
+    ) -> Option<InputSecurityGroup> {
         let group = self.input_security_groups.get(id)?;
         let inputs = self.inputs_using_security_group(id);
         let channels = self.channels_using_security_group(id);
-        let state = if group.is_deleted() {
-            input_security_group_state::DELETED
-        } else if inputs.is_empty() && channels.is_empty() {
-            input_security_group_state::IDLE
-        } else {
-            input_security_group_state::IN_USE
+        let state = match view {
+            GroupStateView::Terminal => {
+                input_security_group_state_for(group, &inputs, &channels)
+            }
+            GroupStateView::Usage => input_security_group_usage_state(&inputs, &channels),
         };
         Some(InputSecurityGroup {
             arn: Some(group.arn.clone()),
@@ -1284,9 +1343,9 @@ impl ComAmazonawsMedialiveMedialiveState {
         }
         self.inputs
             .values()
-            // A deleted input has stopped using the source, exactly as a deleted
-            // source has nothing using it.
-            .filter(|input| !input.is_deleted())
+            // An input whose deletion has been accepted has stopped using the
+            // source, exactly as a deleted source has nothing using it.
+            .filter(|input| !input.is_delete_accepted())
             .filter(|input| input.sdi_sources.iter().any(|source| source == id))
             .map(|input| input.id.clone())
             .collect()
@@ -2734,9 +2793,10 @@ impl InputRecord {
 
     /// Whether a delete has been accepted for this input, in either half of the
     /// deletion lifecycle — so a repeated `DeleteInput` is idempotent rather
-    /// than restarting the clock. PRIVATE: only [`begin_delete_input`] needs it,
-    /// which keeps the deletion flags' "only way in" invariant tight.
-    fn is_delete_accepted(&self) -> bool {
+    /// than restarting the clock, and an input on its way out is no longer a
+    /// current user of the resources it referenced
+    /// ([`ComAmazonawsMedialiveMedialiveState::inputs_using_security_group`]).
+    pub fn is_delete_accepted(&self) -> bool {
         self.is_deleting() || self.is_deleted()
     }
 
@@ -3084,6 +3144,38 @@ fn sdi_source_state_for(source: &SdiSourceRecord, inputs: &[String]) -> &'static
     }
 }
 
+/// The `State` of `group`, whose current users are `inputs` and `channels`.
+///
+/// `DELETED` once `DeleteInputSecurityGroup` has deleted it — the terminal
+/// state, which a deleted group keeps, so a client polling for it sees it and
+/// one that treats `IDLE` as "available" cannot attach a deleted group.
+/// Otherwise the state the group's users imply
+/// ([`input_security_group_usage_state`]). Derived from the store on every read,
+/// never written at create time.
+fn input_security_group_state_for(
+    group: &InputSecurityGroupRecord,
+    inputs: &[String],
+    channels: &[String],
+) -> &'static str {
+    if group.is_deleted() {
+        input_security_group_state::DELETED
+    } else {
+        input_security_group_usage_state(inputs, channels)
+    }
+}
+
+/// The `State` the group's users alone imply: `IN_USE` while some resource
+/// references it and `IDLE` while none does, which is what
+/// `InputSecurityGroup$State` reports ("The current state of the Input Security
+/// Group").
+fn input_security_group_usage_state(inputs: &[String], channels: &[String]) -> &'static str {
+    if inputs.is_empty() && channels.is_empty() {
+        input_security_group_state::IDLE
+    } else {
+        input_security_group_state::IN_USE
+    }
+}
+
 /// Build a new SdiSource record from a `CreateSdiSource` request's id and ARN.
 ///
 /// The caller stores the request's `Name`, `Mode`, `Type` and `Tags` on the
@@ -3201,8 +3293,11 @@ pub(crate) use channel_description_output;
 
 /// Project an `Input` onto one of the structurally identical per-operation
 /// input-description output shapes (`DescribeInputOutput` today; the others when
-/// their own issues land — `DeleteInputResponse` is not one of them, since the
-/// model gives `DeleteInput` an output with no members at all).
+/// their own issues land).
+///
+/// `DeleteInput` serialises through `DescribeInputOutput` itself — see the note
+/// on that handler — so the deleted input it answers with is the same projection
+/// a later `DescribeInput` reports.
 ///
 /// One macro rather than a hand-written copy of the same 22-member move per
 /// operation, so those operations cannot drift from each other.
@@ -3237,6 +3332,33 @@ macro_rules! input_description_output {
 }
 
 pub(crate) use input_description_output;
+
+/// Project an `InputSecurityGroup` onto one of the structurally identical
+/// per-operation FLAT group output shapes (`DescribeInputSecurityGroupOutput`;
+/// `DeleteInputSecurityGroup` serialises through that same shape — see the note
+/// on that handler).
+///
+/// One macro rather than a hand-written copy of the same seven-member move per
+/// operation, so the operations that report a group flat cannot drift from each
+/// other. The operations whose model WRAPS the group in a `SecurityGroup` member
+/// (`CreateInputSecurityGroup`, `UpdateInputSecurityGroup`) use the
+/// `InputSecurityGroup` shape itself and so need no projection.
+macro_rules! input_security_group_description_output {
+    ($out:ident, $group:expr) => {{
+        let group: $crate::ops::types::InputSecurityGroup = $group;
+        $out {
+            arn: group.arn,
+            id: group.id,
+            inputs: group.inputs,
+            state: group.state,
+            tags: group.tags,
+            whitelist_rules: group.whitelist_rules,
+            channels: group.channels,
+        }
+    }};
+}
+
+pub(crate) use input_security_group_description_output;
 
 /// Project a stored [`EventBridgeRuleTemplateGroupRecord`] onto one of the
 /// structurally identical per-operation group output shapes
