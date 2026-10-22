@@ -3,20 +3,24 @@
 //! Engine state for the com-amazonaws-directoryservice-directoryservice-20150416 service.
 //!
 //! This module owns the records the handlers in `src/ops/` share — the directories
-//! `CreateDirectory` persists, the aliases `CreateAlias` assigns, the Amazon SNS topics
-//! `RegisterEventTopic` associates and the tags `AddTagsToResource` merges — plus the
-//! three pieces of behaviour that cannot live in any single operation file:
+//! `CreateDirectory` persists, the snapshots `CreateSnapshot` takes of them, the aliases
+//! `CreateAlias` assigns, the Amazon SNS topics `RegisterEventTopic` associates and the
+//! tags `AddTagsToResource` merges — plus the pieces of behaviour that cannot live in any
+//! single operation file:
 //!
 //! * [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`], which
-//!   materialises the stage transition the clock has already made due (a directory
-//!   leaving `Requested`). Every handler calls it before reading or writing, so a
-//!   reporting operation reports what the clock already owed and nothing more.
+//!   materialises the status transitions the clock has already made due (a directory
+//!   leaving `Requested`, a snapshot leaving `Creating`). Every handler calls it before
+//!   reading or writing, so a reporting operation reports what the clock already owed
+//!   and nothing more.
 //! * [`Directory::to_description`], the one place a stored directory is rendered as the
 //!   modelled `DirectoryDescription`, so every operation that reports a directory
-//!   reports the same derived values (`Alias`, `AccessUrl`).
-//! * [`encode_cursor`] / [`decode_cursor`], the opaque `NextToken` the two paginated
-//!   operations of this slice (`DescribeDirectories`, `ListTagsForResource`) issue and
-//!   resolve.
+//!   reports the same derived values (`Alias`, `AccessUrl`), and
+//!   [`SnapshotRecord::to_snapshot`] / [`EventTopicRegistration::to_event_topic`], the
+//!   same for a stored snapshot and a stored topic association.
+//! * [`encode_cursor`] / [`decode_cursor`], the opaque `NextToken` the paginated
+//!   operations of this slice (`DescribeDirectories`, `DescribeSnapshots`,
+//!   `ListTagsForResource`) issue and resolve.
 //!
 //! The administrator `Password` `CreateDirectory` is called with is deliberately NOT a
 //! field here: the model marks it `@sensitive`, no operation reports it back, and state
@@ -25,20 +29,46 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{DirectoryDescription, DirectoryVpcSettingsDescription, EventTopic, Tag};
+use crate::ops::types::{
+    DirectoryDescription, DirectoryVpcSettingsDescription, EventTopic, Snapshot, Tag,
+};
 
-/// How long the stage transition a create owes takes to fall due.
+/// How long a status transition a create owes takes to fall due.
 ///
 /// `CreateDirectory` answers while the directory is still being built — the modelled
-/// `DirectoryStage` enum's first value is `Requested` — so the move to `Active` is owed
-/// by the clock rather than by any later call. The project's emulator contract requires
-/// such a transition to fall due 250–750 ms after the call that starts it, so a caller
-/// acting immediately after the create still observes the transient stage. 500 ms sits
-/// in the middle of that band.
+/// `DirectoryStage` enum's first value is `Requested` — and `CreateSnapshot` answers
+/// while the snapshot is still being taken — the modelled `SnapshotStatus` enum's first
+/// value is `Creating` — so the move to `Active`/`Completed` is owed by the clock rather
+/// than by any later call. The project's emulator contract requires such a transition to
+/// fall due 250–750 ms after the call that starts it, so a caller acting immediately
+/// after the create still observes the transient state. 500 ms sits in the middle of
+/// that band.
 pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
 
 /// The stage a directory is in between `CreateDirectory` and [`TRANSITION_SPAN`].
 pub const STAGE_REQUESTED: &str = "Requested";
+
+/// The status a snapshot is in between `CreateSnapshot` and [`TRANSITION_SPAN`]: the
+/// first value of the modelled `SnapshotStatus` enum.
+pub const SNAPSHOT_STATUS_CREATING: &str = "Creating";
+
+/// The status a snapshot reaches once [`TRANSITION_SPAN`] has elapsed: the `Completed`
+/// value of the modelled `SnapshotStatus` enum.
+pub const SNAPSHOT_STATUS_COMPLETED: &str = "Completed";
+
+/// The `SnapshotType` of a snapshot a caller asked for: the `Manual` value of the
+/// modelled `SnapshotType` enum. The enum's other value, `Auto`, is for the snapshots
+/// Directory Service takes on its own schedule, which no caller of this emulator starts.
+pub const SNAPSHOT_TYPE_MANUAL: &str = "Manual";
+
+/// The `DirectoryType` values a snapshot can be taken of.
+///
+/// From `CreateSnapshot`'s own documentation: "Creates a snapshot of a Simple AD or
+/// Microsoft AD directory in the Amazon Web Services cloud. You cannot take snapshots of
+/// AD Connector directories." The modelled `DirectoryType` enum's remaining value,
+/// `ADConnector`, is therefore refused, and `SharedMicrosoftAD` — a directory shared from
+/// another account, which the owner snapshots — with it.
+pub const SNAPSHOTTABLE_DIRECTORY_TYPES: [&str; 2] = [TYPE_SIMPLE_AD, "MicrosoftAD"];
 
 /// The stage a created directory reaches once [`TRANSITION_SPAN`] has elapsed.
 pub const STAGE_ACTIVE: &str = "Active";
@@ -68,6 +98,21 @@ pub const MAX_DIRECTORIES: usize = 10;
 /// AWS's tagging limit of 50 tags per resource, the bound
 /// `TagLimitExceededException` reports.
 pub const MAX_TAGS: usize = 50;
+
+/// Directory Service's default quota "Manual snapshots: 5" per directory, the bound
+/// `SnapshotLimitExceededException` reports — the same bound `GetSnapshotLimits`
+/// describes as `SnapshotLimits$ManualSnapshotsLimit`.
+pub const MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY: usize = 5;
+
+/// The most snapshots this emulator keeps in total, across every directory.
+///
+/// NOT an AWS quota: a resource guard. [`MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY`] bounds one
+/// directory's snapshots and `DeleteDirectory` drops the snapshots of the directory it
+/// deletes, so this is the absolute ceiling of the snapshot store — exactly as many as a
+/// Region's worth of directories can hold at once — and it is what keeps a
+/// create-directory / snapshot / delete-directory cycle from growing the store without
+/// end. Past it `CreateSnapshot` is refused.
+pub const MAX_SNAPSHOTS: usize = MAX_DIRECTORIES * MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY;
 
 /// The `TopicStatus` of an association this emulator has just made.
 ///
@@ -118,6 +163,15 @@ pub const MAX_RESERVED_ALIASES: usize = 10 * MAX_DIRECTORIES;
 /// allocated and scanned unbounded.
 pub const MAX_DIRECTORY_IDS_PER_REQUEST: usize = 100;
 
+/// The most `SnapshotIds` entries a single `DescribeSnapshots` will resolve.
+///
+/// NOT an AWS quota: a resource guard, deliberately well above any list a caller has
+/// reason to send — an account holds at most
+/// [`MAX_DIRECTORIES`] × [`MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY`] snapshots, so a longer
+/// list can only repeat ids — and it is what keeps the caller-chosen list from being
+/// allocated and scanned unbounded.
+pub const MAX_SNAPSHOT_IDS_PER_REQUEST: usize = 100;
+
 /// The page size a paginated operation uses when the request declares none.
 ///
 /// NOT an AWS quota: `Limit`'s own documentation says "If this value is zero, the
@@ -137,6 +191,29 @@ pub const MAX_NEXT_TOKEN_CHARS: usize = 1024;
 /// The version tag every [`encode_cursor`] token carries, so a token minted by an older
 /// build is refused rather than misread.
 const CURSOR_VERSION: &str = "v1";
+
+/// Separates the creation rank a cursor resumes after from the filter it was issued
+/// under, in every paginated operation of this service. Not a character a `DirectoryId`,
+/// a `SnapshotId` or a tag key the listings filter on can contain, so the two halves are
+/// unambiguous — and it lives here, beside [`encode_cursor`], because the listings must
+/// agree on it for a token to mean one thing.
+pub const CURSOR_SEPARATOR: char = '|';
+
+/// Separates the parts of one listing's filter inside a cursor. Not a character a
+/// `DirectoryId`, a `SnapshotId` or a tag key can contain, so the parts stay
+/// unambiguous.
+const CURSOR_FILTER_SEPARATOR: char = '/';
+
+/// How a listing records the filter its page was issued under, inside the cursor: its
+/// parts joined by [`CURSOR_FILTER_SEPARATOR`], each part being that member as the
+/// request listed it (or the empty string when the request omitted it).
+///
+/// One encoding for every paginated operation, so the filter half of a token cannot
+/// drift between listings: a later page asked for under a different filter decodes to a
+/// different string and is refused with [`INVALID_NEXT_TOKEN`].
+pub fn cursor_filter(parts: &[&str]) -> String {
+    parts.join(&CURSOR_FILTER_SEPARATOR.to_string())
+}
 
 /// One stored association between a directory and an Amazon SNS topic: what
 /// `RegisterEventTopic` persisted and `DescribeEventTopics` reports.
@@ -289,11 +366,55 @@ impl Directory {
     }
 }
 
+/// One stored snapshot: what `CreateSnapshot` persisted and `DescribeSnapshots`
+/// reports.
+#[derive(Debug, Clone)]
+pub struct SnapshotRecord {
+    pub snapshot_id: String,
+    /// The directory this snapshot was taken of. A snapshot does not outlive that
+    /// directory: `DeleteDirectory` drops the snapshots naming the id it deletes, as
+    /// the real service does.
+    pub directory_id: String,
+    /// The descriptive `Name` the create was called with, if any.
+    pub name: Option<String>,
+    /// One of the modelled `SnapshotType` values; [`SNAPSHOT_TYPE_MANUAL`] for a
+    /// snapshot a caller asked for.
+    pub snapshot_type: String,
+    /// One of the modelled `SnapshotStatus` values.
+    pub status: String,
+    /// When the status transition the create owes falls due; `None` once there is no
+    /// transition left to make. See [`TRANSITION_SPAN`].
+    pub status_due_at: Option<SystemTime>,
+    /// "The date and time that the snapshot was taken", the `StartTime` member reports.
+    pub start_time: SystemTime,
+    /// Creation rank, from
+    /// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::next_seq`], shared
+    /// with the directories so every listing of this service pages over one ordering.
+    pub seq: u64,
+}
+
+impl SnapshotRecord {
+    /// This snapshot as the modelled `Snapshot` structure.
+    pub fn to_snapshot(&self) -> Snapshot {
+        Snapshot {
+            directory_id: Some(self.directory_id.clone()),
+            snapshot_id: Some(self.snapshot_id.clone()),
+            r#type: Some(self.snapshot_type.clone()),
+            name: self.name.clone(),
+            status: Some(self.status.clone()),
+            start_time: Some(as_timestamp(self.start_time)),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-directoryservice-directoryservice-20150416. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// Every stored directory, keyed by its `DirectoryId`.
     pub directories: BTreeMap<String, Directory>,
+    /// Every stored snapshot, keyed by its `SnapshotId`. A snapshot names the directory
+    /// it was taken of, so this is one store rather than one per directory.
+    pub snapshots: BTreeMap<String, SnapshotRecord>,
     /// Which directory owns which alias. An alias is unique across the account, so
     /// this is what `CreateAlias` checks before assigning one. An entry OUTLIVES the
     /// directory it was created for: `CreateAlias`' documentation says an alias
@@ -303,6 +424,9 @@ pub struct ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     pub aliases: BTreeMap<String, String>,
     /// Drives [`Self::mint_directory_id`]; see there for how an id is derived from it.
     id_seed: u64,
+    /// Drives [`Self::mint_snapshot_id`], kept apart from [`Self::id_seed`] so the two
+    /// id spaces advance independently.
+    snapshot_id_seed: u64,
     /// Drives [`Self::next_seq`]: the creation rank stamped on each directory.
     seq_counter: u64,
 }
@@ -320,6 +444,22 @@ const ID_MULTIPLIER: u64 = 1_000_000_007;
 /// The bijection's constant term, so the first id minted is not a run of leading zeros.
 const ID_OFFSET: u64 = 734_291;
 
+/// Mint the next id of one id space: `<prefix>-` followed by ten lower-case hex digits,
+/// the shape both the modelled `DirectoryId` (`^d-[0-9a-f]{10}$`) and `SnapshotId`
+/// (`^s-[0-9a-f]{10}$`) declare.
+///
+/// `seed` is the id space's own counter, advanced here and mapped through the bijection
+/// described on [`ID_MULTIPLIER`], so an id looks unpredictable yet never repeats within
+/// a process. One function, so the derivation cannot drift between the id spaces.
+fn mint_id(seed: &mut u64, prefix: char) -> String {
+    *seed = seed.wrapping_add(1);
+    let scrambled = seed
+        .wrapping_mul(ID_MULTIPLIER)
+        .wrapping_add(ID_OFFSET)
+        % ID_SPACE;
+    format!("{prefix}-{scrambled:010x}")
+}
+
 impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// Mint a fresh `DirectoryId` of the shape the model declares,
     /// `^d-[0-9a-f]{10}$`.
@@ -328,13 +468,14 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// [`ID_MULTIPLIER`], so it is unpredictable-looking yet never repeats within a
     /// process.
     pub fn mint_directory_id(&mut self) -> String {
-        self.id_seed = self.id_seed.wrapping_add(1);
-        let scrambled = self
-            .id_seed
-            .wrapping_mul(ID_MULTIPLIER)
-            .wrapping_add(ID_OFFSET)
-            % ID_SPACE;
-        format!("d-{scrambled:010x}")
+        mint_id(&mut self.id_seed, 'd')
+    }
+
+    /// Mint a fresh `SnapshotId` of the shape the model declares,
+    /// `^s-[0-9a-f]{10}$`, through the same bijection as
+    /// [`Self::mint_directory_id`] over its own seed.
+    pub fn mint_snapshot_id(&mut self) -> String {
+        mint_id(&mut self.snapshot_id_seed, 's')
     }
 
     /// The next creation rank. Stamped on a directory when it is created, so a listing
@@ -344,11 +485,11 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
         self.seq_counter
     }
 
-    /// Materialise every stage transition the clock has already made due at `now`.
+    /// Materialise every status transition the clock has already made due at `now`.
     ///
     /// This is the ONLY write a reporting operation performs: the change here was owed
     /// at `now` whether or not anybody called, because its due instant was stored when
-    /// the directory was created.
+    /// the directory or snapshot was created.
     pub fn advance_clock(&mut self, now: SystemTime) {
         for directory in self.directories.values_mut() {
             let Some(due) = directory.stage_due_at else {
@@ -360,6 +501,15 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                 directory.stage_due_at = None;
             }
         }
+        for snapshot in self.snapshots.values_mut() {
+            let Some(due) = snapshot.status_due_at else {
+                continue;
+            };
+            if now >= due {
+                snapshot.status = SNAPSHOT_STATUS_COMPLETED.to_string();
+                snapshot.status_due_at = None;
+            }
+        }
     }
 
     /// Directories in creation order — the order `DescribeDirectories` pages over.
@@ -367,6 +517,25 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
         let mut ordered: Vec<&Directory> = self.directories.values().collect();
         ordered.sort_by_key(|directory| directory.seq);
         ordered
+    }
+
+    /// Snapshots in creation order — the order `DescribeSnapshots` pages over.
+    pub fn snapshots_in_creation_order(&self) -> Vec<&SnapshotRecord> {
+        let mut ordered: Vec<&SnapshotRecord> = self.snapshots.values().collect();
+        ordered.sort_by_key(|snapshot| snapshot.seq);
+        ordered
+    }
+
+    /// How many manual snapshots `directory_id` currently holds — the count
+    /// [`MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY`] bounds.
+    pub fn manual_snapshot_count(&self, directory_id: &str) -> usize {
+        self.snapshots
+            .values()
+            .filter(|snapshot| {
+                snapshot.directory_id == directory_id
+                    && snapshot.snapshot_type == SNAPSHOT_TYPE_MANUAL
+            })
+            .count()
     }
 }
 
@@ -445,6 +614,13 @@ pub fn region_from_request(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The `EntityDoesNotExistException` message for an id that names no stored snapshot.
+/// Shared so every operation that resolves a snapshot says the same thing about the
+/// same failure.
+pub fn no_such_snapshot(snapshot_id: &str) -> String {
+    format!("Snapshot {snapshot_id} does not exist")
 }
 
 /// The `InvalidNextTokenException` message for a token this service did not issue.

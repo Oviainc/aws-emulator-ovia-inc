@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a snapshot of a stored directory in [`crate::state`], which
+//! `DescribeSnapshots` then reports. The status transition the create owes (`Creating`
+//! to `Completed`) is stored as a due instant and materialised by
+//! [`crate::state::ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`].
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSnapshot"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // A snapshot is taken OF a directory, so the directory is resolved first: an id
+        // naming none is the modelled "specified entity could not be found".
+        let directory_type = match store.directories.get(&input.directory_id) {
+            Some(directory) => directory.directory_type.clone(),
+            None => {
+                return Err(CreateSnapshotErrorModeled::EntityDoesNotExistException(
+                    EntityDoesNotExistException {
+                        message: Some(crate::state::no_such_directory(&input.directory_id)),
+                        request_id: None,
+                    },
+                )
+                .into());
+            }
+        };
+
+        // This operation's own documentation: "Creates a snapshot of a Simple AD or
+        // Microsoft AD directory in the Amazon Web Services cloud. You cannot take
+        // snapshots of AD Connector directories." The model declares no
+        // `UnsupportedOperationException` for this operation, so the directory type the
+        // request named is reported as the invalid parameter it is, naming the member
+        // and the types that admit a snapshot. NOT dead code: no implemented operation
+        // persists an `ADConnector` directory yet, so this branch becomes reachable from
+        // the wire the moment `ConnectDirectory` lands.
+        if !crate::state::SNAPSHOTTABLE_DIRECTORY_TYPES.contains(&directory_type.as_str()) {
+            return Err(invalid_parameter(format!(
+                "DirectoryId {id} names a {directory_type} directory, of which no snapshot can be taken; snapshots are supported for {supported}",
+                id = input.directory_id,
+                supported = crate::state::SNAPSHOTTABLE_DIRECTORY_TYPES.join(", ")
+            )));
+        }
+
+        // Nothing grows the store without end: the snapshot store's absolute ceiling is
+        // checked before anything is minted or inserted. With the per-directory quota
+        // below holding and `DeleteDirectory` dropping the snapshots of the directory it
+        // deletes, this branch is unreachable by construction — it is the guard that
+        // keeps it so, and it reports the store-wide bound rather than a directory's.
+        if store.snapshots.len() >= crate::state::MAX_SNAPSHOTS {
+            return Err(CreateSnapshotErrorModeled::SnapshotLimitExceededException(
+                SnapshotLimitExceededException {
+                    message: Some(format!(
+                        "Maximum number of snapshots has been reached: {max}",
+                        max = crate::state::MAX_SNAPSHOTS
+                    )),
+                    request_id: None,
+                },
+            )
+            .into());
+        }
+
+        // The per-directory manual snapshot quota, which is what
+        // `SnapshotLimitExceededException` reports: "The maximum number of manual
+        // snapshots for the directory has been reached."
+        let held = store.manual_snapshot_count(&input.directory_id);
+        if held >= crate::state::MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY {
+            return Err(CreateSnapshotErrorModeled::SnapshotLimitExceededException(
+                SnapshotLimitExceededException {
+                    message: Some(format!(
+                        "Maximum number of manual snapshots for directory {id} has been reached: {max}",
+                        id = input.directory_id,
+                        max = crate::state::MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY
+                    )),
+                    request_id: None,
+                },
+            )
+            .into());
+        }
+
+        let snapshot_id = store.mint_snapshot_id();
+        let seq = store.next_seq();
+        let record = crate::state::SnapshotRecord {
+            snapshot_id: snapshot_id.clone(),
+            directory_id: input.directory_id.clone(),
+            name: input.name,
+            // A snapshot a caller asked for is a manual one; `Auto` is for the ones
+            // Directory Service takes on its own schedule.
+            snapshot_type: crate::state::SNAPSHOT_TYPE_MANUAL.to_string(),
+            status: crate::state::SNAPSHOT_STATUS_CREATING.to_string(),
+            status_due_at: Some(now + crate::state::TRANSITION_SPAN),
+            start_time: now,
+            seq,
+        };
+        store.snapshots.insert(snapshot_id.clone(), record);
+
+        // Read the id back out of the store, so the response cannot name a snapshot the
+        // insert did not persist.
+        let stored = store
+            .snapshots
+            .get(&snapshot_id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        Ok(CreateSnapshotOutput {
+            snapshot_id: Some(stored.snapshot_id.clone()),
+        })
     }
+}
+
+/// Refuse the request with the modelled `InvalidParameterException`, naming the member
+/// and the rule it broke so the caller can fix the request from the message alone.
+fn invalid_parameter(message: String) -> CreateSnapshotError {
+    CreateSnapshotErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        request_id: None,
+    })
+    .into()
 }
