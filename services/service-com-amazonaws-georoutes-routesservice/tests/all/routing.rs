@@ -23,7 +23,7 @@ use smithy_server_runtime::MultiServiceRouter;
 /// A router carrying only this service, over one shared engine — what
 /// `core/router/src/lib.rs` builds for the whole emulator, narrowed to the service under
 /// test.
-fn routes_service() -> MultiServiceRouter {
+pub(crate) fn routes_service() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are verified by the emulator, not by a service; these tests drive the
@@ -37,7 +37,7 @@ fn routes_service() -> MultiServiceRouter {
 
 /// POST `body` to `path` on `router`, with the SigV4 credential scope that routes a
 /// request to the `geo-routes` signing name.
-async fn post(router: &MultiServiceRouter, path: &str, body: &Value) -> (u16, Value, Option<String>) {
+pub(crate) async fn post(router: &MultiServiceRouter, path: &str, body: &Value) -> (u16, Value, Option<String>) {
     let request = http::Request::builder()
         .method("POST")
         .uri(path)
@@ -67,7 +67,7 @@ async fn post(router: &MultiServiceRouter, path: &str, body: &Value) -> (u16, Va
 /// Great-circle distance in metres, by the spherical law of cosines — deliberately a
 /// different formula from the haversine the service computes with, so these tests check
 /// the answer rather than restate the implementation.
-fn great_circle_m(a: [f64; 2], b: [f64; 2]) -> f64 {
+pub(crate) fn great_circle_m(a: [f64; 2], b: [f64; 2]) -> f64 {
     let (lat1, lat2) = (a[1].to_radians(), b[1].to_radians());
     let delta_lon = (b[0] - a[0]).to_radians();
     let cosine = lat1.sin() * lat2.sin() + lat1.cos() * lat2.cos() * delta_lon.cos();
@@ -91,13 +91,13 @@ fn position(value: &Value, case: &str) -> [f64; 2] {
 }
 
 /// An integer member of a response object.
-fn int(value: &Value, member: &str, case: &str) -> i64 {
+pub(crate) fn int(value: &Value, member: &str, case: &str) -> i64 {
     value[member]
         .as_i64()
         .unwrap_or_else(|| panic!("case {case:?}: {member} is missing or not an integer in {value:?}"))
 }
 
-const ROUTES: &str = "/v2/routes";
+pub(crate) const ROUTES: &str = "/v2/routes";
 const MATRIX: &str = "/v2/route-matrix";
 const SNAP: &str = "/v2/snap-to-roads";
 const OPTIMIZE: &str = "/v2/optimize-waypoints";
@@ -2483,7 +2483,7 @@ async fn what_cannot_be_computed_answers_501() {
     let router = routes_service();
     let good = [-123.1, 49.28];
     let area = json!({ "Geometry": { "BoundingBox": [-124.0, 49.0, -123.0, 50.0] } });
-    let cases: [(&str, &str, Value); 16] = [
+    let cases: [(&str, &str, Value); 14] = [
         (
             "a transit route",
             ROUTES,
@@ -2578,16 +2578,6 @@ async fn what_cannot_be_computed_answers_501() {
             "controlled-access highways avoided on the optimizer",
             OPTIMIZE,
             json!({ "Origin": good, "Avoid": { "ControlledAccessHighways": true } }),
-        ),
-        (
-            "a turn-by-turn step type",
-            ROUTES,
-            json!({ "Origin": good, "Destination": good, "TravelStepType": "TurnByTurn" }),
-        ),
-        (
-            "an instruction measurement system",
-            ROUTES,
-            json!({ "Origin": good, "Destination": good, "InstructionsMeasurementSystem": "Metric" }),
         ),
     ];
 
