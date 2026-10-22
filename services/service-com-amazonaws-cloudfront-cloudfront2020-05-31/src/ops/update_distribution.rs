@@ -410,6 +410,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The same bound the create path applies: a configuration is walked on every
+        // payload that reports it, so an update cannot store counts past CloudFront's
+        // published quotas either.
+        match crate::state::config_limit_exceeded(&input.distribution_config) {
+            None => {}
+            Some(crate::state::ConfigLimit::CacheBehaviors(message)) => {
+                return Err(UpdateDistributionErrorModeled::TooManyCacheBehaviors(
+                    TooManyCacheBehaviors {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+            Some(crate::state::ConfigLimit::TrustedSigners(message)) => {
+                return Err(UpdateDistributionErrorModeled::TooManyTrustedSigners(
+                    TooManyTrustedSigners {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+            Some(crate::state::ConfigLimit::TrustedKeyGroups(message)) => {
+                return Err(
+                    UpdateDistributionErrorModeled::TooManyKeyGroupsAssociatedToDistribution(
+                        TooManyKeyGroupsAssociatedToDistribution {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
         // A distribution's caller reference identifies it for its whole life, so an
         // update that renames it is not a modification CloudFront allows.
         if input.distribution_config.caller_reference != current_caller_reference {

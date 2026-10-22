@@ -30,8 +30,9 @@ fn past_the_settle_span() -> std::time::Duration {
 }
 
 /// A fresh emulator: one engine, one Control Tower service, authentication off (these
-/// tests are about the service's behaviour, not SigV4).
-fn emulator() -> MultiServiceRouter {
+/// tests are about the service's behaviour, not SigV4). Shared with the sibling suites
+/// in this test target.
+pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_with_engine().0
 }
 
@@ -51,10 +52,10 @@ fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// A dispatched call's answer: the HTTP status, the `x-amzn-errortype` error code
 /// restJson1 names a modeled failure with, and the parsed JSON body.
-struct Answer {
-    status: u16,
-    error_code: Option<String>,
-    body: serde_json::Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) error_code: Option<String>,
+    pub(crate) body: serde_json::Value,
 }
 
 impl Answer {
@@ -74,7 +75,11 @@ impl Answer {
 
 /// POST `path` with `body` as a signed restJson1 request. The SigV4 credential scope is
 /// what routes the request to this service and names its region.
-async fn call(router: &MultiServiceRouter, path: &str, body: serde_json::Value) -> Answer {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    path: &str,
+    body: serde_json::Value,
+) -> Answer {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("https://controltower.us-west-2.amazonaws.com{path}"))
@@ -552,24 +557,31 @@ async fn latest_available_version_is_the_numerically_later_of_deployed_and_catal
     }
 }
 
-/// RULE: a value outside a member's modeled constraint is refused with
-/// `ValidationException` (400) and nothing is persisted.
+/// RULE: a request that does not satisfy the model's constraints is refused with 400
+/// and nothing is persisted; a request the FRONT DOOR refuses (before any handler ran)
+/// carries the generic `BadRequestException`, while a request that satisfied every
+/// modeled constraint and was then refused by the handler carries the operation's own
+/// `ValidationException`.
 ///
 /// Rows sit one step OUTSIDE each published bound: `version` shorter than 3 and longer
 /// than 10 characters, `remediationTypes` longer than its max of 1, and `maxResults`
-/// below and above its range of 1..1.
+/// below and above its range of 1..1 — plus one row whose value satisfies every
+/// modeled constraint and is refused by the handler instead.
 #[tokio::test]
 async fn values_outside_a_modeled_bound_are_refused_and_persist_nothing() {
-    let cases: Vec<(&str, &str, serde_json::Value)> = vec![
+    // (case, path, body, the error code the refusal must carry)
+    let cases: Vec<(&str, &str, serde_json::Value, &str)> = vec![
         (
             "version shorter than the min of 3",
             "/create-landingzone",
             serde_json::json!({ "version": "3", "manifest": simple_manifest() }),
+            "BadRequestException",
         ),
         (
             "version longer than the max of 10",
             "/create-landingzone",
             serde_json::json!({ "version": "12345.67890", "manifest": simple_manifest() }),
+            "BadRequestException",
         ),
         (
             "remediationTypes longer than the max of 1",
@@ -579,36 +591,45 @@ async fn values_outside_a_modeled_bound_are_refused_and_persist_nothing() {
                 "manifest": simple_manifest(),
                 "remediationTypes": ["INHERITANCE_DRIFT", "INHERITANCE_DRIFT"]
             }),
+            "BadRequestException",
         ),
         (
             "maxResults below the range min of 1",
             "/list-landingzones",
             serde_json::json!({ "maxResults": 0 }),
+            "BadRequestException",
         ),
         (
             "maxResults above the range max of 1",
             "/list-landingzones",
             serde_json::json!({ "maxResults": 2 }),
+            "BadRequestException",
         ),
         (
+            // Satisfies `ListLandingZonesNextToken`'s pattern, so the front door passes
+            // it and the handler is the one that refuses it.
             "a nextToken no previous call returned",
             "/list-landingzones",
             serde_json::json!({ "nextToken": "not-a-token" }),
+            "ValidationException",
         ),
         (
+            // `manifest` carries no @required trait in this model, so the front door
+            // passes the request and the handler is the one that refuses it.
             "no manifest to describe the landing zone with",
             "/create-landingzone",
             serde_json::json!({ "version": "3.3" }),
+            "ValidationException",
         ),
     ];
 
-    for (case, path, body) in cases {
+    for (case, path, body, expected_code) in cases {
         let router = emulator();
         let refused = call(&router, path, body).await;
         assert_eq!(
             (refused.status, refused.error_code.as_deref()),
-            (400, Some("ValidationException")),
-            "case {case:?}: expected 400 ValidationException, got {:?} body {:?}",
+            (400, Some(expected_code)),
+            "case {case:?}: expected 400 {expected_code}, got {:?} body {:?}",
             (refused.status, refused.error_code.as_deref()),
             refused.body
         );

@@ -25,6 +25,12 @@ pub const FALLBACK_REGION: &str = "us-east-1";
 /// `FlexibleTimeWindowMode` value that asks for a window.
 const FLEXIBLE_TIME_WINDOW_MODE_FLEXIBLE: &str = "FLEXIBLE";
 
+/// The `ScheduleGroupState` a usable group reports.
+///
+/// `ScheduleGroupState` is modelled `ACTIVE | DELETING`, and AWS returns a
+/// newly created group ACTIVE, so only `DeleteScheduleGroup` ever moves one.
+pub const SCHEDULE_GROUP_STATE_ACTIVE: &str = "ACTIVE";
+
 /// The `ScheduleState` a schedule takes when the request omits `State`.
 pub const DEFAULT_SCHEDULE_STATE: &str = "ENABLED";
 
@@ -92,7 +98,7 @@ pub struct ScheduleRecord {
 }
 
 /// Per-service state for com-amazonaws-scheduler-awschronosservice. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsSchedulerAwschronosserviceState {
     /// Client-created groups, by name. The implicit `default` group is NOT
     /// stored: it exists for every account, so membership is answered by
@@ -101,12 +107,54 @@ pub struct ComAmazonawsSchedulerAwschronosserviceState {
     /// Schedules by `(group name, schedule name)` — the pair that identifies a
     /// schedule, and an ordering `ListSchedules` pages through.
     pub schedules: BTreeMap<(String, String), ScheduleRecord>,
+    /// When this account's scheduler state came into being, which is the
+    /// `CreationDate` the implicit `default` group reports.
+    ///
+    /// The default group is created with the account, so no request mints it and
+    /// nothing can read its creation date off a client call. Fixing it here, when
+    /// the store is first reached, keeps it STABLE across reads — a read of the
+    /// default group never writes.
+    pub origin: SystemTime,
+}
+
+impl Default for ComAmazonawsSchedulerAwschronosserviceState {
+    fn default() -> Self {
+        Self {
+            groups: BTreeMap::new(),
+            schedules: BTreeMap::new(),
+            origin: SystemTime::now(),
+        }
+    }
 }
 
 impl ComAmazonawsSchedulerAwschronosserviceState {
     /// Whether `name` names a group a schedule may be created in.
     pub fn group_exists(&self, name: &str) -> bool {
         name == DEFAULT_SCHEDULE_GROUP || self.groups.contains_key(name)
+    }
+
+    /// The group `name` addresses, or `None` when no such group exists.
+    ///
+    /// Every account has the `default` group without having created it, so it is
+    /// answered from [`Self::origin`] rather than from a stored row — the same
+    /// membership rule [`Self::group_exists`] applies, as one record a reader can
+    /// serialize. `region` is the request's region, which the ARN of a group no
+    /// create call minted carries.
+    pub fn group_record(&self, region: &str, name: &str) -> Option<ScheduleGroupRecord> {
+        if let Some(record) = self.groups.get(name) {
+            return Some(record.clone());
+        }
+        if name == DEFAULT_SCHEDULE_GROUP {
+            return Some(ScheduleGroupRecord {
+                name: DEFAULT_SCHEDULE_GROUP.to_string(),
+                arn: schedule_group_arn(region, DEFAULT_SCHEDULE_GROUP),
+                state: SCHEDULE_GROUP_STATE_ACTIVE.to_string(),
+                creation_date: self.origin,
+                last_modification_date: self.origin,
+                tags: Vec::new(),
+            });
+        }
+        None
     }
 }
 

@@ -17,3 +17,5 @@ mod onboarding_loop;
 mod state_roundtrip;
 #[path = "all/tagging.rs"]
 mod tagging;
+#[path = "all/transformer_lifecycle.rs"]
+mod transformer_lifecycle;

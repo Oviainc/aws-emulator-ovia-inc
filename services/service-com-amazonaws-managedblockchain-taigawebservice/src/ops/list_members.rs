@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: pages `MemberSummary` entries out of the members stored on one network in
+//! [`crate::state`], honouring the `name`, `status` and `isOwned` filters.
 //!
 //! ## Shape of an operation
 //!
@@ -102,12 +95,24 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-managedblockchain-taiga
 // here — hence the `ListMembersError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.managedblockchain#ListMembers")]
+//
+// `ResourceNotFoundException` is widened in with `extra_errors`: `NetworkId` is an
+// `@httpLabel` naming a resource that may not exist, and the alternative to the 404 this
+// SERVICE models for a missing resource would be reporting an absent network as an EMPTY
+// SUCCESS — a listing a client cannot tell apart from a network that holds no members.
+// The shape is this service's own, with `httpError` 404, and `ListProposals` — the other
+// listing scoped by this same `/networks/{NetworkId}` label — declares it; only this
+// operation's error list omits it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.managedblockchain#ListMembers",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum ListMembersErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServiceErrorException(InternalServiceErrorException),
     InvalidRequestException(InvalidRequestException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
 }
 
@@ -162,18 +167,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMembers"))
+        // A reporting operation: the page is cut from stored state, and the one write it
+        // makes is materialising the status transitions the clock already owed.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListMembersErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+
+        let after = match crate::state::decode_cursor(input.next_token.as_deref()) {
+            Ok(after) => after,
+            Err(crate::state::MalformedCursor) => {
+                return Err(ListMembersErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "nextToken is not a pagination token this operation issued"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let mut guard = state.lock();
+        guard.settle(::std::time::SystemTime::now());
+
+        // A `NetworkId` that names no network is the resource-not-found case, not an
+        // empty page: an empty page would claim the network exists and holds no members.
+        // The message names the resource that was not found, which is what a caller needs
+        // to tell the two apart; `ResourceName` is `ArnString`
+        // (`@pattern ^arn:.+:.+:.+:.+:.+$`) and nothing stored holds an ARN for a network
+        // that does not exist, so it is left unset rather than filled with a bare id.
+        let Some(network) = guard.networks.get(&input.network_id) else {
+            return Err(ListMembersErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Network {} not found.", input.network_id)),
+                    resource_name: None,
+                },
+            )
+            .into());
+        };
+
+        // Each filter selects on the STORED value of the member it names: `Name` is "The
+        // optional name of the member to list", `Status` lists "only members currently in
+        // this status", and `IsOwned` limits the request "either to members that the
+        // current Amazon Web Services account owns (true) or that other Amazon Web
+        // Services accounts own (false)". An omitted filter selects every member.
+        let selected: Vec<(String, MemberSummary)> = network
+            .members
+            .values()
+            .filter(|member| {
+                input.name.as_deref().is_none_or(|name| member.name == name)
+                    && input
+                        .status
+                        .as_deref()
+                        .is_none_or(|status| member.status == status)
+                    && input
+                        .is_owned
+                        .is_none_or(|is_owned| member.is_owned() == is_owned)
+            })
+            .map(|member| (member.id.clone(), member.to_summary()))
+            .collect();
+
+        let page = crate::state::page_of(
+            selected,
+            after.as_deref(),
+            input.max_results,
+            crate::state::MEMBER_MAX_RESULTS,
+        );
+
+        Ok(ListMembersOutput {
+            members: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

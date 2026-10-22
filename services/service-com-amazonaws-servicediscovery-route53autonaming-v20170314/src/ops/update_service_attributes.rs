@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateServiceAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateServiceAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateServiceAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the service-level attributes of one stored service. The call is an UPSERT
+//! over the stored map: every key in the request is stored with the request's value,
+//! replacing the value a previous call stored for that key, and a key the request does
+//! not name keeps the value it had. The merged map is refused with
+//! `ServiceAttributesLimitExceededException` when it would hold more than
+//! [`crate::state::MAX_SERVICE_ATTRIBUTES`] attributes, and the whole request is then
+//! stored or not at all.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +141,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateServiceAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateServiceAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateServiceAttributes"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateServiceAttributesErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // An attribute KEY's modelled length is the one bound on this request the
+        // centralized walk does not check (it covers the map's entry count and each
+        // VALUE's own length), so it is checked here, with the error the model
+        // documents for a value that "might exceed length constraints".
+        for key in input.attributes.keys() {
+            if let Some(message) = crate::state::attribute_key_too_long(key) {
+                return Err(UpdateServiceAttributesErrorModeled::InvalidInput(InvalidInput {
+                    message: Some(message),
+                })
+                .into());
+            }
+        }
+
+        // ONE lock for the whole read-merge-write, so two concurrent updates of the
+        // same service serialize and the one that takes the lock last is the one a
+        // later read sees.
+        let mut state = state.lock();
+        let Some(service) = state
+            .resolve_service_id(&input.service_id)
+            .and_then(|service_id| state.services.get_mut(&service_id))
+        else {
+            return Err(UpdateServiceAttributesErrorModeled::ServiceNotFound(
+                ServiceNotFound {
+                    message: Some(format!(
+                        "No service exists with the specified ID {}.",
+                        input.service_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Merged off to the side first: a request that would pass the quota stores
+        // NOTHING, rather than the prefix of it that still fitted.
+        let mut merged = service.attributes.clone();
+        for (key, value) in &input.attributes {
+            merged.insert(key.clone(), value.clone());
+        }
+        if merged.len() > crate::state::MAX_SERVICE_ATTRIBUTES {
+            return Err(
+                UpdateServiceAttributesErrorModeled::ServiceAttributesLimitExceededException(
+                    ServiceAttributesLimitExceededException {
+                        message: Some(format!(
+                            "The attributes can't be added to the service because it would then \
+                             hold {} attributes, over the quota of {}.",
+                            merged.len(),
+                            crate::state::MAX_SERVICE_ATTRIBUTES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        service.attributes = merged;
+
+        Ok(UpdateServiceAttributesOutput {})
     }
 }
