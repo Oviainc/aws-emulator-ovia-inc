@@ -211,10 +211,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|transaction| {
                 to.is_none_or(|latest| transaction.transaction_timestamp <= latest)
             })
+            // `ConfirmationStatusFilter$include`: "Transactions that have reached
+            // finality are always part of the response", so the filter decides only
+            // whether the transactions that have NOT reached it are included too.
             .filter(|transaction| {
-                wanted_statuses
-                    .as_ref()
-                    .is_none_or(|wanted| wanted.contains(&transaction.confirmation_status))
+                transaction.confirmation_status == crate::state::CONFIRMATION_FINAL
+                    || wanted_statuses
+                        .as_ref()
+                        .is_none_or(|wanted| wanted.contains(&transaction.confirmation_status))
             })
             .collect();
         if descending {

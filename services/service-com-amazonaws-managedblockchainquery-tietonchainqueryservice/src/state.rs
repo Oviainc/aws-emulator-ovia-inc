@@ -9,6 +9,14 @@
 //! ledger for every value of the model's `QueryNetwork` enum, and every implemented
 //! operation computes its answer by reading that ledger.
 //!
+//! The real service indexes a PUBLIC chain. This emulator cannot hold one — a public
+//! chain's transactions are facts it has no way to compute — so it holds a FIXTURE chain
+//! instead, built once by [`chain`] out of fixed labels and the chains' own published
+//! facts, spanning each network's life up to the instant the state was constructed.
+//! Nothing a request carries ever enters the ledger: an identifier the fixture does not
+//! hold is answered with the modelled empty page or `ResourceNotFoundException`, never
+//! with a history made up from what was asked for.
+//!
 //! The fixture is built so the operations are mutually consistent:
 //!
 //! * a transaction `ListTransactions` returns is fetchable by `GetTransaction`;
@@ -33,6 +41,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
+
+pub mod chain;
 
 use crate::ops::types::{
     BlockchainInstant, ContractMetadata, InternalServerException, OwnerIdentifier, TokenBalance,
@@ -473,6 +483,10 @@ pub struct StoredContract {
 /// One network's ledger.
 #[derive(Debug, Default)]
 pub struct NetworkLedger {
+    /// Which value of the model's `QueryNetwork` enum this ledger holds, so the fixture
+    /// [`chain`] builds for it takes the shape that network uses (a Bitcoin transaction
+    /// has a `transactionId` and no gas, an Ethereum one the reverse).
+    pub network: String,
     /// Every transaction on this network, keyed by [`TxKey`] so iteration is in chain
     /// order.
     pub transactions: BTreeMap<TxKey, StoredTransaction>,
@@ -486,6 +500,10 @@ pub struct NetworkLedger {
     /// Every holding on this network, derived from the transactions by
     /// [`derive_holdings`].
     pub holdings: BTreeMap<HoldingKey, StoredHolding>,
+    /// The balance each holding OPENED with, and when: the base the transactions are
+    /// replayed onto. Kept rather than consumed, so every balance is re-derivable from
+    /// the same base and can never report one that disagrees with the events it holds.
+    opening: Vec<(HoldingKey, BalanceAt)>,
     /// Every asset contract on this network, keyed by its [`normalize_contract_address`]
     /// form so one address resolves however it is spelled; iteration is therefore in a
     /// stable, address-major order.
@@ -539,6 +557,26 @@ impl NetworkLedger {
             .flatten()
             .filter_map(|key| self.transactions.get(key))
             .collect()
+    }
+
+    /// Record the balance a holding opens with, unless the ledger already has one.
+    ///
+    /// An opening balance is what an address held before the first transaction this
+    /// ledger holds for it, so a holding has at most one — recording a second would put
+    /// the balance history out of order.
+    fn record_opening(&mut self, key: HoldingKey, time: i64, balance: i128) {
+        if self.opening.iter().any(|(existing, _)| *existing == key) {
+            return;
+        }
+        self.opening.push((key, BalanceAt { time, balance }));
+    }
+
+    /// Re-derive every balance from the opening balances and the stored transactions.
+    ///
+    /// Balances are never written beside the transfers that produced them, they are
+    /// REPLAYED from them ([`derive_holdings`]).
+    fn recompute_holdings(&mut self) {
+        self.holdings = derive_holdings(&self.transactions, &self.opening);
     }
 }
 
@@ -976,13 +1014,6 @@ pub fn store_unavailable() -> InternalServerException {
 // The fixture ledger
 // ---------------------------------------------------------------------------
 
-/// The instant the fixture ledger's opening balances are recorded at:
-/// 2024-01-01T00:00:00Z, in seconds since the Unix epoch.
-const LEDGER_EPOCH: i64 = 1_704_067_200;
-
-/// The interval between the fixture's blocks, in seconds.
-const BLOCK_INTERVAL: i64 = 600;
-
 /// One Ether in wei, the unit every native Ethereum balance is held in.
 const ETH: i128 = 1_000_000_000_000_000_000;
 
@@ -992,20 +1023,13 @@ const BTC: i128 = 100_000_000;
 /// The gas price every fixture Ethereum transaction paid, in wei (20 gwei).
 const EFFECTIVE_GAS_PRICE: i128 = 20_000_000_000;
 
-/// The block number the fixture's first Ethereum block takes. Chosen only so the
-/// fixture's block numbers look like a mainnet block height; nothing reads the value.
-const ETHEREUM_FIRST_BLOCK: i64 = 19_000_000;
-
-/// The block height the fixture's first Bitcoin block takes; see
-/// [`ETHEREUM_FIRST_BLOCK`].
-const BITCOIN_FIRST_BLOCK: i64 = 820_000;
-
 /// One transaction of the fixture, before the ledger-wide values (timestamps, block
 /// identity, cumulative gas, fees) are computed for it.
 struct SeedTx {
     hash: String,
     transaction_id: Option<String>,
-    /// Which fixture block this transaction is in, counting from 0.
+    /// Which fixture block this transaction is in, counting from 0 at the instant the
+    /// fixture's chain starts ([`chain`]).
     block: i64,
     from: Option<String>,
     to: String,
@@ -1017,17 +1041,15 @@ struct SeedTx {
 }
 
 /// The fixture ledger, one per value of the model's `QueryNetwork` enum.
+///
+/// Built once, when this service's state is constructed, out of the fixed labels and
+/// published chain facts in [`chain`]. `tip` is the instant it is built at, which is the
+/// chain tip of every ledger it returns; no request ever adds to them.
 fn seed_networks() -> BTreeMap<String, NetworkLedger> {
+    let tip = now_secs();
     QUERY_NETWORK_VALUES
         .iter()
-        .map(|network| {
-            let ledger = if is_bitcoin(network) {
-                seed_bitcoin_ledger(network)
-            } else {
-                seed_ethereum_ledger(network)
-            };
-            ((*network).to_string(), ledger)
-        })
+        .map(|network| ((*network).to_string(), chain::seed_ledger(network, tip)))
         .collect()
 }
 
@@ -1135,334 +1157,6 @@ fn well_known_mainnet_erc20(network: &str) -> Vec<StoredContract> {
         .collect()
 }
 
-/// The Ethereum fixture: three wallets, two synthetic contracts — plus, on the mainnet,
-/// the well-known token contracts of [`ETHEREUM_MAINNET_ERC20`] — and six transactions
-/// whose events move native Ether, an ERC-20 balance and two ERC-721 tokens.
-fn seed_ethereum_ledger(network: &str) -> NetworkLedger {
-    let wallet_a = ethereum_address(network, "wallet-a");
-    let wallet_b = ethereum_address(network, "wallet-b");
-    let wallet_c = ethereum_address(network, "wallet-c");
-    let erc20 = ethereum_address(network, "contract-erc20");
-    let erc721 = ethereum_address(network, "contract-erc721");
-
-    let hash = |label: &str| format!("0x{}", digest_hex(&format!("{network}/tx/{label}")));
-
-    let mut contracts = vec![
-        StoredContract {
-            network: network.to_string(),
-            contract_address: erc20.clone(),
-            token_standard: "ERC20".to_string(),
-            deployer_address: wallet_a.clone(),
-            metadata: Some(ContractMetadata {
-                name: Some("Emulated Fungible Token".to_string()),
-                symbol: Some("EFT".to_string()),
-                decimals: Some(18),
-            }),
-        },
-        StoredContract {
-            network: network.to_string(),
-            contract_address: erc721.clone(),
-            token_standard: "ERC721".to_string(),
-            deployer_address: wallet_b.clone(),
-            // `GetAssetContract`'s documentation: "Metadata is currently only available
-            // for some ERC-20 contracts", so this index holds metadata for ERC-20
-            // contracts only and a non-fungible contract carries none.
-            metadata: None,
-        },
-    ];
-
-    // The well-known token contracts of the Ethereum mainnet are deployments of THAT
-    // chain, so they belong to its ledger and to no other network's.
-    if network == ETHEREUM_MAINNET {
-        contracts.extend(well_known_mainnet_erc20(network));
-    }
-
-    // The balances the ledger opens with, at `LEDGER_EPOCH`. Every later balance is
-    // these plus the events below, never a number written down on its own.
-    let opening = vec![
-        (native_eth(&wallet_a), 5 * ETH),
-        (native_eth(&wallet_b), 2 * ETH),
-        (native_eth(&wallet_c), 0),
-        (erc20_holding(&erc20, &wallet_a), 1_000_000_000),
-        (erc20_holding(&erc20, &wallet_b), 0),
-        (erc20_holding(&erc20, &wallet_c), 0),
-        (nft_holding(&erc721, "1", &wallet_a), 1),
-        (nft_holding(&erc721, "2", &wallet_b), 1),
-    ];
-
-    let seeds = vec![
-        // A plain Ether transfer: the transaction's own `to` is the recipient.
-        SeedTx {
-            hash: hash("eth-transfer-1"),
-            transaction_id: None,
-            block: 0,
-            from: Some(wallet_a.clone()),
-            to: wallet_b.clone(),
-            contract_address: None,
-            gas_used: Some(21_000),
-            confirmation_status: CONFIRMATION_FINAL,
-            execution_status: Some(EXECUTION_SUCCEEDED),
-            events: vec![StoredEvent {
-                event_type: "ETH_TRANSFER".to_string(),
-                from: Some(wallet_a.clone()),
-                to: Some(wallet_b.clone()),
-                value: Some(ETH),
-                ..StoredEvent::default()
-            }],
-        },
-        // An ERC-20 transfer: the transaction's `to` is the CONTRACT, and the wallet
-        // that received the tokens appears only on the event.
-        SeedTx {
-            hash: hash("erc20-transfer-1"),
-            transaction_id: None,
-            block: 0,
-            from: Some(wallet_a.clone()),
-            to: erc20.clone(),
-            contract_address: Some(erc20.clone()),
-            gas_used: Some(52_000),
-            confirmation_status: CONFIRMATION_FINAL,
-            execution_status: Some(EXECUTION_SUCCEEDED),
-            events: vec![StoredEvent {
-                event_type: "ERC20_TRANSFER".to_string(),
-                from: Some(wallet_a.clone()),
-                to: Some(wallet_c.clone()),
-                value: Some(250_000_000),
-                contract_address: Some(erc20.clone()),
-                ..StoredEvent::default()
-            }],
-        },
-        // An ERC-721 transfer: one token of a contract moves, so the event carries both
-        // the contract and the `tokenId`.
-        SeedTx {
-            hash: hash("erc721-transfer-1"),
-            transaction_id: None,
-            block: 1,
-            from: Some(wallet_a.clone()),
-            to: erc721.clone(),
-            contract_address: Some(erc721.clone()),
-            gas_used: Some(84_000),
-            confirmation_status: CONFIRMATION_FINAL,
-            execution_status: Some(EXECUTION_SUCCEEDED),
-            events: vec![StoredEvent {
-                event_type: "ERC721_TRANSFER".to_string(),
-                from: Some(wallet_a.clone()),
-                to: Some(wallet_b.clone()),
-                value: Some(1),
-                contract_address: Some(erc721.clone()),
-                token_id: Some("1".to_string()),
-                ..StoredEvent::default()
-            }],
-        },
-        // A transfer that has not reached finality yet.
-        SeedTx {
-            hash: hash("eth-transfer-2"),
-            transaction_id: None,
-            block: 1,
-            from: Some(wallet_b.clone()),
-            to: wallet_c.clone(),
-            contract_address: None,
-            gas_used: Some(21_000),
-            confirmation_status: CONFIRMATION_NONFINAL,
-            execution_status: Some(EXECUTION_SUCCEEDED),
-            events: vec![StoredEvent {
-                event_type: "ETH_TRANSFER".to_string(),
-                from: Some(wallet_b.clone()),
-                to: Some(wallet_c.clone()),
-                value: Some(ETH / 2),
-                ..StoredEvent::default()
-            }],
-        },
-        // A transaction that reverted: it is on the chain and `GetTransaction` returns
-        // it, but it emitted no events and moved no value.
-        SeedTx {
-            hash: hash("erc20-reverted"),
-            transaction_id: None,
-            block: 2,
-            from: Some(wallet_c.clone()),
-            to: erc20.clone(),
-            contract_address: Some(erc20.clone()),
-            gas_used: Some(23_000),
-            confirmation_status: CONFIRMATION_FINAL,
-            execution_status: Some(EXECUTION_FAILED),
-            events: Vec::new(),
-        },
-        // One transaction, two events: `ListTransactionEvents` returns them in the
-        // order they were emitted.
-        SeedTx {
-            hash: hash("multi-event"),
-            transaction_id: None,
-            block: 2,
-            from: Some(wallet_c.clone()),
-            to: erc20.clone(),
-            contract_address: Some(erc20.clone()),
-            gas_used: Some(96_000),
-            confirmation_status: CONFIRMATION_NONFINAL,
-            execution_status: Some(EXECUTION_SUCCEEDED),
-            events: vec![
-                StoredEvent {
-                    event_type: "ERC20_TRANSFER".to_string(),
-                    from: Some(wallet_c.clone()),
-                    to: Some(wallet_b.clone()),
-                    value: Some(100_000_000),
-                    contract_address: Some(erc20.clone()),
-                    ..StoredEvent::default()
-                },
-                StoredEvent {
-                    event_type: "INTERNAL_ETH_TRANSFER".to_string(),
-                    from: Some(wallet_c.clone()),
-                    to: Some(wallet_a.clone()),
-                    value: Some(ETH / 100),
-                    ..StoredEvent::default()
-                },
-            ],
-        },
-    ];
-
-    build_ledger(network, seeds, opening, contracts)
-}
-
-/// Where one fixture Bitcoin transaction's single input comes from.
-///
-/// A Bitcoin transaction spends an earlier transaction's OUTPUT, so the fixture's
-/// transactions form a chain: half of them spend an output a fixture transaction created
-/// (which is what makes that output spent), and the rest spend an output of a
-/// transaction outside the fixture.
-enum BitcoinInput {
-    /// Output 0 of a transaction this ledger does not hold, worth this many satoshi.
-    Funding(i128),
-    /// Output 0 of the fixture transaction with this label, worth whatever that
-    /// transaction's output is worth.
-    Output(&'static str),
-}
-
-/// The Bitcoin fixture: three wallets and four transactions, each spending one input
-/// and creating one output, so every balance moves through a `BITCOIN_VIN` /
-/// `BITCOIN_VOUT` pair.
-///
-/// Two of the four spend an output an earlier fixture transaction created, so the ledger
-/// holds both spent and unspent outputs — the distinction
-/// `TransactionEvent$voutSpent` reports and `ListFilteredTransactionEvents`'s
-/// `voutFilter` selects on. Which outputs are spent is DERIVED by [`build_ledger`] from
-/// the inputs that name them, never written down beside the output.
-fn seed_bitcoin_ledger(network: &str) -> NetworkLedger {
-    let wallet_a = bitcoin_address(network, "wallet-a");
-    let wallet_b = bitcoin_address(network, "wallet-b");
-    let wallet_c = bitcoin_address(network, "wallet-c");
-
-    // A Bitcoin transaction hash is conventionally written bare, without a `0x`
-    // prefix; the modelled pattern admits both spellings and `normalize_hash` makes
-    // them equal.
-    let hash = |label: &str| digest_hex(&format!("{network}/tx/{label}"));
-    let txid = |label: &str| digest_hex(&format!("{network}/txid/{label}"));
-
-    let opening = vec![
-        (native_btc(&wallet_a), 5 * BTC),
-        (native_btc(&wallet_b), BTC),
-        (native_btc(&wallet_c), 0),
-    ];
-
-    // (label, from, to, where the input comes from, fee in satoshi). What the
-    // transaction transfers is COMPUTED, not declared: a Bitcoin output is worth what
-    // the input it spends was worth, less the fee.
-    let transfers: [(&str, &String, &String, BitcoinInput, i128); 4] = [
-        (
-            "vin-vout-1",
-            &wallet_a,
-            &wallet_b,
-            BitcoinInput::Funding(3 * BTC / 2 + 10_000),
-            10_000,
-        ),
-        (
-            "vin-vout-2",
-            &wallet_b,
-            &wallet_c,
-            BitcoinInput::Output("vin-vout-1"),
-            12_000,
-        ),
-        (
-            "vin-vout-3",
-            &wallet_a,
-            &wallet_c,
-            BitcoinInput::Funding(BTC / 4 + 8_000),
-            8_000,
-        ),
-        (
-            "vin-vout-4",
-            &wallet_c,
-            &wallet_a,
-            BitcoinInput::Output("vin-vout-2"),
-            9_000,
-        ),
-    ];
-
-    // What each transaction's output is worth, so a later transaction that spends it
-    // spends exactly that amount.
-    let mut output_value: BTreeMap<&str, i128> = BTreeMap::new();
-    let mut seeds: Vec<SeedTx> = Vec::new();
-    for (index, (label, from, to, input, fee)) in transfers.iter().enumerate() {
-        let (spent_value, spent_hash, spent_id) = match input {
-            BitcoinInput::Funding(amount) => (
-                *amount,
-                hash(&format!("{label}/funding")),
-                txid(&format!("{label}/funding")),
-            ),
-            BitcoinInput::Output(spent_label) => (
-                *output_value
-                    .get(spent_label)
-                    .expect("the fixture's inputs name only outputs it created earlier"),
-                hash(spent_label),
-                txid(spent_label),
-            ),
-        };
-        let value = spent_value - fee;
-        output_value.insert(label, value);
-
-        seeds.push(SeedTx {
-            hash: hash(label),
-            transaction_id: Some(txid(label)),
-            block: index as i64 / 2,
-            from: Some((*from).clone()),
-            to: (*to).clone(),
-            contract_address: None,
-            // Bitcoin has no gas: the fee is the difference between what the inputs
-            // spent and what the outputs created, which `build_ledger` computes.
-            gas_used: None,
-            confirmation_status: if index == 2 {
-                CONFIRMATION_NONFINAL
-            } else {
-                CONFIRMATION_FINAL
-            },
-            // There is no contract execution to succeed or fail on Bitcoin.
-            execution_status: None,
-            events: vec![
-                StoredEvent {
-                    event_type: "BITCOIN_VIN".to_string(),
-                    from: Some((*from).clone()),
-                    // The input spends the whole output it names, fee included.
-                    value: Some(spent_value),
-                    spent_vout_transaction_hash: Some(spent_hash),
-                    spent_vout_transaction_id: Some(spent_id),
-                    spent_vout_index: Some(0),
-                    ..StoredEvent::default()
-                },
-                StoredEvent {
-                    event_type: "BITCOIN_VOUT".to_string(),
-                    to: Some((*to).clone()),
-                    value: Some(value),
-                    vout_index: Some(0),
-                    // `voutSpent` is derived by `build_ledger` from the inputs that
-                    // spend this output.
-                    ..StoredEvent::default()
-                },
-            ],
-        });
-    }
-
-    // The Bitcoin networks have no asset contracts: `GetAssetContract`'s documentation
-    // is explicit that "the Bitcoin blockchain networks do not support this operation".
-    build_ledger(network, seeds, opening, Vec::new())
-}
-
 /// The [`HoldingKey`] of a native Ether balance.
 fn native_eth(owner: &str) -> HoldingKey {
     HoldingKey {
@@ -1491,16 +1185,6 @@ fn erc20_holding(contract: &str, owner: &str) -> HoldingKey {
     }
 }
 
-/// The [`HoldingKey`] of a non-fungible balance: one token of a contract, so both a
-/// contract and a `tokenId`.
-fn nft_holding(contract: &str, token_id: &str, owner: &str) -> HoldingKey {
-    HoldingKey {
-        contract_address: Some(contract.to_string()),
-        token_id: Some(token_id.to_string()),
-        owner_address: owner.to_string(),
-    }
-}
-
 /// Turn the fixture's transactions into a ledger, computing everything that depends on
 /// the ledger as a whole: block identity and timestamps, each transaction's index
 /// within its block and the number of transactions in it, cumulative gas, the fee, and
@@ -1510,8 +1194,12 @@ fn build_ledger(
     seeds: Vec<SeedTx>,
     opening: Vec<(HoldingKey, i128)>,
     contracts: Vec<StoredContract>,
+    start: i64,
 ) -> NetworkLedger {
-    let mut ledger = NetworkLedger::default();
+    let mut ledger = NetworkLedger {
+        network: network.to_string(),
+        ..NetworkLedger::default()
+    };
     for contract in contracts {
         ledger.contracts.insert(
             normalize_contract_address(&contract.contract_address),
@@ -1520,11 +1208,6 @@ fn build_ledger(
     }
 
     let bitcoin = is_bitcoin(network);
-    let first_block = if bitcoin {
-        BITCOIN_FIRST_BLOCK
-    } else {
-        ETHEREUM_FIRST_BLOCK
-    };
     // How many transactions each block holds — `Transaction$numberOfTransactions` is
     // "the number of transactions in the block", so it is counted, not declared.
     let mut per_block: BTreeMap<i64, i64> = BTreeMap::new();
@@ -1567,6 +1250,7 @@ fn build_ledger(
         } else {
             seed.gas_used.map(|gas| gas * EFFECTIVE_GAS_PRICE)
         };
+        let block_time = start + (seed.block + 1) * chain::FIXTURE_BLOCK_INTERVAL;
         let block_identifier = digest_hex(&format!("{network}/block/{}", seed.block));
         let block_hash = if bitcoin {
             block_identifier
@@ -1591,8 +1275,10 @@ fn build_ledger(
             transaction_hash: seed.hash.clone(),
             transaction_id: seed.transaction_id.clone(),
             block_hash: Some(block_hash),
-            block_number: Some((first_block + seed.block).to_string()),
-            transaction_timestamp: LEDGER_EPOCH + (seed.block + 1) * BLOCK_INTERVAL,
+            // The height of the block holding this instant, at the network's own target
+            // block time ([`chain::block_height`]).
+            block_number: Some(chain::block_height(network, block_time).to_string()),
+            transaction_timestamp: block_time,
             transaction_index: index,
             number_of_transactions: per_block.get(&seed.block).copied().unwrap_or(1),
             to: seed.to.clone(),
@@ -1613,7 +1299,12 @@ fn build_ledger(
         });
     }
 
-    ledger.holdings = derive_holdings(&ledger.transactions, &opening, LEDGER_EPOCH);
+    // Every balance opens at the instant the fixture's chain starts, which precedes
+    // every transaction above.
+    for (key, balance) in opening {
+        ledger.record_opening(key, start, balance);
+    }
+    ledger.recompute_holdings();
     ledger
 }
 
@@ -1628,6 +1319,11 @@ fn event_total(events: &[StoredEvent], event_type: &str) -> i128 {
 
 /// Derive every holding from the opening balances and the stored transactions.
 ///
+/// Each opening balance carries the instant it was recorded at, which precedes every
+/// transaction of its own holding; the transactions are then replayed in chain order
+/// (the order the `BTreeMap`'s [`TxKey`] puts them in), so each holding's history comes
+/// out ascending by time however the transactions entered the ledger.
+///
 /// This is why a balance can never disagree with the events that produced it: the
 /// balance operations read holdings, and holdings exist only as the result of replaying
 /// the events `ListTransactionEvents` returns, in chain order. A transaction whose
@@ -1641,15 +1337,14 @@ fn event_total(events: &[StoredEvent], event_type: &str) -> i128 {
 /// reconcile with the transfer events alone and are not fee-inclusive.
 fn derive_holdings(
     transactions: &BTreeMap<TxKey, StoredTransaction>,
-    opening: &[(HoldingKey, i128)],
-    opened_at: i64,
+    opening: &[(HoldingKey, BalanceAt)],
 ) -> BTreeMap<HoldingKey, StoredHolding> {
     let mut holdings: BTreeMap<HoldingKey, StoredHolding> = BTreeMap::new();
-    for (key, balance) in opening {
+    for (key, opened) in opening {
         holdings
             .entry(key.clone())
             .or_default()
-            .record(opened_at, *balance);
+            .record(opened.time, opened.balance);
     }
 
     for transaction in transactions.values() {
