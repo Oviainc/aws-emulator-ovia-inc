@@ -12,6 +12,12 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
+use ::aws_smithy_schema_server::constraints::{envelope, Violation, ViolationKind};
+
+use crate::ops::types::{
+    ConflictException, ResourceNotFoundException, ValidationException, ValidationExceptionField,
+};
+
 /// This service's ARN namespace and sigv4 signing name (OPERATIONS.md, "Wire protocol").
 pub const ARN_SERVICE: &str = "vpc-lattice";
 
@@ -31,13 +37,28 @@ pub const KIND_LISTENER: &str = "listener";
 /// `…:service/svc-…/listener/listener-…/rule/rule-…` (`RuleArn`'s modelled pattern).
 pub const KIND_RULE: &str = "rule";
 
-/// A resource kind this service's error bodies name.
+/// The id prefix of a service network (`^sn-[0-9a-z]{17}$`).
+pub const PREFIX_SERVICE_NETWORK: &str = "sn-";
+/// The id prefix of a service (`^svc-[0-9a-z]{17}$`).
+pub const PREFIX_SERVICE: &str = "svc-";
+/// The id prefix of a service-network/service association (`^snsa-[0-9a-z]{17}$`).
+pub const PREFIX_SERVICE_ASSOCIATION: &str = "snsa-";
+/// The id prefix of a listener (`^listener-[0-9a-z]{17}$`).
+pub const PREFIX_LISTENER: &str = "listener-";
+/// The id prefix of a listener rule (`^rule-[0-9a-z]{17}$`).
+pub const PREFIX_RULE: &str = "rule-";
+
+/// Every modelled id of this service is its prefix plus 17 `[0-9a-z]` characters.
+const ID_SUFFIX_LEN: usize = 17;
+
+/// A resource kind of this service, and the spellings the wire needs of it.
 ///
-/// One kind has more than one spelling and they are NOT interchangeable: the ARN segment
-/// (`servicenetwork`, used in an ARN and in the exceptions' `resourceType` member) is an
-/// internal, lowercase, delimiter-free key, while the token AWS's error MESSAGES name the
-/// kind by is its CamelCase resource name (`ServiceNetwork`). Keeping both on one type is
-/// what stops a handler reaching for the ARN segment where the message token belongs.
+/// One kind is spelled THREE different ways on the wire and they are not
+/// interchangeable: the ARN path segment and `name_index` key ([`Self::arn_kind`]), the
+/// resource-type TOKEN an error's `resourceType` member carries ([`Self::wire_type`]),
+/// and the name an error MESSAGE calls the resource by ([`Self::message_name`]). Every
+/// error this service builds takes its kind from here, so no handler can reuse the
+/// internal key where the token belongs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceKind {
     /// A service network (`sn-…`).
@@ -53,9 +74,23 @@ pub enum ResourceKind {
 }
 
 impl ResourceKind {
-    /// This kind's ARN resource segment, which is also the `resourceType` its error
-    /// bodies carry.
-    pub fn arn_kind(self) -> &'static str {
+    /// How many kinds there are, so a per-kind cache can hold one slot each.
+    pub const COUNT: usize = 5;
+
+    /// This kind's slot in a per-kind array ([`Self::COUNT`] wide).
+    pub const fn slot(self) -> usize {
+        match self {
+            Self::ServiceNetwork => 0,
+            Self::Service => 1,
+            Self::ServiceAssociation => 2,
+            Self::Listener => 3,
+            Self::Rule => 4,
+        }
+    }
+
+    /// The ARN path segment of this kind (`…:servicenetwork/sn-…`), which is also the
+    /// prefix of its [`ComAmazonawsVpclatticeMercurycontrolplaneState::name_index`] keys.
+    pub const fn arn_kind(self) -> &'static str {
         match self {
             Self::ServiceNetwork => KIND_SERVICE_NETWORK,
             Self::Service => KIND_SERVICE,
@@ -65,7 +100,40 @@ impl ResourceKind {
         }
     }
 
-    /// The token AWS's error messages name this kind by.
+    /// The id prefix of this kind.
+    pub const fn id_prefix(self) -> &'static str {
+        match self {
+            Self::ServiceNetwork => PREFIX_SERVICE_NETWORK,
+            Self::Service => PREFIX_SERVICE,
+            Self::ServiceAssociation => PREFIX_SERVICE_ASSOCIATION,
+            Self::Listener => PREFIX_LISTENER,
+            Self::Rule => PREFIX_RULE,
+        }
+    }
+
+    /// The resource-type token the `resourceType` member of this service's error shapes
+    /// carries for this kind: the resource type in UPPER_SNAKE_CASE.
+    ///
+    /// SOURCE: recorded AWS behaviour. `ResourceNotFoundException`, `ConflictException`
+    /// and `ServiceQuotaExceededException` all declare `resourceType` as a required
+    /// `String` and the model enumerates no values for it
+    /// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), while every
+    /// recorded vpc-lattice error spells it as the resource type in upper snake case —
+    /// `SERVICE_NETWORK`, `SERVICE`, `SERVICE_NETWORK_SERVICE_ASSOCIATION`. It is a
+    /// structured field clients branch on, NOT the ARN path segment.
+    pub const fn wire_type(self) -> &'static str {
+        match self {
+            Self::ServiceNetwork => "SERVICE_NETWORK",
+            Self::Service => "SERVICE",
+            Self::ServiceAssociation => "SERVICE_NETWORK_SERVICE_ASSOCIATION",
+            Self::Listener => "LISTENER",
+            Self::Rule => "RULE",
+        }
+    }
+
+    /// The name an error MESSAGE calls this kind by: the resource type in PascalCase,
+    /// with an association named `Association` as the recorded messages spell it
+    /// ("Association snsa-… cannot be found.").
     ///
     /// Source: recorded vpc-lattice not-found bodies, which spell the kind as its
     /// CamelCase resource name — `ServiceNetwork` for a service network, `Service` for a
@@ -74,7 +142,7 @@ impl ResourceKind {
     /// listener takes the same rule the other three follow: the Smithy resource name,
     /// `com.amazonaws.vpclattice#Listener`. A listener RULE follows it too, over
     /// `com.amazonaws.vpclattice#Rule`.
-    pub fn error_label(self) -> &'static str {
+    pub const fn message_name(self) -> &'static str {
         match self {
             Self::ServiceNetwork => "ServiceNetwork",
             Self::Service => "Service",
@@ -90,26 +158,27 @@ impl ResourceKind {
     /// `identifier` is the identifier the CALLER submitted — whichever modelled form it
     /// sent (bare id or ARN) — so the message names back the thing the request named, and
     /// is reportable even when nothing resolved. The model types `message` as a required
-    /// String and states no text, so the construction (kind token plus submitted
-    /// identifier plus "cannot be found.") is what the recordings fix, not one string.
+    /// String and states no text, so the construction ([`Self::message_name`] plus the
+    /// submitted identifier plus "cannot be found.") is what the recordings fix, not one
+    /// string.
     pub fn not_found_message(self, identifier: &str) -> String {
-        format!("{} {identifier} cannot be found.", self.error_label())
+        format!("{} {identifier} cannot be found.", self.message_name())
+    }
+
+    /// The `@pattern` the model puts on this kind's `name` member, or `None` for a kind
+    /// that has no name (an association is named by the pair it links).
+    ///
+    /// SOURCE: `smithy_query(query="shape",shape="ServiceName,ServiceNetworkName,ListenerName,RuleName")`.
+    pub const fn name_pattern(self) -> Option<&'static str> {
+        match self {
+            Self::ServiceNetwork => Some(SERVICE_NETWORK_NAME_PATTERN),
+            Self::Service => Some(SERVICE_NAME_PATTERN),
+            Self::Listener => Some(LISTENER_NAME_PATTERN),
+            Self::Rule => Some(RULE_NAME_PATTERN),
+            Self::ServiceAssociation => None,
+        }
     }
 }
-
-/// The id prefix of a service network (`^sn-[0-9a-z]{17}$`).
-pub const PREFIX_SERVICE_NETWORK: &str = "sn-";
-/// The id prefix of a service (`^svc-[0-9a-z]{17}$`).
-pub const PREFIX_SERVICE: &str = "svc-";
-/// The id prefix of a service-network/service association (`^snsa-[0-9a-z]{17}$`).
-pub const PREFIX_SERVICE_ASSOCIATION: &str = "snsa-";
-/// The id prefix of a listener (`^listener-[0-9a-z]{17}$`).
-pub const PREFIX_LISTENER: &str = "listener-";
-/// The id prefix of a listener rule (`^rule-[0-9a-z]{17}$`).
-pub const PREFIX_RULE: &str = "rule-";
-
-/// Every modelled id of this service is its prefix plus 17 `[0-9a-z]` characters.
-const ID_SUFFIX_LEN: usize = 17;
 
 /// The most items one page of a list operation carries.
 ///
@@ -378,8 +447,8 @@ pub fn default_port_for(protocol: &str) -> Option<i32> {
     }
 }
 
-/// Refuse a rule action outside a constraint its own documentation states, with the
-/// offending member path and the reason; `Ok(())` when it satisfies them.
+/// Refuse a rule action outside a constraint its own documentation states, as the
+/// violation AWS reports it; `Ok(())` when it satisfies them.
 ///
 /// The modelled traits the boundary already enforces (`targetGroups`' `@length(1, 10)`,
 /// `weight`'s `@range(0, 999)`, `statusCode`'s `@range(100, 599)`) are not re-checked
@@ -388,22 +457,22 @@ pub fn default_port_for(protocol: &str) -> Option<i32> {
 pub fn check_rule_action(
     member: &str,
     action: &crate::ops::types::RuleAction,
-) -> Result<(), (String, String)> {
+) -> Result<(), FieldViolation> {
     match action {
         crate::ops::types::RuleAction::fixedResponse(fixed) => {
             if !FIXED_RESPONSE_STATUS_CODES.contains(&fixed.status_code) {
-                let supported = FIXED_RESPONSE_STATUS_CODES
-                    .iter()
-                    .map(i32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err((
-                    format!("{member}.fixedResponse.statusCode"),
-                    format!(
-                        "must be one of the supported status codes {supported}, got {}",
-                        fixed.status_code
+                return Err(Violation {
+                    path: format!("{member}.fixedResponse.statusCode"),
+                    // The documented catalog is a value SET, so it is reported the way
+                    // the framework reports one.
+                    kind: ViolationKind::EnumValue(
+                        FIXED_RESPONSE_STATUS_CODES
+                            .iter()
+                            .map(i32::to_string)
+                            .collect(),
                     ),
-                ));
+                    value: Some(fixed.status_code.to_string()),
+                });
             }
             Ok(())
         }
@@ -821,49 +890,201 @@ pub fn id_from_identifier(identifier: &str, prefix: &str) -> Option<String> {
     .then(|| tail.to_string())
 }
 
-/// Refuse a resource name the modelled name pattern forbids, with the text that names
-/// the broken constraint; `Ok(())` when the name satisfies it.
+/// The `@pattern` the model declares on `ServiceName`, which `CreateService.name`
+/// targets. SOURCE: `smithy_query(query="shape",shape="ServiceName")`.
+pub const SERVICE_NAME_PATTERN: &str = r"^(?!svc-)(?![-])(?!.*[-]$)(?!.*[-]{2})[a-z0-9-]+$";
+
+/// The `@pattern` the model declares on `ServiceNetworkName`, which
+/// `CreateServiceNetwork.name` targets.
+/// SOURCE: `smithy_query(query="shape",shape="ServiceNetworkName")`.
+pub const SERVICE_NETWORK_NAME_PATTERN: &str = r"^(?![-])(?!.*[-]$)(?!.*[-]{2})[a-z0-9-]+$";
+
+/// The `@pattern` the model declares on `ListenerName`, which `CreateListener.name`
+/// targets. SOURCE: `smithy_query(query="shape",shape="ListenerName")`.
+pub const LISTENER_NAME_PATTERN: &str =
+    r"^(?!listener-)(?![-])(?!.*[-]$)(?!.*[-]{2})[a-z0-9-]+$";
+
+/// The `@pattern` the model declares on `RuleName`, which `CreateRule.name` targets.
+/// SOURCE: `smithy_query(query="shape",shape="RuleName")`.
+pub const RULE_NAME_PATTERN: &str = r"^(?!rule-)(?![-])(?!.*[-]$)(?!.*[-]{2})[a-z0-9-]+$";
+
+/// The `@pattern`, with the anchors stripped, as a validation error reports it.
 ///
-/// The rule the `ServiceName` / `ServiceNetworkName` patterns state: lowercase letters,
-/// digits and hyphens only, no leading or trailing hyphen, no two adjacent hyphens,
-/// and — where the resource's ids carry one — not beginning with that id prefix. The
-/// length bounds are a separate `@length` trait the framework already enforces.
+/// The recorded vpc-lattice validation messages quote the pattern's BODY —
+/// "Member must satisfy regular expression pattern: (?![-])…[a-z0-9-]+" — so the
+/// anchors are dropped before the clause is built. The whole value is matched either
+/// way, so they carry nothing for the caller.
+fn reported_pattern(pattern: &str) -> String {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    body.strip_suffix('$').unwrap_or(body).to_string()
+}
+
+/// One member whose submitted value broke a constraint, as this service reports it.
 ///
-/// This has to be enforced in the handler: those patterns are written with negative
-/// lookahead, which the regex engine behind `@pattern` cannot compile, and a pattern
-/// that does not compile is treated as matching, so the boundary lets the name through.
-pub fn check_resource_name(name: &str, reserved_prefix: Option<&str>) -> Result<(), String> {
-    if reserved_prefix.is_some_and(|prefix| name.starts_with(prefix)) {
-        return Err(format!(
-            "must not begin with the reserved prefix {}",
-            reserved_prefix.unwrap_or_default()
-        ));
+/// This is the framework's own violation type
+/// (`aws_smithy_schema_server::constraints::Violation`), NOT a second one: a constraint
+/// a handler has to check by hand is then reported by exactly the code that reports the
+/// ones the boundary refuses before a handler runs.
+pub type FieldViolation = Violation;
+
+/// The modelled `ValidationExceptionReason` for a member whose value failed validation
+/// (`smithy_query(query="shape",shape="ValidationExceptionReason")`).
+pub const VALIDATION_REASON_FIELD: &str = "fieldValidationFailed";
+
+/// AWS's `ValidationException` for members whose submitted values were refused.
+///
+/// The construction — which the recorded responses show, which the AWS SDKs and CLI
+/// parse, and which the framework's [`envelope`] owns — is
+/// "<N> validation error(s) detected: " over the clause
+/// "Value '<submitted value>' at '<member path>' failed to satisfy constraint:
+/// <requirement>" per violation, with `fieldList` carrying one entry per violation whose
+/// own `message` is that clause without the count. The text is therefore DERIVED from
+/// (member path, submitted value, violated constraint) — never a bespoke sentence per
+/// check.
+///
+/// Every caller reports at least one violation; an empty slice describes no refusal and
+/// is not a refusal this service can answer.
+pub fn validation_exception(violations: &[FieldViolation]) -> ValidationException {
+    debug_assert!(
+        !violations.is_empty(),
+        "a ValidationException has to report at least one violated member"
+    );
+    ValidationException {
+        message: envelope(violations).unwrap_or_default(),
+        reason: VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(
+            violations
+                .iter()
+                .map(|violation| ValidationExceptionField {
+                    name: violation.path.clone(),
+                    message: violation.message(),
+                })
+                .collect(),
+        ),
     }
-    if !name
-        .bytes()
-        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    {
-        return Err("may contain only lowercase letters, digits and hyphens".to_string());
+}
+
+/// Refuse a resource name that `kind`'s modelled `name` pattern forbids, as the
+/// violation AWS reports: the member, the submitted name and the modelled pattern.
+///
+/// The pattern itself is evaluated (with `fancy-regex`, which supports the look-around
+/// the patterns are written with), so the refusal and the constraint it reports can
+/// never drift apart. It has to happen here: the boundary validator compiles a
+/// `@pattern` with the `regex` crate, which has no look-around, and treats a pattern it
+/// cannot compile as matching — so the name reaches the handler unchecked. The `@length`
+/// bounds are a separate trait the boundary does enforce.
+pub fn check_resource_name(
+    kind: ResourceKind,
+    member: &str,
+    name: &str,
+) -> Result<(), FieldViolation> {
+    let Some(pattern) = kind.name_pattern() else {
+        return Ok(());
+    };
+    // A match ERROR (the engine's backtrack limit) is deliberately read as "does not
+    // match": a name is at most 63 characters by its `@length`, so no name this service
+    // accepts can reach that limit, and refusing a name the service cannot prove legal
+    // is the safe side — it never persists an unvalidated name.
+    if compiled_pattern(kind).is_some_and(|compiled| compiled.is_match(name).unwrap_or(false)) {
+        return Ok(());
     }
-    if name.starts_with('-') || name.ends_with('-') {
-        return Err("must not begin or end with a hyphen".to_string());
-    }
-    if name.contains("--") {
-        return Err("must not contain two adjacent hyphens".to_string());
+    Err(Violation {
+        path: member.to_string(),
+        kind: ViolationKind::Pattern(reported_pattern(pattern)),
+        value: Some(name.to_string()),
+    })
+}
+
+/// This kind's modelled name `@pattern`, compiled once per kind; `None` for a kind
+/// that has no name.
+///
+/// The pattern comes from [`ResourceKind::name_pattern`] — the ONE place a kind's
+/// pattern is named, and read here rather than passed in, so the compiled regex and the
+/// constraint a violation reports cannot drift apart; this only caches the compilation,
+/// one slot per kind.
+fn compiled_pattern(kind: ResourceKind) -> Option<&'static ::fancy_regex::Regex> {
+    static COMPILED: [::std::sync::OnceLock<::fancy_regex::Regex>; ResourceKind::COUNT] = [
+        ::std::sync::OnceLock::new(),
+        ::std::sync::OnceLock::new(),
+        ::std::sync::OnceLock::new(),
+        ::std::sync::OnceLock::new(),
+        ::std::sync::OnceLock::new(),
+    ];
+    let pattern = kind.name_pattern()?;
+    Some(COMPILED[kind.slot()].get_or_init(|| {
+        ::fancy_regex::Regex::new(pattern).expect("a modelled name @pattern compiles")
+    }))
+}
+
+/// Refuse a `tags` map larger than the modelled `TagMap` ceiling, as the violation the
+/// boundary would report for the same trait; `Ok(())` when it fits.
+///
+/// A map's value is rendered as its entry count, the way the framework's own collection
+/// `@length` check renders one.
+pub fn check_tag_count(tags: Option<&HashMap<String, String>>) -> Result<(), FieldViolation> {
+    let count = tags.map_or(0, HashMap::len);
+    if count > MAX_TAGS {
+        return Err(Violation {
+            path: "tags".to_string(),
+            kind: ViolationKind::MaxLength(MAX_TAGS as i64),
+            value: Some(format!("{count} entries")),
+        });
     }
     Ok(())
 }
 
-/// Refuse a `tags` map larger than the modelled `TagMap` ceiling, with the text naming
-/// the constraint; `Ok(())` when it fits.
-pub fn check_tag_count(tags: Option<&HashMap<String, String>>) -> Result<(), String> {
-    let count = tags.map_or(0, HashMap::len);
-    if count > MAX_TAGS {
-        return Err(format!(
-            "must carry at most {MAX_TAGS} tags, got {count}"
-        ));
+/// AWS's `ResourceNotFoundException` for an identifier that names no persisted resource
+/// of `kind`.
+///
+/// The message is built from the request ([`ResourceKind::not_found_message`]): "<Kind>
+/// <identifier> cannot be found.", over the identifier the caller actually sent (SOURCE:
+/// recorded AWS behaviour — the model types `message` as a required `String` and states
+/// no text, and every recorded not-found of this service reads this way). `resourceType`
+/// is `kind`'s wire token.
+pub fn resource_not_found(kind: ResourceKind, identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: kind.not_found_message(identifier),
+        resource_id: identifier.to_string(),
+        resource_type: kind.wire_type().to_string(),
     }
-    Ok(())
+}
+
+/// A `ConflictException` about a resource of `kind`, over that guard's own message.
+///
+/// Every conflict of this service goes through here, so `resourceType` is the kind's
+/// wire token and never the internal registry key.
+pub fn conflict(kind: ResourceKind, resource_id: &str, message: String) -> ConflictException {
+    ConflictException {
+        message,
+        resource_id: resource_id.to_string(),
+        resource_type: kind.wire_type().to_string(),
+    }
+}
+
+/// AWS's conflict message for a create whose `name` is already taken: it names the
+/// submitted name and the scope the name has to be unique in — `account` plus the
+/// account id for an account-scoped name, and the owning resource for a name scoped to
+/// one (a listener's `name` documents "A listener name must be unique within a
+/// service").
+///
+/// SOURCE: recorded AWS behaviour (409 `ConflictException`, account-scoped names); the
+/// exact wording is an example of that construction, the identifiers in it are the
+/// requirement.
+pub fn duplicate_name_message(name: &str, scope_kind: &str, scope_id: &str) -> String {
+    format!("Resource with name {name} already exists in {scope_kind} {scope_id}.")
+}
+
+/// [`duplicate_name_message`] for a name that is unique per account, the scope of a
+/// service network's and a service's `name`.
+pub fn duplicate_name_in_account_message(name: &str) -> String {
+    duplicate_name_message(name, "account", account_id())
+}
+
+/// AWS's conflict message for a second association of a (service network, service) pair:
+/// it names both ARNs the association links. Same source as
+/// [`duplicate_name_message`].
+pub fn duplicate_association_message(service_network_arn: &str, service_arn: &str) -> String {
+    format!("Association for {service_network_arn} and {service_arn} already exists.")
 }
 
 /// A stored instant as the modelled timestamp.

@@ -162,11 +162,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Ok(after) = crate::state::decode_cursor(input.next_token.as_deref()) else {
             // A token no listing of this service ever minted; the model declares
-            // ValidationException for input the service refuses.
+            // ValidationException for input the service refuses. `nextToken` is an
+            // OPAQUE cursor — the model constrains only its length, which the boundary
+            // enforces — so there is no constraint to report a value against and this
+            // message is the refusal itself, not a constraint clause.
             return Err(ListServicesErrorModeled::ValidationException(
                 ValidationException {
                     message: "nextToken is not a token this service issued".to_string(),
-                    reason: "fieldValidationFailed".to_string(),
+                    reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
                     field_list: Some(vec![ValidationExceptionField {
                         name: "nextToken".to_string(),
                         message: "the token does not name a page of this result set".to_string(),

@@ -167,6 +167,21 @@ pub(crate) fn as_label(value: &str) -> String {
     value.replace('/', "%2F")
 }
 
+/// The `message` member of a modelled exception body, which every error shape of this
+/// service declares required. Shared by the suites of this test target, so the
+/// extraction has one spelling.
+pub(crate) fn message_of(case: &str, answer: &Answer) -> String {
+    answer.body["message"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: the exception must carry the required message member, got {}",
+                answer.body
+            )
+        })
+        .to_string()
+}
+
 /// A timestamp member is present and carries a real instant, in the wire form the model
 /// declares for it: every timestamp member of this service targets
 /// `com.amazonaws.vpclattice#Timestamp`, which carries `@timestampFormat("date-time")`

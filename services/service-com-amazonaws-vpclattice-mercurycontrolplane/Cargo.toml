@@ -26,6 +26,9 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Encodes the opaque `nextToken` cursor a paginated listing hands back.
 hex = { workspace = true }
+# Evaluates the modelled `@pattern` of a resource name, which is written with negative
+# look-ahead the `regex` crate behind `@pattern` cannot compile.
+fancy-regex = "0.16"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

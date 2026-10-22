@@ -142,19 +142,15 @@ impl From<CreateServiceNetworkServiceAssociationErrorModeled> for CreateServiceN
     }
 }
 
-/// HTTP 404 for an identifier that names no persisted resource of `kind`, with AWS's
-/// not-found message construction over the submitted identifier
-/// ([`crate::state::ResourceKind::not_found_message`]).
+/// HTTP 404 for an identifier that names no persisted resource of `kind`, built by the
+/// service's shared error construction ([`crate::state::resource_not_found`]): AWS's
+/// not-found message over the submitted identifier, and the kind's resource-type token.
 fn not_found(
     identifier: &str,
     kind: crate::state::ResourceKind,
 ) -> CreateServiceNetworkServiceAssociationError {
     CreateServiceNetworkServiceAssociationErrorModeled::ResourceNotFoundException(
-        ResourceNotFoundException {
-            message: kind.not_found_message(identifier),
-            resource_id: identifier.to_string(),
-            resource_type: kind.arn_kind().to_string(),
-        },
+        crate::state::resource_not_found(kind, identifier),
     )
     .into()
 }
@@ -230,17 +226,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The modelled `TagMap` ceiling, which the boundary does not refuse here.
-        if let Err(reason) = crate::state::check_tag_count(input.tags.as_ref()) {
+        if let Err(violation) = crate::state::check_tag_count(input.tags.as_ref()) {
             return Err(
                 CreateServiceNetworkServiceAssociationErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!("tags {reason}"),
-                        reason: "fieldValidationFailed".to_string(),
-                        field_list: Some(vec![ValidationExceptionField {
-                            name: "tags".to_string(),
-                            message: reason,
-                        }]),
-                    },
+                    crate::state::validation_exception(&[violation]),
                 )
                 .into(),
             );
@@ -273,14 +262,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(
                     CreateServiceNetworkServiceAssociationErrorModeled::ConflictException(
-                        ConflictException {
-                            message: format!(
-                                "clientToken was already used to associate service {} with service network {}",
-                                existing.service_id, existing.service_network_id
+                        // No recording covers a clientToken replayed with different
+                        // parameters, so this message keeps its own wording; the
+                        // identifier of the conflicting association is in it and the
+                        // resourceType token comes from the shared path.
+                        crate::state::conflict(
+                            crate::state::ResourceKind::ServiceAssociation,
+                            &existing.id,
+                            format!(
+                                "Association {} was already created with this clientToken for {} and {}.",
+                                existing.id, existing.service_network_arn, existing.service_arn
                             ),
-                            resource_id: existing.id.clone(),
-                            resource_type: crate::state::KIND_SERVICE_ASSOCIATION.to_string(),
-                        },
+                        ),
                     )
                     .into(),
                 );
@@ -310,13 +303,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(existing) = store.association_of(&network_id, &service_id) {
             return Err(
                 CreateServiceNetworkServiceAssociationErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "service {service_id} is already associated with service network {network_id}"
+                    crate::state::conflict(
+                        crate::state::ResourceKind::ServiceAssociation,
+                        &existing.id,
+                        crate::state::duplicate_association_message(
+                            &existing.service_network_arn,
+                            &existing.service_arn,
                         ),
-                        resource_id: existing.id.clone(),
-                        resource_type: crate::state::KIND_SERVICE_ASSOCIATION.to_string(),
-                    },
+                    ),
                 )
                 .into(),
             );
@@ -333,7 +327,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             crate::state::MAX_SERVICE_ASSOCIATIONS
                         ),
                         resource_id: None,
-                        resource_type: crate::state::KIND_SERVICE_ASSOCIATION.to_string(),
+                        resource_type: crate::state::ResourceKind::ServiceAssociation
+                            .wire_type()
+                            .to_string(),
                         service_code: crate::state::ARN_SERVICE.to_string(),
                         quota_code: "service-network-service-associations-per-account".to_string(),
                     },

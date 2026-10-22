@@ -204,30 +204,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The modelled `name` pattern is written with negative lookahead, which the
-        // boundary's regex engine cannot compile — so it is enforced here.
-        if let Err(reason) = crate::state::check_resource_name(&input.name, None) {
+        // boundary's regex engine cannot compile — so it is enforced here, against the
+        // pattern itself, and reported in AWS's validation-error construction.
+        if let Err(violation) = crate::state::check_resource_name(
+            crate::state::ResourceKind::ServiceNetwork,
+            "name",
+            &input.name,
+        ) {
             return Err(CreateServiceNetworkErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!("name {reason}"),
-                    reason: "fieldValidationFailed".to_string(),
-                    field_list: Some(vec![ValidationExceptionField {
-                        name: "name".to_string(),
-                        message: reason,
-                    }]),
-                },
+                crate::state::validation_exception(&[violation]),
             )
             .into());
         }
-        if let Err(reason) = crate::state::check_tag_count(input.tags.as_ref()) {
+        if let Err(violation) = crate::state::check_tag_count(input.tags.as_ref()) {
             return Err(CreateServiceNetworkErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!("tags {reason}"),
-                    reason: "fieldValidationFailed".to_string(),
-                    field_list: Some(vec![ValidationExceptionField {
-                        name: "tags".to_string(),
-                        message: reason,
-                    }]),
-                },
+                crate::state::validation_exception(&[violation]),
             )
             .into());
         }
@@ -244,15 +235,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|id| store.service_networks.get(id))
         {
             if existing.name != input.name {
+                // No recording covers a clientToken replayed with different parameters,
+                // so this message keeps its own wording; the identifier of the
+                // conflicting resource is in it and the resourceType token comes from
+                // the shared path.
                 return Err(CreateServiceNetworkErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "clientToken was already used to create service network {} with a different name",
+                    crate::state::conflict(
+                        crate::state::ResourceKind::ServiceNetwork,
+                        &existing.id,
+                        format!(
+                            "ServiceNetwork {} was already created with this clientToken and a different name.",
                             existing.id
                         ),
-                        resource_id: existing.id.clone(),
-                        resource_type: crate::state::KIND_SERVICE_NETWORK.to_string(),
-                    },
+                    ),
                 )
                 .into());
             }
@@ -264,14 +259,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::name_key(crate::state::KIND_SERVICE_NETWORK, &input.name);
         if let Some(taken_by) = store.name_index.get(&name_key) {
             return Err(CreateServiceNetworkErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "a service network named {} already exists in this account",
-                        input.name
-                    ),
-                    resource_id: taken_by.clone(),
-                    resource_type: crate::state::KIND_SERVICE_NETWORK.to_string(),
-                },
+                crate::state::conflict(
+                    crate::state::ResourceKind::ServiceNetwork,
+                    taken_by,
+                    crate::state::duplicate_name_in_account_message(&input.name),
+                ),
             )
             .into());
         }
@@ -288,7 +280,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             crate::state::MAX_SERVICE_NETWORKS
                         ),
                         resource_id: None,
-                        resource_type: crate::state::KIND_SERVICE_NETWORK.to_string(),
+                        resource_type: crate::state::ResourceKind::ServiceNetwork
+                            .wire_type()
+                            .to_string(),
                         service_code: crate::state::ARN_SERVICE.to_string(),
                         quota_code: "service-networks-per-account".to_string(),
                     },

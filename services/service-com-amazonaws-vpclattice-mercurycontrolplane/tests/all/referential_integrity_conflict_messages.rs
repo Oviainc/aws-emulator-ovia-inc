@@ -17,7 +17,7 @@
 //! HTTP status, the error code, the exception's `resourceId`/`resourceType`, and that the
 //! refusal left the resource and its associations intact.
 
-use crate::vpclattice_service_slice::{as_label, Lattice};
+use crate::vpclattice_service_slice::{as_label, message_of, Lattice};
 
 /// How many blocking associations each row sets up before the delete. More than one row
 /// has more than one association, which is what a message carrying a count would reveal.
@@ -48,19 +48,6 @@ fn reports_a_count(message: &str, resolved_id: &str) -> bool {
         .replace(resolved_id, "")
         .chars()
         .any(|c| c.is_ascii_digit())
-}
-
-/// The `message` member of a modelled exception body.
-fn message_of(answer: &crate::vpclattice_service_slice::Answer) -> String {
-    answer.body["message"]
-        .as_str()
-        .unwrap_or_else(|| {
-            panic!(
-                "the exception body must carry the required message member, got {}",
-                answer.body
-            )
-        })
-        .to_string()
 }
 
 /// One service network with `count` services associated with it: the ids of the network,
@@ -182,7 +169,7 @@ async fn refusing_to_delete_an_associated_service_network_reports_the_aws_templa
                 refused.error_code
             );
 
-            let message = message_of(&refused);
+            let message = message_of(&row, &refused);
             assert_eq!(
                 message,
                 expected_service_network_refusal(&linked.network_id),
@@ -201,8 +188,9 @@ async fn refusing_to_delete_an_associated_service_network_reports_the_aws_templa
             );
             assert_eq!(
                 refused.body["resourceType"].as_str(),
-                // The ARN resource kind of a service network.
-                Some("servicenetwork"),
+                // The resource-type token AWS reports for a service network; see the
+                // error_payload_construction suite for the rule it follows.
+                Some("SERVICE_NETWORK"),
                 "case {row:?}: wrong resourceType, got {}",
                 refused.body
             );
@@ -292,7 +280,7 @@ async fn refusing_to_delete_an_associated_service_reports_the_aws_template() {
                 refused.error_code
             );
 
-            let message = message_of(&refused);
+            let message = message_of(&row, &refused);
             assert_eq!(
                 message,
                 expected_service_refusal(&service_id),
@@ -311,8 +299,8 @@ async fn refusing_to_delete_an_associated_service_reports_the_aws_template() {
             );
             assert_eq!(
                 refused.body["resourceType"].as_str(),
-                // The ARN resource kind of a service.
-                Some("service"),
+                // The resource-type token AWS reports for a service.
+                Some("SERVICE"),
                 "case {row:?}: wrong resourceType, got {}",
                 refused.body
             );

@@ -128,14 +128,13 @@ impl From<GetListenerErrorModeled> for GetListenerError {
 }
 
 /// HTTP 404 for an identifier that names no persisted listener of this service (or no
-/// persisted service at all), with AWS's not-found message construction over the
-/// submitted identifier ([`crate::state::ResourceKind::not_found_message`]).
+/// persisted service at all), built by the service's shared error construction
+/// ([`crate::state::resource_not_found`]): AWS's not-found message over the submitted
+/// identifier, and the kind's resource-type token.
 fn not_found(identifier: &str, kind: crate::state::ResourceKind) -> GetListenerError {
-    GetListenerErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: kind.not_found_message(identifier),
-        resource_id: identifier.to_string(),
-        resource_type: kind.arn_kind().to_string(),
-    })
+    GetListenerErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        kind, identifier,
+    ))
     .into()
 }
 

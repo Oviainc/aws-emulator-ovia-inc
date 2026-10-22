@@ -120,17 +120,15 @@ impl From<DeleteServiceNetworkServiceAssociationErrorModeled> for DeleteServiceN
     }
 }
 
-/// HTTP 404 for an identifier that names no persisted association, with AWS's not-found
-/// message construction over the submitted identifier
-/// ([`crate::state::ResourceKind::not_found_message`]).
+/// HTTP 404 for an identifier that names no persisted association, built by the
+/// service's shared error construction ([`crate::state::resource_not_found`]): AWS's
+/// not-found message over the submitted identifier, and the kind's resource-type token.
 fn not_found(identifier: &str) -> DeleteServiceNetworkServiceAssociationError {
-    const KIND: crate::state::ResourceKind = crate::state::ResourceKind::ServiceAssociation;
     DeleteServiceNetworkServiceAssociationErrorModeled::ResourceNotFoundException(
-        ResourceNotFoundException {
-            message: KIND.not_found_message(identifier),
-            resource_id: identifier.to_string(),
-            resource_type: KIND.arn_kind().to_string(),
-        },
+        crate::state::resource_not_found(
+            crate::state::ResourceKind::ServiceAssociation,
+            identifier,
+        ),
     )
     .into()
 }

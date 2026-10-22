@@ -162,16 +162,12 @@ fn output_of(listener: &crate::state::Listener) -> CreateListenerOutput {
 }
 
 /// HTTP 400 for input outside a constraint the model or the member's documentation
-/// states, naming the member and the constraint it broke.
-fn invalid(member: &str, reason: &str) -> CreateListenerError {
-    CreateListenerErrorModeled::ValidationException(ValidationException {
-        message: format!("{member} {reason}"),
-        reason: "fieldValidationFailed".to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: member.to_string(),
-            message: reason.to_string(),
-        }]),
-    })
+/// states, in AWS's validation-error construction
+/// ([`crate::state::validation_exception`]).
+fn invalid(violation: crate::state::FieldViolation) -> CreateListenerError {
+    CreateListenerErrorModeled::ValidationException(crate::state::validation_exception(&[
+        violation,
+    ]))
     .into()
 }
 
@@ -238,29 +234,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .and_then(|id| store.services.get(&id))
         .cloned();
         let Some(service) = service else {
-            const KIND: crate::state::ResourceKind = crate::state::ResourceKind::Service;
             return Err(CreateListenerErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: KIND.not_found_message(&input.service_identifier),
-                    resource_id: input.service_identifier.clone(),
-                    resource_type: KIND.arn_kind().to_string(),
-                },
+                crate::state::resource_not_found(
+                    crate::state::ResourceKind::Service,
+                    &input.service_identifier,
+                ),
             )
             .into());
         };
 
-        if let Err(reason) =
-            crate::state::check_resource_name(&input.name, Some(crate::state::PREFIX_LISTENER))
-        {
-            return Err(invalid("name", &reason));
+        if let Err(violation) = crate::state::check_resource_name(
+            crate::state::ResourceKind::Listener,
+            "name",
+            &input.name,
+        ) {
+            return Err(invalid(violation));
         }
-        if let Err(reason) = crate::state::check_tag_count(input.tags.as_ref()) {
-            return Err(invalid("tags", &reason));
+        if let Err(violation) = crate::state::check_tag_count(input.tags.as_ref()) {
+            return Err(invalid(violation));
         }
-        if let Err((member, reason)) =
+        if let Err(violation) =
             crate::state::check_rule_action("defaultAction", &input.default_action)
         {
-            return Err(invalid(&member, &reason));
+            return Err(invalid(violation));
         }
 
         // The `port` member documents a default for `HTTP` (80) and `HTTPS` (443) only,
@@ -270,13 +266,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .port
             .or_else(|| crate::state::default_port_for(&input.protocol))
         else {
-            return Err(invalid(
-                "port",
-                &format!(
-                    "is required for a {} listener, which has no default port",
-                    input.protocol
-                ),
-            ));
+            // Under a protocol with no documented default the member IS required, so it
+            // is refused the way every absent required member is reported.
+            return Err(invalid(crate::state::FieldViolation {
+                path: "port".to_string(),
+                kind: ::aws_smithy_schema_server::constraints::ViolationKind::MissingRequiredMember,
+                value: None,
+            }));
         };
 
         // `clientToken` is an @idempotencyToken: a retry carrying the token of a
@@ -291,15 +287,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|id| store.listeners.get(id))
         {
             if existing.name != input.name || existing.service_id != service.id {
+                // No recording covers a clientToken replayed with different parameters,
+                // so this message keeps its own wording; the identifier of the
+                // conflicting listener is in it and the resourceType token comes from
+                // the shared path.
                 return Err(CreateListenerErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "clientToken was already used to create listener {} with different parameters",
+                    crate::state::conflict(
+                        crate::state::ResourceKind::Listener,
+                        &existing.id,
+                        format!(
+                            "Listener {} was already created with this clientToken and different parameters.",
                             existing.id
                         ),
-                        resource_id: existing.id.clone(),
-                        resource_type: crate::state::KIND_LISTENER.to_string(),
-                    },
+                    ),
                 )
                 .into());
             }
@@ -311,14 +311,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name_key = crate::state::listener_name_key(&service.id, &input.name);
         if let Some(taken_by) = store.name_index.get(&name_key) {
             return Err(CreateListenerErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "a listener named {} already exists in service {}",
-                        input.name, service.id
+                crate::state::conflict(
+                    crate::state::ResourceKind::Listener,
+                    taken_by,
+                    crate::state::duplicate_name_message(
+                        &input.name,
+                        crate::state::ResourceKind::Service.message_name(),
+                        &service.id,
                     ),
-                    resource_id: taken_by.clone(),
-                    resource_type: crate::state::KIND_LISTENER.to_string(),
-                },
+                ),
             )
             .into());
         }
@@ -334,7 +335,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::MAX_LISTENERS_PER_SERVICE
                     ),
                     resource_id: Some(service.id.clone()),
-                    resource_type: crate::state::KIND_LISTENER.to_string(),
+                    resource_type: crate::state::ResourceKind::Listener.wire_type().to_string(),
                     service_code: crate::state::ARN_SERVICE.to_string(),
                     quota_code: "listeners-per-service".to_string(),
                 },

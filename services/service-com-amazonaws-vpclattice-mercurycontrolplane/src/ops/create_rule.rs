@@ -160,39 +160,32 @@ fn output_of(rule: &crate::state::Rule) -> CreateRuleOutput {
     }
 }
 
-/// HTTP 400 for input outside a constraint the model or the member's documentation
-/// states, naming the member and the constraint it broke.
-fn invalid(member: &str, reason: &str) -> CreateRuleError {
-    CreateRuleErrorModeled::ValidationException(ValidationException {
-        message: format!("{member} {reason}"),
-        reason: "fieldValidationFailed".to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: member.to_string(),
-            message: reason.to_string(),
-        }]),
-    })
-    .into()
+/// HTTP 400 for a member whose submitted value broke a constraint the model or the
+/// member's documentation states, in AWS's validation-error construction
+/// ([`crate::state::validation_exception`]).
+fn invalid(violation: crate::state::FieldViolation) -> CreateRuleError {
+    CreateRuleErrorModeled::ValidationException(crate::state::validation_exception(&[violation]))
+        .into()
 }
 
-/// HTTP 404 for an identifier that names no persisted resource of `kind`, with AWS's
-/// not-found message construction over the submitted identifier
-/// ([`crate::state::ResourceKind::not_found_message`]).
+/// HTTP 404 for an identifier that names no persisted resource of `kind`, built by the
+/// service's shared error construction ([`crate::state::resource_not_found`]): AWS's
+/// not-found message over the submitted identifier, and the kind's resource-type token.
 fn not_found(identifier: &str, kind: crate::state::ResourceKind) -> CreateRuleError {
-    CreateRuleErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: kind.not_found_message(identifier),
-        resource_id: identifier.to_string(),
-        resource_type: kind.arn_kind().to_string(),
-    })
+    CreateRuleErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        kind, identifier,
+    ))
     .into()
 }
 
-/// HTTP 409 for a request that conflicts with a rule the listener already holds.
+/// HTTP 409 for a request that conflicts with a rule the listener already holds, built
+/// by the same shared construction, so `resourceType` is the kind's wire token.
 fn conflict(message: String, resource_id: String) -> CreateRuleError {
-    CreateRuleErrorModeled::ConflictException(ConflictException {
+    CreateRuleErrorModeled::ConflictException(crate::state::conflict(
+        crate::state::ResourceKind::Rule,
+        &resource_id,
         message,
-        resource_id,
-        resource_type: crate::state::KIND_RULE.to_string(),
-    })
+    ))
     .into()
 }
 
@@ -277,16 +270,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        if let Err(reason) =
-            crate::state::check_resource_name(&input.name, Some(crate::state::PREFIX_RULE))
-        {
-            return Err(invalid("name", &reason));
+        if let Err(violation) = crate::state::check_resource_name(
+            crate::state::ResourceKind::Rule,
+            "name",
+            &input.name,
+        ) {
+            return Err(invalid(violation));
         }
-        if let Err(reason) = crate::state::check_tag_count(input.tags.as_ref()) {
-            return Err(invalid("tags", &reason));
+        if let Err(violation) = crate::state::check_tag_count(input.tags.as_ref()) {
+            return Err(invalid(violation));
         }
-        if let Err((member, reason)) = crate::state::check_rule_action("action", &input.action) {
-            return Err(invalid(&member, &reason));
+        if let Err(violation) = crate::state::check_rule_action("action", &input.action) {
+            return Err(invalid(violation));
         }
 
         // `clientToken` is an @idempotencyToken: its documentation states that a retry
@@ -358,7 +353,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::MAX_RULES_PER_LISTENER
                     ),
                     resource_id: Some(listener.id.clone()),
-                    resource_type: crate::state::KIND_RULE.to_string(),
+                    resource_type: crate::state::ResourceKind::Rule.wire_type().to_string(),
                     service_code: crate::state::ARN_SERVICE.to_string(),
                     quota_code: "rules-per-listener".to_string(),
                 },

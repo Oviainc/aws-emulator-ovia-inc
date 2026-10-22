@@ -123,16 +123,14 @@ impl From<DeleteServiceErrorModeled> for DeleteServiceError {
     }
 }
 
-/// HTTP 404 for an identifier that names no persisted service, with AWS's not-found
-/// message construction over the submitted identifier
-/// ([`crate::state::ResourceKind::not_found_message`]).
+/// HTTP 404 for an identifier that names no persisted service, built by the service's
+/// shared error construction ([`crate::state::resource_not_found`]): AWS's not-found
+/// message over the submitted identifier, and the kind's resource-type token.
 fn not_found(identifier: &str) -> DeleteServiceError {
-    const KIND: crate::state::ResourceKind = crate::state::ResourceKind::Service;
-    DeleteServiceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: KIND.not_found_message(identifier),
-        resource_id: identifier.to_string(),
-        resource_type: KIND.arn_kind().to_string(),
-    })
+    DeleteServiceErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        crate::state::ResourceKind::Service,
+        identifier,
+    ))
     .into()
 }
 
@@ -200,11 +198,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let associated = store.associated_network_count(&id);
         if associated > 0 {
             return Err(DeleteServiceErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!("Service {id} has one or more associated service networks."),
-                    resource_id: id.clone(),
-                    resource_type: crate::state::KIND_SERVICE.to_string(),
-                },
+                crate::state::conflict(
+                    crate::state::ResourceKind::Service,
+                    &id,
+                    format!("Service {id} has one or more associated service networks."),
+                ),
             )
             .into());
         }
