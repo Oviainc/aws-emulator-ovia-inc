@@ -2,10 +2,10 @@
 
 //! Engine state for the com-amazonaws-chatbot-wheatleyorchestration-20171011 service.
 //!
-//! This module owns the persisted shape of every chat configuration the service
-//! stores, plus the few helpers the configuration handlers share (the ARN form, the
-//! request's region, and the record -> modelled-shape projection). Handlers reach it
-//! through [`service_state`]; nothing here is per-request.
+//! This module owns the persisted shape of every chat configuration and every custom
+//! action the service stores, plus the few helpers their handlers share (the ARN forms,
+//! the request's region, and the record -> modelled-shape projections). Handlers reach
+//! it through [`service_state`]; nothing here is per-request.
 //!
 //! It also owns the registries of chat workspaces AUTHORIZED with the account — Slack
 //! workspaces, which a channel configuration has to name one of, and Microsoft Teams
@@ -19,8 +19,8 @@
 use std::collections::BTreeMap;
 
 use crate::ops::types::{
-    AccountPreferences, ChimeWebhookConfiguration, ConfiguredTeam, SlackChannelConfiguration,
-    SlackWorkspace, Tag,
+    AccountPreferences, ChimeWebhookConfiguration, ConfiguredTeam, CustomAction,
+    CustomActionAttachment, CustomActionDefinition, SlackChannelConfiguration, SlackWorkspace, Tag,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -61,6 +61,13 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// refused with the modelled `LimitExceededException`.
 pub const MAX_SLACK_CHANNEL_CONFIGURATIONS: usize = MAX_PAGE_SIZE;
 
+/// The most custom actions this store holds AT ALL — across every region, for the same
+/// reason as [`MAX_SLACK_CHANNEL_CONFIGURATIONS`]: AWS enforces a service quota on
+/// custom actions per account, the model does not carry the number, and this bound is
+/// what keeps repeated creates from growing the emulator's memory without limit. Past it
+/// a create is refused with the modelled `LimitExceededException`.
+pub const MAX_CUSTOM_ACTIONS: usize = MAX_PAGE_SIZE;
+
 /// The most Amazon Chime webhook configurations this store holds AT ALL, for the same
 /// reason — and on the same (emulator-owned) grounds — as
 /// [`MAX_SLACK_CHANNEL_CONFIGURATIONS`]: AWS enforces a service quota on chat
@@ -74,6 +81,7 @@ pub const MAX_CHIME_WEBHOOK_CONFIGURATIONS: usize = MAX_PAGE_SIZE;
 // so the two bounds are tied here rather than left to drift apart.
 const _: () = assert!(MAX_SLACK_CHANNEL_CONFIGURATIONS <= MAX_PAGE_SIZE);
 const _: () = assert!(MAX_CHIME_WEBHOOK_CONFIGURATIONS <= MAX_PAGE_SIZE);
+const _: () = assert!(MAX_CUSTOM_ACTIONS <= MAX_PAGE_SIZE);
 
 /// Per-service state for com-amazonaws-chatbot-wheatleyorchestration-20171011. A handler reaches it through [`service_state`].
 ///
@@ -84,6 +92,11 @@ const _: () = assert!(MAX_CHIME_WEBHOOK_CONFIGURATIONS <= MAX_PAGE_SIZE);
 pub struct ComAmazonawsChatbotWheatleyorchestration20171011State {
     /// Every Slack channel configuration, keyed by its `ChatConfigurationArn`.
     pub slack_channel_configurations: BTreeMap<String, SlackChannelConfigRecord>,
+    /// Every custom action, keyed by its `CustomActionArn`.
+    ///
+    /// `BTreeMap` for the same reason as the configurations: `ListCustomActions`
+    /// paginates over it in one stable total order.
+    pub custom_actions: BTreeMap<String, CustomActionRecord>,
     /// Every Amazon Chime webhook configuration, keyed by its `ChatConfigurationArn`,
     /// for the same reason as the Slack ones: `DescribeChimeWebhookConfigurations`
     /// walks them in one stable total order and resumes that walk from an opaque token.
@@ -122,6 +135,7 @@ impl Default for ComAmazonawsChatbotWheatleyorchestration20171011State {
     fn default() -> Self {
         Self {
             slack_channel_configurations: BTreeMap::new(),
+            custom_actions: BTreeMap::new(),
             chime_webhook_configurations: BTreeMap::new(),
             slack_workspace_authorizations: seed_slack_workspaces()
                 .into_iter()
@@ -454,8 +468,8 @@ pub struct SlackChannelConfigRecord {
 
 /// A record's stored tags as the modelled `Tag` list, in `TagKey` order.
 ///
-/// Shared by every kind of chat configuration, so one read cannot answer a different
-/// tag shape than another.
+/// Shared by every kind of chat configuration and by a custom action, so one read cannot
+/// answer a different tag shape than another.
 pub fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
     tags.iter()
         .map(|(tag_key, tag_value)| Tag {
@@ -491,6 +505,61 @@ impl SlackChannelConfigRecord {
             tags: Some(self.tag_list()),
             state: Some(self.state.clone()),
             state_reason: self.state_reason.clone(),
+        }
+    }
+}
+
+/// One stored custom action: everything a later `Get`, `List`, `Update`, `Delete` or tag
+/// call has to be able to answer from.
+///
+/// No `Default`: the ARN, the name, the region and the command text are all required, so
+/// there is no such thing as a default custom action to insert.
+#[derive(Debug, Clone)]
+pub struct CustomActionRecord {
+    pub custom_action_arn: String,
+    /// The name the ARN carries, and the thing a second create in the same region
+    /// collides with.
+    pub action_name: String,
+    /// The region the action lives in, the one its ARN names.
+    pub region: String,
+    /// `Definition.CommandText` — the command the action runs.
+    pub command_text: String,
+    pub alias_name: Option<String>,
+    /// The attachments exactly as the request carried them, absent when it carried
+    /// none: `Attachments` is optional on both the request and the `CustomAction`, so a
+    /// create that named no attachments must not read back as having an empty list.
+    pub attachments: Option<Vec<CustomActionAttachment>>,
+    /// Tags keyed by `TagKey`, so a tag call merges by key and a read answers one entry
+    /// per key in a stable order. The `CustomAction` shape carries no tags; they are
+    /// what `ListTagsForResource` answers for the action's ARN.
+    pub tags: BTreeMap<String, String>,
+    /// The `ClientToken` of the create that minted this action, when it carried one.
+    ///
+    /// `CreateCustomAction`'s `ClientToken` is an `@idempotencyToken`: a retry carrying
+    /// the same token answers the original successful create instead of failing on the
+    /// name that create already took, so the token the action was minted under has to
+    /// outlive the request.
+    pub client_token: Option<String>,
+}
+
+impl CustomActionRecord {
+    /// The stored tags as the modelled `Tag` list, in key order.
+    pub fn tag_list(&self) -> Vec<Tag> {
+        tag_list(&self.tags)
+    }
+
+    /// Project the stored record onto the modelled `CustomAction` the custom-action
+    /// operations return. The single place that mapping lives, so create, get, update
+    /// and list cannot answer different shapes for one record.
+    pub fn view(&self) -> CustomAction {
+        CustomAction {
+            custom_action_arn: self.custom_action_arn.clone(),
+            definition: CustomActionDefinition {
+                command_text: self.command_text.clone(),
+            },
+            alias_name: self.alias_name.clone(),
+            attachments: self.attachments.clone(),
+            action_name: Some(self.action_name.clone()),
         }
     }
 }
@@ -544,6 +613,19 @@ impl ChimeWebhookConfigRecord {
             state_reason: self.state_reason.clone(),
         }
     }
+}
+
+/// The `CustomActionArn` of a custom action:
+/// `arn:aws:chatbot:{region}:{account}:custom-action/{action_name}`, the form the
+/// model's `CustomActionArn` pattern requires
+/// (`^arn:aws:chatbot:[A-Za-z0-9_/.-]{0,63}:[A-Za-z0-9_/.-]{0,63}:custom-action/[a-zA-Z0-9_-]{1,64}$`).
+///
+/// Built through `emulator_server::emulator_arn`, so the account segment is the one
+/// canonical emulator account id and no ARN is assembled by hand. A custom action is
+/// regional, so the ARN carries the request's region and the same action name can be
+/// created once per region.
+pub fn custom_action_arn(region: &str, action_name: &str) -> String {
+    ::emulator_server::emulator_arn(ARN_SERVICE, region, &format!("custom-action/{action_name}"))
 }
 
 /// The `ChatConfigurationArn` of a chat configuration of kind `kind` (the ARN

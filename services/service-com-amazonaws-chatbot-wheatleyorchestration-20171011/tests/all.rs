@@ -15,6 +15,8 @@
 mod account_preferences;
 #[path = "all/chime_webhook_configuration.rs"]
 mod chime_webhook_configuration;
+#[path = "all/custom_action.rs"]
+mod custom_action;
 #[path = "all/microsoft_teams_configured_teams.rs"]
 mod microsoft_teams_configured_teams;
 #[path = "all/slack_channel_configuration.rs"]
