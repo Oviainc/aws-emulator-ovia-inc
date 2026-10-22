@@ -180,13 +180,22 @@ async fn walk(
 // GetAccountPlanState / UpgradeAccountPlan
 // ---------------------------------------------------------------------------
 
-/// The plan a never-upgraded account reports: the free plan, active, with the
-/// members the model marks required and the account id every emulator presents.
-/// Repeating the read reports exactly the same body — a `@readonly` operation
-/// changes nothing a later caller sees.
+/// The plan the store reports once the account holds one: the free plan,
+/// active, with the members the model marks required and the account id every
+/// emulator presents. Repeating the read reports exactly the same body — a
+/// reporting operation changes nothing a later caller sees.
 #[tokio::test]
 async fn account_plan_state_reports_the_stored_plan_and_repeats_it() {
     let router = router();
+    // An account holds account-plan data only once the service's one
+    // plan-writing operation has established it; what a read answers before
+    // that is pinned in `account_plan_absence.rs`.
+    ok(
+        &router,
+        "UpgradeAccountPlan",
+        &json!({"accountPlanType": PLAN_TYPE_FREE}),
+    )
+    .await;
 
     let first = ok(&router, "GetAccountPlanState", &json!({})).await;
     let account_id = text(&first, "accountId");
@@ -202,12 +211,12 @@ async fn account_plan_state_reports_the_stored_plan_and_repeats_it() {
     assert_eq!(
         text(&first, "accountPlanType"),
         PLAN_TYPE_FREE,
-        "case first read: a never-upgraded account is on the free plan, got {first}"
+        "case first read: the plan the account was moved onto is reported, got {first}"
     );
     assert_eq!(
         text(&first, "accountPlanStatus"),
         PLAN_STATUS_ACTIVE,
-        "case first read: the seeded free plan is active, got {first}"
+        "case first read: the established free plan is active, got {first}"
     );
     let unit = text(&first["accountPlanRemainingCredits"], "unit");
     assert!(
@@ -252,7 +261,6 @@ async fn upgrade_account_plan_persists_the_target_plan() {
 
     for (requested, expected_type, expects_expiry) in cases {
         let router = router();
-        let before = ok(&router, "GetAccountPlanState", &json!({})).await;
 
         let upgraded = ok(
             &router,
@@ -262,7 +270,7 @@ async fn upgrade_account_plan_persists_the_target_plan() {
         .await;
         assert_eq!(
             text(&upgraded, "accountId"),
-            text(&before, "accountId"),
+            engine::emulator_account_id(),
             "case upgrade to {requested}: the account is the caller's own, got {upgraded}"
         );
         assert_eq!(
@@ -314,6 +322,12 @@ async fn upgrade_account_plan_persists_the_target_plan() {
 #[tokio::test]
 async fn upgrade_account_plan_refuses_a_plan_type_outside_the_enum() {
     let router = router();
+    ok(
+        &router,
+        "UpgradeAccountPlan",
+        &json!({"accountPlanType": PLAN_TYPE_FREE}),
+    )
+    .await;
     let before = ok(&router, "GetAccountPlanState", &json!({})).await;
 
     // Rows differ in how they miss the enum: casing, an unknown word, an empty

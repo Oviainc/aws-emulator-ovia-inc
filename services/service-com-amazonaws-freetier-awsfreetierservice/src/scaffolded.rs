@@ -196,6 +196,22 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// A modeled error answered with the HTTP status the SERVICE answers it with,
+    /// where the recorded wire status differs from the model's `@httpError`.
+    ///
+    /// Everything but the status line comes from the modeled error — the wire
+    /// `__type`, the body, the schema and the `awsQueryError` code — so a client
+    /// still reads exactly the modeled shape. Reach for this ONLY with recorded
+    /// evidence that the service answers a status its model does not declare (see
+    /// [`crate::ops::get_account_plan_state`], where the recorded
+    /// `ResourceNotFoundException` is an HTTP 400 and the model annotates 404),
+    /// never to reclassify an error at will.
+    Restated {
+        /// The modeled error, rendered as the model declares it.
+        modeled: E,
+        /// The status the service answers it with.
+        status: u16,
+    },
 }
 
 impl<E> Scaffolded<E> {
@@ -221,6 +237,15 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Answer `modeled` with `status` instead of the status its model declares.
+    ///
+    /// See [`Scaffolded::Restated`]: the shape, the body and the wire error code
+    /// are the modeled ones, and only the status line is the one the recorded
+    /// service sends.
+    pub fn restated(modeled: E, status: u16) -> Self {
+        Self::Restated { modeled, status }
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -229,6 +254,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::Restated { modeled, .. } => write!(f, "{modeled}"),
         }
     }
 }
@@ -241,6 +267,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::Restated { modeled, .. } => modeled.source(),
         }
     }
 }
@@ -255,6 +282,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::Restated { modeled, .. } => modeled.as_serializable(),
         }
     }
 
@@ -263,6 +291,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::Restated { modeled, .. } => modeled.variant_schema(),
         }
     }
 
@@ -275,6 +304,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            Self::Restated { modeled, .. } => modeled.shape_name(),
         }
     }
 
@@ -287,6 +317,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            // The one variant whose status is NOT the modeled one; see
+            // `Scaffolded::Restated` for the evidence that justifies it.
+            Self::Restated { status, .. } => *status,
         }
     }
 
@@ -299,6 +332,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            Self::Restated { modeled, .. } => modeled.query_error_code(),
         }
     }
 }
