@@ -307,8 +307,11 @@ fn refuse_missing(akid: &str, message_id: &str, region: &str) -> PutRawMessageCo
         outcome = "ResourceNotFoundException",
         "refused an update to a message that is not in transit"
     );
+    // The text is the service's own rule — the fixed prefix plus the rejected id —
+    // and both operations render it from the one place that states it,
+    // `crate::state::unknown_message_id`.
     PutRawMessageContentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("The in-transit message {message_id} was not found.")),
+        message: Some(crate::state::unknown_message_id(message_id)),
     })
     .into()
 }

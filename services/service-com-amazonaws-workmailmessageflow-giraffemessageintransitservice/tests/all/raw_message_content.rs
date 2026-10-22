@@ -62,6 +62,14 @@ impl Reply {
         serde_json::from_slice(&self.payload).unwrap_or(Value::Null)
     }
 
+    /// The `message` an error payload carries, or the empty string when the
+    /// payload is not an error document with one. The member is modeled as
+    /// `message` with no `jsonName` (`smithy_query(query="shape",
+    /// shape="ResourceNotFoundException")`), so that is the wire key.
+    fn error_message(&self) -> String {
+        self.json()["message"].as_str().unwrap_or_default().to_string()
+    }
+
     /// The payload rendered for an assertion message, without dumping a megabyte
     /// of MIME into the test log.
     fn summary(&self) -> String {
@@ -344,6 +352,12 @@ async fn get_of_an_unknown_message_is_not_found() {
             "case {case:?}: expected ResourceNotFoundException, got {:?}",
             reply.error_type
         );
+        assert_eq!(
+            reply.error_message(),
+            format!("Unknown messageId: {message_id}"),
+            "case {case:?}: expected the unknown-messageId message for {message_id:?}, got {:?}",
+            reply.error_message()
+        );
     }
 }
 
@@ -535,6 +549,12 @@ async fn put_to_an_unknown_message_is_not_found() {
             "case {case:?}: expected ResourceNotFoundException, got {:?}",
             reply.error_type
         );
+        assert_eq!(
+            reply.error_message(),
+            format!("Unknown messageId: {message_id}"),
+            "case {case:?}: expected the unknown-messageId message for {message_id:?}, got {:?}",
+            reply.error_message()
+        );
         let readback = emulator.get_raw_message_content(REGION, &message_id).await;
         assert_eq!(
             readback.status, 404,
@@ -542,6 +562,115 @@ async fn put_to_an_unknown_message_is_not_found() {
             readback.summary()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The message a not-in-transit id is refused with, on every path that refuses it.
+// ---------------------------------------------------------------------------
+
+/// `ResourceNotFoundException` names the id that was rejected: its `message` is
+/// the fixed prefix `Unknown messageId: ` followed verbatim by the request's
+/// `messageId`, on every operation and every path that raises the error.
+///
+/// The axis is the form and length of the rejected id (the whole permitted range
+/// of `len 1..120, ^[a-z0-9\-]*$`), crossed with the four paths that can raise
+/// it: the read, an update whose reference resolves, an update whose reference
+/// does not (so the id check precedes the content-location check), an update
+/// whose reference is versioned, and the independent follow-up read after a
+/// refused update.
+#[tokio::test]
+async fn an_unknown_message_id_is_refused_with_the_id_it_was_asked_about() {
+    let resolvable = reference("updated/object");
+    let versioned = S3Ref::new(BUCKET, "updated/versioned", Some("v1".to_string()));
+    // A reference nothing is stored at: if the content-location check ran first
+    // this row would answer InvalidContentLocation instead.
+    let unresolvable = reference("never/stored");
+
+    let ids = [
+        ("a uuid-shaped id", "8e220c71-0e24-437a-98b8-f83d6c64d1c8".to_string()),
+        (
+            "a long synthetic id",
+            "sim2real-wmf-x-5cabbe533e2d-0b21d79406ff4151aa42c6fa8d23e4a6".to_string(),
+        ),
+        ("the shortest permitted id", "a".to_string()),
+        ("a single dash", "-".to_string()),
+        ("digits only", "0123456789".to_string()),
+        ("dashes only", "----------".to_string()),
+        ("the longest permitted id", "z".repeat(MESSAGE_ID_MAX_LEN)),
+        ("a near miss on a stored id", "present-1".to_string()),
+    ];
+
+    for (case, message_id) in ids {
+        let emulator = Emulator::new();
+        // A message IS in transit under another id, so the rows below are refused
+        // for the id they name and not because the store is empty.
+        emulator.seed_message("present-0", &mime("present", "body"));
+        emulator.seed_object(&resolvable, S3Object::new(mime("rewritten", "body")));
+        emulator.seed_object(&versioned, S3Object::new(mime("rewritten v1", "body")));
+
+        let expected = format!("Unknown messageId: {message_id}");
+        let paths: Vec<(&str, Reply)> = vec![
+            (
+                "GetRawMessageContent",
+                emulator.get_raw_message_content(REGION, &message_id).await,
+            ),
+            (
+                "PutRawMessageContent with a resolvable reference",
+                emulator
+                    .put_raw_message_content(REGION, &message_id, &resolvable)
+                    .await,
+            ),
+            (
+                "PutRawMessageContent with an unresolvable reference",
+                emulator
+                    .put_raw_message_content(REGION, &message_id, &unresolvable)
+                    .await,
+            ),
+            (
+                "PutRawMessageContent with a versioned reference",
+                emulator
+                    .put_raw_message_content(REGION, &message_id, &versioned)
+                    .await,
+            ),
+            (
+                "the follow-up GetRawMessageContent",
+                emulator.get_raw_message_content(REGION, &message_id).await,
+            ),
+        ];
+
+        for (path, reply) in paths {
+            assert_eq!(
+                reply.status, 404,
+                "case {case:?} on {path}: expected HTTP 404, got {} ({})",
+                reply.status,
+                reply.summary()
+            );
+            assert_eq!(
+                reply.error_type, "ResourceNotFoundException",
+                "case {case:?} on {path}: expected ResourceNotFoundException, got {:?} ({})",
+                reply.error_type,
+                reply.summary()
+            );
+            assert_eq!(
+                reply.error_message(),
+                expected,
+                "case {case:?} on {path}: expected {expected:?}, got {:?}",
+                reply.error_message()
+            );
+        }
+    }
+
+    // The control: the id that IS in transit is not refused at all, so the rows
+    // above answer the not-found rule rather than a blanket 404.
+    let emulator = Emulator::new();
+    emulator.seed_message("present-0", &mime("present", "body"));
+    let reply = emulator.get_raw_message_content(REGION, "present-0").await;
+    assert_eq!(
+        reply.status, 200,
+        "case \"control\": expected HTTP 200 for an id in transit, got {} ({})",
+        reply.status,
+        reply.summary()
+    );
 }
 
 /// A frozen message refuses the update with `MessageFrozen` and keeps its content.
