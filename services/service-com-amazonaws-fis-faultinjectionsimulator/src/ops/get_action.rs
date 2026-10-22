@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one entry of FIS's built-in action catalog.
+//!
+//! An action is SERVICE-owned, not caller-owned: FIS publishes the catalog and no API
+//! creates, updates or deletes an entry, so this operation reports from
+//! [`crate::state::ACTION_CATALOG`] and writes nothing. An id the catalog does not hold
+//! answers `ResourceNotFoundException` (HTTP 404) rather than a fabricated action.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +137,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAction"))
+        // The action catalog is the SERVICE's own constant data, so this handler needs no
+        // store: it is bound here only to keep the constructor seam honest.
+        let _ = &self.engine;
+
+        // Reporting only: nothing here writes, so two reads at any two instants report
+        // the same action and a later caller sees exactly what this one saw.
+        let Some(entry) = crate::state::action_catalog_entry(&input.id) else {
+            return Err(GetActionErrorModeled::ResourceNotFoundException(
+                crate::state::action_not_found(&input.id),
+            )
+            .into());
+        };
+
+        // The ARN names the region the request was signed for, as every ARN this service
+        // reports does.
+        let region = crate::state::request_region(ctx.parts());
+        Ok(GetActionOutput {
+            action: Some(entry.to_action(&region)),
+        })
     }
 }
