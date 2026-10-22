@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: opens a session under an existing assistant — a fresh v4 uuid
+//! `sessionId` and its `session/<assistantId>/<sessionId>` ARN, stored under the
+//! parent assistant so `GetSession` reads it back.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +149,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSession"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Mounted on an engine that holds no state: nothing can be persisted,
+            // and this operation models no error that says so.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateSession"));
+        };
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let mut state = state.lock();
+
+        // A session only exists under an assistant, so an unknown parent is a 404
+        // rather than a session with no owner.
+        let Some(assistant_id) = state.resolve_assistant_id(&input.assistant_id) else {
+            return Err(CreateSessionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("No assistant {} found.", input.assistant_id)),
+                    resource_name: Some(input.assistant_id.clone()),
+                },
+            )
+            .into());
+        };
+
+        // A retried create carrying the same `clientToken` answers with the
+        // session the first call created, rather than opening a second one. The
+        // token is scoped to the parent assistant: the same token under another
+        // assistant is a different create.
+        if let Some(token) = input.client_token.as_deref() {
+            let replayed = state
+                .replayed_resource_id(Self::NAME, &assistant_id, token)
+                .cloned()
+                .and_then(|session_id| state.session(&assistant_id, &session_id))
+                .map(crate::state::Session::to_data);
+            if let Some(session) = replayed {
+                return Ok(CreateSessionOutput {
+                    session: Some(session),
+                });
+            }
+        }
+
+        // The model puts no bound on the `tags` map, so the store does: AWS's
+        // tagging restrictions allow at most 50 tags on a resource. Every input
+        // refusal happens before an id is minted, and the count is taken from
+        // what the caller sent.
+        let requested_tags = input.tags.unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateSessionErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "tags must have at most {} entries, but {} were given.",
+                    crate::state::MAX_TAGS_PER_RESOURCE,
+                    requested_tags.len()
+                )),
+            })
+            .into());
+        }
+        let tags: ::std::collections::BTreeMap<String, String> =
+            requested_tags.into_iter().collect();
+
+        let session_id = crate::state::new_resource_id();
+        let session_arn = crate::state::session_arn(&region, &assistant_id, &session_id);
+        match state.insert_session(crate::state::Session {
+            session_id: session_id.clone(),
+            session_arn,
+            assistant_id: assistant_id.clone(),
+            name: input.name,
+            description: input.description,
+            tags,
+            created_at: ::std::time::SystemTime::now(),
+        }) {
+            crate::state::SessionInsert::Stored => {}
+            crate::state::SessionInsert::UnknownAssistant => {
+                return Err(CreateSessionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("No assistant {} found.", input.assistant_id)),
+                        resource_name: Some(input.assistant_id.clone()),
+                    },
+                )
+                .into());
+            }
+            crate::state::SessionInsert::AtCapacity => {
+                // The assistant, or the store as a whole, holds as many
+                // sessions as this emulator keeps. `CreateSession` models no
+                // quota error, so the refusal is the conflicting state of the
+                // parent assistant.
+                return Err(CreateSessionErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "Assistant {} already holds as many sessions as this emulator's store \
+                         ceiling keeps. Delete the assistant before creating another session.",
+                        input.assistant_id
+                    )),
+                })
+                .into());
+            }
+        }
+        if let Some(token) = input.client_token.as_deref() {
+            state.remember_client_token(Self::NAME, &assistant_id, token, &session_id);
+        }
+
+        // Answer from what was just persisted, so this response and a later
+        // `GetSession` cannot disagree.
+        let session = state
+            .session(&assistant_id, &session_id)
+            .map(crate::state::Session::to_data);
+        Ok(CreateSessionOutput { session })
     }
 }

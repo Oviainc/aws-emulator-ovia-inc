@@ -1,11 +1,484 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-wisdom-wisdomservice service.
+//!
+//! Wisdom's assistant lifecycle lives here: the assistants, the sessions nested
+//! under each assistant, and the indexes that let a handler resolve the
+//! `UuidOrArn` path labels the model declares (`^<uuid>$|^arn:…$`) back to the
+//! one stored record. Handlers read and write ONLY through these structures, so
+//! every response is computed from what a previous call persisted.
+
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::time::SystemTime;
+
+use crate::ops::types::{
+    AssistantData, AssistantSummary, ServerSideEncryptionConfiguration, SessionData,
+};
+
+/// The ARN namespace Wisdom resources carry (`awsService.arnNamespace` in the
+/// Smithy model), i.e. `arn:aws:wisdom:<region>:<account>:…`.
+pub const ARN_NAMESPACE: &str = "wisdom";
+
+/// Region used when a request carries no SigV4 credential scope to read one
+/// from. It matches the region the emulator writes into the shared AWS config
+/// it hands clients (`vendor/server/src/lib.rs`, `region = us-east-1`), so an
+/// unsigned request still gets a well-formed ARN.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The largest page `ListAssistants` serves. The model constrains `maxResults`
+/// to `range 1..100`, so 100 is also the page size used when the caller names
+/// none.
+pub const MAX_PAGE_SIZE: i32 = 100;
+
+/// The most assistants this store holds at once.
+///
+/// An assistant stays in the store until something deletes it, so an unbounded
+/// store lets any caller that can reach the port grow this process's heap
+/// without limit: the cap is the bound on that growth. It is a resource guard
+/// this emulator owns, NOT an AWS-published quota — and a create past it is
+/// refused with the error the model declares for exactly this on
+/// `CreateAssistant`, a 402 `ServiceQuotaExceededException`.
+pub const MAX_ASSISTANTS: usize = 1_000;
+
+/// The most sessions one assistant holds.
+///
+/// Same guard, one level down: sessions are created under an assistant and are
+/// only reclaimed when that assistant is deleted. `CreateSession` models no
+/// quota error, so a create past this ceiling is refused with the modelled
+/// `ConflictException` (409) — the conflict is the state of the parent
+/// assistant, which holds as many sessions as it can.
+pub const MAX_SESSIONS_PER_ASSISTANT: usize = 100;
+
+/// The most sessions this store holds across every assistant, so the
+/// assistants x sessions-per-assistant PRODUCT is finite and not just each
+/// factor. Refused the same way as [`MAX_SESSIONS_PER_ASSISTANT`].
+pub const MAX_STORED_SESSIONS: usize = 10_000;
+
+/// The most `clientToken` replay entries the store remembers, oldest evicted
+/// first.
+///
+/// A token's entry is otherwise reclaimed only when the resource it created is
+/// deleted, so a caller that never deletes — or that retries with a fresh token
+/// every time — would grow this index without limit. Past the ceiling the
+/// oldest remembered token is forgotten, which makes a very old retry mint a
+/// new resource rather than letting the index grow forever.
+pub const MAX_REMEMBERED_CLIENT_TOKENS: usize = 10_000;
+
+/// The most tags one resource carries.
+///
+/// AWS's tagging restrictions put the maximum number of tags per resource at
+/// 50, and this model declares no constraint on the `Tags` map, so without the
+/// limit one create could store an arbitrarily large tag map. A request past it
+/// is refused with the modelled `ValidationException`.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// A persisted Wisdom assistant, plus the sessions created under it.
+#[derive(Debug, Clone)]
+pub struct Assistant {
+    pub assistant_id: String,
+    pub assistant_arn: String,
+    pub name: String,
+    /// `AssistantType` on the wire (the model's only value is `AGENT`).
+    pub assistant_type: String,
+    /// `AssistantStatus` on the wire.
+    pub status: String,
+    pub description: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    pub server_side_encryption_configuration: Option<ServerSideEncryptionConfiguration>,
+    pub sessions: HashMap<String, Session>,
+    /// Session ids in creation order, so a session listing is stable.
+    pub session_order: Vec<String>,
+    /// When this record was created. Kept as the record's own creation instant —
+    /// `AssistantData`/`AssistantSummary` model no timestamp member, so nothing
+    /// renders it; it is what a later operation that needs an age (an expiry, a
+    /// creation-time sort) reads, and it is never derived from the request.
+    pub created_at: SystemTime,
+}
+
+/// A persisted Wisdom session, owned by exactly one assistant.
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub session_id: String,
+    pub session_arn: String,
+    pub assistant_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    /// When this session was created. `SessionData` models no timestamp member,
+    /// so nothing renders it; see [`Assistant::created_at`].
+    pub created_at: SystemTime,
+}
+
+/// Tags render as absent rather than as an empty map: the real service omits
+/// the member for a resource created without tags.
+fn wire_tags(tags: &BTreeMap<String, String>) -> Option<HashMap<String, String>> {
+    if tags.is_empty() {
+        None
+    } else {
+        Some(
+            tags.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<HashMap<_, _>>(),
+        )
+    }
+}
+
+impl Assistant {
+    /// This assistant as the `AssistantData` shape `CreateAssistant` and
+    /// `GetAssistant` return.
+    pub fn to_data(&self) -> AssistantData {
+        AssistantData {
+            assistant_id: self.assistant_id.clone(),
+            assistant_arn: self.assistant_arn.clone(),
+            name: self.name.clone(),
+            r#type: self.assistant_type.clone(),
+            status: self.status.clone(),
+            description: self.description.clone(),
+            tags: wire_tags(&self.tags),
+            server_side_encryption_configuration: self
+                .server_side_encryption_configuration
+                .clone(),
+            // Only an assistant wired to a Connect topic carries one; this
+            // emulator never creates that wiring, so the member stays absent.
+            integration_configuration: None,
+        }
+    }
+
+    /// This assistant as the `AssistantSummary` shape `ListAssistants` returns.
+    pub fn to_summary(&self) -> AssistantSummary {
+        AssistantSummary {
+            assistant_id: self.assistant_id.clone(),
+            assistant_arn: self.assistant_arn.clone(),
+            name: self.name.clone(),
+            r#type: self.assistant_type.clone(),
+            status: self.status.clone(),
+            description: self.description.clone(),
+            tags: wire_tags(&self.tags),
+            server_side_encryption_configuration: self
+                .server_side_encryption_configuration
+                .clone(),
+            integration_configuration: None,
+        }
+    }
+}
+
+impl Session {
+    /// This session as the `SessionData` shape `CreateSession` and `GetSession`
+    /// return.
+    pub fn to_data(&self) -> SessionData {
+        SessionData {
+            session_arn: self.session_arn.clone(),
+            session_id: self.session_id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            tags: wire_tags(&self.tags),
+            integration_configuration: None,
+        }
+    }
+}
+
+/// What makes a `clientToken` replay the SAME create: the operation, the scope
+/// the created resource lives in, and the token itself.
+///
+/// The scope matters because a token is only unique within the collection it
+/// created into: `CreateSession` creates under one assistant, so the same token
+/// used under a different assistant is a different create, not a retry of the
+/// first. It is the empty string for an account-level create (`CreateAssistant`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IdempotencyKey {
+    pub operation: String,
+    pub scope: String,
+    pub client_token: String,
+}
+
+/// One entry of the assistant listing: the assistant, plus the cursor the
+/// listing issued it at.
+///
+/// A `nextToken` names a CURSOR, never a position or an id, so an assistant
+/// deleted between two pages cannot invalidate a token already handed out: the
+/// continuation resumes at the first surviving entry at or after that cursor.
+#[derive(Debug, Clone)]
+pub struct ListingEntry {
+    pub cursor: u64,
+    pub assistant_id: String,
+}
+
+/// How a [`ComAmazonawsWisdomWisdomserviceState::insert_session`] ended: stored,
+/// refused because the parent assistant is gone, or refused because a session
+/// ceiling is full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionInsert {
+    /// The session is in the store under its parent.
+    Stored,
+    /// The parent assistant does not exist (any more).
+    UnknownAssistant,
+    /// [`MAX_SESSIONS_PER_ASSISTANT`] or [`MAX_STORED_SESSIONS`] is reached.
+    AtCapacity,
+}
 
 /// Per-service state for com-amazonaws-wisdom-wisdomservice. A handler reaches it through [`service_state`].
+///
+/// Every caller-driven store here is BOUNDED, so repeated requests cannot grow
+/// this process's heap without limit: `assistants` (and the indexes and the
+/// listing that mirror it, one entry per assistant) holds at most
+/// [`MAX_ASSISTANTS`] records; the sessions nested under them hold at most
+/// [`MAX_SESSIONS_PER_ASSISTANT`] each and [`MAX_STORED_SESSIONS`] in total, so
+/// the product of the two ceilings cannot multiply out; each record's tag map
+/// holds at most [`MAX_TAGS_PER_RESOURCE`] pairs; and `idempotency` holds at
+/// most [`MAX_REMEMBERED_CLIENT_TOKENS`] entries, evicting the oldest first.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsWisdomWisdomserviceState {
-    // TODO: add service-specific state fields
+    /// Every assistant, keyed by its `assistantId` (a v4 uuid).
+    pub assistants: HashMap<String, Assistant>,
+    /// The assistants in creation order: the page order `ListAssistants` serves.
+    pub assistant_order: Vec<ListingEntry>,
+    /// The cursor the next created assistant takes. Monotonic, so a cursor is
+    /// never reused and a page token stays meaningful after a delete.
+    pub next_cursor: u64,
+    /// `name` -> `assistantId`, so a duplicate name is a `ConflictException`.
+    pub assistant_name_index: HashMap<String, String>,
+    /// `assistantArn` -> `assistantId`, so an ARN-form label resolves to the
+    /// same record an id-form label does.
+    pub assistant_arn_index: HashMap<String, String>,
+    /// `sessionArn` -> (`assistantId`, `sessionId`), the same for session labels.
+    pub session_arn_index: HashMap<String, (String, String)>,
+    /// How many sessions `assistants` holds in total, for the store-wide
+    /// session ceiling ([`MAX_STORED_SESSIONS`]).
+    pub stored_sessions: usize,
+    /// What each `clientToken` already created, for create replay.
+    pub idempotency: HashMap<IdempotencyKey, String>,
+    /// The remembered tokens in insertion order, so the index evicts the oldest
+    /// first once [`MAX_REMEMBERED_CLIENT_TOKENS`] are held.
+    pub idempotency_order: VecDeque<IdempotencyKey>,
+}
+
+impl ComAmazonawsWisdomWisdomserviceState {
+    /// Resolve an assistant path label — a bare uuid or an assistant ARN — to a
+    /// stored `assistantId`. `None` means no such assistant.
+    pub fn resolve_assistant_id(&self, label: &str) -> Option<String> {
+        if label.starts_with("arn:") {
+            self.assistant_arn_index.get(label).cloned()
+        } else {
+            self.assistants
+                .contains_key(label)
+                .then(|| label.to_string())
+        }
+    }
+
+    /// The assistant a path label names, in either label form.
+    pub fn assistant(&self, label: &str) -> Option<&Assistant> {
+        let id = self.resolve_assistant_id(label)?;
+        self.assistants.get(&id)
+    }
+
+    /// The session a (assistant label, session label) pair names. A session
+    /// whose owner is a different assistant does not resolve.
+    pub fn session(&self, assistant_label: &str, session_label: &str) -> Option<&Session> {
+        let assistant_id = self.resolve_assistant_id(assistant_label)?;
+        let session_id = if session_label.starts_with("arn:") {
+            let (owner, session_id) = self.session_arn_index.get(session_label)?;
+            if *owner != assistant_id {
+                return None;
+            }
+            session_id.clone()
+        } else {
+            session_label.to_string()
+        };
+        self.assistants.get(&assistant_id)?.sessions.get(&session_id)
+    }
+
+    /// Whether this store already holds [`MAX_ASSISTANTS`] assistants, i.e.
+    /// whether a create must be refused rather than add another record.
+    pub fn assistants_at_capacity(&self) -> bool {
+        self.assistants.len() >= MAX_ASSISTANTS
+    }
+
+    /// Persist a new assistant and index it by name and ARN. `false` — nothing
+    /// stored — when the store is already at [`MAX_ASSISTANTS`], so the bound
+    /// holds however the caller reaches this.
+    pub fn insert_assistant(&mut self, assistant: Assistant) -> bool {
+        if self.assistants_at_capacity() {
+            return false;
+        }
+        let cursor = self.next_cursor;
+        self.next_cursor += 1;
+        self.assistant_order.push(ListingEntry {
+            cursor,
+            assistant_id: assistant.assistant_id.clone(),
+        });
+        self.assistant_name_index
+            .insert(assistant.name.clone(), assistant.assistant_id.clone());
+        self.assistant_arn_index
+            .insert(assistant.assistant_arn.clone(), assistant.assistant_id.clone());
+        self.assistants
+            .insert(assistant.assistant_id.clone(), assistant);
+        true
+    }
+
+    /// Persist a new session under its (already resolved) parent assistant,
+    /// within both session ceilings.
+    pub fn insert_session(&mut self, session: Session) -> SessionInsert {
+        // Read the store-wide occupancy before the parent is borrowed, so the
+        // parent is still resolved FIRST: a create naming an assistant that
+        // does not exist is not found, whatever the store's occupancy.
+        let store_full = self.stored_sessions >= MAX_STORED_SESSIONS;
+        let Some(assistant) = self.assistants.get_mut(&session.assistant_id) else {
+            return SessionInsert::UnknownAssistant;
+        };
+        if store_full || assistant.sessions.len() >= MAX_SESSIONS_PER_ASSISTANT {
+            return SessionInsert::AtCapacity;
+        }
+        assistant.session_order.push(session.session_id.clone());
+        self.session_arn_index.insert(
+            session.session_arn.clone(),
+            (session.assistant_id.clone(), session.session_id.clone()),
+        );
+        assistant
+            .sessions
+            .insert(session.session_id.clone(), session);
+        self.stored_sessions += 1;
+        SessionInsert::Stored
+    }
+
+    /// Drop an assistant, its sessions and every index entry that named them —
+    /// including the `clientToken` entries that created them, so a create/delete
+    /// cycle reclaims everything it allocated instead of retaining a row per
+    /// token for the life of the process.
+    pub fn remove_assistant(&mut self, assistant_id: &str) -> Option<Assistant> {
+        let assistant = self.assistants.remove(assistant_id)?;
+        self.assistant_order
+            .retain(|entry| entry.assistant_id != assistant_id);
+        self.assistant_name_index.remove(&assistant.name);
+        self.assistant_arn_index.remove(&assistant.assistant_arn);
+        let mut removed: std::collections::HashSet<&str> =
+            std::collections::HashSet::from([assistant_id]);
+        for session in assistant.sessions.values() {
+            self.session_arn_index.remove(&session.session_arn);
+            removed.insert(session.session_id.as_str());
+        }
+        self.stored_sessions = self.stored_sessions.saturating_sub(assistant.sessions.len());
+        self.idempotency
+            .retain(|_, resource_id| !removed.contains(resource_id.as_str()));
+        // The order queue mirrors the map, so it drops exactly the same entries.
+        self.idempotency_order
+            .retain(|key| self.idempotency.contains_key(key));
+        Some(assistant)
+    }
+
+    /// The listing a page starts at: the creation-ordered assistants at or
+    /// after `next_token`'s cursor, or the whole listing when the caller named
+    /// no token. `None` means the token is not a cursor this listing issues,
+    /// which is a refusal; a cursor past every entry is simply an empty last
+    /// page, because the assistants it named were deleted.
+    pub fn listing_from(&self, next_token: Option<&str>) -> Option<&[ListingEntry]> {
+        let Some(token) = next_token else {
+            return Some(&self.assistant_order);
+        };
+        let cursor: u64 = token.parse().ok()?;
+        // A cursor this listing never issued is not a token of this listing,
+        // even when it parses: every issued token is the cursor of an entry that
+        // existed, so a cursor at or past the next one to be minted is refused
+        // rather than answered with an empty success a client reads as "the end".
+        if cursor >= self.next_cursor {
+            return None;
+        }
+        let start = self
+            .assistant_order
+            .iter()
+            .position(|entry| entry.cursor >= cursor)
+            .unwrap_or(self.assistant_order.len());
+        Some(&self.assistant_order[start..])
+    }
+
+    /// The resource id a previous call created for this
+    /// (operation, scope, `clientToken`). Whether that resource still exists is
+    /// the caller's check: a token whose resource was deleted has its entry
+    /// dropped by [`Self::remove_assistant`], so it replays as if unused.
+    pub fn replayed_resource_id(
+        &self,
+        operation: &str,
+        scope: &str,
+        client_token: &str,
+    ) -> Option<&String> {
+        self.idempotency.get(&IdempotencyKey {
+            operation: operation.to_string(),
+            scope: scope.to_string(),
+            client_token: client_token.to_string(),
+        })
+    }
+
+    /// Record which resource a `clientToken` created, so a retry of the same
+    /// create returns that resource instead of a duplicate.
+    pub fn remember_client_token(
+        &mut self,
+        operation: &str,
+        scope: &str,
+        client_token: &str,
+        resource_id: &str,
+    ) {
+        let key = IdempotencyKey {
+            operation: operation.to_string(),
+            scope: scope.to_string(),
+            client_token: client_token.to_string(),
+        };
+        if let Some(known) = self.idempotency.get_mut(&key) {
+            // Re-remembering a token already held evicts nothing: it names the
+            // same entry.
+            *known = resource_id.to_string();
+            return;
+        }
+        // The index is bounded: once it is full the token remembered longest
+        // ago is forgotten, so a token stream cannot grow this map forever.
+        while self.idempotency_order.len() >= MAX_REMEMBERED_CLIENT_TOKENS {
+            match self.idempotency_order.pop_front() {
+                Some(oldest) => {
+                    self.idempotency.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        self.idempotency.insert(key.clone(), resource_id.to_string());
+        self.idempotency_order.push_back(key);
+    }
+}
+
+/// A fresh resource id: a lowercase hyphenated v4 uuid, the form the model's
+/// `UuidOrArn` pattern requires (`^[a-f0-9]{8}-[a-f0-9]{4}-…$`).
+///
+/// Minted by the framework's own v4 generator, `emulator_telemetry`'s
+/// `random()` id constructor ("A fresh random (v4) identifier"), which this
+/// crate already depends on — so the ids come from the `uuid` crate the
+/// framework uses, and this service declares no id generator and no RNG
+/// dependency of its own.
+pub fn new_resource_id() -> String {
+    ::emulator_telemetry::SessionId::random().as_str().to_string()
+}
+
+/// The region a request was signed for, read from its SigV4 credential scope
+/// (`Credential=<akid>/<date>/<region>/wisdom/aws4_request`), falling back to
+/// [`DEFAULT_REGION`] for an unsigned request.
+pub fn request_region(headers: &::http::HeaderMap) -> String {
+    ::emulator_server::sigv4_credential_scope(headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The ARN of an assistant: `arn:aws:wisdom:<region>:<account>:assistant/<id>`.
+pub fn assistant_arn(region: &str, assistant_id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("assistant/{assistant_id}"))
+}
+
+/// The ARN of a session: `arn:aws:wisdom:<region>:<account>:session/<assistantId>/<sessionId>`.
+///
+/// The session's own id is the LAST segment and the owning assistant's the
+/// middle one, which is the only two-segment form the model's `UuidOrArn`
+/// pattern accepts (`<label>/<uuid>(/<uuid>)?`).
+pub fn session_arn(region: &str, assistant_id: &str, session_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("session/{assistant_id}/{session_id}"),
+    )
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

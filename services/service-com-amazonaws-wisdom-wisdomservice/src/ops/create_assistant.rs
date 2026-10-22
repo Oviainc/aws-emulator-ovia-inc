@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAssistant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAssistant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAssistant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints an assistant — a fresh v4 uuid `assistantId`, the matching
+//! `assistant/<id>` ARN, and the record every later `GetAssistant`,
+//! `ListAssistants`, `CreateSession` and `DeleteAssistant` reads.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +158,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAssistant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAssistantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAssistant"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Mounted on an engine that holds no state: nothing can be persisted,
+            // and this operation models no error that says so.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateAssistant"));
+        };
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let mut state = state.lock();
+
+        // A retried create carrying the same `clientToken` answers with the
+        // resource the first call created, rather than minting a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            let replayed = state
+                .replayed_resource_id(Self::NAME, "", token)
+                .cloned()
+                .and_then(|id| state.assistants.get(&id))
+                .map(crate::state::Assistant::to_data);
+            if let Some(assistant) = replayed {
+                return Ok(CreateAssistantOutput {
+                    assistant: Some(assistant),
+                });
+            }
+        }
+
+        // The model puts no bound on the `tags` map, so the store does: AWS's
+        // tagging restrictions allow at most 50 tags on a resource, and a
+        // request past that is outside what the service accepts. The count is
+        // taken from what the caller sent, before the map is stored.
+        let requested_tags = input.tags.unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateAssistantErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "tags must have at most {} entries, but {} were given.",
+                    crate::state::MAX_TAGS_PER_RESOURCE,
+                    requested_tags.len()
+                )),
+            })
+            .into());
+        }
+        let tags: ::std::collections::BTreeMap<String, String> =
+            requested_tags.into_iter().collect();
+
+        // `name` identifies an assistant within the account, so a second
+        // assistant claiming a live name conflicts with the first.
+        if state.assistant_name_index.contains_key(&input.name) {
+            return Err(CreateAssistantErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "An assistant with the name {} already exists.",
+                    input.name
+                )),
+            })
+            .into());
+        }
+
+        let assistant_id = crate::state::new_resource_id();
+        let assistant_arn = crate::state::assistant_arn(&region, &assistant_id);
+        let stored = state.insert_assistant(crate::state::Assistant {
+            assistant_id: assistant_id.clone(),
+            assistant_arn,
+            name: input.name,
+            assistant_type: input.r#type,
+            // An assistant is usable the moment it is created, so it is created
+            // in the terminal `ACTIVE` status, not a transient one.
+            status: "ACTIVE".to_string(),
+            description: input.description,
+            tags,
+            server_side_encryption_configuration: input.server_side_encryption_configuration,
+            sessions: ::std::collections::HashMap::new(),
+            session_order: Vec::new(),
+            created_at: ::std::time::SystemTime::now(),
+        });
+        if !stored {
+            // The store holds as many assistants as this emulator keeps
+            // (`state::MAX_ASSISTANTS`); the service models this refusal.
+            return Err(CreateAssistantErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "The maximum number of assistants ({}) has been reached. Delete an \
+                         assistant before creating another.",
+                        crate::state::MAX_ASSISTANTS
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(token) = input.client_token.as_deref() {
+            // An assistant is an account-level resource, so the token's scope is
+            // the account the whole store represents.
+            state.remember_client_token(Self::NAME, "", token, &assistant_id);
+        }
+
+        // Answer from what was just persisted, so this response and a later
+        // `GetAssistant` cannot disagree.
+        let assistant = state
+            .assistants
+            .get(&assistant_id)
+            .map(crate::state::Assistant::to_data);
+        Ok(CreateAssistantOutput { assistant })
     }
 }

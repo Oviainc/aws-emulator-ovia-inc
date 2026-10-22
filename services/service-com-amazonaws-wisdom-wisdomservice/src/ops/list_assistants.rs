@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssistants
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssistants`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssistants::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: enumerates the persisted assistants in creation order as
+//! `assistantSummaries`, one `maxResults`-sized page at a time, handing back a
+//! `nextToken` only while assistants remain. Reads only; it never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +138,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssistants` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssistantsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssistants"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Mounted on an engine that holds no state: there is nothing to read,
+            // and this operation models no error that says so.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("ListAssistants"));
+        };
+        let state = state.lock();
+
+        // A page token names the listing cursor the page opens at, so the next
+        // page continues where this one stopped even if an assistant it would
+        // have named was deleted in between.
+        let Some(remaining) = state.listing_from(input.next_token.as_deref()) else {
+            return Err(ListAssistantsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some("The nextToken is not a token of this listing.".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `maxResults` is modelled `range 1..100`, which the boundary validator
+        // has already enforced; the only choice left here is the page size for a
+        // caller who named none, which is the modelled maximum. The lower clamp
+        // keeps a page from being empty-with-a-token — a loop that never ends —
+        // independently of the validator.
+        let page_size = usize::try_from(input.max_results.unwrap_or(crate::state::MAX_PAGE_SIZE))
+            .unwrap_or(crate::state::MAX_PAGE_SIZE as usize)
+            .max(1);
+        let assistant_summaries = remaining
+            .iter()
+            .take(page_size)
+            .filter_map(|entry| state.assistants.get(&entry.assistant_id))
+            .map(crate::state::Assistant::to_summary)
+            .collect();
+        Ok(ListAssistantsOutput {
+            assistant_summaries,
+            next_token: remaining
+                .get(page_size)
+                .map(|entry| entry.cursor.to_string()),
+        })
     }
 }
