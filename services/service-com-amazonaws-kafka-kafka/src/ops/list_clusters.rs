@@ -81,7 +81,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use std::ops::Bound;
+use crate::state::{decode_cluster_page_token, ClusterFilter, ClusterPage, MAX_RESULTS_LIMIT};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -116,33 +116,6 @@ impl From<ListClustersErrorModeled> for ListClustersError {
     fn from(modeled: ListClustersErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
-}
-
-/// The largest page `MaxResults` may ask for, from that member's `range` in the
-/// model (1..100). Also the size used when the request names none.
-const MAX_RESULTS_LIMIT: i32 = 100;
-
-/// Marker that prefixes a token's plaintext, so a token minted for some other
-/// list cannot be mistaken for one of these.
-const NEXT_TOKEN_PREFIX: &str = "kafka:clusters:";
-
-/// Encode the ARN a page stopped at as a token. Base64 of a marked plaintext:
-/// the token is ENCODED, not authenticated, so a caller could decode it or mint
-/// one. That is harmless here — the ARN inside is only used as a `>` comparison
-/// against the keys of the caller's own registry, so a forged resume point can
-/// only skip or repeat entries the caller may already list.
-fn encode_next_token(last_arn: &str) -> String {
-    ::aws_smithy_types::base64::encode(format!("{NEXT_TOKEN_PREFIX}{last_arn}"))
-}
-
-/// The ARN a token resumes after, or `None` when the token is not one this
-/// operation minted.
-fn decode_next_token(token: &str) -> Option<String> {
-    let decoded = ::aws_smithy_types::base64::decode(token).ok()?;
-    let decoded = String::from_utf8(decoded).ok()?;
-    decoded
-        .strip_prefix(NEXT_TOKEN_PREFIX)
-        .map(ToString::to_string)
 }
 
 /// The `ListClusters` operation.
@@ -197,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // between pages shifts nothing already returned.
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match decode_next_token(token) {
+            Some(token) => match decode_cluster_page_token(token) {
                 Some(arn) => Some(arn),
                 None => {
                     return Err(ListClustersErrorModeled::BadRequestException(
@@ -221,37 +194,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // PASS 1 — choose this page's registry keys. `ListClusters` is a regional
         // API, so it reports only the clusters this endpoint's region holds, the
-        // same set the ARN readers resolve against. The registry is ordered by
-        // ARN, so a token resumes by SEEKING to its position rather than walking
-        // the keys already returned; the scan from there stops as soon as the page
-        // is full, and only entries that fail the region or name-prefix test are
-        // skipped past.
-        let mut keys: Vec<String> = Vec::with_capacity(page_size);
-        let mut more_remain = false;
-        let resume_from = match resume_after.as_deref() {
-            Some(last) => Bound::Excluded(last),
-            None => Bound::Unbounded,
-        };
-        for (arn, cluster) in state
-            .clusters
-            .range::<str, _>((resume_from, Bound::Unbounded))
-        {
-            if cluster.region != region {
-                continue;
-            }
-            if input
-                .cluster_name_filter
-                .as_deref()
-                .is_some_and(|prefix| !cluster.name.starts_with(prefix))
-            {
-                continue;
-            }
-            if keys.len() == page_size {
-                more_remain = true;
-                break;
-            }
-            keys.push(arn.clone());
-        }
+        // same set the ARN readers resolve against; the registry does the seek and
+        // the name-prefix test, so both cluster listings page one order one way.
+        let ClusterPage { keys, next_token } = state.cluster_page(
+            &region,
+            ClusterFilter {
+                name_prefix: input.cluster_name_filter.as_deref(),
+                cluster_type: None,
+            },
+            resume_after.as_deref(),
+            page_size,
+        );
 
         // PASS 2 — settle and render exactly the clusters this page reports. The
         // only write is the CREATING -> ACTIVE transition the clock already owed
@@ -282,15 +235,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             page.push(cluster.to_cluster_info());
         }
-
-        // The token is minted from the REGISTRY KEY the resume comparison uses,
-        // not from the rendered `ClusterInfo`, so the two can never disagree and a
-        // full page can never be mistaken for the last one.
-        let next_token = if more_remain {
-            keys.last().map(|last| encode_next_token(last))
-        } else {
-            None
-        };
 
         Ok(ListClustersOutput {
             cluster_info_list: Some(page),

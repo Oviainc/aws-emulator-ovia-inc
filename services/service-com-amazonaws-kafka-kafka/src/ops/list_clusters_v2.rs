@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListClustersV2
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListClustersV2`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Pages the stored clusters, reporting each one as the `Cluster` shape the V2
+//! readers return: the identity members every cluster kind shares, plus the
+//! per-kind detail its `ClusterType` names. `ListClustersV2` is a REGIONAL api, so
+//! it reports only the clusters this endpoint's region holds — the same set the
+//! ARN readers resolve against, paged through the same registry order
+//! `ListClusters` uses. `ClusterNameFilter` keeps the clusters whose name starts
+//! with it, `ClusterTypeFilter` keeps the clusters of that `ClusterType`,
+//! `MaxResults` bounds the page, and `NextToken` is an opaque encoding of the last
+//! ARN returned, resolved against the live registry — absent from the last page.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListClustersV2::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Authentication and authorization are NOT this handler's business: the emulator
+//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
+//! constructed here.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +84,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{decode_cluster_page_token, ClusterFilter, ClusterPage, MAX_RESULTS_LIMIT};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -151,18 +157,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListClustersV2` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListClustersV2ErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListClustersV2"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListClustersV2ErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // `ClusterTypeFilter` is modelled as a free string, but it names a
+        // `ClusterType`, and the enum lists every value a cluster can have
+        // (CLUSTER_TYPE_VALUES, generated from the model). A value outside it
+        // names no cluster kind at all, so it is refused as a bad request rather
+        // than silently matching nothing.
+        if let Some(kind) = input.cluster_type_filter.as_deref() {
+            if !CLUSTER_TYPE_VALUES.contains(&kind) {
+                return Err(ListClustersV2ErrorModeled::BadRequestException(
+                    BadRequestException {
+                        invalid_parameter: Some("ClusterTypeFilter".to_string()),
+                        message: Some(format!(
+                            "The value of parameter ClusterTypeFilter must be one of {}.",
+                            CLUSTER_TYPE_VALUES.join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A token names the ARN the previous page stopped at; the next page starts
+        // after it in the registry's own order, so a cluster created or deleted
+        // between pages shifts nothing already returned.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match decode_cluster_page_token(token) {
+                Some(arn) => Some(arn),
+                None => {
+                    return Err(ListClustersV2ErrorModeled::BadRequestException(
+                        BadRequestException {
+                            invalid_parameter: Some("NextToken".to_string()),
+                            message: Some("The pagination token is not valid.".to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let mut state = state.lock();
+
+        // Absent `MaxResults` pages at the largest size the model allows, and no
+        // request may ask for a longer page than that range permits.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_RESULTS_LIMIT))
+            .unwrap_or(MAX_RESULTS_LIMIT as usize)
+            .clamp(1, MAX_RESULTS_LIMIT as usize);
+
+        // PASS 1 — choose this page's registry keys. The registry does the seek,
+        // the region test and both filters, so this listing pages the same order
+        // `ListClusters` does and the two can never disagree about which clusters
+        // this endpoint holds.
+        let ClusterPage { keys, next_token } = state.cluster_page(
+            &region,
+            ClusterFilter {
+                name_prefix: input.cluster_name_filter.as_deref(),
+                cluster_type: input.cluster_type_filter.as_deref(),
+            },
+            resume_after.as_deref(),
+            page_size,
+        );
+
+        // PASS 2 — settle and render exactly the clusters this page reports. The
+        // only write is the CREATING -> ACTIVE transition the clock already owed
+        // each of them, and the work is bounded by the page size rather than by
+        // the size of the registry.
+        let now = std::time::SystemTime::now();
+        let mut page: Vec<Cluster> = Vec::with_capacity(keys.len());
+        for key in &keys {
+            // Every key came from pass 1 under THIS lock, so each one still
+            // resolves. Reported as a server fault rather than skipped: a page
+            // shorter than the keys the token was minted from would hide a
+            // cluster instead of failing, so a refactor that ever let the two
+            // passes see different registries fails loudly here.
+            let Some(cluster) = state.settled_cluster_in(&region, key, now) else {
+                debug_assert!(
+                    false,
+                    "cluster {key} was chosen for this page but no longer resolves"
+                );
+                return Err(ListClustersV2ErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some(
+                            "a cluster selected for this page is no longer registered".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            };
+            page.push(cluster.to_cluster_v2());
+        }
+
+        Ok(ListClustersV2Output {
+            cluster_info_list: Some(page),
+            next_token,
+        })
     }
 }

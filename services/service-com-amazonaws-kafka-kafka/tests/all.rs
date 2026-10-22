@@ -13,6 +13,10 @@
 // points it into `tests/all/`.
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
+#[path = "all/kafka_harness.rs"]
+mod kafka_harness;
+#[path = "all/list_clusters_v2.rs"]
+mod list_clusters_v2;
 #[path = "all/replicator_listing.rs"]
 mod replicator_listing;
 #[path = "all/state_roundtrip.rs"]
