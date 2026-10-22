@@ -14,6 +14,12 @@
 //! notification flags are sent, severity, alias charset and length, how many
 //! configurations are stored). The `T012ABCDEFG` / `C01234A5BCD` case from the
 //! bootstrap issue is only one row.
+//!
+//! A channel configuration lives inside a Slack workspace registered to the account,
+//! so a create that is meant to succeed goes through
+//! [`Emulator::create_in_registered_workspace`], which registers the request's
+//! workspace first; the precondition itself is covered in
+//! [`crate::resource_preconditions`].
 
 use std::sync::Arc;
 
@@ -66,7 +72,7 @@ impl Reply {
             .map(str::to_string)
     }
 
-    fn configurations(&self) -> Vec<Value> {
+    pub(crate) fn configurations(&self) -> Vec<Value> {
         self.field("slackChannelConfigurations")
             .and_then(Value::as_array)
             .cloned()
@@ -132,6 +138,33 @@ impl Emulator {
         self.call("create-slack-channel-configuration", body).await
     }
 
+    /// Register `team_id` as a Slack workspace of this account — the precondition
+    /// `CreateSlackChannelConfiguration` enforces.
+    pub(crate) async fn register_workspace(&self, team_id: &str) -> Reply {
+        self.call(
+            "register-slack-workspace-for-organization",
+            json!({ "teamId": team_id }),
+        )
+        .await
+    }
+
+    /// A create whose workspace is registered first, so whatever the create answers is
+    /// about the request and the stored configurations rather than about the missing
+    /// workspace. Registering a workspace the account already holds changes nothing, so
+    /// a table may call this once per row with the same `teamId`.
+    pub(crate) async fn create_in_registered_workspace(&self, body: Value) -> Reply {
+        if let Some(team_id) = body.get("teamId").and_then(Value::as_str) {
+            let registered = self.register_workspace(team_id).await;
+            assert_eq!(
+                registered.status, 200,
+                "case {team_id:?}: expected the workspace registration to answer HTTP 200, \
+                 got {} / {}",
+                registered.status, registered.body
+            );
+        }
+        self.create(body).await
+    }
+
     pub(crate) async fn update(&self, body: Value) -> Reply {
         self.call("update-slack-channel-configuration", body).await
     }
@@ -144,7 +177,7 @@ impl Emulator {
         .await
     }
 
-    async fn list(&self, next_token: Option<&str>) -> Reply {
+    pub(crate) async fn list(&self, next_token: Option<&str>) -> Reply {
         let body = match next_token {
             Some(token) => json!({ "nextToken": token }),
             None => json!({}),
@@ -157,8 +190,12 @@ impl Emulator {
             .await
     }
 
-    async fn get_alias(&self) -> Reply {
+    pub(crate) async fn get_alias(&self) -> Reply {
         self.call("get-account-alias", json!({})).await
+    }
+
+    pub(crate) async fn delete_alias(&self) -> Reply {
+        self.call("delete-account-alias", json!({})).await
     }
 
     /// The single stored configuration for `(team_id, channel_id)` as the listing
@@ -351,7 +388,9 @@ async fn a_created_configuration_is_reported_by_list_exactly_as_stored() {
 
     for case in round_trip_cases() {
         let label = case.label;
-        let created = emulator.create(case.create_body()).await;
+        let created = emulator
+            .create_in_registered_workspace(case.create_body())
+            .await;
         assert_eq!(
             created.status, 200,
             "case {label:?}: expected create to answer HTTP 200, got {} / {}",
@@ -387,7 +426,9 @@ async fn configuring_an_already_configured_channel_is_a_conflict() {
     for case in round_trip_cases() {
         let label = case.label;
         let emulator = Emulator::new();
-        let first = emulator.create(case.create_body()).await;
+        let first = emulator
+            .create_in_registered_workspace(case.create_body())
+            .await;
         assert_eq!(
             first.status, 200,
             "case {label:?}: expected the first create to succeed, got {} / {}",
@@ -470,7 +511,9 @@ async fn update_applies_only_the_members_the_request_carries() {
             severity: "high",
             channel_role_arn: role_arn("SupportAppRole"),
         };
-        let created = emulator.create(stored.create_body()).await;
+        let created = emulator
+            .create_in_registered_workspace(stored.create_body())
+            .await;
         assert_eq!(
             created.status, 200,
             "case {label:?}: expected create to succeed, got {} / {}",
@@ -560,7 +603,9 @@ async fn the_documented_severity_and_flag_combination_is_enforced() {
             severity,
             channel_role_arn: role_arn("SupportAppRole"),
         };
-        let created = emulator.create(case.create_body()).await;
+        let created = emulator
+            .create_in_registered_workspace(case.create_body())
+            .await;
         assert_eq!(
             created.status, expected_status,
             "case {label:?}: expected HTTP {expected_status}, got {} / {}",
@@ -611,7 +656,9 @@ async fn the_documented_severity_and_flag_combination_is_enforced() {
         ),
     ] {
         let emulator = Emulator::new();
-        let created = emulator.create(fixture.clone()).await;
+        let created = emulator
+            .create_in_registered_workspace(fixture.clone())
+            .await;
         assert_eq!(
             created.status, 200,
             "case {label:?}: expected create to succeed, got {} / {}",
@@ -664,7 +711,10 @@ async fn an_unconfigured_channel_cannot_be_updated_or_deleted() {
         channel_role_arn: role_arn("SupportAppRole"),
     };
     assert_eq!(
-        emulator.create(present.create_body()).await.status,
+        emulator
+            .create_in_registered_workspace(present.create_body())
+            .await
+            .status,
         200,
         "the neighbouring configuration must be created"
     );
@@ -722,7 +772,10 @@ async fn delete_removes_only_the_named_configuration() {
     let cases = round_trip_cases();
     for case in &cases {
         assert_eq!(
-            emulator.create(case.create_body()).await.status,
+            emulator
+                .create_in_registered_workspace(case.create_body())
+                .await
+                .status,
             200,
             "case {:?}: expected create to succeed",
             case.label
@@ -856,7 +909,7 @@ async fn pagination_reports_every_stored_configuration_exactly_once() {
             let channel_id = format!("C{index:03}");
             let severity = SEVERITY_LEVELS[index % SEVERITY_LEVELS.len()];
             let created = emulator
-                .create(json!({
+                .create_in_registered_workspace(json!({
                     "teamId": team_id,
                     "channelId": channel_id,
                     "notifyOnCaseSeverity": severity,
@@ -891,7 +944,7 @@ async fn a_create_past_the_documented_channel_quota_is_refused() {
     // Fill the account to its documented maximum.
     for index in 0..MAX_SLACK_CHANNEL_CONFIGURATIONS {
         let created = emulator
-            .create(json!({
+            .create_in_registered_workspace(json!({
                 "teamId": "T012ABCDEFG",
                 "channelId": format!("C{index:03}"),
                 "notifyOnCaseSeverity": "none",
@@ -914,7 +967,7 @@ async fn a_create_past_the_documented_channel_quota_is_refused() {
     ];
     for (label, team_id, channel_id) in over_quota {
         let refused = emulator
-            .create(json!({
+            .create_in_registered_workspace(json!({
                 "teamId": team_id,
                 "channelId": channel_id,
                 "notifyOnCaseSeverity": "none",
@@ -968,7 +1021,7 @@ async fn a_create_past_the_documented_channel_quota_is_refused() {
         "expected the delete that frees a slot to succeed"
     );
     let after_delete = emulator
-        .create(json!({
+        .create_in_registered_workspace(json!({
             "teamId": "T999ZZZZZZZ",
             "channelId": "C999",
             "notifyOnCaseSeverity": "none",
@@ -987,7 +1040,7 @@ async fn a_next_token_this_service_did_not_mint_is_refused() {
     let emulator = Emulator::new();
     for index in 0..3 {
         emulator
-            .create(json!({
+            .create_in_registered_workspace(json!({
                 "teamId": "T012ABCDEFG",
                 "channelId": format!("C{index:03}"),
                 "notifyOnCaseSeverity": "none",
@@ -1121,6 +1174,13 @@ async fn a_create_outside_the_modelled_constraints_is_refused() {
         "notifyOnCaseSeverity": "none",
         "channelRoleArn": role_arn("SupportAppRole"),
     });
+    // The workspace the valid request names is registered, so every refusal below is
+    // about the request's own values and not about the missing-workspace precondition.
+    assert_eq!(
+        emulator.register_workspace("T012ABCDEFG").await.status,
+        200,
+        "the workspace must be registered"
+    );
 
     // Rows: each `@required` member absent, a value outside each published length
     // bound, a value outside `^\S+$`, a severity outside the modelled value set, and a

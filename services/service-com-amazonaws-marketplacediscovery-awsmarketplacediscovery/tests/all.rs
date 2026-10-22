@@ -15,6 +15,8 @@
 mod catalog_drilldown;
 #[path = "all/discovery_ordering_and_refusals.rs"]
 mod discovery_ordering_and_refusals;
+#[path = "all/fulfillment_options.rs"]
+mod fulfillment_options;
 #[path = "all/signing_name_claims.rs"]
 mod signing_name_claims;
 #[path = "all/state_roundtrip.rs"]

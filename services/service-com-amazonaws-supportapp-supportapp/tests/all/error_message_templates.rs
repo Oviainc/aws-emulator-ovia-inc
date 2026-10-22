@@ -266,7 +266,10 @@ async fn the_all_or_high_severity_rule_is_stated_as_service_prose_naming_the_ope
     for (label, patch) in update_rows {
         let emulator = Emulator::new();
         assert_eq!(
-            emulator.create(valid_create()).await.status,
+            emulator
+                .create_in_registered_workspace(valid_create())
+                .await
+                .status,
             200,
             "case {label:?}: the fixture configuration must be created"
         );
@@ -311,7 +314,10 @@ async fn the_none_severity_rule_is_stated_in_the_same_service_prose() {
     let label = "severity to none while a stored flag is true";
     let emulator = Emulator::new();
     assert_eq!(
-        emulator.create(valid_create()).await.status,
+        emulator
+            .create_in_registered_workspace(valid_create())
+            .await
+            .status,
         200,
         "case {label:?}: the fixture configuration must be created"
     );
@@ -336,7 +342,10 @@ async fn a_configuration_this_account_does_not_hold_is_reported_with_one_templat
     let emulator = Emulator::new();
     // A stored neighbour, so each 404 is about the named pair and not an empty store.
     assert_eq!(
-        emulator.create(valid_create()).await.status,
+        emulator
+            .create_in_registered_workspace(valid_create())
+            .await
+            .status,
         200,
         "the stored neighbour must be created"
     );

@@ -28,6 +28,27 @@ pub const MAX_SLACK_CHANNEL_CONFIGURATIONS: usize = 20;
 /// account that is within its quota instead of making it dead code.
 pub const CHANNEL_PAGE_SIZE: usize = 10;
 
+/// The most Slack workspaces this account can have registered.
+///
+/// Documented on `CreateSlackChannelConfiguration`: "You can add up to 5 Slack
+/// workspaces for your account". It bounds the workspace registry below, so no caller
+/// can grow it without end. `RegisterSlackWorkspaceForOrganization` models no
+/// `ServiceQuotaExceededException` (its errors are `AccessDeniedException`,
+/// `ConflictException`, `InternalServerException`, `ResourceNotFoundException` and
+/// `ValidationException`), so a registration past this quota is refused with that
+/// operation's modelled `ValidationException`.
+pub const MAX_SLACK_WORKSPACE_CONFIGURATIONS: usize = 5;
+
+/// Whether the single account this emulator presents is an organization's management
+/// or member account, as `RegisterSlackWorkspaceForOrganization` reports it in
+/// `accountType`.
+///
+/// The emulator presents exactly ONE account (`engine::emulator_account_id`), so that
+/// account is the management account of its own organization: there is no second
+/// account for it to be a member of. One of
+/// [`crate::ops::types::ACCOUNT_TYPE_VALUES`].
+pub const ACCOUNT_TYPE: &str = "management";
+
 /// One stored Slack channel configuration: everything
 /// `CreateSlackChannelConfiguration` was given, after the documented defaults were
 /// applied, so `List`/`Update` report the values that were persisted rather than
@@ -63,10 +84,9 @@ impl SlackChannelConfig {
 }
 
 /// One stored Slack workspace configuration, as
-/// `ListSlackWorkspaceConfigurations` reports it and
-/// `RegisterSlackWorkspaceForOrganization` records it. Those operations are still
-/// scaffolded and carry their own gap issues; the field below is where they will
-/// read and write.
+/// `RegisterSlackWorkspaceForOrganization` records it and
+/// `ListSlackWorkspaceConfigurations` will report it (that operation is still
+/// scaffolded and carries its own gap issue).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlackWorkspaceConfig {
     pub team_id: String,
@@ -85,13 +105,27 @@ pub struct ComAmazonawsSupportappSupportappState {
     /// and `DeleteAccountAlias` clears. `None` until one is put: the account has no
     /// alias to report.
     pub account_alias: Option<String>,
-    /// Every stored Slack workspace configuration, keyed by `teamId`. Its writers
-    /// (`RegisterSlackWorkspaceForOrganization`) are still scaffolded; when they are
-    /// implemented they must bound this map the way `CreateSlackChannelConfiguration`
-    /// bounds the one above, with the documented workspace quota
-    /// (`CreateSlackChannelConfiguration`: "You can add up to 5 Slack workspaces for
-    /// your account") and the same modelled `ServiceQuotaExceededException`.
+    /// Every Slack workspace registered to this account, keyed by `teamId`, written by
+    /// `RegisterSlackWorkspaceForOrganization` and bounded by
+    /// [`MAX_SLACK_WORKSPACE_CONFIGURATIONS`]. It is the account's workspace registry:
+    /// a Slack channel configuration lives INSIDE a registered workspace, so
+    /// `CreateSlackChannelConfiguration` refuses a channel whose `teamId` is absent
+    /// here (see [`workspace_not_registered_message`]).
     pub slack_workspace_configurations: BTreeMap<String, SlackWorkspaceConfig>,
+}
+
+/// The `ConflictException` message for a Slack channel configuration refused because
+/// `team_id` is not in this account's workspace registry.
+///
+/// `ConflictException`'s documentation names the condition — "Add, update, or delete a
+/// Slack channel configuration before you add a Slack workspace to your Amazon Web
+/// Services account" — and the message is built from the request's `teamId` and the
+/// account the emulator presents, so a caller reads the condition it hit.
+pub fn workspace_not_registered_message(team_id: &str) -> String {
+    format!(
+        "Workspace installation not found for account {account} and team {team_id}",
+        account = ::engine::emulator_account_id()
+    )
 }
 
 /// The pagination cursor for a page that starts at `(team_id, channel_id)`.

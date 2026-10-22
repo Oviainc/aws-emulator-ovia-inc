@@ -21,13 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Renders the `ListPolicies` `nextToken` payload and the hex halves of a minted
+# `policyId`/`updateToken` inside the patterns the model declares for them.
+hex = { workspace = true }
+# Spreads the seed behind a minted `policyId`/`updateToken` (see `state::random_bytes`).
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
