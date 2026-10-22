@@ -14,6 +14,12 @@
 //! records the report version it covers rather than a principal: a pass is not a
 //! statement about an AWS-side authorisation decision.
 //!
+//! The report catalog IS the account's entitlement, though: AWS Artifact is served
+//! through a gateway that authorizes the report the request targets before the service
+//! is reached, so a `reportId` the catalog does not publish is answered with the front
+//! door's 401 `UnauthorizedException` (`crate::scaffolded::FrontDoorRefusal`) and never
+//! with the modelled 404 — and, as before, leaves no grant behind.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -174,10 +180,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Resolve the report version the grant will cover BEFORE minting anything, so a
         // request naming no report leaves no grant behind.
         let Some(report) = store.reports.get(&input.report_id) else {
-            return Err(GetTermForReportErrorModeled::ResourceNotFoundException(
-                crate::state::report_not_found(&input.report_id),
-            )
-            .into());
+            // Authorization of the targeted report precedes the catalog lookup as far as
+            // a caller can tell: an id the catalog does not publish names no report this
+            // account may read, so the front door's refusal is what it sees.
+            return Err(crate::scaffolded::Scaffolded::unauthorized());
         };
         let Some(version) = report.resolve(input.report_version) else {
             // Total in both shapes: the request either named a version this report never

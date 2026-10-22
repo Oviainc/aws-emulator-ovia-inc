@@ -349,7 +349,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_token,
             Self::NAME,
             &request_fingerprint,
-            Some(input.rule_arn.clone()),
+            Some(crate::state::TokenSubject::Rule(input.rule_arn.clone())),
         );
 
         // Answer from the store, so the response is the merged rule a later

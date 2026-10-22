@@ -359,11 +359,24 @@ fn is_region_shaped(value: &str) -> bool {
 
 /// True when `value` satisfies `ReportId`'s `^report-[a-zA-Z0-9]{16}$`.
 ///
-/// The boundary validator already refuses a modelled `ReportId` member, so this is for a
-/// value the model does not constrain — a `nextToken`, which `ListReports` carries a
-/// report id in.
+/// Two callers need it where the boundary validator cannot be the judge: a `nextToken`,
+/// which `ListReports` carries a report id in and the model does not constrain, and the
+/// front door in [`crate::service`], which decides whether a request names a resource
+/// at all BEFORE that validator runs.
 pub fn is_report_id(value: &str) -> bool {
     let Some(suffix) = value.strip_prefix("report-") else {
+        return false;
+    };
+    suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// True when `value` satisfies `InquiryId`'s `^compliance-inquiry-[a-zA-Z0-9]{16}$` —
+/// the id of a compliance inquiry, as every `complianceInquiryId` member targets one.
+///
+/// Spelled the same way as [`is_report_id`], and for the same caller: the front door
+/// judges the target of a request before the boundary validator sees the member.
+pub fn is_inquiry_id(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("compliance-inquiry-") else {
         return false;
     };
     suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())

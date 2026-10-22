@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeClusterSnapshots
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeClusterSnapshots`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeClusterSnapshots::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the snapshots this service holds, filtered by cluster, snapshot id,
+//! ARN, type, creation window, owner, tags and cluster existence, optionally
+//! sorted, and paginated through the opaque `Marker` cursor.
 //!
 //! ## Shape of an operation
 //!
@@ -147,13 +142,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DescribeClusterSnapshotsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeClusterSnapshots")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeClusterSnapshots",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeClusterSnapshotsErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
     ClusterSnapshotNotFoundFault(ClusterSnapshotNotFoundFault),
     InvalidTagFault(InvalidTagFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -205,20 +207,219 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeClusterSnapshots` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeClusterSnapshotsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeClusterSnapshots"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeClusterSnapshotsErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Valid Values: automated | manual".
+        if let Some(kind) = input.snapshot_type.as_deref() {
+            if kind != st::SNAPSHOT_TYPE_AUTOMATED && kind != st::SNAPSHOT_TYPE_MANUAL {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Invalid value for SnapshotType: '{kind}'. Valid Values: {} | {}",
+                    st::SNAPSHOT_TYPE_AUTOMATED,
+                    st::SNAPSHOT_TYPE_MANUAL
+                )));
+            }
+        }
+
+        // "If ClusterExists is set to true, ClusterIdentifier is required."
+        if input.cluster_exists == Some(true) && input.cluster_identifier.is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "ClusterIdentifier is required when ClusterExists is true.",
+            ));
+        }
+
+        // `SnapshotAttributeToSortBy` declares three values, so a longer list can
+        // only repeat one: the cap keeps the sort work a small constant multiple
+        // of one pass, which matters because it runs under the state lock.
+        if input
+            .sorting_entities
+            .as_ref()
+            .is_some_and(|entities| entities.len() > st::MAX_SORTING_ENTITIES)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Invalid value for SortingEntities: at most {} entities may be specified.",
+                st::MAX_SORTING_ENTITIES
+            )));
+        }
+
+        // Every requested attribute must be one this emulator can order by
+        // honestly, decided BEFORE any filtering or sorting runs: this emulator
+        // measures no backup volume, so it has no `TOTAL_SIZE` to order by and
+        // the modelled "isn't supported" fault is the truthful answer rather than
+        // an arbitrary order.
+        for entity in input.sorting_entities.iter().flatten() {
+            if entity.attribute != "CREATE_TIME" && entity.attribute != "SOURCE_TYPE" {
+                return Err(
+                    DescribeClusterSnapshotsErrorModeled::UnsupportedOperationFault(
+                        UnsupportedOperationFault {
+                            message: Some(format!(
+                                "Sorting snapshots by {} is not supported.",
+                                entity.attribute
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let mut store = state.lock();
+        store.settle(::std::time::Instant::now());
+
+        if let Some(wanted) = input.snapshot_identifier.as_deref() {
+            if store.snapshot(wanted).is_none() {
+                return Err(
+                    DescribeClusterSnapshotsErrorModeled::ClusterSnapshotNotFoundFault(
+                        ClusterSnapshotNotFoundFault {
+                            message: Some(format!("Snapshot {wanted} not found.")),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        // A cluster identifier that names neither a live cluster nor any snapshot
+        // this service holds refers to nothing at all.
+        if let Some(wanted) = input.cluster_identifier.as_deref() {
+            let known = store.cluster(wanted).is_some()
+                || store
+                    .snapshots
+                    .iter()
+                    .any(|s| s.snapshot.cluster_identifier.as_deref() == Some(wanted));
+            if !known {
+                return Err(DescribeClusterSnapshotsErrorModeled::ClusterNotFoundFault(
+                    ClusterNotFoundFault {
+                        message: Some(format!("Cluster {wanted} not found.")),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Select by REFERENCE, then clone only the page: the work done under the
+        // state lock is proportional to the page, not to the whole store.
+        let mut matched: Vec<&Snapshot> = Vec::new();
+        for stored in &store.snapshots {
+            let snapshot = &stored.snapshot;
+            if let Some(wanted) = input.cluster_identifier.as_deref() {
+                if snapshot.cluster_identifier.as_deref() != Some(wanted) {
+                    continue;
+                }
+            }
+            if let Some(wanted) = input.snapshot_identifier.as_deref() {
+                if snapshot.snapshot_identifier.as_deref() != Some(wanted) {
+                    continue;
+                }
+            }
+            if let Some(wanted) = input.snapshot_arn.as_deref() {
+                if snapshot.snapshot_arn.as_deref() != Some(wanted) {
+                    continue;
+                }
+            }
+            if let Some(wanted) = input.snapshot_type.as_deref() {
+                if snapshot.snapshot_type.as_deref() != Some(wanted) {
+                    continue;
+                }
+            }
+            if let Some(wanted) = input.owner_account.as_deref() {
+                if snapshot.owner_account.as_deref() != Some(wanted) {
+                    continue;
+                }
+            }
+            if let Some(start) = input.start_time {
+                if snapshot
+                    .snapshot_create_time
+                    .is_none_or(|t| t.as_nanos() < start.as_nanos())
+                {
+                    continue;
+                }
+            }
+            if let Some(end) = input.end_time {
+                if snapshot
+                    .snapshot_create_time
+                    .is_none_or(|t| t.as_nanos() > end.as_nanos())
+                {
+                    continue;
+                }
+            }
+            if let Some(must_exist) = input.cluster_exists {
+                // "If ClusterExists is set to true, ClusterIdentifier is
+                // required." A `false` needs no identifier: it then reports every
+                // orphaned snapshot.
+                let exists = snapshot
+                    .cluster_identifier
+                    .as_deref()
+                    .is_some_and(|id| store.cluster(id).is_some());
+                if exists != must_exist {
+                    continue;
+                }
+            }
+            if !st::tags_match(
+                snapshot.tags.as_deref().unwrap_or_default(),
+                input.tag_keys.as_deref(),
+                input.tag_values.as_deref(),
+            ) {
+                continue;
+            }
+            matched.push(snapshot);
+        }
+
+        // `SortingEntities` are applied in order, so the FIRST entity is the
+        // primary key: sort by the last one first over a stable sort. Descending
+        // is a reversed COMPARATOR rather than a reversed vector, so equal-keyed
+        // elements keep the order the previous entity gave them. Every attribute
+        // was checked above, so there is nothing left to refuse here.
+        for entity in input.sorting_entities.iter().flatten().rev() {
+            // `SortByOrder` is a modelled enum (ASC | DESC), so the boundary
+            // validator has already refused any other spelling before this
+            // handler runs; absent means ascending.
+            let descending = entity.sort_order.as_deref() == Some("DESC");
+            let order = |a: &Snapshot, b: &Snapshot| {
+                if entity.attribute == "SOURCE_TYPE" {
+                    // `SnapshotAttributeToSortBy`'s `SOURCE_TYPE` is the
+                    // snapshot's source — whether Redshift took it on its own
+                    // schedule or a caller asked for it — which the `Snapshot`
+                    // shape carries only as `SnapshotType`:
+                    // `smithy_query(query="doc", shape="Snapshot", member="SnapshotType")`
+                    // / `DescribeClusterSnapshotsMessage$SnapshotType`
+                    // ("Valid Values: automated | manual").
+                    a.snapshot_type.cmp(&b.snapshot_type)
+                } else {
+                    a.snapshot_create_time
+                        .map(|t| t.as_nanos())
+                        .cmp(&b.snapshot_create_time.map(|t| t.as_nanos()))
+                }
+            };
+            matched.sort_by(|a, b| {
+                if descending {
+                    order(b, a)
+                } else {
+                    order(a, b)
+                }
+            });
+        }
+
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(DescribeClusterSnapshotsOutput {
+            snapshots: Some(matched[start..end].iter().map(|s| (*s).clone()).collect()),
+            marker: next_marker,
+        })
     }
 }

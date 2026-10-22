@@ -334,10 +334,16 @@ async fn not_found_is_one_fixed_message_naming_no_resource() {
 ///
 /// The requirements below are the model's own constraints:
 /// `RuleName` @length 0..128 @pattern `^[a-zA-Z0-9_-]*$`, `RuleDescription`
-/// @length 0..1024 @pattern `^[a-zA-Z0-9_\-\s@\.]*$`, `RuleArn` @pattern
-/// `^arn:aws:compute-optimizer::[0-9]{12}:automation-rule/[a-zA-Z0-9_-]+$`, and
-/// `ListAutomationRulesRequest$maxResults` @range 1..100
-/// (`smithy_query(query="shape",shape="RuleName,RuleDescription,RuleArn,ListAutomationRulesRequest")`).
+/// @length 0..1024 @pattern `^[a-zA-Z0-9_\-\s@\.]*$`, `NextToken` @pattern
+/// `^[A-Za-z0-9+/=]+$`, and `ListAutomationRulesRequest$maxResults` @range
+/// 1..100
+/// (`smithy_query(query="shape",shape="RuleName,RuleDescription,NextToken,ListAutomationRulesRequest")`).
+///
+/// A `RuleArn` outside its pattern is NOT a row here: a resource string that
+/// names no automation rule of this service is refused by authorization
+/// (`AccessDeniedException`, 403) before the request is parsed, so it never
+/// reaches this report — see `automation_event_and_tagging`'s
+/// `a_string_naming_no_rule_of_this_service_is_unauthorized`.
 #[tokio::test]
 async fn a_constraint_refusal_is_a_validation_report() {
     let router = emulator();
@@ -415,14 +421,13 @@ async fn a_constraint_refusal_is_a_validation_report() {
             vec![long_description.clone()],
         ),
         (
-            "rule-arn-outside-its-pattern",
-            "GetAutomationRule",
-            json!({"ruleArn": "not-an-arn"}),
-            "1 validation error detected: Value at 'ruleArn' failed to satisfy constraint: Member \
-             must satisfy regular expression pattern: \
-             arn:aws:compute-optimizer::[0-9]{12}:automation-rule/[a-zA-Z0-9_-]+"
+            "next-token-outside-its-pattern",
+            "ListAutomationRules",
+            json!({"nextToken": "not a token!"}),
+            "1 validation error detected: Value at 'nextToken' failed to satisfy constraint: \
+             Member must satisfy regular expression pattern: [A-Za-z0-9+/=]+"
                 .to_string(),
-            vec!["not-an-arn".to_string()],
+            vec!["not a token!".to_string()],
         ),
         (
             "max-results-below-its-range",

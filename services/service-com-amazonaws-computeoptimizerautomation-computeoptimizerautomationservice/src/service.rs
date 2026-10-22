@@ -22,7 +22,11 @@
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   generated routing table. Return `Some(op)` to route one yourself. THIS
+//!   SERVICE uses it for authorization: a request whose resource member names no
+//!   automation rule of this service is answered `AccessDeniedException` (403)
+//!   there, because authorization is evaluated against the supplied resource
+//!   string before the service parses it — see [`DenyUnauthorizedResource`].
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -41,9 +45,78 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The error code and message a request for a resource the caller is not
+/// authorized for is answered with.
+///
+/// `AccessDeniedException` is a service-common error of every operation of this
+/// service, `@httpError 403`, documented "You do not have sufficient permissions
+/// to perform this action."
+/// (`smithy_query(query="shape",shape="AccessDeniedException")`). AWS's own text
+/// embeds the caller's ARN and the action, which is account-specific; the
+/// requirement is the 403 classification, so the modelled sentence is what this
+/// states.
+const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
+const ACCESS_DENIED_MESSAGE: &str = "You do not have sufficient permissions to perform this action.";
+
+/// The operations whose input names a resource by ARN, and the member each one
+/// names it in.
+///
+/// These are exactly the `RuleArn`-typed input members of this service:
+/// `ruleArn` on the three rule operations and `resourceArn` on the three tagging
+/// ones (`smithy_query(query="operation",operation="...")`). The table is keyed
+/// by OPERATION, not by member name alone, so a future member of another
+/// operation that happens to be called `resourceArn` without being a `RuleArn`
+/// is not judged by this gate — and an operation that takes no resource never
+/// has its body read here.
+const RESOURCE_MEMBERS: [(&str, &str); 6] = [
+    ("GetAutomationRule", "ruleArn"),
+    ("UpdateAutomationRule", "ruleArn"),
+    ("DeleteAutomationRule", "ruleArn"),
+    ("TagResource", "resourceArn"),
+    ("UntagResource", "resourceArn"),
+    ("ListTagsForResource", "resourceArn"),
+];
+
+/// Answers one request `AccessDeniedException` (HTTP 403).
+///
+/// Authorization is evaluated against the resource string a request supplies
+/// BEFORE the service parses that string, so a string that identifies no
+/// resource of this service is refused as unauthorized rather than as a bad
+/// parameter: no permission a caller can hold names a resource the request does
+/// not name. The framework's pre-handler validation would otherwise reject the
+/// `RuleArn` `@pattern` with a 400, which classifies a permissions failure as a
+/// request bug.
+///
+/// It is an [`ErasedOperation`] rather than a handler because that refusal has
+/// to come BEFORE the modelled-constraint walk, and `override_operation` is the
+/// seam that sees a whole request first. The router still authenticates the
+/// request against the modelled operation's auth schemes before running this.
+struct DenyUnauthorizedResource;
+
+impl ErasedOperation for DenyUnauthorizedResource {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        let _ = (req, ctx);
+        // Rendered through the service's own envelope (`__type` + `message` on
+        // this service's awsJson protocol), with the 403 the modelled
+        // `AccessDeniedException` carries.
+        let response = svc.definition().framework_error_response(
+            aws_smithy_schema_server::ProtocolError::Unauthenticated {
+                code: ACCESS_DENIED_CODE,
+                message: ACCESS_DENIED_MESSAGE,
+            },
+        );
+        Box::pin(async move { response })
+    }
+}
 
 /// The `com-amazonaws-computeoptimizerautomation-computeoptimizerautomationservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -52,6 +125,10 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The 403 answer for a request naming a resource the caller cannot hold a
+    /// permission for. Held here so [`Service::override_operation`] can hand out
+    /// a reference to it.
+    deny_unauthorized_resource: DenyUnauthorizedResource,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,7 +138,39 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            deny_unauthorized_resource: DenyUnauthorizedResource,
         }
+    }
+
+    /// Does `req` name a resource no permission of this service can cover?
+    ///
+    /// Resolves the operation the request names first, so only the operations
+    /// that take a resource ARN ([`RESOURCE_MEMBERS`]) are judged at all, then
+    /// reads that operation's resource member out of the body and asks
+    /// [`crate::state::names_automation_rule`] whether it names an automation
+    /// rule of this service. A request this cannot read — an unknown operation,
+    /// a streamed body, a body that is not the protocol's JSON object — is left
+    /// to the modelled walk, which refuses it on its own terms.
+    fn names_unauthorized_resource(&self, req: &aws_smithy_runtime_api::http::Request) -> bool {
+        let Ok(operation) = self.entry.protocol().routing_key(req) else {
+            return false;
+        };
+        let Some((_, arn_member)) = RESOURCE_MEMBERS
+            .iter()
+            .find(|(candidate, _)| *candidate == operation)
+        else {
+            return false;
+        };
+        let Some(body) = req.body().bytes() else {
+            return false;
+        };
+        let Ok(serde_json::Value::Object(members)) = serde_json::from_slice(body) else {
+            return false;
+        };
+        members
+            .get(*arn_member)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !crate::state::names_automation_rule(value))
     }
 }
 
@@ -87,12 +196,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Authorization comes before parameter parsing: a request whose
+        // resource member does not name an automation rule of this service at
+        // all is refused `AccessDeniedException` (403) here, rather than falling
+        // to the modelled `RuleArn` `@pattern` rejection (400) that the
+        // framework's pre-handler walk would answer with. See
+        // [`DenyUnauthorizedResource`]. Every other request resolves through the
+        // generated routing table.
+        self.names_unauthorized_resource(req)
+            .then_some(&self.deny_unauthorized_resource as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

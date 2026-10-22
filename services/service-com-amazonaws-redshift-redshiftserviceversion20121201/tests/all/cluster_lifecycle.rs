@@ -1,0 +1,1541 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The provisioned-cluster lifecycle, end to end over the awsQuery wire.
+//!
+//! Every case drives a real HTTP request through the same `MultiServiceRouter`
+//! the production router builds, so each assertion covers the whole walk:
+//! form-urlencoded deserialize -> handler -> XML serialize. The suite asserts
+//! RULES over tables of inputs, not one recorded request: identifier syntax, the
+//! documented `MaxRecords` window, the cluster-type/node-count agreement, the
+//! retention-period ranges, and the state a write leaves for a later read.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use service_com_amazonaws_redshift_redshiftserviceversion20121201::ops::types::Snapshot;
+use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
+use service_com_amazonaws_redshift_redshiftserviceversion20121201::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// The region every request in this suite signs for, so the derived endpoint
+/// hostnames and ARNs are predictable.
+const REGION: &str = "us-west-2";
+
+/// One emulator: a single shared engine behind a router mounting only Redshift.
+struct Emulator {
+    router: MultiServiceRouter,
+    /// The same engine the router handed the service, so a suite can seed a
+    /// record no implemented operation mints.
+    engine: Arc<engine::InMemoryEngine>,
+}
+
+/// A served response, reduced to what the assertions read.
+struct Answer {
+    status: u16,
+    body: String,
+}
+
+impl Answer {
+    /// The `<Code>` of an awsQuery `<ErrorResponse>`, or `None` on a success.
+    fn error_code(&self) -> Option<String> {
+        first_text(&self.body, "Code")
+    }
+
+    /// The text of the first element with this local name, anywhere in the body.
+    fn text(&self, tag: &str) -> Option<String> {
+        first_text(&self.body, tag)
+    }
+}
+
+impl Emulator {
+    fn new() -> Self {
+        // The one shared engine, exactly as `router/src/lib.rs` builds it: every
+        // request in this suite observes the same store.
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// Seed a snapshot Redshift took on its OWN schedule.
+    ///
+    /// Nothing in this slice mints one — `CreateClusterSnapshot` is documented to
+    /// produce `manual` — so an `automated` record is the only way to make the
+    /// `SOURCE_TYPE` ordering observable at all. Written straight into the same
+    /// shared store the handlers read, so the request path is unchanged.
+    fn seed_automated_snapshot(&self, snapshot_identifier: &str, cluster_identifier: &str) {
+        let store = state::service_state(&*self.engine).expect("the Redshift store");
+        let mut store = store.lock();
+        store.snapshots.push(state::StoredSnapshot {
+            snapshot: Snapshot {
+                snapshot_identifier: Some(snapshot_identifier.to_string()),
+                cluster_identifier: Some(cluster_identifier.to_string()),
+                snapshot_create_time: Some(aws_smithy_types::DateTime::from(
+                    std::time::SystemTime::now(),
+                )),
+                status: Some("available".to_string()),
+                snapshot_type: Some("automated".to_string()),
+                ..Default::default()
+            },
+            // Already past, so the record needs no clock-owed transition.
+            available_at: std::time::Instant::now(),
+        });
+    }
+
+    /// POST one awsQuery action with these form parameters.
+    async fn call(&self, action: &str, params: &[(&str, &str)]) -> Answer {
+        let mut body = format!("Action={action}&Version=2012-12-01");
+        for (name, value) in params {
+            body.push('&');
+            body.push_str(name);
+            body.push('=');
+            body.push_str(&form_encode(value));
+        }
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://redshift.us-west-2.amazonaws.com/")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/redshift/aws4_request, SignedHeaders=host, Signature=0"
+                ),
+            )
+            .body(bytes::Bytes::from(body))
+            .expect("the test request is well formed");
+        let response = self.router.dispatch(request).await;
+        Answer {
+            status: response.status().as_u16(),
+            body: String::from_utf8_lossy(response.body()).into_owned(),
+        }
+    }
+
+    /// Create a cluster with just the three required members.
+    async fn create_minimal(&self, identifier: &str) -> Answer {
+        self.call(
+            "CreateCluster",
+            &[
+                ("ClusterIdentifier", identifier),
+                ("NodeType", "ra3.xlplus"),
+                ("MasterUsername", "admin"),
+            ],
+        )
+        .await
+    }
+}
+
+/// Percent-encode one form value, escaping everything outside the RFC 3986
+/// unreserved characters so a new case cannot silently send a malformed body.
+///
+/// Hand-written rather than taken from `percent-encoding`, for the same reason
+/// as [`all_text`]: this suite must not add an entry to the workspace lockfile.
+fn form_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(byte));
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// The text of every `<tag>…</tag>` element in an awsQuery response body, in
+/// document order.
+///
+/// Deliberately a scanner over this one wire format rather than a general XML
+/// parser from crates.io: adding a crate would add an entry to the workspace
+/// `Cargo.lock`, which mainline also rewrites continuously, and the gate's
+/// squash merge cannot resolve a lockfile both sides changed. The emulator's
+/// awsQuery envelope is element-only, carries no attributes on the members this
+/// suite reads, and is produced by the framework's own escaping serializer, so
+/// matching one element's open/close pair is exact for this input. Element names
+/// are matched whole (`<Port>` cannot match `<PortRange>`).
+fn all_text(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut found = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        let inner = &rest[start + open.len()..];
+        let Some(end) = inner.find(&close) else { break };
+        found.push(unescape(&inner[..end]));
+        rest = &inner[end + close.len()..];
+    }
+    found
+}
+
+/// The five XML entities the framework's serializer emits.
+fn unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// The text of the first `<tag>` element in the body.
+fn first_text(xml: &str, tag: &str) -> Option<String> {
+    all_text(xml, tag).into_iter().next()
+}
+
+/// The `<ClusterIdentifier>` of every cluster a `DescribeClusters` body carries,
+/// in the order the page lists them.
+fn listed_clusters(xml: &str) -> Vec<String> {
+    all_text(xml, "ClusterIdentifier")
+}
+
+/// A string of `len` characters starting with a letter, for a length-bound case.
+fn identifier_of_length(len: usize) -> String {
+    std::iter::once('c')
+        .chain(std::iter::repeat_n('x', len - 1))
+        .collect()
+}
+
+/// One row of the cluster-type / node-count table: the case name, the
+/// `ClusterType` and `NumberOfNodes` the request carries, and the node count the
+/// created cluster must report (`None` when the pair must be refused).
+type ShapeCase = (
+    &'static str,
+    Option<&'static str>,
+    Option<&'static str>,
+    Option<&'static str>,
+);
+
+/// One row of a filter table: the case name, the request's filter parameters,
+/// and the resource ids that must come back.
+type FilterCase = (
+    &'static str,
+    Vec<(&'static str, &'static str)>,
+    Vec<&'static str>,
+);
+
+/// One row of a refusal table: the case name, the request's parameters, and
+/// whether the request must be accepted.
+type RefusalCase = (&'static str, Vec<(&'static str, &'static str)>, bool);
+
+#[tokio::test]
+async fn the_cluster_lifecycle_is_consistent_across_calls() {
+    let emulator = Emulator::new();
+
+    // CREATE — the record is minted in `creating`, with the endpoint and the
+    // creation time, and the password is nowhere on the wire.
+    let created = emulator
+        .call(
+            "CreateCluster",
+            &[
+                ("ClusterIdentifier", "demo-cluster"),
+                ("NodeType", "ra3.xlplus"),
+                ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Passw0rd!"),
+                ("ClusterType", "single-node"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case create demo-cluster: expected 200, got {} with body {}",
+        created.status, created.body
+    );
+    assert_eq!(
+        created.text("ClusterIdentifier").as_deref(),
+        Some("demo-cluster"),
+        "case create demo-cluster: expected the identifier back, got {:?}",
+        created.text("ClusterIdentifier")
+    );
+    assert_eq!(
+        created.text("ClusterStatus").as_deref(),
+        Some("creating"),
+        "case create demo-cluster: expected ClusterStatus=creating, got {:?}",
+        created.text("ClusterStatus")
+    );
+    assert_eq!(
+        created.text("Port").as_deref(),
+        Some("5439"),
+        "case create demo-cluster: expected the default port 5439, got {:?}",
+        created.text("Port")
+    );
+    assert_eq!(
+        created.text("DBName").as_deref(),
+        Some("dev"),
+        "case create demo-cluster: expected the default DBName dev, got {:?}",
+        created.text("DBName")
+    );
+    let address = created
+        .text("Address")
+        .expect("case create demo-cluster: the response carries an endpoint address");
+    assert!(
+        address.starts_with("demo-cluster.") && address.ends_with(".redshift.amazonaws.com"),
+        "case create demo-cluster: expected a Redshift endpoint host for the identifier, got {address:?}"
+    );
+    assert!(
+        !created.body.contains("Passw0rd"),
+        "case create demo-cluster: the admin password must never be echoed, got body {}",
+        created.body
+    );
+    assert!(
+        created.text("ClusterCreateTime").is_some(),
+        "case create demo-cluster: expected ClusterCreateTime to be set, got body {}",
+        created.body
+    );
+
+    // A second create with the same identifier is refused.
+    let duplicate = emulator.create_minimal("demo-cluster").await;
+    assert_eq!(
+        (duplicate.status, duplicate.error_code()),
+        (400, Some("ClusterAlreadyExists".to_string())),
+        "case duplicate create: expected 400 ClusterAlreadyExists, got {} / {:?}",
+        duplicate.status,
+        duplicate.error_code()
+    );
+
+    // DESCRIBE — the stored record comes back with the values create persisted.
+    let described = emulator
+        .call(
+            "DescribeClusters",
+            &[("ClusterIdentifier", "demo-cluster")],
+        )
+        .await;
+    assert_eq!(
+        described.status, 200,
+        "case describe demo-cluster: expected 200, got {} with body {}",
+        described.status, described.body
+    );
+    for (member, expected) in [
+        ("NodeType", "ra3.xlplus"),
+        ("MasterUsername", "admin"),
+        ("DBName", "dev"),
+        ("ClusterVersion", "1.0"),
+        ("NumberOfNodes", "1"),
+    ] {
+        assert_eq!(
+            described.text(member).as_deref(),
+            Some(expected),
+            "case describe demo-cluster: expected {member}={expected}, got {:?}",
+            described.text(member)
+        );
+    }
+    assert_eq!(
+        described.text("Address").as_deref(),
+        Some(address.as_str()),
+        "case describe demo-cluster: expected the same endpoint address create reported, got {:?}",
+        described.text("Address")
+    );
+
+    // MODIFY — the mutation persists and a later describe shows it.
+    let modified = emulator
+        .call(
+            "ModifyCluster",
+            &[
+                ("ClusterIdentifier", "demo-cluster"),
+                ("AutomatedSnapshotRetentionPeriod", "7"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        modified.status, 200,
+        "case modify retention: expected 200, got {} with body {}",
+        modified.status, modified.body
+    );
+    let after_modify = emulator
+        .call(
+            "DescribeClusters",
+            &[("ClusterIdentifier", "demo-cluster")],
+        )
+        .await;
+    assert_eq!(
+        after_modify
+            .text("AutomatedSnapshotRetentionPeriod")
+            .as_deref(),
+        Some("7"),
+        "case modify retention: expected the new retention period to persist, got {:?}",
+        after_modify.text("AutomatedSnapshotRetentionPeriod")
+    );
+
+    // SNAPSHOT — the identifying attributes are copied off the stored cluster.
+    let snapshot = emulator
+        .call(
+            "CreateClusterSnapshot",
+            &[
+                ("SnapshotIdentifier", "demo-snap"),
+                ("ClusterIdentifier", "demo-cluster"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        snapshot.status, 200,
+        "case snapshot demo-snap: expected 200, got {} with body {}",
+        snapshot.status, snapshot.body
+    );
+    for (member, expected) in [
+        ("SnapshotIdentifier", "demo-snap"),
+        ("ClusterIdentifier", "demo-cluster"),
+        // The model states CreateClusterSnapshot "returns status as creating".
+        ("Status", "creating"),
+        ("SnapshotType", "manual"),
+        ("NodeType", "ra3.xlplus"),
+        ("MasterUsername", "admin"),
+        ("DBName", "dev"),
+        ("Port", "5439"),
+    ] {
+        assert_eq!(
+            snapshot.text(member).as_deref(),
+            Some(expected),
+            "case snapshot demo-snap: expected {member}={expected}, got {:?}",
+            snapshot.text(member)
+        );
+    }
+
+    let snapshots = emulator
+        .call(
+            "DescribeClusterSnapshots",
+            &[("ClusterIdentifier", "demo-cluster")],
+        )
+        .await;
+    assert_eq!(
+        all_text(&snapshots.body, "SnapshotIdentifier"),
+        vec!["demo-snap".to_string()],
+        "case list snapshots of demo-cluster: expected exactly demo-snap, got body {}",
+        snapshots.body
+    );
+
+    // DELETE — the cluster leaves the store and its final snapshot stays.
+    let deleted = emulator
+        .call(
+            "DeleteCluster",
+            &[
+                ("ClusterIdentifier", "demo-cluster"),
+                ("FinalClusterSnapshotIdentifier", "demo-final"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        (deleted.status, deleted.text("ClusterStatus")),
+        (200, Some("deleting".to_string())),
+        "case delete demo-cluster: expected 200 with ClusterStatus=deleting, got {} / {:?}",
+        deleted.status,
+        deleted.text("ClusterStatus")
+    );
+
+    let gone = emulator
+        .call(
+            "DescribeClusters",
+            &[("ClusterIdentifier", "demo-cluster")],
+        )
+        .await;
+    assert_eq!(
+        (gone.status, gone.error_code()),
+        (404, Some("ClusterNotFound".to_string())),
+        "case describe after delete: expected 404 ClusterNotFound, got {} / {:?}",
+        gone.status,
+        gone.error_code()
+    );
+
+    let final_snapshots = emulator.call("DescribeClusterSnapshots", &[]).await;
+    let mut listed = all_text(&final_snapshots.body, "SnapshotIdentifier");
+    listed.sort();
+    assert_eq!(
+        listed,
+        vec!["demo-final".to_string(), "demo-snap".to_string()],
+        "case list snapshots after delete: expected both snapshots to survive, got body {}",
+        final_snapshots.body
+    );
+    assert_eq!(
+        all_text(&final_snapshots.body, "SnapshotType")
+            .iter()
+            .filter(|kind| kind.as_str() == "manual")
+            .count(),
+        2,
+        "case list snapshots after delete: both snapshots are manual, got body {}",
+        final_snapshots.body
+    );
+}
+
+#[tokio::test]
+async fn an_identifier_is_accepted_exactly_when_it_satisfies_the_documented_syntax() {
+    // The rule, from `smithy_query(query="doc", shape="CreateClusterMessage",
+    // member="ClusterIdentifier")` and the identical sentences on
+    // `ModifyClusterMessage$NewClusterIdentifier` /
+    // `CreateClusterSnapshotMessage$SnapshotIdentifier`: 1 to N alphanumeric
+    // characters or hyphens, first character a letter, no trailing hyphen and no
+    // two consecutive hyphens; a CLUSTER identifier is additionally lowercase
+    // only, a SNAPSHOT identifier is not, and N is 63 for a cluster and 255 for
+    // a snapshot.
+    let emulator = Emulator::new();
+
+    let max = state::CLUSTER_IDENTIFIER_RULE.max_len;
+    let cluster_cases: Vec<(&str, String, bool)> = vec![
+        ("one letter", "c".to_string(), true),
+        ("letters, digits and hyphens", "my-cluster-01".to_string(), true),
+        ("at the published length bound", identifier_of_length(max), true),
+        ("one past the length bound", identifier_of_length(max + 1), false),
+        ("uppercase letter", "Demo-cluster".to_string(), false),
+        ("leading digit", "1cluster".to_string(), false),
+        ("trailing hyphen", "cluster-".to_string(), false),
+        ("two consecutive hyphens", "my--cluster".to_string(), false),
+        ("underscore", "my_cluster".to_string(), false),
+        ("dot", "my.cluster".to_string(), false),
+    ];
+    for (case, identifier, accepted) in &cluster_cases {
+        let answer = emulator.create_minimal(identifier).await;
+        let ok = answer.status == 200;
+        assert_eq!(
+            ok, *accepted,
+            "case ClusterIdentifier {case} ({identifier:?}): expected accepted={accepted}, got status {} / {:?}",
+            answer.status,
+            answer.error_code()
+        );
+        if !accepted {
+            assert_eq!(
+                answer.error_code().as_deref(),
+                Some("ValidationException"),
+                "case ClusterIdentifier {case} ({identifier:?}): a refusal names the member and its constraint, got body {}",
+                answer.body
+            );
+            assert!(
+                answer.body.contains("ClusterIdentifier"),
+                "case ClusterIdentifier {case} ({identifier:?}): the refusal must name the member, got body {}",
+                answer.body
+            );
+        }
+    }
+
+    // `NewClusterIdentifier` is checked by the same rule.
+    let host = emulator.create_minimal("rename-host").await;
+    assert_eq!(host.status, 200, "case rename host: {}", host.body);
+    for (case, identifier, accepted) in [
+        ("uppercase", "Renamed", false),
+        ("two consecutive hyphens", "re--named", false),
+        ("valid", "renamed-host", true),
+    ] {
+        let answer = emulator
+            .call(
+                "ModifyCluster",
+                &[
+                    ("ClusterIdentifier", "rename-host"),
+                    ("NewClusterIdentifier", identifier),
+                ],
+            )
+            .await;
+        assert_eq!(
+            answer.status == 200,
+            accepted,
+            "case NewClusterIdentifier {case} ({identifier:?}): expected accepted={accepted}, got status {} / {:?}",
+            answer.status,
+            answer.error_code()
+        );
+    }
+
+    // A snapshot identifier shares the rule but allows uppercase and runs to 255.
+    let snap_max = state::SNAPSHOT_IDENTIFIER_RULE.max_len;
+    assert_eq!(
+        snap_max, 255,
+        "the snapshot identifier bound comes from the model doc, got {snap_max}"
+    );
+    for (case, identifier, accepted) in [
+        ("uppercase is allowed", "MySnapshot".to_string(), true),
+        ("at the published length bound", identifier_of_length(snap_max), true),
+        ("one past the length bound", identifier_of_length(snap_max + 1), false),
+        ("trailing hyphen", "snap-".to_string(), false),
+    ] {
+        let answer = emulator
+            .call(
+                "CreateClusterSnapshot",
+                &[
+                    ("SnapshotIdentifier", &identifier),
+                    ("ClusterIdentifier", "renamed-host"),
+                ],
+            )
+            .await;
+        assert_eq!(
+            answer.status == 200,
+            accepted,
+            "case SnapshotIdentifier {case}: expected accepted={accepted}, got status {} / {:?}",
+            answer.status,
+            answer.error_code()
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_cluster_type_and_the_node_count_must_describe_one_another() {
+    // From `smithy_query(query="doc", shape="CreateClusterMessage",
+    // member="ClusterType")`: "Valid Values: multi-node | single-node", and
+    // "When cluster type is specified as single-node, the NumberOfNodes
+    // parameter is not required. multi-node, the NumberOfNodes parameter is
+    // required". `NumberOfNodes` defaults to 1.
+    let emulator = Emulator::new();
+
+    let cases: [ShapeCase; 7] = [
+        ("neither given", None, None, Some("1")),
+        ("single-node alone", Some("single-node"), None, Some("1")),
+        ("single-node with 1 node", Some("single-node"), Some("1"), Some("1")),
+        ("single-node with 2 nodes", Some("single-node"), Some("2"), None),
+        ("multi-node with 4 nodes", Some("multi-node"), Some("4"), Some("4")),
+        ("multi-node with 1 node", Some("multi-node"), Some("1"), None),
+        ("an unmodelled cluster type", Some("mega-node"), Some("2"), None),
+    ];
+    for (index, (case, cluster_type, nodes, expected_nodes)) in cases.into_iter().enumerate() {
+        let identifier = format!("shape-{index}");
+        let mut params: Vec<(&str, &str)> = vec![
+            ("ClusterIdentifier", &identifier),
+            ("NodeType", "dc2.large"),
+            ("MasterUsername", "admin"),
+        ];
+        if let Some(kind) = cluster_type {
+            params.push(("ClusterType", kind));
+        }
+        if let Some(count) = nodes {
+            params.push(("NumberOfNodes", count));
+        }
+        let answer = emulator.call("CreateCluster", &params).await;
+        match expected_nodes {
+            Some(expected) => {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case}: expected the create to be accepted, got {} / {:?}",
+                    answer.status,
+                    answer.error_code()
+                );
+                assert_eq!(
+                    answer.text("NumberOfNodes").as_deref(),
+                    Some(expected),
+                    "case {case}: expected NumberOfNodes={expected}, got {:?}",
+                    answer.text("NumberOfNodes")
+                );
+            }
+            None => assert_eq!(
+                (answer.status, answer.error_code()),
+                (400, Some("ValidationException".to_string())),
+                "case {case}: expected a 400 refusal, got {} / {:?} with body {}",
+                answer.status,
+                answer.error_code(),
+                answer.body
+            ),
+        }
+    }
+
+    // The same rule governs a MODIFY: switching to `single-node` without naming
+    // a count is the one-node shape ("the NumberOfNodes parameter is not
+    // required"), while switching to `multi-node` must say how many.
+    let host = emulator
+        .call(
+            "CreateCluster",
+            &[
+                ("ClusterIdentifier", "shape-host"),
+                ("NodeType", "dc2.large"),
+                ("MasterUsername", "admin"),
+                ("ClusterType", "multi-node"),
+                ("NumberOfNodes", "4"),
+            ],
+        )
+        .await;
+    assert_eq!(host.status, 200, "case seed a 4-node cluster: {}", host.body);
+
+    let to_multi_without_count = emulator
+        .call(
+            "ModifyCluster",
+            &[
+                ("ClusterIdentifier", "shape-host"),
+                ("ClusterType", "single-node"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        to_multi_without_count.status, 200,
+        "case modify to single-node without a count: expected 200, got {} / {:?}",
+        to_multi_without_count.status,
+        to_multi_without_count.error_code()
+    );
+    assert_eq!(
+        to_multi_without_count.text("NumberOfNodes").as_deref(),
+        Some("1"),
+        "case modify to single-node without a count: expected NumberOfNodes=1, got {:?}",
+        to_multi_without_count.text("NumberOfNodes")
+    );
+
+    let back_to_multi = emulator
+        .call(
+            "ModifyCluster",
+            &[
+                ("ClusterIdentifier", "shape-host"),
+                ("ClusterType", "multi-node"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        (back_to_multi.status, back_to_multi.error_code()),
+        (400, Some("ValidationException".to_string())),
+        "case modify to multi-node without a count: expected a 400 refusal, got {} / {:?}",
+        back_to_multi.status,
+        back_to_multi.error_code()
+    );
+}
+
+#[tokio::test]
+async fn a_retention_period_is_accepted_exactly_inside_its_published_range() {
+    // `AutomatedSnapshotRetentionPeriod`: "Must be a value from 0 to 35."
+    // `ManualSnapshotRetentionPeriod`: "either -1 or an integer between 1 and
+    // 3,653". Both from the `CreateClusterMessage` member docs.
+    let emulator = Emulator::new();
+
+    let (auto_lo, auto_hi) = state::AUTOMATED_RETENTION_BOUNDS;
+    let (manual_lo, manual_hi) = state::MANUAL_RETENTION_BOUNDS;
+    let cases: Vec<(String, &str, String, bool)> = vec![
+        ("automated at the low bound".into(), "AutomatedSnapshotRetentionPeriod", auto_lo.to_string(), true),
+        ("automated mid-range".into(), "AutomatedSnapshotRetentionPeriod", "7".into(), true),
+        ("automated at the high bound".into(), "AutomatedSnapshotRetentionPeriod", auto_hi.to_string(), true),
+        ("automated one below".into(), "AutomatedSnapshotRetentionPeriod", (auto_lo - 1).to_string(), false),
+        ("automated one above".into(), "AutomatedSnapshotRetentionPeriod", (auto_hi + 1).to_string(), false),
+        ("manual indefinite".into(), "ManualSnapshotRetentionPeriod", state::MANUAL_RETENTION_INDEFINITE.to_string(), true),
+        ("manual at the low bound".into(), "ManualSnapshotRetentionPeriod", manual_lo.to_string(), true),
+        ("manual at the high bound".into(), "ManualSnapshotRetentionPeriod", manual_hi.to_string(), true),
+        ("manual at zero".into(), "ManualSnapshotRetentionPeriod", "0".into(), false),
+        ("manual one above".into(), "ManualSnapshotRetentionPeriod", (manual_hi + 1).to_string(), false),
+    ];
+    for (index, (case, member, value, accepted)) in cases.into_iter().enumerate() {
+        let identifier = format!("retention-{index}");
+        let answer = emulator
+            .call(
+                "CreateCluster",
+                &[
+                    ("ClusterIdentifier", &identifier),
+                    ("NodeType", "dc2.large"),
+                    ("MasterUsername", "admin"),
+                    (member, &value),
+                ],
+            )
+            .await;
+        if accepted {
+            assert_eq!(
+                answer.status, 200,
+                "case {case} ({member}={value}): expected 200, got {} / {:?}",
+                answer.status,
+                answer.error_code()
+            );
+            assert_eq!(
+                answer.text(member).as_deref(),
+                Some(value.as_str()),
+                "case {case}: expected {member} to be reported back as {value}, got {:?}",
+                answer.text(member)
+            );
+        } else {
+            assert_eq!(
+                (answer.status, answer.error_code()),
+                (400, Some("InvalidRetentionPeriodFault".to_string())),
+                "case {case} ({member}={value}): expected 400 InvalidRetentionPeriodFault, got {} / {:?}",
+                answer.status,
+                answer.error_code()
+            );
+        }
+    }
+
+    // The same range governs the final snapshot a delete takes.
+    let host = emulator.create_minimal("retention-host").await;
+    assert_eq!(host.status, 200, "case delete host: {}", host.body);
+    let refused = emulator
+        .call(
+            "DeleteCluster",
+            &[
+                ("ClusterIdentifier", "retention-host"),
+                ("FinalClusterSnapshotIdentifier", "retention-final"),
+                ("FinalClusterSnapshotRetentionPeriod", "0"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        (refused.status, refused.error_code()),
+        (400, Some("InvalidRetentionPeriodFault".to_string())),
+        "case final snapshot retention 0: expected 400 InvalidRetentionPeriodFault, got {} / {:?}",
+        refused.status,
+        refused.error_code()
+    );
+}
+
+#[tokio::test]
+async fn pagination_walks_the_whole_collection_through_the_marker() {
+    // "Default: 100. Constraints: minimum 20, maximum 100." — the `MaxRecords`
+    // doc shared by `DescribeClustersMessage` and
+    // `DescribeClusterSnapshotsMessage`.
+    let emulator = Emulator::new();
+
+    let total = 25usize;
+    for index in 0..total {
+        let identifier = format!("page-{index:02}");
+        let answer = emulator.create_minimal(&identifier).await;
+        assert_eq!(
+            answer.status, 200,
+            "case seed {identifier}: expected 200, got {} with body {}",
+            answer.status, answer.body
+        );
+    }
+
+    for (case, max_records, accepted) in [
+        ("one below the minimum", (state::MAX_RECORDS_MIN - 1).to_string(), false),
+        ("at the minimum", state::MAX_RECORDS_MIN.to_string(), true),
+        ("at the maximum", state::MAX_RECORDS_MAX.to_string(), true),
+        ("one above the maximum", (state::MAX_RECORDS_MAX + 1).to_string(), false),
+    ] {
+        let answer = emulator
+            .call("DescribeClusters", &[("MaxRecords", &max_records)])
+            .await;
+        assert_eq!(
+            answer.status == 200,
+            accepted,
+            "case MaxRecords {case} ({max_records}): expected accepted={accepted}, got {} / {:?}",
+            answer.status,
+            answer.error_code()
+        );
+        let snapshots = emulator
+            .call("DescribeClusterSnapshots", &[("MaxRecords", &max_records)])
+            .await;
+        assert_eq!(
+            snapshots.status == 200,
+            accepted,
+            "case MaxRecords {case} ({max_records}) on snapshots: expected accepted={accepted}, got {} / {:?}",
+            snapshots.status,
+            snapshots.error_code()
+        );
+    }
+
+    // A truncated page carries a marker; the last page does not.
+    let page_size = state::MAX_RECORDS_MIN as usize;
+    let first = emulator
+        .call(
+            "DescribeClusters",
+            &[("MaxRecords", &state::MAX_RECORDS_MIN.to_string())],
+        )
+        .await;
+    let first_page = listed_clusters(&first.body);
+    assert_eq!(
+        first_page.len(),
+        page_size,
+        "case first page: expected {page_size} clusters, got {:?}",
+        first_page
+    );
+    let marker = first
+        .text("Marker")
+        .expect("case first page: a truncated page returns a Marker");
+
+    let second = emulator
+        .call(
+            "DescribeClusters",
+            &[
+                ("MaxRecords", &state::MAX_RECORDS_MIN.to_string()),
+                ("Marker", &marker),
+            ],
+        )
+        .await;
+    let second_page = listed_clusters(&second.body);
+    assert_eq!(
+        second_page.len(),
+        total - page_size,
+        "case second page: expected the remaining {} clusters, got {:?}",
+        total - page_size,
+        second_page
+    );
+    assert_eq!(
+        second.text("Marker"),
+        None,
+        "case second page: the last page returns no Marker, got {:?}",
+        second.text("Marker")
+    );
+
+    let walked: Vec<String> = first_page.into_iter().chain(second_page).collect();
+    let expected: Vec<String> = (0..total).map(|index| format!("page-{index:02}")).collect();
+    assert_eq!(
+        walked, expected,
+        "case walk every page: expected creation order with no gap or repeat, got {walked:?}"
+    );
+
+    // A marker nobody handed out is refused rather than silently reset — a
+    // decimal offset the caller invented included, since the cursor is not just
+    // a number.
+    for (case, cursor) in [
+        ("not a number", "not-a-cursor"),
+        ("an invented offset", "7"),
+        ("an offset with a forged tag", "20.00000000"),
+    ] {
+        let bogus = emulator.call("DescribeClusters", &[("Marker", cursor)]).await;
+        assert_eq!(
+            (bogus.status, bogus.error_code()),
+            (400, Some("ValidationException".to_string())),
+            "case marker {case} ({cursor:?}): expected a 400 refusal, got {} / {:?}",
+            bogus.status,
+            bogus.error_code()
+        );
+    }
+
+    // "You can specify either the ClusterIdentifier parameter or the Marker
+    // parameter, but not both."
+    let both = emulator
+        .call(
+            "DescribeClusters",
+            &[("ClusterIdentifier", "page-00"), ("Marker", &marker)],
+        )
+        .await;
+    assert_eq!(
+        (both.status, both.error_code()),
+        (400, Some("ValidationException".to_string())),
+        "case identifier and marker together: expected a 400 refusal, got {} / {:?}",
+        both.status,
+        both.error_code()
+    );
+}
+
+#[tokio::test]
+async fn provisioning_settles_on_the_clock_and_a_read_changes_nothing_else() {
+    let emulator = Emulator::new();
+
+    let started = std::time::Instant::now();
+    let created = emulator.create_minimal("clock-cluster").await;
+    assert_eq!(
+        created.text("ClusterStatus").as_deref(),
+        Some("creating"),
+        "case create: the span is never zero, so the caller sees the transient status, got {:?}",
+        created.text("ClusterStatus")
+    );
+    let snapshot = emulator
+        .call(
+            "CreateClusterSnapshot",
+            &[
+                ("SnapshotIdentifier", "clock-snap"),
+                ("ClusterIdentifier", "clock-cluster"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        snapshot.text("Status").as_deref(),
+        Some("creating"),
+        "case snapshot: expected the transient status, got {:?}",
+        snapshot.text("Status")
+    );
+
+    // Two reads before the transition falls due both report the transient
+    // status: a read never moves the resource on by itself. The guard keeps the
+    // assertion honest on a loaded runner — if the span has already elapsed the
+    // transient state was simply not observable, and the only claim left is that
+    // the two reads agree.
+    let first = emulator
+        .call("DescribeClusters", &[("ClusterIdentifier", "clock-cluster")])
+        .await;
+    let second = emulator
+        .call("DescribeClusters", &[("ClusterIdentifier", "clock-cluster")])
+        .await;
+    if started.elapsed() < state::PROVISIONING_SPAN {
+        assert_eq!(
+            (first.text("ClusterStatus"), second.text("ClusterStatus")),
+            (
+                Some("creating".to_string()),
+                Some("creating".to_string())
+            ),
+            "case repeated read: expected both reads before the due instant to report creating, got {:?} then {:?}",
+            first.text("ClusterStatus"),
+            second.text("ClusterStatus")
+        );
+    } else {
+        assert_eq!(
+            first.text("ClusterStatus"),
+            second.text("ClusterStatus"),
+            "case repeated read: expected both reads to agree, got {:?} then {:?}",
+            first.text("ClusterStatus"),
+            second.text("ClusterStatus")
+        );
+    }
+
+    // Past the due instant the clock-owed transition is materialised.
+    let remaining = state::PROVISIONING_SPAN.saturating_sub(started.elapsed());
+    tokio::time::sleep(remaining + Duration::from_millis(250)).await;
+    let settled = emulator
+        .call("DescribeClusters", &[("ClusterIdentifier", "clock-cluster")])
+        .await;
+    assert_eq!(
+        settled.text("ClusterStatus").as_deref(),
+        Some("available"),
+        "case settled cluster: expected available once the span has passed, got {:?}",
+        settled.text("ClusterStatus")
+    );
+    assert_eq!(
+        settled.text("ClusterAvailabilityStatus").as_deref(),
+        Some("Available"),
+        "case settled cluster: expected the availability status to follow, got {:?}",
+        settled.text("ClusterAvailabilityStatus")
+    );
+    let settled_snapshots = emulator
+        .call(
+            "DescribeClusterSnapshots",
+            &[("SnapshotIdentifier", "clock-snap")],
+        )
+        .await;
+    assert_eq!(
+        settled_snapshots.text("Status").as_deref(),
+        Some("available"),
+        "case settled snapshot: expected available once the span has passed, got {:?}",
+        settled_snapshots.text("Status")
+    );
+}
+
+#[tokio::test]
+async fn snapshots_are_filtered_by_cluster_type_and_existence() {
+    let emulator = Emulator::new();
+
+    for identifier in ["filter-a", "filter-b"] {
+        let answer = emulator.create_minimal(identifier).await;
+        assert_eq!(answer.status, 200, "case seed {identifier}: {}", answer.body);
+    }
+    for (snapshot, cluster) in [("snap-a1", "filter-a"), ("snap-a2", "filter-a"), ("snap-b1", "filter-b")] {
+        let answer = emulator
+            .call(
+                "CreateClusterSnapshot",
+                &[
+                    ("SnapshotIdentifier", snapshot),
+                    ("ClusterIdentifier", cluster),
+                ],
+            )
+            .await;
+        assert_eq!(answer.status, 200, "case seed {snapshot}: {}", answer.body);
+    }
+
+    let cases: [FilterCase; 4] = [
+        (
+            "by cluster",
+            vec![("ClusterIdentifier", "filter-a")],
+            vec!["snap-a1", "snap-a2"],
+        ),
+        (
+            "by snapshot id",
+            vec![("SnapshotIdentifier", "snap-b1")],
+            vec!["snap-b1"],
+        ),
+        (
+            "by the manual type",
+            vec![("SnapshotType", "manual")],
+            vec!["snap-a1", "snap-a2", "snap-b1"],
+        ),
+        (
+            "by the automated type",
+            vec![("SnapshotType", "automated")],
+            vec![],
+        ),
+    ];
+    for (case, params, expected) in cases {
+        let answer = emulator.call("DescribeClusterSnapshots", &params).await;
+        assert_eq!(
+            answer.status, 200,
+            "case filter {case}: expected 200, got {} with body {}",
+            answer.status, answer.body
+        );
+        let mut listed = all_text(&answer.body, "SnapshotIdentifier");
+        listed.sort();
+        assert_eq!(
+            listed,
+            expected
+                .iter()
+                .map(|id| (*id).to_string())
+                .collect::<Vec<_>>(),
+            "case filter {case}: unexpected snapshot set, got body {}",
+            answer.body
+        );
+    }
+
+    // An unmodelled snapshot type is refused, not quietly matched.
+    let bad_type = emulator
+        .call("DescribeClusterSnapshots", &[("SnapshotType", "hourly")])
+        .await;
+    assert_eq!(
+        (bad_type.status, bad_type.error_code()),
+        (400, Some("ValidationException".to_string())),
+        "case an unmodelled snapshot type: expected a 400 refusal, got {} / {:?}",
+        bad_type.status,
+        bad_type.error_code()
+    );
+
+    // `ClusterExists` splits the snapshots whose cluster is still there from
+    // those whose cluster has gone. "If ClusterExists is set to true,
+    // ClusterIdentifier is required"; a `false` needs none, and then reports
+    // every orphaned snapshot.
+    let deleted = emulator
+        .call(
+            "DeleteCluster",
+            &[
+                ("ClusterIdentifier", "filter-b"),
+                ("SkipFinalClusterSnapshot", "true"),
+            ],
+        )
+        .await;
+    assert_eq!(deleted.status, 200, "case delete filter-b: {}", deleted.body);
+
+    let missing_identifier = emulator
+        .call("DescribeClusterSnapshots", &[("ClusterExists", "true")])
+        .await;
+    assert_eq!(
+        (missing_identifier.status, missing_identifier.error_code()),
+        (400, Some("ValidationException".to_string())),
+        "case ClusterExists=true without ClusterIdentifier: expected a 400 refusal, got {} / {:?}",
+        missing_identifier.status,
+        missing_identifier.error_code()
+    );
+
+    let cases: [FilterCase; 3] = [
+        (
+            "an existing cluster",
+            vec![("ClusterExists", "true"), ("ClusterIdentifier", "filter-a")],
+            vec!["snap-a1", "snap-a2"],
+        ),
+        (
+            "every orphaned snapshot",
+            vec![("ClusterExists", "false")],
+            vec!["snap-b1"],
+        ),
+        (
+            "an existing cluster asked for as orphaned",
+            vec![("ClusterExists", "false"), ("ClusterIdentifier", "filter-a")],
+            vec![],
+        ),
+    ];
+    for (case, params, expected) in cases {
+        let answer = emulator.call("DescribeClusterSnapshots", &params).await;
+        assert_eq!(
+            answer.status, 200,
+            "case ClusterExists {case}: expected 200, got {} with body {}",
+            answer.status, answer.body
+        );
+        let mut listed = all_text(&answer.body, "SnapshotIdentifier");
+        listed.sort();
+        assert_eq!(
+            listed,
+            expected
+                .iter()
+                .map(|id| (*id).to_string())
+                .collect::<Vec<_>>(),
+            "case ClusterExists {case}: unexpected snapshot set, got body {}",
+            answer.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn snapshots_are_sorted_by_the_entities_the_request_names() {
+    // `SnapshotAttributeToSortBy` declares SOURCE_TYPE | TOTAL_SIZE |
+    // CREATE_TIME and `SortByOrder` declares ASC | DESC.
+    let emulator = Emulator::new();
+
+    let host = emulator.create_minimal("sort-host").await;
+    assert_eq!(host.status, 200, "case seed cluster: {}", host.body);
+    for snapshot in ["sort-1", "sort-2", "sort-3"] {
+        let answer = emulator
+            .call(
+                "CreateClusterSnapshot",
+                &[
+                    ("SnapshotIdentifier", snapshot),
+                    ("ClusterIdentifier", "sort-host"),
+                ],
+            )
+            .await;
+        assert_eq!(answer.status, 200, "case seed {snapshot}: {}", answer.body);
+    }
+
+    // CREATE_TIME: every snapshot was taken at a distinct instant, so the ASC
+    // page is the creation order and the DESC page its exact reverse. Asserting
+    // the identifier SEQUENCE (not a monotone timestamp window) is what makes a
+    // wrong comparator fail.
+    for (case, order, expected) in [
+        ("ascending", "ASC", ["sort-1", "sort-2", "sort-3"]),
+        ("descending", "DESC", ["sort-3", "sort-2", "sort-1"]),
+    ] {
+        let answer = emulator
+            .call(
+                "DescribeClusterSnapshots",
+                &[
+                    (
+                        "SortingEntities.SnapshotSortingEntity.1.Attribute",
+                        "CREATE_TIME",
+                    ),
+                    ("SortingEntities.SnapshotSortingEntity.1.SortOrder", order),
+                ],
+            )
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case sort by CREATE_TIME {case}: expected 200, got {} with body {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            all_text(&answer.body, "SnapshotIdentifier"),
+            expected
+                .iter()
+                .map(|id| (*id).to_string())
+                .collect::<Vec<_>>(),
+            "case sort by CREATE_TIME {case}: unexpected order, got body {}",
+            answer.body
+        );
+    }
+
+    // SOURCE_TYPE orders on the snapshot's own type, so it is only observable
+    // over a set that carries more than one: seed the `automated` snapshot
+    // Redshift would have taken on its own schedule. `automated` sorts before
+    // `manual`, and the three manual snapshots keep their creation order because
+    // the sort is stable.
+    emulator.seed_automated_snapshot("sort-auto", "sort-host");
+    for (case, order, expected) in [
+        (
+            "ascending",
+            "ASC",
+            ["sort-auto", "sort-1", "sort-2", "sort-3"],
+        ),
+        (
+            "descending",
+            "DESC",
+            ["sort-1", "sort-2", "sort-3", "sort-auto"],
+        ),
+    ] {
+        let answer = emulator
+            .call(
+                "DescribeClusterSnapshots",
+                &[
+                    (
+                        "SortingEntities.SnapshotSortingEntity.1.Attribute",
+                        "SOURCE_TYPE",
+                    ),
+                    ("SortingEntities.SnapshotSortingEntity.1.SortOrder", order),
+                ],
+            )
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case sort by SOURCE_TYPE {case}: expected 200, got {} with body {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            all_text(&answer.body, "SnapshotIdentifier"),
+            expected
+                .iter()
+                .map(|id| (*id).to_string())
+                .collect::<Vec<_>>(),
+            "case sort by SOURCE_TYPE {case}: unexpected order, got body {}",
+            answer.body
+        );
+    }
+
+    // An unmodelled SortOrder is refused rather than quietly read as ascending:
+    // `SortByOrder` is a modelled enum, so the boundary validator answers it
+    // before the handler runs.
+    let bad_order = emulator
+        .call(
+            "DescribeClusterSnapshots",
+            &[
+                (
+                    "SortingEntities.SnapshotSortingEntity.1.Attribute",
+                    "CREATE_TIME",
+                ),
+                (
+                    "SortingEntities.SnapshotSortingEntity.1.SortOrder",
+                    "DESCENDING",
+                ),
+            ],
+        )
+        .await;
+    assert_eq!(
+        (bad_order.status, bad_order.error_code()),
+        (400, Some("ValidationError".to_string())),
+        "case an unmodelled SortOrder: expected a 400 refusal, got {} / {:?}",
+        bad_order.status,
+        bad_order.error_code()
+    );
+
+    // An attribute this emulator cannot order by honestly is refused with the
+    // operation's own modelled fault, not served in an arbitrary order.
+    let unsupported = emulator
+        .call(
+            "DescribeClusterSnapshots",
+            &[(
+                "SortingEntities.SnapshotSortingEntity.1.Attribute",
+                "TOTAL_SIZE",
+            )],
+        )
+        .await;
+    assert_eq!(
+        (unsupported.status, unsupported.error_code()),
+        (400, Some("UnsupportedOperation".to_string())),
+        "case sort by TOTAL_SIZE: expected 400 UnsupportedOperation, got {} / {:?}",
+        unsupported.status,
+        unsupported.error_code()
+    );
+
+    // More sorting entities than there are sortable attributes is refused, so
+    // the per-request sort work stays bounded.
+    let mut params: Vec<(String, String)> = Vec::new();
+    for index in 1..=state::MAX_SORTING_ENTITIES + 1 {
+        params.push((
+            format!("SortingEntities.SnapshotSortingEntity.{index}.Attribute"),
+            "CREATE_TIME".to_string(),
+        ));
+    }
+    let borrowed: Vec<(&str, &str)> = params
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let too_many = emulator.call("DescribeClusterSnapshots", &borrowed).await;
+    assert_eq!(
+        (too_many.status, too_many.error_code()),
+        (400, Some("ValidationException".to_string())),
+        "case {} sorting entities: expected a 400 refusal, got {} / {:?}",
+        state::MAX_SORTING_ENTITIES + 1,
+        too_many.status,
+        too_many.error_code()
+    );
+}
+
+#[tokio::test]
+async fn the_store_refuses_to_grow_past_its_quota() {
+    // The store is bounded, so no run of requests can grow it without end. The
+    // bound is the emulator's own (`CLUSTER_QUOTA`), reported through the
+    // operation's modelled `ClusterQuotaExceededFault`.
+    let emulator = Emulator::new();
+
+    for index in 0..state::CLUSTER_QUOTA {
+        let identifier = format!("quota-{index:04}");
+        let answer = emulator.create_minimal(&identifier).await;
+        assert_eq!(
+            answer.status, 200,
+            "case fill {identifier}: expected 200 below the quota, got {} / {:?}",
+            answer.status,
+            answer.error_code()
+        );
+    }
+    let over = emulator.create_minimal("quota-over").await;
+    assert_eq!(
+        (over.status, over.error_code()),
+        (400, Some("ClusterQuotaExceeded".to_string())),
+        "case one past the quota: expected 400 ClusterQuotaExceeded, got {} / {:?}",
+        over.status,
+        over.error_code()
+    );
+
+    // Identity before capacity: at the quota, a repeat create of an existing
+    // cluster still answers the more specific fault.
+    let repeat = emulator.create_minimal("quota-0000").await;
+    assert_eq!(
+        (repeat.status, repeat.error_code()),
+        (400, Some("ClusterAlreadyExists".to_string())),
+        "case repeat create at the quota: expected 400 ClusterAlreadyExists, got {} / {:?}",
+        repeat.status,
+        repeat.error_code()
+    );
+
+    // Releasing a record makes room again: the bound is on what is held, not on
+    // how many requests have ever been served.
+    let deleted = emulator
+        .call(
+            "DeleteCluster",
+            &[
+                ("ClusterIdentifier", "quota-0000"),
+                ("SkipFinalClusterSnapshot", "true"),
+            ],
+        )
+        .await;
+    assert_eq!(deleted.status, 200, "case release one: {}", deleted.body);
+    let again = emulator.create_minimal("quota-over").await;
+    assert_eq!(
+        again.status, 200,
+        "case create after releasing one: expected 200, got {} / {:?}",
+        again.status,
+        again.error_code()
+    );
+}
+
+#[tokio::test]
+async fn a_rename_re_keys_the_cluster_and_keeps_its_namespace() {
+    let emulator = Emulator::new();
+
+    let created = emulator.create_minimal("rename-me").await;
+    assert_eq!(created.status, 200, "case create: {}", created.body);
+    let namespace = created
+        .text("ClusterNamespaceArn")
+        .expect("case create: the cluster reports a namespace ARN");
+    let original_address = created
+        .text("Address")
+        .expect("case create: the cluster reports an endpoint address");
+
+    let taken = emulator.create_minimal("already-there").await;
+    assert_eq!(taken.status, 200, "case create collision target: {}", taken.body);
+    let collision = emulator
+        .call(
+            "ModifyCluster",
+            &[
+                ("ClusterIdentifier", "rename-me"),
+                ("NewClusterIdentifier", "already-there"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        (collision.status, collision.error_code()),
+        (400, Some("ClusterAlreadyExists".to_string())),
+        "case rename onto an existing identifier: expected 400 ClusterAlreadyExists, got {} / {:?}",
+        collision.status,
+        collision.error_code()
+    );
+
+    let renamed = emulator
+        .call(
+            "ModifyCluster",
+            &[
+                ("ClusterIdentifier", "rename-me"),
+                ("NewClusterIdentifier", "renamed"),
+                ("Port", "5555"),
+            ],
+        )
+        .await;
+    assert_eq!(renamed.status, 200, "case rename: {}", renamed.body);
+
+    let old = emulator
+        .call("DescribeClusters", &[("ClusterIdentifier", "rename-me")])
+        .await;
+    assert_eq!(
+        (old.status, old.error_code()),
+        (404, Some("ClusterNotFound".to_string())),
+        "case describe the old identifier: expected 404 ClusterNotFound, got {} / {:?}",
+        old.status,
+        old.error_code()
+    );
+
+    let now = emulator
+        .call("DescribeClusters", &[("ClusterIdentifier", "renamed")])
+        .await;
+    assert_eq!(
+        now.text("ClusterNamespaceArn").as_deref(),
+        Some(namespace.as_str()),
+        "case rename: the namespace ARN identifies the cluster and must survive, got {:?}",
+        now.text("ClusterNamespaceArn")
+    );
+    assert_eq!(
+        now.text("Port").as_deref(),
+        Some("5555"),
+        "case rename: the new port must persist, got {:?}",
+        now.text("Port")
+    );
+    let new_address = now
+        .text("Address")
+        .expect("case rename: the renamed cluster reports an endpoint address");
+    assert!(
+        new_address.starts_with("renamed.") && new_address != original_address,
+        "case rename: the endpoint hostname carries the new name, got {new_address:?} (was {original_address:?})"
+    );
+
+    let unknown = emulator
+        .call(
+            "ModifyCluster",
+            &[("ClusterIdentifier", "never-existed")],
+        )
+        .await;
+    assert_eq!(
+        (unknown.status, unknown.error_code()),
+        (404, Some("ClusterNotFound".to_string())),
+        "case modify an unknown cluster: expected 404 ClusterNotFound, got {} / {:?}",
+        unknown.status,
+        unknown.error_code()
+    );
+}
+
+#[tokio::test]
+async fn a_final_snapshot_is_required_unless_it_is_explicitly_skipped() {
+    let emulator = Emulator::new();
+
+    for identifier in ["final-a", "final-b", "final-c"] {
+        let answer = emulator.create_minimal(identifier).await;
+        assert_eq!(answer.status, 200, "case seed {identifier}: {}", answer.body);
+    }
+
+    // "The FinalClusterSnapshotIdentifier parameter must be specified if
+    // SkipFinalClusterSnapshot is false. Default: false"
+    let cases: [RefusalCase; 4] = [
+        (
+            "neither member given",
+            vec![("ClusterIdentifier", "final-a")],
+            false,
+        ),
+        (
+            "skip explicitly false and no identifier",
+            vec![
+                ("ClusterIdentifier", "final-a"),
+                ("SkipFinalClusterSnapshot", "false"),
+            ],
+            false,
+        ),
+        (
+            "skip true with an identifier",
+            vec![
+                ("ClusterIdentifier", "final-a"),
+                ("SkipFinalClusterSnapshot", "true"),
+                ("FinalClusterSnapshotIdentifier", "final-a-snap"),
+            ],
+            false,
+        ),
+        (
+            "an identifier and no skip",
+            vec![
+                ("ClusterIdentifier", "final-a"),
+                ("FinalClusterSnapshotIdentifier", "final-a-snap"),
+            ],
+            true,
+        ),
+    ];
+    for (case, params, accepted) in cases {
+        let answer = emulator.call("DeleteCluster", &params).await;
+        assert_eq!(
+            answer.status == 200,
+            accepted,
+            "case {case}: expected accepted={accepted}, got {} / {:?} with body {}",
+            answer.status,
+            answer.error_code(),
+            answer.body
+        );
+    }
+
+    // Skipping leaves nothing behind.
+    let skipped = emulator
+        .call(
+            "DeleteCluster",
+            &[
+                ("ClusterIdentifier", "final-b"),
+                ("SkipFinalClusterSnapshot", "true"),
+            ],
+        )
+        .await;
+    assert_eq!(skipped.status, 200, "case skip the final snapshot: {}", skipped.body);
+
+    // A final snapshot name already in use is refused and the cluster stays.
+    let clash = emulator
+        .call(
+            "DeleteCluster",
+            &[
+                ("ClusterIdentifier", "final-c"),
+                ("FinalClusterSnapshotIdentifier", "final-a-snap"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        (clash.status, clash.error_code()),
+        (400, Some("ClusterSnapshotAlreadyExists".to_string())),
+        "case a final snapshot name already in use: expected 400 ClusterSnapshotAlreadyExists, got {} / {:?}",
+        clash.status,
+        clash.error_code()
+    );
+    let survivors = emulator.call("DescribeClusters", &[]).await;
+    assert_eq!(
+        listed_clusters(&survivors.body),
+        vec!["final-c".to_string()],
+        "case a refused delete: the cluster must stay in the store, got body {}",
+        survivors.body
+    );
+    let snapshots = emulator.call("DescribeClusterSnapshots", &[]).await;
+    assert_eq!(
+        all_text(&snapshots.body, "SnapshotIdentifier"),
+        vec!["final-a-snap".to_string()],
+        "case skipped and refused deletes: only the one final snapshot exists, got body {}",
+        snapshots.body
+    );
+}

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TerminateJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TerminateJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Terminates a job: the persisted record moves to the modelled `FAILED` status with
+//! the caller's `reason` as its `statusReason` and `stoppedAt` set, so the next
+//! `DescribeJobs` observes the termination. The model's own doc splits the two cases it
+//! records on the job: a job in `STARTING` or `RUNNING` is terminated
+//! (`isTerminated`), a job that has not progressed that far is cancelled
+//! (`isCancelled`). A job that is already in a terminal status is left exactly as it is,
+//! and an unknown `jobId` is a `ClientException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TerminateJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +141,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TerminateJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TerminateJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TerminateJob"))
+        use crate::state as batch;
+
+        let _ = ctx;
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(
+                TerminateJobErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        // Materialise what the clock owed BEFORE terminating, so a job that already
+        // reached a terminal status is not dragged back out of it.
+        state.materialize_due(now);
+
+        // `state::terminate_job` keeps the documented SUBMITTED/PENDING/RUNNABLE ->
+        // cancelled, STARTING/RUNNING -> terminated distinction, leaves a job that is
+        // already terminal alone, and keeps the clock index in step.
+        if !state.terminate_job(&input.job_id, &input.reason, now) {
+            return Err(TerminateJobErrorModeled::ClientException(batch::client_exception(
+                format!("Job {} does not exist", input.job_id),
+            ))
+            .into());
+        }
+
+        Ok(TerminateJobOutput {})
     }
 }

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts a new cluster into this service's store and reports it back in the
+//! `creating` status, with its connection endpoint and creation time. The admin
+//! password is stored on the record but never placed on the `Cluster` shape, so
+//! it cannot reach the wire. A second create with the same identifier is refused
+//! with `ClusterAlreadyExistsFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -365,18 +362,284 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCluster"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(CreateClusterErrorModeled::DependentServiceUnavailableFault(
+                DependentServiceUnavailableFault {
+                    message: Some(st::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+        let region = st::request_region(ctx);
+        let started = ::std::time::Instant::now();
+        let created_at = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
+        if let Err(message) = st::check_identifier(
+            st::CLUSTER_IDENTIFIER_RULE,
+            "ClusterIdentifier",
+            &input.cluster_identifier,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // The node count and the cluster type describe one another, so both are
+        // resolved by the one shared rule in `state.rs`.
+        let (cluster_type, number_of_nodes) =
+            match st::resolve_cluster_shape(input.cluster_type.as_deref(), input.number_of_nodes, None) {
+                Ok(shape) => shape,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        let automated_retention = input
+            .automated_snapshot_retention_period
+            .unwrap_or(st::DEFAULT_AUTOMATED_RETENTION);
+        if !(st::AUTOMATED_RETENTION_BOUNDS.0..=st::AUTOMATED_RETENTION_BOUNDS.1)
+            .contains(&automated_retention)
+        {
+            return Err(CreateClusterErrorModeled::InvalidRetentionPeriodFault(
+                InvalidRetentionPeriodFault {
+                    message: Some(format!(
+                        "Invalid value for AutomatedSnapshotRetentionPeriod: {automated_retention}. It must be a value from {} to {}.",
+                        st::AUTOMATED_RETENTION_BOUNDS.0, st::AUTOMATED_RETENTION_BOUNDS.1
+                    )),
+                },
+            )
+            .into());
+        }
+        let manual_retention = input
+            .manual_snapshot_retention_period
+            .unwrap_or(st::MANUAL_RETENTION_INDEFINITE);
+        if manual_retention != st::MANUAL_RETENTION_INDEFINITE
+            && !(st::MANUAL_RETENTION_BOUNDS.0..=st::MANUAL_RETENTION_BOUNDS.1)
+                .contains(&manual_retention)
+        {
+            return Err(CreateClusterErrorModeled::InvalidRetentionPeriodFault(
+                InvalidRetentionPeriodFault {
+                    message: Some(format!(
+                        "Invalid value for ManualSnapshotRetentionPeriod: {manual_retention}. It must be either {} or an integer between {} and {}.",
+                        st::MANUAL_RETENTION_INDEFINITE,
+                        st::MANUAL_RETENTION_BOUNDS.0,
+                        st::MANUAL_RETENTION_BOUNDS.1
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "You can't use MasterUserPassword if ManageMasterPassword is true."
+        let manage_master_password = input.manage_master_password.unwrap_or(false);
+        if manage_master_password && input.master_user_password.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "MasterUserPassword cannot be supplied when ManageMasterPassword is true.",
+            ));
+        }
+
+        let mut store = state.lock();
+        store.settle(started);
+        // Identity before capacity: a repeat create of a cluster that already
+        // exists would create nothing, so it keeps the more specific fault even
+        // when the store is full.
+        if store.cluster(&input.cluster_identifier).is_some() {
+            return Err(CreateClusterErrorModeled::ClusterAlreadyExistsFault(
+                ClusterAlreadyExistsFault {
+                    message: Some(format!(
+                        "Cluster already exists: {}",
+                        input.cluster_identifier
+                    )),
+                },
+            )
+            .into());
+        }
+        if store.clusters.len() >= st::CLUSTER_QUOTA {
+            return Err(CreateClusterErrorModeled::ClusterQuotaExceededFault(
+                ClusterQuotaExceededFault {
+                    message: Some(format!(
+                        "The request would exceed the allowed number of clusters ({}).",
+                        st::CLUSTER_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let identifier = input.cluster_identifier.clone();
+        let hsm_requested = input.hsm_client_certificate_identifier.is_some()
+            || input.hsm_configuration_identifier.is_some();
+        let cluster = Cluster {
+            cluster_identifier: Some(identifier.clone()),
+            node_type: Some(input.node_type.clone()),
+            cluster_status: Some(st::STATUS_CREATING.to_string()),
+            cluster_availability_status: Some(
+                st::availability_status(st::STATUS_CREATING).to_string(),
+            ),
+            master_username: Some(input.master_username.clone()),
+            db_name: Some(
+                input
+                    .db_name
+                    .clone()
+                    .unwrap_or_else(|| st::DEFAULT_DB_NAME.to_string()),
+            ),
+            endpoint: Some(Endpoint {
+                address: Some(st::endpoint_address(&identifier, &region)),
+                port: Some(input.port.unwrap_or(st::DEFAULT_PORT)),
+                vpc_endpoints: None,
+            }),
+            cluster_create_time: Some(created_at),
+            automated_snapshot_retention_period: Some(automated_retention),
+            manual_snapshot_retention_period: Some(manual_retention),
+            cluster_security_groups: Some(
+                input
+                    .cluster_security_groups
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|name| ClusterSecurityGroupMembership {
+                        cluster_security_group_name: Some(name),
+                        status: Some("active".to_string()),
+                    })
+                    .collect(),
+            ),
+            vpc_security_groups: Some(
+                input
+                    .vpc_security_group_ids
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|id| VpcSecurityGroupMembership {
+                        vpc_security_group_id: Some(id),
+                        status: Some("active".to_string()),
+                    })
+                    .collect(),
+            ),
+            cluster_parameter_groups: Some(vec![ClusterParameterGroupStatus {
+                parameter_group_name: Some(
+                    input
+                        .cluster_parameter_group_name
+                        .clone()
+                        .unwrap_or_else(|| st::DEFAULT_PARAMETER_GROUP.to_string()),
+                ),
+                parameter_apply_status: Some("in-sync".to_string()),
+                cluster_parameter_status_list: None,
+            }]),
+            cluster_subnet_group_name: input.cluster_subnet_group_name.clone(),
+            vpc_id: input
+                .cluster_subnet_group_name
+                .as_deref()
+                .map(st::derived_vpc_id),
+            availability_zone: Some(
+                input
+                    .availability_zone
+                    .clone()
+                    .unwrap_or_else(|| st::default_availability_zone(&identifier, &region)),
+            ),
+            preferred_maintenance_window: Some(
+                input
+                    .preferred_maintenance_window
+                    .clone()
+                    .unwrap_or_else(|| st::default_maintenance_window(&identifier)),
+            ),
+            cluster_version: Some(
+                input
+                    .cluster_version
+                    .clone()
+                    .unwrap_or_else(|| st::DEFAULT_CLUSTER_VERSION.to_string()),
+            ),
+            allow_version_upgrade: Some(input.allow_version_upgrade.unwrap_or(true)),
+            number_of_nodes: Some(number_of_nodes),
+            publicly_accessible: Some(input.publicly_accessible.unwrap_or(false)),
+            encrypted: Some(input.encrypted.unwrap_or(true)),
+            hsm_status: hsm_requested.then(|| HsmStatus {
+                hsm_client_certificate_identifier: input
+                    .hsm_client_certificate_identifier
+                    .clone(),
+                hsm_configuration_identifier: input.hsm_configuration_identifier.clone(),
+                status: Some("active".to_string()),
+            }),
+            elastic_ip_status: input.elastic_ip.clone().map(|ip| ElasticIpStatus {
+                elastic_ip: Some(ip),
+                status: Some("active".to_string()),
+            }),
+            tags: Some(input.tags.clone().unwrap_or_default()),
+            kms_key_id: input.kms_key_id.clone(),
+            enhanced_vpc_routing: Some(input.enhanced_vpc_routing.unwrap_or(false)),
+            iam_roles: Some(
+                input
+                    .iam_roles
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|arn| ClusterIamRole {
+                        iam_role_arn: Some(arn),
+                        apply_status: Some("in-sync".to_string()),
+                    })
+                    .collect(),
+            ),
+            maintenance_track_name: Some(
+                input
+                    .maintenance_track_name
+                    .clone()
+                    .unwrap_or_else(|| st::DEFAULT_MAINTENANCE_TRACK.to_string()),
+            ),
+            snapshot_schedule_identifier: input.snapshot_schedule_identifier.clone(),
+            availability_zone_relocation_status: Some(
+                if input.availability_zone_relocation.unwrap_or(false) {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+                .to_string(),
+            ),
+            cluster_namespace_arn: Some(st::namespace_arn(&identifier, &region)),
+            default_iam_role_arn: input.default_iam_role_arn.clone(),
+            master_password_secret_arn: manage_master_password
+                .then(|| st::master_password_secret_arn(&identifier, &region)),
+            master_password_secret_kms_key_id: manage_master_password
+                .then(|| input.master_password_secret_kms_key_id.clone())
+                .flatten(),
+            ip_address_type: Some(
+                input
+                    .ip_address_type
+                    .clone()
+                    .unwrap_or_else(|| "ipv4".to_string()),
+            ),
+            multi_az: Some(
+                if input.multi_az.unwrap_or(false) {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                }
+                .to_string(),
+            ),
+            catalog_arn: input
+                .catalog_name
+                .as_deref()
+                .map(|name| ::engine::emulator_arn("glue", &region, &format!("catalog/{name}"))),
+            // `Cluster$ExtraComputeForAutomaticOptimization` is modelled as a
+            // string whose doc speaks in boolean words ("A boolean value that, if
+            // true, …  Default: false"), so the boolean renders as `true`/`false`
+            // rather than the Enabled/Disabled pair `MultiAZ`'s doc uses.
+            extra_compute_for_automatic_optimization: Some(
+                input
+                    .extra_compute_for_automatic_optimization
+                    .unwrap_or(false)
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+
+        store.clusters.push(st::StoredCluster {
+            cluster: cluster.clone(),
+            cluster_type: cluster_type.clone(),
+            // Stored, and deliberately never copied onto `cluster`: the `Cluster`
+            // shape models no password member, so it cannot reach the wire.
+            master_user_password: input.master_user_password.clone(),
+            available_at: started + st::PROVISIONING_SPAN,
+        });
+
+        Ok(CreateClusterOutput {
+            cluster: Some(cluster),
+        })
     }
 }

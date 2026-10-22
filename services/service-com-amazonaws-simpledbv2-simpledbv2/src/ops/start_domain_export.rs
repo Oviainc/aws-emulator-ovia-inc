@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDomainExport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDomainExport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDomainExport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implements the start of the domain-export lifecycle: it MINTS one export record,
+//! persists it, and answers from that record. `GetExport` and `ListExports` read the
+//! same store.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +165,219 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDomainExport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDomainExportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Every `@length` and `@pattern` on this input — `domainName` 1.., `s3Bucket`
+        // 3..255 and its bucket-name pattern, `s3KeyPrefix` 1..850, `s3SseKmsKeyId`
+        // 1..2048, `s3BucketOwner`'s 12-digit pattern, `clientToken` 1.. — is a
+        // modelled constraint the centralized walk already refused anything outside
+        // of, so reaching here means the input satisfies all of them.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDomainExport"))
+        // An engine without this service's store is "nobody wired that engine up",
+        // not a request failure, and this operation's model declares no server error
+        // to say so with: 501 is the honest answer, never a fabricated success.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("StartDomainExport"))?;
+
+        // `s3SseAlgorithm` targets the modelled `S3SseAlgorithm` enum, so only that
+        // shape's own value set is acceptable. The catalog is the generated
+        // `S3_SSE_ALGORITHM_VALUES`, which carries exactly the values the model
+        // declares. This runs BEFORE the combination rule below, so a value the model
+        // does not declare is always reported as the value error rather than as a bad
+        // combination. It is a backstop, not the primary gate: the centralized walk
+        // refuses an out-of-enum value against the schema first, and this keeps the
+        // rule stated where the handler's own refusals live.
+        if let Some(supplied) = input.s3_sse_algorithm.as_deref() {
+            if !S3_SSE_ALGORITHM_VALUES.contains(&supplied) {
+                audit(ctx, "refused-invalid-parameter-value", None);
+                return Err(StartDomainExportErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: format!(
+                            "s3SseAlgorithm must be one of [{}], got '{supplied}'",
+                            S3_SSE_ALGORITHM_VALUES.join(", ")
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // `s3SseKmsKeyId` "is only expected with KMS as the S3 SSE algorithm", so
+        // naming a key with any other algorithm — or with none — is the parameter
+        // combination the model's own `InvalidParameterCombinationException` exists
+        // for.
+        if input.s3_sse_kms_key_id.is_some()
+            && input.s3_sse_algorithm.as_deref() != Some(SSE_ALGORITHM_KMS)
+        {
+            audit(ctx, "refused-invalid-parameter-combination", None);
+            return Err(
+                StartDomainExportErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: format!(
+                            "s3SseKmsKeyId is only expected with s3SseAlgorithm {SSE_ALGORITHM_KMS}, \
+                             but the request named {}",
+                            input
+                                .s3_sse_algorithm
+                                .as_deref()
+                                .unwrap_or("no s3SseAlgorithm")
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // The rule the minted `exportArn` imposes on `domainName`, which the model
+        // leaves unconstrained beyond its minimum length. Checked BEFORE any id is
+        // minted or anything is stored, so a name the ARN cannot carry never reaches
+        // the store or the audit record.
+        if let Some(why) = crate::state::domain_name_rejection(&region, &input.domain_name) {
+            audit(ctx, "refused-invalid-parameter-value", None);
+            return Err(StartDomainExportErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException { message: why },
+            )
+            .into());
+        }
+
+        // `NoSuchDomainException` is modelled but unreachable here, and deliberately
+        // so: this service's whole bound surface is the three export operations, none
+        // of which creates, lists or deletes a SimpleDB domain, so the emulator holds
+        // no domain registry that could contradict the caller. Every `domainName` the
+        // rule above admits therefore names a domain that exists, and `ListExports`
+        // answers an empty list — not this error — for a domain that simply has no
+        // exports.
+
+        let mut store = state.lock();
+        // Status moves this call is about to report alongside are owed on the clock,
+        // not on the call, so settle before reading anything back.
+        store.settle_all(now);
+
+        // `clientToken` carries `@idempotencyToken`, so an SDK fills it in; a request
+        // that reaches here without one still needs the token the output requires, so
+        // the service mints it. It is stored on the record and read back out of it,
+        // never re-derived.
+        let client_token = match input.client_token {
+            Some(token) => token,
+            None => store.fresh_id(),
+        };
+
+        // Idempotency: inside the token's 8-hour window the same token names the same
+        // export. Identical parameters replay that export's own `exportArn` and
+        // `requestedAt`; changed parameters are the `ConflictException` the member's
+        // documentation describes.
+        if let Some(existing) = store.export_for_client_token(&client_token, now) {
+            if existing.started_with(
+                &input.domain_name,
+                &input.s3_bucket,
+                input.s3_key_prefix.as_deref(),
+                input.s3_sse_algorithm.as_deref(),
+                input.s3_sse_kms_key_id.as_deref(),
+                input.s3_bucket_owner.as_deref(),
+            ) {
+                let replayed = StartDomainExportOutput {
+                    client_token: existing.client_token.clone(),
+                    export_arn: existing.export_arn.clone(),
+                    requested_at: ::aws_smithy_types::DateTime::from(existing.requested_at),
+                };
+                audit(ctx, "replayed", Some(&replayed.export_arn));
+                return Ok(replayed);
+            }
+            audit(ctx, "refused-conflict", Some(&existing.export_arn));
+            return Err(StartDomainExportErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "clientToken '{client_token}' was already used to start an export with \
+                         different parameters"
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let export_id = store.fresh_id();
+        debug_assert_eq!(
+            export_id.len(),
+            crate::state::UUID_LEN,
+            "domain_name_rejection sizes the ARN from this id length"
+        );
+        let record = crate::state::StoredExport {
+            export_arn: crate::state::export_arn(&region, &input.domain_name, &export_id),
+            export_id,
+            client_token,
+            domain_name: input.domain_name,
+            export_status: crate::state::STATUS_PENDING.to_string(),
+            requested_at: now,
+            s3_bucket: input.s3_bucket,
+            s3_key_prefix: input.s3_key_prefix,
+            s3_sse_algorithm: input.s3_sse_algorithm,
+            s3_sse_kms_key_id: input.s3_sse_kms_key_id,
+            s3_bucket_owner: input.s3_bucket_owner,
+            export_manifest: None,
+            items_count: None,
+            export_data_cutoff_time: None,
+            failure_code: None,
+            failure_message: None,
+            in_progress_due_at: now
+                .checked_add(crate::state::IN_PROGRESS_SPAN)
+                .unwrap_or(now),
+            succeeded_due_at: now
+                .checked_add(crate::state::SUCCEEDED_SPAN)
+                .unwrap_or(now),
+        };
+
+        // The response is read off the very record about to be stored, so the three
+        // members this operation returns can only ever be what `GetExport` will report.
+        let output = StartDomainExportOutput {
+            client_token: record.client_token.clone(),
+            export_arn: record.export_arn.clone(),
+            requested_at: ::aws_smithy_types::DateTime::from(record.requested_at),
+        };
+
+        // The store is finite and enforces its own ceiling: a start that would take it
+        // past that ceiling stores nothing and is refused the way the service refuses
+        // one past its export quota.
+        if !store.insert_export(record) {
+            audit(ctx, "refused-quota-exceeded", None);
+            return Err(StartDomainExportErrorModeled::NumberExportsLimitExceeded(
+                NumberExportsLimitExceeded {
+                    message: format!(
+                        "this account already holds the maximum of {} exports",
+                        crate::state::MAX_EXPORTS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        audit(ctx, "created", Some(&output.export_arn));
+        Ok(output)
     }
+}
+
+/// The `S3SseAlgorithm` value that `s3SseKmsKeyId` is documented to accompany.
+const SSE_ALGORITHM_KMS: &str = "KMS";
+
+/// Audit record for this state-changing operation: who asked, what changed, and how
+/// it ended.
+///
+/// Emitted at INFO so it survives the emulator's default log filtering. Only wire
+/// metadata and server-minted identifiers go in — never the request's own bucket, key
+/// prefix or `clientToken`, and never the emulator's own credentials. The `exportArn`
+/// carries the caller's `domainName`, which `crate::state::domain_name_rejection` has
+/// already refused every control character from, so no caller can split or forge a
+/// line of this record.
+fn audit(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    outcome: &str,
+    export_arn: Option<&str>,
+) {
+    ::tracing::info!(
+        audit = true,
+        operation = "StartDomainExport",
+        outcome,
+        caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+        export_arn = export_arn.unwrap_or("-"),
+        "StartDomainExport {outcome}"
+    );
 }

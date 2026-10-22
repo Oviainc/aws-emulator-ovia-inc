@@ -249,8 +249,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // minted, recomputed from the store, instead of minting a second.
             crate::state::TokenOutcome::Replay(record) => {
                 if let Some(rule) = record
-                    .rule_arn
-                    .as_deref()
+                    .subject
+                    .as_ref()
+                    .and_then(crate::state::TokenSubject::rule_arn)
                     .and_then(|arn| guard.rules.get(arn))
                 {
                     return Ok(output_for(rule));
@@ -332,7 +333,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_token,
             Self::NAME,
             &request_fingerprint,
-            Some(rule_arn.clone()),
+            Some(crate::state::TokenSubject::Rule(rule_arn.clone())),
         );
 
         // Answer from the store, not from the request struct.

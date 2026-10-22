@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateComputeEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateComputeEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a compute environment and persists it in [`crate::state`]. The name is the
+//! environment's identity: re-creating one that already exists is a `ClientException`,
+//! never an overwrite. The ARN is minted once, from the region the request was signed
+//! for, and stored with the record, so every later operation reports the same one. A
+//! MANAGED environment must bring `computeResources` (the model's own doc for that
+//! member), and the environment is returned in the non-terminal `CREATING` status, which
+//! the clock moves to `VALID`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateComputeEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -209,18 +209,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateComputeEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateComputeEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateComputeEnvironment"))
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(CreateComputeEnvironmentErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        let region = batch::request_region(ctx);
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        if state
+            .compute_environments
+            .contains_key(&input.compute_environment_name)
+        {
+            return Err(CreateComputeEnvironmentErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "Object already exists: compute environment {}",
+                    input.compute_environment_name
+                )),
+            )
+            .into());
+        }
+        if state.compute_environments.len() >= batch::limits::MAX_COMPUTE_ENVIRONMENTS {
+            return Err(CreateComputeEnvironmentErrorModeled::ClientException(
+                batch::client_exception(batch::quota_message(
+                    "compute environments",
+                    batch::limits::MAX_COMPUTE_ENVIRONMENTS,
+                )),
+            )
+            .into());
+        }
+        if input.r#type == batch::CE_TYPE_MANAGED && input.compute_resources.is_none() {
+            return Err(CreateComputeEnvironmentErrorModeled::ClientException(
+                batch::client_exception(
+                    "computeResources is required for a MANAGED compute environment",
+                ),
+            )
+            .into());
+        }
+
+        let name = input.compute_environment_name.clone();
+        let arn = batch::compute_environment_arn(&region, &name);
+        let environment = batch::ComputeEnvironment {
+            name: name.clone(),
+            arn: arn.clone(),
+            ce_type: input.r#type,
+            state: input
+                .state
+                .unwrap_or_else(|| batch::STATE_ENABLED.to_string()),
+            status: batch::STATUS_CREATING.to_string(),
+            status_reason: None,
+            status_due_at: Some(now + batch::JOB_PHASE_MILLIS),
+            uuid: state.new_uuid(),
+            unmanagedv_cpus: input.unmanagedv_cpus,
+            compute_resources: input.compute_resources,
+            service_role: input.service_role,
+            eks_configuration: input.eks_configuration,
+            ecs_settings: input.ecs_settings,
+            context: input.context,
+            tags: input.tags,
+        };
+        state
+            .compute_environments_by_arn
+            .insert(arn.clone(), name.clone());
+        state.compute_environments.insert(name.clone(), environment);
+
+        Ok(CreateComputeEnvironmentOutput {
+            compute_environment_name: Some(name),
+            compute_environment_arn: Some(arn),
+        })
     }
 }

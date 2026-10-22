@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLandingZone
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLandingZone`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLandingZone::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored landing zone a `landingZoneIdentifier` names. Every member comes
+//! from what `CreateLandingZone` persisted in [`crate::state`]; `status` is derived from
+//! whether an operation against it is still in flight.
+//!
+//! Implemented: this operation no longer answers HTTP 501.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +144,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLandingZone` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLandingZoneErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLandingZone"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetLandingZoneErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Only materialises transitions the clock already owed; this operation is
+        // `@readonly` and writes nothing else.
+        store.settle(::std::time::SystemTime::now());
+
+        let resolved = store
+            .resolve_landing_zone_arn(&input.landing_zone_identifier)
+            .and_then(|arn| store.landing_zones.get(&arn).cloned());
+        let Some(landing_zone) = resolved else {
+            return Err(GetLandingZoneErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no landing zone matches landingZoneIdentifier {}",
+                        input.landing_zone_identifier
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetLandingZoneOutput {
+            landing_zone: LandingZoneDetail {
+                version: landing_zone.version,
+                remediation_types: landing_zone.remediation_types,
+                arn: Some(landing_zone.arn),
+                status: Some(landing_zone.status.as_wire().to_string()),
+                latest_available_version: Some(landing_zone.latest_available_version),
+                drift_status: landing_zone
+                    .drift_status
+                    .map(|status| LandingZoneDriftStatusSummary {
+                        status: Some(status.as_wire().to_string()),
+                    }),
+                manifest: landing_zone.manifest,
+            },
+        })
     }
 }

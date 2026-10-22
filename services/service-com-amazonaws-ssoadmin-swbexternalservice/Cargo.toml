@@ -21,13 +21,16 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Hex-encodes pagination cursors, so a `NextToken` stays inside the model's
+# `^[-a-zA-Z0-9+=/_]*$` pattern while still carrying the ARN it resumes from.
+hex = { workspace = true }
+# Hashes the (process, clock, counter) triple this service's minted identifiers are
+# derived from: the `RequestId` of an assignment operation (the model's `UUId` shape)
+# and the `ps-` suffix of a permission-set ARN.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLandingZone
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLandingZone`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLandingZone::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints the account's single landing zone and the `CREATE` entry of the landing zone
+//! operation log, both persisted in [`crate::state`]: the `arn` returned is the key the
+//! landing zone is stored under, and the `operationIdentifier` returned is the key
+//! `GetLandingZoneOperation` resolves.
+//!
+//! Implemented: this operation no longer answers HTTP 501.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +158,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLandingZone` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLandingZoneErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLandingZone"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateLandingZoneErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `LandingZoneDetail$manifest` is `@required`, so a landing zone cannot exist
+        // without one: a create that supplies none could never be reported back.
+        let Some(manifest) = input.manifest else {
+            return Err(CreateLandingZoneErrorModeled::ValidationException(
+                ValidationException {
+                    message: "manifest must be supplied: a landing zone is described by its \
+                              manifest JSON document"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // One landing zone per account. The rule is read off the store, so it holds no
+        // matter which call created the existing one.
+        if let Some(existing) = store.landing_zones.keys().min() {
+            return Err(CreateLandingZoneErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "this account already has a landing zone ({existing}); AWS Control \
+                         Tower supports one landing zone per account"
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The landing zone an in-flight DELETE is tearing down is already out of the map
+        // above, so the account is still occupied by that operation: creating now would
+        // collide with it, which is what `ConflictException` reports.
+        if let Some(in_flight) = store.oldest_operation_in_flight() {
+            return Err(CreateLandingZoneErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "landing zone operation {in_flight} is still in progress; creating a \
+                         landing zone now would leave this account in an inconsistent state"
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::landing_zone_arn(&region, &crate::state::new_landing_zone_id());
+
+        store.landing_zones.insert(
+            arn.clone(),
+            crate::state::LandingZone {
+                arn: arn.clone(),
+                version: input.version.clone(),
+                latest_available_version: crate::state::latest_available_version(
+                    &input.version,
+                    crate::state::CATALOG_LANDING_ZONE_VERSION,
+                ),
+                manifest,
+                remediation_types: input.remediation_types.clone(),
+                // The landing zone is PROCESSING until its CREATE operation is due; the
+                // status is derived from the log by `settle`, and seeded to match here.
+                status: crate::state::LandingZoneStatus::Processing,
+                // Nothing has diverged from a manifest the service has only just been
+                // given, so a new landing zone is in sync.
+                drift_status: Some(crate::state::LandingZoneDriftStatus::InSync),
+                created_at: now,
+            },
+        );
+
+        if let Some(tags) = input.tags {
+            store.tags.insert(arn.clone(), tags.into_iter().collect());
+        }
+
+        let operation_identifier =
+            store.record_operation(crate::state::LandingZoneOperationType::Create, &arn, now);
+
+        Ok(CreateLandingZoneOutput {
+            arn,
+            operation_identifier,
+        })
     }
 }

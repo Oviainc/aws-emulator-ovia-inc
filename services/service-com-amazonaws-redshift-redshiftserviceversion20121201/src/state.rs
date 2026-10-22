@@ -1,11 +1,643 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-redshift-redshiftserviceversion20121201 service.
+//!
+//! One store per emulator, holding the provisioned-cluster control plane: the
+//! clusters and the snapshots taken of them. Both collections keep INSERTION
+//! ORDER, so the `Marker` cursor the paginated `Describe*` operations hand out is
+//! a stable, resumable offset into the same sequence a later page walks.
+//!
+//! Besides the store this module owns the small rules every cluster operation
+//! shares: the documented identifier syntax, the documented `MaxRecords` window,
+//! the derived endpoint address / namespace ARN, and the clock-owed
+//! `creating` -> `available` transitions (see [`PROVISIONING_SPAN`]).
+
+use crate::ops::types::{Cluster, Snapshot};
+use sha2::{Digest, Sha256};
+use std::time::{Duration, Instant};
+
+/// How long after the call that starts it a provisioning transition falls due:
+/// a cluster or a snapshot reported `creating` becomes `available` this long
+/// after the `CreateCluster` / `CreateClusterSnapshot` / `DeleteCluster` call
+/// that minted it.
+///
+/// The span is the emulator's own choice — AWS documents no provisioning
+/// duration — and is deliberately non-zero, so a caller that acts immediately
+/// after the starting call still observes the transient `creating` state. The
+/// due instant is stored and nothing ever sleeps for it.
+pub const PROVISIONING_SPAN: Duration = Duration::from_millis(500);
+
+/// The default `DBName` when `CreateCluster` does not carry one.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage", member="DBName")`
+/// — "Default: dev".
+pub const DEFAULT_DB_NAME: &str = "dev";
+
+/// The only Amazon Redshift engine version the service offers.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage", member="ClusterVersion")`
+/// — "Only version 1.0 is currently available. Example: 1.0".
+pub const DEFAULT_CLUSTER_VERSION: &str = "1.0";
+
+/// The port the Redshift database engine listens on when the request names none.
+pub const DEFAULT_PORT: i32 = 5439;
+
+/// The cluster parameter group a cluster joins when the request names none.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="ClusterParameterGroupName")` — "Default: The default Amazon Redshift
+/// cluster parameter group", which for engine version 1.0 is this name.
+pub const DEFAULT_PARAMETER_GROUP: &str = "default.redshift-1.0";
+
+/// The maintenance track a cluster joins when the request names none.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="MaintenanceTrackName")` — "If you don't provide a maintenance track
+/// name, the cluster is assigned to the current track."
+pub const DEFAULT_MAINTENANCE_TRACK: &str = "current";
+
+/// The default number of days automated snapshots are retained.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="AutomatedSnapshotRetentionPeriod")` — "Default: 1 … Must be a value
+/// from 0 to 35."
+pub const DEFAULT_AUTOMATED_RETENTION: i32 = 1;
+
+/// Inclusive bounds on `AutomatedSnapshotRetentionPeriod`, from the same doc
+/// sentence as [`DEFAULT_AUTOMATED_RETENTION`].
+pub const AUTOMATED_RETENTION_BOUNDS: (i32, i32) = (0, 35);
+
+/// Inclusive bounds on a manual-snapshot retention period, which may also be
+/// `-1` ("retained indefinitely").
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="ManualSnapshotRetentionPeriod")` — "The value must be either -1 or an
+/// integer between 1 and 3,653."
+pub const MANUAL_RETENTION_BOUNDS: (i32, i32) = (1, 3653);
+
+/// The sentinel manual retention period meaning "retained indefinitely".
+pub const MANUAL_RETENTION_INDEFINITE: i32 = -1;
+
+/// The documented `MaxRecords` window every paginated Redshift `Describe*`
+/// operation shares: default 100, minimum 20, maximum 100.
+///
+/// Source: `smithy_query(query="doc", shape="DescribeClustersMessage",
+/// member="MaxRecords")` and the identical sentence on
+/// `DescribeClusterSnapshotsMessage$MaxRecords` — "Default: 100 … Constraints:
+/// minimum 20, maximum 100."
+pub const MAX_RECORDS_DEFAULT: i32 = 100;
+/// The documented minimum of the `MaxRecords` window. See [`MAX_RECORDS_DEFAULT`].
+pub const MAX_RECORDS_MIN: i32 = 20;
+/// The documented maximum of the `MaxRecords` window. See [`MAX_RECORDS_DEFAULT`].
+pub const MAX_RECORDS_MAX: i32 = 100;
+
+/// `ClusterStatus` while the cluster is being provisioned.
+pub const STATUS_CREATING: &str = "creating";
+/// `ClusterStatus` / snapshot `Status` once provisioning is done.
+pub const STATUS_AVAILABLE: &str = "available";
+/// `ClusterStatus` a `DeleteCluster` response reports.
+pub const STATUS_DELETING: &str = "deleting";
+
+/// The `SnapshotType` of every snapshot a caller asks for, whether through
+/// `CreateClusterSnapshot` or as a `DeleteCluster` final snapshot.
+///
+/// Source: `smithy_query(query="doc", shape="Snapshot", member="SnapshotType")`
+/// — "Snapshots created using CreateClusterSnapshot and CopyClusterSnapshot are
+/// of type \"manual\"".
+pub const SNAPSHOT_TYPE_MANUAL: &str = "manual";
+
+/// The `SnapshotType` Redshift gives a snapshot it took on its own schedule.
+///
+/// Source: `smithy_query(query="doc", shape="DescribeClusterSnapshotsMessage",
+/// member="SnapshotType")` — "Valid Values: automated | manual".
+pub const SNAPSHOT_TYPE_AUTOMATED: &str = "automated";
+
+/// How many clusters the store holds before `CreateCluster` refuses with the
+/// modelled `ClusterQuotaExceededFault`.
+///
+/// Amazon Redshift publishes an adjustable quota on clusters per account per
+/// Region, and this emulator models neither Service Quotas nor an account's
+/// adjustments — so this is the emulator's OWN bound on the store rather than a
+/// claim about any account's limit. It is set far above any workflow an emulator
+/// serves, and it is what stops [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::clusters`]
+/// growing without end: every record it holds is released by `DeleteCluster`.
+pub const CLUSTER_QUOTA: usize = 1_000;
+
+/// How many snapshots the store holds before `CreateClusterSnapshot` — and the
+/// final snapshot `DeleteCluster` takes — refuses with the modelled
+/// `ClusterSnapshotQuotaExceededFault`.
+///
+/// The same reasoning as [`CLUSTER_QUOTA`]: the emulator's own bound on
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::snapshots`], not a
+/// claim about an account's published limit. It is larger than the cluster bound
+/// because a cluster accumulates snapshots over its life.
+pub const SNAPSHOT_QUOTA: usize = 10_000;
+
+/// How many `SortingEntities` one `DescribeClusterSnapshots` request may carry.
+///
+/// `SnapshotAttributeToSortBy` declares three values, so a request naming more
+/// entities than there are attributes can only repeat one; the cap keeps the
+/// per-request sort work a small constant multiple of one pass over the store,
+/// which matters because the sort runs while the shared state lock is held.
+pub const MAX_SORTING_ENTITIES: usize = 3;
+
+/// What a handler answers when the shared store cannot be reached: the service's
+/// own modelled "a dependent internal service is temporarily unavailable" fault.
+pub const STORE_UNAVAILABLE: &str =
+    "the Amazon Redshift control-plane store is temporarily unavailable";
+
+/// A cluster as this service stores it: the modelled projection a response is
+/// built from, plus what the model does not carry.
+#[derive(Debug, Clone)]
+pub struct StoredCluster {
+    /// Exactly what `DescribeClusters` reports, so a read never recomputes it.
+    pub cluster: Cluster,
+    /// `single-node` or `multi-node`. The `Cluster` shape models no
+    /// `ClusterType` member, but `ModifyCluster` accepts one, so the resolved
+    /// value is kept here.
+    pub cluster_type: String,
+    /// The admin password, stored so a later `ModifyCluster` can replace it and
+    /// NEVER placed on [`StoredCluster::cluster`] — the `Cluster` shape models
+    /// no password member, so it can never reach the wire.
+    pub master_user_password: Option<String>,
+    /// When the `creating` -> `available` transition falls due.
+    pub available_at: Instant,
+}
+
+/// A snapshot as this service stores it.
+#[derive(Debug, Clone)]
+pub struct StoredSnapshot {
+    /// Exactly what `DescribeClusterSnapshots` reports.
+    pub snapshot: Snapshot,
+    /// When the `creating` -> `available` transition falls due.
+    pub available_at: Instant,
+}
 
 /// Per-service state for com-amazonaws-redshift-redshiftserviceversion20121201. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
-    // TODO: add service-specific state fields
+    /// Every provisioned cluster, keyed by `ClusterIdentifier`, in creation order.
+    pub clusters: Vec<StoredCluster>,
+    /// Every snapshot, keyed by `SnapshotIdentifier`, in creation order.
+    pub snapshots: Vec<StoredSnapshot>,
+}
+
+impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
+    /// Materialise every transition the clock already owes at `now`.
+    ///
+    /// This is the ONLY write a reporting operation makes: the move from
+    /// `creating` to `available` was due at `now` whether or not anybody called,
+    /// so applying it on read changes nothing a later caller could not already
+    /// have observed.
+    pub fn settle(&mut self, now: Instant) {
+        for stored in &mut self.clusters {
+            if stored.cluster.cluster_status.as_deref() == Some(STATUS_CREATING)
+                && now >= stored.available_at
+            {
+                stored.cluster.cluster_status = Some(STATUS_AVAILABLE.to_string());
+                stored.cluster.cluster_availability_status =
+                    Some(availability_status(STATUS_AVAILABLE).to_string());
+            }
+        }
+        for stored in &mut self.snapshots {
+            if stored.snapshot.status.as_deref() == Some(STATUS_CREATING)
+                && now >= stored.available_at
+            {
+                stored.snapshot.status = Some(STATUS_AVAILABLE.to_string());
+            }
+        }
+    }
+
+    /// The stored cluster with this identifier, if any.
+    pub fn cluster(&self, identifier: &str) -> Option<&StoredCluster> {
+        self.clusters
+            .iter()
+            .find(|c| c.cluster.cluster_identifier.as_deref() == Some(identifier))
+    }
+
+    /// The position of the cluster with this identifier, if any.
+    pub fn cluster_position(&self, identifier: &str) -> Option<usize> {
+        self.clusters
+            .iter()
+            .position(|c| c.cluster.cluster_identifier.as_deref() == Some(identifier))
+    }
+
+    /// The stored snapshot with this identifier, if any.
+    pub fn snapshot(&self, identifier: &str) -> Option<&StoredSnapshot> {
+        self.snapshots
+            .iter()
+            .find(|s| s.snapshot.snapshot_identifier.as_deref() == Some(identifier))
+    }
+}
+
+/// `ClusterAvailabilityStatus` for a `ClusterStatus`.
+///
+/// Source: `smithy_query(query="doc", shape="Cluster",
+/// member="ClusterAvailabilityStatus")` — "Available - The cluster is available
+/// for queries" and "Unavailable - The cluster is not available for queries". A
+/// cluster still being provisioned, or on its way out, is not available for
+/// queries at all, so it reports `Unavailable` rather than the `Modifying` value,
+/// which the same doc reserves for a cluster that is "intermittently available …
+/// due to changes that modify the cluster".
+pub fn availability_status(cluster_status: &str) -> &'static str {
+    match cluster_status {
+        STATUS_AVAILABLE => "Available",
+        _ => "Unavailable",
+    }
+}
+
+/// The syntax rule Redshift documents for one identifier member.
+#[derive(Debug, Clone, Copy)]
+pub struct IdentifierRule {
+    /// The input member the rule belongs to, named in the refusal.
+    pub member: &'static str,
+    /// The documented maximum length, in characters.
+    pub max_len: usize,
+    /// Whether the documented rule forbids uppercase letters.
+    pub lowercase_only: bool,
+}
+
+/// The rule for a cluster identifier (`ClusterIdentifier`, `NewClusterIdentifier`).
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="ClusterIdentifier")` — "Must contain from 1 to 63 alphanumeric
+/// characters or hyphens. Alphabetic characters must be lowercase. First
+/// character must be a letter. Cannot end with a hyphen or contain two
+/// consecutive hyphens."
+pub const CLUSTER_IDENTIFIER_RULE: IdentifierRule = IdentifierRule {
+    member: "ClusterIdentifier",
+    max_len: 63,
+    lowercase_only: true,
+};
+
+/// The rule for a snapshot identifier (`SnapshotIdentifier`,
+/// `FinalClusterSnapshotIdentifier`).
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterSnapshotMessage",
+/// member="SnapshotIdentifier")` — "Must contain from 1 to 255 alphanumeric
+/// characters or hyphens. First character must be a letter. Cannot end with a
+/// hyphen or contain two consecutive hyphens." (No lowercase restriction.)
+pub const SNAPSHOT_IDENTIFIER_RULE: IdentifierRule = IdentifierRule {
+    member: "SnapshotIdentifier",
+    max_len: 255,
+    lowercase_only: false,
+};
+
+/// Check `value` against `rule`, naming the member and the constraint it broke.
+///
+/// `member` overrides the rule's own member name, so `NewClusterIdentifier` and
+/// `FinalClusterSnapshotIdentifier` are refused under the same rule as the
+/// member it was documented on, while still naming themselves.
+pub fn check_identifier(rule: IdentifierRule, member: &str, value: &str) -> Result<(), String> {
+    let refuse = |why: &str| {
+        Err(format!(
+            "Invalid value for {member}: '{value}'. {why} (allowed: 1 to {} {}alphanumeric characters or hyphens, first character a letter, no trailing hyphen and no two consecutive hyphens)",
+            rule.max_len,
+            if rule.lowercase_only { "lowercase " } else { "" },
+        ))
+    };
+    if value.is_empty() {
+        return refuse("The identifier cannot be null, empty, or blank.");
+    }
+    if value.chars().count() > rule.max_len {
+        return refuse("The identifier is longer than allowed.");
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return refuse("The identifier contains a character that is neither alphanumeric nor a hyphen.");
+    }
+    if rule.lowercase_only && value.chars().any(|c| c.is_ascii_uppercase()) {
+        return refuse("Alphabetic characters must be lowercase.");
+    }
+    if !value
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        return refuse("The first character must be a letter.");
+    }
+    if value.ends_with('-') {
+        return refuse("The identifier cannot end with a hyphen.");
+    }
+    if value.contains("--") {
+        return refuse("The identifier cannot contain two consecutive hyphens.");
+    }
+    Ok(())
+}
+
+/// The opaque `Marker` cursor the paginated `Describe*` operations hand out for
+/// the record at `offset` in the stable insertion order.
+///
+/// The offset is paired with a tag derived from it, so a cursor this service did
+/// not produce is refused rather than served as a mid-page offset: the
+/// representation is this module's business alone and a caller can only echo
+/// back one it was given.
+fn marker_for(offset: usize) -> String {
+    format!("{offset}.{}", short_digest(&format!("marker/{offset}"), 8))
+}
+
+/// The offset a `Marker` names, or `None` when the cursor is not one
+/// [`marker_for`] produced.
+fn marker_offset(cursor: &str) -> Option<usize> {
+    let (offset, tag) = cursor.rsplit_once('.')?;
+    let offset: usize = offset.parse().ok()?;
+    (tag == short_digest(&format!("marker/{offset}"), 8)).then_some(offset)
+}
+
+/// Resolve one page of `total` records from the request's `Marker` / `MaxRecords`.
+///
+/// Returns the half-open range of the page and the `Marker` to hand back, which
+/// is `Some` only when records remain after it.
+pub fn page_bounds(
+    marker: Option<&str>,
+    max_records: Option<i32>,
+    total: usize,
+) -> Result<(usize, usize, Option<String>), String> {
+    let page_size = match max_records {
+        None => MAX_RECORDS_DEFAULT,
+        Some(value) if (MAX_RECORDS_MIN..=MAX_RECORDS_MAX).contains(&value) => value,
+        Some(value) => {
+            return Err(format!(
+                "Invalid value for MaxRecords: {value}. MaxRecords must be between {MAX_RECORDS_MIN} and {MAX_RECORDS_MAX}."
+            ))
+        }
+    };
+    let start = match marker {
+        None => 0usize,
+        Some(cursor) => match marker_offset(cursor) {
+            Some(offset) if offset <= total => offset,
+            _ => {
+                return Err(format!(
+                    "Invalid value for Marker: '{cursor}'. The marker must be one returned by a previous call."
+                ))
+            }
+        },
+    };
+    let end = (start + page_size as usize).min(total);
+    let next = (end < total).then(|| marker_for(end));
+    Ok((start, end, next))
+}
+
+/// The region this request was signed for, from its SigV4 credential scope.
+///
+/// Falls back to `us-east-1`, the region a generated emulator presents when a
+/// request carries no scope to read one from.
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| "us-east-1".to_string())
+}
+
+/// `n` lowercase hex characters of the SHA-256 of `seed`.
+///
+/// Used only to derive the stable, content-addressed parts of an endpoint
+/// hostname and a namespace id: the same cluster always renders the same value,
+/// so nothing here is a per-run value.
+fn short_digest(seed: &str, n: usize) -> String {
+    let digest = Sha256::digest(seed.as_bytes());
+    hex::encode(digest).chars().take(n).collect()
+}
+
+/// The first byte of the SHA-256 of `seed`, for picking a stable default out of
+/// a documented set.
+fn digest_byte(seed: &str) -> u8 {
+    Sha256::digest(seed.as_bytes())[0]
+}
+
+/// The DNS address of a cluster's connection endpoint, in Redshift's
+/// `<cluster>.<id>.<region>.redshift.amazonaws.com` form.
+///
+/// Derived from the cluster identifier and region, so renaming a cluster moves
+/// its endpoint exactly as the real hostname does.
+pub fn endpoint_address(cluster_identifier: &str, region: &str) -> String {
+    let token = short_digest(&format!("endpoint/{cluster_identifier}/{region}"), 12);
+    format!("{cluster_identifier}.{token}.{region}.redshift.amazonaws.com")
+}
+
+/// The namespace ARN of a cluster: `arn:aws:redshift:<region>:<account>:namespace:<uuid>`.
+///
+/// Computed ONCE, when the cluster is created, and then persisted on the stored
+/// cluster — the namespace identifies the cluster's data, so it must survive a
+/// rename.
+pub fn namespace_arn(cluster_identifier: &str, region: &str) -> String {
+    let hexed = short_digest(&format!("namespace/{cluster_identifier}/{region}"), 32);
+    let uuid = format!(
+        "{}-{}-{}-{}-{}",
+        &hexed[0..8],
+        &hexed[8..12],
+        &hexed[12..16],
+        &hexed[16..20],
+        &hexed[20..32]
+    );
+    engine::emulator_arn("redshift", region, &format!("namespace:{uuid}"))
+}
+
+/// The ARN of a snapshot: `arn:aws:redshift:<region>:<account>:snapshot:<cluster>/<snapshot>`.
+pub fn snapshot_arn(cluster_identifier: &str, snapshot_identifier: &str, region: &str) -> String {
+    engine::emulator_arn(
+        "redshift",
+        region,
+        &format!("snapshot:{cluster_identifier}/{snapshot_identifier}"),
+    )
+}
+
+/// The ARN of the Secrets Manager secret holding a cluster's admin credentials,
+/// used only when `ManageMasterPassword` is on.
+pub fn master_password_secret_arn(cluster_identifier: &str, region: &str) -> String {
+    let token = short_digest(&format!("secret/{cluster_identifier}/{region}"), 6);
+    engine::emulator_arn(
+        "secretsmanager",
+        region,
+        &format!("secret:redshift!{cluster_identifier}-{token}"),
+    )
+}
+
+/// The Availability Zone Redshift picks when the request names none.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="AvailabilityZone")` — "Default: A random, system-chosen Availability
+/// Zone in the region that is specified by the endpoint." The emulator's choice
+/// is derived from the cluster identifier rather than drawn per run, so it is
+/// stable across reads.
+pub fn default_availability_zone(cluster_identifier: &str, region: &str) -> String {
+    const ZONE_SUFFIXES: [char; 3] = ['a', 'b', 'c'];
+    let index = digest_byte(&format!("az/{cluster_identifier}")) as usize % ZONE_SUFFIXES.len();
+    format!("{region}{}", ZONE_SUFFIXES[index])
+}
+
+/// The 30-minute weekly maintenance window Redshift assigns when the request
+/// names none, in the `ddd:hh24:mi-ddd:hh24:mi` form Redshift reports.
+///
+/// Derived from the cluster identifier, so it is stable across reads.
+pub fn default_maintenance_window(cluster_identifier: &str) -> String {
+    const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+    let seed = digest_byte(&format!("window/{cluster_identifier}"));
+    let day = DAYS[usize::from(seed) % DAYS.len()];
+    // 0..=22, so the window's end hour is always a valid same-day hour.
+    let hour = (usize::from(seed) / DAYS.len()) % 23;
+    format!("{day}:{hour:02}:30-{day}:{:02}:00", hour + 1)
+}
+
+/// The VPC a cluster launched into a subnet group reports.
+///
+/// Only a cluster created with a `ClusterSubnetGroupName` is in a VPC, so this
+/// is called only for one.
+pub fn derived_vpc_id(cluster_subnet_group_name: &str) -> String {
+    format!(
+        "vpc-{}",
+        short_digest(&format!("vpc/{cluster_subnet_group_name}"), 17)
+    )
+}
+
+/// Build the snapshot record a manual snapshot of `cluster` reports.
+///
+/// Every identifying attribute is COPIED off the stored cluster — node type,
+/// node count, admin user, database, engine version, port, Availability Zone and
+/// the cluster's own creation time — so a snapshot read back describes the
+/// cluster as it was when the snapshot was asked for.
+///
+/// `Status` starts at `creating`: `smithy_query(query="doc", shape="Snapshot",
+/// member="Status")` states "CreateClusterSnapshot and CopyClusterSnapshot
+/// returns status as \"creating\"". [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::settle`]
+/// moves it to `available` once [`PROVISIONING_SPAN`] has passed.
+pub fn snapshot_of(
+    cluster: &Cluster,
+    snapshot_identifier: &str,
+    created_at: ::aws_smithy_types::DateTime,
+    manual_retention_period: i32,
+    tags: Vec<crate::ops::types::Tag>,
+    region: &str,
+) -> Snapshot {
+    let cluster_identifier = cluster.cluster_identifier.clone().unwrap_or_default();
+    Snapshot {
+        snapshot_identifier: Some(snapshot_identifier.to_string()),
+        cluster_identifier: Some(cluster_identifier.clone()),
+        snapshot_create_time: Some(created_at),
+        status: Some(STATUS_CREATING.to_string()),
+        port: cluster.endpoint.as_ref().and_then(|e| e.port),
+        availability_zone: cluster.availability_zone.clone(),
+        cluster_create_time: cluster.cluster_create_time,
+        master_username: cluster.master_username.clone(),
+        cluster_version: cluster.cluster_version.clone(),
+        snapshot_type: Some(SNAPSHOT_TYPE_MANUAL.to_string()),
+        node_type: cluster.node_type.clone(),
+        number_of_nodes: cluster.number_of_nodes,
+        db_name: cluster.db_name.clone(),
+        vpc_id: cluster.vpc_id.clone(),
+        encrypted: cluster.encrypted,
+        kms_key_id: cluster.kms_key_id.clone(),
+        encrypted_with_hsm: Some(cluster.hsm_status.is_some()),
+        owner_account: Some(engine::emulator_account_id().to_string()),
+        // `Snapshot$SourceRegion` names the region a snapshot was COPIED from, so
+        // a snapshot taken in place leaves it unset.
+        tags: Some(tags),
+        enhanced_vpc_routing: cluster.enhanced_vpc_routing,
+        maintenance_track_name: cluster.maintenance_track_name.clone(),
+        manual_snapshot_retention_period: Some(manual_retention_period),
+        master_password_secret_arn: cluster.master_password_secret_arn.clone(),
+        master_password_secret_kms_key_id: cluster.master_password_secret_kms_key_id.clone(),
+        snapshot_arn: Some(snapshot_arn(
+            &cluster_identifier,
+            snapshot_identifier,
+            region,
+        )),
+        ..Default::default()
+    }
+}
+
+/// Resolve the `ClusterType` / `NumberOfNodes` pair a request asks for, or say
+/// why the pair cannot hold.
+///
+/// The two members describe one another, so neither is applied alone. Source:
+/// `smithy_query(query="doc", shape="CreateClusterMessage", member="ClusterType")`
+/// — "Valid Values: multi-node | single-node" and "When cluster type is specified
+/// as single-node, the NumberOfNodes parameter is not required. multi-node, the
+/// NumberOfNodes parameter is required" — with `NumberOfNodes`'s own "Default: 1".
+///
+/// `current` is the stored pair when a cluster is being MODIFIED, and `None` when
+/// it is being created; a create that names neither member takes the node-count
+/// default and the cluster type that node count describes. Shared by
+/// `CreateCluster` and `ModifyCluster` so the rule cannot drift between them.
+pub fn resolve_cluster_shape(
+    requested_type: Option<&str>,
+    requested_nodes: Option<i32>,
+    current: Option<(&str, i32)>,
+) -> Result<(String, i32), String> {
+    let kind = match requested_type {
+        Some("single-node") => "single-node",
+        Some("multi-node") => "multi-node",
+        Some(other) => {
+            return Err(format!(
+                "Invalid value for ClusterType: '{other}'. Valid Values: multi-node | single-node"
+            ))
+        }
+        // No `ClusterType`: a modify keeps the stored shape, and a create lets
+        // the node count (default 1) say which shape is being asked for.
+        None => match current {
+            Some((stored, _)) => stored,
+            None if requested_nodes.unwrap_or(1) > 1 => "multi-node",
+            None => "single-node",
+        },
+    };
+    // A node count the request does not name: "When cluster type is specified as
+    // single-node, the NumberOfNodes parameter is not required" — a single-node
+    // cluster has exactly one node, whatever it had before. A cluster that STAYS
+    // multi-node keeps the count it had; one that BECOMES multi-node must say how
+    // many, since "multi-node, the NumberOfNodes parameter is required".
+    let nodes = match (requested_nodes, kind, current) {
+        (Some(nodes), _, _) => nodes,
+        (None, "single-node", _) => 1,
+        (None, _, Some((stored_kind, stored_nodes))) if stored_kind == kind => stored_nodes,
+        (None, _, _) => {
+            return Err(
+                "NumberOfNodes is required when ClusterType is multi-node.".to_string()
+            )
+        }
+    };
+    if kind == "single-node" && nodes != 1 {
+        return Err(format!(
+            "Invalid value for NumberOfNodes: {nodes}. A single-node cluster has exactly 1 node."
+        ));
+    }
+    if kind == "multi-node" && nodes < 2 {
+        return Err(format!(
+            "Invalid value for NumberOfNodes: {nodes}. A multi-node cluster must have at least 2 nodes."
+        ));
+    }
+    Ok((kind.to_string(), nodes))
+}
+
+/// Whether a resource's tags satisfy a request's `TagKeys` / `TagValues` filter.
+///
+/// Each filter is independent and inclusive: a resource passes `TagKeys` when it
+/// carries a tag whose key is one of them, and `TagValues` when it carries a tag
+/// whose value is one of them. An absent filter constrains nothing.
+pub fn tags_match(
+    tags: &[crate::ops::types::Tag],
+    tag_keys: Option<&[String]>,
+    tag_values: Option<&[String]>,
+) -> bool {
+    if let Some(keys) = tag_keys {
+        if !keys.is_empty()
+            && !tags
+                .iter()
+                .any(|t| t.key.as_ref().is_some_and(|k| keys.contains(k)))
+        {
+            return false;
+        }
+    }
+    if let Some(values) = tag_values {
+        if !values.is_empty()
+            && !tags
+                .iter()
+                .any(|t| t.value.as_ref().is_some_and(|v| values.contains(v)))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

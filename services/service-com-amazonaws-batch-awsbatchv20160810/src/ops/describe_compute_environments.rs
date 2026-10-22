@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeComputeEnvironments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeComputeEnvironments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the compute environments [`crate::state`] holds, in the order asked for and
+//! resolved by name OR ARN; an entry that names none is omitted rather than failing the
+//! whole call, which is how AWS Batch answers the `Describe*` readers. With no filter it
+//! reports every environment, by name. Paginated through `maxResults`/`nextToken`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeComputeEnvironments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It is a REPORTING operation: it materialises only the `CREATING` -> `VALID` move the
+//! clock already owed, so two reads at one instant answer identically.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +160,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeComputeEnvironments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeComputeEnvironmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeComputeEnvironments"))
+        use crate::state as batch;
+
+        let _ = ctx;
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(DescribeComputeEnvironmentsErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        let requested = input.compute_environments.unwrap_or_default();
+        let mut seen = ::std::collections::HashSet::new();
+        let selected: Vec<batch::ComputeEnvironment> = if requested.is_empty() {
+            let mut names: Vec<&String> = state.compute_environments.keys().collect();
+            names.sort();
+            names
+                .into_iter()
+                .filter_map(|name| state.compute_environments.get(name))
+                .cloned()
+                .collect()
+        } else {
+            requested
+                .iter()
+                .filter_map(|reference| state.compute_environment(reference))
+                .filter(|environment| seen.insert(environment.arn.clone()))
+                .cloned()
+                .collect()
+        };
+
+        let (page, next_token) =
+            batch::paginate(selected, input.max_results, input.next_token.as_deref()).map_err(
+                |message| {
+                    DescribeComputeEnvironmentsError::from(
+                        DescribeComputeEnvironmentsErrorModeled::ClientException(
+                            batch::client_exception(message),
+                        ),
+                    )
+                },
+            )?;
+
+        let details = page
+            .into_iter()
+            .map(|environment| ComputeEnvironmentDetail {
+                compute_environment_name: environment.name,
+                compute_environment_arn: environment.arn,
+                unmanagedv_cpus: environment.unmanagedv_cpus,
+                // No Amazon ECS cluster is created for an emulated environment, so
+                // there is no cluster ARN to report.
+                ecs_cluster_arn: None,
+                tags: environment.tags,
+                r#type: Some(environment.ce_type),
+                state: Some(environment.state),
+                status: Some(environment.status),
+                status_reason: environment.status_reason,
+                compute_resources: environment.compute_resources,
+                service_role: environment.service_role,
+                update_policy: None,
+                // `OrchestrationType`: EKS when the environment was created with an
+                // `eksConfiguration`, else ECS.
+                container_orchestration_type: Some(
+                    if environment.eks_configuration.is_some() {
+                        "EKS"
+                    } else {
+                        "ECS"
+                    }
+                    .to_string(),
+                ),
+                eks_configuration: environment.eks_configuration,
+                uuid: Some(environment.uuid),
+                context: environment.context,
+                ecs_settings: environment.ecs_settings,
+            })
+            .collect();
+
+        Ok(DescribeComputeEnvironmentsOutput {
+            compute_environments: Some(details),
+            next_token,
+        })
     }
 }

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartAutomationEvent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartAutomationEvent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartAutomationEvent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Resolves `recommendedActionId` against the recommended actions
+//! this service holds: an id no action has is `ResourceNotFoundException` (404),
+//! and an action that is there mints one automation event, stored and reported
+//! from the store. The automation itself is not performed by this emulator, so
+//! the event the clock settles reaches the modelled `Failed` status carrying the
+//! reason why — see `crate::state::EVENT_UNPERFORMED_REASON`.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +172,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartAutomationEvent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartAutomationEventErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartAutomationEvent"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartAutomationEventErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service is not mounted on a state-bearing engine".into()),
+                },
+            )
+            .into());
+        };
+
+        let mut probe = input.clone();
+        probe.client_token = None;
+        let request_fingerprint = crate::state::fingerprint(&probe);
+        let client_token = input.client_token.as_deref();
+
+        let mut guard = state.lock();
+
+        match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
+            crate::state::TokenOutcome::Fresh => {}
+            // A retry of the same start: answer with the event the first call
+            // minted instead of starting a second automation for one action.
+            crate::state::TokenOutcome::Replay(record) => {
+                let replayed = record
+                    .subject
+                    .as_ref()
+                    .and_then(crate::state::TokenSubject::event_id)
+                    .map(str::to_string);
+                return match replayed.and_then(|id| guard.events.get_mut(&id)) {
+                    Some(event) => {
+                        // Report the status the clock has already made due, so a
+                        // replay never claims an automation is still running
+                        // after it has settled.
+                        event.settle(::std::time::SystemTime::now());
+                        Ok(output_for(event))
+                    }
+                    // The event the token started is no longer in the store, so
+                    // there is nothing to replay.
+                    None => Err(not_found()),
+                };
+            }
+            crate::state::TokenOutcome::ParameterMismatch => {
+                return Err(
+                    StartAutomationEventErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(
+                                crate::state::IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE.into(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::TokenOutcome::TokenInUse => {
+                return Err(
+                    StartAutomationEventErrorModeled::IdempotencyTokenInUseException(
+                        IdempotencyTokenInUseException {
+                            message: Some("The specified client token is already in use.".into()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The one-time automation is started for a RECOMMENDED ACTION, so the
+        // action is what the request has to name. The store holds the actions
+        // this service can automate; an id none of them carries names no
+        // resource of this service.
+        let Some(action) = guard
+            .recommended_actions
+            .get(&input.recommended_action_id)
+            .cloned()
+        else {
+            return Err(not_found());
+        };
+
+        let account_id = action
+            .account_id
+            .clone()
+            .unwrap_or_else(crate::state::caller_account_id);
+        let event_id = guard.mint_event_id();
+        let event = crate::state::event_for_action(
+            event_id.clone(),
+            &action,
+            account_id,
+            std::time::SystemTime::now(),
+        );
+        guard.events.insert(event);
+        guard.record_token(
+            client_token,
+            Self::NAME,
+            &request_fingerprint,
+            Some(crate::state::TokenSubject::Event(event_id.clone())),
+        );
+
+        // Answer from the store, not from the value built above.
+        match guard.events.get(&event_id) {
+            Some(event) => Ok(output_for(event)),
+            None => Err(StartAutomationEventErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the event that was just stored could not be read back".into()),
+                },
+            )
+            .into()),
+        }
     }
+}
+
+/// The response for a stored event. The ONE place this operation's output is
+/// built, so a fresh start and an idempotent replay answer from the same stored
+/// fields.
+fn output_for(event: &crate::state::StoredEvent) -> StartAutomationEventOutput {
+    StartAutomationEventOutput {
+        recommended_action_id: event.recommended_action_id.clone(),
+        event_id: Some(event.event_id.clone()),
+        event_status: Some(event.event_status.clone()),
+    }
+}
+
+/// The modelled 404 (`ResourceNotFoundException`, HTTP 404). The message is this
+/// service's fixed not-found text and names no resource, so the rejection
+/// discloses nothing about what the store holds.
+fn not_found() -> StartAutomationEventError {
+    StartAutomationEventErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.into()),
+    })
+    .into()
 }

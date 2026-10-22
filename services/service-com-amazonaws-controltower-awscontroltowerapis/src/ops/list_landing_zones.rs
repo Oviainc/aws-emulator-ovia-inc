@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLandingZones
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLandingZones`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLandingZones::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the stored landing zones' ARNs, oldest ARN first, paginated by `maxResults` and
+//! `nextToken`. Derived entirely from [`crate::state`], so it is empty before any create
+//! and empty again after a delete.
+//!
+//! Implemented: this operation no longer answers HTTP 501.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +147,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLandingZones` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLandingZonesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLandingZones"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListLandingZonesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Only materialises transitions the clock already owed; this operation is
+        // `@readonly` and writes nothing else.
+        store.settle(::std::time::SystemTime::now());
+
+        // A stable total order over the page boundary, so a `nextToken` resumes where the
+        // previous page stopped.
+        let mut arns: Vec<String> = store.landing_zones.keys().cloned().collect();
+        arns.sort();
+
+        // The token this operation hands out is the index of the next unreturned entry,
+        // so it is only meaningful against this same list.
+        let start = match input.next_token.as_deref() {
+            None | Some("") => 0usize,
+            Some(token) => match token.parse::<usize>() {
+                Ok(index) if index <= arns.len() => index,
+                _ => {
+                    return Err(ListLandingZonesErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "nextToken {token} was not returned by a previous \
+                                 ListLandingZones call"
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // `maxResults` is modelled `range 1..1`, so the boundary validator has already
+        // refused anything else; absent, every remaining entry is returned. The floor of
+        // 1 keeps a page from being empty-but-tokened should the model ever widen the
+        // range downwards.
+        let limit = input
+            .max_results
+            .map_or(arns.len(), |max| max.max(1) as usize);
+        let end = start.saturating_add(limit).min(arns.len());
+
+        let landing_zones: Vec<LandingZoneSummary> = arns[start..end]
+            .iter()
+            .map(|arn| LandingZoneSummary {
+                arn: Some(arn.clone()),
+            })
+            .collect();
+
+        Ok(ListLandingZonesOutput {
+            landing_zones,
+            next_token: (end < arns.len()).then(|| end.to_string()),
+        })
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReplicationConfigurationTemplates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReplicationConfigurationTemplates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReplicationConfigurationTemplates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the templates the store holds: all of them, or the ones the request's
+//! `replicationConfigurationTemplateIDs` names, cut into `maxResults`-sized pages.
+//! `@readonly` — this handler never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -118,6 +113,10 @@ impl From<DescribeReplicationConfigurationTemplatesErrorModeled> for DescribeRep
     }
 }
 
+/// Namespaces this operation's `nextToken`, so a token minted by another paginated
+/// DRS operation is refused rather than silently resuming in the wrong collection.
+const PAGE_TOKEN_KIND: &str = "ReplicationConfigurationTemplates";
+
 /// The `DescribeReplicationConfigurationTemplates` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -154,18 +153,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReplicationConfigurationTemplates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReplicationConfigurationTemplatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReplicationConfigurationTemplates"))
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeReplicationConfigurationTemplatesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the service store is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                )
+                .into(),
+            );
+        };
+        // Shared-reference guard only: `@readonly`, so nothing here mutates the store.
+        let store = state.lock();
+
+        if !store.initialized {
+            return Err(
+                DescribeReplicationConfigurationTemplatesErrorModeled::UninitializedAccountException(
+                    UninitializedAccountException {
+                        message: Some(
+                            "Elastic Disaster Recovery has not been initialized for this account; \
+                             call InitializeService first"
+                                .to_string(),
+                        ),
+                        code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An explicit id list selects, in the order the request gave: an id the store
+        // does not hold is a 404, not a silently shorter list. An absent (or empty)
+        // list reports every template, in insertion order. Either way the selection
+        // is a list of BORROWS — only the page itself is rendered (see `paginate`).
+        let selected: Vec<(&str, &crate::state::ReplicationConfigurationTemplateRecord)> =
+            match input.replication_configuration_template_i_ds.as_deref() {
+                Some(ids) if !ids.is_empty() => {
+                    let mut selected = Vec::with_capacity(ids.len());
+                    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+                    for id in ids {
+                        let Some((stored_id, record)) =
+                            store.replication_configuration_templates.get_key_value(id)
+                        else {
+                            return Err(
+                        DescribeReplicationConfigurationTemplatesErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(format!(
+                                    "Replication configuration template {id} does not exist"
+                                )),
+                                code: None,
+                                resource_id: Some(id.clone()),
+                                resource_type: Some(
+                                    "ReplicationConfigurationTemplate".to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                        };
+                        // The modelled id list carries no uniqueness constraint, and a
+                        // repeated id names one template: report it ONCE. A page token
+                        // names the id the next page starts at, so a selection holding
+                        // the same id twice would resume at the first copy forever —
+                        // an unbounded series of identical pages.
+                        if seen.insert(stored_id.as_str()) {
+                            selected.push((stored_id.as_str(), record));
+                        }
+                    }
+                    selected
+                }
+                _ => store
+                    .replication_configuration_templates
+                    .iter()
+                    .map(|(id, record)| (id.as_str(), record))
+                    .collect(),
+            };
+
+        let page = crate::state::paginate(
+            PAGE_TOKEN_KIND,
+            selected,
+            input.max_results,
+            input.next_token.as_deref(),
+            crate::state::ReplicationConfigurationTemplateRecord::to_wire,
+        )
+        .map_err(|message| {
+            DescribeReplicationConfigurationTemplatesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message.clone()),
+                    code: None,
+                    reason: None,
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: Some("nextToken".to_string()),
+                        message: Some(message),
+                    }]),
+                },
+            )
+        })?;
+
+        Ok(DescribeReplicationConfigurationTemplatesOutput {
+            items: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

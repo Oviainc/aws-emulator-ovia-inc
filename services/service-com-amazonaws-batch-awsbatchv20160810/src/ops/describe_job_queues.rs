@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeJobQueues
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeJobQueues`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the job queues [`crate::state`] holds, resolved by name OR ARN, with an
+//! entry that names none omitted rather than failing the call. With no filter it reports
+//! every queue, by name. Paginated through `maxResults`/`nextToken`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeJobQueues::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It is a REPORTING operation: it materialises only the `CREATING` -> `VALID` move the
+//! clock already owed.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +156,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeJobQueues` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeJobQueuesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeJobQueues"))
+        use crate::state as batch;
+
+        let _ = ctx;
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(
+                DescribeJobQueuesErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        let requested = input.job_queues.unwrap_or_default();
+        let mut seen = ::std::collections::HashSet::new();
+        let selected: Vec<batch::JobQueue> = if requested.is_empty() {
+            let mut names: Vec<&String> = state.job_queues.keys().collect();
+            names.sort();
+            names
+                .into_iter()
+                .filter_map(|name| state.job_queues.get(name))
+                .cloned()
+                .collect()
+        } else {
+            requested
+                .iter()
+                .filter_map(|reference| state.job_queue(reference))
+                .filter(|queue| seen.insert(queue.arn.clone()))
+                .cloned()
+                .collect()
+        };
+
+        let (page, next_token) =
+            batch::paginate(selected, input.max_results, input.next_token.as_deref()).map_err(
+                |message| {
+                    DescribeJobQueuesError::from(DescribeJobQueuesErrorModeled::ClientException(
+                        batch::client_exception(message),
+                    ))
+                },
+            )?;
+
+        let details = page
+            .into_iter()
+            .map(|queue| JobQueueDetail {
+                job_queue_name: queue.name,
+                job_queue_arn: queue.arn,
+                state: queue.state,
+                scheduling_policy_arn: queue.scheduling_policy_arn,
+                status: Some(queue.status),
+                status_reason: queue.status_reason,
+                priority: queue.priority,
+                compute_environment_order: queue.compute_environment_order,
+                service_environment_order: queue.service_environment_order,
+                job_queue_type: queue.job_queue_type,
+                tags: queue.tags,
+                job_state_time_limit_actions: queue.job_state_time_limit_actions,
+            })
+            .collect();
+
+        Ok(DescribeJobQueuesOutput {
+            job_queues: Some(details),
+            next_token,
+        })
     }
 }

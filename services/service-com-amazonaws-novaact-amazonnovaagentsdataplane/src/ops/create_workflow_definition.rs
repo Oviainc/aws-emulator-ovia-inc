@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkflowDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkflowDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Inserts a workflow definition record keyed by its name — the model requires the name
+//! to be unique within an account and region — and answers 201 with the stored record's
+//! status.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkflowDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation is `@idempotent`, so repeating it must have the effect of calling it
+//! once: the same `clientToken`, or an identical body for a name that already exists,
+//! replays the stored definition's status, while a name that already exists with a
+//! DIFFERENT body conflicts with the current state of that resource and answers 409.
+//! Every value it answers with comes from the record it stored.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +159,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkflowDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkflowDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkflowDefinition"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWorkflowDefinitionErrorModeled::InternalServerException(InternalServerException {
+                message: "the com-amazonaws-novaact-amazonnovaagentsdataplane store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+                reason: None,
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.complete_due_deletions(now);
+
+        // Everything the caller can vary about this create. Two requests with the same
+        // fingerprint are the same call, which is what `@idempotent` lets us replay.
+        let fingerprint = crate::state::fingerprint(&[
+            input.name.clone(),
+            crate::state::field(input.description.as_ref()),
+            crate::state::structural_field(&input.export_config),
+        ]);
+
+        // A `clientToken` already seen on this operation replays its first result,
+        // re-read from the definition it created.
+        let replay = input
+            .client_token
+            .as_deref()
+            .and_then(|token| state.idempotent_create(Self::NAME, token).cloned());
+        if let Some(record) = replay {
+            if record.fingerprint != fingerprint {
+                return Err(CreateWorkflowDefinitionErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "clientToken was already used to create workflow definition {} with different parameters",
+                            record.resource_id
+                        ),
+                        resource_id: record.resource_id,
+                        resource_type: "workflow-definition".to_string(),
+                    },
+                )
+                .into());
+            }
+            // Replay only an ACTIVE definition: once it is DELETING the repeat is
+            // answered the same way an untokened repeat is, by the name path below, so
+            // the same request cannot get two different answers depending on whether a
+            // token was sent.
+            if let Ok(definition) = state.definition(&record.resource_id) {
+                if definition.status == crate::state::WorkflowDefinitionStatus::Active {
+                    return Ok(CreateWorkflowDefinitionOutput {
+                        status: definition.status.as_wire().to_string(),
+                    });
+                }
+            }
+            // The definition that token created is being deleted, or has been: fall
+            // through to the name path, which conflicts while it is still held and
+            // creates it again once it is gone.
+        }
+
+        let existing = state
+            .definition(&input.name)
+            .ok()
+            .map(|definition| (definition.status, definition.create_fingerprint.clone()));
+        if let Some((status, stored_fingerprint)) = existing {
+            let identical_repeat = status == crate::state::WorkflowDefinitionStatus::Active
+                && stored_fingerprint == fingerprint;
+            if !identical_repeat {
+                return Err(CreateWorkflowDefinitionErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "workflow definition {} already exists with status {}",
+                            input.name,
+                            status.as_wire()
+                        ),
+                        resource_id: input.name.clone(),
+                        resource_type: "workflow-definition".to_string(),
+                    },
+                )
+                .into());
+            }
+            if let Some(token) = input.client_token.as_deref() {
+                state.record_idempotent_create(Self::NAME, token, fingerprint, input.name.clone());
+            }
+            return Ok(CreateWorkflowDefinitionOutput {
+                status: status.as_wire().to_string(),
+            });
+        }
+
+        // The store is bounded: a create past the cap is refused, never grown into.
+        state.check_definition_quota().map_err(|quota| {
+            CreateWorkflowDefinitionErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: quota.message(&input.name),
+                    resource_id: input.name.clone(),
+                    resource_type: quota.resource_type().to_string(),
+                    service_code: crate::state::SERVICE_CODE.to_string(),
+                    quota_code: quota.code().to_string(),
+                },
+            )
+        })?;
+
+        let insertion_seq = state.next_insertion_seq();
+        let definition = crate::state::WorkflowDefinition {
+            name: input.name.clone(),
+            arn: crate::state::workflow_definition_arn(&region, &input.name),
+            created_at: now,
+            description: input.description.clone(),
+            export_config: input.export_config.clone(),
+            // A definition AWS returns from a create is usable at once, so it is stored
+            // ACTIVE rather than in a transient status.
+            status: crate::state::WorkflowDefinitionStatus::Active,
+            deletion_due_at: None,
+            create_fingerprint: fingerprint.clone(),
+            runs: ::std::collections::BTreeMap::new(),
+            insertion_seq,
+        };
+        let status = definition.status.as_wire().to_string();
+        state
+            .workflow_definitions
+            .insert(input.name.clone(), definition);
+        if let Some(token) = input.client_token.as_deref() {
+            state.record_idempotent_create(Self::NAME, token, fingerprint, input.name.clone());
+        }
+
+        Ok(CreateWorkflowDefinitionOutput { status })
     }
 }

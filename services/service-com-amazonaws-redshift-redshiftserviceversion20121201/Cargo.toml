@@ -21,13 +21,23 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Stable, content-addressed derivation of a cluster's endpoint host token and
+# namespace id (never a per-run value).
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# `tokio`'s timer, for the one test that waits out a clock-owed transition. The
+# crate's regular dependency on tokio keeps the workspace feature set; features
+# are additive and are not recorded in Cargo.lock, so this adds no locked
+# package. The suite deliberately adds NO other dev-dependency: a new lockfile
+# entry cannot be squash-merged against a mainline that rewrites Cargo.lock
+# continuously, so the XML reader and the form encoder it needs are local to
+# `tests/all/cluster_lifecycle.rs` and documented there.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

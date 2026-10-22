@@ -8,11 +8,11 @@
 //! mounts, so a response that is not computed from persisted state fails here.
 //!
 //! The events themselves are SEEDED into the shared store (the state struct is
-//! this crate's own) rather than created through the API: the operation that
-//! mints an automation event, `StartAutomationEvent`, is still a scaffold stub
-//! with its own issue. The harness below is this suite's own because it has to
-//! hand the engine back for that seeding — the rule-lifecycle suite's helpers
-//! are private to it and keep their engine.
+//! this crate's own) rather than created through the API: an event created
+//! through `StartAutomationEvent` needs a stored recommended action, which only
+//! Compute Optimizer's analysis produces. The harness below hands the engine
+//! back for that seeding, and is `pub(crate)` so the sibling suites that also
+//! have to seed share it.
 
 use std::sync::Arc;
 
@@ -27,7 +27,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// A router with one freshly-engined copy of this service mounted, plus the
 /// engine itself so a case can seed the store the handlers read.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Deterministic regardless of the process-wide default: these cases are
@@ -170,6 +170,9 @@ fn stored_event(
         created_timestamp: DateTime::from_secs(created_secs),
         completed_timestamp: None,
         estimated_monthly_savings: None,
+        // A seeded event is already in the status it names, so the clock owes it
+        // no transition.
+        settles_at: None,
     }
 }
 

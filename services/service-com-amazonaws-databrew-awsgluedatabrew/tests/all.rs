@@ -13,5 +13,9 @@
 // points it into `tests/all/`.
 #[path = "all/databrew_core_loop.rs"]
 mod databrew_core_loop;
+#[path = "all/databrew_harness.rs"]
+mod databrew_harness;
+#[path = "all/dataset_update_lifecycle.rs"]
+mod dataset_update_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

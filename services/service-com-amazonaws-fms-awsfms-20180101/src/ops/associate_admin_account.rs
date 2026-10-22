@@ -1,15 +1,37 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateAdminAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateAdminAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateAdminAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the Firewall Manager default administrator account, persisting it in
+//! [`crate::state::ComAmazonawsFmsAwsfms20180101State::admin_account`] so
+//! `GetAdminAccount` reports it. The organisation has exactly ONE default
+//! administrator, so associating a DIFFERENT account while one is associated is
+//! `InvalidOperationException`; re-associating the same account is idempotent
+//! and leaves the existing association (and its timestamp) untouched.
+//!
+//! ### Why the same account is a 200 and a different one is the error
+//!
+//! `InvalidOperationException`'s documentation (reproduced under `## Errors`
+//! below) illustrates the error with "you might have submitted an
+//! AssociateAdminAccount request for an account ID that was already set as the
+//! Firewall Manager administrator". That sentence is an EXAMPLE of the error's
+//! class — "there was nothing to do or the operation wasn't possible" — not a
+//! statement that this request must fail. The pairing implemented here reads it
+//! as the "nothing to do / not possible" class and resolves the two cases the
+//! class covers in the only self-consistent way:
+//!
+//! * a DIFFERENT account while one is associated is genuinely NOT POSSIBLE —
+//!   there is one default administrator per organisation, and the model offers no
+//!   way to replace it in a single call (`DisassociateAdminAccount` exists for
+//!   that), so this is the branch that errors;
+//! * the SAME account is already in the state the caller asked for, so answering
+//!   200 keeps the call IDEMPOTENT — the property a client retrying a timed-out
+//!   or replayed request depends on, and the reason a bare "nothing to do" is not
+//!   treated as a failure here.
+//!
+//! This is also the pairing the bootstrap issue's plan prescribes. Revisit the
+//! branch when `DisassociateAdminAccount` lands, since that is the operation the
+//! replacement path goes through.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +198,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateAdminAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateAdminAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateAdminAccount"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AssociateAdminAccountErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        match &store.admin_account {
+            // Idempotent re-association: this account already IS the default
+            // administrator, so there is nothing to change.
+            Some(existing) if existing.account_id == input.admin_account => {
+                Ok(AssociateAdminAccountOutput)
+            }
+            // A different account is already associated. An organisation has one
+            // default administrator, so there is no second association to make —
+            // which is what `InvalidOperationException` reports.
+            Some(existing) => Err(AssociateAdminAccountErrorModeled::InvalidOperationException(
+                InvalidOperationException {
+                    message: Some(format!(
+                        "account {} is already set as the Firewall Manager administrator",
+                        existing.account_id
+                    )),
+                },
+            )
+            .into()),
+            None => {
+                store.admin_account = Some(crate::state::AdminAccountRecord {
+                    account_id: input.admin_account.clone(),
+                    role_status: crate::state::ROLE_STATUS_READY.to_string(),
+                    associated_at: ::std::time::SystemTime::now(),
+                });
+                Ok(AssociateAdminAccountOutput)
+            }
+        }
     }
 }

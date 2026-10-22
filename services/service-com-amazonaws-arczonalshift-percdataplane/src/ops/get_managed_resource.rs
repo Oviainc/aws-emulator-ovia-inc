@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetManagedResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetManagedResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetManagedResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one managed resource from the store: its zonal shifts in progress and the
+//! `appliedWeights` they move, both derived from the shifts the store holds.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +89,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -169,18 +163,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetManagedResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetManagedResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetManagedResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetManagedResourceError::from(GetManagedResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the ARC zonal shift store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let mut store = state.lock();
+        // Reporting only: the one write here materialises the status change the clock
+        // already made due — a shift past its expiry time is EXPIRED, and so is no
+        // longer applied to the resource — which was owed whether or not anybody read.
+        store.expire_due_shifts(SystemTime::now());
+
+        let Some(resource) = store.managed_resources.get(&input.resource_identifier) else {
+            return Err(GetManagedResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no managed resource is registered with ARC for resourceIdentifier {}",
+                        input.resource_identifier
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetManagedResourceOutput {
+            arn: Some(resource.arn.clone()),
+            name: Some(resource.name.clone()),
+            autoshifts: Some(resource.autoshifts.clone()),
+            practice_run_configuration: resource.practice_run_configuration.clone(),
+            zonal_autoshift_status: Some(resource.zonal_autoshift_status.as_wire().to_string()),
+            applied_weights: store.applied_weights(&input.resource_identifier),
+            zonal_shifts: store.zonal_shifts_in_resource(&input.resource_identifier),
+        })
     }
 }

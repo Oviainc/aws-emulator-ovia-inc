@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPermissionSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPermissionSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enumerates the ARNs of the permission sets stored for one instance in
+//! this service's state (`crate::state`). This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPermissionSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read, paged by `MaxResults` with a `NextToken` that resumes from the ARN the
+//! previous page ended on, and absent on the last page.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +157,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPermissionSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPermissionSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPermissionSets"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPermissionSetsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+
+        // The cursor is scoped to THIS enumeration: the operation and the instance
+        // whose permission sets it walks.
+        let scope = crate::state::cursor_permission_sets(&input.instance_arn);
+        let after = crate::state::cursor_after(&scope, input.next_token.as_deref()).map_err(
+            |message| {
+                ListPermissionSetsErrorModeled::ValidationException(ValidationException {
+                    message: Some(message.to_string()),
+                    reason: None,
+                })
+            },
+        )?;
+
+        let ordered: Vec<(String, String)> = {
+            let store = state.lock();
+            if store.instance(&input.instance_arn).is_none() {
+                return Err(ListPermissionSetsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No instance found with the ARN {}",
+                            input.instance_arn
+                        )),
+                        reason: None,
+                    },
+                )
+                .into());
+            }
+            // Exactly the ARNs currently stored for this instance, in ARN order, which
+            // is both the page order and the cursor order.
+            store
+                .permission_sets
+                .values()
+                .filter(|record| record.instance_arn == input.instance_arn)
+                .map(|record| {
+                    (
+                        record.permission_set_arn.clone(),
+                        record.permission_set_arn.clone(),
+                    )
+                })
+                .collect()
+        };
+
+        let (permission_sets, next_token) =
+            crate::state::page(&scope, ordered, after.as_deref(), input.max_results);
+        Ok(ListPermissionSetsOutput {
+            permission_sets: Some(permission_sets),
+            next_token,
+        })
     }
 }

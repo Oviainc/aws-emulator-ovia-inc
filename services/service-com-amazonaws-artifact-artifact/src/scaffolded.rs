@@ -40,6 +40,17 @@
 //! place it can return an error its own model does not declare — `validation` above,
 //! for a service whose model carries no client-input error. Delete the wrapper and the
 //! handler has no way to refuse a bad request at all.
+//!
+//! ## The front door's refusals
+//!
+//! AWS Artifact is served through a gateway that authorizes the targeted resource and
+//! validates the request envelope BEFORE the service runs, and answers in shapes this
+//! service's model does not declare (`UnauthorizedException`, `BadRequestException`).
+//! [`FrontDoorRefusal`] is that answer, and `Scaffolded::FrontDoor` is how a handler
+//! states it for the one decision the gateway cannot make without this service's state:
+//! whether the account's catalog holds the resource the request names. The refusals the
+//! gateway makes before dispatch are answered in `crate::service`, which never reaches
+//! a handler.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -177,6 +188,110 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic front-door error shape.
+static FRONT_DOOR_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#FrontDoorRefusal$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic front-door error shape — the body of a refusal the AWS
+/// gateway in FRONT of this service states, which never reaches the service at all.
+///
+/// In the `smithy.framework` namespace for the same reason as [`NOT_IMPLEMENTED_SCHEMA`]:
+/// neither `UnauthorizedException` nor `BadRequestException` is a shape this service's
+/// model declares, so the shape must not collide with a modeled one. ONE schema serves
+/// both because a schema only shapes the BODY (`{"message": …}`); the wire error code
+/// and the status travel beside it, from [`FrontDoorRefusal`].
+pub static FRONT_DOOR_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#FrontDoorRefusal",
+        "smithy.framework",
+        "FrontDoorRefusal",
+    ),
+    ShapeType::Structure,
+    &[&FRONT_DOOR_MESSAGE],
+);
+
+/// The wire error code of the gateway's authorization refusal.
+pub const UNAUTHORIZED_CODE: &str = "UnauthorizedException";
+/// The HTTP status of the gateway's authorization refusal.
+pub const UNAUTHORIZED_STATUS: u16 = 401;
+/// The gateway's own text for an authorization refusal: a CONSTANT it states for every
+/// such refusal, carrying nothing from the request (there is no per-request detail in
+/// it to derive).
+pub const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
+/// The wire error code of the gateway's request-body refusal.
+pub const BAD_REQUEST_CODE: &str = "BadRequestException";
+/// The HTTP status of the gateway's request-body refusal.
+pub const BAD_REQUEST_STATUS: u16 = 400;
+/// The gateway's own text for a request body it cannot bind to the modelled shape —
+/// like [`UNAUTHORIZED_MESSAGE`], one constant for every such refusal: the gateway
+/// names neither the member nor the constraint (that is the SERVICE's
+/// `ValidationException`, which does).
+pub const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
+
+/// One refusal stated by the AWS front door — the gateway that authorizes the targeted
+/// resource and validates the request envelope BEFORE this service runs.
+///
+/// It carries its own wire code and status because the shape is not in the model: the
+/// two refusals this service's front door states are
+/// [`unauthorized`](Self::unauthorized) (HTTP 401 `UnauthorizedException`) and
+/// [`invalid_request_body`](Self::invalid_request_body) (HTTP 400
+/// `BadRequestException`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrontDoorRefusal {
+    /// The wire error code (`__type` and `x-amzn-errortype`).
+    pub code: &'static str,
+    /// The HTTP status.
+    pub status: u16,
+    /// The gateway's constant message for this refusal.
+    pub message: &'static str,
+}
+
+impl FrontDoorRefusal {
+    /// The refusal of a request whose targeted resource the front door cannot
+    /// authorize: HTTP 401 `UnauthorizedException`.
+    pub const fn unauthorized() -> Self {
+        Self {
+            code: UNAUTHORIZED_CODE,
+            status: UNAUTHORIZED_STATUS,
+            message: UNAUTHORIZED_MESSAGE,
+        }
+    }
+
+    /// The refusal of a request whose BODY the front door cannot bind to the modelled
+    /// shape: HTTP 400 `BadRequestException`.
+    pub const fn invalid_request_body() -> Self {
+        Self {
+            code: BAD_REQUEST_CODE,
+            status: BAD_REQUEST_STATUS,
+            message: INVALID_REQUEST_BODY_MESSAGE,
+        }
+    }
+}
+
+impl std::fmt::Display for FrontDoorRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for FrontDoorRefusal {}
+
+impl SerializableStruct for FrontDoorRefusal {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&FRONT_DOOR_MESSAGE, self.message)?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +300,15 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// A refusal the AWS front door states before this service runs, whose shape the
+    /// model does not declare — so it cannot travel as [`Modeled`](Self::Modeled).
+    /// Renders with the status and code the refusal itself carries.
+    ///
+    /// The front door's own pre-dispatch refusals are answered in `crate::service`,
+    /// which never reaches a handler; this variant is for the same refusal reached
+    /// from INSIDE a handler, where the decision needs this service's state — a
+    /// request naming a resource the account's catalog does not hold.
+    FrontDoor(FrontDoorRefusal),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -202,6 +326,17 @@ impl<E> Scaffolded<E> {
     /// The scaffold signal for `operation`.
     pub fn not_implemented(operation: &str) -> Self {
         Self::NotImplemented(NotImplemented::new(operation))
+    }
+
+    /// Refuse the request the way the front door does when it cannot authorize the
+    /// resource the request targets: HTTP 401 `UnauthorizedException`.
+    ///
+    /// Reach for this from a handler when the decision needs this service's state —
+    /// whether the account's catalog holds the named resource at all. A target the
+    /// front door can judge without state (an identifier that is not a well-formed id
+    /// of its type) is refused in `crate::service`, before any handler runs.
+    pub const fn unauthorized() -> Self {
+        Self::FrontDoor(FrontDoorRefusal::unauthorized())
     }
 
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.
@@ -228,6 +363,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::FrontDoor(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +376,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::FrontDoor(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +391,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::FrontDoor(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +400,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::FrontDoor(_) => &FRONT_DOOR_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +413,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            // The front door's own code, carried on the refusal: the gateway states
+            // `UnauthorizedException` / `BadRequestException`, neither of which this
+            // service's model declares.
+            Self::FrontDoor(e) => e.code,
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +429,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            Self::FrontDoor(e) => e.status,
             Self::ValidationException(_) => 400,
         }
     }
@@ -297,6 +441,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
+            // Same reason: the front door's shape carries no `awsQueryError` trait —
+            // and this service is restJson1, which has no query envelope at all.
+            Self::FrontDoor(_) => None,
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
         }

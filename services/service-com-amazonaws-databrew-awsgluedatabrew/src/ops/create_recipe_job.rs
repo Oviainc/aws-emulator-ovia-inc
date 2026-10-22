@@ -192,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let principal = crate::state::request_principal(ctx);
+        let principal = crate::state::request_principal();
         let record = crate::state::JobRecord {
             name: input.name.clone(),
             // The job this operation creates runs a recipe, so its modelled `JobType`
@@ -215,16 +215,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "job",
                 &input.name,
             ),
-            create_date: now,
-            created_by: principal.clone(),
-            last_modified_date: now,
-            last_modified_by: principal,
+            // A job that has only been created has no modification to report, so the
+            // audit's last-modified pair stays unset until an update runs.
+            audit: crate::state::Audit::created(now, principal),
         };
 
         let mut store = state.lock();
         if store.jobs.contains_key(&input.name) {
             return Err(CreateRecipeJobErrorModeled::ConflictException(ConflictException {
-                message: Some(format!("The job {} already exists.", input.name)),
+                message: Some(crate::state::already_exists_message("Job", &input.name)),
             })
             .into());
         }
@@ -234,9 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !store.datasets.contains_key(dataset_name) {
                 return Err(CreateRecipeJobErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "One or more resources can't be found. The dataset {dataset_name} was not found."
-                        )),
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
                 .into());
