@@ -210,32 +210,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An update changes an endpoint this service holds; there is nothing to update
         // for an id it does not, so the target is resolved before the request is judged.
-        let Some(record) = state.origin_endpoints.get_mut(&id) else {
-            return Err(UpdateOriginEndpointErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("OriginEndpoint with ID \"{id}\" not found.")),
-            })
-            .into());
-        };
+        if !state.origin_endpoints.contains_key(&id) {
+            return Err(crate::state::origin_endpoint_not_found(&id).into());
+        }
 
         // Bound what the caller may make this record cost, before anything is written,
         // with the same function the create bounds its request with: an update must not
-        // be able to grow a record past what a create of it would have refused.
-        let refuse = |message: String| {
-            UpdateOriginEndpointError::from(
-                UpdateOriginEndpointErrorModeled::UnprocessableEntityException(
-                    UnprocessableEntityException {
-                        message: Some(message),
-                    },
-                ),
-            )
-        };
+        // be able to grow a record past what a create of it would have refused. Each
+        // refusal is this service's own envelope, keyed by the member it is about.
         crate::state::bound_origin_endpoint_members(
             input.description.as_deref(),
             input.manifest_name.as_deref(),
             input.whitelist.as_deref(),
             input.cmaf_package.as_ref(),
-        )
-        .map_err(refuse)?;
+        )?;
 
         // An endpoint packages its channel in exactly ONE format, so a request naming
         // several cannot be stored — the same rule, decided by the same function, as on
@@ -247,8 +235,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.mss_package.is_some(),
         ) {
             Ok(kind) => kind,
-            Err(supplied) => return Err(refuse(crate::state::packaging_refusal(&supplied))),
+            Err(supplied) => return Err(crate::state::packaging_refusal(&supplied).into()),
         };
+
+        let record = state
+            .origin_endpoints
+            .get_mut(&id)
+            .expect("the endpoint resolved above, under this one hold of the lock");
 
         // Values the SERVICE derives are re-derived from the endpoint's own region and
         // channel, never from the region this particular request was signed for, so an

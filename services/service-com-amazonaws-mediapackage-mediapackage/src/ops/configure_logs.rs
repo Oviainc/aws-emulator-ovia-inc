@@ -163,32 +163,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for an id this service does not hold; the target is resolved before the request
         // is judged.
         if !state.channels.contains_key(&input.id) {
-            return Err(ConfigureLogsErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Channel with ID \"{}\" not found.", input.id)),
-            })
-            .into());
+            return Err(crate::state::channel_not_found(&input.id).into());
         }
 
         // The two log-group names are the only caller-supplied strings this operation
-        // stores, and they are bounded before anything is written.
-        let refuse = |message: String| {
-            ConfigureLogsError::from(ConfigureLogsErrorModeled::UnprocessableEntityException(
-                UnprocessableEntityException {
-                    message: Some(message),
-                },
-            ))
-        };
+        // stores, and they are bounded before anything is written. Each refusal is this
+        // service's own envelope, keyed by the member it is about.
         let ingress_log_group_name = input
             .ingress_access_logs
             .and_then(|logs| logs.log_group_name);
         let egress_log_group_name = input.egress_access_logs.and_then(|logs| logs.log_group_name);
         for (member, value) in [
-            ("IngressAccessLogs.LogGroupName", &ingress_log_group_name),
-            ("EgressAccessLogs.LogGroupName", &egress_log_group_name),
+            ("ingressAccessLogs.logGroupName", &ingress_log_group_name),
+            ("egressAccessLogs.logGroupName", &egress_log_group_name),
         ] {
             if let Some(value) = value {
-                crate::state::bound_chars(member, value, crate::state::MAX_STRING_CHARS)
-                    .map_err(refuse)?;
+                crate::state::bound_chars(member, value, crate::state::MAX_STRING_CHARS)?;
             }
         }
 

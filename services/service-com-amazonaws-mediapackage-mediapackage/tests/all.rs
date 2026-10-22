@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
+#[path = "all/error_envelope.rs"]
+mod error_envelope;
 #[path = "all/ingest_credentials.rs"]
 mod ingest_credentials;
 #[path = "all/mutation_persistence.rs"]
