@@ -4,8 +4,9 @@
 //!
 //! Every implemented CodeBuild operation computes its answer from the records
 //! here: `CreateProject` writes a [`Project`], `StartBuild` writes a
-//! [`StoredBuild`], and the reporting operations (`BatchGetProjects`,
-//! `BatchGetBuilds`, `ListProjects`, `ListBuildsForProject`) only read them.
+//! [`StoredBuild`], `StartSandbox` writes a [`StoredSandbox`], and the reporting
+//! operations (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetSandboxes`,
+//! `ListProjects`, `ListBuildsForProject`) only read them.
 //!
 //! The model shapes themselves are what is stored, so a read hands back exactly
 //! the structure the write persisted rather than a second, drifting copy of the
@@ -13,7 +14,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::ops::types::{Build, BuildPhase, PhaseContext, Project};
+use crate::ops::types::{
+    Build, BuildPhase, PhaseContext, Project, Sandbox, SandboxSession, SandboxSessionPhase,
+};
 
 /// The ARN service segment for this service, as `emulator_arn`'s first argument
 /// (`arn:aws:codebuild:<region>:<account>:<resource>`). Taken from the model's
@@ -41,10 +44,25 @@ pub const DEFAULT_BUILD_TIMEOUT_MINUTES: i32 = 60;
 /// stop it. The due instant is stored, never slept on.
 pub const BUILD_SETTLE_MILLIS: i64 = 750;
 
+/// How long after `StartSandbox` the clock owes a sandbox's move out of `QUEUED`.
+///
+/// AWS documents no provisioning time for a sandbox, so this span is CHOSEN, inside
+/// the 250-750 ms band this project fixes for an emulated transition. It is
+/// deliberately not zero: a caller that reads the sandbox straight after starting it
+/// still observes `QUEUED`. The due instant is stored, never slept on.
+pub const SANDBOX_SETTLE_MILLIS: i64 = 500;
+
 /// How long a `StartBuild` idempotency token stays in force. AWS documents it on
 /// `StartBuildInput$idempotencyToken`: "The token is included in the StartBuild
 /// request and is valid for 5 minutes."
 pub const IDEMPOTENCY_TOKEN_TTL_MILLIS: i64 = 5 * 60 * 1000;
+
+/// How long a `StartSandbox` idempotency token stays in force.
+///
+/// AWS documents `StartSandboxInput$idempotencyToken` as only "A unique client
+/// token" and states no lifetime for it, so this span is CHOSEN: it is the 5 minutes
+/// CodeBuild documents for its nearest documented sibling, `StartBuild`'s token.
+pub const SANDBOX_IDEMPOTENCY_TOKEN_TTL_MILLIS: i64 = IDEMPOTENCY_TOKEN_TTL_MILLIS;
 
 /// Entries one page of a list operation may carry. The model caps both paginated
 /// outputs implemented here at 100 entries — `ListBuildsForProject$ids` targets
@@ -89,6 +107,32 @@ pub const MAX_IDEMPOTENCY_TOKENS: usize = 10_000;
 /// environment instead), and this is far above any real buildspec's variable set.
 pub const MAX_ENVIRONMENT_VARIABLES: usize = 1_000;
 
+/// Entries one `BatchGetSandboxes` request may ask for.
+///
+/// THIS CEILING IS THE EMULATOR'S, NOT AWS'S: `SandboxIds` carries no `@length`, so
+/// the framework's pre-handler constraint walk caps nothing and the entry count is
+/// the caller's alone — yet each entry copies a whole sandbox record (its source,
+/// environment, secondary sources and session phases) into the response, so the count
+/// is what the answer's size is a multiple of. This emulator therefore declares its
+/// own ceiling and answers the modelled `InvalidInputException` past it, the way it
+/// does for a modelled bound. The number is the one the model puts on the sibling
+/// `BuildIds` (`@length(min: 1, max: 100)`), which bounds `BatchGetBuilds`.
+pub const MAX_BATCH_GET_SANDBOXES_IDS: usize = MAX_PAGE_SIZE;
+
+/// Sandbox records this emulator retains, across every project.
+///
+/// A sandbox is minted by each `StartSandbox` rather than being a resource the
+/// caller deletes, so the store needs a ceiling at that growth site: past this,
+/// [`ComAmazonawsCodebuildCodebuild20161006State::insert_sandbox`] evicts the oldest
+/// sandbox (preferring one that has already reached a terminal status), which also
+/// prunes `sandboxes_by_project`. THIS NUMBER IS THE EMULATOR'S, NOT AWS'S — real
+/// CodeBuild caps concurrently running sandboxes by account quota instead.
+pub const MAX_SANDBOXES: usize = 1_000;
+
+/// `StartSandbox` idempotency entries retained at once — the same backstop
+/// [`MAX_IDEMPOTENCY_TOKENS`] is for `StartBuild`'s, for the same reason.
+pub const MAX_SANDBOX_IDEMPOTENCY_TOKENS: usize = MAX_IDEMPOTENCY_TOKENS;
+
 /// Why an emulated build never reaches `SUCCEEDED`.
 ///
 /// Nothing in this emulator executes a CodeBuild build container, so a build
@@ -97,6 +141,27 @@ pub const MAX_ENVIRONMENT_VARIABLES: usize = 1_000;
 /// explanation as the failing phase's context.
 pub const BUILD_NOT_EXECUTED_MESSAGE: &str = "this emulator does not run CodeBuild build \
     containers, so the build could not be provisioned and no buildspec was executed";
+
+/// Why an emulated sandbox never becomes connectable.
+///
+/// A sandbox IS a running container a caller attaches a Session Manager session to
+/// and runs commands in; nothing in this emulator starts one, so the sandbox cannot
+/// report a live session for an environment that was never provisioned. Its session
+/// ends instead in CodeBuild's own build-system failure status, `FAULT` (which the
+/// model documents on `SandboxSessionPhase$phaseStatus` as "The sandbox phase
+/// faulted"), carrying this explanation as the failing phase's context.
+pub const SANDBOX_NOT_PROVISIONED_MESSAGE: &str = "this emulator does not run CodeBuild sandbox \
+    containers, so the sandbox could not be provisioned and no session was established";
+
+/// The status a sandbox and its session report between `StartSandbox` and the
+/// transition the clock owes them: CodeBuild queues a sandbox request the same way it
+/// queues a build.
+pub const SANDBOX_STATUS_QUEUED: &str = "QUEUED";
+
+/// The terminal status an emulated sandbox and its session reach, for the reason
+/// [`SANDBOX_NOT_PROVISIONED_MESSAGE`] gives. `FAULT` is a `StatusType` value, which
+/// is the enum the model puts on a sandbox session's phase status.
+pub const SANDBOX_STATUS_FAULT: &str = "FAULT";
 
 /// Per-service state for com-amazonaws-codebuild-codebuild-20161006. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -114,6 +179,18 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     pub next_build_numbers: BTreeMap<String, i64>,
     /// `StartBuild` idempotency tokens, keyed by (project name, token).
     pub start_build_tokens: BTreeMap<(String, String), StartBuildToken>,
+    /// Sandboxes, keyed by sandbox id (`<projectName>:<uuid>`).
+    pub sandboxes: BTreeMap<String, StoredSandbox>,
+    /// Sandbox ids per project, in start order — which is the order
+    /// `ListSandboxesForProject` reports them in, so a list operation pages over
+    /// this without re-reading every sandbox.
+    pub sandboxes_by_project: BTreeMap<String, Vec<String>>,
+    /// The next per-project sandbox sequence number to hand out. It is not a
+    /// modelled member: it is what makes a sandbox's derived id unique when two
+    /// sandboxes of one project are requested in the same millisecond.
+    pub next_sandbox_numbers: BTreeMap<String, i64>,
+    /// `StartSandbox` idempotency tokens, keyed by (project name, token).
+    pub start_sandbox_tokens: BTreeMap<(String, String), StartSandboxToken>,
 }
 
 /// A persisted build project: the modelled [`Project`] plus the instants its
@@ -142,6 +219,35 @@ pub struct StoredBuild {
     pub settle_due_millis: i64,
 }
 
+/// A persisted sandbox: the modelled [`Sandbox`] plus the instants its timestamps
+/// report and the instant at which the clock owes its move out of `QUEUED`.
+#[derive(Debug, Clone)]
+pub struct StoredSandbox {
+    /// The record every reader hands back.
+    pub sandbox: Sandbox,
+    /// Epoch millis the sandbox was requested at — the same instant
+    /// `sandbox.requestTime` reports, kept as the integer the phase arithmetic uses.
+    pub request_millis: i64,
+    /// Epoch millis at which this sandbox's transition out of `QUEUED` became due.
+    pub settle_due_millis: i64,
+}
+
+/// What one in-force `StartSandbox` idempotency token resolved to. The sibling of
+/// [`StartBuildToken`], keyed and retired by the same rules.
+///
+/// It keeps no request fingerprint, because unlike `StartBuild` there is nothing
+/// left to mismatch: `StartSandbox`'s only other member is `projectName`, which is
+/// already half of the key, so a repeat that reaches an entry carries exactly the
+/// request that issued it.
+#[derive(Debug, Clone)]
+pub struct StartSandboxToken {
+    /// The sandbox the first request with this token started.
+    pub sandbox_id: String,
+    /// Epoch millis the token was issued at; it expires
+    /// [`SANDBOX_IDEMPOTENCY_TOKEN_TTL_MILLIS`] later.
+    pub issued_millis: i64,
+}
+
 /// What one in-force `StartBuild` idempotency token resolved to.
 #[derive(Debug, Clone)]
 pub struct StartBuildToken {
@@ -159,13 +265,13 @@ pub struct StartBuildToken {
 impl ComAmazonawsCodebuildCodebuild20161006State {
     /// Hand out `project_name`'s next `buildNumber` and advance the counter.
     pub fn allocate_build_number(&mut self, project_name: &str) -> i64 {
-        let slot = self
-            .next_build_numbers
-            .entry(project_name.to_string())
-            .or_insert(1);
-        let number = *slot;
-        *slot += 1;
-        number
+        allocate_number(&mut self.next_build_numbers, project_name)
+    }
+
+    /// Hand out `project_name`'s next sandbox sequence number and advance the
+    /// counter. Like a `buildNumber`, a number is never reused for a project.
+    pub fn allocate_sandbox_number(&mut self, project_name: &str) -> i64 {
+        allocate_number(&mut self.next_sandbox_numbers, project_name)
     }
 
     /// Persist `stored` under `id` and record it as the newest build of its
@@ -247,18 +353,14 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         token: StartBuildToken,
         now_millis: i64,
     ) {
-        self.start_build_tokens
-            .retain(|_, held| now_millis - held.issued_millis < IDEMPOTENCY_TOKEN_TTL_MILLIS);
-        self.start_build_tokens.insert(key, token);
-        while self.start_build_tokens.len() > MAX_IDEMPOTENCY_TOKENS {
-            let oldest = self
-                .start_build_tokens
-                .iter()
-                .min_by_key(|(_, held)| held.issued_millis)
-                .map(|(key, _)| key.clone());
-            let Some(oldest) = oldest else { break };
-            self.start_build_tokens.remove(&oldest);
-        }
+        record_token(
+            &mut self.start_build_tokens,
+            key,
+            token,
+            now_millis,
+            IDEMPOTENCY_TOKEN_TTL_MILLIS,
+            MAX_IDEMPOTENCY_TOKENS,
+        );
     }
 
     /// Read a build, first materialising the transition the clock already owes
@@ -270,6 +372,145 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         let stored = self.builds.get_mut(id)?;
         stored.settle(now_millis);
         Some(stored)
+    }
+
+    /// Persist `stored` under `id` and record it as the newest sandbox of its
+    /// project, then bring the store back inside [`MAX_SANDBOXES`]. The sibling of
+    /// [`Self::insert_build`], and the id is a parameter for the same reason.
+    pub fn insert_sandbox(&mut self, id: String, stored: StoredSandbox) {
+        if let Some(project_name) = stored.sandbox.project_name.clone() {
+            self.sandboxes_by_project
+                .entry(project_name)
+                .or_default()
+                .push(id.clone());
+        }
+        self.sandboxes.insert(id, stored);
+        self.enforce_sandbox_ceiling();
+    }
+
+    /// Evict sandboxes until at most [`MAX_SANDBOXES`] are retained, oldest
+    /// terminal one first — the same rule [`Self::enforce_build_ceiling`] applies to
+    /// builds, so a sandbox a caller may still be holding survives an eviction
+    /// round. Evicting one also drops its id from `sandboxes_by_project` and retires
+    /// the per-project sequence counter once neither a project nor a sandbox of that
+    /// name is left.
+    fn enforce_sandbox_ceiling(&mut self) {
+        let mut evicted_any = false;
+        while self.sandboxes.len() > MAX_SANDBOXES {
+            let oldest_terminal = self
+                .sandboxes
+                .iter()
+                .filter(|(_, stored)| stored.is_terminal())
+                .min_by_key(|(_, stored)| stored.request_millis)
+                .map(|(id, _)| id.clone());
+            let evicted = oldest_terminal.or_else(|| {
+                self.sandboxes
+                    .iter()
+                    .min_by_key(|(_, stored)| stored.request_millis)
+                    .map(|(id, _)| id.clone())
+            });
+            let Some(id) = evicted else { break };
+            evicted_any = true;
+            let project_name = self
+                .sandboxes
+                .remove(&id)
+                .and_then(|stored| stored.sandbox.project_name);
+            if let Some(project_name) = project_name {
+                if let Some(ids) = self.sandboxes_by_project.get_mut(&project_name) {
+                    ids.retain(|held| held != &id);
+                    if ids.is_empty() {
+                        self.sandboxes_by_project.remove(&project_name);
+                    }
+                }
+            }
+        }
+        if !evicted_any {
+            return;
+        }
+        let mut counters = ::std::mem::take(&mut self.next_sandbox_numbers);
+        counters.retain(|name, _| {
+            self.projects.contains_key(name) || self.sandboxes_by_project.contains_key(name)
+        });
+        self.next_sandbox_numbers = counters;
+    }
+
+    /// Record the sandbox an in-force idempotency token resolves to, under the same
+    /// retention rules [`Self::record_start_build_token`] applies.
+    pub fn record_start_sandbox_token(
+        &mut self,
+        key: (String, String),
+        token: StartSandboxToken,
+        now_millis: i64,
+    ) {
+        record_token(
+            &mut self.start_sandbox_tokens,
+            key,
+            token,
+            now_millis,
+            SANDBOX_IDEMPOTENCY_TOKEN_TTL_MILLIS,
+            MAX_SANDBOX_IDEMPOTENCY_TOKENS,
+        );
+    }
+
+    /// Read a sandbox, first materialising the transition the clock already owes
+    /// it — the sandbox counterpart of [`Self::settled_build`], and the only write a
+    /// reporting operation makes: the move out of `QUEUED` was due at
+    /// `settle_due_millis` whether or not anybody called, and it is computed from the
+    /// stored instants, so repeating it changes nothing.
+    pub fn settled_sandbox(&mut self, id: &str, now_millis: i64) -> Option<&StoredSandbox> {
+        let stored = self.sandboxes.get_mut(id)?;
+        stored.settle(now_millis);
+        Some(stored)
+    }
+}
+
+/// Hand out `name`'s next number from `counters` and advance it. Shared by the
+/// per-project `buildNumber` and sandbox sequence counters, which allocate alike.
+fn allocate_number(counters: &mut BTreeMap<String, i64>, name: &str) -> i64 {
+    let slot = counters.entry(name.to_string()).or_insert(1);
+    let number = *slot;
+    *slot += 1;
+    number
+}
+
+/// An idempotency entry, as the shared retention pass below reads it.
+trait IssuedToken {
+    /// Epoch millis the entry was issued at.
+    fn issued_millis(&self) -> i64;
+}
+
+impl IssuedToken for StartBuildToken {
+    fn issued_millis(&self) -> i64 {
+        self.issued_millis
+    }
+}
+
+impl IssuedToken for StartSandboxToken {
+    fn issued_millis(&self) -> i64 {
+        self.issued_millis
+    }
+}
+
+/// Record `token` under `key`, dropping the entries whose `ttl_millis` lifetime has
+/// elapsed first — past it an entry can never be matched again — and retiring
+/// anything still over `ceiling` oldest-first.
+fn record_token<T: IssuedToken>(
+    tokens: &mut BTreeMap<(String, String), T>,
+    key: (String, String),
+    token: T,
+    now_millis: i64,
+    ttl_millis: i64,
+    ceiling: usize,
+) {
+    tokens.retain(|_, held| now_millis - held.issued_millis() < ttl_millis);
+    tokens.insert(key, token);
+    while tokens.len() > ceiling {
+        let oldest = tokens
+            .iter()
+            .min_by_key(|(_, held)| held.issued_millis())
+            .map(|(key, _)| key.clone());
+        let Some(oldest) = oldest else { break };
+        tokens.remove(&oldest);
     }
 }
 
@@ -289,6 +530,40 @@ impl StoredBuild {
         self.build.build_complete = true;
         self.build.end_time = Some(datetime(due));
         self.build.phases = Some(terminal_phases(start, due));
+    }
+}
+
+impl StoredSandbox {
+    /// Whether this sandbox has reached a status it can never leave on its own.
+    ///
+    /// Read from the instant the record carries rather than from the status string:
+    /// `endTime` is set exactly when the sandbox stopped, so nothing has to keep a
+    /// list of terminal status names in step with it.
+    pub fn is_terminal(&self) -> bool {
+        self.sandbox.end_time.is_some()
+    }
+
+    /// Materialise this sandbox's terminal state once its due instant has passed.
+    ///
+    /// Idempotent and purely a function of the stored instants: a sandbox that has
+    /// already stopped, or whose span has not elapsed, is left alone. The sandbox
+    /// leaves the queue at the due instant and its session faults there, because no
+    /// container was provisioned — see [`SANDBOX_NOT_PROVISIONED_MESSAGE`].
+    pub fn settle(&mut self, now_millis: i64) {
+        if self.is_terminal() || now_millis < self.settle_due_millis {
+            return;
+        }
+        let requested = self.request_millis;
+        let due = self.settle_due_millis;
+        self.sandbox.status = Some(SANDBOX_STATUS_FAULT.to_string());
+        self.sandbox.start_time = Some(datetime(due));
+        self.sandbox.end_time = Some(datetime(due));
+        if let Some(session) = self.sandbox.current_session.as_mut() {
+            session.status = Some(SANDBOX_STATUS_FAULT.to_string());
+            session.current_phase = Some("COMPLETED".to_string());
+            session.end_time = Some(datetime(due));
+            session.phases = Some(terminal_session_phases(requested, due));
+        }
     }
 }
 
@@ -321,21 +596,46 @@ pub fn datetime(millis: i64) -> ::aws_smithy_types::DateTime {
 
 /// A build's unique identifier — the UUID AWS puts after `<projectName>:`.
 ///
-/// DERIVED, not drawn from a generator: an RFC 9562 version-8 (custom,
-/// hash-based) UUID over the values that already make a build unique — its
-/// project, the `buildNumber` just allocated for it under the state lock, and the
-/// instant it started. No two builds of a project can collide, and the result is
-/// the 8-4-4-4-12 hex form a client parses. The digest is SHA-256 (`sha2`), the
-/// same one [`request_fingerprint`] uses, so this needs no dependency the crate
-/// does not already carry.
+/// Derived by [`derived_uuid`] from the project, the `buildNumber` just allocated
+/// for it under the state lock, and the instant it started, so no two builds of a
+/// project can collide.
 pub fn build_uuid(project_name: &str, build_number: i64, start_millis: i64) -> String {
+    derived_uuid("build", project_name, build_number, start_millis)
+}
+
+/// A sandbox's unique identifier — the UUID that follows `<projectName>:`, derived
+/// exactly as [`build_uuid`] is, from the project, the sandbox sequence number just
+/// allocated for it under the state lock, and the instant it was requested.
+pub fn sandbox_uuid(project_name: &str, sandbox_number: i64, request_millis: i64) -> String {
+    derived_uuid("sandbox", project_name, sandbox_number, request_millis)
+}
+
+/// A sandbox session's unique identifier, derived from the sandbox it belongs to,
+/// the session's sequence number within that sandbox and the instant it started.
+pub fn sandbox_session_uuid(sandbox_id: &str, session_number: i64, start_millis: i64) -> String {
+    derived_uuid("sandbox-session", sandbox_id, session_number, start_millis)
+}
+
+/// An RFC 9562 version-8 (custom, hash-based) UUID over the values that already make
+/// a resource unique: what KIND of resource it is, the name it belongs to, the
+/// sequence number allocated for it under the state lock, and the instant it was
+/// requested at.
+///
+/// DERIVED, not drawn from a generator, so no two resources of one kind and name can
+/// collide, and the result is the 8-4-4-4-12 hex form a client parses. The digest is
+/// SHA-256 (`sha2`), the same one [`request_fingerprint`] uses, so this needs no
+/// dependency the crate does not already carry. `namespace` keeps two kinds of
+/// resource with the same name and sequence number apart.
+fn derived_uuid(namespace: &str, name: &str, sequence: i64, millis: i64) -> String {
     use ::sha2::Digest;
     let mut digest = ::sha2::Sha256::new();
-    digest.update(project_name.as_bytes());
+    digest.update(namespace.as_bytes());
     // A separator, so ("a", 11) and ("a1", 1) cannot hash the same bytes.
     digest.update([0u8]);
-    digest.update(build_number.to_be_bytes());
-    digest.update(start_millis.to_be_bytes());
+    digest.update(name.as_bytes());
+    digest.update([0u8]);
+    digest.update(sequence.to_be_bytes());
+    digest.update(millis.to_be_bytes());
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest.finalize()[..16]);
     // RFC 9562: the version goes in the high nibble of octet 6 and the variant
@@ -389,6 +689,105 @@ pub fn project_arn(region: &str, name: &str) -> String {
 /// `arn:aws:codebuild:<region>:<account>:build/<id>`.
 pub fn build_arn(region: &str, id: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("build/{id}"))
+}
+
+/// `arn:aws:codebuild:<region>:<account>:sandbox/<id>`.
+pub fn sandbox_arn(region: &str, id: &str) -> String {
+    ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("sandbox/{id}"))
+}
+
+/// The session a just-requested sandbox carries: it was submitted and is waiting in
+/// the queue, so it has no outcome, no log location (a log stream is created with the
+/// container) and no network interface (one is attached when the container joins the
+/// project's VPC) yet.
+///
+/// `resolvedSourceVersion` stays absent for the same reason it does on a build:
+/// nothing clones a repository here, so there is no revision to report.
+pub fn queued_sandbox_session(id: String, requested_millis: i64) -> SandboxSession {
+    SandboxSession {
+        id: Some(id),
+        status: Some(SANDBOX_STATUS_QUEUED.to_string()),
+        start_time: Some(datetime(requested_millis)),
+        end_time: None,
+        current_phase: Some("QUEUED".to_string()),
+        phases: Some(queued_session_phases(requested_millis)),
+        resolved_source_version: None,
+        logs: None,
+        network_interface: None,
+    }
+}
+
+/// The phases of a sandbox session that is still queued: it was submitted, and it is
+/// waiting in the queue — the sandbox counterpart of [`in_progress_phases`].
+fn queued_session_phases(requested_millis: i64) -> Vec<SandboxSessionPhase> {
+    vec![
+        finished_session_phase(
+            "SUBMITTED",
+            "SUCCEEDED",
+            requested_millis,
+            requested_millis,
+            None,
+        ),
+        open_session_phase("QUEUED", requested_millis),
+    ]
+}
+
+/// The phases of a sandbox session that has reached its terminal state:
+/// provisioning is where an emulated sandbox stops, because there is no container to
+/// provision.
+fn terminal_session_phases(requested_millis: i64, due_millis: i64) -> Vec<SandboxSessionPhase> {
+    vec![
+        finished_session_phase(
+            "SUBMITTED",
+            "SUCCEEDED",
+            requested_millis,
+            requested_millis,
+            None,
+        ),
+        finished_session_phase("QUEUED", "SUCCEEDED", requested_millis, due_millis, None),
+        finished_session_phase(
+            "PROVISIONING",
+            SANDBOX_STATUS_FAULT,
+            due_millis,
+            due_millis,
+            Some(vec![PhaseContext {
+                status_code: None,
+                message: Some(SANDBOX_NOT_PROVISIONED_MESSAGE.to_string()),
+            }]),
+        ),
+        open_session_phase("COMPLETED", due_millis),
+    ]
+}
+
+/// A sandbox session phase that ran and ended, with its measured duration.
+fn finished_session_phase(
+    phase_type: &str,
+    phase_status: &str,
+    start_millis: i64,
+    end_millis: i64,
+    contexts: Option<Vec<PhaseContext>>,
+) -> SandboxSessionPhase {
+    SandboxSessionPhase {
+        phase_type: Some(phase_type.to_string()),
+        phase_status: Some(phase_status.to_string()),
+        start_time: Some(datetime(start_millis)),
+        end_time: Some(datetime(end_millis)),
+        duration_in_seconds: Some((end_millis - start_millis) / 1000),
+        contexts,
+    }
+}
+
+/// A sandbox session phase that has started and carries no outcome yet — including
+/// the final `COMPLETED` marker phase, the way a build reports it.
+fn open_session_phase(phase_type: &str, start_millis: i64) -> SandboxSessionPhase {
+    SandboxSessionPhase {
+        phase_type: Some(phase_type.to_string()),
+        phase_status: None,
+        start_time: Some(datetime(start_millis)),
+        end_time: None,
+        duration_in_seconds: None,
+        contexts: None,
+    }
 }
 
 /// The phases of a build that is still `IN_PROGRESS`: it was submitted, and it is
