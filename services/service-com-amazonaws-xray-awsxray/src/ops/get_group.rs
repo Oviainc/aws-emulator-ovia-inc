@@ -2,9 +2,10 @@
 
 //! @op GetGroup
 //!
-//! Answers from the stored group record. `GroupName` and `GroupARN` resolve the
-//! same record; neither supplied, or a selector naming no stored group, is an
-//! `InvalidRequestException`.
+//! Answers from the stored group record. The group is selected by EXACTLY ONE
+//! of `GroupName` or `GroupARN`, which resolve the same record; neither
+//! supplied, both supplied (two identities at once), or a selector naming no
+//! stored group is an `InvalidRequestException`.
 //!
 //! ## Shape of an operation
 //!

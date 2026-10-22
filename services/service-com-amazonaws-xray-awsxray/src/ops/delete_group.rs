@@ -3,8 +3,9 @@
 //! @op DeleteGroup
 //!
 //! Removes the stored group record and its ARN index entry, so a later
-//! `GetGroup` fails and `GetGroups` no longer lists it. Either selector
-//! resolves the record; one that names no stored group is an
+//! `GetGroup` fails and `GetGroups` no longer lists it. The group is selected by
+//! EXACTLY ONE selector; one that names no stored group, no selector at all, or
+//! both selectors together (two identities at once) is an
 //! `InvalidRequestException`.
 //!
 //! ## Shape of an operation

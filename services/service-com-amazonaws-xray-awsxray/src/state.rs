@@ -784,11 +784,20 @@ pub struct InsightsConfigurationRecord {
     pub notifications_enabled: Option<bool>,
 }
 
-/// Why a `(GroupName, GroupARN)` pair names no stored group.
+/// The refusal X-Ray answers when a request supplies BOTH group selectors.
+///
+/// A group is identified by exactly one of `GroupName` or `GroupARN`, so a
+/// request carrying both states two identities at once; the service refuses it
+/// with this fixed wording rather than servicing one of them.
+pub const CONFLICTING_GROUP_SELECTORS_MESSAGE: &str = "Provide either GroupName or GroupARN";
+
+/// Why a `(GroupName, GroupARN)` pair names no single stored group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupLookupError {
     /// Neither selector was supplied.
     NoSelector,
+    /// BOTH selectors were supplied, so the request states two identities.
+    ConflictingSelectors,
     /// A selector was supplied but no group matches it.
     NotFound,
 }
@@ -800,6 +809,7 @@ impl GroupLookupError {
     pub fn message(self, group_name: Option<&str>, group_arn: Option<&str>) -> String {
         match self {
             Self::NoSelector => "either GroupName or GroupARN must be specified".to_string(),
+            Self::ConflictingSelectors => CONFLICTING_GROUP_SELECTORS_MESSAGE.to_string(),
             Self::NotFound => format!(
                 "no group matches GroupName {group_name:?} / GroupARN {group_arn:?}"
             ),
@@ -1397,8 +1407,18 @@ impl ComAmazonawsXrayAwsxrayState {
 
     /// The stored name a `(GroupName, GroupARN)` pair selects.
     ///
-    /// Either selector resolves the same record; `GroupName` is tried first, then
-    /// the ARN index.
+    /// A group is identified by EXACTLY ONE selector: `GroupName` is "the
+    /// case-sensitive name of the group" and `GroupARN` "the ARN that was
+    /// generated upon creation"
+    /// (`smithy_query(query="shape",shape="UpdateGroupRequest")`), two names for
+    /// one identity with no operation that re-points either at another group.
+    /// So a pair that supplies NEITHER names nothing
+    /// ([`GroupLookupError::NoSelector`]) and a pair that supplies BOTH states
+    /// two identities at once and is refused unresolved
+    /// ([`GroupLookupError::ConflictingSelectors`]) — whether or not the two
+    /// happen to agree — rather than one side being preferred silently.
+    /// Otherwise the single selector resolves the record, by name or through the
+    /// ARN index.
     pub fn resolve_group_name(
         &self,
         group_name: Option<&str>,
@@ -1406,6 +1426,9 @@ impl ComAmazonawsXrayAwsxrayState {
     ) -> Result<String, GroupLookupError> {
         if group_name.is_none() && group_arn.is_none() {
             return Err(GroupLookupError::NoSelector);
+        }
+        if group_name.is_some() && group_arn.is_some() {
+            return Err(GroupLookupError::ConflictingSelectors);
         }
         if let Some(name) = group_name {
             if self.groups.contains_key(name) {

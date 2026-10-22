@@ -2,13 +2,15 @@
 
 //! @op UpdateGroup
 //!
-//! Updates a stored group in place: the group is selected by either `GroupName`
-//! or `GroupARN`, each member the request SUPPLIES replaces the stored one, each
-//! member it OMITS is left as it is, and the group's name, its ARN and its tags
-//! are untouched, so the response — and every later `GetGroup` / `GetGroups` —
-//! is read back out of `crate::state::GroupRecord` rather than echoed from this
-//! request. A request that names no group, or names one this emulator does not
-//! hold, is refused with the modelled `InvalidRequestException` (HTTP 400).
+//! Updates a stored group in place: the group is selected by EXACTLY ONE of
+//! `GroupName` or `GroupARN`, each member the request SUPPLIES replaces the
+//! stored one, each member it OMITS is left as it is, and the group's name, its
+//! ARN and its tags are untouched, so the response — and every later `GetGroup`
+//! / `GetGroups` — is read back out of `crate::state::GroupRecord` rather than
+//! echoed from this request. A request that names no group, that names a group
+//! this emulator does not hold, or that supplies BOTH selectors (two identities
+//! at once) is refused with the modelled `InvalidRequestException` (HTTP 400)
+//! before anything is written.
 //!
 //! ## Shape of an operation
 //!
@@ -160,9 +162,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Both selectors are optional in the model, so what is left to refuse
-        // here is a request that names no group at all and one that names a
-        // group this emulator does not hold; `GroupName`'s and `GroupARN`'s
-        // length bounds are modelled and already refused before this handler.
+        // here is a request that names no group at all, one that supplies both
+        // selectors, and one that names a group this emulator does not hold;
+        // `GroupName`'s and `GroupARN`'s length bounds are modelled and already
+        // refused before this handler. The refusal happens before any write, so
+        // a refused update leaves every stored group as it was.
         let mut store = state.lock();
         let group_name = store
             .resolve_group_name(input.group_name.as_deref(), input.group_arn.as_deref())

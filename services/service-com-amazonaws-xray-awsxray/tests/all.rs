@@ -14,6 +14,9 @@
 #[path = "all/encryption_config.rs"]
 mod encryption_config;
 
+#[path = "all/group_identifier_exclusivity.rs"]
+mod group_identifier_exclusivity;
+
 #[path = "all/indexing_rules.rs"]
 mod indexing_rules;
 
