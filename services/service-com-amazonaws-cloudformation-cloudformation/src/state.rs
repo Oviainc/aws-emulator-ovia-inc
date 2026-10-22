@@ -23,6 +23,10 @@
 //! maximum, which the model carries no `@length` for) and [`PAGE_SIZE`] items per
 //! paginated response.
 //!
+//! Reading a stack's template body and evaluating what it declares is bounded by the
+//! [`template`] module's own caps (nodes, depth, the documented per-template quotas and
+//! one evaluation budget shared by every expression of one deployment).
+//!
 //! ## Status transitions the clock owes
 //!
 //! CloudFormation answers `CreateStack` / `UpdateStack` / `DeleteStack` while the
@@ -68,6 +72,13 @@ pub const STACK_RESOURCE_TYPE: &str = "AWS::CloudFormation::Stack";
 /// `StackDriftStatus` for a stack that has never been checked for drift — every stack
 /// here, since drift detection is not implemented.
 pub const DRIFT_STATUS_NOT_CHECKED: &str = "NOT_CHECKED";
+
+/// `DeploymentConfig$Mode` for a stack operation that did not state one.
+///
+/// `DeploymentConfigMode`: "STANDARD — Use the standard deployment behavior, ensuring
+/// resources are ready to serve traffic before completing the operation. This is the
+/// default. You do not need to specify this value explicitly."
+pub const DEPLOYMENT_MODE_STANDARD: &str = "STANDARD";
 
 /// The most LIVE stacks this emulator holds.
 ///
@@ -136,6 +147,25 @@ pub mod status {
     pub const DELETE_COMPLETE: &str = "DELETE_COMPLETE";
 }
 
+/// `OperationType` values this service records for a stack operation (all from the
+/// model's `OperationType` enum).
+pub mod operation_type {
+    pub const CREATE_STACK: &str = "CREATE_STACK";
+    pub const UPDATE_STACK: &str = "UPDATE_STACK";
+    pub const DELETE_STACK: &str = "DELETE_STACK";
+}
+
+/// The `OperationType` of the stack operation that moves a stack into `in_progress`, or
+/// `None` for a status no stack operation of this service opens.
+pub fn operation_type_of(in_progress: &str) -> Option<&'static str> {
+    match in_progress {
+        status::CREATE_IN_PROGRESS => Some(operation_type::CREATE_STACK),
+        status::UPDATE_IN_PROGRESS => Some(operation_type::UPDATE_STACK),
+        status::DELETE_IN_PROGRESS => Some(operation_type::DELETE_STACK),
+        _ => None,
+    }
+}
+
 /// The reason CloudFormation records on the event that opens a stack operation.
 pub const USER_INITIATED: &str = "User Initiated";
 
@@ -177,6 +207,15 @@ pub struct StoredOutput {
     pub description: Option<String>,
     pub export_name: Option<String>,
 }
+
+/// One stack operation, as `Stack$LastOperations` reports it: the id the call handed back
+/// and the `OperationType` it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredOperation {
+    pub operation_id: String,
+    pub operation_type: String,
+}
+
 
 /// A stack tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,6 +332,10 @@ pub struct StoredStack {
     /// What the create or update currently in flight will leave the two fields above
     /// with when it completes.
     pub pending_deployment: Option<PendingDeployment>,
+    /// The most recent stack operation, as `Stack$LastOperations` reports it. Recorded by
+    /// [`StoredStack::begin_transition`], so every call that opens an operation records
+    /// exactly one.
+    pub last_operation: Option<StoredOperation>,
     pub creation_time: SystemTime,
     pub last_updated_time: Option<SystemTime>,
     pub deletion_time: Option<SystemTime>,
@@ -331,6 +374,7 @@ impl StoredStack {
             resources: Vec::new(),
             outputs: Vec::new(),
             pending_deployment: None,
+            last_operation: None,
             creation_time: now,
             last_updated_time: None,
             deletion_time: None,
@@ -495,6 +539,17 @@ impl StoredStack {
     ) {
         self.status = in_progress.to_string();
         self.status_reason = Some(USER_INITIATED.to_string());
+        // `Stack$LastOperations`: "Information about the most recent operations performed
+        // on this stack" — this call is that operation, and the type is the one the
+        // status it opens names.
+        if let (Some(operation_type), Some(id)) =
+            (operation_type_of(in_progress), operation_id.clone())
+        {
+            self.last_operation = Some(StoredOperation {
+                operation_id: id,
+                operation_type: operation_type.to_string(),
+            });
+        }
         self.record_event(
             now,
             in_progress,
@@ -614,6 +669,52 @@ pub fn output_views(outputs: &[StoredOutput]) -> Option<Vec<crate::ops::types::O
             })
             .collect(),
     )
+}
+
+/// The parameter values in force on a stack: what the request supplied, plus the
+/// template's own `Default` for every parameter the template declares and the request did
+/// not pass a value for.
+///
+/// `Parameter$Default` is what CloudFormation uses when a stack operation passes no value
+/// for a declared parameter, so the stack reports the parameter either way — the declared
+/// defaults first, then any value supplied for a parameter the template does not declare
+/// (refusing one of those is template validation, which this service does not do). The
+/// declarations come from [`template::parse`], the one reader of a stack's template body,
+/// which is also where the documented per-template parameter quota is enforced.
+///
+/// Linear in the supplied count: the supplied values are indexed once rather than
+/// rescanned per declaration, so two caller-controlled counts cannot multiply.
+pub fn parameters_in_force(
+    template_body: &str,
+    supplied: Vec<StoredParameter>,
+) -> Vec<StoredParameter> {
+    let declared = template::parse(template_body)
+        .map(|parsed| parsed.parameter_defaults)
+        .unwrap_or_default();
+    let supplied_by_key: ::std::collections::HashMap<&str, &StoredParameter> = supplied
+        .iter()
+        .map(|parameter| (parameter.key.as_str(), parameter))
+        .collect();
+    let mut in_force: Vec<StoredParameter> = Vec::new();
+    let mut keys: ::std::collections::HashSet<String> = ::std::collections::HashSet::new();
+    for (key, default) in &declared {
+        let value = match supplied_by_key.get(key.as_str()) {
+            Some(parameter) => parameter.value.clone(),
+            None => default.clone(),
+        };
+        if keys.insert(key.clone()) {
+            in_force.push(StoredParameter {
+                key: key.clone(),
+                value,
+            });
+        }
+    }
+    for parameter in supplied {
+        if keys.insert(parameter.key.clone()) {
+            in_force.push(parameter);
+        }
+    }
+    in_force
 }
 
 /// The region the request was signed for, or [`DEFAULT_REGION`] for an unsigned one.
@@ -781,13 +882,34 @@ pub fn stored_tags(tags: &[crate::ops::types::Tag]) -> Vec<StoredTag> {
 }
 
 /// Stored tags as the modelled `Tags` member.
+///
+/// CloudFormation reports `Tags` on every stack, as an empty element for a stack that
+/// carries none, so this is always present: a client reading the stack sees the same
+/// shape whether or not the stack was tagged.
 pub fn tag_views(tags: &[StoredTag]) -> Option<Vec<crate::ops::types::Tag>> {
-    non_empty(
+    Some(
         tags.iter()
             .map(|tag| crate::ops::types::Tag {
                 key: tag.key.clone(),
                 value: tag.value.clone(),
             })
+            .collect(),
+    )
+}
+
+/// The stack's recorded operation as the modelled `LastOperations` member, always
+/// present: "Information about the most recent operations performed on this stack", which
+/// for this emulator is the one operation it last opened on the stack.
+pub fn last_operation_views(
+    last_operation: Option<&StoredOperation>,
+) -> Option<Vec<crate::ops::types::OperationEntry>> {
+    Some(
+        last_operation
+            .map(|operation| crate::ops::types::OperationEntry {
+                operation_type: Some(operation.operation_type.clone()),
+                operation_id: Some(operation.operation_id.clone()),
+            })
+            .into_iter()
             .collect(),
     )
 }
@@ -830,21 +952,28 @@ pub fn stored_rollback_configuration(
 }
 
 /// Stored rollback configuration as the modelled member.
+///
+/// CloudFormation reports `RollbackConfiguration` on every stack, as an empty element for
+/// a stack that has none, so this is always present; the triggers inside it appear only
+/// when the stack has some.
 pub fn rollback_configuration_view(
     configuration: Option<&StoredRollbackConfiguration>,
 ) -> Option<crate::ops::types::RollbackConfiguration> {
-    configuration.map(|configuration| crate::ops::types::RollbackConfiguration {
-        rollback_triggers: non_empty(
-            configuration
-                .triggers
-                .iter()
-                .map(|trigger| crate::ops::types::RollbackTrigger {
-                    arn: trigger.arn.clone(),
-                    r#type: trigger.trigger_type.clone(),
-                })
-                .collect(),
-        ),
-        monitoring_time_in_minutes: configuration.monitoring_time_in_minutes,
+    Some(crate::ops::types::RollbackConfiguration {
+        rollback_triggers: configuration.and_then(|configuration| {
+            non_empty(
+                configuration
+                    .triggers
+                    .iter()
+                    .map(|trigger| crate::ops::types::RollbackTrigger {
+                        arn: trigger.arn.clone(),
+                        r#type: trigger.trigger_type.clone(),
+                    })
+                    .collect(),
+            )
+        }),
+        monitoring_time_in_minutes: configuration
+            .and_then(|configuration| configuration.monitoring_time_in_minutes),
     })
 }
 
@@ -858,13 +987,29 @@ pub fn stored_deployment_config(
     })
 }
 
-/// Stored deployment configuration as the modelled member.
+/// Stored deployment configuration as the modelled member, with the documented defaults
+/// filled in.
+///
+/// CloudFormation reports `DeploymentConfig` on every stack — it is the configuration the
+/// stack's operations run under, which every stack has. A stack whose operations never
+/// stated one runs under the defaults: [`DEPLOYMENT_MODE_STANDARD`] ("This is the default.
+/// You do not need to specify this value explicitly") and, for `DisableRollback`, the
+/// rollback setting in force on the stack — the same flag `Stack$DisableRollback` reports.
 pub fn deployment_config_view(
     config: Option<&StoredDeploymentConfig>,
+    disable_rollback: bool,
 ) -> Option<crate::ops::types::DeploymentConfig> {
-    config.map(|config| crate::ops::types::DeploymentConfig {
-        mode: config.mode.clone(),
-        disable_rollback: config.disable_rollback,
+    Some(crate::ops::types::DeploymentConfig {
+        mode: Some(
+            config
+                .and_then(|config| config.mode.clone())
+                .unwrap_or_else(|| DEPLOYMENT_MODE_STANDARD.to_string()),
+        ),
+        disable_rollback: Some(
+            config
+                .and_then(|config| config.disable_rollback)
+                .unwrap_or(disable_rollback),
+        ),
     })
 }
 

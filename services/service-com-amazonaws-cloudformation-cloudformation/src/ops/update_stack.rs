@@ -417,6 +417,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let parameters = merged_parameters(&previous.parameters, input.parameters.as_deref())
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // A parameter the template declares and the request passed no value for takes the
+        // template's own `Default`, exactly as on a create.
+        let parameters = crate::state::parameters_in_force(&template_body, parameters);
         // "If you don't specify this parameter, CloudFormation doesn't modify the stack's
         // tags. If you specify an empty value, CloudFormation removes all associated
         // tags." The same shape holds for the other collection members the request may

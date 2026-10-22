@@ -72,7 +72,10 @@ use crate::state::{StoredStack, DRIFT_STATUS_NOT_CHECKED};
 ///
 /// `TemplateDescription` is the template's own `Description`, `DeletionTime` is set only
 /// once the stack's deletion has completed, and `ParentId`/`RootId` are absent because
-/// nested stacks are not implemented.
+/// nested stacks are not implemented. `LastOperations` is the operation the stack last
+/// opened, which `StackSummary` reports alongside `Stack`; `DriftInformation` is
+/// `NOT_CHECKED` because `DetectStackDrift` answers 501 rather than reporting a check
+/// nothing ran.
 fn stack_summary(stored: &StoredStack) -> StackSummary {
     StackSummary {
         stack_id: Some(stored.stack_id.clone()),
@@ -89,7 +92,7 @@ fn stack_summary(stored: &StoredStack) -> StackSummary {
             stack_drift_status: DRIFT_STATUS_NOT_CHECKED.to_string(),
             last_check_timestamp: None,
         }),
-        last_operations: None,
+        last_operations: crate::state::last_operation_views(stored.last_operation.as_ref()),
     }
 }
 
