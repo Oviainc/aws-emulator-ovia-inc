@@ -15,5 +15,7 @@
 mod region_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_messages.rs"]
+mod validation_messages;
 #[path = "all/workspace_instance_lifecycle.rs"]
 mod workspace_instance_lifecycle;

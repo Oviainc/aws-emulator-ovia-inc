@@ -98,15 +98,44 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it. KafkaConnect models its own client-input error for
+        // exactly that case, so name it rather than the framework's generic
+        // `ValidationException`: a client branches on the code, and ALL 19 of
+        // this service's operations declare `BadRequestException` as "HTTP
+        // Status Code 400: Bad request due to incorrect input. Correct your
+        // request and then retry it." (checked against every `**Errors:**` line
+        // in this crate's `OPERATIONS.md`, rendered from the Smithy model), so
+        // the rewording names an error the model declares for whichever
+        // operation the refused request was aimed at. The status the framework
+        // renders for this refusal is already 400, so only the code and the
+        // message change.
+        match refusal {
+            Refusal::Invalid(violations) => {
+                let clauses: Vec<String> = violations
+                    .iter()
+                    .map(smithy_server_runtime::Violation::message)
+                    .collect();
+                Some(Refused {
+                    code: "BadRequestException".to_string(),
+                    message: format!(
+                        "Bad request due to incorrect input: {}. Correct your request and then retry it.",
+                        clauses.join("; ")
+                    ),
+                })
+            }
+            // The framework renders an authentication refusal as 403, which is
+            // this service's `ForbiddenException` ("Access forbidden. Correct
+            // your credentials and then retry your request."), not its 401
+            // `UnauthorizedException`.
+            Refusal::Unauthenticated => Some(Refused {
+                code: "ForbiddenException".to_string(),
+                message: "Access forbidden. Correct your credentials and then retry your request."
+                    .to_string(),
+            }),
+            // `Refusal` is `#[non_exhaustive]`: a refusal this service has not
+            // worded keeps the framework's own wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

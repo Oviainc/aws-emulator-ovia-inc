@@ -9,7 +9,7 @@
 //! generated and cannot declare another module.
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     BadRequestException, ConflictException, InternalServerErrorException, NotFoundException,
@@ -55,6 +55,11 @@ pub struct Schema {
     /// Versions by number. Numeric keys, so the map's order is the version order —
     /// a string key would sort `"10"` before `"2"`.
     pub versions: BTreeMap<u64, SchemaVersion>,
+    /// The code bindings `PutCodeBinding` has started for this schema, keyed by the
+    /// schema version they were generated from and the language they were generated
+    /// for: a binding is identified by that pair, so one schema version can carry a
+    /// binding per language and one language a binding per version.
+    pub code_bindings: BTreeMap<(u64, String), CodeBinding>,
 }
 
 /// One immutable version of a schema: the content a caller sent for it.
@@ -66,6 +71,98 @@ pub struct SchemaVersion {
     pub r#type: String,
     pub description: Option<String>,
     pub created_date: SystemTime,
+}
+
+/// One code binding: the code generation `PutCodeBinding` started for one schema
+/// version in one language.
+///
+/// It holds no generated source — this slice models the binding's LIFECYCLE only, as
+/// `PutCodeBinding` and `DescribeCodeBinding` report it. `GetCodeBindingSource`, which
+/// is what serves the generated source itself, is still a scaffold stub and answers
+/// 501; it owns the decision of what that source is.
+#[derive(Debug, Clone)]
+pub struct CodeBinding {
+    /// The language the request asked generation for, stored as given.
+    ///
+    /// The model types `Language` as an unconstrained `__string` and documents no set
+    /// of accepted values, so this store keeps it as an opaque key rather than
+    /// refusing values against a list the model does not publish.
+    pub language: String,
+    /// The schema version the binding was generated from, resolved at put time: an
+    /// absent request `SchemaVersion` means the then-latest version, and the binding
+    /// stays attached to that number afterwards.
+    pub schema_version: u64,
+    /// When `PutCodeBinding` started this generation.
+    pub created_date: SystemTime,
+    /// The instant generation is due to finish; [`CodeBinding::status_at`] reports
+    /// `CREATE_IN_PROGRESS` before it and `CREATE_COMPLETE` from it on.
+    ///
+    /// Stored as an instant rather than waited for: the transition is the clock's, so
+    /// every later read derives it and no request sleeps.
+    pub generation_due: SystemTime,
+}
+
+/// The `CodeGenerationStatus` of a generation that has not finished yet. One of
+/// [`crate::ops::types::CODE_GENERATION_STATUS_VALUES`].
+pub const CODE_GENERATION_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
+
+/// The `CodeGenerationStatus` of a generation that has finished. One of
+/// [`crate::ops::types::CODE_GENERATION_STATUS_VALUES`].
+pub const CODE_GENERATION_COMPLETE: &str = "CREATE_COMPLETE";
+
+/// How long after `PutCodeBinding` a code binding's generation is due to complete.
+///
+/// AWS publishes no duration for code generation, so this span is the emulator's own
+/// choice. It is deliberately NOT zero: a caller that describes the binding straight
+/// after starting it must still observe the transient `CREATE_IN_PROGRESS` status that
+/// the real service reports, and the 202 `PutCodeBinding` answers with says the work
+/// is accepted, not done. It is short enough that a caller polling the binding reaches
+/// `CREATE_COMPLETE` in well under a second.
+pub const CODE_GENERATION_DURATION: Duration = Duration::from_millis(400);
+
+/// What both `PutCodeBinding` and `DescribeCodeBinding` report about one binding.
+///
+/// The two operations answer the same four members from the same stored binding, so
+/// they render it through one function ([`CodeBinding::report_at`]) and cannot drift.
+#[derive(Debug, Clone)]
+pub struct CodeBindingReport {
+    pub creation_date: SystemTime,
+    pub last_modified: SystemTime,
+    /// The version number in decimal, as `SchemaVersion` is rendered everywhere else.
+    pub schema_version: String,
+    pub status: &'static str,
+}
+
+impl CodeBinding {
+    /// The status of this generation as of `now`: in progress until the instant it is
+    /// due, complete from then on. Derived, so a read never has to write.
+    pub fn status_at(&self, now: SystemTime) -> &'static str {
+        if now < self.generation_due {
+            CODE_GENERATION_IN_PROGRESS
+        } else {
+            CODE_GENERATION_COMPLETE
+        }
+    }
+
+    /// When this binding last changed, as of `now`: it was created, and the only later
+    /// change is the completion the clock makes due.
+    pub fn last_modified_at(&self, now: SystemTime) -> SystemTime {
+        if now < self.generation_due {
+            self.created_date
+        } else {
+            self.generation_due
+        }
+    }
+
+    /// This binding as the two code-binding operations report it.
+    pub fn report_at(&self, now: SystemTime) -> CodeBindingReport {
+        CodeBindingReport {
+            creation_date: self.created_date,
+            last_modified: self.last_modified_at(now),
+            schema_version: self.schema_version.to_string(),
+            status: self.status_at(now),
+        }
+    }
 }
 
 impl Schema {
@@ -273,6 +370,14 @@ pub const MAX_SCHEMAS_PER_REGISTRY: usize = 500;
 /// beside this budget.
 pub const MAX_STORED_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 
+/// See [`MAX_REGISTRIES`]. The ceiling on how many code bindings one schema holds.
+///
+/// A binding is keyed by schema version and language, and `Language` is an
+/// unconstrained string, so one `PutCodeBinding` per caller-chosen language would grow
+/// a schema's binding map for as long as a client keeps calling. A put past the cap is
+/// refused with the service's own `BadRequestException`, as the other caps are.
+pub const MAX_CODE_BINDINGS_PER_SCHEMA: usize = 500;
+
 /// The most items one page of a listing may hold, whatever `Limit` asks for.
 ///
 /// Without it, an absent or very large `Limit` would materialise the whole selected
@@ -359,6 +464,33 @@ pub fn registry_not_found(registry: &str) -> NotFoundException {
 pub fn schema_not_found(registry: &str, schema: &str) -> NotFoundException {
     not_found(format!(
         "Schema {schema} does not exist in registry {registry}."
+    ))
+}
+
+/// Message for a version the named schema does not hold — including a `SchemaVersion`
+/// that is not a version number at all.
+pub fn schema_version_not_found(registry: &str, schema: &str, requested: Option<&str>) -> NotFoundException {
+    match requested {
+        Some(version) => not_found(format!(
+            "Schema {schema} in registry {registry} has no version {version}."
+        )),
+        None => not_found(format!(
+            "Schema {schema} in registry {registry} has no versions."
+        )),
+    }
+}
+
+/// Message for a code binding nobody has started for this schema version and
+/// language.
+pub fn code_binding_not_found(
+    registry: &str,
+    schema: &str,
+    version: u64,
+    language: &str,
+) -> NotFoundException {
+    not_found(format!(
+        "No code binding exists for language {language} of version {version} of schema \
+         {schema} in registry {registry}."
     ))
 }
 
@@ -494,6 +626,67 @@ mod tests {
         }
     }
 
+    /// The status a binding reports is one the model accepts, and it is the clock —
+    /// not a read — that moves it: in progress until the instant generation is due,
+    /// complete from then on, whoever asks and however often.
+    #[test]
+    fn a_code_binding_status_follows_the_clock() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let binding = CodeBinding {
+            language: "Java8".to_string(),
+            schema_version: 3,
+            created_date: created,
+            generation_due: created + CODE_GENERATION_DURATION,
+        };
+
+        // Rows: the put instant, just before the due instant, the due instant itself,
+        // and long after it.
+        for (offset, expected_status, expected_modified) in [
+            (Duration::ZERO, CODE_GENERATION_IN_PROGRESS, created),
+            (
+                CODE_GENERATION_DURATION - Duration::from_millis(1),
+                CODE_GENERATION_IN_PROGRESS,
+                created,
+            ),
+            (
+                CODE_GENERATION_DURATION,
+                CODE_GENERATION_COMPLETE,
+                created + CODE_GENERATION_DURATION,
+            ),
+            (
+                Duration::from_secs(3600),
+                CODE_GENERATION_COMPLETE,
+                created + CODE_GENERATION_DURATION,
+            ),
+        ] {
+            let report = binding.report_at(created + offset);
+            assert!(
+                crate::ops::types::CODE_GENERATION_STATUS_VALUES.contains(&report.status),
+                "case +{offset:?}: {:?} is not a modelled CodeGenerationStatus",
+                report.status
+            );
+            assert_eq!(
+                report.status, expected_status,
+                "case +{offset:?}: expected status {expected_status}, got {}",
+                report.status
+            );
+            assert_eq!(
+                report.last_modified, expected_modified,
+                "case +{offset:?}: expected last-modified {expected_modified:?}, got {:?}",
+                report.last_modified
+            );
+            assert_eq!(
+                report.creation_date, created,
+                "case +{offset:?}: the creation date never moves"
+            );
+            assert_eq!(
+                report.schema_version, "3",
+                "case +{offset:?}: expected the stored version in decimal, got {}",
+                report.schema_version
+            );
+        }
+    }
+
     /// The content budget counts every version of every schema in every registry —
     /// everything a caller's `Content` makes this service retain.
     #[test]
@@ -526,6 +719,7 @@ mod tests {
                         tags: BTreeMap::new(),
                         latest_version: 1,
                         last_modified: now,
+                        code_bindings: BTreeMap::new(),
                         versions: std::iter::once((
                             1,
                             SchemaVersion {

@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/gateway_lifecycle.rs"]
 mod gateway_lifecycle;
+#[path = "all/negative_paths.rs"]
+mod negative_paths;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes faces from a collection and reports which ids it actually removed.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `DeletedFaces` names only the ids the collection held and no longer does, so a
+//! following `ListFaces` / `DescribeCollection` reflects the removal. Every other
+//! requested id is reported in `UnsuccessfulFaceDeletions` with the reason it survived:
+//! `FACE_NOT_FOUND` when the collection never held it, `ASSOCIATED_TO_AN_EXISTING_USER`
+//! when the face belongs to a user and has to be disassociated first.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +154,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFaces"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteFacesErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the Rekognition collection store is unavailable".to_string()),
+                ..InternalServerError::default()
+            })
+        })?;
+        let mut state = state.lock();
+
+        let collection = state
+            .collections
+            .get_mut(&input.collection_id)
+            .ok_or_else(|| {
+                DeleteFacesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(format!(
+                        "The collection id: {} does not exist",
+                        input.collection_id
+                    )),
+                    ..ResourceNotFoundException::default()
+                })
+            })?;
+
+        let mut deleted = Vec::new();
+        let mut unsuccessful = Vec::new();
+        for face_id in &input.face_ids {
+            match collection.faces.iter().position(|face| face.face_id == *face_id) {
+                // A face associated with a user cannot be deleted while the
+                // association stands, so it stays in the collection and is reported
+                // with the reason the service names for it.
+                Some(at) if collection.faces[at].user_id.is_some() => {
+                    unsuccessful.push(UnsuccessfulFaceDeletion {
+                        face_id: Some(face_id.clone()),
+                        user_id: collection.faces[at].user_id.clone(),
+                        reasons: Some(vec!["ASSOCIATED_TO_AN_EXISTING_USER".to_string()]),
+                    });
+                }
+                Some(at) => {
+                    collection.faces.remove(at);
+                    deleted.push(face_id.clone());
+                }
+                // Also the second mention of an id already deleted by this very
+                // request: it is no longer in the collection.
+                None => unsuccessful.push(UnsuccessfulFaceDeletion {
+                    face_id: Some(face_id.clone()),
+                    user_id: None,
+                    reasons: Some(vec!["FACE_NOT_FOUND".to_string()]),
+                }),
+            }
+        }
+
+        Ok(DeleteFacesOutput {
+            // `FaceIdList` is constrained to 1..4096 entries, so "nothing was deleted"
+            // is an absent member rather than an empty list the model cannot carry.
+            deleted_faces: if deleted.is_empty() {
+                None
+            } else {
+                Some(deleted)
+            },
+            unsuccessful_face_deletions: Some(unsuccessful),
+        })
     }
 }

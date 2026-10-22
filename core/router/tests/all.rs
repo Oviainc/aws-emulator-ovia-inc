@@ -25,6 +25,8 @@ mod connect_signing_name_routing;
 mod dynamodb_streams_routing;
 #[path = "all/iam_and_signer_signing_name_routing.rs"]
 mod iam_and_signer_signing_name_routing;
+#[path = "all/iam_signing_name_routing.rs"]
+mod iam_signing_name_routing;
 #[path = "all/ivs_signing_name_routing.rs"]
 mod ivs_signing_name_routing;
 #[path = "all/marketplace_signing_name_routing.rs"]

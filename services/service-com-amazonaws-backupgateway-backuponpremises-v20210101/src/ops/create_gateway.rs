@@ -5,6 +5,10 @@
 //! [`crate::state`], and returns the ARN read back out of the store. This is the ONLY
 //! file to touch for this operation.
 //!
+//! A gateway is minted only for an `ActivationKey` this service ISSUED (the registry in
+//! [`crate::state`]); any other key is refused with the modelled `ValidationException`
+//! carrying `ErrorCode` `ActivationKeyNotFound`, before anything is written.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -169,10 +173,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The record is read back OUT of the store after the insert, so the ARN below is
         // the key the store now holds — not a string built from this request.
         //
-        // One guard spans the ceiling check and the insert, so two concurrent creates
-        // cannot both pass a check that only one of them should: this operation is the
-        // only thing that grows the store, so the store is bounded here.
+        // One guard spans the activation-key lookup, the ceiling check and the insert,
+        // so two concurrent creates cannot both pass a check that only one of them
+        // should: this operation is the only thing that grows the store, so the store is
+        // bounded here.
         let mut store = state.lock();
+
+        // An activation key is ISSUED to a deployed gateway appliance; it is not
+        // something a caller can choose. So a gateway is minted only for a key this
+        // service's registry really holds, and a key it does not hold is refused BEFORE
+        // anything is written — otherwise a client would hold an ARN for a gateway that
+        // does not exist, and every later read would report it.
+        if !store.activation_key_issued(&input.activation_key) {
+            return Err(CreateGatewayErrorModeled::ValidationException(ValidationException {
+                error_code: Some(crate::state::ACTIVATION_KEY_NOT_FOUND.to_string()),
+                message: Some(crate::state::ACTIVATION_KEY_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        }
+
         if store.gateway_count() >= crate::state::MAX_STORED_GATEWAYS {
             return Err(CreateGatewayErrorModeled::ValidationException(ValidationException {
                 error_code: None,

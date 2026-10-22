@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCollections
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCollections`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the live collections, one page at a time, with each one's face model
+//! version beside it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCollections::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The store is keyed by `CollectionId`, so the order is the ids' own and
+//! `FaceModelVersions[i]` belongs to `CollectionIds[i]`. `NextToken` names the first
+//! id of the next page, which is why a collection created or deleted between pages
+//! shifts nothing already reported. A token this service did not mint names no
+//! position and is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +163,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCollections` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCollectionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCollections"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListCollectionsErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the Rekognition collection store is unavailable".to_string()),
+                ..InternalServerError::default()
+            })
+        })?;
+        let state = state.lock();
+
+        let start_at = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                crate::state::decode_cursor(crate::state::COLLECTIONS_CURSOR_SCOPE, token)
+                    .ok_or_else(|| {
+                        ListCollectionsErrorModeled::InvalidPaginationTokenException(
+                            InvalidPaginationTokenException {
+                                message: Some("Invalid pagination token".to_string()),
+                                ..InvalidPaginationTokenException::default()
+                            },
+                        )
+                    })?,
+            ),
+        };
+
+        let page_size = crate::state::page_size(input.max_results);
+        let mut remaining = state
+            .collections
+            .iter()
+            .filter(|(id, _)| start_at.as_ref().is_none_or(|from| *id >= from));
+
+        let mut collection_ids = Vec::new();
+        let mut face_model_versions = Vec::new();
+        for (id, collection) in remaining.by_ref().take(page_size) {
+            collection_ids.push(id.clone());
+            face_model_versions.push(collection.face_model_version.clone());
+        }
+
+        // A caller that asked for an empty page is answered with one and no cursor,
+        // rather than a cursor it could follow forever without advancing.
+        let next_token = if crate::state::page_ends_here(page_size) {
+            None
+        } else {
+            remaining.next().map(|(id, _)| {
+                crate::state::encode_cursor(crate::state::COLLECTIONS_CURSOR_SCOPE, id)
+            })
+        };
+
+        Ok(ListCollectionsOutput {
+            collection_ids: Some(collection_ids),
+            next_token,
+            face_model_versions: Some(face_model_versions),
+        })
     }
 }

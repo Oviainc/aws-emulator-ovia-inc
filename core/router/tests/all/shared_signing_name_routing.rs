@@ -21,6 +21,10 @@
 //!
 //! This suite pins that: with both members of a pair mounted, each one's path space
 //! reaches it and answers with that service's OWN response.
+//!
+//! Its `iam` half has a follow-on, `all/iam_signing_name_routing.rs`, which asserts what
+//! each IAM answer must LOOK like (an XML envelope, never the router's JSON refusal) and
+//! that a role created through the router is readable through it.
 
 use std::sync::Arc;
 

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWatchlists
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWatchlists`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWatchlists::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages a domain's stored watchlists — its default watchlist and every watchlist
+//! created in it — out of [`crate::state::ComAmazonawsVoiceidVoiceidState`] in creation
+//! order. A read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +156,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWatchlists` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWatchlistsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWatchlists"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListWatchlistsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Voice ID store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+        if !store.domains.contains_key(&input.domain_id) {
+            return Err(ListWatchlistsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Domain with ID {} not found.",
+                        input.domain_id
+                    )),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_DOMAIN.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let size = crate::state::page_size(
+            input.max_results,
+            crate::state::LIST_WATCHLISTS_MAX_RESULTS,
+        );
+        let page = crate::state::page(
+            store.watchlist_order(&input.domain_id),
+            input.next_token.as_deref(),
+            size,
+        )
+        .map_err(|message| {
+            ListWatchlistsErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        })?;
+
+        let summaries = page
+            .ids
+            .iter()
+            .filter_map(|watchlist_id| store.watchlist(&input.domain_id, watchlist_id))
+            .map(crate::state::WatchlistRecord::to_summary)
+            .collect();
+
+        Ok(ListWatchlistsOutput {
+            watchlist_summaries: Some(summaries),
+            next_token: page.next_token,
+        })
     }
 }

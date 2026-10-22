@@ -235,6 +235,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: crate::state::tags_from_input(input.tags.as_ref()),
             latest_version: FIRST_VERSION,
             last_modified: now,
+            // Code generation is started by `PutCodeBinding`, never by a create, so a
+            // freshly created schema holds no code bindings.
+            code_bindings: ::std::collections::BTreeMap::new(),
             versions: ::std::iter::once((
                 FIRST_VERSION,
                 crate::state::SchemaVersion {

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEnabledStandards
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEnabledStandards`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEnabledStandards::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the standards subscriptions the caller's account/Region has enabled, from
+//! `crate::state`'s `standards` map — the resources `EnableSecurityHub`'s default
+//! standards create — filtered by `StandardsSubscriptionArns` and `Providers` and
+//! paged by `MaxResults` / `NextToken`.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +118,31 @@ impl From<GetEnabledStandardsErrorModeled> for GetEnabledStandardsError {
     }
 }
 
+/// `MaxResults`' upper bound (`@range(min: 1, max: 100)` on `MaxResults`), which is
+/// also the page size used when the caller names none.
+pub const MAX_RESULTS_LIMIT: usize = 100;
+
+/// Marker the opaque `NextToken` carries, so a token minted for another list — or a
+/// value a caller invented — is rejected rather than read as an offset.
+const NEXT_TOKEN_PREFIX: &str = "securityhub:enabled-standards:";
+
+/// A `NextToken` resuming at `offset` in the sorted result. Opaque to the caller:
+/// the cursor is hex-encoded, so nothing in the response invites arithmetic on it.
+fn encode_next_token(offset: usize) -> String {
+    ::hex::encode(format!("{NEXT_TOKEN_PREFIX}{offset}"))
+}
+
+/// The offset a `NextToken` resumes at, or `None` when it is not one this operation
+/// minted.
+fn decode_next_token(token: &str) -> Option<usize> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    decoded.strip_prefix(NEXT_TOKEN_PREFIX)?.parse().ok()
+}
+
+/// Every `StandardsProvider` value the model declares (`smithy_query(query="shape",
+/// shape="StandardsProvider")`): the cloud providers `Providers` can filter by.
+const STANDARDS_PROVIDERS: [&str; 2] = ["AWS", "Azure"];
+
 /// The `GetEnabledStandards` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -157,18 +179,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEnabledStandards` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEnabledStandardsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEnabledStandards"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetEnabledStandardsError::Modeled(GetEnabledStandardsErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the Security Hub CSPM state store is unavailable".to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+        let invalid_input = |message: String| {
+            GetEnabledStandardsError::Modeled(
+                GetEnabledStandardsErrorModeled::InvalidInputException(InvalidInputException {
+                    message: Some(message),
+                    code: Some("InvalidInputException".to_string()),
+                }),
+            )
+        };
+
+        let key = crate::state::hub_key(ctx);
+        let (account_id, region) = (key.0.clone(), key.1.clone());
+
+        // Whether the request is valid is decided before any state is read, so a
+        // `Providers` value the model does not declare is refused identically on
+        // every hub.
+        let providers = input.providers.clone().unwrap_or_default();
+        for provider in &providers {
+            if !STANDARDS_PROVIDERS.contains(&provider.as_str()) {
+                return Err(invalid_input(format!(
+                    "Providers: {provider} is not a supported cloud provider"
+                )));
+            }
+        }
+
+        let mut store = state.lock();
+        if !store.hubs.contains_key(&key) {
+            return Err(GetEnabledStandardsErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(format!(
+                        "Account {account_id} is not subscribed to Security Hub CSPM in Region {region}"
+                    )),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Reporting the standards means reporting the status the clock already owes:
+        // a subscription whose `PENDING` -> `READY` transition fell due is `READY`
+        // whether or not anybody called. Nothing else in this handler writes.
+        crate::state::settle_standards(&mut store, &key);
+
+        let arn_filter = input.standards_subscription_arns.clone().unwrap_or_default();
+        let mut matched: Vec<(
+            &crate::state::StandardsSubscriptionKey,
+            &crate::state::StandardsSubscriptionRecord,
+        )> = store
+            .standards
+            .iter()
+            .filter(|(subscription_key, _)| {
+                subscription_key.account_id == account_id && subscription_key.region == region
+            })
+            .filter(|(_, record)| {
+                arn_filter.is_empty() || arn_filter.contains(&record.standards_subscription_arn)
+            })
+            .filter(|(_, record)| providers.is_empty() || providers.contains(&record.provider))
+            .collect();
+
+        // A total order over the subscription ARN — unique per standard per hub — is
+        // what makes a `NextToken` page repeatable.
+        matched.sort_by(|(_, left), (_, right)| {
+            left.standards_subscription_arn
+                .cmp(&right.standards_subscription_arn)
+        });
+
+        // `MaxResults` is modelled `@range(min: 1, max: 100)`, so the boundary
+        // validator already refuses a value outside it; clamping here keeps the page
+        // bounded even if this handler is reached another way.
+        let page_size = input.max_results.map_or(MAX_RESULTS_LIMIT, |requested| {
+            usize::try_from(requested)
+                .unwrap_or(MAX_RESULTS_LIMIT)
+                .clamp(1, MAX_RESULTS_LIMIT)
+        });
+        let offset = match input.next_token.as_deref() {
+            Some(token) => decode_next_token(token).ok_or_else(|| {
+                invalid_input("NextToken is not a token this operation issued".to_string())
+            })?,
+            None => 0,
+        };
+        if offset > matched.len() {
+            return Err(invalid_input(
+                "NextToken refers to a position past the end of the result set".to_string(),
+            ));
+        }
+
+        let page: Vec<StandardsSubscription> = matched
+            .iter()
+            .skip(offset)
+            .take(page_size)
+            .map(|(subscription_key, record)| StandardsSubscription {
+                standards_subscription_arn: record.standards_subscription_arn.clone(),
+                standards_arn: subscription_key.standards_arn.clone(),
+                standards_input: record.standards_input.clone(),
+                standards_status: record.standards_status.clone(),
+                standards_controls_updatable: Some(
+                    crate::state::standards_controls_updatable(&record.standards_status)
+                        .to_string(),
+                ),
+                // `StandardsStatusReason` reports why a standard could not be
+                // enabled or disabled; a subscription that is enabling or enabled
+                // has no reason to report.
+                standards_status_reason: None,
+                provider: Some(record.provider.clone()),
+            })
+            .collect();
+        let next_offset = offset + page.len();
+        let next_token = (next_offset < matched.len()).then(|| encode_next_token(next_offset));
+
+        Ok(GetEnabledStandardsOutput {
+            standards_subscriptions: Some(page),
+            next_token,
+        })
     }
 }

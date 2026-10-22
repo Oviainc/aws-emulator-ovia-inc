@@ -14,5 +14,8 @@
 #[path = "all/component_lifecycle.rs"]
 mod component_lifecycle;
 
+#[path = "all/component_wire_fidelity.rs"]
+mod component_wire_fidelity;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

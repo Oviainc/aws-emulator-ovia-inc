@@ -5,6 +5,11 @@
 //! `SemanticVersion` path label, and answers from the version it stored — so a later
 //! ListApplicationVersions/GetApplication sees exactly this version.
 //!
+//! A version carries "the raw packaged AWS SAM template of your application", so a
+//! template body this emulator reads is published only if it declares the SAM `Transform`
+//! field; one that does not is refused with the modelled `BadRequestException` and
+//! nothing is stored for it (see [`crate::state::parse_template`]).
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! The engine is held on `self` (constructor-injected); reach the store through
@@ -187,10 +192,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.semantic_version
             )));
         }
-        // Parsed BEFORE the store is locked, and bounded against the documented template
+        // The inline template is retained for the life of the version, so its size is
+        // bounded before it is parsed and before it is stored, at the documented maximum
+        // of a packaged CloudFormation template.
+        crate::state::bounded_bytes(
+            "TemplateBody",
+            input.template_body.as_ref(),
+            crate::state::MAX_TEMPLATE_BYTES,
+        )
+        .map_err(bad_request)?;
+        // Read BEFORE the store is locked, and bounded against the documented template
         // maxima: the template is caller-supplied, so neither the work it costs nor the
         // bytes it retains may be request-controlled, and neither is paid while holding
-        // the lock every other request waits on.
+        // the lock every other request waits on. A template that is not a packaged AWS SAM
+        // template is refused here, so nothing is published for it.
         let parameter_definitions = crate::state::parse_template(input.template_body.as_ref())
             .map_err(|refusal| bad_request(refusal.message()))?;
 

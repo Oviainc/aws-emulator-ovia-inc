@@ -175,12 +175,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .version_for(input.schema_version.as_deref())
             .ok_or_else(|| {
                 DescribeSchemaError::from(DescribeSchemaErrorModeled::NotFoundException(
-                    crate::state::not_found(format!(
-                        "Schema {} in registry {} has no version {}.",
-                        input.schema_name,
-                        input.registry_name,
-                        input.schema_version.as_deref().unwrap_or_default()
-                    )),
+                    crate::state::schema_version_not_found(
+                        &input.registry_name,
+                        &input.schema_name,
+                        input.schema_version.as_deref(),
+                    ),
                 ))
             })?;
 

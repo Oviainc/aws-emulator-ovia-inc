@@ -1457,6 +1457,17 @@ async fn create_repository_refuses_a_configuration_it_cannot_honour() {
             "TooManyTagsException",
         ),
         (
+            // The same rule `PutImageTagMutability` applies: a filter beside a setting
+            // that has no exclusion to apply could never be consulted.
+            "exclusion filters beside a setting that excludes nothing",
+            json!({"repositoryName": "filters-without-exclusion",
+                   "imageTagMutability": "IMMUTABLE",
+                   "imageTagMutabilityExclusionFilters": [
+                       {"filterType": "WILDCARD", "filter": "release-*"},
+                   ]}),
+            "InvalidParameterException",
+        ),
+        (
             "a tag key past its maximum character length",
             json!({"repositoryName": "long-key", "tags": [
                 {"Key": "k".repeat(129), "Value": "v"},

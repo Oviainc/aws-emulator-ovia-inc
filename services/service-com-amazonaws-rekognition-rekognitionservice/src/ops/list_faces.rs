@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the faces `IndexFaces` stored in a collection, one page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The page is cut out of the collection's insertion order after the `FaceIds` and
+//! `UserId` filters have been applied, and `NextToken` names the first face of the
+//! next page by its per-collection sequence number — which is monotonic and never
+//! reused, so a face indexed or deleted between two pages neither duplicates nor
+//! hides a face the caller has yet to see. A token this service did not mint names no
+//! position and is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +168,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFaces"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListFacesErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the Rekognition collection store is unavailable".to_string()),
+                ..InternalServerError::default()
+            })
+        })?;
+        let state = state.lock();
+
+        let collection = state.collections.get(&input.collection_id).ok_or_else(|| {
+            ListFacesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "The collection id: {} does not exist",
+                    input.collection_id
+                )),
+                ..ResourceNotFoundException::default()
+            })
+        })?;
+
+        let start_at = match input.next_token.as_deref() {
+            None | Some("") => 0,
+            Some(token) => crate::state::decode_sequence_cursor(token).ok_or_else(|| {
+                ListFacesErrorModeled::InvalidPaginationTokenException(
+                    InvalidPaginationTokenException {
+                        message: Some("Invalid pagination token".to_string()),
+                        ..InvalidPaginationTokenException::default()
+                    },
+                )
+            })?,
+        };
+
+        let page_size = crate::state::page_size(input.max_results);
+        let mut remaining = collection.faces.iter().filter(|face| {
+            face.sequence >= start_at
+                && input
+                    .face_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&face.face_id))
+                && input
+                    .user_id
+                    .as_deref()
+                    .is_none_or(|user| face.user_id.as_deref() == Some(user))
+        });
+
+        let page: Vec<Face> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::StoredFace::modeled)
+            .collect();
+
+        // A `NextToken` only where a further page exists, so a caller following the
+        // tokens stops exactly once every matching face has been reported. A caller
+        // that asked for an empty page is answered with one and no cursor, rather than
+        // a cursor it could follow forever without advancing.
+        let next_token = if crate::state::page_ends_here(page_size) {
+            None
+        } else {
+            remaining
+                .next()
+                .map(|face| crate::state::encode_sequence_cursor(face.sequence))
+        };
+
+        Ok(ListFacesOutput {
+            faces: Some(page),
+            next_token,
+            face_model_version: Some(collection.face_model_version.clone()),
+        })
     }
 }

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the whole create request under a freshly minted `connectorArn` and answers with
+//! the identity the service assigned it. A name identifies at most one connector, so a
+//! repeat of a stored name is a `ConflictException`; a `plugins` entry naming a
+//! custom-plugin ARN or revision no stored plugin carries is a `NotFoundException`; a
+//! request the model cannot constrain (a `plugins` list that is not a single element, a
+//! `capacity` naming neither or both of its two forms) is a `BadRequestException`. The
+//! connector is answered `CREATING` and becomes `RUNNING` once the clock says so
+//! (`crate::state::TRANSITION_SPAN`), which every later read materialises.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +191,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConnector"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateConnectorErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the kafkaconnect store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = store.lock();
+        state.settle_due();
+
+        // "You must specify a single-element list containing one customPlugin
+        // object" — the `plugins` member's own documentation. The model declares
+        // no list length, so the framework cannot refuse this one.
+        if input.plugins.len() != 1 {
+            return Err(CreateConnectorErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "plugins must be a single-element list containing one customPlugin object; got {} elements.",
+                    input.plugins.len()
+                )),
+            })
+            .into());
+        }
+
+        // Capacity is "whether it is auto scaled or provisioned": exactly one of
+        // the two forms, which the model expresses as two optional members.
+        let auto_scaled = input.capacity.auto_scaling.is_some();
+        let provisioned = input.capacity.provisioned_capacity.is_some();
+        if auto_scaled == provisioned {
+            return Err(CreateConnectorErrorModeled::BadRequestException(BadRequestException {
+                message: Some(
+                    "capacity must name exactly one of autoScaling or provisionedCapacity."
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
+        if let Some(existing) = state.connector_named(&input.connector_name) {
+            return Err(CreateConnectorErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "A connector named {} already exists ({}). Retry your request with another name.",
+                    input.connector_name, existing.arn
+                )),
+            })
+            .into());
+        }
+
+        // The quota on stored connectors. The real service meters this and
+        // answers the same error once it is reached.
+        if state.connector_quota_reached() {
+            return Err(CreateConnectorErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "Limit exceeded. Resource limit reached: this account already holds {} connectors.",
+                        crate::state::RESOURCE_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        for plugin in &input.plugins {
+            let reference = &plugin.custom_plugin;
+            match state.custom_plugins.get(&reference.custom_plugin_arn) {
+                Some(stored) if stored.state != crate::state::CUSTOM_PLUGIN_ACTIVE => {
+                    // A plugin the service has not finished taking on (or is
+                    // deleting) cannot back a connector: its content is not
+                    // usable yet, so the request is refused rather than stored
+                    // against a plugin that may never become usable.
+                    return Err(CreateConnectorErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(format!(
+                                "The custom plugin {} is {}, not ACTIVE. Correct your request and then retry it.",
+                                reference.custom_plugin_arn, stored.state
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                Some(stored) if stored.revision == reference.revision => {}
+                Some(stored) => {
+                    return Err(CreateConnectorErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(format!(
+                            "The custom plugin {} has no revision {}; its latest revision is {}.",
+                            reference.custom_plugin_arn, reference.revision, stored.revision
+                        )),
+                    })
+                    .into());
+                }
+                None => {
+                    return Err(CreateConnectorErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(format!(
+                            "No custom plugin exists with the ARN {}.",
+                            reference.custom_plugin_arn
+                        )),
+                    })
+                    .into());
+                }
+            }
+        }
+
+        let id = state.mint_resource_id("connector", &input.connector_name);
+        let arn = ::engine::emulator_arn(
+            crate::state::ARN_SERVICE,
+            &region,
+            &format!("connector/{}/{}", input.connector_name, id),
+        );
+        let connector = crate::state::ConnectorRecord {
+            arn: arn.clone(),
+            name: input.connector_name,
+            description: input.connector_description,
+            configuration: input.connector_configuration,
+            capacity: input.capacity,
+            kafka_cluster: input.kafka_cluster,
+            kafka_cluster_client_authentication: input.kafka_cluster_client_authentication,
+            kafka_cluster_encryption_in_transit: input.kafka_cluster_encryption_in_transit,
+            kafka_connect_version: input.kafka_connect_version,
+            network_type: input
+                .network_type
+                .unwrap_or_else(|| crate::state::DEFAULT_NETWORK_TYPE.to_string()),
+            plugins: input.plugins,
+            service_execution_role_arn: input.service_execution_role_arn,
+            worker_configuration: input.worker_configuration,
+            log_delivery: input.log_delivery,
+            state: crate::state::CONNECTOR_CREATING.to_string(),
+            current_version: crate::state::FIRST_CONNECTOR_VERSION.to_string(),
+            creation_time: ::std::time::SystemTime::now(),
+            tags: input.tags.unwrap_or_default(),
+            pending: Some(crate::state::PendingChange::in_a_moment(
+                crate::state::PendingKind::Settle,
+            )),
+        };
+
+        let output = CreateConnectorOutput {
+            connector_arn: Some(connector.arn.clone()),
+            connector_name: Some(connector.name.clone()),
+            connector_state: Some(connector.state.clone()),
+        };
+        state.connectors.insert(arn, connector);
+        Ok(output)
     }
 }

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/image_tag_mutability.rs"]
+mod image_tag_mutability;
 #[path = "all/layer_availability.rs"]
 mod layer_availability;
 #[path = "all/pull_time_update_exclusion_removal.rs"]
