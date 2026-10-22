@@ -5,7 +5,7 @@
 //! `X-Amz-Target: TrentService.<Operation>`) through the same multi-service router
 //! the emulator boots.
 //!
-//! Two rules, each asserted over a table rather than one call:
+//! Three rules, each asserted over a table rather than one call:
 //!
 //! * TrentService answers EVERY client error with the `awsJson1_1` client status,
 //!   HTTP 400, and distinguishes the error only by the body's `__type`; a server
@@ -15,87 +15,21 @@
 //!   and `smithy_query(query="shape",shape="DisabledException,DryRunOperationException")`),
 //!   over control-plane and data-plane operations alike.
 //! * A `KeyId` lookup that found nothing is reported as the resource the request
-//!   asked for, named by its ARN: an alias as an alias, a key as a key.
-
-use std::sync::Arc;
+//!   asked for, named by its ARN: an alias as an alias, a key as a key — unless the
+//!   identifier is an ARN pinned to another Region, which this endpoint can never
+//!   serve, and which is reported by naming that Region.
+//! * A refusal caused by the key's own key state names the key by its ARN and that
+//!   state as prose.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_kms_trentservice::scaffolded::wire_status;
-use service_com_amazonaws_kms_trentservice::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The Region these cases sign for; a row that is about the Region names its own.
-const REGION: &str = "us-east-1";
+// The wire plumbing lives in `tests/all/harness.rs`, shared with every other suite
+// in this crate.
+use super::harness::{b64, call, create_key, error_code, ok, router, text, REGION};
 
-/// A router with only this service mounted, over one shared engine — the same
-/// assembly `core/router` performs, minus the other services.
-fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // In-process tests sign with a placeholder key; signature verification is a
-    // front-door setting, not part of what these tests are about.
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// Call one operation in `region` and return its HTTP status and JSON body.
-async fn call(
-    router: &MultiServiceRouter,
-    region: &str,
-    operation: &str,
-    body: &Value,
-) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://kms.{region}.amazonaws.com/"))
-        .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", format!("TrentService.{operation}"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 \
-                 Credential=AKIDEMULATOR/20260101/{region}/kms/aws4_request, \
-                 SignedHeaders=host;x-amz-target, Signature=0000"
-            ),
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("the request body serializes"),
-        ))
-        .expect("the request builds");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let payload = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    (status, payload)
-}
-
-/// Call one operation in [`REGION`], requiring success.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
-    let (status, payload) = call(router, REGION, operation, body).await;
-    assert_eq!(
-        status, 200,
-        "case {operation} {body}: expected HTTP 200, got {status} with {payload}"
-    );
-    payload
-}
-
-/// The wire error code (`__type`) of an error body, without its namespace.
-fn error_code(payload: &Value) -> String {
-    payload["__type"]
-        .as_str()
-        .unwrap_or_default()
-        .rsplit(['#', ':'])
-        .next()
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// The `message` an error body carries.
+/// The `message` an error body carries. The harness reports the `__type`; only this
+/// suite asserts on the wording, so the accessor lives here.
 fn error_message(payload: &Value) -> String {
     payload["message"]
         .as_str()
@@ -104,22 +38,12 @@ fn error_message(payload: &Value) -> String {
         .to_string()
 }
 
-/// A blob as awsJson1_1 carries it.
-fn b64(bytes: &[u8]) -> String {
-    aws_smithy_types::base64::encode(bytes)
-}
-
-/// Create a key and return its `KeyMetadata`.
-async fn create_key(router: &MultiServiceRouter, description: &str) -> Value {
-    ok(router, "CreateKey", &json!({"Description": description})).await["KeyMetadata"].clone()
-}
-
-/// A string member of a JSON object.
-fn text(case: &str, value: &Value, member: &str) -> String {
-    value[member]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case}: expected a string {member} in {value}"))
-        .to_string()
+/// Create a key with `description` and return its `KeyMetadata`.
+async fn described_key(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    description: &str,
+) -> Value {
+    create_key(router, &json!({"Description": description})).await
 }
 
 /// Every refusal this service can be driven into answers HTTP 400 — whatever
@@ -135,13 +59,13 @@ async fn every_client_error_answers_http_400_with_its_own_type() {
     let router = router();
     let account = engine::emulator_account_id();
 
-    let enabled = create_key(&router, "enabled").await;
+    let enabled = described_key(&router, "enabled").await;
     let enabled_id = text("setup", &enabled, "KeyId");
-    let other = create_key(&router, "other").await;
+    let other = described_key(&router, "other").await;
     let other_id = text("setup", &other, "KeyId");
-    let disabled = create_key(&router, "disabled").await;
+    let disabled = described_key(&router, "disabled").await;
     let disabled_id = text("setup", &disabled, "KeyId");
-    let pending = create_key(&router, "pending").await;
+    let pending = described_key(&router, "pending").await;
     let pending_id = text("setup", &pending, "KeyId");
 
     // A ciphertext of each key, taken while every key is still usable.
@@ -213,6 +137,20 @@ async fn every_client_error_answers_http_400_with_its_own_type() {
             "enable a key pending deletion",
             "EnableKey",
             json!({"KeyId": pending_id}),
+            "KMSInvalidStateException",
+            409,
+        ),
+        (
+            "update the description of a key pending deletion",
+            "UpdateKeyDescription",
+            json!({"KeyId": pending_id, "Description": "nope"}),
+            "KMSInvalidStateException",
+            409,
+        ),
+        (
+            "cancel a deletion that was never scheduled",
+            "CancelKeyDeletion",
+            json!({"KeyId": enabled_id}),
             "KMSInvalidStateException",
             409,
         ),
@@ -379,7 +317,7 @@ fn the_status_mapping_collapses_only_the_client_band() {
 #[tokio::test]
 async fn a_scaffolded_operation_still_answers_501() {
     let router = router();
-    let metadata = create_key(&router, "stub census").await;
+    let metadata = described_key(&router, "stub census").await;
     let key_id = text("setup", &metadata, "KeyId");
 
     // Rows: operations this crate has not implemented yet, control plane and data
@@ -412,7 +350,8 @@ async fn a_scaffolded_operation_still_answers_501() {
 
 /// A `KeyId` lookup that found nothing names the resource the request asked for, by
 /// its ARN: an alias that resolves to no key is reported AS an alias, and a key id or
-/// key ARN as a key.
+/// key ARN as a key. An ARN pinned to ANOTHER Region is reported by naming that
+/// Region, because no endpoint of this one can serve it.
 ///
 /// The rows differ in the form of the identifier (bare name and ARN), in the alias
 /// name (the characters `AliasNameType`'s `^[a-zA-Z0-9:/_-]+$` pattern allows:
@@ -449,14 +388,15 @@ async fn a_failed_key_id_lookup_names_the_resource_the_request_asked_for() {
             format!("Alias {alias_arn} is not found."),
         ));
     }
-    // An alias ARN of another Region reaches this endpoint's alias table and is
-    // still reported as the alias the caller named.
+    // An ARN of another Region cannot be served by the endpoint it was sent to at
+    // all, so the refusal names that Region rather than a resource of this one —
+    // the form recorded on the wire, `NotFoundException: Invalid arn <region>`.
     let foreign = format!("arn:aws:kms:ap-south-1:{account}:alias/elsewhere");
     cases.push((
         format!("alias ARN of another Region {foreign}"),
         REGION,
         foreign.clone(),
-        format!("Alias {foreign} is not found."),
+        "Invalid arn ap-south-1".to_string(),
     ));
     // A key identifier is NOT an alias: it is reported as a key, by its key ARN.
     for (region, key_id) in [
@@ -478,14 +418,13 @@ async fn a_failed_key_id_lookup_names_the_resource_the_request_asked_for() {
             format!("Key '{key_arn}' does not exist"),
         ));
     }
-    // A key ARN of another Region reaches this endpoint and is reported as the key
-    // the caller named.
+    // As above, for a key ARN: the Region it names is what the refusal reports.
     let foreign_key = format!("arn:aws:kms:ap-south-1:{account}:key/{}", "0".repeat(8));
     cases.push((
         format!("key ARN of another Region {foreign_key}"),
         REGION,
         foreign_key.clone(),
-        format!("Key '{foreign_key}' does not exist"),
+        "Invalid arn ap-south-1".to_string(),
     ));
 
     for (case, region, identifier, expected) in cases {
@@ -494,11 +433,16 @@ async fn a_failed_key_id_lookup_names_the_resource_the_request_asked_for() {
             "ScheduleKeyDeletion",
             "DisableKey",
             "EnableKey",
+            "CancelKeyDeletion",
+            "UpdateKeyDescription",
             "Encrypt",
         ] {
             let mut body = json!({"KeyId": identifier});
             if operation == "Encrypt" {
                 body["Plaintext"] = json!(b64(b"hello kms"));
+            }
+            if operation == "UpdateKeyDescription" {
+                body["Description"] = json!("nowhere");
             }
             let (status, payload) = call(&router, region, operation, &body).await;
             let code = error_code(&payload);
@@ -517,5 +461,107 @@ async fn a_failed_key_id_lookup_names_the_resource_the_request_asked_for() {
                  request did ({expected:?}), got {message:?}"
             );
         }
+    }
+}
+
+/// A refusal caused by the key's own key state names the key by its ARN and the state
+/// in question as prose: an operation refused because of the state the key is IN names
+/// that state ("pending deletion", "disabled"), and `CancelKeyDeletion`, which needs
+/// the one `PendingDeletion` state, names the state the key is missing ("not pending
+/// deletion") — every value worded from `KeyState` itself
+/// (`smithy_query(query="shape",shape="KeyState")`).
+///
+/// The rows span the operations that refuse on key state and the states they refuse
+/// in, so one wording covers them all.
+#[tokio::test]
+async fn a_state_refusal_names_the_key_and_its_state() {
+    let router = router();
+
+    let enabled = described_key(&router, "enabled").await;
+    let enabled_arn = text("setup", &enabled, "Arn");
+    let disabled = described_key(&router, "disabled").await;
+    let disabled_arn = text("setup", &disabled, "Arn");
+    ok(&router, "DisableKey", &json!({"KeyId": disabled_arn})).await;
+    let pending = described_key(&router, "pending").await;
+    let pending_arn = text("setup", &pending, "Arn");
+    ok(
+        &router,
+        "ScheduleKeyDeletion",
+        &json!({"KeyId": pending_arn, "PendingWindowInDays": 7}),
+    )
+    .await;
+
+    // Rows: the call, the key it names, and the state prose the refusal must carry.
+    let cases: Vec<(&str, &str, Value, &str, &str)> = vec![
+        (
+            "schedule a key pending deletion",
+            "ScheduleKeyDeletion",
+            json!({"KeyId": pending_arn, "PendingWindowInDays": 7}),
+            &pending_arn,
+            "pending deletion",
+        ),
+        (
+            "disable a key pending deletion",
+            "DisableKey",
+            json!({"KeyId": pending_arn}),
+            &pending_arn,
+            "pending deletion",
+        ),
+        (
+            "enable a key pending deletion",
+            "EnableKey",
+            json!({"KeyId": pending_arn}),
+            &pending_arn,
+            "pending deletion",
+        ),
+        (
+            "update the description of a key pending deletion",
+            "UpdateKeyDescription",
+            json!({"KeyId": pending_arn, "Description": "nope"}),
+            &pending_arn,
+            "pending deletion",
+        ),
+        (
+            "encrypt under a key pending deletion",
+            "Encrypt",
+            json!({"KeyId": pending_arn, "Plaintext": b64(b"hello kms")}),
+            &pending_arn,
+            "pending deletion",
+        ),
+        (
+            "cancel a deletion on an enabled key",
+            "CancelKeyDeletion",
+            json!({"KeyId": enabled_arn}),
+            &enabled_arn,
+            "not pending deletion",
+        ),
+        (
+            "cancel a deletion on a disabled key",
+            "CancelKeyDeletion",
+            json!({"KeyId": disabled_arn}),
+            &disabled_arn,
+            "not pending deletion",
+        ),
+        (
+            "encrypt under a disabled key",
+            "Encrypt",
+            json!({"KeyId": disabled_arn, "Plaintext": b64(b"hello kms")}),
+            &disabled_arn,
+            "disabled",
+        ),
+    ];
+
+    for (case, operation, body, arn, prose) in cases {
+        let (status, payload) = call(&router, REGION, operation, &body).await;
+        let message = error_message(&payload);
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {payload}"
+        );
+        assert_eq!(
+            message,
+            format!("{arn} is {prose}."),
+            "case {case:?}: expected the refusal to name the key and its state, got {message:?}"
+        );
     }
 }

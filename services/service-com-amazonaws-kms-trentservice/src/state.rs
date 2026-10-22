@@ -314,6 +314,17 @@ fn parse_key_identifier(id: &str) -> Result<KeyIdentifier, ()> {
 /// alias that resolves to no key is reported as a missing ALIAS, never as a missing
 /// key identifier.
 ///
+/// BEFORE that, the Region: a key or alias ARN pins the request to one Region, so an
+/// ARN naming a Region other than the one the request was signed for can never be
+/// served by this endpoint at all, and KMS answers by naming the ARN's OWN Region
+/// rather than a resource of the endpoint's. The recording this is read from is
+/// `kms-key-description-update-and-cancel-deletion#task#5` of the
+/// `simparity-wire-aws-v1` wire corpus: `UpdateKeyDescription` with
+/// `KeyId = arn:aws:kms:us-east-1:<account>:key/<id>` sent to the **us-west-2**
+/// endpoint answers HTTP 400 `NotFoundException: Invalid arn us-east-1` — `us-east-1`
+/// is the Region in the ARN, not the Region of the endpoint, which is the one case
+/// that tells the two apart.
+///
 /// `region` is the Region the request was signed for, and the Region of the ARN this
 /// builds, since a KMS key is a regional resource and the same key id in another
 /// Region is a different (absent) key. The exact sentences are examples of KMS's;
@@ -324,6 +335,11 @@ fn parse_key_identifier(id: &str) -> Result<KeyIdentifier, ()> {
 /// `InvalidArnException` answer that instead and never reach this case; `Encrypt` and
 /// `Decrypt`, which do not model it, report such an identifier as not found.
 pub fn key_not_found_message(region: &str, requested: &str) -> String {
+    if let Some(arn_region) = arn_region(requested) {
+        if arn_region != region {
+            return format!("Invalid arn {arn_region}");
+        }
+    }
     match parse_key_identifier(requested) {
         Ok(KeyIdentifier::Alias { alias, scope }) => {
             format!("Alias {} is not found.", arn_of(region, scope, requested, &alias))
@@ -339,6 +355,13 @@ pub fn key_not_found_message(region: &str, requested: &str) -> String {
     }
 }
 
+/// The Region segment of `identifier`, when it is a KMS key or alias ARN.
+fn arn_region(identifier: &str) -> Option<String> {
+    let parsed = parse_key_identifier(identifier).ok()?;
+    let (arn_region, _account) = parsed.scope()?;
+    Some(arn_region.to_string())
+}
+
 /// The ARN a resolved identifier names: the one the request gave when it gave an ARN
 /// (which is what `scope` records), otherwise the ARN `resource` denotes in `region`.
 fn arn_of(
@@ -351,25 +374,6 @@ fn arn_of(
         requested.to_string()
     } else {
         ::engine::emulator_arn(ARN_SERVICE, region, resource)
-    }
-}
-
-/// How a refusal caused by the key's own key state is worded.
-///
-/// KMS names the key by its ARN and says what about its state refuses the call, so
-/// the caller learns whether the state can change: a key whose deletion is scheduled
-/// is reported as pending deletion, and any other incompatible state is reported by
-/// naming that state. The exact sentences are examples of KMS's; what this function
-/// pins is that the refusal names the key and the reason, in ONE place, so no two
-/// operations word the same key state differently.
-pub fn invalid_state_message(key: &Cmk) -> String {
-    if key.key_state == KEY_STATE_PENDING_DELETION {
-        format!("{} is pending deletion.", key.arn)
-    } else {
-        format!(
-            "{} is not in a valid state for this operation. Its key state is {}.",
-            key.arn, key.key_state
-        )
     }
 }
 
@@ -994,6 +998,55 @@ pub fn date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX));
     ::aws_smithy_types::DateTime::from_millis(millis)
+}
+
+/// How an identifier that is an ARN, but not a KMS key or alias ARN, is refused:
+/// `InvalidArnException`'s message names the identifier the request gave, since that
+/// string is the whole of what is wrong with it.
+///
+/// One function for the whole service, so no two operations word the same malformed
+/// identifier differently.
+pub fn invalid_arn_message(requested: &str) -> String {
+    format!("The specified ARN is not valid: {requested}.")
+}
+
+/// How a refusal caused by the key's own key state is worded.
+///
+/// KMS names the key by its ARN and says what about its state refuses the call, so the
+/// caller learns whether the state can change: the message is "<key arn> is <that key
+/// state, as prose>." — recorded on the wire as "… is pending deletion." for a key
+/// whose deletion is scheduled and "… is disabled." for a disabled one.
+///
+/// The prose comes from the `KeyState` value itself
+/// (`smithy_query(query="shape",shape="KeyState")`, whose values are camel case): each
+/// word is lowercased and separated by a space, so a state this slice does not reach
+/// yet is worded the same way without a case for it.
+///
+/// One function for the whole service, so no two operations word the same key state
+/// differently.
+pub fn invalid_state_message(key: &Cmk) -> String {
+    format!("{} is {}.", key.arn, key_state_prose(&key.key_state))
+}
+
+/// How KMS words the refusal of a request that REQUIRES a key state the key is not in
+/// — the negative of [`invalid_state_message`]: where an operation refused because of
+/// the state the key is in names that state, one refused because the key is outside
+/// the single state it needs names the state it is missing, "<key arn> is not pending
+/// deletion."
+pub fn required_state_message(key: &Cmk, required_state: &str) -> String {
+    format!("{} is not {}.", key.arn, key_state_prose(required_state))
+}
+
+/// A `KeyState` value as prose: `PendingDeletion` -> `pending deletion`.
+fn key_state_prose(key_state: &str) -> String {
+    let mut prose = String::with_capacity(key_state.len() + 2);
+    for (index, c) in key_state.char_indices() {
+        if c.is_ascii_uppercase() && index != 0 {
+            prose.push(' ');
+        }
+        prose.extend(c.to_lowercase());
+    }
+    prose
 }
 
 /// The AWS Region a request was signed for, which is the Region the keys it creates

@@ -31,6 +31,8 @@ mod modelled_wire_shape;
 mod no_content_responses;
 #[path = "all/policy_access_check.rs"]
 mod policy_access_check;
+#[path = "all/policy_check_reason_text.rs"]
+mod policy_check_reason_text;
 #[path = "all/policy_checks.rs"]
 mod policy_checks;
 #[path = "all/resource_tags.rs"]

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: resolves the owning service and listener, refuses a name or a priority
+//! another rule of the same listener already holds, mints a rule under the listener,
+//! persists it in
+//! [`crate::state::ComAmazonawsVpclatticeMercurycontrolplaneState::rules`] and answers
+//! from what was stored (`GetRule` reads the same record back).
 //!
 //! ## Shape of an operation
 //!
@@ -151,6 +148,54 @@ impl From<CreateRuleErrorModeled> for CreateRuleError {
     }
 }
 
+/// The response for a stored rule — every member read back out of state.
+fn output_of(rule: &crate::state::Rule) -> CreateRuleOutput {
+    CreateRuleOutput {
+        id: Some(rule.id.clone()),
+        arn: Some(rule.arn.clone()),
+        name: Some(rule.name.clone()),
+        r#match: Some(rule.r#match.clone()),
+        priority: Some(rule.priority),
+        action: Some(rule.action.clone()),
+    }
+}
+
+/// HTTP 400 for input outside a constraint the model or the member's documentation
+/// states, naming the member and the constraint it broke.
+fn invalid(member: &str, reason: &str) -> CreateRuleError {
+    CreateRuleErrorModeled::ValidationException(ValidationException {
+        message: format!("{member} {reason}"),
+        reason: "fieldValidationFailed".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: reason.to_string(),
+        }]),
+    })
+    .into()
+}
+
+/// HTTP 404 for an identifier that names no persisted resource of `kind`, with AWS's
+/// not-found message construction over the submitted identifier
+/// ([`crate::state::ResourceKind::not_found_message`]).
+fn not_found(identifier: &str, kind: crate::state::ResourceKind) -> CreateRuleError {
+    CreateRuleErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: kind.not_found_message(identifier),
+        resource_id: identifier.to_string(),
+        resource_type: kind.arn_kind().to_string(),
+    })
+    .into()
+}
+
+/// HTTP 409 for a request that conflicts with a rule the listener already holds.
+fn conflict(message: String, resource_id: String) -> CreateRuleError {
+    CreateRuleErrorModeled::ConflictException(ConflictException {
+        message,
+        resource_id,
+        resource_type: crate::state::KIND_RULE.to_string(),
+    })
+    .into()
+}
+
 /// The `CreateRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -187,18 +232,170 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRule"))
+        // The modelled constraints the boundary CAN check (`@length`, `priority`'s
+        // 1..2000 range, the path-match patterns, `headerMatches`' 1..5, `statusCode`'s
+        // 100..599) are refused before this handler runs; `name`'s pattern is written
+        // with negative lookahead the boundary's regex engine cannot compile, and the
+        // documented narrower constraints below carry no modelled trait at all.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let region = crate::state::region_of(ctx.parts());
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Both identifiers are modelled as either the bare id or the resource's ARN; one
+        // naming no persisted resource is 404, never a rule hung under nothing. A
+        // listener is a resource OF its service, so a listener stored under a different
+        // service is not reachable through this one.
+        let Some(service_id) =
+            crate::state::id_from_identifier(&input.service_identifier, crate::state::PREFIX_SERVICE)
+                .filter(|id| store.services.contains_key(id))
+        else {
+            return Err(not_found(
+                &input.service_identifier,
+                crate::state::ResourceKind::Service,
+            ));
+        };
+        let listener = crate::state::id_from_identifier(
+            &input.listener_identifier,
+            crate::state::PREFIX_LISTENER,
+        )
+        .and_then(|id| store.listeners.get(&id))
+        .filter(|listener| listener.service_id == service_id)
+        .cloned();
+        let Some(listener) = listener else {
+            return Err(not_found(
+                &input.listener_identifier,
+                crate::state::ResourceKind::Listener,
+            ));
+        };
+
+        if let Err(reason) =
+            crate::state::check_resource_name(&input.name, Some(crate::state::PREFIX_RULE))
+        {
+            return Err(invalid("name", &reason));
+        }
+        if let Err(reason) = crate::state::check_tag_count(input.tags.as_ref()) {
+            return Err(invalid("tags", &reason));
+        }
+        if let Err((member, reason)) = crate::state::check_rule_action("action", &input.action) {
+            return Err(invalid(&member, &reason));
+        }
+
+        // `clientToken` is an @idempotencyToken: its documentation states that a retry
+        // "using the same client token and parameters" succeeds without performing any
+        // action, and that "if the parameters aren't identical, the retry fails" — so
+        // EVERY member the create persists takes part in the comparison, against the
+        // values as they were stored (the action normalised the same way).
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::token_key(Self::NAME, token));
+        if let Some(existing) = token
+            .as_ref()
+            .and_then(|key| store.idempotency_tokens.get(key))
+            .and_then(|id| store.rules.get(id))
+        {
+            let identical = existing.name == input.name
+                && existing.listener_id == listener.id
+                && existing.service_id == service_id
+                && existing.priority == input.priority
+                && existing.r#match == input.r#match
+                && existing.action == crate::state::normalized_rule_action(&input.action)
+                && existing.tags == input.tags.clone().unwrap_or_default();
+            if !identical {
+                return Err(conflict(
+                    format!(
+                        "clientToken was already used to create rule {} with different parameters",
+                        existing.id
+                    ),
+                    existing.id.clone(),
+                ));
+            }
+            return Ok(output_of(existing));
+        }
+
+        // "The name must be unique within the listener" (the `name` member's own
+        // documentation), so the key is scoped to the owning listener.
+        let name_key = crate::state::rule_name_key(&listener.id, &input.name);
+        if let Some(taken_by) = store.name_index.get(&name_key) {
+            return Err(conflict(
+                format!(
+                    "a rule named {} already exists in listener {}",
+                    input.name, listener.id
+                ),
+                taken_by.clone(),
+            ));
+        }
+
+        // "Each rule for a specific listener must have a unique priority" (the
+        // `priority` member's own documentation): a create that would take a priority
+        // another rule of this listener holds conflicts with that rule's current state.
+        // The message is built from the request's `priority`, in the wording the real
+        // service answers this conflict with.
+        if let Some(taken_by) = store.rule_with_priority(&listener.id, input.priority) {
+            return Err(conflict(
+                format!("Rule with priority {} already exist!", input.priority),
+                taken_by.id.clone(),
+            ));
+        }
+
+        // The emulator's own ceiling on stored rules, answered with the modelled 402 so
+        // a caller looping on create cannot grow this process without bound.
+        if store.rule_count(&listener.id) >= crate::state::MAX_RULES_PER_LISTENER {
+            return Err(CreateRuleErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "listener {} already holds the maximum of {} rules",
+                        listener.id,
+                        crate::state::MAX_RULES_PER_LISTENER
+                    ),
+                    resource_id: Some(listener.id.clone()),
+                    resource_type: crate::state::KIND_RULE.to_string(),
+                    service_code: crate::state::ARN_SERVICE.to_string(),
+                    quota_code: "rules-per-listener".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let id = crate::state::mint_id(crate::state::PREFIX_RULE);
+        let sequence = store.next_sequence();
+        let record = crate::state::Rule {
+            arn: crate::state::rule_arn(&region, &service_id, &listener.id, &id),
+            id: id.clone(),
+            name: input.name.clone(),
+            listener_id: listener.id.clone(),
+            service_id: service_id.clone(),
+            priority: input.priority,
+            r#match: input.r#match.clone(),
+            // Stored with the weight default the `weight` member documents filled in,
+            // so every later read reports the same action.
+            action: crate::state::normalized_rule_action(&input.action),
+            // A rule this operation mints is an additional rule, never the listener's
+            // default one (that is `CreateListener`'s `defaultAction`).
+            is_default: false,
+            tags: input.tags.clone().unwrap_or_default(),
+            created_at: now,
+            last_updated_at: now,
+            sequence,
+        };
+
+        store.name_index.insert(name_key, id.clone());
+        if let Some(key) = token {
+            store.idempotency_tokens.record(key, id.clone());
+        }
+        // The answer is read off the record that gets persisted, never rebuilt from the
+        // request.
+        let output = output_of(&record);
+        store.rules.insert(id, record);
+        Ok(output)
     }
 }

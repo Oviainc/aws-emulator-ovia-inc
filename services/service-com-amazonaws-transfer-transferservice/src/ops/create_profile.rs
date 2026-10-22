@@ -182,8 +182,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Every create mints a NEW system-assigned identifier: two creates carrying
-        // identical configuration are two independent profiles.
+        // `ProfileType` is a modelled enum and `As2Id` a modelled pattern, so a value
+        // outside either is already refused before this handler runs: what reaches here
+        // is a profile the service would create. Every create mints a NEW
+        // system-assigned identifier: two creates carrying identical configuration are
+        // two independent profiles.
         let profile_id = guard.mint_id("p");
         let profile = st::Profile {
             arn: st::profile_arn(&region, &profile_id),

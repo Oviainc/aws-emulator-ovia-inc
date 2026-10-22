@@ -303,12 +303,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
 
-        // A property is named either by its asset and property ids or by its alias;
-        // exactly one of the two forms identifies it. Resolved exactly as
-        // `GetAssetPropertyValue` resolves it — the asset label through the shared
-        // `resolve_asset_id`, the property through `AssetRecord::property_position` —
-        // so a property is named one way across the service.
-        let (asset_id, property_id) = match (
+        // A stream is named either by the asset and property ids of the property it
+        // is associated with or by its alias; exactly one of the two forms identifies
+        // it. Resolved exactly as `GetAssetPropertyValue` resolves it — the asset
+        // label through the shared `resolve_asset_id`, the property through
+        // `AssetRecord::property_position`, an alias through the shared
+        // `resolve_alias_series` — so a stream is named one way across the service.
+        let stream = match (
             input.asset_id.as_deref(),
             input.property_id.as_deref(),
             input.property_alias.as_deref(),
@@ -327,13 +328,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "The asset {asset_label} has no property {property_label}."
                     ))
                 })?;
-                (asset_id, property_id)
+                crate::state::SeriesKey::Property(asset_id, property_id)
             }
-            (None, None, Some(alias)) => {
-                store.property_alias_index.get(alias).cloned().ok_or_else(|| {
-                    not_found(format!("The property alias {alias} could not be found."))
-                })?
-            }
+            // An alias names ONE data stream, whether an asset property is associated
+            // with it or not: the shared resolver reaches the property's stream, or
+            // the disassociated one standing under that alias.
+            (None, None, Some(alias)) => store.resolve_alias_series(alias).ok_or_else(|| {
+                not_found(format!("The property alias {alias} could not be found."))
+            })?,
             _ => {
                 return Err(invalid_request(
                     "Specify either assetId and propertyId, or propertyAlias.".to_string(),
@@ -366,7 +368,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .join(", ")
             ))
         })?;
-        let aggregated = crate::state::aggregated_values(&store, &asset_id, &property_id, &query);
+        let aggregated = crate::state::aggregated_values(&store, &stream, &query);
         drop(store);
 
         // `nextToken` is this enumeration's resume point: the window start of the first

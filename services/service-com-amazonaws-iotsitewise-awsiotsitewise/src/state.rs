@@ -7,9 +7,12 @@
 //! (`externalId:<id>` labels, property aliases, a gateway's platform device). A
 //! resource's tags live on that resource's own record, reached by ARN through
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::tags_for_resource`], so the
-//! tagging operations and the creates share one tag set per resource. Every handler
-//! reads and writes THIS struct through [`service_state`]; nothing in `src/ops/`
-//! keeps state of its own.
+//! tagging operations and the creates share one tag set per resource. A data
+//! stream no asset property owns lives in its own map
+//! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::disassociated_time_series`]),
+//! which is what `DisassociateTimeSeriesFromAssetProperty` leaves behind. Every
+//! handler reads and writes THIS struct through [`service_state`]; nothing in
+//! `src/ops/` keeps state of its own.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -186,6 +189,59 @@ pub const GATEWAY_VERSION_V3: &str = "3";
 /// oldest, so repeated writes cannot grow one series without limit. The emulator's
 /// own bound; AWS publishes a retention period rather than a sample count.
 pub const MAX_SAMPLES_PER_SERIES: usize = 1_000;
+
+/// How many DISASSOCIATED time series this store keeps.
+///
+/// `DisassociateTimeSeriesFromAssetProperty` keeps the data stream it detaches
+/// (see [`DisassociatedTimeSeriesRecord`]) and `DeleteTimeSeries` — the operation
+/// that forgets one — is still a scaffold stub, so repeatedly binding and
+/// detaching aliases would otherwise grow this map without limit. Like a series'
+/// samples ([`MAX_SAMPLES_PER_SERIES`]) and unlike a resource an operation can
+/// delete, an eviction policy IS available here: past this many series the least
+/// recently updated one goes, since `DisassociateTimeSeriesFromAssetProperty`
+/// declares no limit error to refuse with. The emulator's own bound, not a
+/// published AWS quota, and high enough that no ordinary workflow meets it.
+pub const MAX_DISASSOCIATED_TIME_SERIES: usize = 1_000;
+
+/// A time series (data stream) that no asset property owns.
+///
+/// IoT SiteWise models a time series as a resource in its own right, separate
+/// from the asset property it may be attached to: `ListTimeSeries`'s
+/// `timeSeriesType` is `ASSOCIATED` or `DISASSOCIATED`
+/// (`smithy_query(query="shape", shape="ListTimeSeriesType")`), a
+/// `TimeSeriesSummary` carries `assetId` and `propertyId` only when it is
+/// associated, and `DeleteTimeSeries` — not the disassociate call — is what
+/// forgets one ("If the time series isn't associated with an asset property,
+/// specify the alias of the time series"). So detaching a series from its asset
+/// property leaves THIS record behind: the stream keeps the identity, alias, data
+/// type and creation date it had while associated, and its last-update instant
+/// moves to the call that detached it.
+#[derive(Debug, Clone)]
+pub struct DisassociatedTimeSeriesRecord {
+    /// The alias that identifies the stream, and the only way to address it once
+    /// no `(assetId, propertyId)` pair names it.
+    pub alias: String,
+    /// The stream's own `TimeSeriesId`: a fresh `ID`-shaped value, inside the
+    /// modelled `TimeSeriesId` bound of 36..73 characters.
+    ///
+    /// Minted rather than carried over from the pair that owned it, because the
+    /// asset property the stream left still has a series of its own that its ids
+    /// name ([`time_series_id`]): two series are two ids, so a detached stream
+    /// cannot keep reporting the pair-derived one. Stored, so it is stable across
+    /// every read of this stream.
+    pub time_series_id: String,
+    /// A `PropertyDataType` value: the data type of the stream's samples.
+    pub data_type: String,
+    /// Set only for a `STRUCT` stream, as `TimeSeriesSummary$dataTypeSpec` states.
+    pub data_type_spec: Option<String>,
+    pub creation_date: SystemTime,
+    pub last_update_date: SystemTime,
+    /// The stream's samples, kept sorted ascending by timestamp exactly as the
+    /// property's own series is. A time series IS the data stream, so the values
+    /// written while it was associated travel with it rather than staying on the
+    /// asset property, and come back to a property the alias is bound to again.
+    pub values: Vec<AssetPropertyValue>,
+}
 
 /// A stored asset model: everything `DescribeAssetModel` reports, plus the
 /// bookkeeping (`version`, `tags`, `active_at`) the other operations read.
@@ -694,6 +750,11 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     pub property_values: HashMap<String, HashMap<String, Vec<AssetPropertyValue>>>,
     /// `propertyAlias` -> `(assetId, propertyId)`, so alias lookups resolve.
     pub property_alias_index: HashMap<String, (String, String)>,
+    /// The time series no asset property owns, by the alias that identifies each
+    /// one. Disjoint from [`Self::property_alias_index`] by construction: an
+    /// alias names an associated stream or a disassociated one, never both — see
+    /// [`Self::set_property_alias`] and [`Self::disassociate_time_series`].
+    pub disassociated_time_series: HashMap<String, DisassociatedTimeSeriesRecord>,
     /// Gateways by `gatewayId`.
     pub gateways: HashMap<String, GatewayRecord>,
     /// [`gateway_device_key`] -> `gatewayId`: which gateway, if any, already runs
@@ -755,6 +816,8 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         };
         let property = &mut asset.properties[at];
         let resolved_property_id = property.id.clone();
+        let property_data_type = property.data_type.clone();
+        let property_data_type_spec = property.data_type_spec.clone();
         let previous = property.alias.take();
         property.alias = alias.clone();
 
@@ -770,6 +833,38 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             }
         }
         if let Some(alias) = alias {
+            // An alias names ONE stream: binding it to a property makes that
+            // stream associated, so a disassociated one standing under the same
+            // alias is that same stream — it stops being listed apart from the
+            // property that now owns it, and the samples it holds become that
+            // property's history again, merged through the quality-aware
+            // single-value-per-timestamp write.
+            //
+            // Only a stream of the property's OWN data type is that property's
+            // data: AWS requires the two to match to associate a time series with
+            // an asset property, and every write path here checks a TQV's variant
+            // against the property's `PropertyDataType`, so samples of another type
+            // are never carried into a history that may not hold them.
+            // A stream whose data type is not this property's is NOT destroyed
+            // here: it stays where it is, samples and all. `UpdateAssetProperty`
+            // refuses such a request with the modelled refusal before reaching
+            // this helper — the same shape as the alias-conflict case above — so
+            // the only way to arrive here is a caller whose own rule allows the
+            // rebind, and nothing a caller stored is dropped on its behalf.
+            let same_type = self
+                .disassociated_time_series
+                .get(&alias)
+                .is_some_and(|series| {
+                    series.data_type == property_data_type
+                        && series.data_type_spec == property_data_type_spec
+                });
+            if same_type {
+                if let Some(series) = self.disassociated_time_series.remove(&alias) {
+                    for value in series.values {
+                        self.record_property_value(asset_id, &resolved_property_id, value);
+                    }
+                }
+            }
             // Whoever held this alias loses it, record and index together.
             if let Some((held_by_asset, held_by_property)) =
                 self.property_alias_index.insert(
@@ -791,6 +886,103 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         true
     }
 
+    /// The `(dataType, dataTypeSpec)` of the disassociated stream `alias` names,
+    /// when one stands under it.
+    ///
+    /// What an operation that binds an alias to an asset property compares with
+    /// that property's own data type: a time series is associated with an asset
+    /// property only where the two match, so a binding that would mix another
+    /// type's samples into the property's history is refused by the operation
+    /// rather than resolved by dropping stored data.
+    pub fn disassociated_stream_type(&self, alias: &str) -> Option<(&str, Option<&str>)> {
+        self.disassociated_time_series.get(alias).map(|series| {
+            (
+                series.data_type.as_str(),
+                series.data_type_spec.as_deref(),
+            )
+        })
+    }
+
+    /// Detach the time series the `(asset_id, property_id)` property's alias
+    /// names from that property, and keep the series as a disassociated one.
+    ///
+    /// The alias leaves the property's own `alias` member and
+    /// [`Self::property_alias_index`] through [`Self::set_property_alias`], so
+    /// nothing resolves the property by it afterwards, while the stream itself
+    /// survives as a [`DisassociatedTimeSeriesRecord`] addressable by that alias —
+    /// what IoT SiteWise reports as a `DISASSOCIATED` time series, and what
+    /// `DeleteTimeSeries` rather than this call forgets.
+    ///
+    /// The SAMPLES go with the stream, not with the property: a time series is the
+    /// data stream, and an asset property reports the values of the stream it is
+    /// associated with, so a property the stream has left reports no history until
+    /// a stream is associated with it again. They are not dropped — re-binding the
+    /// alias to an asset property brings them back ([`Self::set_property_alias`]).
+    /// The detached stream gets its own `TimeSeriesId`, since the property's ids
+    /// still name a series of their own.
+    ///
+    /// `asset_id` is a stored id, not a label: resolve it with
+    /// [`Self::resolve_asset_id`] first. `property_id` takes either `CustomID`
+    /// form. Answers `false` — writing nothing — when no stored asset holds that
+    /// property or the property carries no alias, so there is no association to
+    /// break.
+    pub fn disassociate_time_series(
+        &mut self,
+        asset_id: &str,
+        property_id: &str,
+        now: SystemTime,
+    ) -> bool {
+        let Some(asset) = self.assets.get(asset_id) else {
+            return false;
+        };
+        let Some(property) = asset.property(property_id) else {
+            return false;
+        };
+        let Some(alias) = property.alias.clone() else {
+            return false;
+        };
+        let resolved_property_id = property.id.clone();
+        let record = DisassociatedTimeSeriesRecord {
+            alias,
+            time_series_id: new_id(),
+            data_type: property.data_type.clone(),
+            data_type_spec: property.data_type_spec.clone(),
+            creation_date: asset.creation_date,
+            last_update_date: now,
+            values: self
+                .property_values
+                .get_mut(asset_id)
+                .and_then(|properties| properties.remove(&resolved_property_id))
+                .unwrap_or_default(),
+        };
+        self.set_property_alias(asset_id, property_id, None);
+        self.keep_disassociated_time_series(record);
+        true
+    }
+
+    /// Store `record` under its alias, bounded at
+    /// [`MAX_DISASSOCIATED_TIME_SERIES`] by dropping the least recently updated
+    /// series.
+    ///
+    /// The eviction exists only because nothing in this emulator forgets a
+    /// disassociated stream yet; it goes away when `DeleteTimeSeries` — the
+    /// operation AWS gives a caller for that — is implemented.
+    fn keep_disassociated_time_series(&mut self, record: DisassociatedTimeSeriesRecord) {
+        self.disassociated_time_series
+            .insert(record.alias.clone(), record);
+        while self.disassociated_time_series.len() > MAX_DISASSOCIATED_TIME_SERIES {
+            let Some(oldest) = self
+                .disassociated_time_series
+                .values()
+                .min_by_key(|series| series.last_update_date)
+                .map(|series| series.alias.clone())
+            else {
+                break;
+            };
+            self.disassociated_time_series.remove(&oldest);
+        }
+    }
+
     /// Whether ANY stored asset model holds a composite model under `id`.
     ///
     /// A composite model id is globally unique, so both the collision check on a
@@ -804,18 +996,10 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// Append `value` to the `(asset_id, property_id)` series, keeping it sorted
     /// ascending by timestamp.
     ///
-    /// A value at an already-stored timestamp is QUALITY-AWARE: "For each asset
-    /// property, IoT SiteWise overwrites TQVs with duplicate timestamps unless the
-    /// newer TQV has a different quality" (the `BatchPutAssetPropertyValue` model
-    /// doc), so the stored sample is replaced only when the two name the same
-    /// quality, and a differing quality leaves the series exactly as it was. Either
-    /// way the series stays single-valued at that timestamp.
-    ///
-    /// The series is BOUNDED at [`MAX_SAMPLES_PER_SERIES`]: past that many samples
-    /// the oldest goes, so no sequence of writes can grow one series without
-    /// limit. A sample newer than everything stored — the shape real ingest takes
-    /// — takes an append-only fast path and costs no element move, so the sorted
-    /// insert cannot be driven to quadratic cost under the shared state lock.
+    /// The insert itself is [`record_sample`], shared with the write path an
+    /// alias-addressed ingest of a disassociated stream takes, so the
+    /// quality-aware single-value-per-timestamp rule and the
+    /// [`MAX_SAMPLES_PER_SERIES`] bound hold for every stream alike.
     pub fn record_property_value(
         &mut self,
         asset_id: &str,
@@ -828,42 +1012,84 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .or_default()
             .entry(property_id.to_string())
             .or_default();
-        let key = timestamp_key(&value.timestamp);
-        if series
-            .last()
-            .is_none_or(|last| timestamp_key(&last.timestamp) < key)
-        {
-            series.push(value);
-        } else {
-            match series.binary_search_by(|existing| timestamp_key(&existing.timestamp).cmp(&key))
-            {
-                Ok(at) => {
-                    if quality_of(&series[at]) != quality_of(&value) {
-                        // Accepted and discarded: the stored TQV wins at a
-                        // timestamp a differing-quality TQV re-puts.
-                        return;
+        record_sample(series, value);
+    }
+
+    /// Append `value` to the stream `key` names, answering `false` when no stream
+    /// does.
+    ///
+    /// The one write path for a time series, so an alias-addressed ingest reaches
+    /// a disassociated stream on exactly the terms
+    /// [`Self::record_property_value`] writes an associated one on — the
+    /// quality-aware single-value-per-timestamp rule and the
+    /// [`MAX_SAMPLES_PER_SERIES`] bound.
+    pub fn record_stream_value(&mut self, key: &SeriesKey, value: AssetPropertyValue) -> bool {
+        match key {
+            SeriesKey::Property(asset_id, property_id) => {
+                let asset_id = asset_id.clone();
+                let property_id = property_id.clone();
+                self.record_property_value(&asset_id, &property_id, value);
+                true
+            }
+            SeriesKey::Disassociated(alias) => {
+                match self.disassociated_time_series.get_mut(alias) {
+                    Some(series) => {
+                        record_sample(&mut series.values, value);
+                        true
                     }
-                    series[at] = value;
+                    None => false,
                 }
-                Err(at) => series.insert(at, value),
             }
         }
-        if series.len() > MAX_SAMPLES_PER_SERIES {
-            let excess = series.len() - MAX_SAMPLES_PER_SERIES;
-            series.drain(..excess);
+    }
+
+    /// The stream a `propertyAlias` names: the asset property it is associated
+    /// with, or the disassociated series standing under it. `None` when no stream
+    /// answers to that alias at all.
+    ///
+    /// An alias names ONE data stream whether or not an asset property is
+    /// associated with it — IoT SiteWise reports a series as `ASSOCIATED` or
+    /// `DISASSOCIATED` and `DeleteTimeSeries` identifies a disassociated one "if
+    /// the time series isn't associated with an asset property, specify the alias
+    /// of the time series" — so every operation addressed by an alias resolves it
+    /// here and reaches the same stream.
+    pub fn resolve_alias_series(&self, alias: &str) -> Option<SeriesKey> {
+        if let Some((asset_id, property_id)) = self.property_alias_index.get(alias) {
+            return Some(SeriesKey::Property(asset_id.clone(), property_id.clone()));
+        }
+        self.disassociated_time_series
+            .contains_key(alias)
+            .then(|| SeriesKey::Disassociated(alias.to_string()))
+    }
+
+    /// The samples of the stream `key` names, oldest first. Empty for a stream
+    /// nothing has been written to, and for one `key` names no longer.
+    pub fn series(&self, key: &SeriesKey) -> &[AssetPropertyValue] {
+        match key {
+            SeriesKey::Property(asset_id, property_id) => self
+                .property_values
+                .get(asset_id)
+                .and_then(|properties| properties.get(property_id))
+                .map_or(&[][..], Vec::as_slice),
+            SeriesKey::Disassociated(alias) => self
+                .disassociated_time_series
+                .get(alias)
+                .map_or(&[][..], |series| series.values.as_slice()),
         }
     }
 
     /// The highest-timestamp value stored for `(asset_id, property_id)`, if any.
+    ///
+    /// The property's OWN series, borrowing the two ids the way
+    /// [`Self::property_values`] is nested for. A caller that wants the stream an
+    /// alias names, associated or not, resolves it with
+    /// [`Self::resolve_alias_series`] and reads [`Self::series`].
     pub fn latest_property_value(
         &self,
         asset_id: &str,
         property_id: &str,
     ) -> Option<&AssetPropertyValue> {
-        self.property_values
-            .get(asset_id)?
-            .get(property_id)?
-            .last()
+        self.property_values.get(asset_id)?.get(property_id)?.last()
     }
 
     /// The tag set of the resource `arn` names, for reading.
@@ -1382,6 +1608,61 @@ pub fn quality_of(value: &AssetPropertyValue) -> &str {
     value.quality.as_deref().unwrap_or(DEFAULT_QUALITY)
 }
 
+/// Which stored data stream a request's identifiers name.
+///
+/// A time series is either ASSOCIATED with an asset property \u2014 the pair of ids
+/// names it, and so does any alias bound to that property \u2014 or DISASSOCIATED,
+/// which only its alias names. Resolved once in
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::resolve_alias_series`] so every
+/// operation addressed by an alias reads and writes the same stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeriesKey {
+    /// The stream of the `(assetId, propertyId)` asset property, by stored ids.
+    Property(String, String),
+    /// A stream no asset property owns, by the alias that identifies it.
+    Disassociated(String),
+}
+
+/// Put `value` into `series`, which stays sorted ascending by timestamp.
+///
+/// A value at an already-stored timestamp is QUALITY-AWARE: "For each asset
+/// property, IoT SiteWise overwrites TQVs with duplicate timestamps unless the
+/// newer TQV has a different quality" (the `BatchPutAssetPropertyValue` model
+/// doc), so the stored sample is replaced only when the two name the same
+/// quality, and a differing quality leaves the series exactly as it was. Either
+/// way the series stays single-valued at that timestamp.
+///
+/// The series is BOUNDED at [`MAX_SAMPLES_PER_SERIES`]: past that many samples the
+/// oldest goes, so no sequence of writes can grow one series without limit. A
+/// sample newer than everything stored \u2014 the shape real ingest takes \u2014 takes an
+/// append-only fast path and costs no element move, so the sorted insert cannot be
+/// driven to quadratic cost under the shared state lock.
+fn record_sample(series: &mut Vec<AssetPropertyValue>, value: AssetPropertyValue) {
+    let key = timestamp_key(&value.timestamp);
+    if series
+        .last()
+        .is_none_or(|last| timestamp_key(&last.timestamp) < key)
+    {
+        series.push(value);
+    } else {
+        match series.binary_search_by(|existing| timestamp_key(&existing.timestamp).cmp(&key)) {
+            Ok(at) => {
+                if quality_of(&series[at]) != quality_of(&value) {
+                    // Accepted and discarded: the stored TQV wins at a timestamp a
+                    // differing-quality TQV re-puts.
+                    return;
+                }
+                series[at] = value;
+            }
+            Err(at) => series.insert(at, value),
+        }
+    }
+    if series.len() > MAX_SAMPLES_PER_SERIES {
+        let excess = series.len() - MAX_SAMPLES_PER_SERIES;
+        series.drain(..excess);
+    }
+}
+
 /// A wall-clock instant as the modelled `Timestamp` type.
 pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
@@ -1607,8 +1888,9 @@ impl<'a> AggregateQuery<'a> {
     }
 }
 
-/// The aggregated values of the `(asset_id, property_id)` series under `query` —
-/// what either aggregate operation reports for one property.
+/// The aggregated values of the stream `stream` names under `query` — what either
+/// aggregate operation reports for one data stream, associated with an asset
+/// property or not.
 ///
 /// DERIVED, never stored: the samples `BatchPutAssetPropertyValue` wrote are
 /// bucketed into the epoch-aligned windows `query` names and each bucket is
@@ -1622,17 +1904,13 @@ impl<'a> AggregateQuery<'a> {
 /// bounded however wide a range it names.
 pub fn aggregated_values(
     store: &ComAmazonawsIotsitewiseAwsiotsitewiseState,
-    asset_id: &str,
-    property_id: &str,
+    stream: &SeriesKey,
     query: &AggregateQuery<'_>,
 ) -> Vec<AggregatedValue> {
-    let Some(series) = store
-        .property_values
-        .get(asset_id)
-        .and_then(|properties| properties.get(property_id))
-    else {
+    let series = store.series(stream);
+    if series.is_empty() {
         return Vec::new();
-    };
+    }
 
     // The series is kept sorted ascending, so one window's samples are contiguous
     // and a single `last_mut()` bucket is all the grouping needs.

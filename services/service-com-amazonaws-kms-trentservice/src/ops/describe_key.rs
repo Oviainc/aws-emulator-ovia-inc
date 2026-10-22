@@ -194,10 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             crate::state::KeyRef::MalformedArn => {
                 Err(DescribeKeyErrorModeled::InvalidArnException(InvalidArnException {
-                    message: Some(format!(
-                        "The specified ARN is not valid: {}.",
-                        input.key_id
-                    )),
+                    message: Some(crate::state::invalid_arn_message(&input.key_id)),
                 })
                 .into())
             }

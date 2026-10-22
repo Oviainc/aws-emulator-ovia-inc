@@ -1543,14 +1543,29 @@ pub fn resource_not_found_message(resource_arn: &str) -> String {
     format!("could not find the resource {resource_arn}")
 }
 
-/// The message a Step Functions resource error carries: the error's own name, in
-/// spaced Title Case, then the ARN the request named, quoted.
+// ---------------------------------------------------------------------------
+// Error messages
+// ---------------------------------------------------------------------------
+
+/// The message a Step Functions client error carries: the CONDITION the error
+/// names, in spaced Title Case, then `: ` and the value of the request that
+/// condition is about, quoted.
 ///
 /// This is built from the request through ONE rule — the recorded service answers
-/// `State Machine Does Not Exist: '<arn>'` for `StateMachineDoesNotExist` and
-/// `Execution Already Exists: '<arn>'` for `ExecutionAlreadyExists` — so every
-/// operation here words a resource refusal through this, and none of them invents a
-/// sentence of its own.
+/// `State Machine Does Not Exist: '<arn>'` for `StateMachineDoesNotExist`,
+/// `Execution Already Exists: '<arn>'` for `ExecutionAlreadyExists` and
+/// `Invalid Name: '<name>'` for `InvalidName` — so every operation here words a
+/// refusal through this, and none of them invents a sentence of its own. The
+/// quoted value is whatever the condition is ABOUT: usually an ARN, but the name
+/// the caller sent for `InvalidName`, and the definition diagnostic for
+/// `InvalidDefinition`.
+///
+/// Errors whose subject is NOT a value of the request keep their own wording:
+/// `StateMachineLimitExceeded`, `TooManyTags` and `ExecutionLimitExceeded`
+/// report a limit, `ExecutionNotRedrivable` an eligibility reason, and
+/// `ValidationException` carries the standard validation envelope (see
+/// `crate::service`'s `validation` module). `StateMachineTypeNotSupported`
+/// carries no value at all — see [`STATE_MACHINE_TYPE_NOT_SUPPORTED`].
 pub fn resource_error_message(error_name: &str, arn: &str) -> String {
     format!("{error_name}: '{arn}'")
 }
@@ -1558,9 +1573,11 @@ pub fn resource_error_message(error_name: &str, arn: &str) -> String {
 /// `StateMachineDoesNotExist`'s own name, as its message spells it. RECORDED text.
 pub const STATE_MACHINE_DOES_NOT_EXIST: &str = "State Machine Does Not Exist";
 
-/// `StateMachineDeleting`'s, for [`resource_error_message`]. The error's own name
-/// under the rule above, not a recorded message.
-pub const STATE_MACHINE_DELETING: &str = "State Machine is Deleting";
+/// `StateMachineDeleting`'s, for [`resource_error_message`]. RECORDED text: the
+/// service words this condition as a SENTENCE rather than as the words of the
+/// shape name (`sfn-state-machine-deleting-rejections#task#6` records
+/// `State Machine is being deleted: '<arn>'`).
+pub const STATE_MACHINE_DELETING: &str = "State Machine is being deleted";
 
 /// `ExecutionDoesNotExist`'s, for [`resource_error_message`]. The error's own name
 /// under the rule above, not a recorded message.
@@ -1568,6 +1585,54 @@ pub const EXECUTION_DOES_NOT_EXIST: &str = "Execution Does Not Exist";
 
 /// `ExecutionAlreadyExists`'s, for [`resource_error_message`]. RECORDED text.
 pub const EXECUTION_ALREADY_EXISTS: &str = "Execution Already Exists";
+
+/// `StateMachineAlreadyExists`'s, for [`resource_error_message`]. RECORDED text.
+pub const STATE_MACHINE_ALREADY_EXISTS: &str = "State Machine Already Exists";
+
+/// `InvalidName`'s, for [`resource_error_message`]. RECORDED text
+/// (`states-creation-input-validation-errors#task#8` records
+/// `Invalid Name: '<name>'`): the quoted value is the NAME the caller sent, not
+/// an ARN, and not which character of it failed.
+pub const INVALID_NAME: &str = "Invalid Name";
+
+/// `InvalidDefinition`'s, for [`resource_error_message`]. RECORDED text: the
+/// service names the thing that is invalid rather than spelling the shape name,
+/// and the quoted value is one definition diagnostic, `<code>: <detail>` (see
+/// [`asl::validate`]).
+pub const INVALID_STATE_MACHINE_DEFINITION: &str = "Invalid State Machine Definition";
+
+/// What `StateMachineTypeNotSupported` says, whatever operation raises it and
+/// whatever state machine it was raised for.
+///
+/// A FIXED service string, not the template above: the error shape's own
+/// documentation is "State machine type is not supported" and the recorded
+/// service answers one constant sentence that carries no value of the request,
+/// so this message does not vary with the operation, the workflow type or the
+/// ARN. Every operation that refuses a workflow type states it through this.
+pub const STATE_MACHINE_TYPE_NOT_SUPPORTED: &str =
+    "This operation is not supported by this type of state machine";
+
+/// The members of this service's model whose target shape is a FRACTIONAL number
+/// (Smithy `float`/`double`), named by their wire (lowerCamel) member name.
+///
+/// The standard validation message echoes a rejected value as the member's
+/// MODELLED TYPE renders it, so a member listed here is reported with a
+/// fractional part (`150.0`) where an `integer`/`long` member is not (`150`).
+/// Source: the model itself — `smithy_query(query="operation",
+/// operation="UpdateMapRun")` reports `toleratedFailurePercentage` as
+/// `{"target": "ToleratedFailurePercentage", "range": {"min": 0, "max": 100},
+/// "type": "float"}`. `tests/all/error_messages.rs` reads the model and fails if
+/// it declares a fractional member this list does not carry, so the list cannot
+/// silently fall behind the model.
+///
+/// The key is the member's WIRE NAME, because that is all a constraint violation
+/// carries — it reports a dotted member path, not the shape the member belongs
+/// to. Every structure of this model that spells `toleratedFailurePercentage`
+/// (`UpdateMapRunInput`, `DescribeMapRunOutput`, `InspectionData`) targets the
+/// same `float` shape, so one name covers them all; a model that ever declared
+/// one member name as `float` in one structure and `integer` in another would
+/// need the shape/member pair instead, and the test above would not catch it.
+pub const FRACTIONAL_MEMBERS: &[&str] = &["toleratedFailurePercentage"];
 
 /// Why a redrive was not performed; see
 /// [`ComAmazonawsSfnAwsstepfunctionsState::redrive_execution`]. A redrive the
@@ -1616,7 +1681,7 @@ impl StateMachineArn {
     /// a label `mapStateLabel` in a state machine named `myStateMachine`:
     /// `arn:partition:states:region:account-id:stateMachine:myStateMachine/mapStateLabel`".
     /// The label follows the name after a `/`, which the `name` rule
-    /// ([`invalid_name_reason`]) forbids inside a name, so the two forms never
+    /// ([`is_valid_name`]) forbids inside a name, so the two forms never
     /// collide.
     pub fn label(&self) -> Option<&str> {
         self.name.split_once('/').map(|(_, label)| label)
@@ -1853,28 +1918,19 @@ const FORBIDDEN_NAME_CHARS: &[char] = &[
     ';', ':', '/',
 ];
 
-/// Why `name` is not an acceptable state machine or execution name, or `None` when
-/// it is. The length bounds (1..80) are modelled, so the centralized walk has
-/// already refused anything outside them; only the character rule lives here.
-pub fn invalid_name_reason(name: &str) -> Option<String> {
-    for (position, character) in name.chars().enumerate() {
-        let why = if character.is_whitespace() {
-            "white space"
-        } else if FORBIDDEN_NAME_CHARS.contains(&character) {
-            "a bracket, wildcard or special character"
-        } else if matches!(u32::from(character), 0x0000..=0x001F | 0x007F..=0x009F | 0xFFFE | 0xFFFF)
-        {
-            "a control character"
-        } else {
-            continue;
-        };
-        return Some(format!(
-            "name must not contain {why}: found U+{:04X} at character {} of '{name}'",
-            u32::from(character),
-            position + 1
-        ));
-    }
-    None
+/// Whether `name` is an acceptable state machine or execution name.
+///
+/// The length bounds (1..80) are modelled, so the centralized walk has already
+/// refused anything outside them; only the character rule lives here. A refusal
+/// is reported through the modelled `InvalidName`, whose message states the
+/// condition and the rejected name rather than which character failed — see
+/// [`resource_error_message`] with [`INVALID_NAME`].
+pub fn is_valid_name(name: &str) -> bool {
+    !name.chars().any(|character| {
+        character.is_whitespace()
+            || FORBIDDEN_NAME_CHARS.contains(&character)
+            || matches!(u32::from(character), 0x0000..=0x001F | 0x007F..=0x009F | 0xFFFE | 0xFFFF)
+    })
 }
 
 /// Why `role_arn` is not the ARN of an IAM role, or `None` when it is — the
@@ -2574,6 +2630,39 @@ pub mod asl {
         pub elapsed: Duration,
     }
 
+    /// The diagnostic code `INVALID_JSON_DESCRIPTION`: "JSON syntax problem
+    /// found".
+    ///
+    /// The four codes below are the ones this emulator's validation can reach, out
+    /// of the error-code list the model documents on
+    /// `ValidateStateMachineDefinitionDiagnostic`
+    /// (`smithy_query(query="doc",shape="ValidateStateMachineDefinitionDiagnostic")`).
+    /// That same documentation is why the code is the stable part of an
+    /// `InvalidDefinition` message and the detail after it is not: "might add new
+    /// diagnostics in the future, adjust diagnostic codes, or change the message
+    /// wording. […] Do not rely on the exact order, count, or wording of
+    /// diagnostic messages."
+    pub const INVALID_JSON_DESCRIPTION: &str = "INVALID_JSON_DESCRIPTION";
+
+    /// `SCHEMA_VALIDATION_FAILED`: "Schema validation reported errors" — the
+    /// definition is JSON, but not the shape the Amazon States Language declares.
+    pub const SCHEMA_VALIDATION_FAILED: &str = "SCHEMA_VALIDATION_FAILED";
+
+    /// `MISSING_TRANSITION_TARGET`: "The value of \"Next\" field doesn't match a
+    /// known state name" — reported for every transition target that names no
+    /// declared state, `StartAt`'s included.
+    pub const MISSING_TRANSITION_TARGET: &str = "MISSING_TRANSITION_TARGET";
+
+    /// `INVALID_STATE_NAME`: "The state name does not follow the naming
+    /// convention".
+    pub const INVALID_STATE_NAME: &str = "INVALID_STATE_NAME";
+
+    /// One diagnostic as an `InvalidDefinition` message carries it: the code that
+    /// classifies the problem, then the detail describing it.
+    fn diagnostic(code: &str, detail: impl ::std::fmt::Display) -> String {
+        format!("{code}: {detail}")
+    }
+
     /// Why `definition` is not a definition this service accepts, or `Ok` when it
     /// is.
     ///
@@ -2584,29 +2673,52 @@ pub mod asl {
     /// names a declared state, a terminal state carries no `Next`, and a continuing
     /// state carries `Next` or `"End": true`.
     ///
+    /// The `Err` is the SUBJECT of that error's message — one diagnostic, `<code>:
+    /// <detail>` — which the operation states through
+    /// [`crate::state::resource_error_message`] with
+    /// [`crate::state::INVALID_STATE_MACHINE_DEFINITION`].
+    ///
     /// A definition may use states this emulator does not EXECUTE and still be
     /// valid, because it is valid ASL: what cannot be run surfaces at execution
     /// time, as a `FAILED` execution, not as a rejected create.
     pub fn validate(definition: &str) -> Result<(), String> {
-        let document: Value = serde_json::from_str(definition)
-            .map_err(|error| format!("the definition is not valid JSON: {error}"))?;
-        let document = document
-            .as_object()
-            .ok_or_else(|| "the definition must be a JSON object".to_string())?;
+        let document: Value = serde_json::from_str(definition).map_err(|error| {
+            diagnostic(
+                INVALID_JSON_DESCRIPTION,
+                format!("the definition is not valid JSON: {error}"),
+            )
+        })?;
+        let document = document.as_object().ok_or_else(|| {
+            diagnostic(SCHEMA_VALIDATION_FAILED, "the definition must be a JSON object")
+        })?;
         let start_at = document
             .get("StartAt")
             .and_then(Value::as_str)
-            .ok_or_else(|| "the definition must carry a string 'StartAt' member".to_string())?;
+            .ok_or_else(|| {
+                diagnostic(
+                    SCHEMA_VALIDATION_FAILED,
+                    "the definition must carry a string 'StartAt' member",
+                )
+            })?;
         let states = document
             .get("States")
             .and_then(Value::as_object)
-            .ok_or_else(|| "the definition must carry an object 'States' member".to_string())?;
+            .ok_or_else(|| {
+                diagnostic(
+                    SCHEMA_VALIDATION_FAILED,
+                    "the definition must carry an object 'States' member",
+                )
+            })?;
         if states.is_empty() {
-            return Err("'States' must declare at least one state".to_string());
+            return Err(diagnostic(
+                SCHEMA_VALIDATION_FAILED,
+                "'States' must declare at least one state",
+            ));
         }
         if !states.contains_key(start_at) {
-            return Err(format!(
-                "'StartAt' names '{start_at}', which 'States' does not declare"
+            return Err(diagnostic(
+                MISSING_TRANSITION_TARGET,
+                format!("'StartAt' names '{start_at}', which 'States' does not declare"),
             ));
         }
         for (name, state) in states {
@@ -2614,46 +2726,71 @@ pub mod asl {
             // history event of that state, so its LENGTH is bounded here, not only
             // the number of events: this is what keeps a history's bytes bounded.
             if name.chars().count() > MAX_STATE_NAME_CHARS {
-                return Err(format!(
-                    "a state name may carry at most {MAX_STATE_NAME_CHARS} characters, and this \
-                     definition declares one of {}",
-                    name.chars().count()
+                return Err(diagnostic(
+                    INVALID_STATE_NAME,
+                    format!(
+                        "a state name may carry at most {MAX_STATE_NAME_CHARS} characters, and \
+                         this definition declares one of {}",
+                        name.chars().count()
+                    ),
                 ));
             }
-            let state = state
-                .as_object()
-                .ok_or_else(|| format!("state '{name}' must be a JSON object"))?;
+            let state = state.as_object().ok_or_else(|| {
+                diagnostic(
+                    SCHEMA_VALIDATION_FAILED,
+                    format!("state '{name}' must be a JSON object"),
+                )
+            })?;
             let state_type = state
                 .get("Type")
                 .and_then(Value::as_str)
-                .ok_or_else(|| format!("state '{name}' must carry a string 'Type' member"))?;
+                .ok_or_else(|| {
+                    diagnostic(
+                        SCHEMA_VALIDATION_FAILED,
+                        format!("state '{name}' must carry a string 'Type' member"),
+                    )
+                })?;
             // A `Fail` state's `Error` and `Cause` are reported verbatim by
             // `DescribeExecution`, through shapes with their own maxima, so a
             // definition carrying a longer one could never be reported.
             for (member, cap) in [("Error", MAX_ERROR_BYTES), ("Cause", MAX_CAUSE_BYTES)] {
                 if let Some(value) = state.get(member).and_then(Value::as_str) {
                     if value.len() > cap {
-                        return Err(format!(
-                            "state '{name}' carries a '{member}' of {} bytes, more than the {cap} \
-                             this service reports",
-                            value.len()
+                        return Err(diagnostic(
+                            SCHEMA_VALIDATION_FAILED,
+                            format!(
+                                "state '{name}' carries a '{member}' of {} bytes, more than the \
+                                 {cap} this service reports",
+                                value.len()
+                            ),
                         ));
                     }
                 }
             }
             match state.get("Next") {
                 Some(next) => {
-                    let next = next
-                        .as_str()
-                        .ok_or_else(|| format!("state '{name}' has a non-string 'Next' member"))?;
+                    let next = next.as_str().ok_or_else(|| {
+                        diagnostic(
+                            SCHEMA_VALIDATION_FAILED,
+                            format!("state '{name}' has a non-string 'Next' member"),
+                        )
+                    })?;
                     if !states.contains_key(next) {
-                        return Err(format!(
-                            "state '{name}' transitions to '{next}', which 'States' does not declare"
+                        return Err(diagnostic(
+                            MISSING_TRANSITION_TARGET,
+                            format!(
+                                "state '{name}' transitions to '{next}', which 'States' does not \
+                                 declare"
+                            ),
                         ));
                     }
                     if TERMINAL_STATE_TYPES.contains(&state_type) {
-                        return Err(format!(
-                            "state '{name}' is a '{state_type}' state, which ends an execution and must not carry 'Next'"
+                        return Err(diagnostic(
+                            SCHEMA_VALIDATION_FAILED,
+                            format!(
+                                "state '{name}' is a '{state_type}' state, which ends an execution \
+                                 and must not carry 'Next'"
+                            ),
                         ));
                     }
                 }
@@ -2661,8 +2798,12 @@ pub mod asl {
                     if CONTINUING_STATE_TYPES.contains(&state_type)
                         && state.get("End").and_then(Value::as_bool) != Some(true)
                     {
-                        return Err(format!(
-                            "state '{name}' is a '{state_type}' state, so it must carry either 'Next' or \"End\": true"
+                        return Err(diagnostic(
+                            SCHEMA_VALIDATION_FAILED,
+                            format!(
+                                "state '{name}' is a '{state_type}' state, so it must carry either \
+                                 'Next' or \"End\": true"
+                            ),
                         ));
                     }
                 }

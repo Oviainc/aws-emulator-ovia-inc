@@ -19,7 +19,13 @@ pub struct GetRuleInput {
     pub rule_identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#GetRuleResponse")]
+/// `GetRuleResponse`, with its schema written out instead of derived because
+/// `createdAt` and `lastUpdatedAt` are `@timestampFormat("date-time")`; the note in
+/// `shared_types` says why that cannot be derived here. Member for member this is the
+/// model's shape: same ids, same order, same indices.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this shape
+/// is an operation OUTPUT, which the server only ever serializes.
 #[derive(Debug, Clone, Default)]
 pub struct GetRuleOutput {
     pub arn: Option<String>,
@@ -33,3 +39,82 @@ pub struct GetRuleOutput {
     pub last_updated_at: Option<::aws_smithy_types::DateTime>,
 }
 
+#[allow(non_upper_case_globals)]
+impl GetRuleOutput {
+    const M_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetRuleResponse", "arn", String, 0);
+    const M_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetRuleResponse", "id", String, 1);
+    const M_NAME: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetRuleResponse", "name", String, 2);
+    const M_IS_DEFAULT: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetRuleResponse", "isDefault", Boolean, 3);
+    const M_MATCH: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetRuleResponse", "match", Union, 4);
+    const M_PRIORITY: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetRuleResponse", "priority", Integer, 5);
+    const M_ACTION: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetRuleResponse", "action", Union, 6);
+    const M_CREATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("GetRuleResponse", "createdAt", 7);
+    const M_LAST_UPDATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("GetRuleResponse", "lastUpdatedAt", 8);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.vpclattice#GetRuleResponse",
+            shared_types::NAMESPACE,
+            "GetRuleResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ARN,
+            &Self::M_ID,
+            &Self::M_NAME,
+            &Self::M_IS_DEFAULT,
+            &Self::M_MATCH,
+            &Self::M_PRIORITY,
+            &Self::M_ACTION,
+            &Self::M_CREATED_AT,
+            &Self::M_LAST_UPDATED_AT,
+        ],
+    );
+}
+
+pub static GET_RULE_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &GetRuleOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetRuleOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.arn.as_ref() {
+            serializer.write_string(&Self::M_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.id.as_ref() {
+            serializer.write_string(&Self::M_ID, value.as_str())?;
+        }
+        if let Some(value) = self.name.as_ref() {
+            serializer.write_string(&Self::M_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.is_default.as_ref() {
+            serializer.write_boolean(&Self::M_IS_DEFAULT, *value)?;
+        }
+        if let Some(value) = self.r#match.as_ref() {
+            serializer.write_struct(&Self::M_MATCH, value)?;
+        }
+        if let Some(value) = self.priority.as_ref() {
+            serializer.write_integer(&Self::M_PRIORITY, *value)?;
+        }
+        if let Some(value) = self.action.as_ref() {
+            serializer.write_struct(&Self::M_ACTION, value)?;
+        }
+        if let Some(value) = self.created_at.as_ref() {
+            serializer.write_timestamp(&Self::M_CREATED_AT, value)?;
+        }
+        if let Some(value) = self.last_updated_at.as_ref() {
+            serializer.write_timestamp(&Self::M_LAST_UPDATED_AT, value)?;
+        }
+        Ok(())
+    }
+}

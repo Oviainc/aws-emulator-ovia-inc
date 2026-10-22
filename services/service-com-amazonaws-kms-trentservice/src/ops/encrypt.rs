@@ -282,7 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !key.is_usable() {
             if key.key_state == crate::state::KEY_STATE_DISABLED {
                 return Err(EncryptErrorModeled::DisabledException(DisabledException {
-                    message: Some(format!("{} is disabled.", key.arn)),
+                    message: Some(crate::state::invalid_state_message(key)),
                 })
                 .into());
             }

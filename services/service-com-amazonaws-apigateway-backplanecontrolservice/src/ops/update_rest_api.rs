@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRestApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRestApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the request's `patchOperations` to the stored `RestApi` record,
+//! in request order, and reports the updated API — so a later `GetRestApi` reads back
+//! exactly what the patch set.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRestApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The whole list is applied to a COPY of the record and written back only once every op
+//! has succeeded, so a list carrying one unsupported op leaves the stored API as it was
+//! rather than half-patched.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +117,125 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    patch_bool, patch_enum_string, patch_optional_i32, patch_optional_string, patch_string_set,
+    Patch, PatchFailure, RestApiEntry, MAX_COLLECTION_ENTRIES, MAX_POLICY_CHARS, MAX_STRING_CHARS,
+};
+
+/// The `path` values `UpdateRestApi` accepts: one per updateable member of the `RestApi`
+/// shape, the `endpointConfiguration` sub-members included. `id`, `createdDate`,
+/// `rootResourceId`, `warnings` and `apiStatus` are assigned by the service, and `tags`
+/// are changed through `TagResource`/`UntagResource`, so none of them is patchable; the
+/// API's resources have their own operations.
+const SUPPORTED_PATHS: &[&str] = &[
+    "/apiKeySource",
+    "/binaryMediaTypes/<media-type>",
+    "/description",
+    "/disableExecuteApiEndpoint",
+    "/endpointAccessMode",
+    "/endpointConfiguration/ipAddressType",
+    "/endpointConfiguration/types/<endpoint-type>",
+    "/endpointConfiguration/vpcEndpointIds/<vpc-endpoint-id>",
+    "/minimumCompressionSize",
+    "/name",
+    "/policy",
+    "/securityPolicy",
+    "/version",
+];
+
+/// The documented range of `minimumCompressionSize`: "non-negative between 0 and
+/// 10485760 (10M) bytes, inclusive" (`RestApi$minimumCompressionSize`), the same range
+/// `CreateRestApi` enforces.
+const COMPRESSION_SIZE_RANGE: ::std::ops::RangeInclusive<i32> = 0..=10_485_760;
+
+/// Apply one patch to a COPY of a stored API.
+fn apply_patch(entry: &mut RestApiEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    match patch.member() {
+        // An API always reports a name, so the member can be replaced but not removed.
+        "name" => crate::state::patch_required_string(&mut entry.name, patch, MAX_STRING_CHARS),
+        "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
+        "version" => patch_optional_string(&mut entry.version, patch, MAX_STRING_CHARS),
+        "policy" => patch_optional_string(&mut entry.policy, patch, MAX_POLICY_CHARS),
+        "disableExecuteApiEndpoint" => {
+            patch_bool(&mut entry.disable_execute_api_endpoint, patch)
+        }
+        // A patch `value` is a bare string on the wire, so an enum-typed member's value
+        // set is checked here rather than by the boundary validator.
+        "apiKeySource" => {
+            patch_enum_string(&mut entry.api_key_source, patch, API_KEY_SOURCE_TYPE_VALUES)
+        }
+        "securityPolicy" => {
+            patch_enum_string(&mut entry.security_policy, patch, SECURITY_POLICY_VALUES)
+        }
+        "endpointAccessMode" => patch_enum_string(
+            &mut entry.endpoint_access_mode,
+            patch,
+            ENDPOINT_ACCESS_MODE_VALUES,
+        ),
+        "minimumCompressionSize" => patch_optional_i32(
+            &mut entry.minimum_compression_size,
+            patch,
+            COMPRESSION_SIZE_RANGE,
+        ),
+        "binaryMediaTypes" => {
+            let media_type = patch.collection_entry(1)?;
+            crate::state::bound_chars(&patch.path, &media_type, MAX_STRING_CHARS)
+                .map_err(PatchFailure::BadRequest)?;
+            patch_string_set(
+                &mut entry.binary_media_types,
+                patch,
+                &media_type,
+                MAX_COLLECTION_ENTRIES,
+            )
+        }
+        "endpointConfiguration" => apply_endpoint_patch(entry, patch),
+        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+    }
+}
+
+/// Apply one patch that reaches into the `endpointConfiguration` structure.
+fn apply_endpoint_patch(entry: &mut RestApiEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    let mut configuration = entry.endpoint_configuration.clone().unwrap_or_default();
+    // The structure's own members are addressed the way a top-level member is, with the
+    // `endpointConfiguration` token dropped.
+    let nested = patch.rebased(1);
+    match nested.member() {
+        "types" => {
+            let endpoint_type = nested.collection_entry(1)?;
+            if patch.op == crate::state::PatchOpKind::Add
+                && !ENDPOINT_TYPE_VALUES.contains(&endpoint_type.as_str())
+            {
+                return Err(PatchFailure::BadRequest(format!(
+                    "{} takes one of {}, got {endpoint_type:?}",
+                    patch.path,
+                    ENDPOINT_TYPE_VALUES.join(", ")
+                )));
+            }
+            let mut types = configuration.types.unwrap_or_default();
+            patch_string_set(&mut types, &nested, &endpoint_type, MAX_COLLECTION_ENTRIES)?;
+            configuration.types = Some(types);
+        }
+        "vpcEndpointIds" => {
+            let vpc_endpoint_id = nested.collection_entry(1)?;
+            crate::state::bound_chars(&patch.path, &vpc_endpoint_id, MAX_STRING_CHARS)
+                .map_err(PatchFailure::BadRequest)?;
+            let mut ids = configuration.vpc_endpoint_ids.unwrap_or_default();
+            patch_string_set(&mut ids, &nested, &vpc_endpoint_id, MAX_COLLECTION_ENTRIES)?;
+            configuration.vpc_endpoint_ids = Some(ids);
+        }
+        "ipAddressType" => {
+            patch_enum_string(
+                &mut configuration.ip_address_type,
+                &nested,
+                IP_ADDRESS_TYPE_VALUES,
+            )?;
+        }
+        _ => return Err(patch.unsupported_path(SUPPORTED_PATHS)),
+    }
+    entry.endpoint_configuration = Some(configuration);
+    Ok(())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -192,18 +309,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRestApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRestApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRestApi"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches = crate::state::parse_patches(input.patch_operations.as_ref())
+            .map_err(patch_failure)?;
+
+        let mut store = state.lock();
+
+        // Patched on a COPY: a list whose later op is refused leaves the stored API
+        // untouched, rather than keeping the ops before it.
+        let mut updated = store
+            .rest_apis
+            .get(&input.rest_api_id)
+            .ok_or_else(|| {
+                UpdateRestApiErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+                })
+            })?
+            .clone();
+
+        for patch in &patches {
+            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+        }
+
+        store.rest_apis.insert(input.rest_api_id.clone(), updated);
+        let stored = store
+            .rest_apis
+            .get(&input.rest_api_id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // Rendered through the one `RestApi` body this crate builds, so the update
+        // reports the record exactly as `GetRestApi` will read it back.
+        let body = CreateRestApiOutput::from(stored);
+        Ok(UpdateRestApiOutput {
+            id: body.id,
+            name: body.name,
+            description: body.description,
+            created_date: body.created_date,
+            version: body.version,
+            warnings: body.warnings,
+            binary_media_types: body.binary_media_types,
+            minimum_compression_size: body.minimum_compression_size,
+            api_key_source: body.api_key_source,
+            endpoint_configuration: body.endpoint_configuration,
+            policy: body.policy,
+            tags: body.tags,
+            disable_execute_api_endpoint: body.disable_execute_api_endpoint,
+            root_resource_id: body.root_resource_id,
+            security_policy: body.security_policy,
+            endpoint_access_mode: body.endpoint_access_mode,
+            api_status: body.api_status,
+            api_status_message: body.api_status_message,
+        })
     }
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateRestApiError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateRestApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateRestApiErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateRestApiErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
 }

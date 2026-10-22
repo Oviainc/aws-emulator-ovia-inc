@@ -40,6 +40,11 @@ const UNCITED_RESOURCE_TYPE: &str = "AWS::SQS::Queue";
 /// An account this test treats as known, so a policy naming it is not public.
 const KNOWN_ACCOUNT: &str = "111122223333";
 
+/// The canonical finding every `CheckNoPublicAccess` reason reports, from the model's own
+/// `smithy.api#examples` for the operation (verify with
+/// `grep 'Public access granted in the following statement' smithy-model/com-amazonaws-accessanalyzer-accessanalyzer.json`).
+const PUBLIC_ACCESS_FINDING: &str = "Public access granted in the following statement";
+
 /// Call `CheckNoPublicAccess` with `policy` serialized into the `policyDocument` string
 /// member, as a client does.
 async fn check(emulator: &Emulator, policy: &Value, resource_type: &str) -> Reply {
@@ -58,7 +63,8 @@ async fn check_raw(emulator: &Emulator, policy_document: &str, resource_type: &s
 }
 
 /// The `(statementIndex, statementId)` of every reported reason, in report order, after
-/// asserting each reason carries a description.
+/// asserting each reason carries the CANONICAL description: the finding, then the
+/// statement named by its `Sid` when it carries one and by its index when it does not.
 fn reported_reasons(reply: &Reply, case: &str) -> Vec<(i64, Option<String>)> {
     reply
         .member("reasons")
@@ -67,24 +73,24 @@ fn reported_reasons(reply: &Reply, case: &str) -> Vec<(i64, Option<String>)> {
             reasons
                 .iter()
                 .map(|reason| {
-                    let description = reason
-                        .get("description")
+                    let statement_index = reason
+                        .get("statementIndex")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(-1);
+                    let statement_id = reason
+                        .get("statementId")
                         .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    assert!(
-                        description.contains("public access"),
-                        "case {case:?}: every reason must say why the statement is public, got {reason:?}"
+                        .map(str::to_string);
+                    let expected = match statement_id.as_deref() {
+                        Some(sid) => format!("{PUBLIC_ACCESS_FINDING} with sid: {sid}."),
+                        None => format!("{PUBLIC_ACCESS_FINDING} with index: {statement_index}."),
+                    };
+                    assert_eq!(
+                        reason.get("description").and_then(Value::as_str),
+                        Some(expected.as_str()),
+                        "case {case:?}: expected the canonical reason {expected:?}, got {reason:?}"
                     );
-                    (
-                        reason
-                            .get("statementIndex")
-                            .and_then(Value::as_i64)
-                            .unwrap_or(-1),
-                        reason
-                            .get("statementId")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                    )
+                    (statement_index, statement_id)
                 })
                 .collect()
         })

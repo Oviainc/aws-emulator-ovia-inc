@@ -49,6 +49,7 @@ use crate::ops::types::{
     InferenceSettings, Input, InputAttachment, InputDestination, InputDestinationRequest,
     InputDestinationRoute, InputDeviceSettings, InputSecurityGroup, InputSource,
     InputSourceRequest, InputSpecification, InputVpcRequest, InputWhitelistRule,
+    InputWhitelistRuleCidr,
     LinkedChannelSettings, MaintenanceStatus, MediaConnectFlow, MediaConnectFlowRequest,
     MediaResource, MediaResourceNeighbor, MonitorDeployment, MulticastSettings,
     MulticastSettingsCreateRequest, MulticastSource, OutputDestination, PipelineDetail,
@@ -552,6 +553,35 @@ pub fn is_ipv4_cidr(cidr: &str) -> bool {
         return false;
     };
     prefix_length <= 32 && address.parse::<::std::net::Ipv4Addr>().is_ok()
+}
+
+/// The `WhitelistRules` a request asks for, validated into the CIDR strings the
+/// store keeps, or the message naming the first entry that is not an IPv4 CIDR.
+///
+/// ONE copy for every operation that writes a group's whitelist
+/// (`CreateInputSecurityGroup` and `UpdateInputSecurityGroup`), which document
+/// the member identically ("List of IPv4 CIDR addresses to whitelist"), so the
+/// rule the two enforce cannot drift apart. The whole list is checked before the
+/// caller writes anything, so a refused request leaves the store untouched
+/// rather than applying a prefix of its rules.
+pub fn whitelist_rules_from_request(
+    requested: Vec<InputWhitelistRuleCidr>,
+) -> Result<Vec<String>, String> {
+    let mut cidrs: Vec<String> = Vec::with_capacity(requested.len());
+    for (index, rule) in requested.into_iter().enumerate() {
+        let Some(cidr) = rule.cidr else {
+            return Err(format!(
+                "WhitelistRules[{index}].Cidr is required: a whitelist rule must name an IPv4 CIDR to whitelist"
+            ));
+        };
+        if !is_ipv4_cidr(&cidr) {
+            return Err(format!(
+                "WhitelistRules[{index}].Cidr must be an IPv4 CIDR with a prefix length of 0 to 32 (for example 10.0.0.0/16); got {cidr:?}"
+            ));
+        }
+        cidrs.push(cidr);
+    }
+    Ok(cidrs)
 }
 
 /// A bounded map from a caller-chosen `@idempotencyToken` to the id of the

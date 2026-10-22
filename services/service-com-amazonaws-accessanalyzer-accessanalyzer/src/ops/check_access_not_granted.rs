@@ -128,20 +128,81 @@ const RESULT_FAIL: &str = "FAIL";
 /// See [`RESULT_FAIL`].
 const RESULT_PASS: &str = "PASS";
 
+/// Which dimensions of the request's `access` object the check probed.
+///
+/// The operation's `access` member documents exactly three modes —  "If only actions are
+/// specified, IAM Access Analyzer checks for access to peform at least one of the actions
+/// on any resource in the policy. If only resources are specified, then IAM Access
+/// Analyzer checks for access to perform any action on at least one of the resources. If
+/// both actions and resources are specified, …"
+/// (`smithy_query(query="operation", operation="CheckAccessNotGranted")`) — and the
+/// service's `message` and `reasons[].description` NAME the mode the request asked for:
+/// the recorded response to an actions-only request says "the listed actions", while the
+/// model's `smithy.api#examples` for this operation say "the listed actions or resources"
+/// (`grep 'one or more of the listed actions or resources' smithy-model/com-amazonaws-accessanalyzer-accessanalyzer.json`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Probed {
+    /// Only `actions` was named: those actions on any resource.
+    Actions,
+    /// Only `resources` was named: any action on those resources.
+    Resources,
+    /// Both were named.
+    ActionsAndResources,
+}
+
+impl Probed {
+    /// The mode an access object naming these dimensions asks about, or `None` when it
+    /// names neither (which the handler refuses rather than answers).
+    fn named(actions: bool, resources: bool) -> Option<Self> {
+        match (actions, resources) {
+            (true, true) => Some(Self::ActionsAndResources),
+            (true, false) => Some(Self::Actions),
+            (false, true) => Some(Self::Resources),
+            (false, false) => None,
+        }
+    }
+
+    /// The noun phrase the service's sentences name this mode with.
+    const fn phrase(self) -> &'static str {
+        match self {
+            Self::Actions => "actions",
+            Self::Resources => "resources",
+            Self::ActionsAndResources => "actions or resources",
+        }
+    }
+
+    /// The mode a request that probed both of these asked about: the whole request names a
+    /// dimension when any of its access objects does.
+    fn merged(self, other: Self) -> Self {
+        if self == other {
+            self
+        } else {
+            Self::ActionsAndResources
+        }
+    }
+}
+
 /// The `message` reported beside [`RESULT_FAIL`], and beside [`RESULT_PASS`].
 ///
-/// The service returns a fixed string per `result`, and this model STATES both of them,
-/// in `CheckAccessNotGranted`'s `smithy.api#examples` trait — so the strings are a
-/// requirement, not an example. Verify either with
-/// `grep 'grants access to perform one or more of the listed actions or resources' smithy-model/com-amazonaws-accessanalyzer-accessanalyzer.json`
-/// and `grep 'does not grant access to perform the listed actions or resources' …`
-/// (the model is a single line, so grep reports the file rather than the span). Note the
-/// two are NOT parallel: only the FAIL wording says "one or more of".
-const MESSAGE_FAIL: &str =
-    "The policy document grants access to perform one or more of the listed actions or resources.";
-/// The `message` reported beside [`RESULT_PASS`]; same source as [`MESSAGE_FAIL`].
-const MESSAGE_PASS: &str =
-    "The policy document does not grant access to perform the listed actions or resources.";
+/// One fixed sentence per `result`, naming the dimensions the request probed (see
+/// [`Probed`]) and nothing else from the request: the FAIL sentence is the recorded
+/// response's for an actions-only request and the model's examples' for one naming both,
+/// and the PASS sentence is the model's examples'. Note the two are NOT parallel: only
+/// the FAIL wording says "one or more of".
+fn message_fail(probed: Probed) -> String {
+    format!(
+        "The policy document grants access to perform one or more of the listed {}.",
+        probed.phrase()
+    )
+}
+
+/// The `message` reported beside [`RESULT_PASS`]; same source as [`message_fail`].
+fn message_pass(probed: Probed) -> String {
+    format!(
+        "The policy document does not grant access to perform the listed {}.",
+        probed.phrase()
+    )
+}
 
 /// This operation's name, mirroring the `NAME` the `impl Operation` below carries, for
 /// the log records on the request path.
@@ -304,9 +365,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // factors are combined.
         let mut budget = intersect::Budget::new();
         // Each statement that may grant one of the requested permissions is a reason the
-        // check fails, reported once each in document order.
-        let mut reasons: Vec<ReasonSummary> = Vec::new();
+        // check fails, reported once each in document order. Only the statement's own
+        // identity is collected here: the `description` is composed once the whole request's
+        // probed mode is known, so every reason names the same mode as the `message`.
+        let mut blamed: Vec<(i32, Option<String>)> = Vec::new();
         let mut reported: ::std::collections::HashSet<i32> = ::std::collections::HashSet::new();
+        // Which dimensions the request as a whole probes, accumulated over its access
+        // objects (the model allows one, so in practice the single object's own mode).
+        let mut probed: Option<Probed> = None;
         // The pattern a dimension the caller left empty stands for. Per the operation's
         // documentation, naming only actions asks about those actions on ANY resource and
         // naming only resources about ANY action on those resources, which is IAM's `*`.
@@ -314,7 +380,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (position, access) in input.access.iter().enumerate() {
             let named_actions = access.actions.as_deref().unwrap_or(&[]);
             let named_resources = access.resources.as_slice();
-            if named_actions.is_empty() && named_resources.is_empty() {
+            let Some(entry_probed) =
+                Probed::named(!named_actions.is_empty(), !named_resources.is_empty())
+            else {
                 crate::state::audit(
                     Self::NAME,
                     ctx,
@@ -324,7 +392,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "access",
                     format!("access[{position}] must specify actions, resources, or both"),
                 ));
-            }
+            };
+            probed = Some(match probed {
+                Some(already) => already.merged(entry_probed),
+                None => entry_probed,
+            });
             if named_actions.len() > MAX_ACTIONS_PER_ACCESS {
                 return Err(refuse_field(
                     &format!("access[{position}].actions"),
@@ -372,19 +444,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let grants = intersect::granting(&document, actions, resources, &mut budget)
                 .await
                 .map_err(refuse_matching)?;
-            for grant in grants {
-                if !reported.insert(grant.statement.index) {
+            for statement in grants {
+                if !reported.insert(statement.index) {
                     continue;
                 }
-                reasons.push(ReasonSummary {
-                    description: Some(describe(grant.action, grant.resource)),
-                    statement_index: Some(grant.statement.index),
-                    statement_id: grant.statement.sid.clone(),
-                });
+                blamed.push((statement.index, statement.sid.clone()));
             }
         }
+        // `access` is non-empty and every entry names at least one dimension (both refused
+        // above), so the request's mode is known by here.
+        let probed = probed.unwrap_or(Probed::ActionsAndResources);
         // No sort: the statements are walked in document order and each index is
         // recorded at most once, so `reasons` is in statement order by construction.
+        let reasons: Vec<ReasonSummary> = blamed
+            .into_iter()
+            .map(|(index, statement_id)| ReasonSummary {
+                description: Some(describe(probed, statement_id.as_deref(), index)),
+                statement_index: Some(index),
+                statement_id,
+            })
+            .collect();
         ::tracing::debug!(
             operation = OPERATION,
             result = if reasons.is_empty() {
@@ -402,14 +481,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if reasons.is_empty() {
             Ok(CheckAccessNotGrantedOutput {
                 result: Some(RESULT_PASS.to_string()),
-                message: Some(MESSAGE_PASS.to_string()),
+                message: Some(message_pass(probed)),
                 // No statement reaches the access, so there is no statement to point at.
                 reasons: None,
             })
         } else {
             Ok(CheckAccessNotGrantedOutput {
                 result: Some(RESULT_FAIL.to_string()),
-                message: Some(MESSAGE_FAIL.to_string()),
+                message: Some(message_fail(probed)),
                 reasons: Some(reasons),
             })
         }
@@ -491,22 +570,19 @@ fn refuse_matching(error: intersect::MatchError) -> CheckAccessNotGrantedError {
     .into()
 }
 
-/// The `reasons[].description` for a statement that may grant `action` on `resource`.
+/// The `reasons[].description` for a statement that may grant one of the requested
+/// permissions.
 ///
-/// Built from the request, so it says which of the requested permissions the statement
-/// reaches; a dimension the caller left empty reads as "any", which is what it asked.
-fn describe(action: &str, resource: &str) -> String {
-    let action = if action == intersect::ANY {
-        "any action".to_string()
-    } else {
-        format!("the action {action}")
-    };
-    let resource = if resource == intersect::ANY {
-        "any resource".to_string()
-    } else {
-        format!("the resource {resource}")
-    };
-    format!("This statement may grant access to perform {action} on {resource}.")
+/// The service's canonical short form: the finding (one or more of the permissions the
+/// request listed, in the dimensions it probed) and the statement it blames, named by
+/// [`crate::state::statement_reference`] — never a narrative about what the statement
+/// contains.
+fn describe(probed: Probed, statement_id: Option<&str>, statement_index: i32) -> String {
+    format!(
+        "One or more of the listed {} in the statement {}.",
+        probed.phrase(),
+        crate::state::statement_reference(statement_id, statement_index)
+    )
 }
 
 /// Deciding which statements of a parsed policy may grant a permission the caller
@@ -672,16 +748,6 @@ mod intersect {
         Ok(())
     }
 
-    /// One requested permission a statement may grant: the statement, and the requested
-    /// action and resource it reaches — the first such pair, which is what the response's
-    /// `reasons[].description` is built from.
-    #[derive(Debug)]
-    pub struct Grant<'a> {
-        pub statement: &'a policy::Statement,
-        pub action: &'a str,
-        pub resource: &'a str,
-    }
-
     /// The statements that may grant one of the requested permissions, in document order
     /// and at most once each.
     ///
@@ -702,7 +768,7 @@ mod intersect {
         actions: &'a [String],
         resources: &'a [String],
         budget: &mut Budget,
-    ) -> Result<Vec<Grant<'a>>, MatchError> {
+    ) -> Result<Vec<&'a policy::Statement>, MatchError> {
         // `denied[i * resources.len() + j]`: the pair (actions[i], resources[j]) is ruled
         // out by an unconditional `Deny`. One grid of at most
         // `MAX_ACTIONS_PER_ACCESS * MAX_RESOURCES_PER_ACCESS` bools, never a list of owned
@@ -750,20 +816,14 @@ mod intersect {
                 .iter()
                 .enumerate()
                 .filter(|(_, reached)| **reached)
-                .find_map(|(i, _)| {
+                .any(|(i, _)| {
                     resources_reached
                         .iter()
                         .enumerate()
-                        .find_map(|(j, reached)| {
-                            (*reached && !denied[i * resources.len() + j]).then_some((i, j))
-                        })
+                        .any(|(j, reached)| *reached && !denied[i * resources.len() + j])
                 });
-            if let Some((i, j)) = granted {
-                grants.push(Grant {
-                    statement,
-                    action: actions[i].as_str(),
-                    resource: resources[j].as_str(),
-                });
+            if granted {
+                grants.push(statement);
             }
         }
         Ok(grants)

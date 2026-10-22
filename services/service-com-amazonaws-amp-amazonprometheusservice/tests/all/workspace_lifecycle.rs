@@ -50,7 +50,8 @@ impl Reply {
     }
 }
 
-/// The emulator under test: this service on its own shared engine.
+/// The emulator under test: this service on its own shared engine. Shared with the
+/// other suites in this test target, which drive the same request path.
 pub(crate) struct Amp {
     router: MultiServiceRouter,
 }

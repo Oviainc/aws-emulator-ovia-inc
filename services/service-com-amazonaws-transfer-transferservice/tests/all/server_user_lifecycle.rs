@@ -563,7 +563,8 @@ async fn listed_ssh_public_key_count_matches_the_stored_keys() {
 }
 
 // ---------------------------------------------------------------------------
-// Pagination.
+// Pagination. The page walk itself is `crate::harness::drain_pages`, shared with
+// every other `@paginated` suite in this crate.
 // ---------------------------------------------------------------------------
 
 /// RULE: a `List*` call returns at most `MaxResults` items, hands back a `NextToken`

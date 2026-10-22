@@ -37,6 +37,19 @@ async fn describe_group(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "GET", &format!("/prod/inputSecurityGroups/{id}"), None).await
 }
 
+/// `UpdateInputSecurityGroup` on one group, as a client calls it: PUT on the
+/// group's own path (`smithy_query(query="operation",
+/// operation="UpdateInputSecurityGroup")`: PUT /prod/inputSecurityGroups/{InputSecurityGroupId}).
+async fn update_group(router: &MultiServiceRouter, id: &str, body: Value) -> (u16, Value) {
+    call(
+        router,
+        "PUT",
+        &format!("/prod/inputSecurityGroups/{id}"),
+        Some(body),
+    )
+    .await
+}
+
 /// The `whitelistRules` projection of a list of CIDRs, as the wire carries it
 /// (`InputWhitelistRule$Cidr`, jsonName `cidr`).
 fn whitelist(cidrs: &[&str]) -> Value {
@@ -488,4 +501,508 @@ async fn the_group_store_is_bounded() {
             described["whitelistRules"]
         );
     }
+}
+
+/// Rule: `UpdateInputSecurityGroup` writes the members the request carries onto
+/// the stored group and leaves the members it omits as they were, so every later
+/// read of the group answers from the updated record — the group keeps its id and
+/// its ARN, and the update's own response is that same record.
+///
+/// The table spans what the rule generalises over: which member the request
+/// carries (whitelist only, tags only, both, neither), how many rules replace how
+/// many (one for several, several for one, both published prefix bounds), the
+/// order they arrive in, and the empty list that clears the whitelist — which is
+/// a VALUE, not an omission.
+#[tokio::test]
+async fn an_update_writes_what_it_carries_and_leaves_the_rest() {
+    // (case, the group's starting rules and tags, the update body,
+    //  the CIDRs it must report after, the tags it must report after)
+    let table: [(&str, Value, Value, &[&str], Value); 9] = [
+        (
+            "an update carrying no members at all leaves the group as it was",
+            json!({
+                "whitelistRules": [{ "cidr": "10.8.0.0/16" }],
+                "tags": { "env": "test" },
+            }),
+            json!({}),
+            &["10.8.0.0/16"],
+            json!({ "env": "test" }),
+        ),
+        (
+            "one rule replaced by another",
+            json!({ "whitelistRules": [{ "cidr": "10.0.0.0/16" }] }),
+            json!({ "whitelistRules": [{ "cidr": "192.0.2.0/24" }] }),
+            &["192.0.2.0/24"],
+            json!({}),
+        ),
+        (
+            "one rule replaced by several, in order",
+            json!({ "whitelistRules": [{ "cidr": "10.0.0.0/16" }] }),
+            json!({
+                "whitelistRules": [
+                    { "cidr": "203.0.113.0/24" },
+                    { "cidr": "198.51.100.128/25" },
+                    { "cidr": "172.16.0.0/12" },
+                ]
+            }),
+            &["203.0.113.0/24", "198.51.100.128/25", "172.16.0.0/12"],
+            json!({}),
+        ),
+        (
+            "several rules replaced by one",
+            json!({
+                "whitelistRules": [{ "cidr": "10.1.0.0/16" }, { "cidr": "10.2.0.0/16" }]
+            }),
+            json!({ "whitelistRules": [{ "cidr": "10.3.0.0/16" }] }),
+            &["10.3.0.0/16"],
+            json!({}),
+        ),
+        (
+            "both published prefix bounds",
+            json!({ "whitelistRules": [{ "cidr": "10.0.0.0/16" }] }),
+            json!({ "whitelistRules": [{ "cidr": "0.0.0.0/0" }, { "cidr": "198.51.100.7/32" }] }),
+            &["0.0.0.0/0", "198.51.100.7/32"],
+            json!({}),
+        ),
+        (
+            "an empty list clears the whitelist",
+            json!({ "whitelistRules": [{ "cidr": "10.0.0.0/16" }] }),
+            json!({ "whitelistRules": [] }),
+            &[],
+            json!({}),
+        ),
+        (
+            "a group that had no rules gets some",
+            json!({}),
+            json!({ "whitelistRules": [{ "cidr": "10.4.0.0/16" }] }),
+            &["10.4.0.0/16"],
+            json!({}),
+        ),
+        (
+            "tags only: the whitelist is left alone",
+            json!({
+                "whitelistRules": [{ "cidr": "10.5.0.0/16" }],
+                "tags": { "env": "test" },
+            }),
+            json!({ "tags": { "env": "prod", "owner": "fixer" } }),
+            &["10.5.0.0/16"],
+            json!({ "env": "prod", "owner": "fixer" }),
+        ),
+        (
+            "both members at once",
+            json!({
+                "whitelistRules": [{ "cidr": "10.6.0.0/16" }],
+                "tags": { "env": "test" },
+            }),
+            json!({
+                "whitelistRules": [{ "cidr": "10.7.0.0/16" }],
+                "tags": { "env": "staging" },
+            }),
+            &["10.7.0.0/16"],
+            json!({ "env": "staging" }),
+        ),
+    ];
+
+    for (case, created_with, update, cidrs, expected_tags) in table {
+        let router = medialive();
+        let created = create_group(&router, case, created_with).await;
+        let id = created["id"].as_str().unwrap_or_default().to_string();
+
+        let (status, updated) = update_group(&router, &id, update).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: UpdateInputSecurityGroup: expected 200, got {status}: {updated}"
+        );
+        let group = updated["securityGroup"].clone();
+        assert_eq!(
+            group["whitelistRules"],
+            whitelist(cidrs),
+            "case {case:?}: expected the group's rules to be {cidrs:?}, got {:?}",
+            group["whitelistRules"]
+        );
+        assert_eq!(
+            group["tags"], expected_tags,
+            "case {case:?}: expected the group's tags to be {expected_tags}, got {:?}",
+            group["tags"]
+        );
+        // An update changes the group, never its identity.
+        assert_eq!(
+            group["id"], created["id"],
+            "case {case:?}: expected the group to keep its id {:?}, got {:?}",
+            created["id"], group["id"]
+        );
+        assert_eq!(
+            group["arn"], created["arn"],
+            "case {case:?}: expected the group to keep its ARN {:?}, got {:?}",
+            created["arn"], group["arn"]
+        );
+        // Nothing uses these groups, so the update leaves them IDLE with no
+        // inputs and no channels: `State` reports what uses the group, which a
+        // whitelist change does not touch.
+        assert_eq!(
+            group["state"],
+            json!("IDLE"),
+            "case {case:?}: expected an unused group to stay IDLE, got {:?}",
+            group["state"]
+        );
+
+        // Round trip: the update persisted, so the reader reports exactly what
+        // the update reported.
+        let (status, described) = describe_group(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeInputSecurityGroup: expected 200, got {status}: {described}"
+        );
+        for member in [
+            "arn",
+            "id",
+            "inputs",
+            "state",
+            "tags",
+            "whitelistRules",
+            "channels",
+        ] {
+            assert_eq!(
+                described[member], group[member],
+                "case {case:?}: expected describe to report the updated {member} {:?}, got {:?}",
+                group[member], described[member]
+            );
+        }
+    }
+}
+
+/// Rule: an update is applied to the group the path names and to no other, and
+/// the last update of a group is the one that stands.
+#[tokio::test]
+async fn an_update_touches_only_the_group_it_names() {
+    let router = medialive();
+    let target = create_group(
+        &router,
+        "the updated group",
+        json!({ "whitelistRules": [{ "cidr": "10.1.0.0/16" }] }),
+    )
+    .await;
+    let target_id = target["id"].as_str().unwrap_or_default().to_string();
+    let bystander = create_group(
+        &router,
+        "the untouched group",
+        json!({ "whitelistRules": [{ "cidr": "10.2.0.0/16" }], "tags": { "keep": "me" } }),
+    )
+    .await;
+    let bystander_id = bystander["id"].as_str().unwrap_or_default().to_string();
+
+    // Successive updates of one group: each one replaces what the one before it
+    // wrote, so the last stands.
+    for (case, cidr) in [("first update", "10.3.0.0/16"), ("second update", "10.4.0.0/16")] {
+        let (status, updated) = update_group(
+            &router,
+            &target_id,
+            json!({ "whitelistRules": [{ "cidr": cidr }] }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status}: {updated}"
+        );
+        assert_eq!(
+            updated["securityGroup"]["whitelistRules"],
+            whitelist(&[cidr]),
+            "case {case:?}: expected {cidr:?}, got {:?}",
+            updated["securityGroup"]["whitelistRules"]
+        );
+    }
+
+    let (status, described) = describe_group(&router, &target_id).await;
+    assert_eq!(status, 200, "expected the updated group to be readable, got {status}: {described}");
+    assert_eq!(
+        described["whitelistRules"],
+        whitelist(&["10.4.0.0/16"]),
+        "case \"the last update stands\": expected 10.4.0.0/16, got {:?}",
+        described["whitelistRules"]
+    );
+
+    let (status, other) = describe_group(&router, &bystander_id).await;
+    assert_eq!(status, 200, "expected the other group to be readable, got {status}: {other}");
+    assert_eq!(
+        other["whitelistRules"],
+        whitelist(&["10.2.0.0/16"]),
+        "case \"the group the update did not name\": expected its own rule, got {:?}",
+        other["whitelistRules"]
+    );
+    assert_eq!(
+        other["tags"],
+        json!({ "keep": "me" }),
+        "case \"the group the update did not name\": expected its own tags, got {:?}",
+        other["tags"]
+    );
+}
+
+/// Rule: a whitelist rule must name an IPv4 CIDR with a prefix length of 0 to 32
+/// on an update exactly as on a create, and a request carrying anything else is
+/// refused with the operation's modelled `BadRequestException` (400) while the
+/// group keeps the whitelist it already had.
+///
+/// The same table of out-of-rule values the create suite uses, because it is the
+/// same rule: the member is documented "List of IPv4 CIDR addresses to whitelist"
+/// on both operations. The last row proves the whole list is checked before
+/// anything is written — its first entry is valid and its second is not.
+#[tokio::test]
+async fn an_update_refuses_rules_outside_the_ipv4_cidr_rule() {
+    // (case, the whitelistRules the update carries)
+    let table: [(&str, Value); 10] = [
+        ("bare address, no prefix", json!([{ "cidr": "10.0.0.0" }])),
+        ("prefix one past the bound", json!([{ "cidr": "10.0.0.0/33" }])),
+        ("negative prefix", json!([{ "cidr": "10.0.0.0/-1" }])),
+        ("non-numeric prefix", json!([{ "cidr": "10.0.0.0/x" }])),
+        ("octet out of range", json!([{ "cidr": "256.0.0.0/8" }])),
+        ("too few octets", json!([{ "cidr": "10.0.0/8" }])),
+        ("an IPv6 prefix", json!([{ "cidr": "2001:db8::/32" }])),
+        ("empty string", json!([{ "cidr": "" }])),
+        ("a rule that names no CIDR", json!([{}])),
+        (
+            "a valid rule followed by an invalid one",
+            json!([{ "cidr": "10.9.0.0/16" }, { "cidr": "nonsense" }]),
+        ),
+    ];
+
+    for (case, rules) in table {
+        let router = medialive();
+        let created = create_group(
+            &router,
+            case,
+            json!({ "whitelistRules": [{ "cidr": "10.0.0.0/16" }] }),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap_or_default().to_string();
+
+        let (status, body) = update_group(&router, &id, json!({ "whitelistRules": rules })).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the update to be refused, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(status, &body),
+            "BadRequestException",
+            "case {case:?}: expected the operation's own BadRequestException, got {body}"
+        );
+
+        // A refused update writes nothing: the group still has the rule the
+        // create gave it, not a prefix of the refused list.
+        let (status, described) = describe_group(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the group to still be readable, got {status}: {described}"
+        );
+        assert_eq!(
+            described["whitelistRules"],
+            whitelist(&["10.0.0.0/16"]),
+            "case {case:?}: expected the refused update to leave the whitelist alone, got {:?}",
+            described["whitelistRules"]
+        );
+    }
+}
+
+/// Rule: `UpdateInputSecurityGroup` on an id no group has answers the operation's
+/// modelled `NotFoundException` (404) and writes nothing.
+///
+/// The table spans the kinds of id that name no group, including a channel's and
+/// an input's — the id spaces are separate, so neither is a group's id.
+#[tokio::test]
+async fn an_update_refuses_an_id_no_group_has() {
+    let router = medialive();
+    let (status, channel) = call(
+        &router,
+        "POST",
+        "/prod/channels",
+        Some(json!({ "name": "not-a-security-group" })),
+    )
+    .await;
+    assert_eq!(status, 201, "CreateChannel: expected 201, got {status}: {channel}");
+    let channel_id = channel["channel"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let (status, created_input) = call(
+        &router,
+        "POST",
+        "/prod/inputs",
+        Some(json!({ "name": "also-not-a-security-group", "type": "URL_PULL" })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "CreateInput: expected 201, got {status}: {created_input}"
+    );
+    let input_id = created_input["input"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    // One group exists, so the store is not simply empty.
+    let real = create_group(&router, "a real group", json!({})).await;
+    let real_id = real["id"].as_str().unwrap_or_default().to_string();
+
+    // (case, the id to update)
+    let table: [(&str, String); 5] = [
+        ("zero", "0".to_string()),
+        ("a numeric id never minted", "9999999".to_string()),
+        ("a non-numeric id", "not-an-id".to_string()),
+        ("a channel's id", channel_id),
+        ("an input's id", input_id),
+    ];
+
+    for (case, id) in table {
+        let (status, body) = update_group(
+            &router,
+            &id,
+            json!({ "whitelistRules": [{ "cidr": "10.0.0.0/8" }] }),
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected 404, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(status, &body),
+            "NotFoundException",
+            "case {case:?}: expected NotFoundException, got {body}"
+        );
+    }
+
+    // The group that does exist was not touched by any of those refusals.
+    let (status, described) = describe_group(&router, &real_id).await;
+    assert_eq!(status, 200, "expected the real group to be readable, got {status}: {described}");
+    assert_eq!(
+        described["whitelistRules"],
+        json!([]),
+        "case \"the group no refused update named\": expected no rules, got {:?}",
+        described["whitelistRules"]
+    );
+}
+
+/// Rule: a group's `State`, `Inputs` and `Channels` report what currently uses
+/// it, so an update to a group a resource references succeeds and keeps reporting
+/// that use — the update changes the whitelist, not who uses the group.
+#[tokio::test]
+async fn an_update_keeps_reporting_what_uses_the_group() {
+    let router = medialive();
+    let group = create_group(
+        &router,
+        "in use",
+        json!({ "whitelistRules": [{ "cidr": "10.0.0.0/16" }] }),
+    )
+    .await;
+    let group_id = group["id"].as_str().unwrap_or_default().to_string();
+
+    let (status, created_input) = call(
+        &router,
+        "POST",
+        "/prod/inputs",
+        Some(json!({
+            "name": "uses-the-group",
+            "type": "URL_PULL",
+            "inputSecurityGroups": [group_id.clone()],
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "CreateInput: expected 201, got {status}: {created_input}"
+    );
+    let input_id = created_input["input"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let (status, updated) = update_group(
+        &router,
+        &group_id,
+        json!({ "whitelistRules": [{ "cidr": "198.51.100.0/24" }] }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"an input uses the group\": expected the update to succeed, got {status}: {updated}"
+    );
+    let group = updated["securityGroup"].clone();
+    assert_eq!(
+        group["whitelistRules"],
+        whitelist(&["198.51.100.0/24"]),
+        "case \"an input uses the group\": expected the new rule, got {:?}",
+        group["whitelistRules"]
+    );
+    assert_eq!(
+        group["state"],
+        json!("IN_USE"),
+        "case \"an input uses the group\": expected IN_USE, got {:?}",
+        group["state"]
+    );
+    assert_eq!(
+        group["inputs"],
+        json!([input_id]),
+        "case \"an input uses the group\": expected the using input's id, got {:?}",
+        group["inputs"]
+    );
+    assert_eq!(
+        group["channels"],
+        json!([]),
+        "case \"an input uses the group\": expected no channels, got {:?}",
+        group["channels"]
+    );
+
+    // The clock's own transitions still settle around an update: the channel the
+    // group is attached to goes on moving through its states, and once it is
+    // deleted the group reports that it is no longer used.
+    let (status, channel) = call(
+        &router,
+        "POST",
+        "/prod/channels",
+        Some(json!({
+            "name": "also-uses-the-group",
+            "channelSecurityGroups": [group_id.clone()],
+        })),
+    )
+    .await;
+    assert_eq!(status, 201, "CreateChannel: expected 201, got {status}: {channel}");
+    let channel_id = channel["channel"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let (_, updated) = update_group(&router, &group_id, json!({ "tags": { "phase": "attached" } })).await;
+    assert_eq!(
+        updated["securityGroup"]["channels"],
+        json!([channel_id.clone()]),
+        "case \"a channel attached too\": expected the attaching channel's id, got {:?}",
+        updated["securityGroup"]["channels"]
+    );
+    assert_eq!(
+        updated["securityGroup"]["whitelistRules"],
+        whitelist(&["198.51.100.0/24"]),
+        "case \"a channel attached too\": expected a tags-only update to keep the whitelist, got {:?}",
+        updated["securityGroup"]["whitelistRules"]
+    );
+
+    wait_for_the_clock();
+    let (status, deleting) = call(
+        &router,
+        "DELETE",
+        &format!("/prod/channels/{channel_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "DeleteChannel: expected 200, got {status}: {deleting}");
+    wait_for_the_clock();
+
+    let (_, updated) = update_group(&router, &group_id, json!({ "tags": { "phase": "released" } })).await;
+    assert_eq!(
+        updated["securityGroup"]["channels"],
+        json!([]),
+        "case \"the channel deleted\": expected no channels, got {:?}",
+        updated["securityGroup"]["channels"]
+    );
+    assert_eq!(
+        updated["securityGroup"]["tags"],
+        json!({ "phase": "released" }),
+        "case \"the channel deleted\": expected the update's tags, got {:?}",
+        updated["securityGroup"]["tags"]
+    );
 }

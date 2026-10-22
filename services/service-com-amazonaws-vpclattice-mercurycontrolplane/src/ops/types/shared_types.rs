@@ -13,13 +13,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-vpclattice-mercurycontr
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.vpclattice#RuleMatch")]
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
+// `PartialEq` so a handler can tell whether a retried create carries the SAME match:
+// `clientToken`'s documentation makes an identical parameter set the condition for the
+// idempotent answer, and a differing one a `ConflictException`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum RuleMatch {
     httpMatch(HttpMatch),
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#HttpMatch")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct HttpMatch {
     pub method: Option<String>,
     pub path_match: Option<PathMatch>,
@@ -27,7 +30,7 @@ pub struct HttpMatch {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#PathMatch")]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PathMatch {
     pub r#match: PathMatchType,
     pub case_sensitive: Option<bool>,
@@ -35,14 +38,14 @@ pub struct PathMatch {
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.vpclattice#PathMatchType")]
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PathMatchType {
     Exact(String),
     Prefix(String),
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#HeaderMatch")]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HeaderMatch {
     pub name: String,
     pub r#match: HeaderMatchType,
@@ -51,7 +54,7 @@ pub struct HeaderMatch {
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.vpclattice#HeaderMatchType")]
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HeaderMatchType {
     Exact(String),
     Prefix(String),
@@ -60,27 +63,28 @@ pub enum HeaderMatchType {
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.vpclattice#RuleAction")]
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
+// `PartialEq` for the same reason as [`RuleMatch`]'s.
+#[derive(Debug, Clone, PartialEq)]
 pub enum RuleAction {
     Forward(ForwardAction),
     fixedResponse(FixedResponseAction),
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#ForwardAction")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ForwardAction {
     pub target_groups: Vec<WeightedTargetGroup>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#WeightedTargetGroup")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct WeightedTargetGroup {
     pub target_group_identifier: String,
     pub weight: Option<i32>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#FixedResponseAction")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct FixedResponseAction {
     pub status_code: i32,
 }

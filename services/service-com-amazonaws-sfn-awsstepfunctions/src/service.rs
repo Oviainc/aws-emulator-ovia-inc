@@ -45,6 +45,11 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// How this service words the input-constraint refusals the framework hands
+/// back — the one formatter every operation's boundary validation reaches.
+/// Private: it is reached through `override_refusal` below, not by a caller.
+mod validation;
+
 /// The `com-amazonaws-sfn-awsstepfunctions` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -105,8 +110,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // for the rest. Replace BOTH the code and the message: a client branches
         // on the code, so a message without its matching code is worse than
         // leaving both alone.
-        let _ = refusal;
-        None
+        //
+        // Step Functions answers the standard AWS validation envelope, with the
+        // rejected value echoed as the member's MODELLED TYPE renders it — a
+        // fractional member with a fractional part, an integral one without. See
+        // [`validation`] for the whole rule. Code and message are replaced
+        // together, and the code stays the modelled `ValidationException` (HTTP
+        // 400) a client branches on; only the value's rendering changes.
+        validation::refused(refusal)
     }
 
     fn override_routing_error(

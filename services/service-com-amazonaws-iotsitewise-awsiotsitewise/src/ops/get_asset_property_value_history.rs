@@ -220,11 +220,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
 
-        // A property is named either by its asset and property ids or by its alias;
-        // exactly one of the two forms identifies it. Resolved exactly as
-        // `GetAssetPropertyValue` resolves it, through the shared resolver, so one
-        // property is named one way across the service.
-        let (asset_id, property_id) = match (
+        // A stream is named either by the asset and property ids of the property it
+        // is associated with or by its alias; exactly one of the two forms
+        // identifies it. Resolved exactly as `GetAssetPropertyValue` resolves it,
+        // through the shared resolvers, so one stream is named one way across the
+        // service.
+        let stream = match (
             input.asset_id.as_deref(),
             input.property_id.as_deref(),
             input.property_alias.as_deref(),
@@ -244,13 +245,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "The asset {asset_label} has no property {property_id}."
                     )));
                 }
-                (asset_id, property_id.to_string())
+                crate::state::SeriesKey::Property(asset_id, property_id.to_string())
             }
-            (None, None, Some(alias)) => {
-                store.property_alias_index.get(alias).cloned().ok_or_else(|| {
-                    not_found(format!("The property alias {alias} could not be found."))
-                })?
-            }
+            // An alias names ONE data stream, whether an asset property is
+            // associated with it or not: a disassociated series keeps the samples it
+            // carried and its alias is what addresses them.
+            (None, None, Some(alias)) => store.resolve_alias_series(alias).ok_or_else(|| {
+                not_found(format!("The property alias {alias} could not be found."))
+            })?,
             _ => {
                 return Err(invalid_request(
                     "Specify either assetId and propertyId, or propertyAlias.".to_string(),
@@ -261,22 +263,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The stored series is sorted ascending by timestamp, so the window and the
         // quality filter select from it in order and ASCENDING needs no sort at all.
         let mut selected: Vec<AssetPropertyValue> = store
-            .property_values
-            .get(&asset_id)
-            .and_then(|properties| properties.get(&property_id))
-            .map(|series| {
-                series
-                    .iter()
-                    .filter(|sample| {
-                        let at = crate::state::timestamp_key(&sample.timestamp);
-                        after.is_none_or(|start| at > start)
-                            && through.is_none_or(|end| at <= end)
-                    })
-                    .filter(|sample| keeps_quality(input.qualities.as_deref(), sample))
-                    .cloned()
-                    .collect()
+            .series(&stream)
+            .iter()
+            .filter(|sample| {
+                let at = crate::state::timestamp_key(&sample.timestamp);
+                after.is_none_or(|start| at > start) && through.is_none_or(|end| at <= end)
             })
-            .unwrap_or_default();
+            .filter(|sample| keeps_quality(input.qualities.as_deref(), sample))
+            .cloned()
+            .collect();
         if descending {
             selected.reverse();
         }

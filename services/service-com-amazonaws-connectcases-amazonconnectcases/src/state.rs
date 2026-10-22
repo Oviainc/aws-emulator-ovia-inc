@@ -3,7 +3,7 @@
 //! Engine state for the com-amazonaws-connectcases-amazonconnectcases service.
 //!
 //! One `Domain` is the container for everything Cases persists: its fields,
-//! templates and cases all hang off the domain, which is how the real service
+//! templates, layouts and cases all hang off the domain, which is how the real service
 //! scopes them (every operation but `CreateDomain`/`ListDomains` carries a
 //! `domainId` path label). Handlers reach this store through [`service_state`]
 //! and never build their own engine.
@@ -13,7 +13,8 @@
 //! Every map here grows one entry per request, with caller-chosen contents, so
 //! each one carries an explicit ceiling: [`MAX_DOMAINS`],
 //! [`MAX_FIELDS_PER_DOMAIN`], [`MAX_TEMPLATES_PER_DOMAIN`],
-//! [`MAX_CASES_PER_DOMAIN`] and [`MAX_IDEMPOTENCY_TOKENS`]. Creating past a
+//! [`MAX_LAYOUTS_PER_DOMAIN`], [`MAX_CASES_PER_DOMAIN`] and
+//! [`MAX_IDEMPOTENCY_TOKENS`]. Creating past a
 //! ceiling is refused with a modelled error, and the idempotency table evicts
 //! its oldest entry rather than growing, so no caller can grow this store
 //! without end.
@@ -38,9 +39,10 @@ use std::time::SystemTime;
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    EventBridgeConfiguration, FieldAttributes, FieldValueUnion, InternalServerException,
-    LayoutConfiguration, RequiredField, ResourceNotFoundException, ServiceQuotaExceededException,
-    TagPropagationConfiguration, UserUnion,
+    BasicLayout, EventBridgeConfiguration, FieldAttributes, FieldValueUnion,
+    InternalServerException, LayoutConfiguration, LayoutContent, LayoutSections, RequiredField,
+    ResourceNotFoundException, Section, ServiceQuotaExceededException, TagPropagationConfiguration,
+    UserUnion,
 };
 
 /// The ARN namespace (and SigV4 signing name / endpoint prefix) of this service,
@@ -77,6 +79,25 @@ pub const MAX_FIELDS_PER_DOMAIN: usize = 500;
 
 /// Most templates one domain holds. Emulator-owned ceiling, as [`MAX_DOMAINS`].
 pub const MAX_TEMPLATES_PER_DOMAIN: usize = 500;
+
+/// Most layouts one domain holds. This one is the service's OWN published
+/// figure, which `DeleteLayout`'s documentation restates — "You can delete up to
+/// 100 layouts per domain"
+/// (`smithy_query(query="doc", shape="DeleteLayout")`) — and it doubles as this
+/// store's ceiling on request-driven growth, as [`MAX_DOMAINS`].
+pub const MAX_LAYOUTS_PER_DOMAIN: usize = 100;
+
+/// Most sections one layout panel (`topPanel` / `moreInfo`) may carry: the
+/// model's `SectionsList` cap of `..1`
+/// (`smithy_query(query="shape", shape="SectionsList")`), re-checked in the
+/// handler for the same reason as [`MAX_CASE_FIELD_IDS`].
+pub const MAX_LAYOUT_SECTIONS: usize = 1;
+
+/// Most field items one layout field group may list: the model's
+/// `FieldGroup$fields` cap of `..220`
+/// (`smithy_query(query="shape", shape="FieldGroup")`), re-checked in the
+/// handler for the same reason as [`MAX_CASE_FIELD_IDS`].
+pub const MAX_LAYOUT_SECTION_FIELDS: usize = 220;
 
 /// Most cases one domain holds. Emulator-owned ceiling, as [`MAX_DOMAINS`].
 pub const MAX_CASES_PER_DOMAIN: usize = 10_000;
@@ -128,6 +149,7 @@ pub struct Domain {
     pub tags: HashMap<String, String>,
     pub fields: HashMap<String, Field>,
     pub templates: HashMap<String, Template>,
+    pub layouts: HashMap<String, Layout>,
     pub cases: HashMap<String, Case>,
     pub event_bridge: Option<EventBridgeConfiguration>,
 }
@@ -165,6 +187,28 @@ pub struct Template {
     pub tag_propagation_configurations: Vec<TagPropagationConfiguration>,
     /// One of `TEMPLATE_STATUS_VALUES`.
     pub status: String,
+    pub deleted: bool,
+    /// Reserved for the tagging slice, as [`Field::tags`].
+    pub tags: HashMap<String, String>,
+    pub created_time: SystemTime,
+    pub last_modified_time: SystemTime,
+}
+
+/// A case layout: which of the domain's fields the Cases user interface shows,
+/// and in what order.
+#[derive(Debug, Clone)]
+pub struct Layout {
+    pub layout_id: String,
+    pub layout_arn: String,
+    pub name: String,
+    /// The content as it was last written, in the complete form
+    /// [`normalized_layout_content`] keeps it in: every section, each field
+    /// group's name and the order of its fields are exactly what the write
+    /// gave, so a read hands back the record rather than a re-encoding of it.
+    pub content: LayoutContent,
+    /// Reserved for `DeleteLayout`, which is still a 501: a deleted layout is
+    /// still readable through `GetLayout` and refuses `UpdateLayout`, so the
+    /// record carries a flag rather than being dropped.
     pub deleted: bool,
     /// Reserved for the tagging slice, as [`Field::tags`].
     pub tags: HashMap<String, String>,
@@ -309,6 +353,25 @@ impl Domain {
             self.templates.len(),
             MAX_TEMPLATES_PER_DOMAIN,
             "templates in this domain",
+        )
+    }
+
+    /// The layout `layout_id` names, or the modelled 404 for it. A layout that
+    /// has been deleted IS still reported, unlike a template: per
+    /// `DeleteLayout`'s documentation, after a delete "You can still retrieve
+    /// the layout by calling GetLayout".
+    pub fn layout(&self, layout_id: &str) -> Result<&Layout, ResourceNotFoundException> {
+        self.layouts
+            .get(layout_id)
+            .ok_or_else(|| not_found("Layout", layout_id))
+    }
+
+    /// Refuse a new layout once the domain holds [`MAX_LAYOUTS_PER_DOMAIN`].
+    pub fn layout_capacity(&self) -> Result<(), ServiceQuotaExceededException> {
+        capacity(
+            self.layouts.len(),
+            MAX_LAYOUTS_PER_DOMAIN,
+            "layouts in this domain",
         )
     }
 
@@ -570,6 +633,15 @@ pub fn template_arn(region: &str, domain_id: &str, template_id: &str) -> String 
     )
 }
 
+/// The ARN of a layout of a domain.
+pub fn layout_arn(region: &str, domain_id: &str, layout_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("domain/{domain_id}/layout/{layout_id}"),
+    )
+}
+
 /// The ARN of a case of a domain.
 pub fn case_arn(region: &str, domain_id: &str, case_id: &str) -> String {
     ::engine::emulator_arn(
@@ -577,6 +649,84 @@ pub fn case_arn(region: &str, domain_id: &str, case_id: &str) -> String {
         region,
         &format!("domain/{domain_id}/case/{case_id}"),
     )
+}
+
+/// A layout's `content` in the COMPLETE form the service keeps it in: a
+/// `basic` layout has both of its panels, and each panel has a `sections` list
+/// — empty where the request named no section — while everything the request
+/// did spell (each section, its field group's name and the order of its fields)
+/// is kept exactly as given.
+///
+/// The real service answers a panel the create never mentioned as present and
+/// empty rather than absent, so the content is normalised ONCE here, on the
+/// write, and every read reports the stored record rather than re-deriving it.
+pub fn normalized_layout_content(content: LayoutContent) -> LayoutContent {
+    let LayoutContent::Basic(basic) = content;
+    LayoutContent::Basic(BasicLayout {
+        top_panel: Some(normalized_layout_panel(basic.top_panel)),
+        more_info: Some(normalized_layout_panel(basic.more_info)),
+    })
+}
+
+/// One panel of [`normalized_layout_content`]: its sections, or none of them.
+fn normalized_layout_panel(panel: Option<LayoutSections>) -> LayoutSections {
+    LayoutSections {
+        sections: Some(panel.and_then(|panel| panel.sections).unwrap_or_default()),
+    }
+}
+
+/// Every field id a layout's `content` references, in document order:
+/// `topPanel` first, then `moreInfo`, each panel's sections in the order they
+/// are listed and each field group's fields in the order it lists them. One
+/// pass over the content, so it is linear in the number of field items and
+/// bounded by [`MAX_LAYOUT_SECTIONS`] and [`MAX_LAYOUT_SECTION_FIELDS`].
+pub fn layout_field_ids(content: &LayoutContent) -> Vec<String> {
+    let LayoutContent::Basic(basic) = content;
+    [basic.top_panel.as_ref(), basic.more_info.as_ref()]
+        .into_iter()
+        .flatten()
+        .flat_map(|panel| panel.sections.iter().flatten())
+        .flat_map(|section| {
+            let Section::fieldGroup(group) = section;
+            group.fields.iter().map(|item| item.id.clone())
+        })
+        .collect()
+}
+
+/// `Some(message)` when a layout's `content` carries more sections in one panel
+/// than [`MAX_LAYOUT_SECTIONS`], or more fields in one group than
+/// [`MAX_LAYOUT_SECTION_FIELDS`]: the refusal text naming the member, the
+/// length seen and the ceiling.
+///
+/// Checked in the handler for the same reason as [`list_too_long`], which it
+/// builds the message with: the per-request work is bounded by this code rather
+/// than only by the boundary validator.
+pub fn layout_content_too_long(content: &LayoutContent) -> Option<String> {
+    let LayoutContent::Basic(basic) = content;
+    for (panel_name, panel) in [
+        ("content.basic.topPanel", basic.top_panel.as_ref()),
+        ("content.basic.moreInfo", basic.more_info.as_ref()),
+    ] {
+        let sections = panel.and_then(|panel| panel.sections.as_deref()).unwrap_or(&[]);
+        if let Some(message) = list_too_long(
+            &format!("{panel_name}.sections"),
+            sections.len(),
+            MAX_LAYOUT_SECTIONS,
+        ) {
+            return Some(message);
+        }
+        for section in sections {
+            let Section::fieldGroup(group) = section;
+            if let Some(message) = list_too_long(
+                &format!("{panel_name}.sections.fieldGroup.fields"),
+                group.fields.len(),
+                MAX_LAYOUT_SECTION_FIELDS,
+            ) {
+                return Some(message);
+            }
+        }
+    }
+    None
 }
 
 /// The region to build a new resource's ARN in: the one the caller signed for,

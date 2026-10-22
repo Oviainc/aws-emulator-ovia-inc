@@ -938,6 +938,30 @@ pub fn unsupported_action_exception(message: impl Into<String>) -> ValidationExc
     }
 }
 
+/// How a policy check's `ReasonSummary$description` names the statement it blames.
+///
+/// The three policy checks (`CheckAccessNotGranted`, `CheckNoNewAccess`,
+/// `CheckNoPublicAccess`) all report a finding as one SHORT canonical sentence followed by
+/// a reference to the offending statement of the submitted document — never a narrative
+/// about what that statement contains. The reference names the statement's `Sid` when it
+/// carries one and its zero-based position in the document when it does not, which are the
+/// two forms AWS puts on the wire: the `sid` form in this model's own
+/// `smithy.api#examples` for `CheckAccessNotGranted` and `CheckNoPublicAccess` (verify with
+/// `grep 'in the statement with sid: ' smithy-model/com-amazonaws-accessanalyzer-accessanalyzer.json`),
+/// and the `index` form in the recorded responses for documents whose statements carry no
+/// `Sid`.
+///
+/// Returned without the trailing full stop, so each check appends it to its own sentence:
+/// `format!("… statement {reference}.")`.
+pub fn statement_reference(statement_id: Option<&str>, statement_index: i32) -> String {
+    match statement_id.filter(|sid| !sid.is_empty()) {
+        Some(sid) => format!("with sid: {sid}"),
+        // A statement with no `Sid` has only its position to be named by, which is the
+        // same number the reason reports in `statementIndex`.
+        None => format!("with index: {statement_index}"),
+    }
+}
+
 /// The smallest `unusedAccessAge` an `UnusedAccessConfiguration` may carry.
 ///
 /// The model gives the member no `@range`, but its documentation does bound it — "You

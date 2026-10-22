@@ -34,6 +34,8 @@ fn authorization(region: &str) -> String {
 }
 
 /// One emulator: a single shared engine behind the production router.
+/// `pub(crate)` so every suite in this test target drives the service the same
+/// way, rather than each one growing its own copy of this harness.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
     region: String,
@@ -44,7 +46,7 @@ impl Emulator {
         Self::in_region("us-east-1")
     }
 
-    fn in_region(region: &str) -> Self {
+    pub(crate) fn in_region(region: &str) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(engine));
@@ -108,7 +110,7 @@ impl Emulator {
     }
 
     /// Send a call that must fail, and hand back its status, wire error code and message.
-    async fn failure_detail(
+    pub(crate) async fn failure_detail(
         &self,
         case: &str,
         method: &str,
@@ -135,7 +137,7 @@ impl Emulator {
     }
 }
 
-fn string_at(json: &Value, member: &str, case: &str) -> String {
+pub(crate) fn string_at(json: &Value, member: &str, case: &str) -> String {
     json.get(member)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: no string member {member:?} in {json:?}"))
@@ -254,7 +256,7 @@ async fn get_case_fields(
 
 /// `true` when `id` is a server-minted resource id: the 8-4-4-4-12 lowercase
 /// hex form the real service's ids take, carrying nothing from the request.
-fn is_minted_id(id: &str) -> bool {
+pub(crate) fn is_minted_id(id: &str) -> bool {
     let groups: Vec<&str> = id.split('-').collect();
     groups.len() == 5
         && groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])

@@ -311,12 +311,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         // A verb names at most one method on a resource: re-putting one is a conflict,
-        // not an overwrite.
+        // not an overwrite. The message is API Gateway's own wording for it, as a
+        // recorded refusal reports: it names the conflict, not the verb, which the
+        // request already carries in its URI.
         if resource.methods.contains_key(&verb) {
             return Err(PutMethodErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Method already exists for this resource: {verb}"
-                )),
+                message: Some("Method already exists for this resource".to_string()),
             })
             .into());
         }

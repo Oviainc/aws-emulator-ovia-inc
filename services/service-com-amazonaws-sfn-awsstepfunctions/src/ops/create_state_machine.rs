@@ -243,11 +243,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        if let Some(why) = crate::state::invalid_name_reason(&input.name) {
-            return Err(
-                CreateStateMachineErrorModeled::InvalidName(InvalidName { message: Some(why) })
-                    .into(),
-            );
+        if !crate::state::is_valid_name(&input.name) {
+            return Err(CreateStateMachineErrorModeled::InvalidName(InvalidName {
+                message: Some(crate::state::resource_error_message(
+                    crate::state::INVALID_NAME,
+                    &input.name,
+                )),
+            })
+            .into());
         }
 
         // `roleArn` is "the Amazon Resource Name (ARN) of the IAM role to use for
@@ -267,20 +270,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .unwrap_or_else(|| crate::state::STATE_MACHINE_TYPE_STANDARD.to_string());
         if !STATE_MACHINE_TYPE_VALUES.contains(&sm_type.as_str()) {
+            // UNREACHABLE in practice, and deliberately kept as a guard: `type`
+            // targets the modelled `StateMachineType` enum, so the centralized walk
+            // has already refused any other value with the `ValidationException`
+            // enum-value-set clause (`Member must satisfy enum value set: [...]`) —
+            // which is what AWS answers for an unmodelled enum value. A value that
+            // somehow reached here is a workflow type this operation does not
+            // support, and `StateMachineTypeNotSupported`'s message is a fixed
+            // service string carrying no request value, so it is stated through the
+            // one constant every operation refusing a workflow type reads.
             return Err(CreateStateMachineErrorModeled::StateMachineTypeNotSupported(
                 StateMachineTypeNotSupported {
-                    message: Some(format!(
-                        "type must be one of [{}], got '{sm_type}'",
-                        STATE_MACHINE_TYPE_VALUES.join(", ")
-                    )),
+                    message: Some(crate::state::STATE_MACHINE_TYPE_NOT_SUPPORTED.to_string()),
                 },
             )
             .into());
         }
 
-        if let Err(why) = crate::state::asl::validate(&input.definition) {
+        if let Err(diagnostic) = crate::state::asl::validate(&input.definition) {
             return Err(CreateStateMachineErrorModeled::InvalidDefinition(
-                InvalidDefinition { message: Some(why) },
+                InvalidDefinition {
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::INVALID_STATE_MACHINE_DEFINITION,
+                        &diagnostic,
+                    )),
+                },
             )
             .into());
         }
@@ -409,7 +423,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // The service's message for this condition is the condition's
                     // own name followed by the colliding ARN in single quotes, built
                     // from the request rather than from this emulator's prose.
-                    message: Some(format!("State Machine Already Exists: '{existing_arn}'")),
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::STATE_MACHINE_ALREADY_EXISTS,
+                        &existing_arn,
+                    )),
                 },
             )
             .into());

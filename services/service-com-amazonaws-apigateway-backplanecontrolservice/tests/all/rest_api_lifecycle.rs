@@ -105,8 +105,14 @@ pub(crate) async fn create_api(gateway: &Gateway, name: &str) -> (String, String
     (id, root)
 }
 
-/// `CreateResource` for `path_part` under `parent`, asserting it was accepted.
-async fn create_resource(gateway: &Gateway, api: &str, parent: &str, path_part: &str) -> Value {
+/// `CreateResource` for `path_part` under `parent`, asserting it was accepted. Shared
+/// with the sibling `patch_updates` suite, which renames the resources it builds.
+pub(crate) async fn create_resource(
+    gateway: &Gateway,
+    api: &str,
+    parent: &str,
+    path_part: &str,
+) -> Value {
     let answer = gateway
         .call(
             "POST",

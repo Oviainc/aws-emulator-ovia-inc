@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the request's `patchOperations` to the stored `Resource` record,
+//! in request order, and reports the updated resource — so a later `GetResource` reads
+//! back exactly what the patch set.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A resource's `path` is DERIVED from its parent chain, so renaming a segment or moving
+//! the resource recomputes `path` here for the resource and for every resource beneath
+//! it. The whole list is applied to a COPY of the API's resource tree and written back
+//! only once every op has succeeded, so a refused op leaves the tree as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +80,193 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{Patch, PatchFailure, PatchOpKind, ResourceEntry, RestApiEntry};
+
+/// The `path` values `UpdateResource` accepts: the resource's own segment and its place
+/// in the tree. `id` is assigned by the service and `path` is derived from the parent
+/// chain, so neither is patchable; a resource's methods are changed through the `Method`
+/// operations.
+const SUPPORTED_PATHS: &[&str] = &["/parentId", "/pathPart"];
+
+/// Every resource of `api` that is a descendant of `resource_id`, the resource itself
+/// included — the set whose `path` a rename or a move recomputes, and the set a resource
+/// may not be moved into.
+fn descendants(api: &RestApiEntry, resource_id: &str) -> Vec<String> {
+    let mut found = vec![resource_id.to_string()];
+    let mut frontier = vec![resource_id.to_string()];
+    while let Some(parent) = frontier.pop() {
+        for child in api.resources.values() {
+            if child.parent_id.as_deref() == Some(parent.as_str())
+                && !found.contains(&child.id)
+            {
+                found.push(child.id.clone());
+                frontier.push(child.id.clone());
+            }
+        }
+    }
+    found
+}
+
+/// Refuse a path part that another child of `parent_id` already holds: two siblings with
+/// one segment would share a path, and a path is what routes a request.
+fn refuse_sibling_clash(
+    api: &RestApiEntry,
+    resource_id: &str,
+    parent_id: &str,
+    path_part: &str,
+) -> Result<(), PatchFailure> {
+    let taken = api.resources.values().any(|sibling| {
+        sibling.id != resource_id
+            && sibling.parent_id.as_deref() == Some(parent_id)
+            && sibling.path_part.as_deref() == Some(path_part)
+    });
+    if taken {
+        return Err(PatchFailure::Conflict(format!(
+            "Another child resource with the path part '{path_part}' already exists for this resource"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a patch of `pathPart` or `parentId` on an API's root resource: the root is
+/// the API's own entry point and has neither a segment nor a parent, so neither member
+/// names anything on it.
+fn require_non_root(resource: &ResourceEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    if resource.parent_id.is_none() || resource.path_part.is_none() {
+        return Err(PatchFailure::BadRequest(format!(
+            "{} cannot be changed on the API's root resource",
+            patch.path
+        )));
+    }
+    Ok(())
+}
+
+/// Apply one patch to a COPY of the API's resource tree.
+fn apply_patch(
+    api: &mut RestApiEntry,
+    resource_id: &str,
+    patch: &Patch,
+) -> Result<(), PatchFailure> {
+    let current = api
+        .resources
+        .get(resource_id)
+        .ok_or_else(|| PatchFailure::NotFound(crate::state::NO_SUCH_RESOURCE.to_string()))?
+        .clone();
+
+    match patch.member() {
+        "pathPart" => {
+            patch.require_single_valued()?;
+            require_non_root(&current, patch)?;
+            if !matches!(patch.op, PatchOpKind::Add | PatchOpKind::Replace) {
+                // A non-root resource is one segment of a path, so it cannot be left
+                // without one.
+                return Err(patch.unsupported_op());
+            }
+            let path_part = patch.require_value()?.to_string();
+            if path_part.is_empty() {
+                return Err(PatchFailure::BadRequest(format!(
+                    "{} must not be empty",
+                    patch.path
+                )));
+            }
+            if path_part.contains('/') {
+                return Err(PatchFailure::BadRequest(format!(
+                    "{} is a single path segment and must not contain '/': {path_part:?}",
+                    patch.path
+                )));
+            }
+            crate::state::bound_chars(&patch.path, &path_part, crate::state::MAX_PATH_PART_CHARS)
+                .map_err(PatchFailure::BadRequest)?;
+            let parent_id = current.parent_id.clone().unwrap_or_default();
+            refuse_sibling_clash(api, resource_id, &parent_id, &path_part)?;
+            if let Some(resource) = api.resources.get_mut(resource_id) {
+                resource.path_part = Some(path_part);
+            }
+            Ok(())
+        }
+        "parentId" => {
+            patch.require_single_valued()?;
+            require_non_root(&current, patch)?;
+            if !matches!(patch.op, PatchOpKind::Add | PatchOpKind::Replace) {
+                // Only the root resource has no parent, and it is not movable.
+                return Err(patch.unsupported_op());
+            }
+            let parent_id = patch.require_value()?.to_string();
+            if !api.resources.contains_key(&parent_id) {
+                return Err(PatchFailure::NotFound(
+                    crate::state::NO_SUCH_RESOURCE.to_string(),
+                ));
+            }
+            // A resource cannot be moved under itself or under one of its own
+            // descendants: that would cut the subtree off the API's root and leave it
+            // with no path at all.
+            if descendants(api, resource_id).contains(&parent_id) {
+                return Err(PatchFailure::BadRequest(format!(
+                    "{} must not name the resource itself or one of its descendants: {parent_id}",
+                    patch.path
+                )));
+            }
+            let path_part = current.path_part.clone().unwrap_or_default();
+            refuse_sibling_clash(api, resource_id, &parent_id, &path_part)?;
+            if let Some(resource) = api.resources.get_mut(resource_id) {
+                resource.parent_id = Some(parent_id);
+            }
+            Ok(())
+        }
+        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+    }
+}
+
+/// Rematerialise every resource's `path` from the stored parent chain, walking down from
+/// the API's root: the derived member must follow the segment or the parent that changed,
+/// for the patched resource and for everything beneath it.
+///
+/// The materialised path is bounded, which is what bounds how deeply resources may nest.
+fn recompute_paths(api: &mut RestApiEntry) -> Result<(), PatchFailure> {
+    let root_id = api.root_resource_id.clone();
+    let mut frontier = vec![root_id.clone()];
+    if let Some(root) = api.resources.get_mut(&root_id) {
+        root.path = super::create_rest_api::ROOT_RESOURCE_PATH.to_string();
+    }
+    while let Some(parent_id) = frontier.pop() {
+        let parent_path = match api.resources.get(&parent_id) {
+            Some(parent) => parent.path.clone(),
+            None => continue,
+        };
+        let children: Vec<String> = api
+            .resources
+            .values()
+            .filter(|resource| resource.parent_id.as_deref() == Some(parent_id.as_str()))
+            .map(|resource| resource.id.clone())
+            .collect();
+        for child_id in children {
+            let Some(child) = api.resources.get_mut(&child_id) else {
+                continue;
+            };
+            let path_part = child.path_part.clone().unwrap_or_default();
+            let path = super::create_resource::child_path(&parent_path, &path_part);
+            crate::state::bound_chars("the resource path", &path, crate::state::MAX_PATH_CHARS)
+                .map_err(PatchFailure::BadRequest)?;
+            child.path = path;
+            frontier.push(child_id);
+        }
+    }
+    Ok(())
+}
+
+/// The stored resource `resource_id` names, for the response body.
+fn stored_resource<'api>(
+    api: &'api RestApiEntry,
+    resource_id: &str,
+) -> Result<&'api ResourceEntry, UpdateResourceError> {
+    api.resources.get(resource_id).ok_or_else(|| {
+        UpdateResourceErrorModeled::NotFoundException(NotFoundException {
+            message: Some(crate::state::NO_SUCH_RESOURCE.to_string()),
+        })
+        .into()
+    })
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -154,18 +340,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches = crate::state::parse_patches(input.patch_operations.as_ref())
+            .map_err(patch_failure)?;
+
+        let mut store = state.lock();
+
+        // Patched on a COPY of the API: a list whose later op is refused leaves the
+        // stored tree untouched, rather than keeping the ops before it.
+        let mut updated = store
+            .rest_apis
+            .get(&input.rest_api_id)
+            .ok_or_else(|| {
+                UpdateResourceErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+                })
+            })?
+            .clone();
+        if !updated.resources.contains_key(&input.resource_id) {
+            return Err(UpdateResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_RESOURCE.to_string()),
+            })
+            .into());
+        }
+
+        for patch in &patches {
+            apply_patch(&mut updated, &input.resource_id, patch).map_err(patch_failure)?;
+        }
+        // `path` is derived, so it is rematerialised from the patched tree rather than
+        // edited: the patched resource and every resource beneath it follow.
+        recompute_paths(&mut updated).map_err(patch_failure)?;
+
+        store.rest_apis.insert(input.rest_api_id.clone(), updated);
+        let api = store
+            .rest_apis
+            .get(&input.rest_api_id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let stored = stored_resource(api, &input.resource_id)?;
+        // Rendered through the one `Resource` body this crate builds, so the update
+        // reports the record exactly as `GetResource` will read it back. A `Resource`
+        // body carries the resource's verbs; only a request that asks for it with
+        // `embed=methods` gets the embedded methods, and this operation takes no `embed`.
+        let body = super::create_resource::resource_body(stored, false);
+        Ok(UpdateResourceOutput {
+            id: body.id,
+            parent_id: body.parent_id,
+            path_part: body.path_part,
+            path: body.path,
+            resource_methods: body.resource_methods,
+        })
     }
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateResourceError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateResourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateResourceErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
 }

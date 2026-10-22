@@ -199,6 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tags: ::std::collections::HashMap::new(),
                 fields: ::std::collections::HashMap::new(),
                 templates: ::std::collections::HashMap::new(),
+                layouts: ::std::collections::HashMap::new(),
                 cases: ::std::collections::HashMap::new(),
                 event_bridge: None,
             });

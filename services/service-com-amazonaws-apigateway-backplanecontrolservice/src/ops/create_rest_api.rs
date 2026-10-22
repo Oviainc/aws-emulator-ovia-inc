@@ -158,6 +158,48 @@ const MAX_COMPRESSION_SIZE: i32 = 10_485_760;
 /// created in the terminal `AVAILABLE` state and no later call moves it.
 const API_STATUS_AVAILABLE: &str = "AVAILABLE";
 
+/// The `apiKeySource` a REST API created without one gets: "HEADER to read the API key
+/// from the X-API-Key header of a request" (`RestApi$apiKeySource`) is API Gateway's
+/// default source, and a recorded create of an API that set none reports `HEADER`.
+const DEFAULT_API_KEY_SOURCE: &str = "HEADER";
+
+/// The endpoint type such an API gets: edge-optimized, as a recorded create of an API
+/// that set no `endpointConfiguration` reports (`{types: ['EDGE'], ipAddressType:
+/// 'ipv4'}`).
+const DEFAULT_ENDPOINT_TYPE: &str = "EDGE";
+
+/// The `ipAddressType` such an API gets; see [`DEFAULT_ENDPOINT_TYPE`].
+const DEFAULT_IP_ADDRESS_TYPE: &str = "ipv4";
+
+/// The `securityPolicy` such an API reports — "the Transport Layer Security (TLS)
+/// version + cipher suite for this RestApi" (`RestApi$securityPolicy`) — as a recorded
+/// create of an edge-optimized API that set none reports.
+const DEFAULT_SECURITY_POLICY: &str = "TLS_1_0";
+
+/// The `endpointConfiguration` a created API is stored with: what the request asked
+/// for, with each member AWS fills in itself defaulted where the request left it out.
+///
+/// AWS answers a created API with this structure populated whether or not the request
+/// carried one, so a client that reads `types` to decide edge-versus-regional behaviour
+/// or `ipAddressType` to choose a call path always has a value.
+fn defaulted_endpoint_configuration(
+    requested: Option<EndpointConfiguration>,
+) -> EndpointConfiguration {
+    let requested = requested.unwrap_or_default();
+    EndpointConfiguration {
+        types: match requested.types {
+            Some(types) if !types.is_empty() => Some(types),
+            _ => Some(vec![DEFAULT_ENDPOINT_TYPE.to_string()]),
+        },
+        ip_address_type: Some(
+            requested
+                .ip_address_type
+                .unwrap_or_else(|| DEFAULT_IP_ADDRESS_TYPE.to_string()),
+        ),
+        vpc_endpoint_ids: requested.vpc_endpoint_ids,
+    }
+}
+
 /// The `path` of an API's implicit root resource.
 pub const ROOT_RESOURCE_PATH: &str = "/";
 
@@ -251,13 +293,16 @@ impl From<&RestApiEntry> for CreateRestApiOutput {
             api_key_source: entry.api_key_source.clone(),
             endpoint_configuration: entry.endpoint_configuration.clone(),
             policy: entry.policy.clone(),
-            tags: (!entry.tags.is_empty()).then(|| {
+            // The collection of tags is ALWAYS reported, empty when the API carries
+            // none: `tags` is "the collection of tags" of the resource, which is an
+            // empty map on an API that has none, not an absent one.
+            tags: Some(
                 entry
                     .tags
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            }),
+                    .collect(),
+            ),
             disable_execute_api_endpoint: entry.disable_execute_api_endpoint,
             root_resource_id: Some(entry.root_resource_id.clone()),
             security_policy: entry.security_policy.clone(),
@@ -460,15 +505,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name,
             description: input.description,
             version: input.version,
-            created_date: Some(::aws_smithy_types::DateTime::from(
-                ::std::time::SystemTime::now(),
-            )),
+            created_date: Some(crate::state::now()),
             binary_media_types: input.binary_media_types.unwrap_or_default(),
             minimum_compression_size: input.minimum_compression_size,
-            api_key_source: input.api_key_source,
-            endpoint_configuration: input.endpoint_configuration,
+            // The members AWS fills in itself when the request sets none: a created API
+            // always reports an api key source, an endpoint configuration and a
+            // security policy, so they are stored at create time rather than left
+            // absent for every later read to omit.
+            api_key_source: Some(
+                input
+                    .api_key_source
+                    .unwrap_or_else(|| DEFAULT_API_KEY_SOURCE.to_string()),
+            ),
+            endpoint_configuration: Some(defaulted_endpoint_configuration(
+                input.endpoint_configuration,
+            )),
             policy: input.policy,
-            security_policy: input.security_policy,
+            security_policy: Some(
+                input
+                    .security_policy
+                    .unwrap_or_else(|| DEFAULT_SECURITY_POLICY.to_string()),
+            ),
             endpoint_access_mode: input.endpoint_access_mode,
             api_status: Some(API_STATUS_AVAILABLE.to_string()),
             api_status_message: None,

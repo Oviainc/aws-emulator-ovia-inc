@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateTimeSeriesFromAssetProperty
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateTimeSeriesFromAssetProperty`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation breaks the association between the time series (data
+//! stream) an alias names and the asset property that carries it, in the shared engine
+//! store (`crate::state`); this is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateTimeSeriesFromAssetProperty::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The association lives on the stored asset property (its `alias` member and the alias
+//! index `DescribeTimeSeries`, `GetAssetPropertyValue` and ingest resolve through), so
+//! breaking it is a write to that property. The STREAM is not deleted with it: IoT
+//! SiteWise models a time series as its own resource — `ListTimeSeries` reports one as
+//! `ASSOCIATED` or `DISASSOCIATED`, and `DeleteTimeSeries` is what forgets one — so the
+//! detached stream stays addressable by its alias as a
+//! [`crate::state::DisassociatedTimeSeriesRecord`], keeping the data type and creation
+//! date it had while associated and carrying a `TimeSeriesId` of its own, since the
+//! asset property's ids still name a series of theirs. The samples go WITH the stream,
+//! because the time series is the data stream and an asset property reports the values
+//! of the stream associated with it; binding the alias to an asset property again brings
+//! them back.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +192,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateTimeSeriesFromAssetProperty` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateTimeSeriesFromAssetPropertyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            internal_failure("the IoT SiteWise store is unavailable".to_string())
+        })?;
+        // No member of the answer is region-scoped, so this handler builds no ARN and
+        // reads nothing from the request beyond its modelled input.
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `assetId` and `propertyId` are `CustomID`s: a raw id, or
+        // `externalId:<externalId>`. Both forms name the one stored property, resolved
+        // the way every other handler in this crate resolves them.
+        let asset_id = store
+            .resolve_asset_id(&input.asset_id)
+            .ok_or_else(|| not_found(format!("The asset {} could not be found.", input.asset_id)))?;
+        let asset = store
+            .assets
+            .get(&asset_id)
+            .ok_or_else(|| not_found(format!("The asset {} could not be found.", input.asset_id)))?;
+        let property = asset.property(&input.property_id).ok_or_else(|| {
+            not_found(format!(
+                "The asset {} has no property {}.",
+                input.asset_id, input.property_id
+            ))
+        })?;
+        let property_id = property.id.clone();
+
+        // This call names ONE association — the alias, and the asset property it is
+        // attached to — so it acts only when that association is the one the store
+        // holds. An alias the property does not carry (because it carries none, or
+        // another one, or because the alias names some other property's stream) names
+        // no association this call can break, and removing an association that was
+        // never made is a refusal rather than a success, as `DisassociateAssets` treats
+        // the same situation.
+        if property.alias.as_deref() != Some(input.alias.as_str()) {
+            return Err(not_found(format!(
+                "The time series {} is not associated with the property {} of asset {}.",
+                input.alias, property_id, asset_id
+            )));
+        }
+
+        // `clientToken` is NOT honoured for idempotent replay — no token -> answer
+        // mapping is stored, as in `CreateAsset` and `UpdateAssetProperty`. A replay
+        // finds the association already broken and is answered the refusal above,
+        // which is what any later caller naming an association the store does not
+        // hold is answered.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateTimeSeriesFromAssetProperty"))
+        // The alias leaves the property and the alias index together, and the stream
+        // it named survives as a disassociated time series: one state helper, so the
+        // two cannot disagree. Both lookups above resolved under this same lock, so
+        // the refusal below is DEFENCE IN DEPTH — this handler cannot reach it — and
+        // it reports the modelled server failure rather than answering 200 after a
+        // partial write.
+        if !store.disassociate_time_series(&asset_id, &property_id, now) {
+            return Err(internal_failure(format!(
+                "The property {property_id} of asset {asset_id} stopped resolving while the \
+                 disassociation was being applied."
+            )));
+        }
+
+        // The asset carries the property that just changed, so its last-update instant
+        // moves with it — the same write `UpdateAssetProperty` makes when it rebinds or
+        // removes a property's alias.
+        if let Some(asset) = store.assets.get_mut(&asset_id) {
+            asset.last_update_date = now;
+        }
+
+        Ok(DisassociateTimeSeriesFromAssetPropertyOutput)
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> DisassociateTimeSeriesFromAssetPropertyError {
+    DisassociateTimeSeriesFromAssetPropertyError::Modeled(
+        DisassociateTimeSeriesFromAssetPropertyErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException { message },
+        ),
+    )
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> DisassociateTimeSeriesFromAssetPropertyError {
+    DisassociateTimeSeriesFromAssetPropertyError::Modeled(
+        DisassociateTimeSeriesFromAssetPropertyErrorModeled::InternalFailureException(
+            InternalFailureException { message },
+        ),
+    )
 }

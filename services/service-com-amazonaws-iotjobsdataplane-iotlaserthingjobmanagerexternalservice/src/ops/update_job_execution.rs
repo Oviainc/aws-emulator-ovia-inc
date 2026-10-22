@@ -168,7 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for UpdateJobExecution<Eng>
 {
     type Input = UpdateJobExecutionInput;
-    type Output = UpdateJobExecutionOutput;
+    /// The modelled output, written as a COMPLETE document: `executionState` and
+    /// `jobDocument` reach the wire as JSON `null` when the request did not ask for
+    /// them (or there is no document), never as keys the body leaves out.
+    type Output = ResponseDocument<UpdateJobExecutionOutput>;
     type Error = UpdateJobExecutionError;
 
     const NAME: &'static str = "UpdateJobExecution";
@@ -310,17 +313,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // device" — `JobExecution$versionNumber`.
         record.version_number += 1;
 
-        Ok(UpdateJobExecutionOutput {
-            // Both members are opt-in: "The default is false" for each.
-            execution_state: input
-                .include_job_execution_state
-                .unwrap_or(false)
-                .then(|| crate::state::to_execution_state(record)),
-            job_document: input
-                .include_job_document
-                .unwrap_or(false)
-                .then(|| record.job_document.clone())
-                .flatten(),
-        })
+        Ok(ResponseDocument::new(
+            UpdateJobExecutionOutput {
+                // Both members are opt-in: "The default is false" for each. A member
+                // the request did not ask for is reported as JSON `null`, not left
+                // out of the document.
+                execution_state: input
+                    .include_job_execution_state
+                    .unwrap_or(false)
+                    .then(|| crate::state::to_execution_state(record)),
+                job_document: input
+                    .include_job_document
+                    .unwrap_or(false)
+                    .then(|| record.job_document.clone())
+                    .flatten(),
+            },
+            Self::OUTPUT_SCHEMA,
+        ))
     }
 }

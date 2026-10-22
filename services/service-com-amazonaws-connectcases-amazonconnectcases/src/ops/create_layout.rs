@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLayout
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLayout`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a layout in this service's state and answers the ids a later read
+//! accepts. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLayout::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
+//! A 501 from this operation would mean "nobody has written it yet", never "the
+//! emulator is broken". It is written, so the SCAFFOLDED marker line is gone from the
+//! top of this file: that line is the machine-readable record of
 //! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
 //! so leaving it on an implemented operation under-reports progress.
 //!
@@ -166,18 +165,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLayout` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLayoutErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLayout"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateLayoutErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // Pure input validation, done BEFORE the store lock is taken. The
+        // model's own section and field-group caps are re-checked here as well
+        // as at the boundary, so the single pass over the content below is
+        // bounded by this code.
+        if let Some(message) = crate::state::layout_content_too_long(&input.content) {
+            return Err(
+                CreateLayoutErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        let mut store = state.lock();
+
+        let domain = store
+            .domain_mut(&input.domain_id)
+            .map_err(CreateLayoutErrorModeled::ResourceNotFoundException)?;
+        // Bound request-driven growth: a caller cannot fill the domain without end.
+        domain
+            .layout_capacity()
+            .map_err(CreateLayoutErrorModeled::ServiceQuotaExceededException)?;
+
+        // The model's own words for `name`: "It must be unique for the Cases
+        // domain". So a create under a name already taken is refused instead of
+        // shadowing the layout that holds it, as a template name is.
+        if let Some(existing) = domain
+            .layouts
+            .values()
+            .find(|layout| !layout.deleted && layout.name == input.name)
+        {
+            return Err(
+                CreateLayoutErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "a layout named {} already exists in domain {} (layoutId {})",
+                        input.name, input.domain_id, existing.layout_id
+                    ),
+                })
+                .into(),
+            );
+        }
+
+        // Every field id the content references is resolved against the domain
+        // BEFORE anything is stored, so a layout never records a reference that
+        // cannot be followed: a layout naming a non-existent fieldId is a
+        // `ValidationException`. The documented refusal of the Title and Status
+        // fields ("they are not configurable") is subsumed by this check: a
+        // domain in this emulator holds only the Custom fields `CreateField`
+        // stored, so there is no System field to name.
+        let referenced = crate::state::layout_field_ids(&input.content);
+        let unknown = domain.unknown_field_ids(referenced.iter().map(String::as_str));
+        if !unknown.is_empty() {
+            return Err(
+                CreateLayoutErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "content names field ids that do not exist in domain {}: {}",
+                        input.domain_id,
+                        crate::state::name_ids(&unknown)
+                    ),
+                })
+                .into(),
+            );
+        }
+
+        let layout_id = crate::state::new_id();
+        let layout_arn = crate::state::layout_arn(&region, &input.domain_id, &layout_id);
+        // Read the answer back out of the record just stored, so the response can
+        // only report what a later GetLayout will find.
+        let stored = domain
+            .layouts
+            .entry(layout_id.clone())
+            .or_insert_with(|| crate::state::Layout {
+                layout_id,
+                layout_arn,
+                name: input.name,
+                // Stored in the complete form the service keeps a layout in,
+                // so a read reports the record rather than normalising it.
+                content: crate::state::normalized_layout_content(input.content),
+                deleted: false,
+                tags: ::std::collections::HashMap::new(),
+                created_time: now,
+                last_modified_time: now,
+            });
+
+        Ok(CreateLayoutOutput {
+            layout_id: stored.layout_id.clone(),
+            layout_arn: stored.layout_arn.clone(),
+        })
     }
 }

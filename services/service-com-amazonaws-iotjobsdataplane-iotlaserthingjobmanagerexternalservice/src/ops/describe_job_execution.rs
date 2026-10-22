@@ -145,7 +145,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for DescribeJobExecution<Eng>
 {
     type Input = DescribeJobExecutionInput;
-    type Output = DescribeJobExecutionOutput;
+    /// The modelled output, written as a COMPLETE document (see
+    /// [`super::types::ResponseDocument`]): this operation determines `execution`
+    /// for every answer it returns 200 for, so the completion adds nothing here —
+    /// it is the same rule, stated for every operation of this service.
+    type Output = ResponseDocument<DescribeJobExecutionOutput>;
     type Error = DescribeJobExecutionError;
 
     const NAME: &'static str = "DescribeJobExecution";
@@ -203,12 +207,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Unless set to false, the response contains the job document. The
         // default is true."
         let include_job_document = input.include_job_document.unwrap_or(true);
-        Ok(DescribeJobExecutionOutput {
-            execution: Some(crate::state::to_job_execution(
-                record,
-                include_job_document,
-                crate::state::now_epoch_seconds(),
-            )),
-        })
+        Ok(ResponseDocument::new(
+            DescribeJobExecutionOutput {
+                execution: Some(crate::state::to_job_execution(
+                    record,
+                    include_job_document,
+                    crate::state::now_epoch_seconds(),
+                )),
+            },
+            Self::OUTPUT_SCHEMA,
+        ))
     }
 }
