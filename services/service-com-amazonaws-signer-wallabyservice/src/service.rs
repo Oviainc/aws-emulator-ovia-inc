@@ -45,6 +45,27 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The first URI path segment this service's model binds to a DIFFERENT endpoint host
+/// than its own: `GetRevocationStatus` (`GET /revocations`) carries
+/// `@endpoint(hostPrefix: "data-")`
+/// (`smithy_query(query="operation",operation="GetRevocationStatus")`), so an SDK sends
+/// it to `data-signer.<region>.amazonaws.com` — the Signer DATA PLANE, emulated by
+/// `services/service-com-amazonaws-signerdata-signerdataplane`, which signs with the
+/// same `signer` signing name. Declining it here leaves exactly one claimant for that
+/// path instead of the `500 AmbiguousService` two claimants produce.
+const DATA_PLANE_PATH_SEGMENT: &str = "revocations";
+
+/// The first `/`-separated segment of `path`, or `None` for a path with no non-empty
+/// first segment (`"/"`, `""`).
+///
+/// Mirrors the framework's own `first_path_segment`, which is private to
+/// `emulator_server` and reads a whole buffered request; the `Service::can_handle` seam
+/// receives only `Parts`, so the identical rule is applied here.
+fn first_path_segment(path: &str) -> Option<&str> {
+    let segment = path.trim_start_matches('/').split('/').next()?;
+    (!segment.is_empty()).then_some(segment)
+}
+
 /// The `com-amazonaws-signer-wallabyservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,12 +95,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // AWS Signer and the Signer data plane are two emulated services behind ONE
+        // SigV4 signing name (`signer`) — the router resolves a request's routing key
+        // from the credential scope first, so both see the key `signer` — which the
+        // model cannot express. Claiming on the signing name ALONE therefore makes both
+        // services claim every `signer`-signed request and the router answers `500
+        // AmbiguousService` for ALL of it, this service's own operations included.
+        //
+        // This is the service whose endpoint prefix IS the shared signing name, so it
+        // serves that name's traffic — except the one path space the model itself
+        // addresses at the data-plane endpoint (`DATA_PLANE_PATH_SEGMENT`), which the
+        // peer crate emulates and which is declined here.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+            Some(key) if key == self.entry.identity().signing_name() => {
+                first_path_segment(parts.uri.path()) != Some(DATA_PLANE_PATH_SEGMENT)
+            }
+            _ => false,
         }
     }
 

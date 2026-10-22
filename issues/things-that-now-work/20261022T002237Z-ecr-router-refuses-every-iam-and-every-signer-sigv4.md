@@ -11,6 +11,33 @@ Issue-Commit: ace69a9d3348e9c8c81d3eff309bd15ea7c6e8c3
 
 # Router refuses every 'iam' and every 'signer' sigv4 request as AmbiguousService (same signing name registered twice), and answers the XML-protocol iam client with a JSON body
 
+## Resolution
+
+Both causes are closed at the request-claiming seam: each emulated service now claims only
+the requests addressed to its own endpoint — the routing key must name it (its SigV4 signing
+name, or its own endpoint prefix) and the request must address its own URI path space — so
+exactly one service claims an `iam`-signed or a `signer`-signed request and no
+`AmbiguousService` refusal can be produced for either name. `signer` requests now reach AWS
+Signer (PutSigningProfile and the profile reads answer 200) and `GET /revocations` reaches the
+Signer data plane that implements it; `iam` requests reach AWS IAM and are answered inside
+IAM's own awsQuery XML envelope, so a query/XML client parses the answer instead of raising a
+malformed-response error on a JSON `__type` body. Pinned by
+`core/router/tests/all/iam_and_signer_signing_name_routing.rs`.
+
+Two parts of the report's "Fix" text are deliberately not covered here, and the three Cause-1
+ECR traces (`ecr.pull-time-update-exclusion-fields-preserved`,
+`ecr.register-pull-time-exclusion-duplicate-rejected`,
+`ecr.e2e-registry-policy-cross-account-pull-consequence`) therefore still fail — now on a
+different, separately tracked cause rather than on an unparseable response:
+
+* every AWS IAM operation, `CreateRole` included, is still a scaffold answering HTTP 501
+  `NotImplemented` (in IAM's XML envelope). Implementing it belongs to that operation's own
+  stub issue, so a check that needs a real role ARN fails there;
+* the router's generic `AmbiguousService` envelope is rendered as JSON whatever the target
+  protocol is, and that renderer lives in the read-only `vendor/smithy-server-runtime` router,
+  which cannot be changed from inside the emulator. With the duplicate claims removed the
+  refusal is unreachable for these two signing names, which is what removes the symptom.
+
 > _Note: this issue was identified against the code base at commit `ace69a9d3348e9c8c81d3eff309bd15ea7c6e8c3`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

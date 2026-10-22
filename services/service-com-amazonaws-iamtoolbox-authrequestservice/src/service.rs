@@ -45,6 +45,13 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// This service's endpoint prefix, as the model gives it (`iam-toolbox`) — distinct from
+/// its SigV4 signing name (`iam`), which the generated identity carries. `can_handle`
+/// claims a request that names either, so a request addressed at this service's own
+/// endpoint host (`iam-toolbox.<region>.amazonaws.com`, whose first label is the routing
+/// key for an unsigned request) still reaches it.
+pub const ENDPOINT_PREFIX: &str = "iam-toolbox";
+
 /// The first `/`-separated segment of `path`, or `None` for a path with no non-empty
 /// first segment (`"/"`, `""`).
 fn first_path_segment(path: &str) -> Option<&str> {
@@ -103,7 +110,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // This service signs as `iam` — a signing name it SHARES with IAM
+        // This service signs as `iam` — a signing name it SHARES with AWS IAM
         // (`services/service-com-amazonaws-iam-awsidentitymanagementv20100508`), whose
         // own endpoint is `iam` while this one's is `iam-toolbox`. The router's routing
         // key comes from the SigV4 credential scope first, so both services resolve to
@@ -111,11 +118,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // which the router answers `500 AmbiguousService` for, to BOTH services' traffic.
         //
         // So the claim is narrowed the way the framework narrows it for the other
-        // signing-name collisions: the signing name must match AND the request must
-        // address this service's own modeled URI path space (see `claims_modeled_path`),
-        // which here is the `/authorization-details/…` space its one operation binds.
+        // signing-name collisions: the routing key must name this service (its signing
+        // name, or its own endpoint prefix for a request addressed by host) AND the
+        // request must address this service's own modeled URI path space (see
+        // `claims_modeled_path`), which here is the `/authorization-details/…` space its
+        // one operation binds. IAM, the service whose endpoint prefix IS the shared
+        // signing name, serves that name's remaining traffic (the awsQuery root path).
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) if key == self.entry.identity().signing_name() => {
+            Some(key) if key == self.entry.identity().signing_name() || key == ENDPOINT_PREFIX => {
                 claims_modeled_path(parts, crate::ROUTE_PATH_SEGMENTS)
             }
             _ => false,

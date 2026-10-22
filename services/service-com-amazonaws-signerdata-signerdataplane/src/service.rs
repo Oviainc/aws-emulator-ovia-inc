@@ -45,6 +45,35 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The first `/`-separated segment of `path`, or `None` for a path with no non-empty
+/// first segment (`"/"`, `""`).
+fn first_path_segment(path: &str) -> Option<&str> {
+    let segment = path.trim_start_matches('/').split('/').next()?;
+    (!segment.is_empty()).then_some(segment)
+}
+
+/// Whether `parts` addresses a path inside `path_segments` — the model-derived first URI
+/// path segments this service declares (`crate::ROUTE_PATH_SEGMENTS`).
+///
+/// This mirrors the framework's own discriminator,
+/// `emulator_server::can_handle_based_on_route_key_and_path`, which the generated
+/// `can_handle` entry point uses. The framework helper takes a whole buffered
+/// `http::Request`, which the `Service::can_handle` seam below does not receive, so the
+/// rule is applied here over `Parts` instead of called. It is kept identical, including
+/// both edge cases: an EMPTY list means the model published no usable discriminator and
+/// is "no constraint", and the framework's own `ROOT_PATH_SEGMENT` sentinel is how a
+/// service that must answer `POST /` claims the root path without claiming every path.
+/// Matching is EXACT segment equality, deliberately never a prefix test.
+fn claims_modeled_path(parts: &http::request::Parts, path_segments: &[&str]) -> bool {
+    if path_segments.is_empty() {
+        return true;
+    }
+    match first_path_segment(parts.uri.path()) {
+        Some(segment) => path_segments.contains(&segment),
+        None => path_segments.contains(&emulator_server::ROOT_PATH_SEGMENT),
+    }
+}
+
 /// The `com-amazonaws-signerdata-signerdataplane` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,18 +103,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name — and also one that names its ENDPOINT PREFIX, which the model
-        // gives as `data-signer` while the SigV4 signing name is `signer`. The
-        // default predicate only knows the signing name, so an anonymous request
-        // addressed at the service's own endpoint host
-        // (`data-signer.<region>.amazonaws.com`, where the routing key is the
-        // host's first label) would otherwise reach no service at all, even
-        // though it is addressed at exactly this one. A signed request still
+        // Claim a request whose resolved route key is this service's signing name — and
+        // also one that names its ENDPOINT PREFIX, which the model gives as
+        // `data-signer` while the SigV4 signing name is `signer`. The default predicate
+        // only knows the signing name, so an anonymous request addressed at the
+        // service's own endpoint host (`data-signer.<region>.amazonaws.com`, where the
+        // routing key is the host's first label) would otherwise reach no service at
+        // all, even though it is addressed at exactly this one. A signed request still
         // routes on the signing name, which the credential scope carries.
+        //
+        // That signing name is SHARED with AWS Signer
+        // (`services/service-com-amazonaws-signer-wallabyservice`, endpoint `signer`),
+        // so the key alone would make both services claim every `signer`-signed request
+        // and the router would answer `500 AmbiguousService` for ALL of it. The claim is
+        // therefore also narrowed to this service's own modeled URI path space
+        // (`/revocations`, see `claims_modeled_path`); AWS Signer serves the rest of the
+        // signing name's traffic and declines this path space, which its own model binds
+        // to this data-plane endpoint via `@endpoint(hostPrefix: "data-")`.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name() || key == ENDPOINT_PREFIX,
-            None => false,
+            Some(key) if key == self.entry.identity().signing_name() || key == ENDPOINT_PREFIX => {
+                claims_modeled_path(parts, crate::ROUTE_PATH_SEGMENTS)
+            }
+            _ => false,
         }
     }
 
