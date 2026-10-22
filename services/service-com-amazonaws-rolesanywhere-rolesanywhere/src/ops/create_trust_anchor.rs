@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrustAnchor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrustAnchor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrustAnchor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a trust anchor from the caller's certificate source and stores it in
+//! [`crate::state::ComAmazonawsRolesanywhereRolesanywhereState::trust_anchors`], so
+//! `GetTrustAnchor`, `ListTrustAnchors` and `DeleteTrustAnchor` all see the same record.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +143,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrustAnchor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTrustAnchorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrustAnchor"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // `Source` is `@required`, but its own two members are not, and the model names
+        // which certificate data member belongs to which `sourceType`. A source that
+        // carries neither, or carries the data of the other type, describes no
+        // certificate authority at all — so it is refused rather than stored.
+        let source_type = input
+            .source
+            .source_type
+            .clone()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| validation("source.sourceType", "Member must not be null"))?;
+        if !TRUST_ANCHOR_TYPE_VALUES.contains(&source_type.as_str()) {
+            return Err(validation(
+                "source.sourceType",
+                &format!(
+                    "Member must satisfy enum value set: [{}]",
+                    TRUST_ANCHOR_TYPE_VALUES.join(", ")
+                ),
+            ));
+        }
+        let source_data = input
+            .source
+            .source_data
+            .as_ref()
+            .ok_or_else(|| validation("source.sourceData", "Member must not be null"))?;
+        let expected_data_member = match source_type.as_str() {
+            crate::state::CERTIFICATE_BUNDLE_SOURCE_TYPE => Some("x509CertificateData"),
+            crate::state::ACM_PCA_SOURCE_TYPE => Some("acmPcaArn"),
+            // `SELF_SIGNED_REPOSITORY` is the third modelled `sourceType` and the model
+            // ties neither `SourceData` member to it, so no pairing can be asserted for
+            // it and whatever the caller sent is stored as sent.
+            _ => None,
+        };
+        let actual_data_member = match source_data {
+            SourceData::x509CertificateData(_) => "x509CertificateData",
+            SourceData::acmPcaArn(_) => "acmPcaArn",
+        };
+        if let Some(expected) = expected_data_member.filter(|member| *member != actual_data_member)
+        {
+            return Err(validation(
+                "source.sourceData",
+                &format!("Member must be {expected} for a trust anchor of type {source_type}"),
+            ));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Both caller-driven stores are bounded by an entry count, refused here before
+        // anything is inserted, so repeating this call cannot grow the store without
+        // limit. This operation models no quota error, so the refusal is its own
+        // `ValidationException`.
+        if store.trust_anchors.len() >= crate::state::MAX_TRUST_ANCHORS {
+            return Err(CreateTrustAnchorErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "This account already holds the maximum of {} trust anchors in this Region",
+                        crate::state::MAX_TRUST_ANCHORS
+                    )),
+                },
+            )
+            .into());
+        }
+        let trust_anchor_id = store.mint_uuid();
+        let record = crate::state::TrustAnchorRecord {
+            trust_anchor_arn: ::engine::emulator_arn(
+                crate::state::ARN_NAMESPACE,
+                &region,
+                &format!("trust-anchor/{trust_anchor_id}"),
+            ),
+            trust_anchor_id: trust_anchor_id.clone(),
+            name: input.name,
+            source: input.source,
+            // A request that says nothing about `enabled` creates a usable trust
+            // anchor: the member is optional, and `DisableTrustAnchor` is the way to
+            // turn one off afterwards.
+            enabled: input.enabled.unwrap_or(true),
+            created_at: now,
+            updated_at: now,
+            notification_settings: crate::state::notification_details(
+                input.notification_settings.unwrap_or_default(),
+            ),
+            tags: input.tags.unwrap_or_default(),
+        };
+        let trust_anchor = record.to_detail();
+        store.trust_anchors.insert(trust_anchor_id, record);
+
+        Ok(CreateTrustAnchorOutput { trust_anchor })
     }
+}
+
+/// Refuse the request with this operation's own modelled `ValidationException`
+/// (HTTP 400), worded the way the boundary validator words a constraint failure.
+fn validation(member: &str, constraint: &str) -> CreateTrustAnchorError {
+    CreateTrustAnchorErrorModeled::ValidationException(ValidationException {
+        message: Some(crate::state::validation_message(member, constraint)),
+    })
+    .into()
 }
