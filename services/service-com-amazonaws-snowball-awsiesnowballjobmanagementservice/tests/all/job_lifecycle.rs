@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 // The store ceilings this emulator imposes, read from the crate rather than restated, so
 // the ceiling case cannot drift from the bound it exercises. Nothing in this API deletes
 // an address or a job, so each create is refused once its store is full.
+use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::ops::create_address::DEFAULT_ADDRESS_TYPE;
 use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::ops::types::JOB_STATE_VALUES;
 use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::state::{
     JobState, MAX_STORED_ADDRESSES, MAX_STORED_JOBS,
@@ -49,7 +50,7 @@ const ADDRESS_TYPES: &[&str] = &["AWS_SHIP", "CUST_PICKUP"];
 const JOB_TYPES: &[&str] = &["EXPORT", "IMPORT", "LOCAL_USE"];
 
 /// A router with just this service mounted on a fresh engine.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are not what these tests are about; the router still routes by the
@@ -63,8 +64,20 @@ fn router() -> MultiServiceRouter {
     router
 }
 
-/// One `awsJson1_1` call, returning the HTTP status and the parsed response body.
+/// One `awsJson1_1` call signed for [`SIGNED_REGION`].
 async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+    call_in_region(router, SIGNED_REGION, operation, body).await
+}
+
+/// One `awsJson1_1` call signed for `region`, returning the HTTP status and the parsed
+/// response body. The region travels in the SigV4 credential scope, which is the only
+/// place a request carries one.
+pub(crate) async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -73,7 +86,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDSNOWBALLTEST/20260101/{SIGNED_REGION}\
+                "AWS4-HMAC-SHA256 Credential=AKIDSNOWBALLTEST/20260101/{region}\
                  /snowball/aws4_request, SignedHeaders=host;x-amz-target, Signature=00"
             ),
         )
@@ -96,7 +109,12 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16
 }
 
 /// A call that must succeed, returning its body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: Value, case: &str) -> Value {
+pub(crate) async fn ok(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+    case: &str,
+) -> Value {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -127,7 +145,7 @@ async fn refused(
 
 /// Assert `id` is `prefix` followed by a lowercase-hex `8-4-4-4-12` group — the shape
 /// the modelled `AddressId` / `JobId` patterns admit.
-fn assert_prefixed_uuid(id: &str, prefix: &str, case: &str) {
+pub(crate) fn assert_prefixed_uuid(id: &str, prefix: &str, case: &str) {
     let Some(body) = id.strip_prefix(prefix) else {
         panic!("case {case:?}: expected an id starting {prefix:?}, got {id:?}");
     };
@@ -151,7 +169,7 @@ fn assert_prefixed_uuid(id: &str, prefix: &str, case: &str) {
 }
 
 /// A required string member of a response body.
-fn string(body: &Value, member: &str, case: &str) -> String {
+pub(crate) fn string(body: &Value, member: &str, case: &str) -> String {
     body[member]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected a string {member}, got {body}"))
@@ -166,11 +184,34 @@ fn boolean(body: &Value, member: &str) -> bool {
 }
 
 /// Create an address and return the `AddressId` the service minted for it.
-async fn create_address(router: &MultiServiceRouter, address: Value, case: &str) -> String {
+pub(crate) async fn create_address(
+    router: &MultiServiceRouter,
+    address: Value,
+    case: &str,
+) -> String {
     let created = ok(router, "CreateAddress", json!({ "Address": address }), case).await;
     let address_id = string(&created, "AddressId", case);
     assert_prefixed_uuid(&address_id, "ADID", case);
     address_id
+}
+
+/// An address carrying every member a Snow device cannot be delivered without
+/// (`create_address::REQUIRED_DELIVERY_MEMBERS`), in a country [`SIGNED_REGION`] ships
+/// to, with `extra` merged over it. The base of every row below, so a row differs only
+/// along the axis it is there for.
+pub(crate) fn deliverable_address(name: &str, street1: &str, extra: Value) -> Value {
+    let mut address = json!({
+        "Name": name,
+        "Street1": street1,
+        "City": "Seattle",
+        "Country": "US",
+        "PostalCode": "98101",
+        "PhoneNumber": "425-555-0100",
+    });
+    for (member, value) in extra.as_object().expect("the extra members are an object") {
+        address[member] = value.clone();
+    }
+    address
 }
 
 /// Every address row: one per combination of present members, value length, `Type` from
@@ -180,75 +221,74 @@ fn address_rows() -> Vec<(&'static str, Value)> {
     vec![
         (
             "every documented member",
-            json!({
-                "Name": "Bootstrap Receiver",
-                "Company": "Example Corp",
-                "Street1": "123 Main Street",
-                "Street2": "Suite 400",
-                "Street3": "Mailstop 7",
-                "City": "Seattle",
-                "StateOrProvince": "WA",
-                "Country": "US",
-                "PostalCode": "98101",
-                "PhoneNumber": "425-555-0100",
-                "IsRestricted": false,
-                "Type": ADDRESS_TYPES[0],
-            }),
+            deliverable_address(
+                "Bootstrap Receiver",
+                "123 Main Street",
+                json!({
+                    "Company": "Example Corp",
+                    "Street2": "Suite 400",
+                    "Street3": "Mailstop 7",
+                    "StateOrProvince": "WA",
+                    "IsRestricted": false,
+                    "Type": ADDRESS_TYPES[0],
+                }),
+            ),
         ),
         (
             "only the members a carrier needs",
-            json!({
-                "Name": "Minimal Receiver",
-                "Street1": "1 Short Road",
-                "City": "Portland",
-                "Country": "US",
-                "PostalCode": "97201",
-            }),
+            deliverable_address("Minimal Receiver", "1 Short Road", json!({})),
         ),
         (
             "restricted pickup address",
-            json!({
-                "Name": "Pickup Contact",
-                "Street1": "500 Dock Way",
-                "City": "Dublin",
-                "Country": "IE",
-                "PostalCode": "D02 AF30",
-                "PhoneNumber": "+353 1 555 0199",
-                "IsRestricted": true,
-                "Type": ADDRESS_TYPES[1],
-            }),
+            deliverable_address(
+                "Pickup Contact",
+                "500 Dock Way",
+                json!({
+                    "City": "Anchorage",
+                    "StateOrProvince": "AK",
+                    "PostalCode": "99501",
+                    "IsRestricted": true,
+                    "Type": ADDRESS_TYPES[1],
+                }),
+            ),
         ),
         (
             "long and non-ascii values",
-            json!({
-                "Name": "Núñez Ólafsdóttir",
-                "Company": "ドコモ・システムズ株式会社",
-                "Street1": "x".repeat(1024),
-                "City": "São Paulo",
-                "StateOrProvince": "SP",
-                "Country": "BR",
-                "PostalCode": "01310-100",
-                "PhoneNumber": "+55 11 5555 0188",
-            }),
+            deliverable_address(
+                "Núñez Ólafsdóttir",
+                &"x".repeat(1024),
+                json!({
+                    "Company": "ドコモ・システムズ株式会社",
+                    "City": "São Paulo del Norte",
+                    "StateOrProvince": "NM",
+                    "PostalCode": "87501",
+                    "PhoneNumber": "+1 505 555 0188",
+                }),
+            ),
         ),
         (
             "members the model documents as ignored",
-            json!({
-                "Name": "Ignored Member Receiver",
-                "Street1": "9 Legacy Lane",
-                "City": "Tokyo",
-                "PrefectureOrDistrict": "Chiyoda",
-                "Landmark": "Near the station",
-                "Country": "JP",
-                "PostalCode": "100-0001",
-            }),
+            deliverable_address(
+                "Ignored Member Receiver",
+                "9 Legacy Lane",
+                json!({
+                    "PrefectureOrDistrict": "Chiyoda",
+                    "Landmark": "Near the station",
+                }),
+            ),
         ),
     ]
 }
 
 /// Assert the reported address is exactly what was submitted, under the minted id, with
-/// the ignored members dropped and nothing invented.
-fn assert_address_matches(reported: &Value, submitted: &Value, address_id: &str, case: &str) {
+/// the ignored members dropped, the delivery type the create implied, and nothing else
+/// invented.
+pub(crate) fn assert_address_matches(
+    reported: &Value,
+    submitted: &Value,
+    address_id: &str,
+    case: &str,
+) {
     assert_eq!(
         reported.get("AddressId").and_then(Value::as_str),
         Some(address_id),
@@ -290,12 +330,35 @@ fn assert_address_matches(reported: &Value, submitted: &Value, address_id: &str,
         // on an address that never set it.
         let is_default_bool =
             member == "IsRestricted" && reported[member] == Value::Bool(false);
+        // An address created for a device to be shipped to is a delivery address unless
+        // the create typed it otherwise, so the service reports a `Type` for one that
+        // named none.
+        let is_default_type = member == "Type"
+            && !submitted.contains_key("Type")
+            && reported[member] == json!(DEFAULT_ADDRESS_TYPE);
         assert!(
-            member == "AddressId" || is_default_bool || submitted.contains_key(member),
+            member == "AddressId"
+                || is_default_bool
+                || is_default_type
+                || submitted.contains_key(member),
             "case {case:?}: the reported address carries {member}, which was never \
              submitted: {reported}"
         );
     }
+    // Whether the create typed the address or not, the reported address carries a type
+    // from the modelled catalog.
+    let reported_type = reported
+        .get("Type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let expected_type = submitted
+        .get("Type")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_ADDRESS_TYPE);
+    assert_eq!(
+        reported_type, expected_type,
+        "case {case:?}: expected Type {expected_type}, got {reported}"
+    );
 }
 
 /// Every state the lifecycle enum spells, so the set below is checked against the model
@@ -381,13 +444,7 @@ async fn every_create_address_mints_a_new_id() {
     let router = router();
     // One address submitted repeatedly: the id is the service's, so each call must mint
     // a fresh one rather than key on the submitted values.
-    let submitted = json!({
-        "Name": "Repeat Receiver",
-        "Street1": "2 Same Street",
-        "City": "Austin",
-        "Country": "US",
-        "PostalCode": "73301",
-    });
+    let submitted = deliverable_address("Repeat Receiver", "2 Same Street", json!({}));
     let mut minted: BTreeSet<String> = BTreeSet::new();
     for attempt in 0..32u32 {
         let case = format!("identical address, attempt {attempt}");
@@ -410,7 +467,7 @@ async fn describe_address_refuses_an_id_no_address_answers_to() {
     let router = router();
     let known = create_address(
         &router,
-        json!({ "Name": "Known", "Street1": "3 Known Way", "Country": "US" }),
+        deliverable_address("Known", "3 Known Way", json!({})),
         "a known address",
     )
     .await;
@@ -645,7 +702,7 @@ async fn create_job_refuses_a_resource_no_record_answers_to() {
     let router = router();
     let address_id = create_address(
         &router,
-        json!({ "Name": "Known", "Street1": "3 Known Way", "Country": "US" }),
+        deliverable_address("Known", "3 Known Way", json!({})),
         "a known address",
     )
     .await;
@@ -724,7 +781,7 @@ async fn router_with_jobs(count: usize) -> (MultiServiceRouter, Vec<String>) {
     let router = router();
     let address_id = create_address(
         &router,
-        json!({ "Name": "List Receiver", "Street1": "7 List Way", "Country": "US" }),
+        deliverable_address("List Receiver", "7 List Way", json!({})),
         "the listed jobs' address",
     )
     .await;
@@ -1011,7 +1068,7 @@ async fn cancel_job_refuses_an_id_no_job_answers_to() {
 #[tokio::test]
 async fn a_create_past_the_store_ceiling_is_refused() {
     let router = router();
-    let address = json!({ "Name": "Bounded", "Street1": "1 Bound Way", "Country": "US" });
+    let address = deliverable_address("Bounded", "1 Bound Way", json!({}));
 
     // Each row is one bounded store: fill it to its ceiling, then assert the request one
     // past the ceiling is refused rather than accepted, and that what is already stored
