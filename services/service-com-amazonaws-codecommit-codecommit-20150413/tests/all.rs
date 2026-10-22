@@ -21,6 +21,8 @@ mod compared_commit_comments;
 mod default_branch;
 #[path = "all/file_commit_history.rs"]
 mod file_commit_history;
+#[path = "all/folder_listing.rs"]
+mod folder_listing;
 #[path = "all/repository_lifecycle.rs"]
 mod repository_lifecycle;
 #[path = "all/repository_rename.rs"]
