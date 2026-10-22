@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConnectionAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConnectionAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConnectionAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the stored alias enters `DELETING` and the clock drops it from this
+//! service's state, releasing its hold on the connection string. An `AliasId` that names
+//! no stored alias is refused with `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -90,7 +85,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-workspaces-workspacesse
 // here — hence the `DeleteConnectionAliasError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.workspaces#DeleteConnectionAlias")]
+// `InternalServerException` is widened in with `extra_errors`: the service models it
+// ("Unexpected server error occured.") but does not list it on this operation, and it
+// is the only shape that can carry the one fault this handler can hit — the engine not
+// being the in-memory engine this service's store lives in.
+#[smithy_macros::operation_error(
+    "com.amazonaws.workspaces#DeleteConnectionAlias",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteConnectionAliasErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -99,6 +101,7 @@ pub enum DeleteConnectionAliasErrorModeled {
     OperationNotSupportedException(OperationNotSupportedException),
     ResourceAssociatedException(ResourceAssociatedException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -152,18 +155,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConnectionAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConnectionAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConnectionAlias"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteConnectionAliasErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the WorkSpaces state store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+        // Clear any transition the clock already owes first: an alias whose deletion
+        // has completed is gone, so a second delete of it must not find it.
+        state.settle();
+
+        // "You can delete a connection alias only after it is no longer shared with
+        // any accounts or associated with any directories" — the refusal the model
+        // carries for that is `ResourceAssociatedException`. No stored alias can be
+        // associated or shared in this emulator: the operations that would do either
+        // (`AssociateConnectionAlias`, `UpdateConnectionAliasPermission`) are still
+        // scaffold stubs, so there is no association state to refuse on, and
+        // deletion is accepted from every state an alias can be in here.
+        if state
+            .request_delete_connection_alias(&input.alias_id)
+            .is_none()
+        {
+            // The model states this shape's message: `ResourceNotFoundException`
+            // and its `message` member are both documented as "The resource could
+            // not be found.", and the shape carries a separate `ResourceId` member
+            // — "The ID of the resource that could not be found" — which is where
+            // the alias the caller asked for is named.
+            return Err(DeleteConnectionAliasErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some("The resource could not be found.".to_string()),
+                    resource_id: Some(input.alias_id.clone()),
+                },
+            )
+            .into());
+        }
+
+        Ok(DeleteConnectionAliasOutput {})
     }
 }

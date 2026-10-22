@@ -7,6 +7,10 @@
 //!
 //! Every request goes through `MultiServiceRouter::dispatch`, i.e. the same path the
 //! emulator serves in production (`awsJson1_1`: `POST /` with `X-Amz-Target`).
+//!
+//! The request harness below (`emulator`, `call`, `ok`, `failure`, `discovered`) is
+//! `pub(crate)`, so a sibling suite in `tests/all/` drives the emulator the same way
+//! instead of growing a second copy of it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -20,7 +24,7 @@ use smithy_server_runtime::MultiServiceRouter;
 const TARGET_PREFIX: &str = "Route53AutoNaming_v20170314";
 
 /// The region the test requests are signed for; every ARN must carry it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// One emulator with this service mounted on a fresh shared engine.
 ///
@@ -1205,6 +1209,10 @@ async fn tags_up_to_the_documented_quota_are_accepted_and_one_more_is_refused() 
         ("one past the quota", quota + 1, false),
     ] {
         let namespace_body = json!({ "Name": format!("tagged-ns-{count}"), "Tags": tags(count) });
+        let public_namespace_body = json!({
+            "Name": format!("tagged-public-{count}.example.com"),
+            "Tags": tags(count),
+        });
         let service_body = json!({
             "Name": format!("tagged-svc-{count}"),
             "NamespaceId": namespace_id,
@@ -1212,6 +1220,7 @@ async fn tags_up_to_the_documented_quota_are_accepted_and_one_more_is_refused() 
         });
         for (operation, body) in [
             ("CreateHttpNamespace", namespace_body),
+            ("CreatePublicDnsNamespace", public_namespace_body),
             ("CreateService", service_body),
         ] {
             let (status, json) = call(&router, operation, body).await;
