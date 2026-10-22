@@ -82,11 +82,13 @@ pub struct SchemaVersion {
 /// 501; it owns the decision of what that source is.
 #[derive(Debug, Clone)]
 pub struct CodeBinding {
-    /// The language the request asked generation for, stored as given.
+    /// The language generation was asked for: one of [`CODE_BINDING_LANGUAGES`],
+    /// which is what [`code_binding_language`] admits.
     ///
-    /// The model types `Language` as an unconstrained `__string` and documents no set
-    /// of accepted values, so this store keeps it as an opaque key rather than
-    /// refusing values against a list the model does not publish.
+    /// The model types `Language` as an unconstrained `__string`, but the service
+    /// does constrain it — it refuses anything outside the pattern quoted on
+    /// [`CODE_BINDING_LANGUAGES`] — so only a language this service generates for
+    /// ever reaches the store.
     pub language: String,
     /// The schema version the binding was generated from, resolved at put time: an
     /// absent request `SchemaVersion` means the then-latest version, and the binding
@@ -178,6 +180,46 @@ impl Schema {
             Some(raw) => self.versions.get(&raw.parse::<u64>().ok()?),
         }
     }
+}
+
+/// The languages this service generates code bindings for, in the identifiers the
+/// API takes in the `Language` URI label.
+///
+/// Source: the `Language` member is modelled as a plain `__string` with no enum and
+/// no pattern (`smithy_query(query="operation",operation="PutCodeBinding")`), so the
+/// accepted set is the SERVICE's, not the model's. The service states it in the
+/// refusal it answers a bad `Language` with — "Parameter CodeBindingLanguage doesn't
+/// match pattern `^(Java8|TypeScript3|Python36|Go1)$`" — i.e. the code-binding
+/// languages EventBridge Schemas generates for: Java 8+, TypeScript 3+, Python 3.6+
+/// and Go 1.x. Anything else is a language this service cannot generate, and is
+/// refused rather than recorded.
+///
+/// The order is the pattern's: the alternation in the refusal below is built from
+/// this list, so the two cannot drift apart.
+pub const CODE_BINDING_LANGUAGES: &[&str] = &["Java8", "TypeScript3", "Python36", "Go1"];
+
+/// The name the service's own validation gives the `Language` URI label it checks
+/// against [`code_binding_language_pattern`].
+pub const CODE_BINDING_LANGUAGE_PARAMETER: &str = "CodeBindingLanguage";
+
+/// The pattern an acceptable `Language` matches: the alternation of
+/// [`CODE_BINDING_LANGUAGES`], anchored at both ends, which is why a language family
+/// without its version suffix and a differently-cased spelling are both refused.
+pub fn code_binding_language_pattern() -> String {
+    format!("^({})$", CODE_BINDING_LANGUAGES.join("|"))
+}
+
+/// The canonical language identifier a request named, or `None` when it named a
+/// language this service does not generate bindings for.
+///
+/// The comparison is exact: these identifiers are wire values, and a service that
+/// quietly accepted another spelling would persist a binding under a language a
+/// later read cannot ask for.
+pub fn code_binding_language(requested: &str) -> Option<&'static str> {
+    CODE_BINDING_LANGUAGES
+        .iter()
+        .copied()
+        .find(|language| *language == requested)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -372,10 +414,12 @@ pub const MAX_STORED_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 
 /// See [`MAX_REGISTRIES`]. The ceiling on how many code bindings one schema holds.
 ///
-/// A binding is keyed by schema version and language, and `Language` is an
-/// unconstrained string, so one `PutCodeBinding` per caller-chosen language would grow
-/// a schema's binding map for as long as a client keeps calling. A put past the cap is
-/// refused with the service's own `BadRequestException`, as the other caps are.
+/// A binding is keyed by schema version and language. The language is one of the
+/// finitely many [`CODE_BINDING_LANGUAGES`], so what a caller can grow is the number
+/// of VERSIONS it starts bindings for; this cap is the explicit ceiling on the
+/// product, kept so the binding map is bounded however many versions a schema comes
+/// to hold. A put past the cap is refused with the service's own
+/// `BadRequestException`, as the other caps are.
 pub const MAX_CODE_BINDINGS_PER_SCHEMA: usize = 500;
 
 /// The most items one page of a listing may hold, whatever `Limit` asks for.
@@ -491,6 +535,20 @@ pub fn code_binding_not_found(
     not_found(format!(
         "No code binding exists for language {language} of version {version} of schema \
          {schema} in registry {registry}."
+    ))
+}
+
+/// Refuse a `Language` this service generates no code bindings for.
+///
+/// The model gives `Language` no enum, so this is the service's own constraint, and
+/// the refusal states it the way the service does: it names the parameter it checked
+/// and the pattern that parameter must match ([`code_binding_language_pattern`]), so
+/// a caller can fix the request from the message alone. The rejected value is not
+/// echoed back — the pattern is what the caller needs.
+pub fn unsupported_code_binding_language() -> BadRequestException {
+    bad_request(format!(
+        "Parameter {CODE_BINDING_LANGUAGE_PARAMETER} doesn't match pattern {}",
+        code_binding_language_pattern()
     ))
 }
 

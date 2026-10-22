@@ -16,7 +16,7 @@ use service_com_amazonaws_schemas_schemas::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request below signs with, unless the case varies it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account segment every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;

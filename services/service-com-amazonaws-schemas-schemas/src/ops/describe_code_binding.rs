@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCodeBinding
+//!
 //! Reports the lifecycle of the code binding `PutCodeBinding` started for one schema
 //! version in one language. Implemented here — this is the ONLY file to touch for this
 //! operation.
@@ -151,6 +152,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ctx` carries request metadata only; a code binding is named by the schema it
         // belongs to and carries no ARN, so this handler needs nothing from it.
         let _ = ctx;
+
+        // Same request-level constraint as `PutCodeBinding`: a language this service
+        // generates no bindings for is refused as a bad request, before any lookup —
+        // it is not a binding that happens to be missing.
+        let language = crate::state::code_binding_language(&input.language).ok_or_else(|| {
+            DescribeCodeBindingError::from(DescribeCodeBindingErrorModeled::BadRequestException(
+                crate::state::unsupported_code_binding_language(),
+            ))
+        })?;
+
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeCodeBindingError::from(
                 DescribeCodeBindingErrorModeled::InternalServerErrorException(
@@ -192,16 +203,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A binding exists only once a put started its generation: describing one
         // nobody asked for is a 404, exactly as for a schema that was never created.
+        // The canonical language is the key, as `PutCodeBinding` stored it.
         let binding = schema
             .code_bindings
-            .get(&(version, input.language.clone()))
+            .get(&(version, language.to_string()))
             .ok_or_else(|| {
                 DescribeCodeBindingError::from(DescribeCodeBindingErrorModeled::NotFoundException(
                     crate::state::code_binding_not_found(
                         &input.registry_name,
                         &input.schema_name,
                         version,
-                        &input.language,
+                        language,
                     ),
                 ))
             })?;

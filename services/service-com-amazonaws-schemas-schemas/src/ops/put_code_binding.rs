@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutCodeBinding
+//!
 //! Starts code generation for one schema version in one language, and reports the
-//! binding's lifecycle. Implemented here — this is the ONLY file to touch for this
-//! operation.
+//! binding's lifecycle. A repeat for the same `(schema version, language)` pair
+//! reports the generation already under way rather than starting a second one.
+//! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,6 +155,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ctx` carries request metadata only; a code binding is named by the schema
         // it belongs to and carries no ARN, so this handler needs nothing from it.
         let _ = ctx;
+
+        // Which languages this service can generate is a constraint on the REQUEST,
+        // not on the store, so it is checked before anything is looked up — where the
+        // boundary validator would have refused it had the model given `Language` an
+        // enum. A language this service cannot generate is a 400, never a 404: no
+        // registry or schema would make it generatable.
+        let language = crate::state::code_binding_language(&input.language).ok_or_else(|| {
+            PutCodeBindingError::from(PutCodeBindingErrorModeled::BadRequestException(
+                crate::state::unsupported_code_binding_language(),
+            ))
+        })?;
+
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutCodeBindingError::from(PutCodeBindingErrorModeled::InternalServerErrorException(
                 crate::state::internal_error(),
@@ -195,15 +209,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which is what makes the `CREATE_IN_PROGRESS` this 202 reports observable to
         // the next caller.
         let now = ::std::time::SystemTime::now();
-        let key = (version, input.language.clone());
+        // Keyed by the canonical language, which is the one this service generates
+        // for and the one a later read asks for.
+        let key = (version, language.to_string());
         // A put for a binding that already exists does NOT restart generation: the
         // binding for one version and language is one resource, so its creation date
         // stays where the first put put it and a repeat call reports the generation
         // already running (or already finished).
         if !schema.code_bindings.contains_key(&key) {
-            // The store lives for the life of the process, `Language` is an
-            // unconstrained string and only a put adds a binding, so the number of
-            // bindings one schema holds is capped. See
+            // The store lives for the life of the process and only a put adds a
+            // binding, so the number of bindings one schema holds is capped. See
             // `crate::state::MAX_CODE_BINDINGS_PER_SCHEMA`.
             if schema.code_bindings.len() >= crate::state::MAX_CODE_BINDINGS_PER_SCHEMA {
                 return Err(PutCodeBindingErrorModeled::BadRequestException(
@@ -217,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             schema.code_bindings.insert(
                 key.clone(),
                 crate::state::CodeBinding {
-                    language: input.language.clone(),
+                    language: language.to_string(),
                     schema_version: version,
                     created_date: now,
                     generation_due: now + crate::state::CODE_GENERATION_DURATION,

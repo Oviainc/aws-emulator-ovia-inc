@@ -82,11 +82,14 @@ struct BindingCase {
 /// for, whether the schema version is named explicitly or left to the latest, and the
 /// shape of the schema name.
 ///
-/// `Language` is modelled as an unconstrained `__string` with no documented set of
-/// values (`smithy_query(query="operation",operation="PutCodeBinding")` shows
-/// `Language: __string, httpLabel, required`), so the rows deliberately span
-/// AWS-published language identifiers AND a value no list of them contains: the
-/// service treats the language as an opaque key either way.
+/// `Language` is modelled as an unconstrained `__string`
+/// (`smithy_query(query="operation",operation="PutCodeBinding")` shows
+/// `Language: __string, httpLabel, required`), but the SERVICE constrains it to the
+/// languages it generates bindings for — see the sibling suite
+/// [`crate::code_bindings`] and
+/// `service_com_amazonaws_schemas_schemas::state::CODE_BINDING_LANGUAGES` — so every
+/// row here names one of those, and a value outside them belongs to the refusal
+/// table in that suite.
 fn binding_cases() -> Vec<BindingCase> {
     vec![
         BindingCase {
@@ -118,9 +121,9 @@ fn binding_cases() -> Vec<BindingCase> {
             reported_version: "1",
         },
         BindingCase {
-            case: "language-no-published-list-contains",
+            case: "second-language-on-a-dotted-schema-name",
             schema: "order.placed_v1",
-            language: "Cobol85",
+            language: "Python36",
             requested_version: None,
             reported_version: "1",
         },
@@ -546,7 +549,7 @@ async fn the_reported_version_round_trips_as_a_request_member() {
 
     for (case, schema, language) in [
         ("java-on-demo-schema", "demo-schema", "Java8"),
-        ("cobol-on-dotted-schema", "order.placed_v1", "Cobol85"),
+        ("typescript-on-dotted-schema", "order.placed_v1", "TypeScript3"),
     ] {
         let put = emulator
             .call("POST", &binding_uri(REGISTRY, schema, language, None), None)
