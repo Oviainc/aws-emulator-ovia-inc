@@ -416,9 +416,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateFileSystemErrorModeled::FileSystemAlreadyExists(
                 FileSystemAlreadyExists {
                     error_code: "FileSystemAlreadyExists".to_string(),
-                    message: Some(format!(
-                        "File system already exists with CreationToken {}",
-                        input.creation_token
+                    message: Some(efs::file_system_already_exists_message(
+                        existing,
+                        &input.creation_token,
                     )),
                     file_system_id: existing.clone(),
                 },

@@ -26,33 +26,35 @@ fn authorization(region: &str) -> String {
     )
 }
 
-/// One HTTP answer, reduced to what the assertions read.
-struct Reply {
-    status: u16,
+/// One HTTP answer, reduced to what the assertions read. Reached from the sibling
+/// suites too (`crate::file_system_lifecycle::…`), so one harness drives every test in
+/// this crate.
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     /// `x-amzn-errortype`, the header restJson1 resolves an error shape from.
-    error_type: Option<String>,
-    body: Value,
+    pub(crate) error_type: Option<String>,
+    pub(crate) body: Value,
     body_len: usize,
 }
 
 impl Reply {
-    fn get(&self, key: &str) -> &Value {
+    pub(crate) fn get(&self, key: &str) -> &Value {
         &self.body[key]
     }
 
-    fn string(&self, key: &str) -> String {
+    pub(crate) fn string(&self, key: &str) -> String {
         self.body[key].as_str().unwrap_or_default().to_string()
     }
 }
 
 /// The emulator under test: this one service mounted on one shared engine.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     region: String,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::in_region("us-east-1")
     }
 
@@ -66,7 +68,7 @@ impl Emulator {
         }
     }
 
-    async fn send(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn send(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
         let mut builder = http::Request::builder()
             .method(method)
             .uri(format!(
@@ -99,11 +101,11 @@ impl Emulator {
         }
     }
 
-    async fn create_file_system(&self, body: Value) -> Reply {
+    pub(crate) async fn create_file_system(&self, body: Value) -> Reply {
         self.send("POST", "/2015-02-01/file-systems", Some(body)).await
     }
 
-    async fn describe_file_systems(&self, query: &str) -> Reply {
+    pub(crate) async fn describe_file_systems(&self, query: &str) -> Reply {
         let path = if query.is_empty() {
             "/2015-02-01/file-systems".to_string()
         } else {
@@ -112,16 +114,16 @@ impl Emulator {
         self.send("GET", &path, None).await
     }
 
-    async fn delete_file_system(&self, id: &str) -> Reply {
+    pub(crate) async fn delete_file_system(&self, id: &str) -> Reply {
         self.send("DELETE", &format!("/2015-02-01/file-systems/{id}"), None)
             .await
     }
 
-    async fn create_mount_target(&self, body: Value) -> Reply {
+    pub(crate) async fn create_mount_target(&self, body: Value) -> Reply {
         self.send("POST", "/2015-02-01/mount-targets", Some(body)).await
     }
 
-    async fn describe_mount_targets(&self, query: &str) -> Reply {
+    pub(crate) async fn describe_mount_targets(&self, query: &str) -> Reply {
         let path = if query.is_empty() {
             "/2015-02-01/mount-targets".to_string()
         } else {
@@ -130,14 +132,14 @@ impl Emulator {
         self.send("GET", &path, None).await
     }
 
-    async fn delete_mount_target(&self, id: &str) -> Reply {
+    pub(crate) async fn delete_mount_target(&self, id: &str) -> Reply {
         self.send("DELETE", &format!("/2015-02-01/mount-targets/{id}"), None)
             .await
     }
 
     /// Create one `available` file system, waiting out the clock-owed
     /// `creating` -> `available` transition so a mount target can be added to it.
-    async fn available_file_system(&self, token: &str) -> String {
+    pub(crate) async fn available_file_system(&self, token: &str) -> String {
         let created = self
             .create_file_system(json!({ "CreationToken": token }))
             .await;
@@ -155,7 +157,7 @@ impl Emulator {
 /// Wait past the clock-owed `creating` -> `available` transition. The handlers never
 /// sleep for it — they store the due instant — so only a test that wants the settled
 /// state waits here.
-async fn settle() {
+pub(crate) async fn settle() {
     tokio::time::sleep(state::CREATING_FOR + Duration::from_millis(150)).await;
 }
 

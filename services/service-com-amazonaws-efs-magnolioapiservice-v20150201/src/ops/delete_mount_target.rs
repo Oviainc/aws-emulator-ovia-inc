@@ -184,9 +184,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteMountTargetErrorModeled::MountTargetNotFound(
                 MountTargetNotFound {
                     error_code: "MountTargetNotFound".to_string(),
-                    message: Some(format!(
-                        "Mount target {} does not exist",
-                        input.mount_target_id
+                    message: Some(crate::state::mount_target_not_found_message(
+                        &input.mount_target_id,
                     )),
                 },
             )

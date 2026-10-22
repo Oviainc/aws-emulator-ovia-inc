@@ -299,7 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateMountTargetErrorModeled::FileSystemNotFound(
                 FileSystemNotFound {
                     error_code: "FileSystemNotFound".to_string(),
-                    message: Some(format!("File system {file_system_id} does not exist")),
+                    message: Some(efs::file_system_not_found_message(&file_system_id)),
                 },
             )
             .into());
@@ -312,7 +312,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     IncorrectFileSystemLifeCycleState {
                         error_code: "IncorrectFileSystemLifeCycleState".to_string(),
                         message: Some(format!(
-                            "File system {file_system_id} is in life cycle state {}, not {}",
+                            "File system {} is in life cycle state {}, not {}",
+                            efs::quoted(&file_system_id),
                             file_system.life_cycle_state,
                             efs::LIFE_CYCLE_AVAILABLE
                         )),
@@ -334,8 +335,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateMountTargetErrorModeled::SubnetNotFound(SubnetNotFound {
                 error_code: "SubnetNotFound".to_string(),
                 message: Some(format!(
-                    "Subnet {} does not exist: VPC {} already holds the maximum of {} subnets",
-                    input.subnet_id,
+                    "{} VPC {} already holds the maximum of {} subnets",
+                    efs::does_not_exist(efs::SUBNET_NOUN, &input.subnet_id),
                     state.vpc_id(),
                     efs::MAX_SUBNETS_PER_VPC
                 )),

@@ -10,6 +10,10 @@
 //! The record types here are the single source of every description this service
 //! returns: `FileSystem::describe` and `MountTarget::describe` build the modelled
 //! output shape, so a create and a later describe cannot disagree.
+//!
+//! The request-derived error MESSAGES are built here too ([`does_not_exist`],
+//! [`file_system_already_exists_message`]), for the same reason: every operation that
+//! resolves an id refuses with one sentence construction instead of its own.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -549,6 +553,70 @@ pub fn kms_key_arn(key: &str, region: &str) -> String {
         format!("key/{key}")
     };
     ::engine::emulator_arn("kms", region, &resource)
+}
+
+/// A value a request named, as EFS renders it inside an error message: in single
+/// quotes, so the value can be lifted back out of the sentence by a client or a log
+/// reader. Recorded EFS errors show the construction on both the id of a resource and
+/// the creation token of a request ("File system 'fs-…' does not exist.", "File system
+/// 'fs-…' already exists with creation token '…'").
+pub fn quoted(value: &str) -> String {
+    format!("'{value}'")
+}
+
+/// The noun EFS names a file system by in its messages; see [`does_not_exist`].
+pub const FILE_SYSTEM_NOUN: &str = "File system";
+/// The noun EFS names a mount target by in its messages; see [`does_not_exist`].
+pub const MOUNT_TARGET_NOUN: &str = "Mount target";
+/// The noun EFS names an access point by in its messages; see [`does_not_exist`].
+pub const ACCESS_POINT_NOUN: &str = "Access point";
+/// The noun EFS names a subnet by in its messages; see [`does_not_exist`].
+pub const SUBNET_NOUN: &str = "Subnet";
+
+/// The single construction behind every "not found" message this service emits:
+/// `<Noun> '<id>' does not exist.` — the noun of the resource the request asked for,
+/// then the id the REQUEST named in single quotes ([`quoted`]), in a sentence
+/// terminated with a period.
+///
+/// Built here once rather than per handler, so the same request-derived sentence is
+/// reached through every entry point that resolves an id (describe, delete, create).
+pub fn does_not_exist(noun: &str, id: &str) -> String {
+    format!("{noun} {} does not exist.", quoted(id))
+}
+
+/// `FileSystemNotFound`'s message — "Returned if the specified `FileSystemId` value
+/// doesn't exist in the requester's Amazon Web Services account": the requested
+/// `FileSystemId`, rendered by [`does_not_exist`].
+pub fn file_system_not_found_message(file_system_id: &str) -> String {
+    does_not_exist(FILE_SYSTEM_NOUN, file_system_id)
+}
+
+/// `MountTargetNotFound`'s message — "Returned if there is no mount target with the
+/// specified ID found in the caller's Amazon Web Services account".
+pub fn mount_target_not_found_message(mount_target_id: &str) -> String {
+    does_not_exist(MOUNT_TARGET_NOUN, mount_target_id)
+}
+
+/// `AccessPointNotFound`'s message — "Returned if the specified `AccessPointId` value
+/// doesn't exist in the requester's Amazon Web Services account".
+pub fn access_point_not_found_message(access_point_id: &str) -> String {
+    does_not_exist(ACCESS_POINT_NOUN, access_point_id)
+}
+
+/// `FileSystemAlreadyExists`' message — "Returned if the file system you are trying to
+/// create already exists, with the creation token you provided". The one piece of
+/// actionable data is WHICH file system already holds the token, so the message names
+/// the existing record's id and the `CreationToken` the request carried, each
+/// single-quoted ([`quoted`]).
+pub fn file_system_already_exists_message(
+    existing_file_system_id: &str,
+    creation_token: &str,
+) -> String {
+    format!(
+        "{FILE_SYSTEM_NOUN} {} already exists with creation token {}",
+        quoted(existing_file_system_id),
+        quoted(creation_token)
+    )
 }
 
 /// A `SystemTime` as the modelled `Timestamp`. EFS reports a file system's

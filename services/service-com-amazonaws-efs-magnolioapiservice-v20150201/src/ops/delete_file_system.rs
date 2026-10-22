@@ -187,9 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(DeleteFileSystemErrorModeled::FileSystemNotFound(
                     FileSystemNotFound {
                         error_code: "FileSystemNotFound".to_string(),
-                        message: Some(format!(
-                            "File system {file_system_id} does not exist"
-                        )),
+                        message: Some(efs::file_system_not_found_message(&file_system_id)),
                     },
                 )
                 .into())
@@ -201,8 +199,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     FileSystemInUse {
                         error_code: "FileSystemInUse".to_string(),
                         message: Some(format!(
-                            "File system {file_system_id} still has {} mount target(s); delete \
-                             them first",
+                            "File system {} still has {} mount target(s); delete them first",
+                            efs::quoted(&file_system_id),
                             file_system.mount_target_ids.len()
                         )),
                     },

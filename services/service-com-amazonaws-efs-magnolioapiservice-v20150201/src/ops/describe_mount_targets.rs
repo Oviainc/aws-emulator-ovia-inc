@@ -203,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DescribeMountTargetsErrorModeled::AccessPointNotFound(
                 AccessPointNotFound {
                     error_code: "AccessPointNotFound".to_string(),
-                    message: Some(format!("Access point {access_point_id} does not exist")),
+                    message: Some(efs::access_point_not_found_message(access_point_id)),
                 },
             )
             .into());
@@ -214,9 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(DescribeMountTargetsErrorModeled::MountTargetNotFound(
                     MountTargetNotFound {
                         error_code: "MountTargetNotFound".to_string(),
-                        message: Some(format!(
-                            "Mount target {mount_target_id} does not exist"
-                        )),
+                        message: Some(efs::mount_target_not_found_message(mount_target_id)),
                     },
                 )
                 .into());
@@ -229,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(DescribeMountTargetsErrorModeled::FileSystemNotFound(
                     FileSystemNotFound {
                         error_code: "FileSystemNotFound".to_string(),
-                        message: Some(format!("File system {file_system_id} does not exist")),
+                        message: Some(efs::file_system_not_found_message(file_system_id)),
                     },
                 )
                 .into());
@@ -257,8 +255,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .position(|mount_target| mount_target.mount_target_id == marker)
                 .ok_or_else(|| {
                     bad_request(format!(
-                        "Marker {marker} does not name a mount target of this request's result \
-                         set"
+                        "Marker {} does not name a mount target of this request's result set",
+                        efs::quoted(marker)
                     ))
                 })?,
             None => 0,

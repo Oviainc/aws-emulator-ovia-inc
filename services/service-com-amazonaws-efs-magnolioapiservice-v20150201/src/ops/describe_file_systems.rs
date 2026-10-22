@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let wanted_id = input.file_system_id.as_deref().map(efs::file_system_id_of);
         if let Some(id) = wanted_id {
             if !state.file_systems.contains_key(id) {
-                return Err(not_found(format!("File system {id} does not exist")));
+                return Err(not_found(efs::file_system_not_found_message(id)));
             }
         }
         // A `CreationToken` names one file system exactly as a `FileSystemId` does, so a
@@ -192,7 +192,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.creation_token.as_deref() {
             if !state.creation_tokens.contains_key(token) {
                 return Err(not_found(format!(
-                    "No file system exists with creation token {token}"
+                    "No file system exists with creation token {}.",
+                    efs::quoted(token)
                 )));
             }
         }
@@ -218,7 +219,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .position(|file_system| file_system.file_system_id == marker)
                 .ok_or_else(|| {
                     bad_request(format!(
-                        "Marker {marker} does not name a file system of this request's result set"
+                        "Marker {} does not name a file system of this request's result set",
+                        efs::quoted(marker)
                     ))
                 })?,
             None => 0,
