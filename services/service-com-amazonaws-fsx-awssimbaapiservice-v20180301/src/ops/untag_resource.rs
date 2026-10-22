@@ -67,7 +67,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::ResourceLookup;
+use crate::state::{resource_not_found_message, ResourceLookup};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,10 +156,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let file_system_id = match store.resolve_resource(&input.resource_arn) {
             ResourceLookup::FileSystem(id) => id,
-            ResourceLookup::NotFound => {
+            ResourceLookup::NotFound(resource_id) => {
                 return Err(UntagResourceErrorModeled::ResourceNotFound(ResourceNotFound {
                     resource_arn: input.resource_arn.clone(),
-                    message: Some("the resource does not exist".to_string()),
+                    // Built from the identifier the request's ARN named, so the response
+                    // says WHICH resource could not be found.
+                    message: Some(resource_not_found_message(&resource_id)),
                 })
                 .into());
             }
@@ -179,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.file_systems.get_mut(&file_system_id) else {
             return Err(UntagResourceErrorModeled::ResourceNotFound(ResourceNotFound {
                 resource_arn: input.resource_arn.clone(),
-                message: Some("the resource does not exist".to_string()),
+                message: Some(resource_not_found_message(&file_system_id)),
             })
             .into());
         };

@@ -92,8 +92,8 @@
 use super::types::*;
 
 use crate::state::{
-    decode_page_token, file_systems_page_scope, page_size, paginate, FileSystemRecord,
-    MAX_FILE_SYSTEMS_PER_PAGE,
+    decode_page_token, file_system_not_found_message, file_systems_page_scope, page_size, paginate,
+    FileSystemRecord, MAX_FILE_SYSTEMS_PER_PAGE,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -199,7 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(DescribeFileSystemsErrorModeled::FileSystemNotFound(
                     FileSystemNotFound {
-                        message: Some(format!("file system {missing} does not exist")),
+                        // Built from the id the caller asked about, so the response says
+                        // WHICH of the requested ids is missing.
+                        message: Some(file_system_not_found_message(missing)),
                     },
                 )
                 .into());
