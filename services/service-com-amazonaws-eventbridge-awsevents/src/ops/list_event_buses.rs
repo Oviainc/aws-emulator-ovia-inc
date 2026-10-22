@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEventBuses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEventBuses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the account's event buses from [`crate::state`], in name order.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEventBuses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORTING operation: it writes nothing. "Lists all the event buses in your
+//! account, including the default event bus, custom event buses, and partner
+//! event buses", so every stored bus is reported — the account's `default` bus
+//! included — narrowed to "only those event buses with names that start with the
+//! specified prefix" when `NamePrefix` is given. One call reports at most `Limit`
+//! buses (at most [`crate::state::MAX_LIST_PAGE`]) and hands back a `NextToken`
+//! when more are stored; that token is a position in the same name order, so a
+//! resumed page starts after the last bus reported.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +151,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEventBuses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEventBusesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEventBuses"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEventBusesErrorModeled::InternalException(InternalException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+            .into());
+        };
+
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(after) => Some(after),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Parameter NextToken is not valid. Reason: it is not a token this \
+                         service issued.",
+                    ))
+                }
+            },
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        // Filtered in the name order the ordered map keeps; the page token is a
+        // position in that same order, so resuming means "every name strictly
+        // after it".
+        let matched: Vec<&crate::state::EventBus> = store
+            .buses
+            .iter()
+            .filter(|(name, _)| {
+                let filtered_out = input
+                    .name_prefix
+                    .as_deref()
+                    .is_some_and(|prefix| !name.starts_with(prefix));
+                let already_returned = resume_after
+                    .as_deref()
+                    .is_some_and(|after| name.as_str() <= after);
+                !filtered_out && !already_returned
+            })
+            .map(|(_, bus)| bus)
+            .collect();
+
+        let limit = input.limit.map_or(crate::state::MAX_LIST_PAGE, |limit| {
+            usize::try_from(limit)
+                .unwrap_or(crate::state::MAX_LIST_PAGE)
+                .clamp(1, crate::state::MAX_LIST_PAGE)
+        });
+        let page_len = matched.len().min(limit);
+        let page = &matched[..page_len];
+        let has_more = matched.len() > page_len;
+
+        // Every member read back out of the stored record, and the ARN derived
+        // from that record's name and the region the request was signed for — so
+        // a bus reported here and the same bus reported by `DescribeEventBus`
+        // cannot disagree.
+        let event_buses: Vec<EventBus> = page
+            .iter()
+            .map(|bus| EventBus {
+                name: Some(bus.name.clone()),
+                arn: Some(crate::state::event_bus_arn(&region, &bus.name)),
+                description: bus.description.clone(),
+                policy: bus.policy.document(),
+                creation_time: Some(crate::state::to_wire_timestamp(bus.created)),
+                last_modified_time: Some(crate::state::to_wire_timestamp(bus.last_modified)),
+                // Set only for a bus "created on behalf of your account by an
+                // Amazon Web Services service"; nothing here creates one.
+                managed_by: None,
+            })
+            .collect();
+        let next_token = page
+            .last()
+            .filter(|_| has_more)
+            .map(|bus| crate::state::encode_page_token(&bus.name));
+
+        Ok(ListEventBusesOutput {
+            event_buses: Some(event_buses),
+            next_token,
+        })
     }
 }
