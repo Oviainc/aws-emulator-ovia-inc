@@ -142,7 +142,12 @@ fn detector() -> &'static Detector {
 /// gets an EMPTY list. That is the engine's own answer: a confidence it did not
 /// produce would be an invented one, and the modelled `Languages` member is
 /// optional precisely because a response need not name a language.
-fn detect_languages(text: &str) -> Vec<DominantLanguage> {
+///
+/// `pub(crate)` because the asynchronous `StartDominantLanguageDetectionJob` analyses
+/// each of its input documents with the SAME engine, through this one function:
+/// synchronous and batch identification of a document must never be two
+/// implementations that can disagree.
+pub(crate) fn detect_languages(text: &str) -> Vec<DominantLanguage> {
     let sample: String = text.chars().take(IDENTIFICATION_SAMPLE_CHARS).collect();
     detector()
         .detect(&sample)
