@@ -15,6 +15,8 @@
 mod availability_zones;
 #[path = "all/default_network.rs"]
 mod default_network;
+#[path = "all/describe_images.rs"]
+mod describe_images;
 #[path = "all/describe_security_groups.rs"]
 mod describe_security_groups;
 #[path = "all/describe_subnets.rs"]

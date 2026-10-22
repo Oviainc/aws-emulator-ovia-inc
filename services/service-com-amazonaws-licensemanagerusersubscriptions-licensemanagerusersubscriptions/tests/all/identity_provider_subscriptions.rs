@@ -84,11 +84,21 @@ impl Reply {
     }
 }
 
-pub(crate) async fn call(h: &Harness, path: &str, body: &Value) -> Reply {
+/// Dispatch one request through the router: the method, the path (with any query
+/// string) and the JSON body, if the operation carries one.
+///
+/// Every call in this crate's suites goes through here, so a request is deserialized,
+/// constraint-checked, handled and serialized exactly as a client's would be.
+pub(crate) async fn send(
+    h: &Harness,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&Value>,
+) -> Reply {
     let request = http::Request::builder()
-        .method("POST")
+        .method(method)
         .uri(format!(
-            "https://{SIGNING_NAME}.{REGION}.amazonaws.com{path}"
+            "https://{SIGNING_NAME}.{REGION}.amazonaws.com{path_and_query}"
         ))
         .header("content-type", "application/json")
         .header(
@@ -98,9 +108,10 @@ pub(crate) async fn call(h: &Harness, path: &str, body: &Value) -> Reply {
                  /aws4_request, SignedHeaders=host, Signature=0"
             ),
         )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("the request body serializes"),
-        ))
+        .body(bytes::Bytes::from(match body {
+            Some(body) => serde_json::to_vec(body).expect("the request body serializes"),
+            None => Vec::new(),
+        }))
         .expect("a well-formed request");
     let response = h.router.dispatch(request).await;
     let status = response.status().as_u16();
@@ -124,6 +135,12 @@ pub(crate) async fn call(h: &Harness, path: &str, body: &Value) -> Reply {
         error_type,
         body,
     }
+}
+
+/// A `POST` of `body` to `path` — the shape every operation of this service's RPC-style
+/// surface takes.
+pub(crate) async fn call(h: &Harness, path: &str, body: &Value) -> Reply {
+    send(h, "POST", path, Some(body)).await
 }
 
 pub(crate) async fn register(h: &Harness, body: &Value) -> Reply {
@@ -234,7 +251,7 @@ impl Registration {
 }
 
 /// The `arn:` prefix every resource of `kind` minted for this request must carry.
-fn arn_prefix(kind: &str) -> String {
+pub(crate) fn arn_prefix(kind: &str) -> String {
     format!("arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT}:{kind}/")
 }
 

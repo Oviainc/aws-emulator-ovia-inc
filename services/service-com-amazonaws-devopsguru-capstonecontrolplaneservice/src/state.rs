@@ -5,8 +5,9 @@
 //! Everything a DevOps Guru client can itself create lives here: the analysis
 //! coverage it declares (`UpdateResourceCollection`), the notification channels it
 //! adds (`AddNotificationChannel`), the service-integration configuration it sets
-//! (`UpdateServiceIntegration`) and the event-source integration it toggles
-//! (`UpdateEventSourcesConfig`).
+//! (`UpdateServiceIntegration`), the event-source integration it toggles
+//! (`UpdateEventSourcesConfig`) and the cost estimation it starts
+//! (`StartCostEstimation`).
 //!
 //! Insights are produced by DevOps Guru's own analysis, never by a client call, so
 //! [`ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::insights`] is the map
@@ -18,6 +19,7 @@
 //! `ResourceNotFoundException`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     CloudFormationCollection, InsightTimeRange, PredictionTimeRange, ProactiveInsight,
@@ -36,6 +38,9 @@ pub struct ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
     /// The last `UpdateServiceIntegration` configuration, which
     /// `DescribeServiceIntegration` reports.
     pub service_integration: ServiceIntegrationRecord,
+    /// The account's cost estimation, as `StartCostEstimation` created it and
+    /// `GetCostEstimation` reports it. `None` until the first start.
+    pub cost_estimation: Option<CostEstimationRecord>,
     /// The last `UpdateEventSourcesConfig` configuration, which
     /// `DescribeEventSourcesConfig` reports.
     pub event_sources: EventSourcesRecord,
@@ -366,6 +371,163 @@ pub struct KmsServerSideEncryptionRecord {
     pub encryption_type: Option<String>,
 }
 
+/// One cost estimation, as `StartCostEstimation` created it.
+///
+/// There is at most ONE per account and Region: `StartCostEstimation` returns no id
+/// and `GetCostEstimation` takes none, so neither operation can name a second
+/// estimation. A new start therefore replaces the previous estimate rather than
+/// adding to the store, which is also why this record is not a growth site.
+#[derive(Debug, Clone)]
+pub struct CostEstimationRecord {
+    /// `ClientToken` as submitted (`@idempotencyToken`), so a retry of the same
+    /// request is recognised as the same estimation rather than starting another.
+    pub client_token: Option<String>,
+    /// `ResourceCollection.CloudFormation.StackNames` as submitted, left `None` when
+    /// the request carried no CloudFormation filter, so a read reports the collection
+    /// that was submitted rather than a filled-in default.
+    pub stack_names: Option<Vec<String>>,
+    /// `ResourceCollection.Tags` as submitted: one `(AppBoundaryKey, TagValues)` entry
+    /// per filter, in request order.
+    pub tags: Option<Vec<(String, Vec<String>)>>,
+    /// When the estimation was started (`TimeRange.StartTime`).
+    pub started_at: SystemTime,
+    /// When the analysis is due to be finished: the estimation reports `ONGOING`
+    /// before this instant and `COMPLETED` from it on, with `TimeRange.EndTime` at
+    /// it. Stored rather than waited for, so no read ever blocks.
+    pub completes_at: SystemTime,
+    /// The per-resource-type costs computed when the estimation started.
+    pub costs: Vec<ResourceCostRecord>,
+}
+
+/// One `ServiceResourceCost`: the monthly cost of analysing the resources of one
+/// type that the estimation's collection covers.
+#[derive(Debug, Clone)]
+pub struct ResourceCostRecord {
+    /// `ServiceResourceCost.Type`.
+    pub resource_type: String,
+    /// `ServiceResourceCost.State` (`CostEstimationServiceResourceState`).
+    pub state: String,
+    /// `ServiceResourceCost.Count` — how many resources of this type are analysed.
+    pub count: i32,
+    /// `ServiceResourceCost.UnitCost` — the price per resource hour.
+    pub unit_cost: f64,
+    /// `ServiceResourceCost.Cost` — the monthly cost for those resources.
+    pub cost: f64,
+}
+
+impl CostEstimationRecord {
+    /// The `CostEstimationStatus` to report at `now`: the estimation is `ONGOING`
+    /// until its completion instant and `COMPLETED` from then on, so a reader
+    /// derives the status from the clock instead of a read having to move it.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.completes_at {
+            COST_ESTIMATION_STATUS_ONGOING
+        } else {
+            COST_ESTIMATION_STATUS_COMPLETED
+        }
+    }
+
+    /// `TimeRange.EndTime`: the completion instant once it has passed, and nothing
+    /// while the estimation is still running — an unfinished estimation has no end.
+    pub fn end_time(&self, now: SystemTime) -> Option<SystemTime> {
+        (now >= self.completes_at).then_some(self.completes_at)
+    }
+
+    /// Whether `client_token` is this estimation's idempotency token. An absent or
+    /// empty token identifies nothing, so it never matches.
+    pub fn has_token(&self, client_token: Option<&str>) -> bool {
+        match (self.client_token.as_deref(), client_token) {
+            (Some(stored), Some(offered)) => !stored.is_empty() && stored == offered,
+            _ => false,
+        }
+    }
+
+    /// Whether this estimation was started for exactly the collection
+    /// `(stack_names, tags)` names — what tells a retry of the same request from a
+    /// different request sent under the same idempotency token.
+    pub fn covers_same_collection(
+        &self,
+        stack_names: Option<&Vec<String>>,
+        tags: Option<&Vec<(String, Vec<String>)>>,
+    ) -> bool {
+        self.stack_names.as_ref() == stack_names && self.tags.as_ref() == tags
+    }
+}
+
+/// `CostEstimationStatus` as the model spells "still running" — see
+/// `COST_ESTIMATION_STATUS_VALUES` in `ops/types/shared_types.rs`.
+pub const COST_ESTIMATION_STATUS_ONGOING: &str = "ONGOING";
+
+/// `CostEstimationStatus` as the model spells "finished".
+pub const COST_ESTIMATION_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// `CostEstimationServiceResourceState` for a resource the client declared for
+/// analysis — see `COST_ESTIMATION_SERVICE_RESOURCE_STATE_VALUES` in
+/// `ops/types/shared_types.rs`.
+///
+/// A resource is `ACTIVE` when it produces metrics, events or logs, and only active
+/// resource hours are charged. A resource inside the account's analysis coverage is
+/// exactly what the estimate is being made for, and this emulator has no metric
+/// stream that could show one quiet, so a covered resource is counted active.
+pub const COST_ESTIMATION_RESOURCE_ACTIVE: &str = "ACTIVE";
+
+/// The `ServiceResourceCost.Type` for the CloudFormation half of a cost estimation's
+/// collection.
+///
+/// This emulator's resource inventory is the coverage the client declared through
+/// `UpdateResourceCollection` — it performs none of AWS's own per-service resource
+/// discovery — so what it can count for a stack-defined boundary is the covered
+/// stacks the request names.
+pub const COST_ESTIMATION_STACK_TYPE: &str = "AWS::CloudFormation::Stack";
+
+/// The `ServiceResourceCost.Type` for the tag half of a cost estimation's collection:
+/// one covered app-boundary tag value. See [`COST_ESTIMATION_STACK_TYPE`] for why the
+/// unit counted is a coverage entry.
+pub const COST_ESTIMATION_TAG_TYPE: &str = "AWS::Tag";
+
+/// The `ResourceType` a cost-estimation-shaped `ConflictException` reports.
+/// `ResourceIdType` is an unconstrained string, so this value names the kind of
+/// resource the reported `ResourceId` belongs to.
+pub const COST_ESTIMATION_RESOURCE_TYPE: &str = "COST_ESTIMATION";
+
+/// Emulator-enforced ceiling on `ResourceCollection.Tags`, from the documented AWS
+/// rule rather than from the model: `TagCostEstimationResourceCollectionFilter`'s
+/// documentation states "The maximum number of tags you can specify for a cost
+/// estimate is one", and `TagCostEstimationResourceCollectionFilters` carries no list
+/// length, so `StartCostEstimation` is what refuses a longer list.
+pub const MAX_COST_ESTIMATION_TAG_FILTERS: usize = 1;
+
+/// DevOps Guru's published price to analyse one active resource for one hour, in USD:
+/// "$0.0028 per resource hour" (<https://aws.amazon.com/devops-guru/pricing/>), the
+/// rate `GetCostEstimation` reports as `ServiceResourceCost.UnitCost`.
+pub const RESOURCE_HOUR_UNIT_COST: f64 = 0.0028;
+
+/// The hours a monthly estimate is priced over: AWS bills a 730-hour month
+/// (365 days ÷ 12 months × 24 hours), and the estimate is the cost to analyse the
+/// resources for a month.
+pub const HOURS_PER_MONTH: f64 = 730.0;
+
+/// A money amount at the precision of the per-resource-hour unit price (four decimal
+/// places), so a cost reports a currency value rather than a binary-float tail.
+pub fn round_cost(amount: f64) -> f64 {
+    (amount * 10_000.0).round() / 10_000.0
+}
+
+/// The monthly cost of analysing `count` active resources at
+/// [`RESOURCE_HOUR_UNIT_COST`] over a [`HOURS_PER_MONTH`] month.
+pub fn monthly_cost(count: i32) -> f64 {
+    round_cost(f64::from(count) * RESOURCE_HOUR_UNIT_COST * HOURS_PER_MONTH)
+}
+
+/// How long after `StartCostEstimation` the estimate is due to be finished.
+///
+/// DevOps Guru creates the estimate asynchronously — `StartCostEstimation` "starts the
+/// creation" of it and `GetCostEstimation` reports `ONGOING` "if it's still in
+/// progress" — and AWS publishes no duration for that work, so this span is the
+/// emulator's own choice: never zero, so a caller reading straight after the start
+/// still sees `ONGOING`, and short enough that an ordinary poll sees `COMPLETED`.
+pub const COST_ESTIMATION_DURATION: Duration = Duration::from_millis(300);
+
 /// `OptInStatus` as the model spells "off" — see `OPT_IN_STATUS_VALUES` in
 /// `ops/types/shared_types.rs`. `EventSourceOptInStatus` declares the same two
 /// values (`DISABLED` | `ENABLED`), so the event-source record spells "off" with
@@ -450,8 +612,14 @@ pub const PAGE_SIZE: usize = 100;
 //
 // The product is therefore finite: at most MAX_COVERED_STACK_NAMES stack names, the
 // account's one app-boundary key ([`APP_BOUNDARY_KEYS_PER_ACCOUNT`]) holding at most
-// MAX_TAG_VALUES_PER_KEY values, at most MAX_NOTIFICATION_CHANNELS channels, and one
-// service-integration record of fixed shape.
+// MAX_TAG_VALUES_PER_KEY values, at most MAX_NOTIFICATION_CHANNELS channels, one
+// service-integration record of fixed shape, and one cost estimation.
+//
+// The cost estimation is not a growth site either: `StartCostEstimation` replaces the
+// single record in place, and the collection it stores is bounded by the model
+// (`CostEstimationStackNames` and `CostEstimationTagValues` are both fixed at 1 item)
+// together with the one-tag maximum `TagCostEstimationResourceCollectionFilter`
+// documents, which `StartCostEstimation` enforces before it stores anything.
 //
 // `insights` carries no cap because no request can grow it: insights come from DevOps
 // Guru's analysis, which this emulator does not run, so nothing a caller sends adds an

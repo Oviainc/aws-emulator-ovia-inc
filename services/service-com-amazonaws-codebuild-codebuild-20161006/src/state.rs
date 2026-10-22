@@ -5,10 +5,10 @@
 //! Every implemented CodeBuild operation computes its answer from the records
 //! here: `CreateProject` writes a [`Project`], `StartBuild` writes a
 //! [`StoredBuild`], `StartSandbox` writes a [`StoredSandbox`],
-//! `ImportSourceCredentials` writes a [`StoredSourceCredentials`], and the
-//! reporting operations (`BatchGetProjects`, `BatchGetBuilds`,
-//! `BatchGetSandboxes`, `ListProjects`, `ListBuildsForProject`,
-//! `ListSourceCredentials`) only read them.
+//! `ImportSourceCredentials` writes a [`StoredSourceCredentials`],
+//! `BatchDeleteBuilds` removes a build, and the reporting operations
+//! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetSandboxes`, `ListProjects`,
+//! `ListBuildsForProject`, `ListSourceCredentials`) only read them.
 //!
 //! The model shapes themselves are what is stored, so a read hands back exactly
 //! the structure the write persisted rather than a second, drifting copy of the
@@ -193,8 +193,12 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     /// list operation sorts and pages over this without re-reading every build.
     pub builds_by_project: BTreeMap<String, Vec<String>>,
     /// The next `buildNumber` to hand out per project. A project's first build is
-    /// 1 and each subsequent one is incremented by 1; the counter is kept when a
-    /// project is deleted, so a number is never reused.
+    /// 1 and each subsequent one is incremented by 1; the counter is kept while the
+    /// project exists OR any of its builds is still retained, so deleting a project
+    /// (whose builds survive it, as AWS documents) never reuses a number, and
+    /// neither does deleting a build of a project that is still there. It is
+    /// retired only once neither is left — nothing can observe it then, and keeping
+    /// it would be unbounded growth for no behaviour.
     pub next_build_numbers: BTreeMap<String, i64>,
     /// `StartBuild` idempotency tokens, keyed by (project name, token).
     pub start_build_tokens: BTreeMap<(String, String), StartBuildToken>,
@@ -364,7 +368,6 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
     /// counter after that, so keeping it would be unbounded growth for no
     /// behaviour.
     fn enforce_build_ceiling(&mut self) {
-        let mut evicted_any = false;
         while self.builds.len() > MAX_BUILDS {
             let oldest_completed = self
                 .builds
@@ -379,25 +382,41 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
                     .map(|(id, _)| id.clone())
             });
             let Some(id) = evicted else { break };
-            evicted_any = true;
-            let project_name = self
-                .builds
-                .remove(&id)
-                .and_then(|stored| stored.build.project_name);
-            if let Some(project_name) = project_name {
-                if let Some(ids) = self.builds_by_project.get_mut(&project_name) {
-                    ids.retain(|held| held != &id);
-                    if ids.is_empty() {
-                        self.builds_by_project.remove(&project_name);
-                    }
+            self.remove_build(&id);
+        }
+    }
+
+    /// Remove the build `id` names, and answer whether a record was held.
+    ///
+    /// The one place a build leaves the store, so the project index never keeps an
+    /// id the build map no longer has: `BatchDeleteBuilds` deletes through here and
+    /// so does an eviction. A `buildNumber` counter can only be orphaned by the
+    /// removal that empties its project's index, so the scan runs there and nowhere
+    /// else — a 100-id delete over one project pays for one scan, and an insert that
+    /// evicts nothing pays for none.
+    pub fn remove_build(&mut self, id: &str) -> bool {
+        let Some(stored) = self.builds.remove(id) else {
+            return false;
+        };
+        if let Some(project_name) = stored.build.project_name {
+            if let Some(ids) = self.builds_by_project.get_mut(&project_name) {
+                ids.retain(|held| held != id);
+                if ids.is_empty() {
+                    self.builds_by_project.remove(&project_name);
+                    self.retire_orphaned_build_numbers();
                 }
             }
         }
-        // Only an eviction can orphan a counter, so the common path (nothing
-        // evicted) does not pay for the scan.
-        if !evicted_any {
-            return;
-        }
+        true
+    }
+
+    /// Drop the `buildNumber` counters nothing can observe any more.
+    ///
+    /// A counter is kept while its project exists or any of its builds is still
+    /// retained, so a number is never reused for a project a caller can still
+    /// reach; once neither is left nothing can observe the counter, and keeping it
+    /// would be unbounded growth for no behaviour.
+    fn retire_orphaned_build_numbers(&mut self) {
         let mut counters = ::std::mem::take(&mut self.next_build_numbers);
         counters.retain(|name, _| {
             self.projects.contains_key(name) || self.builds_by_project.contains_key(name)

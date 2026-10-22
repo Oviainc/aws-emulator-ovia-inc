@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGlobalCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGlobalCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation persists a new Aurora global database cluster in this
+//! service's store, which is what `DescribeGlobalClusters` reports. It is the ONLY file
+//! to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGlobalCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +189,208 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGlobalCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGlobalClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A global cluster is ACCOUNT-scoped and its ARN carries no region, so the region
+        // the request was signed for does not scope what it creates. It is still read, so
+        // a malformed credential scope is refused here as it is everywhere else in this
+        // service.
+        let _region =
+            crate::state::request_region(ctx).map_err(CreateGlobalClusterError::validation)?;
+        // "This parameter is stored as a lowercase string", so the identifier is folded
+        // before it is stored, echoed or looked up — which is also what makes
+        // `DescribeGlobalClusters`'s case-insensitive lookup agree with this write. Its
+        // length and alphabet are the model's own constraints, already refused before this
+        // handler runs.
+        let identifier = input.global_cluster_identifier.to_ascii_lowercase();
+        // `Tags` publishes no bound of its own and every tag is STORED, so the list is
+        // bounded before anything is resolved or stored, the same way this service bounds
+        // every other stored request list.
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tags(&tags)
+            .map_err(CreateGlobalClusterError::invalid_parameter_value)?;
+
+        // Every value this request names is resolved BEFORE the store is touched, so a
+        // request this service refuses leaves no global cluster behind for a later
+        // describe to find.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGlobalCluster"))
+        // `SourceDBClusterIdentifier`: "If you provide a value for this parameter, don't
+        // specify values for the following settings because Amazon Aurora uses the values
+        // from the specified source DB cluster: DatabaseName Engine EngineVersion
+        // StorageEncrypted."
+        if let Some(source) = &input.source_db_cluster_identifier {
+            let conflicting: Vec<&str> = [
+                ("DatabaseName", input.database_name.is_some()),
+                ("Engine", input.engine.is_some()),
+                ("EngineVersion", input.engine_version.is_some()),
+                ("StorageEncrypted", input.storage_encrypted.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(member, named)| named.then_some(member))
+            .collect();
+            if !conflicting.is_empty() {
+                return Err(CreateGlobalClusterError::invalid_parameter_combination(
+                    format!(
+                        "{} can't be specified together with SourceDBClusterIdentifier: a \
+                         global database created from a source DB cluster takes those \
+                         settings from that cluster",
+                        conflicting.join(", ")
+                    ),
+                ));
+            }
+            // This service holds NO DB cluster records: every operation that could create
+            // one — `CreateDBCluster`, `RestoreDBClusterFromSnapshot`,
+            // `RestoreDBClusterToPointInTime` — is still a scaffolded 501 (their own stub
+            // issues), so no value resolves to a cluster this global database could take
+            // as its primary, which is the modelled `DBClusterNotFoundFault`. When one of
+            // those operations stores a cluster, this is the lookup that adopts it as the
+            // first member.
+            return Err(CreateGlobalClusterErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(format!(
+                        "The source cluster could not be found or cannot be accessed: {source}"
+                    )),
+                },
+            )
+            .into());
+        }
+        // "Valid Values: aurora-mysql | aurora-postgresql" — a global database is an
+        // Aurora resource, so an engine outside that list names nothing it can run.
+        if let Some(engine) = &input.engine {
+            crate::state::check_global_cluster_engine(engine)
+                .map_err(CreateGlobalClusterError::invalid_parameter_value)?;
+        }
+        crate::state::check_engine_lifecycle_support(
+            input
+                .engine_lifecycle_support
+                .as_deref()
+                .unwrap_or(crate::state::DEFAULT_ENGINE_LIFECYCLE_SUPPORT),
+        )
+        .map_err(CreateGlobalClusterError::invalid_parameter_value)?;
+        // The version the global cluster runs. A request that names none gets the engine's
+        // own default — the version this service would provision — and one that names a
+        // version the engine-version catalogue carries is reported as that catalogue
+        // entry, so `8.0` is answered with the concrete version behind it rather than
+        // echoed.
+        //
+        // A well-formed version the catalogue does NOT carry stands as the request named
+        // it, and is NOT refused: unlike a DB instance, whose `EngineVersion` is the
+        // version an instance this service provisions RUNS, a global database's member DB
+        // clusters are created separately, and the catalogue
+        // `DescribeDBEngineVersions` publishes is explicitly "NOT the real service's live
+        // list" — so a published Aurora version missing from it is not a version AWS
+        // refuses. Only a value that is no version at all is refused.
+        let engine_version = match &input.engine {
+            Some(engine) => {
+                match crate::ops::describe_db_engine_versions::resolve_version(
+                    engine,
+                    input.engine_version.as_deref(),
+                ) {
+                    Ok(Some(entry)) => Some(entry.engine_version.to_string()),
+                    // An engine the catalogue publishes no available version for: there
+                    // is nothing to resolve against, so what the request named stands —
+                    // checked, like the branches below, for being a version at all.
+                    Ok(None) => {
+                        if let Some(named) = input.engine_version.as_deref() {
+                            crate::state::check_engine_version_form(named)
+                                .map_err(CreateGlobalClusterError::invalid_parameter_value)?;
+                        }
+                        input.engine_version.clone()
+                    }
+                    Err(_) => {
+                        let named = input
+                            .engine_version
+                            .as_deref()
+                            .expect("resolution only fails for a version the request named");
+                        crate::state::check_engine_version_form(named)
+                            .map_err(CreateGlobalClusterError::invalid_parameter_value)?;
+                        Some(named.to_string())
+                    }
+                }
+            }
+            // No engine to resolve a version against, so nothing is invented for it: what
+            // the request named stands, checked only for being a version at all.
+            None => {
+                if let Some(named) = input.engine_version.as_deref() {
+                    crate::state::check_engine_version_form(named)
+                        .map_err(CreateGlobalClusterError::invalid_parameter_value)?;
+                }
+                input.engine_version.clone()
+            }
+        };
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router
+        // builds; 501 is the honest answer, never a fabricated global cluster.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+
+        // The identifier names one global cluster in the account, and the store is keyed
+        // by it alone: a second create under the same identifier is the modelled
+        // already-exists fault rather than a silent overwrite of the first.
+        if store.global_clusters.contains_key(&identifier) {
+            return Err(
+                CreateGlobalClusterErrorModeled::GlobalClusterAlreadyExistsFault(
+                    GlobalClusterAlreadyExistsFault {
+                        message: Some(format!(
+                            "Global cluster already exists: {identifier}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The account's global database allowance: the store cannot be grown without
+        // bound, and the modelled fault says exactly this ("The number of global database
+        // clusters for this account is already at the maximum allowed").
+        if store.global_clusters.len() >= crate::state::GLOBAL_CLUSTER_QUOTA_PER_ACCOUNT {
+            return Err(
+                CreateGlobalClusterErrorModeled::GlobalClusterQuotaExceededFault(
+                    GlobalClusterQuotaExceededFault {
+                        message: Some(format!(
+                            "the request would exceed the allowed number of global database \
+                             clusters ({} per account)",
+                            crate::state::GLOBAL_CLUSTER_QUOTA_PER_ACCOUNT
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mint = store.next_mint();
+        let record = crate::state::GlobalClusterRecord {
+            identifier: identifier.clone(),
+            resource_id: crate::state::mint_global_cluster_resource_id(mint),
+            // A global database created EMPTY provisions no DB cluster of its own — "You
+            // can create a global database that is initially empty, and then create the
+            // primary and secondary DB clusters in the global database" — so it is usable
+            // the moment it exists and owes no transition to a later status.
+            status: crate::state::GLOBAL_CLUSTER_STATUS_AVAILABLE.to_string(),
+            engine: input.engine,
+            engine_version,
+            engine_lifecycle_support: input
+                .engine_lifecycle_support
+                .unwrap_or_else(|| crate::state::DEFAULT_ENGINE_LIFECYCLE_SUPPORT.to_string()),
+            database_name: input.database_name,
+            // "Specifies whether to enable storage encryption for the new global database
+            // cluster" / "deletion protection", each off unless the request asks for it.
+            storage_encrypted: input.storage_encrypted.unwrap_or(false),
+            deletion_protection: input.deletion_protection.unwrap_or(false),
+            // The members of a global database are its primary and secondary DB clusters,
+            // which only a DB cluster create or `CreateGlobalCluster`'s own
+            // `SourceDBClusterIdentifier` can supply. Neither can have here (both are
+            // refused above), so the cluster is reported with an EMPTY member list — the
+            // list an empty global database has — rather than an invented member.
+            member_cluster_arns: Vec::new(),
+            endpoint_host: crate::state::mint_endpoint_host(mint),
+            tags,
+        };
+        let global_cluster = record.to_wire();
+        store.global_clusters.insert(identifier, record);
+
+        Ok(CreateGlobalClusterOutput {
+            global_cluster: Some(global_cluster),
+        })
     }
 }

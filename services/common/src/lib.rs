@@ -22,6 +22,9 @@
 //! * [`validation`], which restores the value a constraint violation echoes to the one
 //!   the caller submitted, so a service wording its own `ValidationException` from the
 //!   framework's violations does not report a value nobody sent;
+//! * [`iam_trust_policy`], the ONE reading of an IAM trust policy, for every service that
+//!   resolves a caller-supplied execution role before it writes — so two services asked
+//!   whether a document lets them assume a role cannot answer differently;
 //! * [`stable_hex_id`], the one deterministic mixing function a service derives a
 //!   wire-visible id with;
 //! * [`network`], the contract the account's EC2 network — which subnets a Region has —
@@ -99,6 +102,7 @@ pub mod arn;
 pub mod bedrock;
 pub mod db_data_sources;
 pub mod front_door;
+pub mod iam_trust_policy;
 pub mod iot_job_executions;
 pub mod network;
 pub mod shared_path;
