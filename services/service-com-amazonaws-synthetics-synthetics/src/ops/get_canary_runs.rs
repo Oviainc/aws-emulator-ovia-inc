@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCanaryRuns
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCanaryRuns`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCanaryRuns::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the run history this service's store holds for one canary.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +81,22 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
+
+use crate::state::STORE_UNAVAILABLE;
+
+/// `GetCanaryRunsRequest$MaxResults`: "If you omit this parameter, the default of 100 is
+/// used." (which is also the member's modelled maximum).
+const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// `GetCanaryRunsRequest$RunType`: "When a value is not provided for RunType, the default
+/// value is CANARY_RUN".
+const DEFAULT_RUN_TYPE: &str = "CANARY_RUN";
+
+/// A page token that resumes at a run ID rather than at a position: runs are prepended as
+/// they start, so a positional boundary would shift under the caller. A run ID is a UUID,
+/// so the token is always within `Token`'s modelled 4..252 length.
+const TOKEN_RUN_PREFIX: &str = "rn#";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -160,18 +168,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCanaryRuns` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCanaryRunsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCanaryRuns"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetCanaryRunsError::from(GetCanaryRunsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(STORE_UNAVAILABLE.to_string()),
+                },
+            ))
+        })?;
+
+        let run_type = input.run_type.as_deref().unwrap_or(DEFAULT_RUN_TYPE);
+        // `GetCanaryRunsRequest$RunType`: "When you provide RunType=CANARY_RUN and
+        // dryRunId, you will get an exception".
+        if input.dry_run_id.is_some() && run_type == "CANARY_RUN" {
+            return Err(GetCanaryRunsErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "DryRunId cannot be combined with RunType=CANARY_RUN".to_string(),
+                ),
+            })
+            .into());
+        }
+
+        let start = match input.next_token.as_deref() {
+            None => None,
+            // Only a token this operation could have issued is accepted: the `rn#` prefix
+            // and a run ID behind it. Anything else is a bad request rather than an empty
+            // page, the same rule `DescribeCanaries` applies to its own token.
+            Some(token) => Some(
+                token
+                    .strip_prefix(TOKEN_RUN_PREFIX)
+                    // The only thing this operation ever puts after the prefix is a run
+                    // ID, which the model shapes as a `UUID`.
+                    .filter(|run_id| crate::state::is_uuid(run_id))
+                    .ok_or_else(|| {
+                        GetCanaryRunsError::from(
+                            GetCanaryRunsErrorModeled::ValidationException(ValidationException {
+                                message: Some(
+                                    "NextToken is not a token this operation issued".to_string(),
+                                ),
+                            }),
+                        )
+                    })?,
+            ),
+        };
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            // At least one entry per page, independently of the boundary validator: a
+            // page size of zero would return nothing while still emitting a token, so a
+            // client loop would never terminate.
+            .max(1);
+
+        let now = SystemTime::now();
+        let mut guard = state.lock();
+        // Only what the clock already owed: a run whose outcome came due, a canary that
+        // finished provisioning.
+        guard.settle(now);
+        let canary = guard.canaries.get(&input.name).ok_or_else(|| {
+            GetCanaryRunsError::from(GetCanaryRunsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Canary {} not found", input.name)),
+                },
+            ))
+        })?;
+
+        if let Some(dry_run_id) = input.dry_run_id.as_deref() {
+            // This emulator performs no dry runs, so it has minted no dry run id and any
+            // id a caller presents names a dry run that does not exist.
+            return Err(GetCanaryRunsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Dry run {dry_run_id} not found for canary {}",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+        if run_type == "DRY_RUN" {
+            // Same reason: there are no dry runs to report, which is an empty page rather
+            // than a failure.
+            return Ok(GetCanaryRunsOutput {
+                canary_runs: Some(Vec::new()),
+                next_token: None,
+            });
+        }
+
+        // The history is kept newest first, the order this operation reports.
+        let from = match start {
+            None => 0,
+            // A well-formed token whose run is no longer in the history is answered with
+            // the last, empty page rather than a failure: the run it named was dropped by
+            // the canary's retention period or by the retained-run bound between the two
+            // calls, so there is genuinely nothing after it left to report.
+            Some(run_id) => canary
+                .runs
+                .iter()
+                .position(|run| run.id == run_id)
+                .unwrap_or(canary.runs.len()),
+        };
+        let until = from.saturating_add(page_size).min(canary.runs.len());
+        let canary_runs: Vec<CanaryRun> = canary.runs[from..until]
+            .iter()
+            .map(|run| run.to_canary_run())
+            .collect();
+        let next_token = canary
+            .runs
+            .get(until)
+            .map(|next| format!("{TOKEN_RUN_PREFIX}{}", next.id));
+
+        Ok(GetCanaryRunsOutput {
+            canary_runs: Some(canary_runs),
+            next_token,
+        })
     }
 }
