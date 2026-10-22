@@ -2,10 +2,13 @@
 
 //! Engine state for the com-amazonaws-mediaconvert-mediaconvert service.
 //!
-//! The transcoding-job control plane: the `queues` a job can be sent to and the `jobs`
-//! themselves. Every response the handlers in `src/ops/` build is projected from a
-//! record stored here, so a value a caller reads back is the value some earlier call
-//! persisted.
+//! The transcoding-job control plane: the `queues` a job can be sent to, the `jobs`
+//! themselves and the account's input `policy`. Every response the handlers in
+//! `src/ops/` build is projected from a record stored here, so a value a caller reads
+//! back is the value some earlier call persisted.
+//!
+//! The account policy is a SINGLETON — the API has no policy name or id, so `PutPolicy`
+//! replaces one record and `DeletePolicy` drops it; it is not caller-driven growth.
 //!
 //! # Bounds on caller-driven growth and per-request work
 //!
@@ -45,7 +48,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     AccelerationSettings, HopDestination, Job, JobSettings, JobTemplate, JobTemplateSettings,
-    Queue, ReservationPlan, ReservationPlanSettings, Timing,
+    Policy, Queue, ReservationPlan, ReservationPlanSettings, Timing,
 };
 
 /// The built-in queue a job with no `Queue` member is sent to.
@@ -555,6 +558,44 @@ impl JobRecord {
     }
 }
 
+/// The account's input policy: the decision the caller stated for each kind of job
+/// input, and nothing more.
+///
+/// Every member of the modelled `Policy` is optional and each targets `InputPolicy`,
+/// whose value set is the generated [`crate::ops::types::INPUT_POLICY_VALUES`]
+/// (`ALLOWED`/`DISALLOWED`) the boundary validator enforces, so the policy a caller puts
+/// can name any subset of the three input kinds. The record keeps each decision exactly
+/// as it was stated, including "not stated": an input kind a policy does not restrict
+/// needs no stored decision — it is allowed, which is also what an account with no
+/// policy at all allows — so no member is materialised on the caller's behalf.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyRecord {
+    pub http_inputs: Option<String>,
+    pub https_inputs: Option<String>,
+    pub s3_inputs: Option<String>,
+}
+
+impl PolicyRecord {
+    /// The record a `PutPolicy` request asks for. The policy is REPLACED, not merged, so
+    /// this is the whole of what that request stated.
+    pub fn from_requested(requested: &Policy) -> Self {
+        Self {
+            http_inputs: requested.http_inputs.clone(),
+            https_inputs: requested.https_inputs.clone(),
+            s3_inputs: requested.s3_inputs.clone(),
+        }
+    }
+
+    /// The modelled `Policy`.
+    pub fn view(&self) -> Policy {
+        Policy {
+            http_inputs: self.http_inputs.clone(),
+            https_inputs: self.https_inputs.clone(),
+            s3_inputs: self.s3_inputs.clone(),
+        }
+    }
+}
+
 /// What the store did when asked to cancel a job.
 #[derive(Debug)]
 pub enum CancelOutcome {
@@ -590,6 +631,11 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     pub queues: BTreeMap<String, QueueRecord>,
     /// Jobs by `Id`. At most [`MAX_JOBS`] entries.
     pub jobs: BTreeMap<String, JobRecord>,
+    /// The account's input policy, once `PutPolicy` has stored one. `None` until then
+    /// and again after `DeletePolicy`, when the account carries no policy and
+    /// `GetPolicy` reports none. A single record, never a growing collection: the
+    /// policy API names no resource.
+    pub policy: Option<PolicyRecord>,
     /// Job templates by `Name`; "Each name must be unique within your account". Seeded
     /// with the built-in [`SYSTEM_JOB_TEMPLATES`]; a caller's own templates join them
     /// through `CreateJobTemplate`, which is where that growth gets its cap.
@@ -646,6 +692,9 @@ impl Default for ComAmazonawsMediaconvertMediaconvertState {
         Self {
             queues,
             jobs: BTreeMap::new(),
+            // No policy until a caller puts one; an account carrying no policy is the
+            // state `GetPolicy` reports as an absent `Policy`, so nothing is seeded.
+            policy: None,
             job_templates: SYSTEM_JOB_TEMPLATES
                 .iter()
                 .map(|name| ((*name).to_string(), JobTemplateRecord::system(name, now)))
