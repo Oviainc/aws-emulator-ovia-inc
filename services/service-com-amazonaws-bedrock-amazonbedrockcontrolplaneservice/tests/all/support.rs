@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The HTTP harness both guardrail suites drive the emulator through.
+//! The HTTP harness every suite in this crate drives the emulator through.
 //!
-//! Extracted out of `guardrails.rs` so `guardrail_wire_shape.rs` exercises the SAME
-//! dispatch path rather than a second copy of it: one shared engine, one registered
-//! service, requests signed the way an SDK signs them and dispatched in-process through
-//! the `MultiServiceRouter` the emulator boots.
+//! Extracted out of `guardrails.rs` so the other suites exercise the SAME dispatch path
+//! rather than a second copy of it: one shared engine, one registered service, requests
+//! signed the way an SDK signs them and dispatched in-process through the
+//! `MultiServiceRouter` the emulator boots.
 
 use std::sync::Arc;
 
@@ -103,17 +103,34 @@ pub fn emulator() -> Emulator {
 }
 
 impl Emulator {
+    /// One request signed for [`REGION`], the region these suites address.
     pub async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
+        self.call_in_region(REGION, method, path, body).await
+    }
+
+    /// One request signed for `region`.
+    ///
+    /// The region a request addresses travels in its SigV4 credential scope, and a
+    /// service reads it from there (`crate::state::request_region`), so a suite whose
+    /// rule is about that region — an ARN compared against it, an ARN minted with it —
+    /// drives this form and the rest keep [`call`](Self::call).
+    pub async fn call_in_region(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Reply {
         let payload = body.map_or_else(Vec::new, |value| {
             serde_json::to_vec(&value).expect("a serializable request body")
         });
         let request = http::Request::builder()
             .method(method)
-            .uri(format!("https://bedrock.{REGION}.amazonaws.com{path}"))
+            .uri(format!("https://bedrock.{region}.amazonaws.com{path}"))
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/bedrock/\
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/bedrock/\
                      aws4_request, SignedHeaders=host, Signature=00"
                 ),
             )

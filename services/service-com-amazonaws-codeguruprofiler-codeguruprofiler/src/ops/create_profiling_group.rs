@@ -247,6 +247,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             latest_agent_profile_reported_at: None,
             profiles: ::std::collections::VecDeque::new(),
             seen_profile_tokens: ::std::collections::VecDeque::new(),
+            // A new group has had no recommendation analysis recorded against it, so it
+            // holds no findings reports: `ListFindingsReports` reports the empty list.
+            findings_reports: ::std::collections::VecDeque::new(),
         };
         let description = group.description();
         guard

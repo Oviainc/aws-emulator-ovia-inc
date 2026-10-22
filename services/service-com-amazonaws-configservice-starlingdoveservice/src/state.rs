@@ -14,9 +14,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ComplianceContributorCount, ComplianceSummary, ConfigRule, ConfigSnapshotDeliveryProperties,
-    ConfigurationRecorder, ConfigurationRecorderStatus, DeliveryChannel,
-    EvaluationModeConfiguration, ExclusionByResourceTypes, RecordingGroup, RecordingMode,
+    AccountAggregationSource, AggregatorFilters, ComplianceContributorCount, ComplianceSummary,
+    ConfigRule, ConfigSnapshotDeliveryProperties, ConfigurationAggregator, ConfigurationRecorder,
+    ConfigurationRecorderStatus, DeliveryChannel, EvaluationModeConfiguration,
+    ExclusionByResourceTypes, OrganizationAggregationSource, RecordingGroup, RecordingMode,
     RecordingStrategy, Scope, Source, Tag,
 };
 
@@ -111,6 +112,20 @@ pub const RECORDER_STATUS_SETTLE_AFTER: Duration = Duration::from_millis(500);
 /// `PutConfigRule` refuses a new rule with `MaxNumberOfConfigRulesExceededException`.
 /// 150 is the Config rules service quota (managed plus custom rules per Region).
 pub const CONFIG_RULES_QUOTA: usize = 150;
+
+/// The most configuration aggregators this account and Region can hold, after which
+/// `PutConfigurationAggregator` refuses a new one with `LimitExceededException`
+/// (`LimitExceededException`: "For PutConfigurationAggregator API, this exception is
+/// thrown if the number of accounts and aggregators exceeds the limit"). 50 is the
+/// Config "maximum number of configuration aggregators" service quota.
+pub const CONFIGURATION_AGGREGATORS_QUOTA: usize = 50;
+
+/// How many aggregators one `DescribeConfigurationAggregators` page carries when the
+/// request asks for no `Limit` (`DescribeConfigurationAggregatorsRequest$Limit`: "The
+/// maximum number of configuration aggregators returned on each page. The default is
+/// maximum. If you specify 0, Config uses the default") — the maximum being the
+/// modelled `Limit` range maximum.
+pub const DESCRIBE_CONFIGURATION_AGGREGATORS_PAGE_SIZE: i32 = 100;
 
 /// How many rules one `DescribeConfigRules` page carries.
 ///
@@ -321,6 +336,54 @@ impl ConfigRuleEntry {
     }
 }
 
+/// One persisted configuration aggregator.
+///
+/// An aggregator aggregates EITHER individual source accounts
+/// ([`Self::account_aggregation_sources`]) OR an organization
+/// ([`Self::organization_aggregation_source`]) — never both, which is what
+/// `PutConfigurationAggregator` refuses.
+#[derive(Debug, Clone)]
+pub struct ConfigurationAggregatorEntry {
+    pub name: String,
+    /// The id Config assigned this aggregator when it was created
+    /// (`config-aggregator-<base-36>`). It is the resource segment of the
+    /// aggregator's ARN and never changes once minted.
+    pub id: String,
+    pub arn: String,
+    pub account_aggregation_sources: Vec<AccountAggregationSource>,
+    pub organization_aggregation_source: Option<OrganizationAggregationSource>,
+    pub aggregator_filters: Option<AggregatorFilters>,
+    pub created_at: SystemTime,
+    /// When the aggregator's sources or filters were last replaced. Equals
+    /// [`Self::created_at`] until the first update.
+    pub last_updated_at: SystemTime,
+    /// Tags are taken at creation and not updated afterwards
+    /// (`PutConfigurationAggregator`: "Tags are added at creation and cannot be
+    /// updated with this operation ... tags will not be updated, even if they are
+    /// different. Use TagResource and UntagResource to update tags after creation").
+    pub tags: Vec<Tag>,
+}
+
+impl ConfigurationAggregatorEntry {
+    /// The modelled `ConfigurationAggregator`, read back out of state.
+    ///
+    /// `CreatedBy` names the Amazon Web Services service that created the aggregator,
+    /// so it stays unset for one a caller created.
+    pub fn to_shape(&self) -> ConfigurationAggregator {
+        ConfigurationAggregator {
+            configuration_aggregator_name: Some(self.name.clone()),
+            configuration_aggregator_arn: Some(self.arn.clone()),
+            account_aggregation_sources: (!self.account_aggregation_sources.is_empty())
+                .then(|| self.account_aggregation_sources.clone()),
+            organization_aggregation_source: self.organization_aggregation_source.clone(),
+            creation_time: Some(timestamp(self.created_at)),
+            last_updated_time: Some(timestamp(self.last_updated_at)),
+            created_by: None,
+            aggregator_filters: self.aggregator_filters.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-configservice-starlingdoveservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
@@ -341,6 +404,13 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// Source of the next configuration recorder id, so every recorder Config
     /// creates here gets a distinct one.
     pub next_recorder_seq: u64,
+    /// Configuration aggregators, keyed by `ConfigurationAggregatorName`. A
+    /// `BTreeMap` so `DescribeConfigurationAggregators` pages over a stable ordering
+    /// and a page token survives aggregators created and deleted between pages.
+    pub configuration_aggregators: BTreeMap<String, ConfigurationAggregatorEntry>,
+    /// Source of the next configuration aggregator id, so every aggregator gets a
+    /// distinct one.
+    pub next_aggregator_seq: u64,
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -394,6 +464,32 @@ fn splitmix64(seq: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
+}
+
+/// The ARN resource type of a configuration aggregator, as Config spells it in the
+/// ARNs it mints (`ConfigurationAggregatorArn`'s pattern:
+/// `config-aggregator/config-aggregator-[a-z\d]+`).
+pub const AGGREGATOR_ARN_RESOURCE_TYPE: &str = "config-aggregator";
+
+/// The ARN of a configuration aggregator:
+/// `arn:aws:config:<region>:<account>:config-aggregator/config-aggregator-<id>`.
+pub fn configuration_aggregator_arn(region: &str, id: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{AGGREGATOR_ARN_RESOURCE_TYPE}/{id}"),
+    )
+}
+
+/// The id Config assigns the `seq`-th configuration aggregator created in this
+/// emulator: `config-aggregator-` plus eight base-36 characters, the shape the
+/// `ConfigurationAggregatorArn` pattern allows (`config-aggregator-[a-z\d]+`).
+///
+/// [`splitmix64`] spreads the digits so a caller cannot read a creation order out of
+/// an id; being a bijection on `u64`, distinct sequence numbers still give distinct
+/// ids.
+pub fn mint_configuration_aggregator_id(seq: u64) -> String {
+    format!("{AGGREGATOR_ARN_RESOURCE_TYPE}-{}", base36(splitmix64(seq), 8))
 }
 
 /// The ARN of a Config rule: `arn:aws:config:<region>:<account>:config-rule/<id>`.
@@ -577,6 +673,19 @@ pub fn no_such_config_rule_message(name: &str) -> String {
     format!(
         "The ConfigRule '{name}' provided in the request is invalid. Please check the \
          configRule name."
+    )
+}
+
+/// How Config words `NoSuchConfigurationAggregatorException` for a request that named
+/// an aggregator this account does not hold.
+///
+/// The message is BUILT FROM THE REQUEST — it quotes the
+/// `ConfigurationAggregatorName` the caller sent and names the member to check — so
+/// every operation that refuses an absent aggregator words it the same way.
+pub fn no_such_configuration_aggregator_message(name: &str) -> String {
+    format!(
+        "The configuration aggregator '{name}' provided in the request does not exist. \
+         Please check the ConfigurationAggregatorName and try again."
     )
 }
 

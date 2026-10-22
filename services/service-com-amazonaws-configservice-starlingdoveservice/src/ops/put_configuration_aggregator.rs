@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutConfigurationAggregator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutConfigurationAggregator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutConfigurationAggregator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates a configuration aggregator in [`crate::state`]. A new aggregator
+//! is assigned and persisted an id, the ARN built from it, and a creation time; a
+//! request naming one that already exists REPLACES its aggregation sources and filters
+//! and bumps `LastUpdatedTime`, keeping the id, the ARN, the creation time and the tags
+//! it was created with, so `DescribeConfigurationAggregators` reads back exactly what
+//! was written.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +184,182 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutConfigurationAggregator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutConfigurationAggregatorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutConfigurationAggregator"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let account_sources = input.account_aggregation_sources.unwrap_or_default();
+        let organization_source = input.organization_aggregation_source;
+
+        // An aggregator aggregates EITHER individual source accounts OR an
+        // organization: "The source account can be individual account(s) or an
+        // organization."
+        match (!account_sources.is_empty(), organization_source.is_some()) {
+            (true, true) => {
+                return Err(invalid_parameter_value(
+                    "the configuration aggregator cannot be created because the request \
+                     contains both AccountAggregationSources and \
+                     OrganizationAggregationSource; include only one aggregation source \
+                     and try again",
+                ));
+            }
+            (false, false) => {
+                return Err(invalid_parameter_value(
+                    "the configuration aggregator cannot be created because the request is \
+                     missing both AccountAggregationSources and \
+                     OrganizationAggregationSource; include one aggregation source and \
+                     try again",
+                ));
+            }
+            _ => {}
+        }
+
+        // Every aggregation source names the Regions it aggregates: all of them
+        // (`AllAwsRegions`, which also takes in "future regions") or the explicit list
+        // in `AwsRegions` — one of the two, never both and never neither.
+        for source in &account_sources {
+            check_aggregated_regions(
+                "AccountAggregationSources",
+                source.all_aws_regions,
+                source.aws_regions.as_deref(),
+            )?;
+        }
+        if let Some(organization_source) = organization_source.as_ref() {
+            check_aggregated_regions(
+                "OrganizationAggregationSource",
+                organization_source.all_aws_regions,
+                organization_source.aws_regions.as_deref(),
+            )?;
+            // The organization source's role is what Config assumes to read the
+            // organization's details, so an empty ARN leaves it nothing to assume —
+            // which is what `InvalidRoleException` reports ("You have provided a null or
+            // empty Amazon Resource Name (ARN) for the IAM role").
+            if organization_source.role_arn.trim().is_empty() {
+                return Err(PutConfigurationAggregatorErrorModeled::InvalidRoleException(
+                    InvalidRoleException {
+                        message: Some(
+                            "OrganizationAggregationSource.RoleArn is empty; provide the ARN \
+                             of the IAM role Config assumes to retrieve your organization's \
+                             details"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // `AggregatorFilters`: "Either ResourceType or ServicePrincipal is required."
+        if let Some(filters) = input.aggregator_filters.as_ref() {
+            if filters.resource_type.is_none() && filters.service_principal.is_none() {
+                return Err(invalid_parameter_value(
+                    "AggregatorFilters requires either ResourceType or ServicePrincipal",
+                ));
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let name = input.configuration_aggregator_name;
+        let mut store = state.lock();
+
+        // A new aggregator has to fit under this Region's aggregator quota; a request
+        // that updates one which already exists consumes nothing.
+        if !store.configuration_aggregators.contains_key(&name)
+            && store.configuration_aggregators.len()
+                >= crate::state::CONFIGURATION_AGGREGATORS_QUOTA
+        {
+            return Err(PutConfigurationAggregatorErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this account already has the maximum of {} configuration \
+                         aggregators in this Region",
+                        crate::state::CONFIGURATION_AGGREGATORS_QUOTA,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if let Some(existing) = store.configuration_aggregators.get_mut(&name) {
+            // Putting an aggregator that already exists is idempotent: it keeps the id,
+            // the ARN and the creation time it was created with, and its tags are left
+            // alone even when this request carries different ones ("tags will not be
+            // updated, even if they are different. Use TagResource and UntagResource to
+            // update tags after creation"). The accounts the request carries REPLACE the
+            // ones the aggregator held ("accountIds that are passed will be replaced
+            // with existing accounts").
+            existing.account_aggregation_sources = account_sources;
+            existing.organization_aggregation_source = organization_source;
+            existing.aggregator_filters = input.aggregator_filters;
+            existing.last_updated_at = now;
+        } else {
+            let sequence = store.next_aggregator_seq;
+            // A u64 counter cannot be exhausted by API calls, so it never reissues an
+            // id; saturating rather than wrapping keeps that true by construction.
+            store.next_aggregator_seq = sequence.saturating_add(1);
+            let id = crate::state::mint_configuration_aggregator_id(sequence);
+            let arn = crate::state::configuration_aggregator_arn(&region, &id);
+            store.configuration_aggregators.insert(
+                name.clone(),
+                crate::state::ConfigurationAggregatorEntry {
+                    name: name.clone(),
+                    id,
+                    arn,
+                    account_aggregation_sources: account_sources,
+                    organization_aggregation_source: organization_source,
+                    aggregator_filters: input.aggregator_filters,
+                    created_at: now,
+                    last_updated_at: now,
+                    tags: input.tags.unwrap_or_default(),
+                },
+            );
+        }
+
+        let aggregator = store
+            .configuration_aggregators
+            .get(&name)
+            .expect("the aggregator was just created or updated under this name")
+            .to_shape();
+
+        Ok(PutConfigurationAggregatorOutput {
+            configuration_aggregator: Some(aggregator),
+        })
+    }
+}
+
+/// Refuse the request with the modelled `InvalidParameterValueException` ("One or more
+/// of the specified parameters are not valid"), which is how Config answers a request
+/// whose aggregation sources cannot hold together.
+fn invalid_parameter_value(message: &str) -> PutConfigurationAggregatorError {
+    PutConfigurationAggregatorErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message.to_string()),
+        },
+    )
+    .into()
+}
+
+/// Check that `member`'s aggregation source names the Regions it aggregates: either
+/// `AllAwsRegions` or a non-empty `AwsRegions`, and not both.
+///
+/// The message is BUILT FROM THE REQUEST — it names the member whose Regions are wrong
+/// — so both kinds of aggregation source are refused the same way.
+fn check_aggregated_regions(
+    member: &str,
+    all_aws_regions: bool,
+    aws_regions: Option<&[String]>,
+) -> Result<(), PutConfigurationAggregatorError> {
+    let listed = aws_regions.is_some_and(|regions| !regions.is_empty());
+    match (all_aws_regions, listed) {
+        (true, true) => Err(invalid_parameter_value(&format!(
+            "{member} contains both AllAwsRegions and AwsRegions; specify only one of them \
+             and try again"
+        ))),
+        (false, false) => Err(invalid_parameter_value(&format!(
+            "{member} specifies no regions; list the source regions in AwsRegions or set \
+             AllAwsRegions to true and try again"
+        ))),
+        _ => Ok(()),
     }
 }
