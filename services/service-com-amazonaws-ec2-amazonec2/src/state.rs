@@ -118,7 +118,7 @@
 //! reasons the VPC and subnet stores do.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::Ipv6Addr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -128,6 +128,7 @@ use crate::ops::types::{
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
     LaunchTemplate, Monitoring, OperatorResponse, Placement, PrivateDnsNameOptionsOnLaunch,
     RequestLaunchTemplateData, RunInstancesOutput, SecurityGroup, StateReason, Subnet, Tag,
+    TagSpecification,
     UserIdGroupPair, Vpc, VpcCidrBlockAssociation, VpcCidrBlockState,
 };
 use crate::scaffolded::Scaffolded;
@@ -752,6 +753,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// field-by-field copy. Ordered by id, which is the order the describe reports and
     /// pages over.
     pub subnets: BTreeMap<String, Subnet>,
+    /// When each subnet's `pending` -> `available` transition falls due, for the subnets
+    /// that have one.
+    ///
+    /// The subnet counterpart of [`Self::vpc_available_at`], for the same reason and on the
+    /// same clock: `CreateSubnet` answers a subnet in the non-terminal `pending` state, so
+    /// the clock owes it `available` [`TRANSITION_DELAY`] later whether or not anybody
+    /// calls again. A subnet AWS hands over ready — a default VPC's default subnets — never
+    /// has an entry here.
+    pub subnet_available_at: BTreeMap<String, Instant>,
     /// Every AMI the account can see, by `ImageId`, as the modelled [`Image`] shape itself
     /// — the Amazon-published catalog a fresh account already has (see the module docs)
     /// plus any image a writer stores later. Ordered by id, which is the order the
@@ -800,6 +810,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_available_at: BTreeMap::new(),
             vpc_attributes: BTreeMap::new(),
             subnets: BTreeMap::new(),
+            subnet_available_at: BTreeMap::new(),
             images: BTreeMap::new(),
             security_groups: BTreeMap::new(),
             launch_templates: BTreeMap::new(),
@@ -1058,6 +1069,13 @@ impl ComAmazonawsEc2Amazonec2State {
     /// Everything the service itself owns is derived here rather than taken from the
     /// caller: the id, the ARN built from it, and the owning account — so two writers
     /// cannot report the same group differently.
+    ///
+    /// The record's caller-chosen bytes are NOT charged here, because not every writer has
+    /// any: `CreateSecurityGroup` charges [`security_group_payload_bytes`] of the group it
+    /// stores, while [`Self::insert_default_security_group`] writes a name and description
+    /// the SERVICE chose, which the budget ([`MAX_STORED_BYTES`], a bound on caller-supplied
+    /// data) does not count. [`Self::remove_security_group`] gives back on exactly the same
+    /// terms.
     pub fn insert_security_group(&mut self, spec: SecurityGroupSpec) -> String {
         let group_id = self.next_id("sg");
         let group = SecurityGroup {
@@ -1720,6 +1738,19 @@ impl ComAmazonawsEc2Amazonec2State {
                 }
             }
             // The transition is applied once; nothing is owed on this VPC any more.
+            false
+        });
+        let subnets = &mut self.subnets;
+        self.subnet_available_at.retain(|subnet_id, due_at| {
+            if now < *due_at {
+                return true;
+            }
+            if let Some(subnet) = subnets.get_mut(subnet_id) {
+                if subnet.state.as_deref() == Some(SUBNET_STATE_PENDING) {
+                    subnet.state = Some(SUBNET_STATE_AVAILABLE.to_string());
+                }
+            }
+            // The transition is applied once; nothing is owed on this subnet any more.
             false
         });
     }
@@ -3062,33 +3093,19 @@ pub enum CidrProblem {
 /// the host bits are cleared rather than the value being refused. The prefix length is
 /// held to the published block size ([`MIN_VPC_IPV4_PREFIX`]..=[`MAX_VPC_IPV4_PREFIX`]).
 ///
-/// The address itself is parsed by the standard library's `Ipv4Addr`, the same parser
-/// [`parse_ipv4_cidr_block`] uses, so this crate keeps ONE rule for what an IPv4 address
-/// is; the only difference between the two readers is that this one CLEARS the host bits
-/// where that one requires them already clear.
+/// The block itself is read by [`canonical_ipv4_cidr`], which the subnet path
+/// ([`canonical_subnet_ipv4_cidr`]) reads its own blocks with too, so this crate keeps ONE
+/// rule for what an IPv4 CIDR block is and only the published block size differs between
+/// the two. That reader in turn parses the address with the standard library's `Ipv4Addr`,
+/// the same parser [`parse_ipv4_cidr_block`] uses; the only difference between those two
+/// is that this path CLEARS the host bits where that one requires them already clear.
 pub fn canonical_vpc_ipv4_cidr(value: &str) -> Result<String, CidrProblem> {
-    let (address, prefix_length) = value.split_once('/').ok_or(CidrProblem::Malformed)?;
-    let base = u32::from(
-        address
-            .parse::<::std::net::Ipv4Addr>()
-            .map_err(|_| CidrProblem::Malformed)?,
-    );
-    let prefix_length: u8 = prefix_length.parse().map_err(|_| CidrProblem::Malformed)?;
-    if prefix_length > 32 {
-        // No IPv4 block has a prefix longer than its address, so the value is malformed
-        // rather than a block of a disallowed size.
-        return Err(CidrProblem::Malformed);
-    }
+    let canonical = canonical_ipv4_cidr(value)?;
+    let (_, prefix_length) = split_ipv4_cidr(&canonical).ok_or(CidrProblem::Malformed)?;
     if !(MIN_VPC_IPV4_PREFIX..=MAX_VPC_IPV4_PREFIX).contains(&prefix_length) {
         return Err(CidrProblem::PrefixLength);
     }
-    let mask = u32::MAX
-        .checked_shl(u32::from(32 - prefix_length))
-        .unwrap_or_default();
-    Ok(format!(
-        "{}/{prefix_length}",
-        ::std::net::Ipv4Addr::from(base & mask)
-    ))
+    Ok(canonical)
 }
 
 /// A requested IPv6 CIDR block in canonical form: the host bits cleared, the address
@@ -3808,8 +3825,28 @@ fn page_token_checksum(start_at: &str) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Security groups: what the CREATE path adds to the describe path's own helpers
+// The VPC-scoped network resource lifecycle
 // ---------------------------------------------------------------------------
+//
+// A subnet and a security group are resources INSIDE a VPC: each is created into one
+// named VPC, reported by that resource's describe, and deleted once nothing depends on
+// it — and the VPC itself can only be deleted once it holds none of them, because
+// "you must detach or delete all gateways and resources that are associated with the
+// VPC before you can delete it … When you delete the VPC, it deletes the default
+// security group, network ACL, and route table for the VPC" (`DeleteVpc`). What those
+// operations share — the dependency question, the removal that gives the record's
+// bytes back, and the error codes a refusal carries — lives here, so one rule cannot be
+// enforced two ways. The security-group CREATE path's own helpers (its text alphabet,
+// its id form) are below, beside the group create that reads them.
+
+/// A subnet AWS is still creating: the `SubnetState` enum's `pending` member
+/// (`smithy_query(query="shape",shape="SubnetState")`), which is what `CreateSubnet`
+/// answers with until [`TRANSITION_DELAY`] has passed — the subnet counterpart of
+/// [`VPC_STATE_PENDING`].
+pub const SUBNET_STATE_PENDING: &str = "pending";
+
+/// The `ResourceType` a `CreateSubnet` tag specification may name: the subnet it creates.
+pub const RESOURCE_TYPE_SUBNET: &str = "subnet";
 
 /// The `ResourceType` a `CreateSecurityGroup` tag specification may name: the group it
 /// creates (`ResourceType` enum member `security-group`).
@@ -3840,6 +3877,234 @@ pub const MAX_SECURITY_GROUPS: usize = 2_500;
 /// EC2's error code for a create that would take the account past its security group
 /// quota (EC2 API error codes, "SecurityGroupLimitExceeded").
 pub const SECURITY_GROUP_LIMIT_EXCEEDED: &str = "SecurityGroupLimitExceeded";
+
+/// EC2's error code for a delete the resource's own dependencies forbid — "the operation
+/// fails with `DependencyViolation`" (`DeleteSecurityGroup`).
+pub const DEPENDENCY_VIOLATION: &str = "DependencyViolation";
+
+/// EC2's error code for a delete of a resource the service owns rather than the caller:
+/// the default security group a VPC comes with, which only `DeleteVpc` removes.
+pub const CANNOT_DELETE: &str = "CannotDelete";
+
+/// EC2's error code for a subnet CIDR block that overlaps one already in the VPC: "A
+/// subnet CIDR block must not overlap the CIDR block of an existing subnet in the VPC"
+/// (`CreateSubnet`).
+pub const INVALID_SUBNET_CONFLICT: &str = "InvalidSubnet.Conflict";
+
+/// EC2's error code for a subnet CIDR block that is not inside its VPC's: a subnet is a
+/// range OF the VPC's range, so a block outside it names no part of the VPC.
+pub const INVALID_SUBNET_RANGE: &str = "InvalidSubnet.Range";
+
+/// The smallest IPv4 prefix length a SUBNET CIDR block may have: "The allowed size for an
+/// IPv4 subnet is between a /28 netmask (16 IP addresses) and a /16 netmask (65,536 IP
+/// addresses)" (`CreateSubnet`) — the same published bounds as a VPC's own block, named
+/// separately because they come from a different sentence and could move apart.
+pub const MIN_SUBNET_IPV4_PREFIX: u8 = 16;
+
+/// The largest IPv4 prefix length a subnet CIDR block may have (see
+/// [`MIN_SUBNET_IPV4_PREFIX`]).
+pub const MAX_SUBNET_IPV4_PREFIX: u8 = 28;
+
+/// A requested IPv4 SUBNET CIDR block in the canonical form AWS stores it in.
+///
+/// "We modify the specified CIDR block to its canonical form; for example, if you specify
+/// 100.68.0.18/18, we modify it to 100.68.0.0/18" (`CreateSubnetRequest$CidrBlock`) — the
+/// same canonicalisation as a VPC's block, held to the subnet block size
+/// ([`MIN_SUBNET_IPV4_PREFIX`]..=[`MAX_SUBNET_IPV4_PREFIX`]).
+pub fn canonical_subnet_ipv4_cidr(value: &str) -> Result<String, CidrProblem> {
+    let canonical = canonical_ipv4_cidr(value)?;
+    let (_, prefix_length) = split_ipv4_cidr(&canonical).ok_or(CidrProblem::Malformed)?;
+    if !(MIN_SUBNET_IPV4_PREFIX..=MAX_SUBNET_IPV4_PREFIX).contains(&prefix_length) {
+        return Err(CidrProblem::PrefixLength);
+    }
+    Ok(canonical)
+}
+
+/// `value` as an IPv4 CIDR block with its host bits cleared, with NO rule on the prefix
+/// length: the one reader both [`canonical_vpc_ipv4_cidr`] and
+/// [`canonical_subnet_ipv4_cidr`] put their own published block size on top of.
+fn canonical_ipv4_cidr(value: &str) -> Result<String, CidrProblem> {
+    let (address, prefix_length) = value.split_once('/').ok_or(CidrProblem::Malformed)?;
+    let base = u32::from(
+        address
+            .parse::<::std::net::Ipv4Addr>()
+            .map_err(|_| CidrProblem::Malformed)?,
+    );
+    let prefix_length: u8 = prefix_length.parse().map_err(|_| CidrProblem::Malformed)?;
+    if prefix_length > 32 {
+        // No IPv4 block has a prefix longer than its address, so the value is malformed
+        // rather than a block of a disallowed size.
+        return Err(CidrProblem::Malformed);
+    }
+    let mask = u32::MAX
+        .checked_shl(u32::from(32 - prefix_length))
+        .unwrap_or_default();
+    Ok(format!(
+        "{}/{prefix_length}",
+        ::std::net::Ipv4Addr::from(base & mask)
+    ))
+}
+
+/// `block` as its base address and prefix length, for a block already in canonical form.
+fn split_ipv4_cidr(block: &str) -> Option<(u32, u8)> {
+    let (address, prefix_length) = block.split_once('/')?;
+    let base = u32::from(address.parse::<::std::net::Ipv4Addr>().ok()?);
+    let prefix_length: u8 = prefix_length.parse().ok()?;
+    (prefix_length <= 32).then_some((base, prefix_length))
+}
+
+/// The first and last address of `block`, or `None` when it is not an IPv4 CIDR block.
+fn ipv4_cidr_bounds(block: &str) -> Option<(u32, u32)> {
+    let (base, prefix_length) = split_ipv4_cidr(block)?;
+    let size = 1u64 << (32 - u32::from(prefix_length));
+    let last = u64::from(base).checked_add(size - 1)?;
+    Some((base, u32::try_from(last).ok()?))
+}
+
+/// Do `left` and `right` share any address?
+///
+/// Two CIDR blocks of the same family overlap exactly when one's range meets the other's,
+/// which is the question "A subnet CIDR block must not overlap the CIDR block of an
+/// existing subnet in the VPC" (`CreateSubnet`) asks. A block this emulator cannot read
+/// overlaps nothing, rather than being guessed at.
+pub fn ipv4_cidr_blocks_overlap(left: &str, right: &str) -> bool {
+    match (ipv4_cidr_bounds(left), ipv4_cidr_bounds(right)) {
+        (Some((left_first, left_last)), Some((right_first, right_last))) => {
+            left_first <= right_last && right_first <= left_last
+        }
+        _ => false,
+    }
+}
+
+/// Is every address of `inner` an address of `outer`?
+///
+/// A subnet's block has to be a block OF its VPC's block, so this is the containment the
+/// create path checks before the overlap one. An unreadable block contains nothing and is
+/// contained by nothing.
+pub fn ipv4_cidr_block_contains(outer: &str, inner: &str) -> bool {
+    match (ipv4_cidr_bounds(outer), ipv4_cidr_bounds(inner)) {
+        (Some((outer_first, outer_last)), Some((inner_first, inner_last))) => {
+            outer_first <= inner_first && inner_last <= outer_last
+        }
+        _ => false,
+    }
+}
+
+/// The tags a create assigns to the ONE resource it creates, from the request's
+/// `TagSpecifications`.
+///
+/// "You must specify the resource type to tag, otherwise the request will fail"
+/// (`TagSpecification`), and the only type an action may name is the resource it creates —
+/// so a specification naming anything else is refused rather than silently dropped.
+///
+/// The tag payload is bounded here the way `CreateTags` bounds its own: at most the
+/// documented number of tags per resource, each key and value within its documented
+/// length, no key given twice ("Tag keys must be unique per resource", so two entries for
+/// one key have no defined winner), and no key in the reserved `aws:` namespace. A count
+/// of resources is not a bound on the caller-chosen bytes each one holds, which is why
+/// every create charges [`tag_list_bytes`] of the result against the store's byte budget.
+pub fn tags_from_specifications<E>(
+    specifications: Option<&[TagSpecification]>,
+    resource_type: &str,
+    operation: &str,
+) -> Result<Vec<Tag>, Scaffolded<E>> {
+    let mut tags: Vec<Tag> = Vec::new();
+    for specification in specifications.unwrap_or_default() {
+        match specification.resource_type.as_deref() {
+            Some(named) if named == resource_type => {
+                tags.extend(specification.tags.clone().unwrap_or_default());
+            }
+            Some(other) => {
+                return Err(invalid_parameter_value(format!(
+                    "'{other}' is not a valid resource type for tagging on {operation}"
+                )))
+            }
+            None => {
+                return Err(missing_parameter(
+                    "Tag specification resource type must have a value",
+                ))
+            }
+        }
+    }
+    if tags.len() > MAX_TAGS_PER_RESOURCE {
+        return Err(Scaffolded::tag_limit_exceeded(format!(
+            "The request carries {} tags, above the maximum of {max} per resource",
+            tags.len(),
+            max = MAX_TAGS_PER_RESOURCE,
+        )));
+    }
+    let mut keys_seen: BTreeSet<&str> = BTreeSet::new();
+    for tag in &tags {
+        let key = tag.key.as_deref().unwrap_or_default();
+        if key.is_empty() {
+            return Err(invalid_parameter_value("A tag key cannot be empty"));
+        }
+        if key.starts_with(RESERVED_TAG_PREFIX) {
+            return Err(invalid_parameter_value(format!(
+                "Tag key '{key}' is invalid: the '{prefix}' prefix is reserved",
+                prefix = RESERVED_TAG_PREFIX,
+            )));
+        }
+        if !keys_seen.insert(key) {
+            return Err(invalid_parameter_value(format!(
+                "Tag key '{key}' is given more than once; tag keys must be unique"
+            )));
+        }
+        validate_tag_size(key, tag.value.as_deref().unwrap_or_default())?;
+    }
+    Ok(tags)
+}
+
+/// Refuse a delete the resource's own dependencies forbid: HTTP 400
+/// `DependencyViolation`. `message` names the resource and what still depends on it, so
+/// the caller knows what to delete first.
+pub fn dependency_violation<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(DEPENDENCY_VIOLATION, 400, message)
+}
+
+/// Refuse a delete of the default security group of a VPC: HTTP 400 `CannotDelete`. That
+/// group exists for as long as its VPC does — "When you delete the VPC, it deletes the
+/// default security group" (`DeleteVpc`) — so only `DeleteVpc` removes it.
+pub fn cannot_delete<E>(group_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        CANNOT_DELETE,
+        400,
+        format!(
+            "The security group '{group_id}' is the default group of its VPC \
+             and cannot be deleted"
+        ),
+    )
+}
+
+/// Refuse a subnet CIDR block that overlaps one already in the VPC: HTTP 400
+/// `InvalidSubnet.Conflict`.
+pub fn invalid_subnet_conflict<E>(cidr_block: &str, subnet_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_SUBNET_CONFLICT,
+        400,
+        format!("The CIDR '{cidr_block}' conflicts with another subnet ('{subnet_id}')"),
+    )
+}
+
+/// Refuse a subnet CIDR block that is not inside its VPC's own block: HTTP 400
+/// `InvalidSubnet.Range`.
+pub fn invalid_subnet_range<E>(cidr_block: &str, vpc_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_SUBNET_RANGE,
+        400,
+        format!("The CIDR '{cidr_block}' is not within the CIDR block of VPC '{vpc_id}'"),
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_SUBNETS`]: HTTP 400
+/// `SubnetLimitExceeded`.
+pub fn subnet_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        SUBNET_LIMIT_EXCEEDED,
+        400,
+        format!("The maximum number of subnets has been reached ({MAX_SUBNETS})"),
+    )
+}
 
 /// EC2's error code for a second security group with a name the VPC already holds: "You
 /// can't have two security groups for the same VPC with the same name"
@@ -3898,4 +4163,209 @@ pub fn security_group_limit_exceeded<E>() -> Scaffolded<E> {
     )
 }
 
+/// The caller-chosen bytes a stored VPC retains: its tags, plus the strings an IPv6
+/// association holds. The same quantity `CreateVpc` charged against the store's budget, so
+/// [`ComAmazonawsEc2Amazonec2State::remove_vpc`] gives back exactly what was taken.
+pub fn vpc_payload_bytes(vpc: &Vpc) -> usize {
+    let ipv6_bytes: usize = vpc
+        .ipv6_cidr_block_association_set
+        .iter()
+        .flatten()
+        .map(|association| {
+            association.ipv6_cidr_block.as_deref().map_or(0, str::len)
+                + association.ipv6_pool.as_deref().map_or(0, str::len)
+                + association.network_border_group.as_deref().map_or(0, str::len)
+        })
+        .sum();
+    tag_list_bytes(vpc.tags.as_deref().unwrap_or_default()).saturating_add(ipv6_bytes)
+}
+
+/// The caller-chosen bytes a stored subnet retains: its tags, which is what
+/// [`ComAmazonawsEc2Amazonec2State::insert_subnet`] charged.
+pub fn subnet_payload_bytes(subnet: &Subnet) -> usize {
+    tag_list_bytes(subnet.tags.as_deref().unwrap_or_default())
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The account's default VPC, by id — the VPC a request that names none is about:
+    /// "If you don't specify a security group when you launch an instance, the instance is
+    /// launched into the appropriate default security group" (`CreateSecurityGroup`), the
+    /// group of that VPC.
+    pub fn default_vpc_id(&self) -> Option<String> {
+        self.vpcs
+            .iter()
+            .find(|(_, vpc)| vpc.is_default == Some(true))
+            .map(|(vpc_id, _)| vpc_id.clone())
+    }
+
+    /// Whether `group_id` is the default security group of its VPC: the group named
+    /// [`DEFAULT_SECURITY_GROUP_NAME`], which every VPC comes with and only `DeleteVpc`
+    /// removes.
+    pub fn is_default_security_group(&self, group_id: &str) -> bool {
+        self.security_groups
+            .get(group_id)
+            .and_then(|group| group.group_name.as_deref())
+            .is_some_and(|name| name == DEFAULT_SECURITY_GROUP_NAME)
+    }
+
+    /// The instances that still hold a place in `subnet_id`.
+    ///
+    /// "You must terminate all running instances in the subnet before you can delete the
+    /// subnet" (`DeleteSubnet`) — an instance that has reached `terminated` holds nothing
+    /// any more, so it is not a dependency; every other state is.
+    pub fn instances_in_subnet(&self, subnet_id: &str) -> Vec<String> {
+        let mut found: Vec<String> = self
+            .instances
+            .values()
+            .filter(|instance| {
+                instance.subnet_id.as_deref() == Some(subnet_id)
+                    && instance.state != InstanceStateName::Terminated
+            })
+            .map(|instance| instance.instance_id.clone())
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// What still depends on the security group `group_id`, as the ids of the depending
+    /// resources.
+    ///
+    /// "If you attempt to delete a security group that is associated with an instance or
+    /// network interface, is referenced by another security group in the same VPC, or has a
+    /// VPC association, the operation fails with `DependencyViolation`"
+    /// (`DeleteSecurityGroup`): an instance that holds the group, and another group of the
+    /// same VPC whose rules name it.
+    pub fn security_group_dependencies(&self, group_id: &str) -> Vec<String> {
+        let vpc_id = self
+            .security_groups
+            .get(group_id)
+            .and_then(|group| group.vpc_id.clone());
+        let mut found: Vec<String> = self
+            .instances
+            .values()
+            .filter(|instance| {
+                instance.state != InstanceStateName::Terminated
+                    && instance
+                        .security_groups
+                        .iter()
+                        .any(|(id, _)| id.as_deref() == Some(group_id))
+            })
+            .map(|instance| instance.instance_id.clone())
+            .collect();
+        for (other_id, other) in &self.security_groups {
+            if other_id == group_id || other.vpc_id != vpc_id {
+                continue;
+            }
+            let references = other
+                .ip_permissions
+                .iter()
+                .chain(other.ip_permissions_egress.iter())
+                .flatten()
+                .flat_map(|permission| permission.user_id_group_pairs.iter().flatten())
+                .any(|pair| pair.group_id.as_deref() == Some(group_id));
+            if references {
+                found.push(other_id.clone());
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// What still depends on the VPC `vpc_id`, as the ids of the depending resources.
+    ///
+    /// "You must detach or delete all gateways and resources that are associated with the
+    /// VPC before you can delete it. For example, you must terminate all instances running
+    /// in the VPC, delete all security groups associated with the VPC (except the default
+    /// one) … When you delete the VPC, it deletes the default security group, network ACL,
+    /// and route table for the VPC" (`DeleteVpc`). So the dependencies are this VPC's
+    /// subnets, its security groups other than the default one, and the instances still
+    /// running in it; the default group is NOT one, because the delete removes it.
+    pub fn vpc_dependencies(&self, vpc_id: &str) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        for (subnet_id, subnet) in &self.subnets {
+            if subnet.vpc_id.as_deref() == Some(vpc_id) {
+                found.push(subnet_id.clone());
+            }
+        }
+        for (group_id, group) in &self.security_groups {
+            if group.vpc_id.as_deref() == Some(vpc_id)
+                && group.group_name.as_deref() != Some(DEFAULT_SECURITY_GROUP_NAME)
+            {
+                found.push(group_id.clone());
+            }
+        }
+        for instance in self.instances.values() {
+            if instance.state == InstanceStateName::Terminated {
+                continue;
+            }
+            let in_vpc = instance.subnet_id.as_deref().is_some_and(|subnet_id| {
+                self.subnets
+                    .get(subnet_id)
+                    .and_then(|subnet| subnet.vpc_id.as_deref())
+                    == Some(vpc_id)
+            });
+            if in_vpc {
+                found.push(instance.instance_id.clone());
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// Remove the subnet `subnet_id` and answer it as it was last reported, or `None` when
+    /// the store holds no such subnet. The bytes the record held go back to the store's
+    /// budget, and the `available` transition the clock may still owe it goes with it, so a
+    /// later materialisation cannot resurrect a deleted subnet's state.
+    pub fn remove_subnet(&mut self, subnet_id: &str) -> Option<Subnet> {
+        let subnet = self.subnets.remove(subnet_id)?;
+        self.subnet_available_at.remove(subnet_id);
+        self.release_stored_bytes(subnet_payload_bytes(&subnet));
+        Some(subnet)
+    }
+
+    /// Remove the security group `group_id` and answer it as it was last reported, or
+    /// `None` when the store holds no such group.
+    ///
+    /// The bytes the record held go back to the store's budget on exactly the terms they
+    /// were taken on: `CreateSecurityGroup` charged [`security_group_payload_bytes`] of the
+    /// group it stored, while the default group of a VPC carries a name and description the
+    /// SERVICE chose and was never charged for them — so releasing for it would walk
+    /// `stored_bytes` below what the store actually holds and silently weaken
+    /// [`MAX_STORED_BYTES`]. A caller cannot create a second group named
+    /// [`DEFAULT_SECURITY_GROUP_NAME`] in a VPC (the name is already taken), so that name
+    /// identifies the uncharged group exactly.
+    pub fn remove_security_group(&mut self, group_id: &str) -> Option<SecurityGroup> {
+        let was_default = self.is_default_security_group(group_id);
+        let group = self.security_groups.remove(group_id)?;
+        if !was_default {
+            self.release_stored_bytes(security_group_payload_bytes(&group));
+        }
+        Some(group)
+    }
+
+    /// Remove the VPC `vpc_id` with the resources its delete takes with it, and answer it
+    /// as it was last reported, or `None` when the store holds no such VPC.
+    ///
+    /// "When you delete the VPC, it deletes the default security group, network ACL, and
+    /// route table for the VPC" (`DeleteVpc`), so the groups of this VPC go here rather
+    /// than being left behind naming a VPC that no longer exists — the caller has already
+    /// had to delete every other one ([`Self::vpc_dependencies`]). The bytes every removed
+    /// record held go back to the store's budget, and the `available` transition the clock
+    /// may still owe the VPC goes with it.
+    pub fn remove_vpc(&mut self, vpc_id: &str) -> Option<Vpc> {
+        let vpc = self.vpcs.remove(vpc_id)?;
+        self.vpc_available_at.remove(vpc_id);
+        self.release_stored_bytes(vpc_payload_bytes(&vpc));
+        let groups: Vec<String> = self
+            .security_groups
+            .iter()
+            .filter(|(_, group)| group.vpc_id.as_deref() == Some(vpc_id))
+            .map(|(group_id, _)| group_id.clone())
+            .collect();
+        for group_id in groups {
+            self.remove_security_group(&group_id);
+        }
+        Some(vpc)
+    }
+}
 
