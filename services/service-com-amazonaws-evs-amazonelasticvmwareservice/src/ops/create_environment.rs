@@ -16,6 +16,22 @@
 //!    environment's VLAN subnets may overlap.
 //! 4. `hcxNetworkAclId` is required when `isHcxPublic` is true.
 //! 5. An environment name is unique within the account and Region.
+//! 6. `termsAccepted` must be true: it is the caller's confirmation that it holds the
+//!    VCF licenses the environment needs, so an environment cannot be created without
+//!    it.
+//! 7. The `vpcId` is not already used by another deployed environment of this Region.
+//!
+//! Whether the VPC *exists* is not one of them, and neither is the account's AWS
+//! Premium Support subscription: this emulator holds no EC2 and no account-subscription
+//! state to decide either from (EC2's own `CreateVpc` is still a 501 stub), and a guess
+//! either way would refuse or admit every request alike. Only preconditions this
+//! service can actually evaluate are enforced.
+//!
+//! Every one of those checks runs before anything is minted, and they are all
+//! evaluated: a request that breaks several is refused ONCE, with one
+//! `ValidationException` whose `fieldList` carries an entry per failed check and whose
+//! `message` joins those entries ([`crate::state::aggregate_validation_error`]). A
+//! refused request creates nothing.
 //!
 //! The store itself is bounded by [`crate::state::MAX_ENVIRONMENTS`]: this is the only
 //! operation that grows it, and it refuses with the service's
@@ -258,25 +274,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        validate_vcf_mode(&input)?;
-        let requested_hosts = input.hosts.unwrap_or_default();
-        validate_hosts(&requested_hosts)?;
-        let vlan_plan = plan_vlans(&input.initial_vlans)?;
+        // Every request-level precondition, evaluated before anything is minted. They
+        // are all collected rather than short-circuited: AWS reports a request's
+        // failed preconditions together, so a caller can correct them in one round
+        // trip instead of one refusal at a time.
+        let mut failures: Vec<ValidationExceptionField> = Vec::new();
+        failures.extend(terms_accepted_failure(&input));
+        failures.extend(vcf_mode_failures(&input));
+        failures.extend(host_failures(input.hosts.as_deref().unwrap_or_default()));
+        let vlan_plan = plan_vlans(&input.initial_vlans);
+        failures.extend(vlan_failures(&input.initial_vlans, &vlan_plan));
 
         let region = crate::state::request_region(ctx.parts());
         let mut state = state.lock();
         state.materialise_due_transitions();
 
+        // The two preconditions that depend on stored state rather than on the
+        // request alone, so they are gathered with the lock held.
         if let Some(name) = input.environment_name.as_deref() {
             if state.name_is_taken(&region, name) {
-                return Err(CreateEnvironmentErrorModeled::ValidationException(
-                    crate::state::request_validation_error(format!(
-                        "An environment named {name} already exists in {region}."
-                    )),
-                )
-                .into());
+                failures.push(crate::state::field_failure(
+                    "environmentName",
+                    &format!("is already used by an environment in {region}"),
+                ));
             }
         }
+        if state.vpc_is_in_use(&region, &input.vpc_id) {
+            failures.push(crate::state::field_failure(
+                "vpcId",
+                "is already used by another deployed Amazon EVS environment, which Amazon EVS \
+                 does not support",
+            ));
+        }
+
+        if !failures.is_empty() {
+            return Err(CreateEnvironmentErrorModeled::ValidationException(
+                crate::state::aggregate_validation_error(failures),
+            )
+            .into());
+        }
+        let requested_hosts = input.hosts.unwrap_or_default();
 
         // Bound the store before anything is minted: a generated emulator holds its
         // resources for the life of the process, so the create path is the one that
@@ -446,68 +483,68 @@ impl Ipv4Cidr {
     }
 }
 
-/// Refuse a request that uses a parameter the chosen VCF mode does not support:
-/// "When you specify SELF_DEPLOYED for vcfVersion ... The licenseInfo, hosts,
-/// vcfHostnames, siteId, and connectivityInfo parameters are not supported in this
-/// mode."
-fn validate_vcf_mode(input: &CreateEnvironmentInput) -> Result<(), CreateEnvironmentError> {
+/// The failure, if any, of the precondition that the caller accepted the terms:
+/// `termsAccepted` is the "Confirmation that the customer has purchased and will
+/// continue to maintain the required number of VCF software licenses to cover all
+/// physical processor cores in the Amazon EVS environment" (its own doc), so an
+/// environment cannot be created while it is false.
+fn terms_accepted_failure(input: &CreateEnvironmentInput) -> Option<ValidationExceptionField> {
+    (!input.terms_accepted).then(|| {
+        crate::state::field_failure(
+            "termsAccepted",
+            "must be accepted (true) before an environment can be created",
+        )
+    })
+}
+
+/// Every parameter the chosen VCF mode does not support: "When you specify
+/// SELF_DEPLOYED for vcfVersion ... The licenseInfo, hosts, vcfHostnames, siteId, and
+/// connectivityInfo parameters are not supported in this mode."
+fn vcf_mode_failures(input: &CreateEnvironmentInput) -> Vec<ValidationExceptionField> {
     if input.vcf_version != SELF_DEPLOYED {
-        return Ok(());
+        return Vec::new();
     }
-    let unsupported = [
+    [
         ("licenseInfo", input.license_info.is_some()),
         ("hosts", input.hosts.is_some()),
         ("vcfHostnames", input.vcf_hostnames.is_some()),
         ("siteId", input.site_id.is_some()),
         ("connectivityInfo", input.connectivity_info.is_some()),
-    ];
-    for (member, supplied) in unsupported {
-        if supplied {
-            return Err(CreateEnvironmentErrorModeled::ValidationException(
-                crate::state::field_validation_error(
-                    member,
-                    &format!("is not supported when vcfVersion is {SELF_DEPLOYED}"),
-                ),
-            )
-            .into());
-        }
-    }
-    Ok(())
+    ]
+    .into_iter()
+    .filter(|(_, supplied)| *supplied)
+    .map(|(member, _)| {
+        crate::state::field_failure(
+            member,
+            &format!("is not supported when vcfVersion is {SELF_DEPLOYED}"),
+        )
+    })
+    .collect()
 }
 
-/// Refuse a host that names both placement mechanisms: "You cannot use the
+/// Every host that names both placement mechanisms: "You cannot use the
 /// dedicatedHostId and placementGroupId parameters together in the same
 /// CreateEnvironment action. This results in a ValidationException response."
-fn validate_hosts(hosts: &[HostInfoForCreate]) -> Result<(), CreateEnvironmentError> {
-    for host in hosts {
-        if host.dedicated_host_id.is_some() && host.placement_group_id.is_some() {
-            return Err(CreateEnvironmentErrorModeled::ValidationException(
-                crate::state::request_validation_error(
-                    "dedicatedHostId and placementGroupId cannot be used together in the same \
-                     CreateEnvironment action.",
-                ),
+fn host_failures(hosts: &[HostInfoForCreate]) -> Vec<ValidationExceptionField> {
+    hosts
+        .iter()
+        .enumerate()
+        .filter(|(_, host)| host.dedicated_host_id.is_some() && host.placement_group_id.is_some())
+        .map(|(index, _)| {
+            crate::state::field_failure(
+                &format!("hosts[{index}]"),
+                "cannot use dedicatedHostId and placementGroupId together in the same \
+                 CreateEnvironment action",
             )
-            .into());
-        }
-    }
-    Ok(())
+        })
+        .collect()
 }
 
 /// The ten VLAN subnets to materialise, in the order `InitialVlans` models its
-/// members, after checking every rule that governs them.
-fn plan_vlans(initial: &InitialVlans) -> Result<Vec<PlannedVlan<'_>>, CreateEnvironmentError> {
-    // "Required when isHcxPublic is set to true" (`hcxNetworkAclId` doc).
-    if initial.is_hcx_public && initial.hcx_network_acl_id.is_none() {
-        return Err(CreateEnvironmentErrorModeled::ValidationException(
-            crate::state::field_validation_error(
-                "initialVlans.hcxNetworkAclId",
-                "is required when isHcxPublic is true",
-            ),
-        )
-        .into());
-    }
-
-    let planned = vec![
+/// members. The layout alone: the rules that govern the blocks are
+/// [`vlan_failures`].
+fn plan_vlans(initial: &InitialVlans) -> Vec<PlannedVlan<'_>> {
+    vec![
         PlannedVlan {
             function_name: "vmkManagement",
             member: "initialVlans.vmkManagement",
@@ -579,47 +616,61 @@ fn plan_vlans(initial: &InitialVlans) -> Result<Vec<PlannedVlan<'_>>, CreateEnvi
             is_public: false,
             network_acl_id: None,
         },
-    ];
+    ]
+}
+
+/// Every rule the request's VLAN subnets break: the HCX network ACL the public HCX
+/// VLAN requires, and, per VLAN subnet, a parsable CIDR block of an allowed size that
+/// overlaps none of the environment's other VLAN subnets.
+fn vlan_failures(
+    initial: &InitialVlans,
+    planned: &[PlannedVlan<'_>],
+) -> Vec<ValidationExceptionField> {
+    let mut failures = Vec::new();
+
+    // "Required when isHcxPublic is set to true" (`hcxNetworkAclId` doc).
+    if initial.is_hcx_public && initial.hcx_network_acl_id.is_none() {
+        failures.push(crate::state::field_failure(
+            "initialVlans.hcxNetworkAclId",
+            "is required when isHcxPublic is true",
+        ));
+    }
 
     let mut networks: Vec<(&'static str, Ipv4Cidr)> = Vec::with_capacity(planned.len());
-    for vlan in &planned {
+    for vlan in planned {
         let member = vlan.member;
         // The modelled `Cidr` pattern already refused anything that is not a
         // dotted-quad with a prefix length, so a parse failure here is a value that
         // pattern admits and no IPv4 subnet can be.
-        let network = Ipv4Cidr::parse(vlan.cidr).ok_or_else(|| {
-            CreateEnvironmentErrorModeled::ValidationException(
-                crate::state::field_validation_error(member, "is not a valid IPv4 CIDR block"),
-            )
-        })?;
+        let Some(network) = Ipv4Cidr::parse(vlan.cidr) else {
+            failures.push(crate::state::field_failure(
+                member,
+                "is not a valid IPv4 CIDR block",
+            ));
+            continue;
+        };
         let prefix_len = network.prefix_len;
         if !(MIN_VLAN_PREFIX_LEN..=MAX_VLAN_PREFIX_LEN).contains(&prefix_len) {
-            return Err(CreateEnvironmentErrorModeled::ValidationException(
-                crate::state::field_validation_error(
-                    member,
-                    &format!(
-                        "must have a prefix length between /{MIN_VLAN_PREFIX_LEN} and \
-                         /{MAX_VLAN_PREFIX_LEN}, but was /{prefix_len}"
-                    ),
+            failures.push(crate::state::field_failure(
+                member,
+                &format!(
+                    "must have a prefix length between /{MIN_VLAN_PREFIX_LEN} and \
+                     /{MAX_VLAN_PREFIX_LEN}, but was /{prefix_len}"
                 ),
-            )
-            .into());
+            ));
         }
         // "Amazon EVS VLAN subnet CIDR blocks must not overlap with other subnets"
         // (`InitialVlans` doc).
         if let Some((other, _)) = networks.iter().find(|(_, other)| other.overlaps(&network)) {
-            return Err(CreateEnvironmentErrorModeled::ValidationException(
-                crate::state::field_validation_error(
-                    member,
-                    &format!("overlaps the CIDR block of {other}"),
-                ),
-            )
-            .into());
+            failures.push(crate::state::field_failure(
+                member,
+                &format!("overlaps the CIDR block of {other}"),
+            ));
         }
         networks.push((member, network));
     }
 
-    Ok(planned)
+    failures
 }
 
 // The `InitialVlans` member a VLAN's `functionName` came from is carried on

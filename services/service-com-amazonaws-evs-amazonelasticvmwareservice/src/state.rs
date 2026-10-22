@@ -69,17 +69,54 @@ pub fn timestamp(ms: i64) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_millis(ms)
 }
 
-/// A `ValidationException` refusing one input member, naming the member and the
-/// constraint it broke the way the boundary validator does.
-pub fn field_validation_error(member: &str, problem: &str) -> ValidationException {
-    ValidationException {
+/// What the top-level `message` of an aggregated `ValidationException` opens with.
+pub const VALIDATION_FAILURE_PREFIX: &str = "Request validation failure: ";
+
+/// What joins the `fieldList` entries inside that top-level `message`.
+pub const VALIDATION_FAILURE_SEPARATOR: &str = " | ";
+
+/// One `fieldList` entry: the input member that failed a check, and the sentence
+/// saying why. The sentence NAMES the member, because the aggregated top-level
+/// `message` is built by joining these sentences and nothing else distinguishes them.
+pub fn field_failure(member: &str, problem: &str) -> crate::ops::types::ValidationExceptionField {
+    crate::ops::types::ValidationExceptionField {
+        name: member.to_string(),
         message: format!("{member} {problem}"),
-        reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
-        field_list: Some(vec![crate::ops::types::ValidationExceptionField {
-            name: member.to_string(),
-            message: problem.to_string(),
-        }]),
     }
+}
+
+/// A `ValidationException` reporting EVERY check a request failed, not just the
+/// first: one `fieldList` entry per failure, and a top-level `message` that joins
+/// those entries' sentences.
+///
+/// This is the shape AWS answers a request that breaks several of an operation's
+/// preconditions with, so a caller that surfaces `fieldList` can correct all of them
+/// in one round trip instead of discovering them one refusal at a time.
+pub fn aggregate_validation_error(
+    failures: Vec<crate::ops::types::ValidationExceptionField>,
+) -> ValidationException {
+    debug_assert!(
+        !failures.is_empty(),
+        "an aggregated ValidationException reports at least one failure"
+    );
+    let joined = failures
+        .iter()
+        .map(|failure| failure.message.as_str())
+        .collect::<Vec<_>>()
+        .join(VALIDATION_FAILURE_SEPARATOR);
+    ValidationException {
+        message: format!("{VALIDATION_FAILURE_PREFIX}{joined}"),
+        reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(failures),
+    }
+}
+
+/// A `ValidationException` refusing one input member, naming the member and the
+/// constraint it broke the way the boundary validator does. The single-failure case
+/// of [`aggregate_validation_error`], so one refused member and ten of them are
+/// reported in the same form.
+pub fn field_validation_error(member: &str, problem: &str) -> ValidationException {
+    aggregate_validation_error(vec![field_failure(member, problem)])
 }
 
 /// A `ValidationException` refusing a request that no single member explains.
@@ -510,6 +547,20 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
         self.environments.values().any(|environment| {
             environment.region == region
                 && environment.environment_name.as_deref() == Some(name)
+                && environment.state != STATE_DELETED
+        })
+    }
+
+    /// Whether some environment IN `region` is already deployed inside `vpc_id`.
+    /// `CreateEnvironment` refuses a second one: "The VPC cannot be used with any
+    /// other deployed Amazon EVS environment. Amazon EVS does not provide multi-VPC
+    /// support for environments at this time." (`vpcId` doc). A VPC is a regional
+    /// resource, so the Region is the scope, and a VPC freed by a deleted environment
+    /// is usable again.
+    pub fn vpc_is_in_use(&self, region: &str, vpc_id: &str) -> bool {
+        self.environments.values().any(|environment| {
+            environment.region == region
+                && environment.vpc_id == vpc_id
                 && environment.state != STATE_DELETED
         })
     }

@@ -41,7 +41,7 @@ const ACCOUNT: &str = "000000000000";
 const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
 
 /// The emulator a test drives: one shared engine, this service mounted on it.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The tests exercise behaviour, not signing: the credentials below are unsigned.
@@ -53,7 +53,7 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// Call one operation and return its HTTP status and JSON body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     call_in_region(router, REGION, operation, body).await
 }
 
@@ -98,7 +98,7 @@ async fn call_in_region(
 
 /// Ten non-overlapping VLAN subnet CIDR blocks of the given prefix length, one per
 /// `InitialVlans` member, each in its own `10.0.<n>.0` block.
-fn vlans_with_prefix(prefix_len: u8) -> Value {
+pub(crate) fn vlans_with_prefix(prefix_len: u8) -> Value {
     let cidr = |index: u8| json!({ "cidr": format!("10.0.{}.0/{prefix_len}", index * 2) });
     json!({
         "vmkManagement": cidr(0),
@@ -119,10 +119,22 @@ fn vlans() -> Value {
     vlans_with_prefix(28)
 }
 
+/// A VPC id no other request in this test target has used, as the modelled
+/// `^vpc-[a-f0-9]{8}([a-f0-9]{9})?$` spells one.
+///
+/// Amazon EVS refuses a VPC that already carries a deployed environment ("The VPC
+/// cannot be used with any other deployed Amazon EVS environment", `vpcId` doc), so a
+/// test that creates several environments gives each its own VPC.
+pub(crate) fn fresh_vpc_id() -> String {
+    static NEXT: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(1);
+    let ordinal = NEXT.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+    format!("vpc-{ordinal:017x}")
+}
+
 /// A `CreateEnvironment` request that satisfies every rule, optionally named.
-fn create_request(name: Option<&str>) -> Value {
+pub(crate) fn create_request(name: Option<&str>) -> Value {
     let mut body = json!({
-        "vpcId": "vpc-0123456789abcdef0",
+        "vpcId": fresh_vpc_id(),
         "serviceAccessSubnetId": "subnet-0123456789abcdef0",
         "vcfVersion": "VCF-5.2.1",
         "termsAccepted": true,
@@ -135,7 +147,7 @@ fn create_request(name: Option<&str>) -> Value {
 }
 
 /// Four hosts, as `hosts` requires (len 4..4), with `extra` merged into the first.
-fn four_hosts(extra: Value) -> Value {
+pub(crate) fn four_hosts(extra: Value) -> Value {
     let mut first = json!({
         "hostName": "esx-1",
         "keyName": "evs-key",
@@ -172,7 +184,7 @@ fn is_subnet_id(id: &str) -> bool {
 }
 
 /// The `__type` an error body carries, for an assertion message.
-fn error_type(body: &Value) -> String {
+pub(crate) fn error_type(body: &Value) -> String {
     body["__type"].as_str().unwrap_or("<none>").to_string()
 }
 
@@ -193,12 +205,8 @@ async fn create(router: &MultiServiceRouter, name: Option<&str>) -> String {
 async fn an_environment_round_trips_through_create_get_list_vlans_and_delete() {
     let router = emulator();
 
-    let (status, created) = call(
-        &router,
-        "CreateEnvironment",
-        &create_request(Some("demo-env")),
-    )
-    .await;
+    let request = create_request(Some("demo-env"));
+    let (status, created) = call(&router, "CreateEnvironment", &request).await;
     assert_eq!(status, 200, "create: expected 200, got {status} {created}");
     let environment = created["environment"].clone();
     let id = environment["environmentId"]
@@ -224,7 +232,7 @@ async fn an_environment_round_trips_through_create_get_list_vlans_and_delete() {
     );
     for (member, expected) in [
         ("environmentName", json!("demo-env")),
-        ("vpcId", json!("vpc-0123456789abcdef0")),
+        ("vpcId", request["vpcId"].clone()),
         ("serviceAccessSubnetId", json!("subnet-0123456789abcdef0")),
         ("vcfVersion", json!("VCF-5.2.1")),
         ("termsAccepted", json!(true)),
@@ -754,6 +762,9 @@ async fn the_client_token_has_no_effect_on_which_environment_is_created() {
     request["clientToken"] = json!("tok-1");
 
     let (first_status, first) = call(&router, "CreateEnvironment", &request).await;
+    // A second VPC, because one VPC carries one deployed environment: the repeated
+    // token is what this test varies, nothing else.
+    request["vpcId"] = json!(fresh_vpc_id());
     let (second_status, second) = call(&router, "CreateEnvironment", &request).await;
     assert_eq!(
         (first_status, second_status),
