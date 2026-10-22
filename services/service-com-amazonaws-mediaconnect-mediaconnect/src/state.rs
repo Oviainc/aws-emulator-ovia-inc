@@ -1,11 +1,425 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-mediaconnect-mediaconnect service.
+//!
+//! The store is keyed by the flow's own ARN, which is what every flow operation
+//! addresses a flow by (`@httpLabel FlowArn`). A second index by name backs the
+//! uniqueness rule MediaConnect enforces on flow names: the flow name is the last
+//! segment of the ARN the service mints, so two flows with one name would share one
+//! ARN.
+
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
+
+use crate::ops::types::{
+    EncodingConfig, Encryption, Entitlement, FailoverConfig, Flow, ListedFlow, Maintenance,
+    MediaStream, MonitoringConfig, NdiConfig, Output, Source, Transport, VpcInterface,
+    VpcInterfaceAttachment,
+};
+
+/// The `Status` enum the model declares for a flow
+/// (`smithy_query(query="shape",shape="Status")`: STANDBY | ACTIVE | UPDATING | DELETING
+/// | STARTING | STOPPING | ERROR). Only the five a flow's lifecycle reaches are named
+/// here; the rest belong to operations that are still scaffolded.
+pub const STATUS_STANDBY: &str = "STANDBY";
+/// See [`STATUS_STANDBY`].
+pub const STATUS_STARTING: &str = "STARTING";
+/// See [`STATUS_STANDBY`].
+pub const STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`STATUS_STANDBY`].
+pub const STATUS_STOPPING: &str = "STOPPING";
+/// See [`STATUS_STANDBY`].
+pub const STATUS_DELETING: &str = "DELETING";
+
+/// `SourceType` (`smithy_query(query="shape",shape="SourceType")`): a source that
+/// originated in this account is `OWNED`; one reached through another account's
+/// entitlement is `ENTITLED`.
+pub const SOURCE_TYPE_OWNED: &str = "OWNED";
+/// See [`SOURCE_TYPE_OWNED`].
+pub const SOURCE_TYPE_ENTITLED: &str = "ENTITLED";
+
+/// How long a flow stays in a transient status (`STARTING`, `STOPPING`) before the
+/// clock settles it into the steady one.
+///
+/// AWS documents no duration for this transition, so the span is this emulator's own
+/// choice inside the project's 250-750 ms window: non-zero, so a caller that polls
+/// immediately after StartFlow still observes `STARTING`, and short enough that a test
+/// can wait it out.
+pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
+
+/// The region used when a request carries no SigV4 credential scope to read one from.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// This service's ARN namespace and sigv4 signing name (`OPERATIONS.md`): the third
+/// segment of every ARN the service mints.
+pub const SERVICE_NAMESPACE: &str = "mediaconnect";
+
+/// The ceiling on how many flows this store holds: the cap that bounds caller-driven
+/// growth of the flow map.
+///
+/// This emulator keeps its resources in memory for the life of the process and
+/// CreateFlow is the only thing that adds one, so the store needs a maximum entry
+/// count — neither a TTL nor an eviction policy is available to it, because
+/// DescribeFlow must still answer what CreateFlow created. CreateFlow refuses past this
+/// cap with the service's own modelled `CreateFlow420Exception`, "raised by Elemental
+/// MediaConnect when creating the flow" and declared on CreateFlow alone (never on a
+/// read). The number is the emulator's own bound, not a published AWS default — AWS
+/// publishes the flows-per-Region quota as adjustable, so no single value is the
+/// contract — and it is high enough that no ordinary workflow meets it.
+pub const MAX_FLOWS: usize = 5_000;
+
+/// The ceiling on how many entries one CreateFlow request may put in any one of a
+/// flow's sub-collections (sources, outputs, entitlements, media streams, VPC
+/// interfaces, tags), so a single request cannot store an arbitrarily large record.
+///
+/// For outputs and entitlements this is the limit the operation itself documents: "The
+/// request optionally can include outputs (up to 50) and entitlements (up to 50)"
+/// (`smithy_query(query="operation",operation="CreateFlow")`), and it is also the
+/// tags-per-resource limit AWS applies service-wide. AWS documents no count for the
+/// remaining collections, so the same number is applied to them as the emulator's own
+/// bound. CreateFlow refuses past it with `BadRequestException`, which the model
+/// describes as the error for "a semantic error" in the request.
+pub const MAX_FLOW_COLLECTION_ENTRIES: usize = 50;
+
+/// The first port handed to a source that did not ask for one. MediaConnect assigns an
+/// ingest port from its own pool when the request omits `IngestPort`; the emulator
+/// assigns from a WRAPPING pool that starts at this base, so a source's port is drawn
+/// from the pool rather than guaranteed unique — two sources far enough apart in the
+/// ARN counter can share one, which is harmless because nothing in the emulator binds
+/// these ports.
+const INGEST_PORT_BASE: i32 = 5000;
+
+/// The highest port the ingest-port pool hands out, so the assignment stays inside the
+/// 16-bit port space however many sources are created.
+const INGEST_PORT_CEILING: i32 = 65_535;
+
+/// A status change the clock owes: at `due_at` the flow's status becomes `status`.
+#[derive(Debug, Clone)]
+pub struct PendingStatus {
+    /// The status the flow settles into.
+    pub status: String,
+    /// The instant from which the change is owed.
+    pub due_at: SystemTime,
+}
+
+/// A source of a stored flow. `Flow.Source` is the first entry, `Flow.Sources` the
+/// whole list.
+#[derive(Debug, Clone, Default)]
+pub struct StoredSource {
+    pub source_arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub ingest_ip: Option<String>,
+    pub ingest_port: Option<i32>,
+    pub whitelist_cidr: Option<String>,
+    pub entitlement_arn: Option<String>,
+    pub vpc_interface_name: Option<String>,
+    pub sender_ip_address: Option<String>,
+    pub sender_control_port: Option<i32>,
+    pub decryption: Option<Encryption>,
+    pub transport: Option<Transport>,
+}
+
+impl StoredSource {
+    /// The modelled `Source` for this record.
+    pub fn to_source(&self) -> Source {
+        Source {
+            source_arn: self.source_arn.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            ingest_ip: self.ingest_ip.clone(),
+            ingest_port: self.ingest_port,
+            whitelist_cidr: self.whitelist_cidr.clone(),
+            entitlement_arn: self.entitlement_arn.clone(),
+            vpc_interface_name: self.vpc_interface_name.clone(),
+            sender_ip_address: self.sender_ip_address.clone(),
+            sender_control_port: self.sender_control_port,
+            decryption: self.decryption.clone(),
+            transport: self.transport.clone(),
+            ..Source::default()
+        }
+    }
+}
+
+/// An output of a stored flow.
+#[derive(Debug, Clone, Default)]
+pub struct StoredOutput {
+    pub output_arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub destination: Option<String>,
+    pub port: Option<i32>,
+    pub encryption: Option<Encryption>,
+    pub output_status: Option<String>,
+    pub vpc_interface_attachment: Option<VpcInterfaceAttachment>,
+    pub transport: Option<Transport>,
+}
+
+impl StoredOutput {
+    /// The modelled `Output` for this record.
+    pub fn to_output(&self) -> Output {
+        Output {
+            output_arn: self.output_arn.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            destination: self.destination.clone(),
+            port: self.port,
+            encryption: self.encryption.clone(),
+            output_status: self.output_status.clone(),
+            vpc_interface_attachment: self.vpc_interface_attachment.clone(),
+            transport: self.transport.clone(),
+            ..Output::default()
+        }
+    }
+}
+
+/// A flow, as the service holds it between calls. Every flow operation's response is
+/// computed from this record.
+#[derive(Debug, Clone)]
+pub struct StoredFlow {
+    pub flow_arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub availability_zone: String,
+    pub status: String,
+    /// The status change the clock owes, if any. See [`TRANSITION_SPAN`].
+    pub pending: Option<PendingStatus>,
+    pub egress_ip: Option<String>,
+    pub flow_size: Option<String>,
+    pub maintenance: Option<Maintenance>,
+    pub source_failover_config: Option<FailoverConfig>,
+    pub source_monitoring_config: Option<MonitoringConfig>,
+    pub ndi_config: Option<NdiConfig>,
+    pub encoding_config: Option<EncodingConfig>,
+    pub sources: Vec<StoredSource>,
+    pub outputs: Vec<StoredOutput>,
+    pub entitlements: Vec<Entitlement>,
+    pub media_streams: Vec<MediaStream>,
+    pub vpc_interfaces: Vec<VpcInterface>,
+    /// What CreateFlow's `FlowTags` put on the flow. No operation in this slice reports
+    /// tags back (`Flow` carries no tag member and the tagging operations are still
+    /// scaffolded), so this field is written and not yet read: it is here for
+    /// TagResource / ListTagsForResource to read when that slice lands.
+    pub tags: BTreeMap<String, String>,
+    /// When the flow was created. `Flow` models no creation timestamp either, so like
+    /// [`StoredFlow::tags`] this is recorded now for the operations that will report it
+    /// (the maintenance / reservation slices) rather than read in this one.
+    pub created_at: SystemTime,
+}
+
+impl StoredFlow {
+    /// Materialise the status change the clock already made due, if it is due at `now`.
+    ///
+    /// This is the only write a reporting operation (DescribeFlow, ListFlows) performs:
+    /// the change was owed at `due_at` whether or not anybody called.
+    pub fn settle(&mut self, now: SystemTime) {
+        if let Some(pending) = self.pending.take() {
+            if now >= pending.due_at {
+                self.status = pending.status;
+            } else {
+                self.pending = Some(pending);
+            }
+        }
+    }
+
+    /// Enter `transient` now and owe `settled` once [`TRANSITION_SPAN`] has passed.
+    pub fn begin_transition(&mut self, transient: &str, settled: &str, now: SystemTime) {
+        self.status = transient.to_string();
+        self.pending = Some(PendingStatus {
+            status: settled.to_string(),
+            due_at: now + TRANSITION_SPAN,
+        });
+    }
+
+    /// `ListedFlow.SourceType`: `ENTITLED` when the flow ingests through an entitlement
+    /// granted by another account, `OWNED` otherwise.
+    pub fn source_type(&self) -> &'static str {
+        if self
+            .sources
+            .iter()
+            .any(|source| source.entitlement_arn.is_some())
+        {
+            SOURCE_TYPE_ENTITLED
+        } else {
+            SOURCE_TYPE_OWNED
+        }
+    }
+
+    /// The modelled `Flow` for this record.
+    pub fn to_flow(&self) -> Flow {
+        Flow {
+            flow_arn: self.flow_arn.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            availability_zone: self.availability_zone.clone(),
+            status: self.status.clone(),
+            egress_ip: self.egress_ip.clone(),
+            flow_size: self.flow_size.clone(),
+            maintenance: self.maintenance.clone(),
+            source_failover_config: self.source_failover_config.clone(),
+            source_monitoring_config: self.source_monitoring_config.clone(),
+            ndi_config: self.ndi_config.clone(),
+            encoding_config: self.encoding_config.clone(),
+            entitlements: self.entitlements.clone(),
+            outputs: self.outputs.iter().map(StoredOutput::to_output).collect(),
+            // A flow always carries at least one source (CreateFlow refuses a request
+            // without one), so the first source is `Flow.Source` and the whole list is
+            // `Flow.Sources`.
+            source: self
+                .sources
+                .first()
+                .map(StoredSource::to_source)
+                .unwrap_or_default(),
+            sources: (!self.sources.is_empty())
+                .then(|| self.sources.iter().map(StoredSource::to_source).collect()),
+            media_streams: (!self.media_streams.is_empty()).then(|| self.media_streams.clone()),
+            vpc_interfaces: (!self.vpc_interfaces.is_empty()).then(|| self.vpc_interfaces.clone()),
+        }
+    }
+
+    /// The modelled `ListedFlow` summary for this record.
+    pub fn to_listed_flow(&self) -> ListedFlow {
+        ListedFlow {
+            flow_arn: self.flow_arn.clone(),
+            name: self.name.clone(),
+            description: self.description.clone().unwrap_or_default(),
+            availability_zone: self.availability_zone.clone(),
+            source_type: self.source_type().to_string(),
+            status: self.status.clone(),
+            maintenance: self.maintenance.clone(),
+        }
+    }
+}
 
 /// Per-service state for com-amazonaws-mediaconnect-mediaconnect. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMediaconnectMediaconnectState {
-    // TODO: add service-specific state fields
+    /// Every live flow, keyed by its ARN. Ordered, so ListFlows pages stably.
+    pub flows: BTreeMap<String, StoredFlow>,
+    /// Flow name -> flow ARN, the index behind the name-uniqueness rule.
+    pub flow_arns_by_name: BTreeMap<String, String>,
+    /// Monotonic counter minting the unique fragment of every flow / source / output /
+    /// entitlement ARN and of the addresses and ports the service assigns.
+    pub next_arn_suffix: u64,
+}
+
+impl ComAmazonawsMediaconnectMediaconnectState {
+    /// The next value of the ARN-fragment counter. Never repeats within a process.
+    pub fn next_suffix(&mut self) -> u64 {
+        self.next_arn_suffix += 1;
+        self.next_arn_suffix
+    }
+
+    /// Settle every flow whose status change the clock already made due.
+    pub fn settle_due_transitions(&mut self, now: SystemTime) {
+        for flow in self.flows.values_mut() {
+            flow.settle(now);
+        }
+    }
+}
+
+/// The resource fragment of a flow ARN: `flow:<flow id>:<name>`.
+///
+/// The id is the ARN counter in zero-padded hex, so the fragment satisfies the
+/// `FlowArn` pattern the model declares
+/// (`^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:flow:[a-zA-Z0-9-]+:[a-zA-Z0-9_-]+$`)
+/// and is unique per flow.
+pub fn flow_resource_fragment(suffix: u64, name: &str) -> String {
+    format!("flow:1-{suffix:08x}:{name}")
+}
+
+/// An ingest address for a source the emulator assigns an endpoint to.
+///
+/// Addresses come from the RFC 5737 documentation range `198.51.100.0/24`, which is
+/// reserved for documentation and never routes anywhere. The range is a WRAPPING pool
+/// of 254 addresses: an address repeats once the ARN counter passes the pool size,
+/// which is harmless because nothing in the emulator binds these addresses.
+pub fn assigned_ingest_ip(suffix: u64) -> String {
+    format!("198.51.100.{}", 1 + (suffix % 254))
+}
+
+/// The egress address of a flow — `Flow.EgressIp`, "the IP address from which video
+/// will be sent to output destinations".
+///
+/// From the RFC 5737 range `203.0.113.0/24`, reserved for documentation. Like
+/// [`assigned_ingest_ip`], a wrapping pool of 254 addresses that never route anywhere.
+pub fn assigned_egress_ip(suffix: u64) -> String {
+    format!("203.0.113.{}", 1 + (suffix % 254))
+}
+
+/// The ingest port assigned to a source that did not request one, drawn from the
+/// wrapping pool [`INGEST_PORT_BASE`]..[`INGEST_PORT_CEILING`].
+pub fn assigned_ingest_port(suffix: u64) -> i32 {
+    let span = u64::try_from(INGEST_PORT_CEILING - INGEST_PORT_BASE).unwrap_or(1);
+    INGEST_PORT_BASE + i32::try_from(suffix % span).unwrap_or(0)
+}
+
+/// The region this request was signed for, from its SigV4 credential scope, or
+/// [`DEFAULT_REGION`] when the request carries no scope.
+///
+/// A scope value that is not a region token is ignored rather than interpolated: the
+/// region is a segment of every ARN this service mints, and the modelled `FlowArn`
+/// pattern constrains that segment to `[a-z0-9-]+`.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| {
+            !region.is_empty()
+                && region
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Whether `name` can be a flow name: it is the last segment of the ARN the service
+/// mints for the flow, and the modelled `FlowArn` pattern constrains that segment to
+/// `[a-zA-Z0-9_-]+`.
+pub fn is_valid_flow_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Whether `arn` is a flow ARN this service could have minted.
+///
+/// This function is the crate's ONE encoding of the modelled `FlowArn` constraint
+/// (`smithy_query(query="shape",shape="FlowArn")`:
+/// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:flow:[a-zA-Z0-9-]+:[a-zA-Z0-9_-]+$`),
+/// checked segment by segment: the `arn` prefix, an `aws*` partition, this service's
+/// namespace, a region token, a 12-digit account id, the `flow` resource type, the flow
+/// id and the flow name. The integration test asserts minted ARNs through this same
+/// function, so there is no second spelling that can drift from it.
+///
+/// ListFlows' `NextToken` is the ARN its next page resumes at, so a token the service
+/// never minted is a semantic error in the request rather than a key to page from. The
+/// flow it names need NOT still exist: paging must survive a delete between pages.
+pub fn is_mintable_flow_arn(arn: &str) -> bool {
+    let segments: Vec<&str> = arn.split(':').collect();
+    let [prefix, partition, service, region, account, resource_type, flow_id, flow_name] =
+        segments.as_slice()
+    else {
+        return false;
+    };
+    prefix == &"arn"
+        && partition.starts_with("aws")
+        && partition[3..]
+            .bytes()
+            .all(|b| b.is_ascii_alphabetic() || b == b'-')
+        && service == &SERVICE_NAMESPACE
+        && !region.is_empty()
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && account.len() == 12
+        && account.bytes().all(|b| b.is_ascii_digit())
+        && resource_type == &"flow"
+        && !flow_id.is_empty()
+        && flow_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && is_valid_flow_name(flow_name)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

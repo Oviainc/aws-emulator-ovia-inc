@@ -96,17 +96,33 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        match refusal {
+            // MediaConnect declares no `ValidationException`. Its client-input error is
+            // `BadRequestException` (HTTP 400) — "thrown if the request contains a
+            // semantic error. The precise meaning depends on the API, and is documented
+            // in the error message" — and every operation of this service lists it. So a
+            // request the framework refuses before any handler runs (a required member
+            // absent, a value outside a declared bound, an ARN failing its modelled
+            // pattern) is worded with the code a MediaConnect client branches on, and the
+            // message states each violation the framework found.
+            Refusal::Invalid(violations) => {
+                let detail = violations
+                    .iter()
+                    .map(smithy_server_runtime::Violation::message)
+                    .collect::<Vec<String>>()
+                    .join("; ");
+                Some(Refused {
+                    code: "BadRequestException".to_string(),
+                    message: if detail.is_empty() {
+                        "The request contains a semantic error.".to_string()
+                    } else {
+                        detail
+                    },
+                })
+            }
+            // An unauthenticated caller keeps the framework's 403 wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

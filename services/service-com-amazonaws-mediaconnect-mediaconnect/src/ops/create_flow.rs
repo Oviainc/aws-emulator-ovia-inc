@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFlow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFlow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFlow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a flow and PERSISTS it in [`crate::state`]: the response is the stored record,
+//! so DescribeFlow / ListFlows report exactly what this operation wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -104,6 +98,239 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{StoredFlow, StoredOutput, StoredSource};
+
+/// This service's ARN namespace and sigv4 signing name, from [`crate::state`] so the
+/// minting side and the ARN-recognising side name it once.
+use crate::state::SERVICE_NAMESPACE;
+
+/// `OutputStatus` / `EntitlementStatus` enum value the model documents as the default
+/// MediaConnect applies when the request omits the member: "If you don't specify the
+/// outputStatus field in your request, MediaConnect sets it to ENABLED"
+/// (`AddOutputRequest$OutputStatus`), and the same sentence on
+/// `GrantEntitlementRequest$EntitlementStatus`.
+const STATUS_ENABLED: &str = "ENABLED";
+
+/// `NetworkInterfaceType` (`ena | efa`) applied when a VPC interface request omits one;
+/// `ena` is the standard elastic network adapter.
+const NETWORK_INTERFACE_TYPE_ENA: &str = "ena";
+
+/// The first dynamic RTP payload type (RFC 3551 §6: 96-127 are dynamic). `MediaStream`'s
+/// `Fmt` member is "the format type number (sometimes referred to as RTP payload type) of
+/// the media stream. MediaConnect assigns this value to the media stream."
+const DYNAMIC_RTP_PAYLOAD_TYPE_BASE: i32 = 96;
+
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error".
+fn bad_request(message: impl Into<String>) -> CreateFlowError {
+    CreateFlowErrorModeled::BadRequestException(BadRequestException {
+        message: message.into(),
+    })
+    .into()
+}
+
+/// Refuse the request with `CreateFlow420Exception` (HTTP 420), the error the model
+/// declares for a flow this service will not create — here because the flow store is at
+/// its bound (see [`crate::state::MAX_FLOWS`]). The 420 is declared on CreateFlow alone,
+/// so the refusal belongs to the create rather than being reported as a throttle or an
+/// outage.
+fn cannot_create(message: impl Into<String>) -> CreateFlowError {
+    CreateFlowErrorModeled::CreateFlow420Exception(CreateFlow420Exception {
+        message: message.into(),
+    })
+    .into()
+}
+
+/// Materialise one `SetSourceRequest` into the source record the flow keeps.
+fn materialise_source(
+    request: &SetSourceRequest,
+    index: usize,
+    flow_name: &str,
+    region: &str,
+    suffix: u64,
+) -> StoredSource {
+    let name = request
+        .name
+        .clone()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            if index == 0 {
+                flow_name.to_string()
+            } else {
+                format!("{flow_name}-{}", index + 1)
+            }
+        });
+    // A source reached through another account's entitlement is fed by that account's
+    // flow, so this service assigns it no ingest endpoint of its own; an owned source
+    // listens on the address and port the service assigns it.
+    let entitled = request.entitlement_arn.is_some();
+    StoredSource {
+        source_arn: ::engine::emulator_arn(
+            SERVICE_NAMESPACE,
+            region,
+            &format!("source:1-{suffix:08x}:{name}"),
+        ),
+        name,
+        description: request.description.clone(),
+        ingest_ip: (!entitled).then(|| crate::state::assigned_ingest_ip(suffix)),
+        ingest_port: (!entitled).then(|| {
+            request
+                .ingest_port
+                .unwrap_or_else(|| crate::state::assigned_ingest_port(suffix))
+        }),
+        whitelist_cidr: request.whitelist_cidr.clone(),
+        entitlement_arn: request.entitlement_arn.clone(),
+        vpc_interface_name: request.vpc_interface_name.clone(),
+        sender_ip_address: request.sender_ip_address.clone(),
+        sender_control_port: request.sender_control_port,
+        decryption: request.decryption.clone(),
+        // `Transport.Protocol` is required, so a source that names no protocol (an
+        // entitled one, say) carries no transport rather than an empty one.
+        transport: request.protocol.clone().map(|protocol| Transport {
+            protocol,
+            max_bitrate: request.max_bitrate,
+            max_latency: request.max_latency,
+            max_sync_buffer: request.max_sync_buffer,
+            min_latency: request.min_latency,
+            sender_control_port: request.sender_control_port,
+            sender_ip_address: request.sender_ip_address.clone(),
+            source_listener_address: request.source_listener_address.clone(),
+            source_listener_port: request.source_listener_port,
+            stream_id: request.stream_id.clone(),
+            ndi_source_settings: request.ndi_source_settings.clone(),
+            ..Transport::default()
+        }),
+    }
+}
+
+/// Materialise one `AddOutputRequest` into the output record the flow keeps.
+fn materialise_output(
+    request: &AddOutputRequest,
+    index: usize,
+    region: &str,
+    suffix: u64,
+) -> StoredOutput {
+    let name = request
+        .name
+        .clone()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("output-{}", index + 1));
+    StoredOutput {
+        output_arn: ::engine::emulator_arn(
+            SERVICE_NAMESPACE,
+            region,
+            &format!("output:1-{suffix:08x}:{name}"),
+        ),
+        name,
+        description: request.description.clone(),
+        destination: request.destination.clone(),
+        port: request.port,
+        encryption: request.encryption.clone(),
+        output_status: Some(
+            request
+                .output_status
+                .clone()
+                .unwrap_or_else(|| STATUS_ENABLED.to_string()),
+        ),
+        vpc_interface_attachment: request.vpc_interface_attachment.clone(),
+        transport: request.protocol.clone().map(|protocol| Transport {
+            protocol,
+            cidr_allow_list: request.cidr_allow_list.clone(),
+            max_latency: request.max_latency,
+            min_latency: request.min_latency,
+            smoothing_latency: request.smoothing_latency,
+            remote_id: request.remote_id.clone(),
+            sender_control_port: request.sender_control_port,
+            stream_id: request.stream_id.clone(),
+            ndi_speed_hq_quality: request.ndi_speed_hq_quality,
+            ndi_program_name: request.ndi_program_name.clone(),
+            ndi_output_timecode_source: request.ndi_output_timecode_source.clone(),
+            ndi_audio_reference_level: request.ndi_audio_reference_level,
+            ..Transport::default()
+        }),
+    }
+}
+
+/// Materialise one `GrantEntitlementRequest` into the entitlement the flow carries.
+fn materialise_entitlement(
+    request: &GrantEntitlementRequest,
+    index: usize,
+    region: &str,
+    suffix: u64,
+) -> Entitlement {
+    let name = request
+        .name
+        .clone()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("entitlement-{}", index + 1));
+    Entitlement {
+        entitlement_arn: ::engine::emulator_arn(
+            SERVICE_NAMESPACE,
+            region,
+            &format!("entitlement:1-{suffix:08x}:{name}"),
+        ),
+        name,
+        description: request.description.clone(),
+        encryption: request.encryption.clone(),
+        entitlement_status: Some(
+            request
+                .entitlement_status
+                .clone()
+                .unwrap_or_else(|| STATUS_ENABLED.to_string()),
+        ),
+        data_transfer_subscriber_fee_percent: request.data_transfer_subscriber_fee_percent,
+        subscribers: request.subscribers.clone(),
+    }
+}
+
+/// Materialise one `AddMediaStreamRequest` into the media stream the flow carries.
+fn materialise_media_stream(request: &AddMediaStreamRequest, index: usize) -> MediaStream {
+    MediaStream {
+        fmt: DYNAMIC_RTP_PAYLOAD_TYPE_BASE + i32::try_from(index).unwrap_or(0),
+        media_stream_id: request.media_stream_id,
+        media_stream_name: request.media_stream_name.clone(),
+        media_stream_type: request.media_stream_type.clone(),
+        clock_rate: request.clock_rate,
+        description: request.description.clone(),
+        video_format: request.video_format.clone(),
+        attributes: request
+            .attributes
+            .as_ref()
+            .map(|attributes| MediaStreamAttributes {
+                lang: attributes.lang.clone(),
+                fmtp: attributes
+                    .fmtp
+                    .as_ref()
+                    .map(|fmtp| Fmtp {
+                        channel_order: fmtp.channel_order.clone(),
+                        colorimetry: fmtp.colorimetry.clone(),
+                        exact_framerate: fmtp.exact_framerate.clone(),
+                        par: fmtp.par.clone(),
+                        range: fmtp.range.clone(),
+                        scan_mode: fmtp.scan_mode.clone(),
+                        tcs: fmtp.tcs.clone(),
+                    })
+                    .unwrap_or_default(),
+            }),
+    }
+}
+
+/// Materialise one `VpcInterfaceRequest` into the VPC interface the flow carries.
+fn materialise_vpc_interface(request: &VpcInterfaceRequest, suffix: u64) -> VpcInterface {
+    VpcInterface {
+        name: request.name.clone(),
+        // The elastic network interface the service creates in the caller's subnet.
+        network_interface_ids: vec![format!("eni-{suffix:017x}")],
+        network_interface_type: request
+            .network_interface_type
+            .clone()
+            .unwrap_or_else(|| NETWORK_INTERFACE_TYPE_ENA.to_string()),
+        role_arn: request.role_arn.clone(),
+        security_group_ids: request.security_group_ids.clone(),
+        subnet_id: request.subnet_id.clone(),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -177,18 +404,187 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFlow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFlowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFlow"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFlowErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect flow store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The flow name is the last segment of the ARN this operation mints, and the
+        // modelled `FlowArn` pattern constrains that segment to `[a-zA-Z0-9_-]+`.
+        if !crate::state::is_valid_flow_name(&input.name) {
+            return Err(bad_request(format!(
+                "Invalid flow name {:?}. A flow name may contain only letters, numbers, \
+                 hyphens and underscores, and must not be empty.",
+                input.name
+            )));
+        }
+
+        // "The request must include one source." It arrives either as `Source` (a single
+        // source) or as `Sources` (the failover pair).
+        let requested_sources: Vec<SetSourceRequest> = input
+            .sources
+            .clone()
+            .filter(|sources| !sources.is_empty())
+            .or_else(|| input.source.clone().map(|source| vec![source]))
+            .unwrap_or_default();
+        if requested_sources.is_empty() {
+            return Err(bad_request(
+                "A create flow request must include one source: set either Source or Sources.",
+            ));
+        }
+
+        // One request may not store an arbitrarily large flow record: every collection
+        // it can fill is bounded (see `crate::state::MAX_FLOW_COLLECTION_ENTRIES`).
+        for (member, len) in [
+            ("Sources", requested_sources.len()),
+            ("Outputs", input.outputs.iter().flatten().count()),
+            ("Entitlements", input.entitlements.iter().flatten().count()),
+            ("MediaStreams", input.media_streams.iter().flatten().count()),
+            ("VpcInterfaces", input.vpc_interfaces.iter().flatten().count()),
+            ("FlowTags", input.flow_tags.iter().flatten().count()),
+        ] {
+            if len > crate::state::MAX_FLOW_COLLECTION_ENTRIES {
+                return Err(bad_request(format!(
+                    "A create flow request may include at most {} {member} entries; this one \
+                     has {len}.",
+                    crate::state::MAX_FLOW_COLLECTION_ENTRIES
+                )));
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The flow name is part of the flow's ARN, so two flows cannot share one name.
+        if let Some(existing) = store.flow_arns_by_name.get(&input.name) {
+            return Err(bad_request(format!(
+                "A flow named {:?} already exists in this account and Region: {existing}.",
+                input.name
+            )));
+        }
+
+        // The flow store is bounded: nothing evicts a flow and DescribeFlow must still
+        // answer what CreateFlow created, so the create refuses once the store is full
+        // rather than growing it without limit. See `crate::state::MAX_FLOWS`.
+        if store.flows.len() >= crate::state::MAX_FLOWS {
+            return Err(cannot_create(format!(
+                "This account already holds the maximum of {} flows in this Region. Delete a \
+                 flow before creating another one.",
+                crate::state::MAX_FLOWS
+            )));
+        }
+
+        let flow_suffix = store.next_suffix();
+        let flow_arn = ::engine::emulator_arn(
+            SERVICE_NAMESPACE,
+            &region,
+            &crate::state::flow_resource_fragment(flow_suffix, &input.name),
+        );
+
+        let mut sources = Vec::with_capacity(requested_sources.len());
+        for (index, request) in requested_sources.iter().enumerate() {
+            let suffix = store.next_suffix();
+            sources.push(materialise_source(
+                request,
+                index,
+                &input.name,
+                &region,
+                suffix,
+            ));
+        }
+
+        let mut outputs = Vec::new();
+        for (index, request) in input.outputs.iter().flatten().enumerate() {
+            let suffix = store.next_suffix();
+            outputs.push(materialise_output(request, index, &region, suffix));
+        }
+
+        let mut entitlements = Vec::new();
+        for (index, request) in input.entitlements.iter().flatten().enumerate() {
+            let suffix = store.next_suffix();
+            entitlements.push(materialise_entitlement(request, index, &region, suffix));
+        }
+
+        let media_streams: Vec<MediaStream> = input
+            .media_streams
+            .iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, request)| materialise_media_stream(request, index))
+            .collect();
+
+        let mut vpc_interfaces = Vec::new();
+        for request in input.vpc_interfaces.iter().flatten() {
+            let suffix = store.next_suffix();
+            vpc_interfaces.push(materialise_vpc_interface(request, suffix));
+        }
+
+        let stored = StoredFlow {
+            flow_arn: flow_arn.clone(),
+            name: input.name.clone(),
+            // CreateFlow models no `Description` member, so a new flow has none.
+            description: None,
+            // "The Availability Zone that you want to create the flow in. These options
+            // are limited to the Availability Zones within the current Region": when the
+            // request names none, the service picks one in the request's Region.
+            availability_zone: input
+                .availability_zone
+                .clone()
+                .filter(|zone| !zone.is_empty())
+                .unwrap_or_else(|| format!("{region}a")),
+            // A new flow is not running: it stands by until StartFlow. AWS returns it in
+            // this steady status, so no transition is owed here.
+            status: crate::state::STATUS_STANDBY.to_string(),
+            pending: None,
+            egress_ip: Some(crate::state::assigned_egress_ip(flow_suffix)),
+            flow_size: input.flow_size.clone(),
+            maintenance: input.maintenance.as_ref().map(|maintenance| Maintenance {
+                maintenance_day: Some(maintenance.maintenance_day.clone()),
+                maintenance_start_hour: Some(maintenance.maintenance_start_hour.clone()),
+                // Set when a maintenance window is actually scheduled for the flow.
+                maintenance_deadline: None,
+                maintenance_scheduled_date: None,
+            }),
+            source_failover_config: input.source_failover_config.clone(),
+            source_monitoring_config: input.source_monitoring_config.clone(),
+            ndi_config: input.ndi_config.clone(),
+            encoding_config: input.encoding_config.clone(),
+            sources,
+            outputs,
+            entitlements,
+            media_streams,
+            vpc_interfaces,
+            tags: input
+                .flow_tags
+                .iter()
+                .flatten()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            created_at: now,
+        };
+
+        store
+            .flow_arns_by_name
+            .insert(input.name.clone(), flow_arn.clone());
+        store.flows.insert(flow_arn.clone(), stored);
+
+        // The response is the STORED record, read back out of the store, not the request.
+        let flow = store
+            .flows
+            .get(&flow_arn)
+            .map(StoredFlow::to_flow)
+            .ok_or_else(|| {
+                CreateFlowError::from(CreateFlowErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the flow could not be read back after it was stored".to_string(),
+                    },
+                ))
+            })?;
+        Ok(CreateFlowOutput { flow: Some(flow) })
     }
 }
