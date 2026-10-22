@@ -2,10 +2,17 @@
 
 //! Engine state for the com-amazonaws-eks-awswesleyfrontend service.
 //!
-//! This holds the cluster lifecycle slice: `CreateCluster` writes a
-//! [`ClusterRecord`] here, and `DescribeCluster`, `ListClusters`, `TagResource`,
-//! `ListTagsForResource` and `DeleteCluster` all compute their responses from it.
-//! Nothing in `src/ops/` keeps a second copy of a cluster.
+//! This holds the cluster lifecycle slice: `CreateCluster` and `RegisterCluster`
+//! write a [`ClusterRecord`] here, and `DescribeCluster`, `ListClusters`,
+//! `TagResource`, `ListTagsForResource` and `DeleteCluster` all compute their
+//! responses from it. Nothing in `src/ops/` keeps a second copy of a cluster.
+//!
+//! One record covers both kinds of cluster this API knows: an Amazon EKS cluster
+//! `CreateCluster` provisions a control plane for, and an external Kubernetes
+//! cluster `RegisterCluster` connects. The members only a provisioned control
+//! plane has (`endpoint`, `roleArn`, `resourcesVpcConfig`, `version`,
+//! `platformVersion`) are optional on the record, because a connected cluster
+//! reports none of them — it reports [`ClusterRecord::connector_config`] instead.
 //!
 //! It also holds the EKS Pod Identity association slice:
 //! `CreatePodIdentityAssociation` writes a [`PodIdentityAssociationRecord`] here
@@ -38,6 +45,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     AccessConfigResponse, Certificate, Cluster, ClusterVersionInformation, ComputeConfigResponse,
+    ConnectorConfigResponse,
     ControlPlaneScalingConfig, EncryptionConfig, Identity, KubeApiServerConfigResponse,
     KubeControllerManagerConfigResponse, KubeSchedulerConfigResponse,
     KubernetesNetworkConfigResponse, Logging, OidcIdentityProviderConfig, OutpostConfigResponse,
@@ -54,6 +62,11 @@ pub const STATUS_CREATING: &str = "CREATING";
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 /// See [`STATUS_CREATING`].
 pub const STATUS_DELETING: &str = "DELETING";
+/// See [`STATUS_CREATING`]. The status a cluster `RegisterCluster` connected
+/// reports until the connector manifest is applied in the external cluster.
+pub const STATUS_PENDING: &str = "PENDING";
+/// See [`STATUS_CREATING`].
+pub const STATUS_FAILED: &str = "FAILED";
 /// See [`STATUS_CREATING`] — the status a cluster reports while one of its
 /// asynchronous updates is in flight.
 pub const STATUS_UPDATING: &str = "UPDATING";
@@ -95,6 +108,17 @@ pub const UPDATE_COMPLETION_DELAY: Duration = Duration::from_millis(500);
 /// errors that go with it), short enough to be worth waiting for. The due
 /// instant is stored on the record; nothing sleeps for it.
 pub const CLUSTER_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long a connected cluster has to apply its connector manifest before the
+/// registration lapses.
+///
+/// CITED, not chosen: "If the manifest isn't applied within three days, the
+/// connected cluster will no longer be visible and must be deregistered using
+/// DeregisterCluster" (`RegisterCluster`'s own documentation). It is reported to
+/// the caller as `connectorConfig.activationExpiry`, and it is the instant at
+/// which the clock owes a still-`PENDING` connected cluster the move to
+/// `FAILED`.
+pub const CONNECTOR_ACTIVATION_WINDOW: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
 /// The Kubernetes version a cluster gets when `CreateCluster` is called without
 /// `version`. The model documents the member as "The desired Kubernetes version
@@ -178,6 +202,11 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// `maxResults`. The model bounds `maxResults` at 1..100, so the full page is the
 /// natural default.
 pub const DEFAULT_LIST_PAGE_SIZE: i32 = 100;
+
+/// The one value `ListClusters`' `include` takes: "Use 'all' to return connected
+/// clusters, or blank to return only Amazon EKS clusters. 'all' must be in
+/// lowercase otherwise an error occurs" (`ListClustersRequest$include`).
+pub const LIST_INCLUDE_ALL: &str = "all";
 
 /// The only `identityProviderConfig.type` this API defines: "The type of the
 /// identity provider configuration. The only type available is `oidc`"
@@ -345,11 +374,23 @@ pub struct ClusterRecord {
     pub name: String,
     pub arn: String,
     pub created_at: SystemTime,
-    pub version: String,
-    pub platform_version: String,
-    pub endpoint: String,
-    pub role_arn: String,
-    pub resources_vpc_config: VpcConfigResponse,
+    /// Unset on a connected cluster: a registration carries no Kubernetes
+    /// version, and the external cluster's own version is only learned once its
+    /// connector agent reports in — which nothing in this emulator does.
+    pub version: Option<String>,
+    /// Unset on a connected cluster: there is no Amazon EKS control plane behind
+    /// it to carry a platform version.
+    pub platform_version: Option<String>,
+    /// Unset on a connected cluster: its API server endpoint is not published by
+    /// Amazon EKS.
+    pub endpoint: Option<String>,
+    /// Unset on a connected cluster: the cluster role is a provisioning input of
+    /// `CreateCluster`. A connected cluster's role lives in
+    /// [`Self::connector_config`] instead.
+    pub role_arn: Option<String>,
+    /// Unset on a connected cluster: Amazon EKS provisions no VPC resources for a
+    /// cluster it did not create.
+    pub resources_vpc_config: Option<VpcConfigResponse>,
     pub kubernetes_network_config: Option<KubernetesNetworkConfigResponse>,
     pub logging: Option<Logging>,
     pub identity: Option<Identity>,
@@ -358,6 +399,16 @@ pub struct ClusterRecord {
     /// When set, the instant at which the clock owes this cluster the move from
     /// `CREATING` to `ACTIVE`. Cleared once the move is materialised.
     pub active_at: Option<SystemTime>,
+    /// Set only on a connected cluster: what `RegisterCluster` minted for it, and
+    /// what `Cluster$connectorConfig` reports. `Some` is what makes a record a
+    /// connected cluster rather than an Amazon EKS one (see
+    /// [`ClusterRecord::is_connected`]).
+    pub connector_config: Option<ConnectorConfigResponse>,
+    /// When set, the instant at which the connector activation window closes (see
+    /// [`CONNECTOR_ACTIVATION_WINDOW`]) and the clock owes a still-`PENDING`
+    /// connected cluster the move to `FAILED`. Cleared once the move is
+    /// materialised.
+    pub activation_expires_at: Option<SystemTime>,
     pub tags: BTreeMap<String, String>,
     pub encryption_config: Vec<EncryptionConfig>,
     pub access_config: Option<AccessConfigResponse>,
@@ -459,6 +510,18 @@ impl ClusterRecord {
             self.status = STATUS_ACTIVE.to_string();
             self.active_at = None;
         }
+        // A connected cluster whose activation window closed with no manifest
+        // applied is no longer a usable registration, and that move was due at
+        // `activation_expires_at` whether or not anybody called. Nothing in this
+        // emulator applies a connector manifest, so no call takes a connected
+        // cluster out of `PENDING` before that instant; the status is still
+        // checked so a record that somehow left `PENDING` is not dragged back.
+        if self.activation_expires_at.is_some_and(|due| now >= due) {
+            if self.status == STATUS_PENDING {
+                self.status = STATUS_FAILED.to_string();
+            }
+            self.activation_expires_at = None;
+        }
 
         for config in self.identity_provider_configs.values_mut() {
             config.materialize_due_transitions(now);
@@ -486,6 +549,12 @@ impl ClusterRecord {
         }
     }
 
+    /// Whether this record is an external cluster `RegisterCluster` connected,
+    /// rather than an Amazon EKS cluster `CreateCluster` provisioned.
+    pub fn is_connected(&self) -> bool {
+        self.connector_config.is_some()
+    }
+
     /// The update this cluster is still running, if any.
     ///
     /// A cluster runs at most one update at a time, so this is what a mutating
@@ -510,17 +579,17 @@ impl ClusterRecord {
             name: Some(self.name.clone()),
             arn: Some(self.arn.clone()),
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
-            version: Some(self.version.clone()),
-            endpoint: Some(self.endpoint.clone()),
-            role_arn: Some(self.role_arn.clone()),
-            resources_vpc_config: Some(self.resources_vpc_config.clone()),
+            version: self.version.clone(),
+            endpoint: self.endpoint.clone(),
+            role_arn: self.role_arn.clone(),
+            resources_vpc_config: self.resources_vpc_config.clone(),
             kubernetes_network_config: self.kubernetes_network_config.clone(),
             logging: self.logging.clone(),
             identity: self.identity.clone(),
             status: Some(self.status.clone()),
             certificate_authority: self.certificate_authority.clone(),
             client_request_token: self.client_request_token.clone(),
-            platform_version: Some(self.platform_version.clone()),
+            platform_version: self.platform_version.clone(),
             tags: Some(
                 self.tags
                     .iter()
@@ -541,12 +610,12 @@ impl ClusterRecord {
             kube_api_server_config: self.kube_api_server_config.clone(),
             kube_scheduler_config: self.kube_scheduler_config.clone(),
             kube_controller_manager_config: self.kube_controller_manager_config.clone(),
+            connector_config: self.connector_config.clone(),
             // Left unset by this slice, each with its own gap issue: `id` is the
-            // id of a local cluster on an Outpost, `health` is filled in by
-            // cluster insights, and `connector_config` only by `RegisterCluster`.
+            // id of a local cluster on an Outpost, and `health` is filled in by
+            // cluster insights.
             id: None,
             health: None,
-            connector_config: None,
         }
     }
 }
@@ -1134,12 +1203,34 @@ impl ComAmazonawsEksAwswesleyfrontendState {
     /// The names of the clusters this store holds in `region`, in sorted order.
     ///
     /// The map is keyed `(region, name)`, so its iteration order already sorts
-    /// each region's names; this only drops the other regions.
+    /// each region's names; this only drops the other regions. EVERY cluster is
+    /// counted, connected ones included, because what this feeds is the quota and
+    /// the uniqueness of a name within a region — neither of which distinguishes
+    /// how the cluster got there.
     pub fn cluster_names_in<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         self.clusters
             .keys()
             .filter(move |(key_region, _)| key_region == region)
             .map(|(_, name)| name.as_str())
+    }
+
+    /// The names `ListClusters` projects for `region`, in sorted order.
+    ///
+    /// A connected cluster is listed only when the caller asked for it:
+    /// `include` "indicates whether external clusters are included in the
+    /// returned list. Use 'all' to return connected clusters, or blank to return
+    /// only Amazon EKS clusters" (`ListClustersRequest$include`).
+    pub fn listed_cluster_names_in<'a>(
+        &'a self,
+        region: &'a str,
+        include_connected: bool,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.clusters
+            .iter()
+            .filter(move |((key_region, _), record)| {
+                key_region == region && (include_connected || !record.is_connected())
+            })
+            .map(|((_, name), _)| name.as_str())
     }
 
     /// Every EKS Pod Identity association of one cluster, in association-id order.
@@ -1221,6 +1312,21 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// 16 bytes rendered in the hyphenated `8-4-4-4-12` lowercase-hex layout a UUID
+/// takes. The one renderer for both of this service's UUID-shaped identifiers
+/// ([`new_update_id`] and [`derive_activation_id`]).
+fn hyphenate_uuid(bytes: &[u8; 16]) -> String {
+    let hex = hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 /// A fresh identifier in the shape EKS gives an `Update$id`: "a UUID that is
 /// used to track the update" — a version-4 UUID, `8-4-4-4-12` lowercase hex with
 /// the version and variant bits RFC 4122 §4.4 fixes.
@@ -1248,15 +1354,7 @@ pub fn new_update_id(sequence: u64) -> String {
     // RFC 4122 §4.4: the version nibble is 4, and the variant's two top bits are `10`.
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let hex = hex::encode(bytes);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
+    hyphenate_uuid(&bytes)
 }
 
 /// The 32-hex-character resource identifier EKS gives a cluster, which appears in
@@ -1354,6 +1452,58 @@ pub fn derive_certificate_authority_data(resource_id: &str) -> String {
          -----END CERTIFICATE-----\n"
     );
     ::aws_smithy_types::base64::encode(placeholder)
+}
+
+/// The digest one registration's server-generated values are derived from.
+///
+/// `domain` separates the values derived for the same registration, so the
+/// activation id does not reveal the activation code; the cluster ARN and the
+/// creation instant together make it distinct per registration, so registering
+/// the same name again after deregistering it mints fresh values rather than
+/// repeating the previous ones.
+fn registration_digest(arn: &str, created_at: SystemTime, domain: &str) -> [u8; 32] {
+    let nanos = created_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut hasher = Sha256::new();
+    hasher.update(domain.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(arn.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(nanos.to_be_bytes());
+    hasher.finalize().into()
+}
+
+/// The `connectorConfig.activationId` of a registration: "a unique ID associated
+/// with the cluster for registration purposes"
+/// (`ConnectorConfigResponse$activationId`), in the hyphenated 8-4-4-4-12 hex
+/// form an activation id takes.
+///
+/// Computed once, by `RegisterCluster`, and stored on the record — no read
+/// recomputes it, so it is stable for the registration's whole life.
+pub fn derive_activation_id(arn: &str, created_at: SystemTime) -> String {
+    let digest = registration_digest(arn, created_at, "activation-id");
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    hyphenate_uuid(&bytes)
+}
+
+/// The `connectorConfig.activationCode` of a registration: "a unique code
+/// associated with the cluster for registration purposes"
+/// (`ConnectorConfigResponse$activationCode`).
+///
+/// It is NOT a credential this emulator authenticates anything with: the code is
+/// consumed by the connector agent against AWS Systems Manager, which this
+/// emulator does not serve, so nothing here accepts it and no request is
+/// authorized by it (an operation that returns a real credential mints it
+/// through the credential store instead). It is derived like the activation id,
+/// from a separate domain, so a read-back returns the same value the
+/// registration reported.
+pub fn derive_activation_code(arn: &str, created_at: SystemTime) -> String {
+    let digest = registration_digest(arn, created_at, "activation-code");
+    // 15 bytes encode to 20 base64 characters with no padding.
+    ::aws_smithy_types::base64::encode(&digest[..15])
 }
 
 /// How many bytes of the name's own digest a page token carries, so a token this

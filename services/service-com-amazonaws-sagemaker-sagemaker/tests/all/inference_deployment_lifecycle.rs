@@ -32,9 +32,13 @@ pub(crate) const CREATE_SPACING: Duration = Duration::from_millis(5);
 ///
 /// Shared with this crate's other suites (`use super::inference_deployment_lifecycle::*`)
 /// so every wire test drives the same router the production one assembles, rather than
-/// each suite growing its own copy.
+/// each suite growing its own copy of the dispatch path.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The ONE shared engine the service is mounted on. A suite that exercises an
+    /// operation whose writer is still a scaffold stub seeds that operation's records
+    /// here — the same store the handler reads through `state::service_state`.
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -45,9 +49,9 @@ impl Emulator {
         // credential scope only so the ARN region is the one the caller signed for.
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_sagemaker_sagemaker::EmulatedService::new(engine),
+            service_com_amazonaws_sagemaker_sagemaker::EmulatedService::new(Arc::clone(&engine)),
         );
-        Self { router }
+        Self { router, engine }
     }
 
     /// Call `target` with a SigV4 credential scope naming `region`.

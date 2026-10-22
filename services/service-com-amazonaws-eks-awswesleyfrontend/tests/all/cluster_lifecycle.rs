@@ -55,7 +55,7 @@ async fn delete(router: &MultiServiceRouter, name: &str) -> Answer {
     .await
 }
 
-async fn list(router: &MultiServiceRouter, query: &str) -> Answer {
+pub(crate) async fn list(router: &MultiServiceRouter, query: &str) -> Answer {
     let uri = if query.is_empty() {
         "/clusters".to_string()
     } else {
@@ -73,7 +73,7 @@ pub(crate) fn minimal_request(name: &str) -> serde_json::Value {
     })
 }
 
-fn names_of(answer: &Answer) -> Vec<String> {
+pub(crate) fn names_of(answer: &Answer) -> Vec<String> {
     answer.body["clusters"]
         .as_array()
         .map(|items| {

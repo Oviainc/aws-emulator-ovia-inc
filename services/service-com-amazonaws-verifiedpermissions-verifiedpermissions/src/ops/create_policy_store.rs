@@ -124,16 +124,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token.as_deref() {
             if let Some(record) = state.idempotency_replay("CreatePolicyStore", token) {
                 if record.parameters != parameters {
+                    // `ConflictException`'s message is the service's fixed
+                    // summary; the resource the token already created is
+                    // reported in the required `resources` list, which also
+                    // keeps the token value itself out of the response.
                     return Err(CreatePolicyStoreErrorModeled::ConflictException(
-                        ConflictException {
-                            message: format!(
-                                "the client token {token} was already used with different parameters"
-                            ),
-                            resources: vec![ResourceConflict {
-                                resource_id: record.resource_id.clone(),
-                                resource_type: "POLICY_STORE".to_string(),
-                            }],
-                        },
+                        crate::ops::conflict([crate::ops::resource_conflict(
+                            &record.resource_id,
+                            crate::state::RESOURCE_TYPE_POLICY_STORE,
+                        )]),
                     )
                     .into());
                 }
