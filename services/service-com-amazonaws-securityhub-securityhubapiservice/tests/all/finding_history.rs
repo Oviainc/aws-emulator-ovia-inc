@@ -285,6 +285,9 @@ async fn the_creating_import_is_one_history_event() {
         "Title": "Minimal",
         "Description": "Only the required members",
         "Resources": [{ "Type": "AwsEc2Instance", "Id": "i-1" }],
+        // The Amazon Finding Format requires a conforming finding to populate
+        // `Severity` or `FindingProviderFields`, so the bare form carries one of them.
+        "Severity": { "Label": "LOW" },
     });
     minimal["Types"] = json!(["TTPs/Initial Access"]);
 

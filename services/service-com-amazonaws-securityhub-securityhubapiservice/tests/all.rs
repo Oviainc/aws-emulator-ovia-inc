@@ -19,6 +19,8 @@ mod describe_standards;
 mod enabled_standards;
 #[path = "all/finding_history.rs"]
 mod finding_history;
+#[path = "all/finding_ingest_lifecycle.rs"]
+mod finding_ingest_lifecycle;
 #[path = "all/member_lifecycle.rs"]
 mod member_lifecycle;
 #[path = "all/resource_tagging.rs"]

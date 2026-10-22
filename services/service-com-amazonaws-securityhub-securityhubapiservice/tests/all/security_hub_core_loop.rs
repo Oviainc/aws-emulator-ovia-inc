@@ -14,24 +14,25 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region the test signs for; the handler reads it out of the SigV4 credential
 /// scope, exactly as a signed SDK request carries it.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The account every emulated caller presents.
-const ACCOUNT_ID: &str = "000000000000";
+pub(crate) const ACCOUNT_ID: &str = "000000000000";
 
 /// A product ARN of the shape Security Hub's own product uses.
-const PRODUCT_ARN: &str = "arn:aws:securityhub:us-east-1::product/aws/securityhub";
+pub(crate) const PRODUCT_ARN: &str = "arn:aws:securityhub:us-east-1::product/aws/securityhub";
 
 /// The only schema version the `AwsSecurityFinding` format defines.
-const SCHEMA_VERSION: &str = "2018-10-08";
+pub(crate) const SCHEMA_VERSION: &str = "2018-10-08";
 
-/// One emulator with the Security Hub service mounted, driven over HTTP.
-struct Harness {
+/// One emulator with the Security Hub service mounted, driven over HTTP. Shared with
+/// the other suites in this crate's `tests/all/`.
+pub(crate) struct Harness {
     router: MultiServiceRouter,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -43,7 +44,7 @@ impl Harness {
 
     /// Dispatch one request and return `(status, parsed body)`. An empty body parses
     /// as `Value::Null`, which is what an operation with no output members returns.
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
         let serialized = body.map(|b| serde_json::to_vec(&b).expect("serializable request body"));
         let request = http::Request::builder()
             .method(method)
@@ -69,7 +70,7 @@ impl Harness {
         (status, parsed)
     }
 
-    async fn enable(&self, body: Option<Value>) -> (u16, Value) {
+    pub(crate) async fn enable(&self, body: Option<Value>) -> (u16, Value) {
         self.call("POST", "/accounts", body.or(Some(json!({})))).await
     }
 
@@ -85,21 +86,21 @@ impl Harness {
         self.call("DELETE", "/accounts", None).await
     }
 
-    async fn import(&self, findings: Vec<Value>) -> (u16, Value) {
+    pub(crate) async fn import(&self, findings: Vec<Value>) -> (u16, Value) {
         self.call("POST", "/findings/import", Some(json!({ "Findings": findings })))
             .await
     }
 
-    async fn get_findings(&self, body: Value) -> (u16, Value) {
+    pub(crate) async fn get_findings(&self, body: Value) -> (u16, Value) {
         self.call("POST", "/findings", Some(body)).await
     }
 
-    async fn update_findings(&self, body: Value) -> (u16, Value) {
+    pub(crate) async fn update_findings(&self, body: Value) -> (u16, Value) {
         self.call("PATCH", "/findings/batchupdate", Some(body)).await
     }
 
     /// Enable the hub and import `findings`, asserting both succeed.
-    async fn with_findings(findings: Vec<Value>) -> Self {
+    pub(crate) async fn with_findings(findings: Vec<Value>) -> Self {
         let harness = Self::new();
         let (status, _) = harness.enable(None).await;
         assert_eq!(status, 200, "EnableSecurityHub must succeed, got {status}");
@@ -116,7 +117,7 @@ impl Harness {
 }
 
 /// A finding that satisfies every documented `AwsSecurityFinding` constraint.
-fn base_finding(id: &str) -> Value {
+pub(crate) fn base_finding(id: &str) -> Value {
     json!({
         "SchemaVersion": SCHEMA_VERSION,
         "Id": id,
@@ -136,7 +137,7 @@ fn base_finding(id: &str) -> Value {
 }
 
 /// The ids in `Findings`, in the order the response listed them.
-fn returned_ids(body: &Value) -> Vec<String> {
+pub(crate) fn returned_ids(body: &Value) -> Vec<String> {
     body["Findings"]
         .as_array()
         .map(|items| {
@@ -149,7 +150,7 @@ fn returned_ids(body: &Value) -> Vec<String> {
 }
 
 /// The one finding in `Findings` with `id`.
-fn finding_with_id(body: &Value, id: &str) -> Value {
+pub(crate) fn finding_with_id(body: &Value, id: &str) -> Value {
     body["Findings"]
         .as_array()
         .and_then(|items| {
@@ -443,6 +444,9 @@ async fn imported_findings_come_back_from_get_findings() {
     minimal.as_object_mut().expect("object").remove("Workflow");
     minimal.as_object_mut().expect("object").remove("Types");
     minimal.as_object_mut().expect("object").remove("RecordState");
+    // A conforming finding populates `Severity` or `FindingProviderFields`; this one
+    // takes the second branch of that documented `anyOf`.
+    minimal["FindingProviderFields"] = json!({ "Severity": { "Label": "LOW" } });
 
     let seeded = vec![base_finding("finding-base"), low, rich, minimal];
     let harness = Harness::with_findings(seeded.clone()).await;
@@ -533,7 +537,7 @@ async fn imported_findings_come_back_from_get_findings() {
 #[tokio::test]
 async fn import_rejects_findings_that_break_a_documented_constraint() {
     // (case, mutation, the member the error message must name)
-    let cases: [RejectionCase; 8] = [
+    let cases: [RejectionCase; 10] = [
         (
             "wrong schema version",
             |f| f["SchemaVersion"] = json!("2018-10-07"),
@@ -568,6 +572,21 @@ async fn import_rejects_findings_that_break_a_documented_constraint() {
             "Types one past the 50 maximum",
             |f| f["Types"] = json!(vec!["Effects/Data Exposure"; 51]),
             "Types",
+        ),
+        (
+            "RelatedFindings one past the 10 maximum",
+            |f| {
+                f["RelatedFindings"] = json!(vec![
+                    json!({ "ProductArn": PRODUCT_ARN, "Id": "related" });
+                    11
+                ]);
+            },
+            "RelatedFindings",
+        ),
+        (
+            "RelatedFindings below the 1 minimum",
+            |f| f["RelatedFindings"] = json!([]),
+            "RelatedFindings",
         ),
         (
             "UpdatedAt is not a timestamp",

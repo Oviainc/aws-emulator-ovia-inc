@@ -4,10 +4,16 @@
 //! Stores each accepted finding in [`crate::state`], keyed by the hub it belongs to
 //! plus the modelled `AwsSecurityFindingIdentifier` (`ProductArn` + `Id`), so a
 //! re-import of the same identifier UPDATES the stored record instead of creating a
-//! duplicate. `SuccessCount` / `FailedCount` are counted from what was stored, and a
-//! finding refused for violating one of the `AwsSecurityFinding` shape's documented
-//! constraints is reported in `FailedFindings` with the member and constraint it
-//! broke.
+//! duplicate — updating the PROVIDER-owned members only, because the members Security
+//! Hub CSPM reserves for the customer's investigation workflow (`Note`,
+//! `UserDefinedFields`, `VerificationState`, `Workflow`) cannot be updated through
+//! this operation once the finding exists. Every stored finding also carries the
+//! members the service itself sets (`Region`, `ProcessedAt`, `RecordState`,
+//! `Workflow.Status`, `FindingProviderFields`). `SuccessCount` / `FailedCount` are
+//! counted from what was stored, and a finding refused for violating the Amazon Web
+//! Services Security Finding Format or one of the `AwsSecurityFinding` shape's
+//! documented constraints is reported in `FailedFindings` with the member and
+//! constraint it broke.
 //!
 //! Every stored write also appends a `BATCH_IMPORT_FINDINGS` change event to that
 //! finding's history — the creating import, and any later re-import that changes an
@@ -166,22 +172,147 @@ const MAX_DESCRIPTION_LEN: usize = 1024;
 const MAX_RESOURCES: usize = 32;
 /// `AwsSecurityFinding$Types`: "Array Members: Maximum number of 50 items."
 const MAX_TYPES: usize = 50;
+/// `AwsSecurityFinding$RelatedFindings`: "Array Members: Minimum number of 1 item.
+/// Maximum number of 10 items." (`smithy_query(query="doc",
+/// shape="AwsSecurityFinding", member="RelatedFindings")`).
+const MAX_RELATED_FINDINGS: usize = 10;
 /// `AwsSecurityFinding$ProductFields` / `$UserDefinedFields`: "Can contain up to 50
 /// key-value pairs."
 const MAX_FIELD_MAP_ENTRIES: usize = 50;
 
+/// The `Workflow.Status` values Security Hub CSPM resets when a re-import reactivates
+/// a finding: "Security Hub CSPM also resets the workflow status from `NOTIFIED` or
+/// `RESOLVED` to `NEW` in the following cases: `RecordState` changes from `ARCHIVED` to
+/// `ACTIVE`; `ComplianceStatus` changes from `PASSED` to either `WARNING`, `FAILED`, or
+/// `NOT_AVAILABLE`" (`smithy_query(query="shape", shape="Workflow")`, member `Status`).
+/// A `SUPPRESSED` finding is not reset: the doc names only these two.
+const RESET_WORKFLOW_STATUSES: [&str; 2] = ["NOTIFIED", "RESOLVED"];
+
+/// The `RecordState` a reset is measured from: a finding that was archived and is
+/// active again has been reactivated.
+const ARCHIVED_RECORD_STATE: &str = "ARCHIVED";
+
+/// The `ComplianceStatus` a reset is measured from: a finding whose compliance was
+/// `PASSED` and no longer is has regressed.
+const COMPLIANCE_STATUS_PASSED: &str = "PASSED";
+
+/// Whether this re-import reactivates the finding, which is what makes Security Hub CSPM
+/// reset the workflow status it otherwise leaves to the customer: the record state goes
+/// from `ARCHIVED` to `ACTIVE`, or the compliance status leaves `PASSED` for another
+/// status.
+fn reactivates(stored: &AwsSecurityFinding, incoming: &AwsSecurityFinding) -> bool {
+    let unarchived = stored.record_state.as_deref() == Some(ARCHIVED_RECORD_STATE)
+        && incoming.record_state.as_deref() == Some(crate::state::DEFAULT_RECORD_STATE);
+    // A nested `fn`, not a closure: the returned `&str` borrows from the argument, a
+    // link a closure's inferred signature cannot express.
+    fn compliance_status(finding: &AwsSecurityFinding) -> Option<&str> {
+        finding
+            .compliance
+            .as_ref()
+            .and_then(|compliance| compliance.status.as_deref())
+    }
+    // "Populated and not PASSED" IS the doc's WARNING / FAILED / NOT_AVAILABLE: those
+    // three are the whole of the `ComplianceStatus` enum beside PASSED
+    // (`super::types::COMPLIANCE_STATUS_VALUES`, generated from the model), and a
+    // re-import that states no compliance status at all states no regression.
+    let incoming_status = compliance_status(incoming);
+    let regressed = compliance_status(stored) == Some(COMPLIANCE_STATUS_PASSED)
+        && incoming_status.is_some()
+        && incoming_status != Some(COMPLIANCE_STATUS_PASSED);
+    unarchived || regressed
+}
+
+/// Set the members Security Hub CSPM itself owns on a finding it is ingesting,
+/// whatever the provider submitted for them:
+///
+/// * `RecordState` / `Workflow.Status` — the lifecycle pair every consumer keys its
+///   triage on, defaulted to [`crate::state::DEFAULT_RECORD_STATE`] /
+///   [`crate::state::DEFAULT_WORKFLOW_STATUS`] when the provider sent none.
+/// * `FindingProviderFields` — "When a new finding is sent to Security Hub CSPM by a
+///   finding provider, Security Hub CSPM populates the `FindingProviderFields` object
+///   automatically, if it is empty, based on the corresponding top-level fields"
+///   (`smithy_query(query="shape", shape="FindingProviderFields")`). A finding that
+///   populates none of those top-level fields gets no object at all, since there is
+///   nothing to populate it from.
+///
+/// Called on both store branches, so a created and a re-imported finding carry the
+/// same service-owned members.
+fn apply_service_set_defaults(finding: &mut AwsSecurityFinding) {
+    if finding.record_state.is_none() {
+        finding.record_state = Some(crate::state::DEFAULT_RECORD_STATE.to_string());
+    }
+    match finding.workflow.as_mut() {
+        Some(workflow) => {
+            if workflow.status.is_none() {
+                workflow.status = Some(crate::state::DEFAULT_WORKFLOW_STATUS.to_string());
+            }
+        }
+        None => {
+            finding.workflow = Some(Workflow {
+                status: Some(crate::state::DEFAULT_WORKFLOW_STATUS.to_string()),
+            });
+        }
+    }
+    if finding.finding_provider_fields.is_none() {
+        // Nothing to derive the object from unless at least one of the top-level
+        // fields it mirrors is populated, so that is settled before anything is built.
+        let has_source = finding.confidence.is_some()
+            || finding.criticality.is_some()
+            || finding.related_findings.is_some()
+            || finding.severity.is_some()
+            || finding.types.is_some();
+        if has_source {
+            // `FindingProviderSeverity` carries only `Label` and `Original`;
+            // `Normalized` and `Product` have no counterpart under
+            // `FindingProviderFields`.
+            let severity = finding
+                .severity
+                .as_ref()
+                .map(|severity| FindingProviderSeverity {
+                    label: severity.label.clone(),
+                    original: severity.original.clone(),
+                });
+            finding.finding_provider_fields = Some(FindingProviderFields {
+                confidence: finding.confidence,
+                criticality: finding.criticality,
+                related_findings: finding.related_findings.clone(),
+                severity,
+                types: finding.types.clone(),
+            });
+        }
+    }
+}
+
 /// Why this finding cannot be stored, naming the member and the constraint it
 /// violates, or `None` when it satisfies every one of them.
 ///
-/// Each rule is a length / count / format constraint the `AwsSecurityFinding` shape
-/// documents but the Smithy model does not express as a trait, so the framework's
-/// boundary validation cannot refuse it: the operation reports it per finding in
-/// `FailedFindings` rather than failing the whole batch.
+/// Each rule is a required-property, length, count or format constraint the Amazon Web
+/// Services Security Finding Format and the `AwsSecurityFinding` shape document but the
+/// Smithy model does not express as a trait, so the framework's boundary validation
+/// cannot refuse it: the operation reports it per finding in `FailedFindings` rather
+/// than failing the whole batch. Conformance is judged on the SUBMITTED payload, a
+/// re-import included — a submission that does not adhere to the format is not a
+/// finding the service can apply, whatever the stored record happens to carry.
 fn rejection_reason(finding: &AwsSecurityFinding) -> Option<String> {
     if finding.schema_version != crate::state::FINDING_SCHEMA_VERSION {
         return Some(format!(
             "SchemaVersion must be {}, got {}",
             crate::state::FINDING_SCHEMA_VERSION, finding.schema_version
+        ));
+    }
+    // The Amazon Web Services Security Finding Format requires a finding to populate
+    // `Severity` or `FindingProviderFields` — its `anyOf` over the two, which the
+    // Smithy model expresses as no trait: `AwsSecurityFinding$Severity` is not
+    // `@required`, and `FindingProviderFields` is the documented channel finding
+    // providers "use ... to provide and update values for ... Severity"
+    // (`smithy_query(query="shape", shape="FindingProviderFields")`). A finding that
+    // populates neither does not conform, so it is reported per finding.
+    if finding.severity.is_none() && finding.finding_provider_fields.is_none() {
+        return Some(format!(
+            "Finding does not adhere to Amazon Finding Format. FindingId: {} Error: data should \
+             have required property 'Severity', data should have required property \
+             'FindingProviderFields', data should match some schema in anyOf.",
+            finding.id
         ));
     }
     if finding.id.len() > MAX_ID_LEN {
@@ -222,6 +353,14 @@ fn rejection_reason(finding: &AwsSecurityFinding) -> Option<String> {
             return Some(format!(
                 "Types must contain at most {MAX_TYPES} items, got {}",
                 types.len()
+            ));
+        }
+    }
+    if let Some(related_findings) = finding.related_findings.as_ref() {
+        if related_findings.is_empty() || related_findings.len() > MAX_RELATED_FINDINGS {
+            return Some(format!(
+                "RelatedFindings must contain between 1 and {MAX_RELATED_FINDINGS} items, got {}",
+                related_findings.len()
             ));
         }
     }
@@ -322,20 +461,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // CSPM received a finding and begins to process it".
             finding.region = Some(region.clone());
             finding.processed_at = Some(received_at.clone());
-            // `RecordState` and `Workflow.Status` are the service-owned lifecycle
-            // members: neither is modelled on input as required, and `Workflow$Status`
-            // documents "NEW - The initial state of a finding, before it is reviewed"
-            // with Security Hub itself resetting the status, so an ingested finding
-            // that carries neither gets the service's initial values rather than
-            // reading back with the members absent.
-            if finding.record_state.is_none() {
-                finding.record_state = Some(crate::state::DEFAULT_RECORD_STATE.to_string());
-            }
-            if finding.workflow.as_ref().and_then(|w| w.status.clone()).is_none() {
-                finding.workflow = Some(Workflow {
-                    status: Some(crate::state::DEFAULT_WORKFLOW_STATUS.to_string()),
-                });
-            }
+            // `RecordState`, `Workflow.Status` and `FindingProviderFields` are settled
+            // per store branch by `apply_service_set_defaults`, so a re-import can
+            // carry the stored lifecycle state forward before the defaults apply.
             if let Some(severity) = finding.severity.as_mut() {
                 crate::state::complete_severity(severity);
             }
@@ -346,10 +474,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // submitted under is what names the importer.
             let importer = finding.product_arn.clone();
             match store.findings.get_mut(&key) {
-                // Re-importing an identifier updates the stored finding in place.
+                // Re-importing an identifier updates the stored finding in place, and
+                // updates PROVIDER-owned members only: "After a finding is created,
+                // BatchImportFindings cannot be used to update the following finding
+                // fields and objects, which Security Hub CSPM customers use to manage
+                // their investigation workflow. Note UserDefinedFields
+                // VerificationState Workflow" (this operation's own documentation), so
+                // those four are carried forward from the stored record whether the
+                // incoming payload omits them or carries a different value.
                 Some(existing) => {
-                    // The change event records what this write actually changed, so
-                    // it is computed against the stored finding BEFORE the write.
+                    let stored = &existing.finding;
+                    finding.note = stored.note.clone();
+                    finding.user_defined_fields = stored.user_defined_fields.clone();
+                    finding.verification_state = stored.verification_state.clone();
+                    finding.workflow = stored.workflow.clone();
+                    // `RecordState` is service-owned, and the doc quoted above does not
+                    // list it among the members a provider may not update, so a
+                    // re-import that CARRIES one is honoured; one that carries none
+                    // states nothing about the record state, so the state the record
+                    // already has stands (an archived finding is not reactivated by a
+                    // payload that never mentioned RecordState).
+                    if finding.record_state.is_none() {
+                        finding.record_state = stored.record_state.clone();
+                    }
+                    // The one workflow status change this operation does make, because
+                    // the service and not the customer owns it: a re-import that
+                    // reactivates the finding resets a NOTIFIED or RESOLVED status to
+                    // NEW, the finding being up for review again.
+                    if reactivates(stored, &finding) {
+                        if let Some(status) = finding
+                            .workflow
+                            .as_mut()
+                            .and_then(|workflow| workflow.status.as_mut())
+                        {
+                            if RESET_WORKFLOW_STATUSES.contains(&status.as_str()) {
+                                *status = crate::state::DEFAULT_WORKFLOW_STATUS.to_string();
+                            }
+                        }
+                    }
+                    apply_service_set_defaults(&mut finding);
+                    // The change event records what this write actually changed, so it
+                    // is computed against the stored finding BEFORE the write, and
+                    // against the finding as it will be STORED — a member carried
+                    // forward above did not change, so it is not reported as one.
                     let updates = crate::state::finding_changes(&existing.finding, &finding);
                     existing.finding = finding;
                     existing.updated_seq = seq;
@@ -368,6 +535,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
                 None => {
+                    apply_service_set_defaults(&mut finding);
                     // The creating event names the fields the finding was created
                     // with: every ASFF field the import set, each with no prior value.
                     let updates = crate::state::finding_created_fields(&finding);
