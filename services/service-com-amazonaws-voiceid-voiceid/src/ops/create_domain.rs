@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a domain, creates the default watchlist every domain is created with, and
+//! persists both in [`crate::state::ComAmazonawsVoiceidVoiceidState`]; the response is
+//! built from the stored record, and a replayed `ClientToken` returns that same record.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +163,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDomain"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDomainErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Voice ID store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // The ARN carries the region the caller signed for, read off the request.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `CreateDomain` is `@idempotent`: the same `ClientToken` replayed returns
+        // the domain the first call created rather than minting a second one. The
+        // replayed request's members are NOT compared against the stored ones, so
+        // a token reused with a different body answers with the first domain
+        // instead of the `ConflictException` this operation models for that case;
+        // comparing them belongs with the operation that records the request a
+        // token was first seen with.
+        if let Some(token) = input.client_token.as_deref() {
+            let key = crate::state::IdempotencyKey::domain(token);
+            if let Some(existing) = store
+                .idempotency
+                .get(&key)
+                .and_then(|domain_id| store.domains.get(domain_id))
+            {
+                return Ok(CreateDomainOutput {
+                    domain: Some(existing.to_domain()),
+                });
+            }
+        }
+
+        let tags = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        let record = store
+            .create_domain(
+                input.name,
+                input.description,
+                input.server_side_encryption_configuration.kms_key_id,
+                tags,
+                &region,
+                now,
+            )
+            .map_err(|refusal| match refusal {
+                crate::state::CreateError::QuotaExceeded(message) => {
+                    CreateDomainErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(message),
+                        },
+                    )
+                }
+                crate::state::CreateError::IdMintExhausted(message) => {
+                    CreateDomainErrorModeled::InternalServerException(InternalServerException {
+                        message: Some(message),
+                    })
+                }
+            })?;
+        if let Some(token) = input.client_token.as_deref() {
+            store.remember_token(
+                crate::state::IdempotencyKey::domain(token),
+                record.domain_id.clone(),
+            );
+        }
+
+        Ok(CreateDomainOutput {
+            domain: Some(record.to_domain()),
+        })
     }
 }
