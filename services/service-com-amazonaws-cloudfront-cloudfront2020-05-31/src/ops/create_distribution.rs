@@ -6,6 +6,31 @@
 //! stores the submitted `DistributionConfig` whole, and reports the record it stored.
 //! The distribution starts `InProgress`, and the clock owes it `Deployed`.
 //!
+//! The `CallerReference` is what decides whether there is anything to create: a reference
+//! the store does not hold yet makes a new distribution, the same reference carrying the
+//! same configuration is the SAME request again and answers with the distribution it
+//! already names, and the same reference carrying a different configuration is refused
+//! with `DistributionAlreadyExists`. The two branches are what the RECORDED service does:
+//! the corpus fixture `cfval-caller-reference-reuse-conflict` has one create under a
+//! reference the store already holds answered 201 with a `Distribution` payload and
+//! another answered 409. Which of its steps is which is established by replaying it: with
+//! the conflict keyed on the caller reference ALONE, the recorded-201 step was answered
+//! 409 (its key `cloudfront|CreateDistribution|2xx->4xx|status` kept failing) even though
+//! a create under an unused reference already answered 201 — so the recorded-201 step is a
+//! repeat under a reference already in use; and with the repeat answered from the stored
+//! record, that step matches while the fixture's other reuse step still answers 409,
+//! because its configuration differs. The error shape says the same thing in words — the
+//! reference is "associated with ANOTHER distribution" — and `CreateInvalidation` in this
+//! crate already serves this rule for the caller reference of a batch.
+//!
+//! The configuration compared is the one that distribution holds NOW, which is also the
+//! one `GetDistribution` reports: after an `UpdateDistribution` the question "is this the
+//! configuration that reference names" is asked of the updated configuration, so a repeat
+//! of the original create under a reference whose distribution has since been
+//! reconfigured is the conflict rather than a replay. The rule itself lives on the shared
+//! create path, `crate::state::ComAmazonawsCloudfrontCloudfront20200531State::create_distribution`,
+//! so `CreateDistributionWithTags` follows it too.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -390,7 +415,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // This operation's request carries no tag set, so the distribution it creates
         // starts with no tags; everything else is the shared create path, which
-        // `CreateDistributionWithTags` runs too.
+        // `CreateDistributionWithTags` runs too — including the caller-reference rule.
         let created = store
             .create_distribution(input.distribution_config, crate::state::TagSet::new(), now)
             .map_err(create_refusal)?;
