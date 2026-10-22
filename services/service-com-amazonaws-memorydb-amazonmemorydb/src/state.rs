@@ -16,7 +16,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    Cluster, Endpoint, EngineVersionInfo, Node, SecurityGroupMembership, Shard, Tag, ACL,
+    Cluster, Endpoint, EngineVersionInfo, Node, ParameterGroup, SecurityGroupMembership, Shard,
+    Tag, ACL,
 };
 
 /// The region an ARN or endpoint carries when the request is unsigned, matching the
@@ -210,6 +211,9 @@ pub struct ComAmazonawsMemorydbAmazonmemorydbState {
     pub clusters: BTreeMap<String, StoredCluster>,
     /// ACLs by `ACLName`.
     pub acls: BTreeMap<String, StoredAcl>,
+    /// Parameter groups by `ParameterGroupName`, in name order like the maps above,
+    /// so a listing over them pages stably.
+    pub parameter_groups: BTreeMap<String, StoredParameterGroup>,
     /// Tags by resource ARN, written by the `Tags` member of a create. The
     /// `ListTags`/`TagResource` slice (still scaffolded) reads the same map.
     pub tags: BTreeMap<String, Vec<(String, String)>>,
@@ -325,6 +329,24 @@ pub struct StoredNode {
     pub created_at: SystemTime,
 }
 
+/// A parameter group as this emulator persists it: the three members
+/// `CreateParameterGroup` accepts plus the ARN the service itself mints.
+///
+/// A parameter group has NO status member in the model (`ParameterGroup` is
+/// `Name`/`Family`/`Description`/`ARN`), so there is no transient status to settle and
+/// nothing for the clock to owe it.
+#[derive(Debug, Clone)]
+pub struct StoredParameterGroup {
+    pub name: String,
+    /// `ParameterGroup$Family`: "The name of the parameter group family that this
+    /// parameter group is compatible with." Stored verbatim — the model publishes no
+    /// catalog of families, so the service records the caller's rather than matching it
+    /// against a guessed list.
+    pub family: String,
+    pub description: Option<String>,
+    pub arn: String,
+}
+
 /// An ACL as this emulator persists it. `Clusters` is NOT stored: it is derived from
 /// the clusters currently referencing the ACL (see
 /// [`ComAmazonawsMemorydbAmazonmemorydbState::clusters_using_acl`]).
@@ -373,9 +395,10 @@ impl StoredCluster {
             parameter_group_name: self.parameter_group_name.clone(),
             // Left ABSENT deliberately: `ParameterGroupStatus` has its own vocabulary
             // (a parameter group is in sync with the cluster, or being applied to it),
-            // and this slice does not model parameter groups at all — their own
-            // operations are still scaffolded. Reporting the cluster's own status here
-            // would be a plausible-looking token for state nothing tracks.
+            // and nothing tracks the application of a parameter group to a cluster —
+            // the operations that would (`UpdateParameterGroup`, `UpdateCluster`'s
+            // `ParameterGroupName`) do not record it. Reporting the cluster's own
+            // status here would be a plausible-looking token for state nothing tracks.
             parameter_group_status: None,
             security_groups: Some(
                 self.security_group_ids
@@ -437,6 +460,18 @@ impl StoredNode {
     }
 }
 
+impl StoredParameterGroup {
+    /// The modelled `ParameterGroup` for this stored parameter group.
+    pub fn to_api(&self) -> ParameterGroup {
+        ParameterGroup {
+            name: Some(self.name.clone()),
+            family: Some(self.family.clone()),
+            description: self.description.clone(),
+            arn: Some(self.arn.clone()),
+        }
+    }
+}
+
 impl StoredAcl {
     /// The modelled `ACL` for this stored ACL. `clusters` is the derived membership
     /// list, which only the state as a whole can compute.
@@ -470,6 +505,11 @@ pub fn cluster_arn(region: &str, name: &str) -> String {
 /// `arn:aws:memorydb:<region>:<account>:acl/<name>`.
 pub fn acl_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("acl/{name}"))
+}
+
+/// `arn:aws:memorydb:<region>:<account>:parametergroup/<name>`.
+pub fn parameter_group_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("parametergroup/{name}"))
 }
 
 /// The per-cluster label AWS puts between the cluster name and the service domain in

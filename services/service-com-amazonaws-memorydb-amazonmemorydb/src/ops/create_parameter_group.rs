@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: inserts the parameter group into [`crate::state`] keyed by
+//! `ParameterGroupName` and answers with the stored record, so `DescribeParameterGroups`
+//! reports exactly what was persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +154,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateParameterGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); this operation models no server fault, so
+            // the request is refused rather than answered with a fabricated group.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        // Besides this create's own insert, the only write: the status transitions the
+        // clock already owed the stored clusters and ACLs at this instant.
+        state.settle(std::time::Instant::now());
+
+        if state.parameter_groups.contains_key(&input.parameter_group_name) {
+            return Err(
+                CreateParameterGroupErrorModeled::ParameterGroupAlreadyExistsFault(
+                    ParameterGroupAlreadyExistsFault {
+                        message: Some(format!(
+                            "Parameter group with name {} already exists.",
+                            input.parameter_group_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The store itself is bounded: one caller cannot grow it without end.
+        if state.parameter_groups.len() >= crate::state::MAX_RESOURCES_PER_KIND {
+            return Err(
+                CreateParameterGroupErrorModeled::ParameterGroupQuotaExceededFault(
+                    ParameterGroupQuotaExceededFault {
+                        message: Some(format!(
+                            "The maximum number of parameter groups ({}) has been reached.",
+                            crate::state::MAX_RESOURCES_PER_KIND
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let arn = crate::state::parameter_group_arn(&region, &input.parameter_group_name);
+        let group = crate::state::StoredParameterGroup {
+            name: input.parameter_group_name.clone(),
+            // `Family` is recorded as the caller gave it: the model publishes no
+            // catalog of families, so there is nothing here to resolve it against.
+            family: input.family,
+            description: input.description,
+            arn: arn.clone(),
+        };
+
+        let tags = crate::state::tag_pairs(input.tags.as_ref());
+        if !tags.is_empty() {
+            state.tags.insert(arn, tags);
+        }
+        let response = group.to_api();
+        state
+            .parameter_groups
+            .insert(input.parameter_group_name, group);
+        Ok(CreateParameterGroupOutput {
+            parameter_group: Some(response),
+        })
     }
 }
