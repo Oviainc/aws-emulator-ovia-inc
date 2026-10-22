@@ -17,5 +17,7 @@ mod logging_configuration;
 mod query_logging_configuration;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/workspace_configuration.rs"]
+mod workspace_configuration;
 #[path = "all/workspace_lifecycle.rs"]
 mod workspace_lifecycle;

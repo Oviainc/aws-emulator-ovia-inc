@@ -7,6 +7,10 @@
 //! Every suite drives the real request path — `MultiServiceRouter::dispatch` over this
 //! service mounted on one shared engine — so routing, the `restJson1` wire shapes, the
 //! modelled response statuses and the modelled error envelopes are all exercised.
+//!
+//! That harness (`Amp`, `Reply`, [`text`], [`wait_for_due_transition`]) is `pub(crate)`
+//! so the other suites in this test target drive the same path instead of each building
+//! their own.
 
 use bytes::Bytes;
 use service_com_amazonaws_amp_amazonprometheusservice::ops::types::WORKSPACE_STATUS_CODE_VALUES;
