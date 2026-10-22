@@ -21,7 +21,7 @@ use crate::ops::types::{
     AccessDeniedException, AmiProductSummary, ChangeSetSummaryListItem, ChangeSummary,
     ContainerProductSummary, DataProductSummary, Entity, EntitySummary,
     MachineLearningProductSummary, ResourceInUseException, ResourceNotFoundException,
-    SaaSProductSummary, Tag, ValidationException, ValidationExceptionField,
+    SaaSProductSummary, Tag, ValidationException,
 };
 
 /// The only catalog this service serves.
@@ -1064,40 +1064,39 @@ fn to_json(document: &Document, budget: usize) -> Option<Value> {
     })
 }
 
-/// The modelled `ValidationException` payload for a request this service
-/// refuses, naming the member that was wrong.
-pub fn validation(field: &str, message: impl Into<String>) -> ValidationException {
-    let message = message.into();
+/// The modelled `ValidationException` payload stated the way this service states
+/// one: everything it has to say about the request is in `Message`, as the
+/// bracketed list of per-member sentences, and `ValidationExceptionFieldList` is
+/// left absent.
+///
+/// The form is the service's own, read off its recorded refusals: two different
+/// operations answer a rejected member with a `Message` of exactly that shape
+/// (`[Requested entity id '…' is invalid. It should match with …]`,
+/// `[Requested sort by '…' is invalid. It should be one of '…'.]`) and with no
+/// `ValidationExceptionFieldList` beside it. So the message is what names the
+/// member, and every refusal built here passes one that does.
+pub fn validation_message(message: impl Into<String>) -> ValidationException {
     ValidationException {
-        message: Some(message.clone()),
-        validation_exception_field_list: Some(vec![ValidationExceptionField {
-            // `ValidationExceptionReason`'s value for a member whose value the
-            // service rejects.
-            reason: Some("FieldValidationFailed".to_string()),
-            field: Some(field.to_string()),
-            message: Some(message),
-            entity_type: None,
-            entity_id: None,
-            change_type: None,
-        }]),
+        message: Some(format!("[{}]", message.into())),
+        validation_exception_field_list: None,
     }
 }
 
+/// The modelled `ValidationException` payload for a request this service
+/// refuses, naming the member that was wrong — [`validation_message`] with the
+/// member named ahead of what was wrong with it.
+pub fn validation(field: &str, message: impl Into<String>) -> ValidationException {
+    validation_message(format!("{field}: {}", message.into()))
+}
+
 /// The modelled `ValidationException` payload for a member this service could
-/// not read at all — `ValidationExceptionReason`'s `CannotParse`.
+/// not read at all.
+///
+/// Stated like any other refusal: the only thing that distinguished it was
+/// `ValidationExceptionField$Reason`, and this service reports no field list to
+/// carry a reason in, so the message says what could not be read.
 pub fn cannot_parse(field: &str, message: impl Into<String>) -> ValidationException {
-    let message = message.into();
-    ValidationException {
-        message: Some(message.clone()),
-        validation_exception_field_list: Some(vec![ValidationExceptionField {
-            reason: Some("CannotParse".to_string()),
-            field: Some(field.to_string()),
-            message: Some(message),
-            entity_type: None,
-            entity_id: None,
-            change_type: None,
-        }]),
-    }
+    validation(field, message)
 }
 
 /// The modelled `ValidationException` payload for a `Catalog` other than the
@@ -1107,6 +1106,60 @@ pub fn wrong_catalog(catalog: &str) -> ValidationException {
         "Catalog",
         format!("Catalog must be {AWS_MARKETPLACE_CATALOG}, not {catalog:?}"),
     )
+}
+
+/// The form an entity id takes, as the model's own `EntityId` shape states it
+/// (`@pattern("^[a-zA-Z0-9][.a-zA-Z0-9/-]+[a-zA-Z0-9]$")`).
+///
+/// `EntityId` is the shape every member that NAMES an entity targets —
+/// `EntityRequest$EntityId`, the `EntityDetails` / `Errors` map keys of
+/// `BatchDescribeEntities`, `ValidationExceptionField$EntityId` — so it is this
+/// service's statement of which strings are entity ids at all. A handful of
+/// members, `DescribeEntityRequest$EntityId` among them, target the wider
+/// `ResourceId` (`^[\w\-]+$`) instead, which admits strings no entity id can be
+/// (an underscore, or a single character); the service enforces the `EntityId`
+/// form on those members too, and the pattern is reported verbatim in the
+/// refusal so a caller can see what was required.
+pub const ENTITY_ID_PATTERN: &str = "^[a-zA-Z0-9][.a-zA-Z0-9/-]+[a-zA-Z0-9]$";
+
+/// Whether `value` is an entity id: [`ENTITY_ID_PATTERN`], spelled out as a
+/// predicate — an alphanumeric first and last character with one or more
+/// alphanumeric, `.`, `/` or `-` characters between them (so the shortest entity
+/// id is three characters long).
+pub fn is_entity_id(value: &str) -> bool {
+    let mut middle = value.chars();
+    let (Some(first), Some(last)) = (middle.next(), middle.next_back()) else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && last.is_ascii_alphanumeric()
+        && !middle.as_str().is_empty()
+        && middle.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | '-'))
+}
+
+/// The modelled `ValidationException` payload for an entity id outside
+/// [`ENTITY_ID_PATTERN`] — what a read refuses BEFORE it looks the entity up, so
+/// a malformed id is a 422 and only a well-formed one can reach the 404.
+///
+/// The message is built from the request: it names the rejected id and the
+/// pattern the service requires, which is what lets a caller correct the call.
+pub fn invalid_entity_id(entity_id: &str) -> ValidationException {
+    validation_message(format!(
+        "Requested entity id '{entity_id}' is invalid. \
+         It should match with {ENTITY_ID_PATTERN}."
+    ))
+}
+
+/// The modelled `ValidationException` payload for a `Sort$SortBy` outside the
+/// attributes the list being called sorts on (`supported`).
+///
+/// The message is built from the request — the attribute it asked to sort by and
+/// the set this list accepts — in the form the service states such a refusal in.
+pub fn invalid_sort_by(sort_by: &str, supported: &[&str]) -> ValidationException {
+    validation_message(format!(
+        "Requested sort by '{sort_by}' is invalid. It should be one of '{}'.",
+        supported.join(", ")
+    ))
 }
 
 /// The modelled `ResourceNotFoundException` payload for a change set id that
@@ -1120,14 +1173,34 @@ pub fn change_set_not_found(change_set_id: &str) -> ResourceNotFoundException {
 /// The modelled `ResourceNotFoundException` payload for an entity id that names
 /// no entity.
 ///
-/// The wording is this service's own for an absent resource, as its recorded
-/// answers show it ("Requested entity '<id>' does not exist."): it names the id
-/// the request asked for, so the caller can see which one was missing.
+/// The message is built from the request, naming the entity that was asked for,
+/// in the form this service's recorded answers show it states a missing entity
+/// in — the same sentence the `Errors` map of `BatchDescribeEntities` carries per
+/// missing entity, so one entity read and a batch of them report a missing
+/// entity identically.
 pub fn entity_not_found(entity_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("Requested entity '{entity_id}' does not exist.")),
+        message: Some(entity_missing_message(entity_id)),
     }
 }
+
+/// The sentence that states `entity_id` names no entity, shared by the
+/// `ResourceNotFoundException` a single entity read answers and the
+/// `BatchDescribeErrorDetail$ErrorMessage` the batch read reports for the same
+/// entity.
+pub fn entity_missing_message(entity_id: &str) -> String {
+    format!("Requested entity '{entity_id}' does not exist.")
+}
+
+/// The `BatchDescribeErrorDetail$ErrorCode` for an entity the catalog does not
+/// hold.
+///
+/// `BatchDescribeEntities` models no top-level error for a missing entity (its
+/// modelled errors are AccessDenied / InternalService / Throttling / Validation
+/// only) and answers one in the `Errors` map instead, keyed by the entity id,
+/// carrying the name of the error a single read of that entity would have
+/// raised.
+pub const BATCH_ERROR_RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 
 /// The modelled `ResourceNotFoundException` payload for a resource ARN that
 /// names a resource of this catalog the store does not hold.

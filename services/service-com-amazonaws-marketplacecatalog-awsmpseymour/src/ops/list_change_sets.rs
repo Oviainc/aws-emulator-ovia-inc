@@ -239,13 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(|| crate::state::CHANGE_SET_SORT_BY[0].to_string());
         if !crate::state::CHANGE_SET_SORT_BY.contains(&sort_by.as_str()) {
             return Err(ListChangeSetsErrorModeled::ValidationException(
-                crate::state::validation(
-                    "Sort.SortBy",
-                    format!(
-                        "ListChangeSets sorts by {:?}, not by {sort_by:?}",
-                        crate::state::CHANGE_SET_SORT_BY
-                    ),
-                ),
+                crate::state::invalid_sort_by(&sort_by, crate::state::CHANGE_SET_SORT_BY),
             )
             .into());
         }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDescribeEntities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDescribeEntities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDescribeEntities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the same record `DescribeEntity` reports, for up to 20 entities in one call:
+//! every entity the catalog holds lands in `EntityDetails`, and every one it does not
+//! lands in `Errors` under its own id, so one missing entity does not fail the call.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +140,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDescribeEntities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDescribeEntitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDescribeEntities"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchDescribeEntitiesErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the marketplace catalog store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `EntityRequest$Catalog` documents the same fixed value every other
+        // operation's `Catalog` does, so an entry naming another catalog is a
+        // bad request rather than a missing entity: it is refused for the whole
+        // call, before any entity is read.
+        for request in &input.entity_request_list {
+            if request.catalog != crate::state::AWS_MARKETPLACE_CATALOG {
+                return Err(BatchDescribeEntitiesErrorModeled::ValidationException(
+                    crate::state::wrong_catalog(&request.catalog),
+                )
+                .into());
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An entity exists once the change set that creates it has succeeded,
+        // which is a change the clock owes rather than one a reader makes.
+        store.settle(now);
+
+        // BOTH members are reported, empty maps included: a request for entities
+        // the catalog does not hold answers `EntityDetails {}` beside the
+        // `Errors` that say why, and a request that resolves every entity
+        // answers `Errors {}`.
+        let mut entity_details: ::std::collections::HashMap<String, EntityDetail> =
+            ::std::collections::HashMap::new();
+        let mut errors: ::std::collections::HashMap<String, BatchDescribeErrorDetail> =
+            ::std::collections::HashMap::new();
+        for request in &input.entity_request_list {
+            // `EntityRequest$EntityId` is modelled with `EntityId`'s own
+            // pattern, so a malformed id never reaches this handler.
+            match store.entities.get(&request.entity_id) {
+                Some(entity) => {
+                    entity_details.insert(
+                        request.entity_id.clone(),
+                        EntityDetail {
+                            entity_type: Some(entity.entity_type.clone()),
+                            entity_identifier: Some(entity.identifier()),
+                            entity_arn: Some(entity.arn.clone()),
+                            last_modified_date: Some(entity.last_modified_date.clone()),
+                            // `EntityDetail` carries the details as a document
+                            // only; `None` is unreachable, since nothing deeper
+                            // than the stored bound was accepted.
+                            details_document: crate::state::json_to_document(&entity.details),
+                        },
+                    );
+                }
+                None => {
+                    // A missing entity is NOT a top-level failure here: this
+                    // operation models none for it, and reports it per entity
+                    // under the id that was asked for.
+                    errors.insert(
+                        request.entity_id.clone(),
+                        BatchDescribeErrorDetail {
+                            error_code: Some(
+                                crate::state::BATCH_ERROR_RESOURCE_NOT_FOUND.to_string(),
+                            ),
+                            error_message: Some(crate::state::entity_missing_message(
+                                &request.entity_id,
+                            )),
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok(BatchDescribeEntitiesOutput {
+            entity_details: Some(entity_details),
+            errors: Some(errors),
+        })
     }
 }
