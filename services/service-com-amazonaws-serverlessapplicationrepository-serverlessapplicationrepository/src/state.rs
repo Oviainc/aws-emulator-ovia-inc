@@ -22,7 +22,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::ops::types::{ApplicationSummary, ParameterDefinition, Version, VersionSummary};
+use crate::ops::types::{
+    ApplicationSummary, BadRequestException, ConflictException, InternalServerErrorException,
+    NotFoundException, ParameterDefinition, Version, VersionSummary,
+};
 
 /// The region an ARN carries when the request names none.
 ///
@@ -316,6 +319,107 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 /// two catalogues, and the same name in each is two applications with two ARNs.
 pub fn name_key(region: &str, name: &str) -> String {
     format!("{region}/{name}")
+}
+
+/// The condition an error body names in its `errorCode` member.
+///
+/// Every error this service models declares `ErrorCode` (jsonName `errorCode`) beside
+/// `Message` (`smithy_query(query="shape", shape="ConflictException")`, and the same for
+/// `NotFoundException`, `BadRequestException`, `ForbiddenException`,
+/// `InternalServerErrorException` and `TooManyRequestsException`). The HTTP status
+/// already travels in the status line and in the `x-amzn-errortype` header, so what the
+/// body's `errorCode` adds is the NAME of the condition that was raised: it is the only
+/// field that separates two conditions sharing one modelled shape and one status — a
+/// duplicate application and a duplicate version are both 409 `ConflictException` — so a
+/// client branching on `errorCode` can tell them apart. The member's own documentation is
+/// just the bare status number, which is the shape's `httpError`, not a value to echo.
+///
+/// Each name is the `<Subject><Condition>Exception` form AWS reports for the condition;
+/// a condition no recording covers takes the same form over the subject the handler
+/// checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorCode {
+    /// The catalogue already holds an application with the requested name (409).
+    ApplicationAlreadyExists,
+    /// The catalogue holds no application with the requested id (404).
+    ApplicationNotFound,
+    /// The application already carries the requested semantic version (409).
+    VersionAlreadyExists,
+    /// The application carries no such semantic version (404).
+    VersionNotFound,
+    /// A member of the request is outside the contract (400).
+    InvalidRequest,
+    /// The service could not serve the request (500).
+    InternalServerError,
+}
+
+impl ErrorCode {
+    /// The name this condition reports in `errorCode`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ApplicationAlreadyExists => "ApplicationAlreadyExistsException",
+            Self::ApplicationNotFound => "ApplicationNotFoundException",
+            Self::VersionAlreadyExists => "VersionAlreadyExistsException",
+            Self::VersionNotFound => "VersionNotFoundException",
+            Self::InvalidRequest => "InvalidRequestException",
+            Self::InternalServerError => "InternalServerErrorException",
+        }
+    }
+
+    /// The status of the modelled shape this condition is carried by — the `httpError`
+    /// of `ConflictException` (409), `NotFoundException` (404),
+    /// `BadRequestException` (400) and `InternalServerErrorException` (500). Used only
+    /// to keep a condition and the shape it is raised through in step.
+    pub const fn http_status(self) -> u16 {
+        match self {
+            Self::ApplicationAlreadyExists | Self::VersionAlreadyExists => 409,
+            Self::ApplicationNotFound | Self::VersionNotFound => 404,
+            Self::InvalidRequest => 400,
+            Self::InternalServerError => 500,
+        }
+    }
+}
+
+/// The modelled 409 for `code`: "The resource already exists."
+pub fn conflict(code: ErrorCode, message: impl Into<String>) -> ConflictException {
+    debug_assert_eq!(code.http_status(), 409, "a ConflictException is 409");
+    ConflictException {
+        error_code: Some(code.name().to_string()),
+        message: Some(message.into()),
+    }
+}
+
+/// The modelled 404 for `code`: the resource named in the request does not exist.
+pub fn not_found(code: ErrorCode, message: impl Into<String>) -> NotFoundException {
+    debug_assert_eq!(code.http_status(), 404, "a NotFoundException is 404");
+    NotFoundException {
+        error_code: Some(code.name().to_string()),
+        message: Some(message.into()),
+    }
+}
+
+/// The modelled 400: "One of the parameters in the request is invalid." Every request
+/// this service refuses as invalid raises the one condition for it,
+/// [`ErrorCode::InvalidRequest`], and says in `message` which member is wrong and why.
+pub fn bad_request(message: impl Into<String>) -> BadRequestException {
+    BadRequestException {
+        error_code: Some(ErrorCode::InvalidRequest.name().to_string()),
+        message: Some(message.into()),
+    }
+}
+
+/// The modelled 500, for a request the emulator could not serve at all.
+pub fn internal_server_error(message: impl Into<String>) -> InternalServerErrorException {
+    InternalServerErrorException {
+        error_code: Some(ErrorCode::InternalServerError.name().to_string()),
+        message: Some(message.into()),
+    }
+}
+
+/// The wording a 404 carries for an application the catalogue does not hold, naming the
+/// `ApplicationId` the caller asked for.
+pub fn application_not_found_message(application_id: &str) -> String {
+    format!("Application with id {application_id} could not be found.")
 }
 
 /// Whether `semantic_version` is a semantic version, which is what the model says the
