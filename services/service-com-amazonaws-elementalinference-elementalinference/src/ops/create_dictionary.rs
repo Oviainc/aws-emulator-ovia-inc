@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDictionary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDictionary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a dictionary, persists it in `crate::state` and builds the
+//! response from the stored record. The dictionary is accepted asynchronously (HTTP
+//! 202), so it is stored in the transient `CREATING` status with the instant its move
+//! to `AVAILABLE` falls due; the dictionary readers materialise that move.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDictionary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The scaffold's own notes on the operation shape and on reaching state are kept
+//! below, minus the line that recorded this operation as a stub.
 //!
 //! ## Shape of an operation
 //!
@@ -176,17 +174,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDictionary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDictionaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDictionary"))
+        // request metadata.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDictionaryErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the com.amazonaws.elementalinference state store is unavailable"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `language` is an enum member, so only the values the model lists are a
+        // dictionary language. The boundary validator refuses the rest, and this is
+        // the same refusal for a request that reaches the handler regardless.
+        if !DICTIONARY_LANGUAGE_VALUES.contains(&input.language.as_str()) {
+            return Err(CreateDictionaryErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "'{}' is not a valid value for 'language'; it must be one of {}.",
+                        input.language,
+                        DICTIONARY_LANGUAGE_VALUES.join(", ")
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = std::time::Instant::now();
+
+        let mut state = state.lock();
+        state.settle_due_transitions(now);
+
+        // The dictionary store is BOUNDED: past the quota the service refuses the
+        // create rather than growing its state by another record, which is also what
+        // the real service answers once an account's quota is exhausted.
+        if state.dictionaries.len() >= crate::state::MAX_DICTIONARIES {
+            return Err(CreateDictionaryErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "This account already holds the maximum of {} dictionaries. \
+                         Delete unused dictionaries or request a quota increase.",
+                        crate::state::MAX_DICTIONARIES
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let id = state.mint_dictionary_id();
+        // 202: the dictionary is accepted in CREATING and reaches AVAILABLE on the
+        // clock ("After creation succeeds, the status will be AVAILABLE.").
+        let due = now + crate::state::TRANSITION_SPAN;
+        let dictionary = crate::state::Dictionary {
+            arn: crate::state::dictionary_arn(&region, &id),
+            id,
+            name: input.name,
+            language: input.language,
+            // The payload is optional; a dictionary created without one holds no
+            // entries rather than none at all.
+            entries: input.entries.unwrap_or_default(),
+            status: crate::state::DictionaryStatus::Creating,
+            // Nothing can reference a dictionary that did not exist a moment ago; a
+            // feed output starts referencing it later.
+            references: Vec::new(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            transition_due_at: Some(due),
+        };
+
+        // Built from the record that is about to be stored, so GetDictionary answers
+        // with exactly these values.
+        let output = CreateDictionaryOutput {
+            arn: dictionary.arn.clone(),
+            id: dictionary.id.clone(),
+            name: dictionary.name.clone(),
+            language: dictionary.language.clone(),
+            status: dictionary.status.as_wire().to_string(),
+            references: Some(dictionary.feed_references()),
+            tags: dictionary.tag_map(),
+        };
+        state.dictionaries.insert(dictionary.id.clone(), dictionary);
+        state.note_due(due);
+        Ok(output)
     }
 }
