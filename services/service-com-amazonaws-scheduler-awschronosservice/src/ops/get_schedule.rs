@@ -189,7 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
         let group_name = crate::state::effective_group_name(input.group_name.as_deref());
-        let store = state.lock();
+        let mut store = state.lock();
+        // Materialise any group deletion the clock has already made due, so a
+        // schedule that went with a deleted group is not reported as live.
+        store.settle(::std::time::SystemTime::now());
 
         let Some(record) = store.schedules.get(&(group_name.clone(), input.name.clone())) else {
             return Err(GetScheduleErrorModeled::ResourceNotFoundException(

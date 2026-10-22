@@ -8,15 +8,29 @@
 //! lets `ListSchedules` resume from an opaque page token.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{FlexibleTimeWindow, Tag, Target};
 
 /// The schedule group every schedule lands in when a request names none.
 ///
-/// AWS creates this group with the account: it is never created by a client, so
-/// it is always present and `CreateScheduleGroup` on it conflicts.
+/// AWS creates this group with the account: it is never created by a client and
+/// no client may delete it, so every operation that would create, modify or
+/// delete the group of this name is refused by
+/// [`reserved_group_refusal`] before any existence check runs.
 pub const DEFAULT_SCHEDULE_GROUP: &str = "default";
+
+/// How long after `DeleteScheduleGroup` a group's removal becomes due.
+///
+/// `DeleteScheduleGroup`: "When you delete a group, it remains in a DELETING
+/// state until all of its associated schedules are deleted. … This operation is
+/// eventually consistent." AWS documents no duration for that window, so this
+/// span is CHOSEN: long enough that a caller reading straight after the delete
+/// still observes the `DELETING` group (and the state errors that go with it),
+/// short enough for a test to wait it out. Nothing sleeps for it — the due
+/// instant is stored and [`ComAmazonawsSchedulerAwschronosserviceState::settle`]
+/// materialises the removal the clock already owed.
+pub const GROUP_DELETION_DELAY: Duration = Duration::from_millis(500);
 
 /// The region an ARN carries when the request is unsigned, so no SigV4
 /// credential scope names one.
@@ -30,6 +44,10 @@ const FLEXIBLE_TIME_WINDOW_MODE_FLEXIBLE: &str = "FLEXIBLE";
 /// `ScheduleGroupState` is modelled `ACTIVE | DELETING`, and AWS returns a
 /// newly created group ACTIVE, so only `DeleteScheduleGroup` ever moves one.
 pub const SCHEDULE_GROUP_STATE_ACTIVE: &str = "ACTIVE";
+
+/// The `ScheduleGroupState` of a group whose deletion the clock has not yet
+/// finished: `DeleteScheduleGroup` moves a group here, and nothing else does.
+pub const SCHEDULE_GROUP_STATE_DELETING: &str = "DELETING";
 
 /// The `ScheduleState` a schedule takes when the request omits `State`.
 pub const DEFAULT_SCHEDULE_STATE: &str = "ENABLED";
@@ -120,6 +138,10 @@ pub struct ScheduleGroupRecord {
     pub last_modification_date: SystemTime,
     /// Carried for `TagResource`/`UntagResource`/`ListTagsForResource`.
     pub tags: Vec<Tag>,
+    /// When this group's removal becomes due, set by `DeleteScheduleGroup`.
+    /// `None` for a group nobody has deleted — the only state in which the
+    /// group accepts new schedules.
+    pub deletion_due: Option<SystemTime>,
 }
 
 impl ScheduleGroupRecord {
@@ -230,9 +252,38 @@ impl Default for ComAmazonawsSchedulerAwschronosserviceState {
 }
 
 impl ComAmazonawsSchedulerAwschronosserviceState {
-    /// Whether `name` names a group a schedule may be created in.
+    /// Whether `name` names a group this account holds — including one still in
+    /// `DELETING`, which is addressable until its removal falls due.
     pub fn group_exists(&self, name: &str) -> bool {
         name == DEFAULT_SCHEDULE_GROUP || self.groups.contains_key(name)
+    }
+
+    /// Whether `name` names a group whose deletion is under way.
+    pub fn group_is_deleting(&self, name: &str) -> bool {
+        self.groups
+            .get(name)
+            .is_some_and(|group| group.deletion_due.is_some())
+    }
+
+    /// Materialise every group removal the clock has already made due, together
+    /// with the schedules that group held (`DeleteScheduleGroup`: "Deleting a
+    /// schedule group results in EventBridge Scheduler deleting all schedules
+    /// associated with the group").
+    ///
+    /// Every operation calls this first, so a caller never reads a group whose
+    /// `DELETING` window has elapsed, and nothing is removed before the instant
+    /// the delete call made it due.
+    pub fn settle(&mut self, now: SystemTime) {
+        let due: Vec<String> = self
+            .groups
+            .values()
+            .filter(|group| group.deletion_due.is_some_and(|due| due <= now))
+            .map(|group| group.name.clone())
+            .collect();
+        for name in due {
+            self.groups.remove(&name);
+            self.schedules.retain(|(group, _), _| group != &name);
+        }
     }
 
     /// The group `name` addresses, or `None` when no such group exists.
@@ -254,6 +305,9 @@ impl ComAmazonawsSchedulerAwschronosserviceState {
                 creation_date: self.origin,
                 last_modification_date: self.origin,
                 tags: Vec::new(),
+                // The built-in group is never deleted: `DeleteScheduleGroup` on
+                // the reserved name is refused, so no removal is ever due.
+                deletion_due: None,
             });
         }
         None
@@ -321,8 +375,31 @@ impl ComAmazonawsSchedulerAwschronosserviceState {
                 creation_date: origin,
                 last_modification_date: origin,
                 tags: Vec::new(),
+                // Nothing has deleted this group: the built-in one cannot be
+                // deleted at all, and any other name already has its row.
+                deletion_due: None,
             })
     }
+}
+
+/// The refusal for an operation addressed at a RESERVED schedule group — the
+/// built-in group every account owns — or `None` for any other name.
+///
+/// EventBridge Scheduler owns the `default` group: a client can neither create
+/// it (it already exists for every account) nor delete it, and the refusal is a
+/// request-validation failure about the NAME, evaluated before any existence or
+/// conflict check, rather than a collision with the resource. The message is the
+/// one AWS is recorded answering; its code (`ValidationException`) and status
+/// (400) are what a client branches on.
+pub fn reserved_group_refusal(name: &str) -> Option<String> {
+    (name == DEFAULT_SCHEDULE_GROUP)
+        .then(|| format!("This operation cannot be performed on schedule group {name}."))
+}
+
+/// The `ResourceNotFoundException` message for a group this account does not
+/// hold, worded as AWS words it.
+pub fn group_does_not_exist(name: &str) -> String {
+    format!("Schedule group {name} does not exist.")
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -367,6 +444,198 @@ pub fn effective_group_name(group_name: Option<&str>) -> String {
 /// A server clock reading as the wire `DateTime` the timestamp members carry.
 pub fn to_wire_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
+}
+
+/// The IAM service principal EventBridge Scheduler assumes a schedule's
+/// execution role as (`Target$RoleArn`: "the IAM role that EventBridge
+/// Scheduler will use for this target when the schedule is invoked").
+pub const SCHEDULER_SERVICE_PRINCIPAL: &str = "scheduler.amazonaws.com";
+
+/// The `sts` action a role's trust policy must allow for a principal to assume
+/// it.
+const ASSUME_ROLE_ACTION: &str = "sts:AssumeRole";
+
+/// What AWS answers when a schedule's execution role cannot be assumed — the
+/// role does not exist, or its trust policy does not admit Scheduler.
+pub const EXECUTION_ROLE_REFUSAL: &str =
+    "The execution role you provide must allow AWS EventBridge Scheduler to assume the role.";
+
+/// The role name an IAM role ARN carries, when the ARN names a role of THIS
+/// account: everything after the last `/`, so a role under a path
+/// (`:role/service-role/<name>`) resolves to the name IAM holds it under.
+///
+/// `None` when the value is not an IAM role ARN of this account — a malformed
+/// ARN (which the modelled `@pattern` on `Target$RoleArn` has already refused by
+/// the time a handler runs) or one naming another account, whose roles this
+/// account's Scheduler cannot assume ("the execution role must be in the same
+/// account as the schedule", EventBridge Scheduler's execution-role reference).
+fn iam_role_name(role_arn: &str) -> Option<&str> {
+    let mut fields = role_arn.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some(_partition),
+        Some("iam"),
+        Some(""),
+        Some(account),
+        Some(resource),
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        return None;
+    };
+    if account != ::engine::emulator_account_id() {
+        return None;
+    }
+    let name = resource.strip_prefix("role/")?.rsplit('/').next()?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// Whether an IAM trust-policy document lets `principal` assume the role.
+///
+/// The document is an IAM policy: a `Statement` (one object or a list) whose
+/// entry matches the principal when it names the `sts:AssumeRole` action and a
+/// `Principal.Service` naming it. `Action` and `Service` are each either a
+/// single string or a list, and IAM action names are case-insensitive, so both
+/// forms and both casings are accepted. IAM reports the document URL-encoded, so
+/// it is decoded before it is parsed.
+///
+/// Evaluated the way IAM evaluates a policy: an explicit `Deny` for the
+/// principal WINS over any `Allow`, so a document carrying both refuses the
+/// assume rather than admitting it.
+fn trust_policy_admits(document: &str, principal: &str) -> bool {
+    let decoded = ::percent_encoding::percent_decode_str(document).decode_utf8_lossy();
+    let Ok(policy) = ::serde_json::from_str::<::serde_json::Value>(&decoded) else {
+        return false;
+    };
+    let statement = &policy["Statement"];
+    let statements: Vec<&::serde_json::Value> = match statement.as_array() {
+        Some(entries) => entries.iter().collect(),
+        None => vec![statement],
+    };
+    let matching = || {
+        statements
+            .iter()
+            .filter(|entry| statement_matches(entry, principal))
+    };
+    let denied = matching().any(|entry| entry["Effect"].as_str() == Some("Deny"));
+    let allowed = matching().any(|entry| entry["Effect"].as_str() == Some("Allow"));
+    allowed && !denied
+}
+
+/// Whether one trust-policy statement is ABOUT `principal` assuming the role —
+/// whatever effect it then states.
+fn statement_matches(statement: &::serde_json::Value, principal: &str) -> bool {
+    let names_assume_role = json_strings(&statement["Action"]).iter().any(|action| {
+        action.eq_ignore_ascii_case(ASSUME_ROLE_ACTION)
+            || action == "sts:*"
+            || action == "*"
+    });
+    let names_principal = json_strings(&statement["Principal"]["Service"])
+        .iter()
+        .any(|service| service == principal);
+    names_assume_role && names_principal
+}
+
+/// The strings a policy member holds, whether it is one string or a list of
+/// them. Anything else contributes none.
+fn json_strings(value: &::serde_json::Value) -> Vec<String> {
+    match value {
+        ::serde_json::Value::String(one) => vec![one.clone()],
+        ::serde_json::Value::Array(many) => many
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Refuse a target whose execution role EventBridge Scheduler could not assume.
+///
+/// EventBridge Scheduler resolves `Target.RoleArn` against IAM when the schedule
+/// is written — not when it fires — and refuses the request with 400
+/// `ValidationException`, persisting nothing, unless that role exists in this
+/// account and its trust policy lets the Scheduler service principal assume it.
+/// IAM is reached the way any emulated service reaches another: through the
+/// in-process callback ([`smithy_server_runtime::OperationContext::callback`]),
+/// so this crate names no other service crate.
+///
+/// `None` means the schedule may be written. That includes the case where this
+/// emulator has no IAM to ask (a router with only this service mounted, say):
+/// nothing is then known about the role, and a refusal has to be grounded in
+/// what IAM answered, never assumed.
+pub async fn execution_role_violation(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+) -> Option<String> {
+    let Some(role_name) = iam_role_name(role_arn) else {
+        return Some(EXECUTION_ROLE_REFUSAL.to_string());
+    };
+    let config = ::aws_sdk_iam::Config::builder()
+        .behavior_version(::aws_sdk_iam::config::BehaviorVersion::latest())
+        .http_client(ctx.callback().http_client())
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .region(::aws_sdk_iam::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://iam.{region}.amazonaws.com"))
+        // The transport is in-process: there is nothing to retry, time out or
+        // watch for a stalled stream, and each of those would need a sleep
+        // implementation this client is not given. The same goes for caching the
+        // identity: the credentials are handed over directly.
+        .retry_config(::aws_sdk_iam::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_iam::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_iam::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_iam::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    let answer = ::aws_sdk_iam::Client::from_conf(config)
+        .get_role()
+        .role_name(role_name)
+        .send()
+        .await;
+    match answer {
+        Ok(output) => {
+            let trusted = output
+                .role()
+                .and_then(::aws_sdk_iam::types::Role::assume_role_policy_document)
+                .is_some_and(|document| {
+                    trust_policy_admits(document, SCHEDULER_SERVICE_PRINCIPAL)
+                });
+            (!trusted).then(|| EXECUTION_ROLE_REFUSAL.to_string())
+        }
+        // IAM says this account holds no such role: the refusal is grounded.
+        Err(error) if role_is_absent(&error) => Some(EXECUTION_ROLE_REFUSAL.to_string()),
+        // Any other answer is this emulator failing to ask, not IAM reporting a
+        // bad role, so it refuses nothing — and it is worth a warning, because a
+        // deployment with no IAM to ask is one where this gate does not run.
+        Err(error) => {
+            ::tracing::warn!(
+                %role_arn,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the execution role could not be verified against IAM"
+            );
+            None
+        }
+    }
+}
+
+/// Whether an IAM `GetRole` failure is IAM reporting that the role does not
+/// exist (`NoSuchEntity`), as opposed to the call not reaching IAM.
+fn role_is_absent(
+    error: &::aws_sdk_iam::error::SdkError<
+        ::aws_sdk_iam::operation::get_role::GetRoleError,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    error
+        .as_service_error()
+        .is_some_and(::aws_sdk_iam::operation::get_role::GetRoleError::is_no_such_entity_exception)
 }
 
 /// Refuse a `FlexibleTimeWindow` whose `MaximumWindowInMinutes` does not match

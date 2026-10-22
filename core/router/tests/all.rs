@@ -53,6 +53,8 @@ mod rds_docdb_neptune_signing_name_routing;
 mod rds_shared_signing_name_routing;
 #[path = "all/rds_signing_name_routing.rs"]
 mod rds_signing_name_routing;
+#[path = "all/scheduler_execution_role.rs"]
+mod scheduler_execution_role;
 #[path = "all/servicecatalog_signing_name_routing.rs"]
 mod servicecatalog_signing_name_routing;
 #[path = "all/shared_signing_name_routing.rs"]
