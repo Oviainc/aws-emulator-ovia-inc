@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCacheCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCacheCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`CreateCacheCluster::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -297,18 +293,414 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCacheCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCacheClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Every member of this request is either persisted and reported, or the
+        // request is refused with a modelled error. Nothing is accepted and
+        // dropped: a 200 must never claim a configuration the store does not
+        // hold.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCacheCluster"))
+        // `CacheClusterId` "is stored as a lowercase string", so the identity a
+        // later Describe / Modify / Delete resolves is the lowercased one.
+        let cache_cluster_id = input.cache_cluster_id.to_ascii_lowercase();
+        // `CacheClusterId` carries no modelled `@pattern`, so the documented
+        // name rule is enforced here rather than at the boundary.
+        if !crate::state::is_valid_cluster_id(&cache_cluster_id) {
+            return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "Invalid value {} for CacheClusterId: a name must contain from 1 to 50 \
+                         alphanumeric characters or hyphens, must begin with a letter, and must \
+                         not end with a hyphen or contain two consecutive hyphens.",
+                        input.cache_cluster_id
+                    )),
+                },
+            )
+            .into());
+        }
+        let engine = match crate::state::normalize_engine(
+            input
+                .engine
+                .as_deref()
+                .unwrap_or(crate::state::DEFAULT_ENGINE),
+        ) {
+            Ok(engine) => engine,
+            Err(message) => {
+                return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+        };
+        let num_cache_nodes = input
+            .num_cache_nodes
+            .unwrap_or(crate::state::DEFAULT_NUM_CACHE_NODES);
+        if let Err(message) = crate::state::validate_num_cache_nodes(&engine, num_cache_nodes) {
+            return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // A port is a TCP port: the member is an `IntegerOptional` with no
+        // modelled range, so the bound is enforced here.
+        if let Some(port) = input.port {
+            if !(1..=65535).contains(&port) {
+                return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {port} for Port: must be between 1 and 65535."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let tags = match crate::state::tag_pairs(input.tags) {
+            Ok(tags) => tags,
+            Err(crate::state::TagRefusal::TooMany(count)) => {
+                return Err(
+                    CreateCacheClusterErrorModeled::TagQuotaPerResourceExceeded(
+                        TagQuotaPerResourceExceeded {
+                            message: Some(format!(
+                                "{count} tags were supplied; the maximum number of tags permitted \
+                                 on a resource is {}.",
+                                crate::state::MAX_TAGS_PER_RESOURCE
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Err(crate::state::TagRefusal::MissingKey) => {
+                return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some("Invalid value for Tags: a tag's Key may not be null.".to_string()),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // A cluster joins a replication group only if that group exists, and no
+        // replication group can: every replication-group operation in this
+        // service is still a scaffolded 501, so there is nothing to join.
+        if let Some(group) = input.replication_group_id.as_deref() {
+            return Err(CreateCacheClusterErrorModeled::ReplicationGroupNotFoundFault(
+                ReplicationGroupNotFoundFault {
+                    message: Some(format!("Replication group {group} not found.")),
+                },
+            )
+            .into());
+        }
+
+        // Same for cache security groups — the EC2-Classic mechanism whose
+        // `CreateCacheSecurityGroup` is a scaffolded 501.
+        if let Some(name) = input
+            .cache_security_group_names
+            .as_deref()
+            .unwrap_or_default()
+            .first()
+        {
+            return Err(CreateCacheClusterErrorModeled::CacheSecurityGroupNotFoundFault(
+                CacheSecurityGroupNotFoundFault {
+                    message: Some(format!("Cache security group {name} not found.")),
+                },
+            )
+            .into());
+        }
+
+        // Only the engine families' default parameter groups exist here; see
+        // `crate::state::is_known_parameter_group`.
+        if let Some(name) = input.cache_parameter_group_name.as_deref() {
+            if !crate::state::is_known_parameter_group(name) {
+                return Err(
+                    CreateCacheClusterErrorModeled::CacheParameterGroupNotFoundFault(
+                        CacheParameterGroupNotFoundFault {
+                            message: Some(format!("CacheParameterGroup {name} not found.")),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A cluster can only be seeded from a snapshot that exists, and none
+        // can: `CreateSnapshot` / `CopySnapshot` are scaffolded 501s, and an
+        // `SnapshotArns` entry would have to be read out of Amazon S3, which
+        // this emulator does not reach.
+        if let Some(name) = input.snapshot_name.as_deref() {
+            return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "Invalid value {name} for SnapshotName: no such snapshot exists."
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(arn) = input.snapshot_arns.as_deref().unwrap_or_default().first() {
+            return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "Invalid value {arn} for SnapshotArns: this emulator cannot read a \
+                         snapshot file from Amazon S3."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Outposts: the emulator provisions no Outpost capacity, so a request
+        // that places the cluster in one is refused rather than served from a
+        // Region it did not ask for.
+        for (member, value) in [
+            ("OutpostMode", input.outpost_mode.as_deref()),
+            ("PreferredOutpostArn", input.preferred_outpost_arn.as_deref()),
+            (
+                "PreferredOutpostArns",
+                input
+                    .preferred_outpost_arns
+                    .as_deref()
+                    .unwrap_or_default()
+                    .first()
+                    .map(String::as_str),
+            ),
+        ] {
+            if let Some(value) = value {
+                return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {value} for {member}: this emulator provisions no \
+                             Outpost capacity."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // `AZMode` "is only supported for Memcached clusters" and
+        // `PreferredAvailabilityZones` "is only supported on Memcached".
+        for (member, present) in [
+            ("AZMode", input.az_mode.is_some()),
+            (
+                "PreferredAvailabilityZones",
+                input.preferred_availability_zones.is_some(),
+            ),
+        ] {
+            if present && engine != "memcached" {
+                return Err(
+                    CreateCacheClusterErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(format!(
+                                "{member} is only supported for memcached clusters, not for \
+                                 {engine}."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        // "If you want all the nodes in the same Availability Zone, use
+        // PreferredAvailabilityZone instead": the two members are an either/or,
+        // and the list "must equal the value of NumCacheNodes".
+        if let Some(zones) = input.preferred_availability_zones.as_deref() {
+            if input.preferred_availability_zone.is_some() {
+                return Err(
+                    CreateCacheClusterErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(
+                                "PreferredAvailabilityZone and PreferredAvailabilityZones cannot \
+                                 both be specified."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if zones.len() != usize::try_from(num_cache_nodes).unwrap_or(0) {
+                return Err(
+                    CreateCacheClusterErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(format!(
+                                "PreferredAvailabilityZones lists {} zones, which must equal \
+                                 NumCacheNodes ({num_cache_nodes}).",
+                                zones.len()
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        if store.cache_clusters.contains_key(&cache_cluster_id) {
+            return Err(CreateCacheClusterErrorModeled::CacheClusterAlreadyExistsFault(
+                CacheClusterAlreadyExistsFault {
+                    message: Some(format!("Cache cluster {cache_cluster_id} already exists.")),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: past its quota a create is refused rather than
+        // adding another record. `ClusterQuotaForCustomerExceededFault` is the
+        // modelled refusal for exactly this.
+        if store.cache_clusters.len() >= crate::state::CLUSTER_QUOTA {
+            return Err(
+                CreateCacheClusterErrorModeled::ClusterQuotaForCustomerExceededFault(
+                    ClusterQuotaForCustomerExceededFault {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} cache clusters.",
+                            crate::state::CLUSTER_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The subnet group the cluster is placed in has to be one this account
+        // created, so the name is resolved against the stored groups — which is
+        // also what makes `CreateCacheSubnetGroup` a prerequisite rather than an
+        // echo.
+        let cache_subnet_group_name = match input.cache_subnet_group_name.as_deref() {
+            Some(name) => {
+                let key = name.to_ascii_lowercase();
+                match store.cache_subnet_groups.get(&key) {
+                    Some(group) => Some(group.name.clone()),
+                    None => {
+                        return Err(
+                            CreateCacheClusterErrorModeled::CacheSubnetGroupNotFoundFault(
+                                CacheSubnetGroupNotFoundFault {
+                                    message: Some(format!("Cache subnet group {name} not found.")),
+                                },
+                            )
+                            .into(),
+                        )
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let engine_version = input
+            .engine_version
+            .unwrap_or_else(|| crate::state::default_engine_version(&engine).to_string());
+        let cache_parameter_group_name = input
+            .cache_parameter_group_name
+            .unwrap_or_else(|| crate::state::default_parameter_group_name(&engine, &engine_version));
+        // `SnapshotRetentionLimit` / `SnapshotWindow` are "only valid if the
+        // Engine parameter is redis", so a Memcached cluster cannot carry
+        // either: the request is refused rather than answered 200 with the
+        // setting dropped. A Valkey / Redis OSS cluster takes the documented
+        // default of 0.
+        let backups_supported = engine != "memcached";
+        if !backups_supported {
+            for (member, present) in [
+                (
+                    "SnapshotRetentionLimit",
+                    input.snapshot_retention_limit.is_some(),
+                ),
+                ("SnapshotWindow", input.snapshot_window.is_some()),
+            ] {
+                if present {
+                    return Err(
+                        CreateCacheClusterErrorModeled::InvalidParameterCombinationException(
+                            InvalidParameterCombinationException {
+                                message: Some(format!(
+                                    "{member} is only valid for a cluster running valkey or \
+                                     redis, not for {engine}."
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+        let snapshot_retention_limit = if backups_supported {
+            Some(
+                input
+                    .snapshot_retention_limit
+                    .unwrap_or(crate::state::DEFAULT_SNAPSHOT_RETENTION_LIMIT),
+            )
+        } else {
+            None
+        };
+        // Where the cluster's nodes go: the explicit per-node list, the one
+        // zone the request named, a spread over zones for `cross-az`, or the
+        // single "system chosen Availability Zone".
+        let availability_zones = match (
+            input.preferred_availability_zones,
+            input.preferred_availability_zone,
+        ) {
+            (Some(zones), _) => zones,
+            (None, Some(zone)) => vec![zone],
+            (None, None) if input.az_mode.as_deref() == Some(crate::state::AZ_MODE_CROSS) => (0
+                ..usize::try_from(num_cache_nodes).unwrap_or(1).max(1))
+                .map(|index| crate::state::availability_zone(&region, index))
+                .collect(),
+            (None, None) => vec![crate::state::availability_zone(&region, 0)],
+        };
+        let new = crate::state::NewCluster {
+            cache_cluster_id,
+            port: input.port.unwrap_or_else(|| crate::state::default_port(&engine)),
+            availability_zones,
+            az_mode: input.az_mode,
+            preferred_maintenance_window: input
+                .preferred_maintenance_window
+                .unwrap_or_else(|| crate::state::DEFAULT_MAINTENANCE_WINDOW.to_string()),
+            region,
+            engine,
+            engine_version,
+            cache_node_type: input.cache_node_type,
+            num_cache_nodes,
+            cache_subnet_group_name,
+            cache_parameter_group_name,
+            snapshot_retention_limit,
+            snapshot_window: backups_supported.then_some(input.snapshot_window).flatten(),
+            auto_minor_version_upgrade: input.auto_minor_version_upgrade,
+            security_group_ids: input.security_group_ids.unwrap_or_default(),
+            notification_topic_arn: input.notification_topic_arn,
+            // The token itself is a secret and is NOT stored; only the fact that
+            // one was set, which is all the model reports.
+            auth_token_enabled: input.auth_token.is_some(),
+            transit_encryption_enabled: input.transit_encryption_enabled,
+            network_type: input.network_type,
+            ip_discovery: input.ip_discovery,
+            log_delivery_configurations: {
+                let mut stored = Vec::new();
+                crate::state::apply_log_delivery(
+                    &mut stored,
+                    input.log_delivery_configurations.unwrap_or_default(),
+                );
+                stored
+            },
+            tags,
+            now,
+        };
+
+        // A created cluster is NOT ready: it answers `creating`, and the clock
+        // owes it `available` once the transition span has passed.
+        Ok(CreateCacheClusterOutput {
+            cache_cluster: Some(store.insert_cluster(new).to_modeled(true)),
+        })
     }
 }

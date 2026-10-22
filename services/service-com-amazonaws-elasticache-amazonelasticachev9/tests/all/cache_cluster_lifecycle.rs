@@ -1,0 +1,2685 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for the ElastiCache cache-cluster and cache-subnet-group
+//! lifecycle.
+//!
+//! Every assertion goes over the wire: an `awsQuery` form-urlencoded request is
+//! built, dispatched through the same [`MultiServiceRouter`] the production
+//! emulator mounts, and only the HTTP status and the XML body are inspected.
+//! Nothing reaches into the service's state struct, so a response that is not
+//! computed from persisted state cannot pass.
+//!
+//! The tests are tables: each row is one input along the axis the rule under
+//! test generalises over (engine, node count, port, region, page size, subnet
+//! count, apply-immediately), and the `demo-cluster` case from the bootstrap
+//! issue is only one row.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use service_com_amazonaws_elasticache_amazonelasticachev9::state;
+use service_com_amazonaws_elasticache_amazonelasticachev9::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// The region every test signs with unless it is exercising the region rule
+/// itself.
+const REGION: &str = "us-east-1";
+
+/// The API version an `awsQuery` client sends beside `Action`, from the model's
+/// service version (`smithy_query(query="service_info")`: `version 2015-02-02`).
+const API_VERSION: &str = "2015-02-02";
+
+/// Long enough past [`state::CLUSTER_TRANSITION`] that the clock owes a cluster
+/// its next status; the handlers never sleep, so only the test waits.
+const PAST_TRANSITION: Duration = Duration::from_millis(750);
+
+/// One wire answer, reduced to what a client branches on: the status, and every
+/// text node in the XML body keyed by its element path.
+#[derive(Debug)]
+struct Reply {
+    status: u16,
+    body: String,
+    nodes: Vec<(String, String)>,
+}
+
+impl Reply {
+    /// The first text node whose element path ends in `suffix`.
+    fn text(&self, suffix: &str) -> Option<&str> {
+        self.all(suffix).into_iter().next()
+    }
+
+    /// Every text node whose element path ends in `suffix`, in document order.
+    fn all(&self, suffix: &str) -> Vec<&str> {
+        self.nodes
+            .iter()
+            .filter(|(path, _)| path == suffix || path.ends_with(&format!("/{suffix}")))
+            .map(|(_, text)| text.as_str())
+            .collect()
+    }
+
+    /// The `awsQuery` error code (`<ErrorResponse><Error><Code>`), or the empty
+    /// string on a success.
+    fn error_code(&self) -> &str {
+        self.text("Error/Code").unwrap_or_default()
+    }
+
+    /// The pagination `Marker` a describe answered with, if any. `Marker` is the
+    /// only element of that name in either describe's output.
+    fn marker(&self) -> Option<&str> {
+        self.text("Marker")
+    }
+}
+
+/// Resolve the five predefined XML entities in an element's text.
+fn unescape_xml(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        // `&amp;` last, so `&amp;lt;` does not become `<`.
+        .replace("&amp;", "&")
+}
+
+/// Parse an XML document into `(element path, text)` pairs in document order.
+///
+/// Deliberately a local scanner rather than an XML-crate dependency: adding one
+/// would put this crate's only edit into `Cargo.lock`, the one file every
+/// concurrent fix also edits, and that collision is what kept the merge gate's
+/// squash refusing this change. The bodies parsed here are the awsQuery
+/// envelopes the vendored protocol serializer emits — elements, text and an
+/// `xmlns` attribute — so a scanner over `<` / `>` reads them exactly.
+fn xml_text_nodes(body: &str) -> Vec<(String, String)> {
+    let mut path: Vec<String> = Vec::new();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut rest = body;
+    while let Some(open) = rest.find('<') {
+        // Whatever precedes the tag is the text of the element now open.
+        let text = rest[..open].trim();
+        if !text.is_empty() && !path.is_empty() {
+            out.push((path.join("/"), unescape_xml(text)));
+        }
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find('>') else {
+            panic!("unterminated XML tag in response body:\n{body}");
+        };
+        let tag = &rest[..close];
+        rest = &rest[close + 1..];
+        // `<?xml …?>`, `<!-- … -->` and `<![CDATA[…]]>` open no element.
+        if tag.starts_with('?') || tag.starts_with('!') {
+            continue;
+        }
+        if tag.starts_with('/') {
+            assert!(
+                path.pop().is_some(),
+                "closing tag with no open element in response body:\n{body}"
+            );
+            continue;
+        }
+        let self_closing = tag.ends_with('/');
+        let name = tag
+            .trim_end_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        if !self_closing {
+            path.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// Percent-encode one form value, leaving only the unreserved characters.
+fn form_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(byte));
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// An emulator with just this service mounted on a fresh engine, driven
+/// in-process through the production router.
+struct Emulator {
+    router: MultiServiceRouter,
+}
+
+impl Emulator {
+    fn new() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        // Signatures are not what these tests are about; the router still routes
+        // by the SigV4 credential scope below, which is also where an ARN's
+        // region comes from.
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(engine));
+        Self { router }
+    }
+
+    /// Send one `awsQuery` call: `Action`, `Version` and the given form pairs.
+    async fn call_in(&self, region: &str, action: &str, params: &[(String, String)]) -> Reply {
+        let mut body = format!("Action={action}&Version={API_VERSION}");
+        for (key, value) in params {
+            body.push('&');
+            body.push_str(key);
+            body.push('=');
+            body.push_str(&form_encode(value));
+        }
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/elasticache/aws4_request, \
+             SignedHeaders=host, Signature=deadbeef"
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", format!("elasticache.{region}.amazonaws.com"))
+            .header("authorization", authorization)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Bytes::from(body))
+            .expect("build request");
+
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let bytes = response.into_body();
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        let nodes = if body.is_empty() {
+            Vec::new()
+        } else {
+            xml_text_nodes(&body)
+        };
+        Reply {
+            status,
+            body,
+            nodes,
+        }
+    }
+
+    async fn call(&self, action: &str, params: &[(String, String)]) -> Reply {
+        self.call_in(REGION, action, params).await
+    }
+}
+
+/// One refusal row: the case name, the form pairs that make the request, and
+/// the HTTP status plus `awsQuery` error code it must be answered with.
+type RefusalCase = (
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    u16,
+    &'static str,
+);
+
+/// One node-placement row: the case name, the form pairs that make the
+/// request, how many distinct zones its nodes must end up in, and what
+/// `PreferredAvailabilityZone` must report.
+type PlacementCase = (
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    usize,
+    &'static str,
+);
+
+/// `[("A", "b")]` as the owned pairs [`Emulator::call`] takes.
+fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
+}
+
+/// Create one cluster with `CacheClusterId` and whatever else `extra` names.
+async fn create_cluster(emulator: &Emulator, id: &str, extra: &[(&str, &str)]) -> Reply {
+    let mut pairs = params(&[("CacheClusterId", id)]);
+    pairs.extend(params(extra));
+    emulator.call("CreateCacheCluster", &pairs).await
+}
+
+/// Describe one cluster by id, with its node list.
+async fn describe_cluster(emulator: &Emulator, id: &str) -> Reply {
+    emulator
+        .call(
+            "DescribeCacheClusters",
+            &params(&[("CacheClusterId", id), ("ShowCacheNodeInfo", "true")]),
+        )
+        .await
+}
+
+/// Create a cluster and wait out the span after which the clock owes it
+/// `available`, so a test about modify / delete starts from a settled cluster.
+async fn create_available_cluster(emulator: &Emulator, id: &str, extra: &[(&str, &str)]) {
+    let created = create_cluster(emulator, id, extra).await;
+    assert_eq!(
+        created.status, 200,
+        "case {id}: create must succeed, got {}",
+        created.body
+    );
+    std::thread::sleep(PAST_TRANSITION);
+}
+
+/// One row of the create/round-trip table.
+#[derive(Debug, Clone)]
+struct ClusterCase {
+    id: &'static str,
+    /// The form pairs sent beside `CacheClusterId`.
+    extra: &'static [(&'static str, &'static str)],
+    /// The identity the cluster is stored and reported under.
+    stored_id: &'static str,
+    engine: &'static str,
+    engine_version: &'static str,
+    port: &'static str,
+    num_cache_nodes: usize,
+    parameter_group: &'static str,
+}
+
+#[tokio::test]
+async fn a_created_cluster_is_read_back_from_persisted_state() {
+    // The axis: the engine and its documented defaults (`Engine` "memcached |
+    // redis", the operation's own doc adding Valkey), the node count the engine
+    // permits, and whether the request names a port and a version at all. The
+    // parameter group is the family rule: `default.redis<major>` /
+    // `default.valkey<major>` / `default.memcached<major>.<minor>`.
+    let cases = [
+        ClusterCase {
+            id: "demo-cluster",
+            extra: &[("CacheNodeType", "cache.t3.micro")],
+            stored_id: "demo-cluster",
+            engine: "redis",
+            engine_version: "7.1",
+            port: "6379",
+            num_cache_nodes: 1,
+            parameter_group: "default.redis7",
+        },
+        ClusterCase {
+            id: "Mixed-Case-Id",
+            extra: &[("Engine", "REDIS"), ("EngineVersion", "6.2")],
+            // `CacheClusterId` "is stored as a lowercase string", and so is the
+            // engine name.
+            stored_id: "mixed-case-id",
+            engine: "redis",
+            engine_version: "6.2",
+            port: "6379",
+            num_cache_nodes: 1,
+            parameter_group: "default.redis6",
+        },
+        ClusterCase {
+            id: "memcached-three",
+            extra: &[
+                ("Engine", "memcached"),
+                ("NumCacheNodes", "3"),
+                ("CacheNodeType", "cache.m7g.large"),
+            ],
+            stored_id: "memcached-three",
+            engine: "memcached",
+            engine_version: "1.6.22",
+            port: "11211",
+            num_cache_nodes: 3,
+            parameter_group: "default.memcached1.6",
+        },
+        ClusterCase {
+            id: "memcached-max",
+            extra: &[
+                ("Engine", "memcached"),
+                // The published upper bound on a Memcached cluster.
+                ("NumCacheNodes", "40"),
+                ("Port", "11222"),
+            ],
+            stored_id: "memcached-max",
+            engine: "memcached",
+            engine_version: "1.6.22",
+            port: "11222",
+            num_cache_nodes: 40,
+            parameter_group: "default.memcached1.6",
+        },
+        ClusterCase {
+            id: "valkey-cluster",
+            extra: &[("Engine", "valkey"), ("Port", "7000")],
+            stored_id: "valkey-cluster",
+            engine: "valkey",
+            engine_version: "8.0",
+            port: "7000",
+            num_cache_nodes: 1,
+            parameter_group: "default.valkey8",
+        },
+    ];
+
+    let emulator = Emulator::new();
+    // Create every row first, then wait out the transition span ONCE: a cluster
+    // in the `creating` state reports cluster-level information only, so the
+    // node-level assertions below need a settled cluster.
+    let mut creates = Vec::new();
+    for case in &cases {
+        let created = create_cluster(&emulator, case.id, case.extra).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: create must answer 200, got {}",
+            created.body
+        );
+        assert_eq!(
+            created.text("CacheCluster/CacheClusterStatus"),
+            Some("creating"),
+            "case {case:?}: a just-created cluster is not ready yet, got {:?}",
+            created.text("CacheCluster/CacheClusterStatus")
+        );
+        creates.push(created);
+    }
+    std::thread::sleep(PAST_TRANSITION);
+
+    for (case, created) in cases.iter().zip(&creates) {
+        // The round trip: everything the response claims must come back out of
+        // the store through the Describe reader.
+        let described = describe_cluster(&emulator, case.id).await;
+        assert_eq!(
+            described.status, 200,
+            "case {case:?}: describe must answer 200, got {}",
+            described.body
+        );
+        for (field, expected) in [
+            ("CacheCluster/CacheClusterId", case.stored_id),
+            ("CacheCluster/Engine", case.engine),
+            ("CacheCluster/EngineVersion", case.engine_version),
+            ("ConfigurationEndpoint/Port", case.port),
+            (
+                "CacheParameterGroup/CacheParameterGroupName",
+                case.parameter_group,
+            ),
+        ] {
+            assert_eq!(
+                described.text(field),
+                Some(expected),
+                "case {case:?}: {field} must report the stored value, got {:?}",
+                described.text(field)
+            );
+        }
+        assert_eq!(
+            described.text("CacheCluster/NumCacheNodes"),
+            Some(case.num_cache_nodes.to_string().as_str()),
+            "case {case:?}: NumCacheNodes must report the stored count, got {:?}",
+            described.text("CacheCluster/NumCacheNodes")
+        );
+
+        // The create response and the describe response must agree on every
+        // value the service minted, not just on the ones the request carried.
+        for minted in [
+            "CacheCluster/ARN",
+            "ConfigurationEndpoint/Address",
+            "CacheCluster/CacheClusterCreateTime",
+            "CacheCluster/PreferredAvailabilityZone",
+            "CacheCluster/PreferredMaintenanceWindow",
+        ] {
+            assert_eq!(
+                created.text(minted),
+                described.text(minted),
+                "case {case:?}: {minted} must be stored once, got {:?} then {:?}",
+                created.text(minted),
+                described.text(minted)
+            );
+            assert!(
+                created.text(minted).is_some(),
+                "case {case:?}: {minted} must be reported"
+            );
+        }
+        assert_eq!(
+            described.text("CacheCluster/ARN"),
+            Some(
+                format!(
+                    "arn:aws:elasticache:{REGION}:{}:cluster:{}",
+                    engine::emulator_account_id(),
+                    case.stored_id
+                )
+                .as_str()
+            ),
+            "case {case:?}: the ARN must name the cluster, got {:?}",
+            described.text("CacheCluster/ARN")
+        );
+        assert!(
+            described
+                .text("ConfigurationEndpoint/Address")
+                .is_some_and(|address| address.starts_with(&format!("{}.", case.stored_id))
+                    && address.contains(".cfg.")
+                    && address.ends_with(&format!("{REGION}.cache.amazonaws.com"))),
+            "case {case:?}: the configuration endpoint must name the cluster and carry .cfg, \
+             got {:?}",
+            described.text("ConfigurationEndpoint/Address")
+        );
+
+        // `ShowCacheNodeInfo=true`, so the node list is reported, one node per
+        // stored node with the 4-digit ids the model documents.
+        let node_ids = described.all("CacheNodes/CacheNode/CacheNodeId");
+        assert_eq!(
+            node_ids.len(),
+            case.num_cache_nodes,
+            "case {case:?}: expected {} cache nodes, got {node_ids:?}",
+            case.num_cache_nodes
+        );
+        assert_eq!(
+            node_ids.first(),
+            Some(&"0001"),
+            "case {case:?}: node ids are 4-digit and start at 0001, got {node_ids:?}"
+        );
+        let node_ports = described.all("CacheNodes/CacheNode/Endpoint/Port");
+        assert!(
+            node_ports.iter().all(|port| *port == case.port),
+            "case {case:?}: every node listens on the cluster's port {}, got {node_ports:?}",
+            case.port
+        );
+    }
+}
+
+#[tokio::test]
+async fn cache_nodes_are_reported_only_when_the_caller_asks_for_them() {
+    let emulator = Emulator::new();
+    create_cluster(&emulator, "node-info", &[("Engine", "memcached"), ("NumCacheNodes", "2")])
+        .await;
+    // A cluster in the `creating` state reports cluster-level information only,
+    // so this test starts from a settled one.
+    std::thread::sleep(PAST_TRANSITION);
+
+    for (show, expected_nodes) in [("true", 2), ("false", 0)] {
+        let reply = emulator
+            .call(
+                "DescribeCacheClusters",
+                &params(&[("CacheClusterId", "node-info"), ("ShowCacheNodeInfo", show)]),
+            )
+            .await;
+        let node_ids = reply.all("CacheNodes/CacheNode/CacheNodeId");
+        assert_eq!(
+            node_ids.len(),
+            expected_nodes,
+            "case ShowCacheNodeInfo={show}: expected {expected_nodes} nodes, got {node_ids:?}"
+        );
+    }
+
+    // Absent is the same as false: the flag is what asks for the node list.
+    let reply = emulator
+        .call(
+            "DescribeCacheClusters",
+            &params(&[("CacheClusterId", "node-info")]),
+        )
+        .await;
+    assert!(
+        reply.all("CacheNodes/CacheNode/CacheNodeId").is_empty(),
+        "case ShowCacheNodeInfo absent: no node list is reported, got {}",
+        reply.body
+    );
+}
+
+#[tokio::test]
+async fn a_cluster_reaches_available_on_the_clock_and_not_before() {
+    let emulator = Emulator::new();
+
+    // Every engine's cluster starts transient and settles the same way, so the
+    // row is the engine.
+    for engine in ["redis", "valkey", "memcached"] {
+        let id = format!("settle-{engine}");
+        let created = create_cluster(&emulator, &id, &[("Engine", engine)]).await;
+        assert_eq!(
+            created.text("CacheCluster/CacheClusterStatus"),
+            Some("creating"),
+            "case {engine}: the create answer is transient, got {:?}",
+            created.text("CacheCluster/CacheClusterStatus")
+        );
+
+        // Straight after the call the transient status is still what a reader
+        // sees: the span is never zero.
+        let immediate = describe_cluster(&emulator, &id).await;
+        assert_eq!(
+            immediate.text("CacheCluster/CacheClusterStatus"),
+            Some("creating"),
+            "case {engine}: a describe inside the span still reports creating, got {:?}",
+            immediate.text("CacheCluster/CacheClusterStatus")
+        );
+        // "If the cluster is in the creating state, only cluster-level
+        // information is displayed until all of the nodes are successfully
+        // provisioned" — even though this describe asked for the node list.
+        assert!(
+            immediate
+                .all("CacheNodes/CacheNode/CacheNodeId")
+                .is_empty(),
+            "case {engine}: a creating cluster reports cluster-level information only, got {}",
+            immediate.body
+        );
+    }
+
+    std::thread::sleep(PAST_TRANSITION);
+
+    for engine in ["redis", "valkey", "memcached"] {
+        let id = format!("settle-{engine}");
+        let settled = describe_cluster(&emulator, &id).await;
+        assert_eq!(
+            settled.text("CacheCluster/CacheClusterStatus"),
+            Some("available"),
+            "case {engine}: past the span the clock owes the cluster available, got {:?}",
+            settled.text("CacheCluster/CacheClusterStatus")
+        );
+        let node_statuses = settled.all("CacheNodes/CacheNode/CacheNodeStatus");
+        assert!(
+            !node_statuses.is_empty() && node_statuses.iter().all(|status| *status == "available"),
+            "case {engine}: the cluster's nodes settle with it, got {node_statuses:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_node_count_a_create_accepts_is_the_one_the_engine_permits() {
+    // `NumCacheNodes`: "For clusters running Valkey or Redis OSS, this value
+    // must be 1. For clusters running Memcached, this value must be between 1
+    // and 40." Each published bound is a row, and so is one past it.
+    let cases: [(&str, &str, bool); 13] = [
+        ("redis", "1", true),
+        ("redis", "2", false),
+        ("redis", "0", false),
+        ("valkey", "1", true),
+        ("valkey", "3", false),
+        ("memcached", "1", true),
+        ("memcached", "20", true),
+        ("memcached", "40", true),
+        ("memcached", "41", false),
+        ("memcached", "0", false),
+        // `NumCacheNodes` carries no modelled `@range`, so the extremes of the
+        // wire type reach the handler and must be refused rather than
+        // overflowing any arithmetic on the way.
+        ("memcached", "-2147483648", false),
+        ("memcached", "2147483647", false),
+        ("redis", "-2147483647", false),
+    ];
+
+    let emulator = Emulator::new();
+    for (index, (engine, count, accepted)) in cases.iter().enumerate() {
+        let id = format!("nodes-{index}");
+        let reply = create_cluster(
+            &emulator,
+            &id,
+            &[("Engine", engine), ("NumCacheNodes", count)],
+        )
+        .await;
+        if *accepted {
+            assert_eq!(
+                reply.status, 200,
+                "case {engine}/{count}: must be accepted, got {} {}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.text("CacheCluster/NumCacheNodes"),
+                Some(*count),
+                "case {engine}/{count}: the stored count is what was asked for, got {:?}",
+                reply.text("CacheCluster/NumCacheNodes")
+            );
+        } else {
+            assert_eq!(
+                reply.status, 400,
+                "case {engine}/{count}: must be refused 400, got {} {}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error_code(),
+                "InvalidParameterValue",
+                "case {engine}/{count}: expected InvalidParameterValue, got {}",
+                reply.body
+            );
+            // A refused create stores nothing.
+            let described = describe_cluster(&emulator, &id).await;
+            assert_eq!(
+                described.status, 404,
+                "case {engine}/{count}: a refused create must not have stored a cluster, got {}",
+                described.body
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_create_naming_a_resource_this_emulator_does_not_hold_is_refused() {
+    let emulator = Emulator::new();
+    // A subnet group that DOES exist, so the refusals below are about the
+    // named resource and not about the group.
+    let group = emulator
+        .call(
+            "CreateCacheSubnetGroup",
+            &params(&[
+                ("CacheSubnetGroupName", "demo-subnets"),
+                ("CacheSubnetGroupDescription", "demo"),
+                ("SubnetIds.SubnetIdentifier.1", "subnet-11111111"),
+            ]),
+        )
+        .await;
+    assert_eq!(group.status, 200, "the subnet group must be created: {}", group.body);
+    create_cluster(&emulator, "taken", &[]).await;
+
+    // Each row: the member that names a resource, and the modelled refusal.
+    let cases: [RefusalCase; 9] = [
+        (
+            "duplicate id",
+            &[("CacheClusterId", "taken")],
+            400,
+            "CacheClusterAlreadyExists",
+        ),
+        (
+            "unknown subnet group",
+            &[("CacheSubnetGroupName", "nope")],
+            400,
+            "CacheSubnetGroupNotFoundFault",
+        ),
+        (
+            "unknown replication group",
+            &[("ReplicationGroupId", "rg-1")],
+            404,
+            "ReplicationGroupNotFoundFault",
+        ),
+        (
+            "unknown cache security group",
+            &[("CacheSecurityGroupNames.CacheSecurityGroupName.1", "sg-a")],
+            404,
+            "CacheSecurityGroupNotFound",
+        ),
+        (
+            "unknown parameter group",
+            &[("CacheParameterGroupName", "my-own-group")],
+            404,
+            "CacheParameterGroupNotFound",
+        ),
+        (
+            "a default name that is no engine family",
+            &[("CacheParameterGroupName", "default.nonsense")],
+            404,
+            "CacheParameterGroupNotFound",
+        ),
+        (
+            "unknown engine",
+            &[("Engine", "dynamo")],
+            400,
+            "InvalidParameterValue",
+        ),
+        (
+            "SnapshotRetentionLimit on memcached",
+            &[("Engine", "memcached"), ("SnapshotRetentionLimit", "5")],
+            400,
+            "InvalidParameterCombination",
+        ),
+        (
+            "SnapshotWindow on memcached",
+            &[("Engine", "memcached"), ("SnapshotWindow", "05:00-09:00")],
+            400,
+            "InvalidParameterCombination",
+        ),
+    ];
+
+    for (case, extra, status, code) in cases {
+        let mut pairs = params(&[("CacheClusterId", "refused")]);
+        pairs.extend(params(extra));
+        // The duplicate row carries its own id, which must win.
+        for (key, value) in params(extra) {
+            if key == "CacheClusterId" {
+                pairs.retain(|(k, _)| k != "CacheClusterId");
+                pairs.push((key, value));
+            }
+        }
+        let reply = emulator.call("CreateCacheCluster", &pairs).await;
+        assert_eq!(
+            reply.status, status,
+            "case {case}: expected HTTP {status}, got {} {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            code,
+            "case {case}: expected {code}, got {}",
+            reply.body
+        );
+    }
+
+    // The subnet group that DOES exist is accepted, and the cluster reports it.
+    let accepted = create_cluster(
+        &emulator,
+        "in-a-subnet-group",
+        &[
+            ("CacheSubnetGroupName", "Demo-Subnets"),
+            // An engine family's default group DOES exist, so naming it
+            // explicitly is accepted and stored.
+            ("CacheParameterGroupName", "default.redis7"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        accepted.text("CacheCluster/CacheSubnetGroupName"),
+        Some("demo-subnets"),
+        "a cluster reports the stored (lowercased) subnet group name, got {}",
+        accepted.body
+    );
+    assert_eq!(
+        accepted.text("CacheParameterGroup/CacheParameterGroupName"),
+        Some("default.redis7"),
+        "a named default parameter group is accepted and stored, got {}",
+        accepted.body
+    );
+}
+
+#[tokio::test]
+async fn describe_pagination_is_bounded_resumable_and_complete() {
+    let emulator = Emulator::new();
+    // 25 clusters: more than one page at the smallest page size the service
+    // serves, so the second page is non-empty and the third does not exist.
+    let total = 25;
+    for index in 0..total {
+        let reply = create_cluster(&emulator, &format!("page-{index:03}"), &[]).await;
+        assert_eq!(reply.status, 200, "cluster {index} must be created: {}", reply.body);
+    }
+
+    // `MaxRecords`: "Default: 100. Constraints: minimum 20; maximum 100." Each
+    // published bound is a row, and so is one past it.
+    let cases: [(&str, bool); 5] = [
+        ("20", true),
+        ("100", true),
+        ("19", false),
+        ("101", false),
+        ("1", false),
+    ];
+    for (max_records, accepted) in cases {
+        let reply = emulator
+            .call(
+                "DescribeCacheClusters",
+                &params(&[("MaxRecords", max_records)]),
+            )
+            .await;
+        if accepted {
+            assert_eq!(
+                reply.status, 200,
+                "case MaxRecords={max_records}: must be accepted, got {} {}",
+                reply.status, reply.body
+            );
+            let page = reply.all("CacheClusters/CacheCluster/CacheClusterId");
+            let expected = max_records.parse::<usize>().expect("numeric row").min(total);
+            assert_eq!(
+                page.len(),
+                expected,
+                "case MaxRecords={max_records}: expected {expected} clusters, got {page:?}"
+            );
+        } else {
+            assert_eq!(
+                reply.status, 400,
+                "case MaxRecords={max_records}: must be refused 400, got {} {}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error_code(),
+                "InvalidParameterValue",
+                "case MaxRecords={max_records}: expected InvalidParameterValue, got {}",
+                reply.body
+            );
+        }
+    }
+
+    // A marker this service did not mint is a bad parameter value, not an
+    // empty page.
+    let bogus = emulator
+        .call(
+            "DescribeCacheClusters",
+            &params(&[("Marker", "not-a-marker")]),
+        )
+        .await;
+    assert_eq!(
+        bogus.status, 400,
+        "case bogus marker: must be refused 400, got {} {}",
+        bogus.status, bogus.body
+    );
+
+    // Walking the pages visits every cluster exactly once.
+    let mut seen: Vec<String> = Vec::new();
+    let mut marker: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let mut pairs = params(&[("MaxRecords", "20")]);
+        if let Some(token) = marker.as_deref() {
+            pairs.extend(params(&[("Marker", token)]));
+        }
+        let reply = emulator.call("DescribeCacheClusters", &pairs).await;
+        assert_eq!(
+            reply.status, 200,
+            "page {pages}: must be served, got {} {}",
+            reply.status, reply.body
+        );
+        let page: Vec<String> = reply
+            .all("CacheClusters/CacheCluster/CacheClusterId")
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            !page.is_empty(),
+            "page {pages}: a marker must not have been issued for an empty page"
+        );
+        seen.extend(page);
+        pages += 1;
+        marker = reply.marker().map(str::to_string);
+        if marker.is_none() {
+            break;
+        }
+        assert!(pages < 10, "pagination must terminate; saw {pages} pages");
+    }
+    assert_eq!(pages, 2, "25 clusters at 20 per page is 2 pages, got {pages}");
+    let unique: BTreeMap<&String, ()> = seen.iter().map(|id| (id, ())).collect();
+    assert_eq!(
+        unique.len(),
+        total,
+        "every cluster must appear exactly once across the pages, got {} of {total} unique in {}",
+        unique.len(),
+        seen.len()
+    );
+    assert_eq!(
+        seen.len(),
+        total,
+        "no cluster may repeat across pages, got {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn modify_applies_immediately_or_records_pending_modified_values() {
+    let emulator = Emulator::new();
+
+    // The axis: whether `ApplyImmediately` is set, over the members
+    // `PendingModifiedValues` models (node count, node type, engine version) —
+    // these are the ones that axis governs.
+    let cases: [(&str, &str); 3] = [
+        ("true", "immediate"),
+        ("false", "deferred"),
+        // Absent is the same as false.
+        ("", "absent"),
+    ];
+
+    for (apply, label) in cases {
+        let id = format!("modify-{label}");
+        create_available_cluster(&emulator, &id, &[("Engine", "memcached"), ("NumCacheNodes", "1")])
+            .await;
+
+        let mut pairs = params(&[
+            ("CacheClusterId", &id),
+            ("NumCacheNodes", "3"),
+            ("CacheNodeType", "cache.m7g.large"),
+            ("EngineVersion", "1.6.17"),
+            ("PreferredMaintenanceWindow", "tue:04:00-tue:05:00"),
+        ]);
+        if !apply.is_empty() {
+            pairs.extend(params(&[("ApplyImmediately", apply)]));
+        }
+        let modified = emulator.call("ModifyCacheCluster", &pairs).await;
+        assert_eq!(
+            modified.status, 200,
+            "case {label}: modify must answer 200, got {}",
+            modified.body
+        );
+
+        let described = describe_cluster(&emulator, &id).await;
+        // A member `PendingModifiedValues` does NOT model has nowhere to be
+        // pending, so it is applied whatever `ApplyImmediately` says.
+        assert_eq!(
+            described.text("CacheCluster/PreferredMaintenanceWindow"),
+            Some("tue:04:00-tue:05:00"),
+            "case {label}: the maintenance window applies at once, got {:?}",
+            described.text("CacheCluster/PreferredMaintenanceWindow")
+        );
+
+        if apply == "true" {
+            assert_eq!(
+                described.text("CacheCluster/NumCacheNodes"),
+                Some("3"),
+                "case {label}: an applied change is visible to the next describe, got {:?}",
+                described.text("CacheCluster/NumCacheNodes")
+            );
+            assert_eq!(
+                described.all("CacheNodes/CacheNode/CacheNodeId").len(),
+                3,
+                "case {label}: the node list grows with the count, got {:?}",
+                described.all("CacheNodes/CacheNode/CacheNodeId")
+            );
+            assert_eq!(
+                described.text("CacheCluster/CacheNodeType"),
+                Some("cache.m7g.large"),
+                "case {label}: the node type applies, got {:?}",
+                described.text("CacheCluster/CacheNodeType")
+            );
+            assert_eq!(
+                described.text("CacheCluster/EngineVersion"),
+                Some("1.6.17"),
+                "case {label}: the engine version applies, got {:?}",
+                described.text("CacheCluster/EngineVersion")
+            );
+            assert!(
+                described.all("PendingModifiedValues/NumCacheNodes").is_empty(),
+                "case {label}: nothing stays pending once applied, got {}",
+                described.body
+            );
+            assert_eq!(
+                described.text("CacheCluster/CacheClusterStatus"),
+                Some("modifying"),
+                "case {label}: an immediate modify leaves the cluster transient, got {:?}",
+                described.text("CacheCluster/CacheClusterStatus")
+            );
+        } else {
+            assert_eq!(
+                described.text("CacheCluster/NumCacheNodes"),
+                Some("1"),
+                "case {label}: a deferred change leaves the running count alone, got {:?}",
+                described.text("CacheCluster/NumCacheNodes")
+            );
+            assert_eq!(
+                described.all("CacheNodes/CacheNode/CacheNodeId").len(),
+                1,
+                "case {label}: a deferred change adds no nodes, got {:?}",
+                described.all("CacheNodes/CacheNode/CacheNodeId")
+            );
+            for (field, expected) in [
+                ("PendingModifiedValues/NumCacheNodes", "3"),
+                ("PendingModifiedValues/CacheNodeType", "cache.m7g.large"),
+                ("PendingModifiedValues/EngineVersion", "1.6.17"),
+            ] {
+                assert_eq!(
+                    described.text(field),
+                    Some(expected),
+                    "case {label}: {field} must report the deferred value, got {:?}",
+                    described.text(field)
+                );
+            }
+            assert_eq!(
+                described.text("CacheCluster/CacheClusterStatus"),
+                Some("available"),
+                "case {label}: a deferred modify does not move the status, got {:?}",
+                described.text("CacheCluster/CacheClusterStatus")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn removing_nodes_needs_the_ids_to_remove() {
+    let emulator = Emulator::new();
+    create_available_cluster(
+        &emulator,
+        "shrink",
+        &[("Engine", "memcached"), ("NumCacheNodes", "3")],
+    )
+    .await;
+
+    // `NumCacheNodes`: "If you are removing cache nodes, you must use the
+    // CacheNodeIdsToRemove parameter to provide the IDs of the specific cache
+    // nodes to remove."
+    let cases: [RefusalCase; 3] = [
+        (
+            "no ids",
+            &[("NumCacheNodes", "1"), ("ApplyImmediately", "true")],
+            400,
+            "InvalidParameterCombination",
+        ),
+        (
+            "too few ids",
+            &[
+                ("NumCacheNodes", "1"),
+                ("ApplyImmediately", "true"),
+                ("CacheNodeIdsToRemove.CacheNodeId.1", "0002"),
+            ],
+            400,
+            "InvalidParameterCombination",
+        ),
+        (
+            "unknown id",
+            &[
+                ("NumCacheNodes", "2"),
+                ("ApplyImmediately", "true"),
+                ("CacheNodeIdsToRemove.CacheNodeId.1", "0009"),
+            ],
+            400,
+            "InvalidParameterValue",
+        ),
+    ];
+    for (case, extra, status, code) in cases {
+        let mut pairs = params(&[("CacheClusterId", "shrink")]);
+        pairs.extend(params(extra));
+        let reply = emulator.call("ModifyCacheCluster", &pairs).await;
+        assert_eq!(
+            reply.status, status,
+            "case {case}: expected HTTP {status}, got {} {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            code,
+            "case {case}: expected {code}, got {}",
+            reply.body
+        );
+    }
+
+    // With the ids, the named nodes are the ones that go.
+    let shrunk = emulator
+        .call(
+            "ModifyCacheCluster",
+            &params(&[
+                ("CacheClusterId", "shrink"),
+                ("NumCacheNodes", "1"),
+                ("ApplyImmediately", "true"),
+                ("CacheNodeIdsToRemove.CacheNodeId.1", "0001"),
+                ("CacheNodeIdsToRemove.CacheNodeId.2", "0002"),
+            ]),
+        )
+        .await;
+    assert_eq!(shrunk.status, 200, "the shrink must succeed: {}", shrunk.body);
+    let remaining = describe_cluster(&emulator, "shrink").await;
+    assert_eq!(
+        remaining.all("CacheNodes/CacheNode/CacheNodeId"),
+        vec!["0003"],
+        "the named nodes are removed and the rest stay, got {:?}",
+        remaining.all("CacheNodes/CacheNode/CacheNodeId")
+    );
+}
+
+#[tokio::test]
+async fn delete_reports_the_cluster_deleting_and_removes_it() {
+    let emulator = Emulator::new();
+    create_available_cluster(&emulator, "doomed", &[]).await;
+    create_available_cluster(&emulator, "survivor", &[]).await;
+
+    let deleted = emulator
+        .call(
+            "DeleteCacheCluster",
+            &params(&[("CacheClusterId", "Doomed")]),
+        )
+        .await;
+    assert_eq!(deleted.status, 200, "delete must answer 200, got {}", deleted.body);
+    assert_eq!(
+        deleted.text("CacheCluster/CacheClusterStatus"),
+        Some("deleting"),
+        "case delete: the final snapshot reports the cluster deleting, got {:?}",
+        deleted.text("CacheCluster/CacheClusterStatus")
+    );
+    assert_eq!(
+        deleted.text("CacheCluster/CacheClusterId"),
+        Some("doomed"),
+        "case delete: the answer names the stored cluster, got {}",
+        deleted.body
+    );
+
+    let gone = describe_cluster(&emulator, "doomed").await;
+    assert_eq!(
+        gone.status, 404,
+        "case delete: the cluster is gone, got {} {}",
+        gone.status, gone.body
+    );
+    assert_eq!(
+        gone.error_code(),
+        "CacheClusterNotFound",
+        "case delete: expected CacheClusterNotFound, got {}",
+        gone.body
+    );
+
+    let listed = emulator.call("DescribeCacheClusters", &[]).await;
+    assert_eq!(
+        listed.all("CacheClusters/CacheCluster/CacheClusterId"),
+        vec!["survivor"],
+        "case delete: the unfiltered describe no longer lists it, got {:?}",
+        listed.all("CacheClusters/CacheCluster/CacheClusterId")
+    );
+
+    // `ShowCacheClustersNotInReplicationGroups` keeps the clusters that belong
+    // to no replication group; `CreateCacheCluster` refuses a
+    // `ReplicationGroupId`, so every stored cluster qualifies and the flag
+    // excludes nothing.
+    let standalone = emulator
+        .call(
+            "DescribeCacheClusters",
+            &params(&[("ShowCacheClustersNotInReplicationGroups", "true")]),
+        )
+        .await;
+    assert_eq!(
+        standalone.all("CacheClusters/CacheCluster/CacheClusterId"),
+        vec!["survivor"],
+        "case standalone filter: every stored cluster belongs to no replication group, got {:?}",
+        standalone.all("CacheClusters/CacheCluster/CacheClusterId")
+    );
+}
+
+#[tokio::test]
+async fn a_final_snapshot_is_refused_rather_than_claimed() {
+    let emulator = Emulator::new();
+    // The axis: the engine. Neither can take a final snapshot here — this slice
+    // stores no snapshots at all — so the member is refused for both rather
+    // than accepted and dropped.
+    for engine in ["memcached", "redis", "valkey"] {
+        let id = format!("final-{engine}");
+        create_available_cluster(&emulator, &id, &[("Engine", engine)]).await;
+
+        let refused = emulator
+            .call(
+                "DeleteCacheCluster",
+                &params(&[
+                    ("CacheClusterId", &id),
+                    ("FinalSnapshotIdentifier", "last-one"),
+                ]),
+            )
+            .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {engine}: expected HTTP 400, got {} {}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code(),
+            "SnapshotFeatureNotSupportedFault",
+            "case {engine}: expected SnapshotFeatureNotSupportedFault, got {}",
+            refused.body
+        );
+        // The refused delete left the cluster in place.
+        let still_there = describe_cluster(&emulator, &id).await;
+        assert_eq!(
+            still_there.status, 200,
+            "case {engine}: a refused delete must not remove the cluster, got {}",
+            still_there.body
+        );
+
+        // Without the member the delete goes through.
+        let accepted = emulator
+            .call("DeleteCacheCluster", &params(&[("CacheClusterId", &id)]))
+            .await;
+        assert_eq!(
+            accepted.status, 200,
+            "case {engine}: expected HTTP 200 without a final snapshot, got {} {}",
+            accepted.status, accepted.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_stored_cluster_setting_is_reported_back() {
+    // The axis: the member. Each row sets one configuration member and names
+    // the element that must report it, so a member accepted and dropped fails
+    // here.
+    let emulator = Emulator::new();
+    let created = create_cluster(
+        &emulator,
+        "configured",
+        &[
+            ("NotificationTopicArn", "arn:aws:sns:us-east-1:000000000000:events"),
+            ("AuthToken", "a-very-long-and-secret-token"),
+            ("TransitEncryptionEnabled", "true"),
+            ("NetworkType", "dual_stack"),
+            ("IpDiscovery", "ipv6"),
+            ("SnapshotRetentionLimit", "5"),
+            ("SnapshotWindow", "05:00-09:00"),
+            ("AutoMinorVersionUpgrade", "false"),
+            ("SecurityGroupIds.SecurityGroupId.1", "sg-0123456789abcdef0"),
+            ("LogDeliveryConfigurations.LogDeliveryConfigurationRequest.1.LogType", "slow-log"),
+            (
+                "LogDeliveryConfigurations.LogDeliveryConfigurationRequest.1.DestinationType",
+                "cloudwatch-logs",
+            ),
+            (
+                "LogDeliveryConfigurations.LogDeliveryConfigurationRequest.1.DestinationDetails.CloudWatchLogsDetails.LogGroup",
+                "/aws/elasticache/slow",
+            ),
+            ("LogDeliveryConfigurations.LogDeliveryConfigurationRequest.1.LogFormat", "json"),
+            ("LogDeliveryConfigurations.LogDeliveryConfigurationRequest.1.Enabled", "true"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "the configured create must answer 200, got {}",
+        created.body
+    );
+
+    let described = describe_cluster(&emulator, "configured").await;
+    for (member, element, expected) in [
+        (
+            "NotificationTopicArn",
+            "NotificationConfiguration/TopicArn",
+            "arn:aws:sns:us-east-1:000000000000:events",
+        ),
+        (
+            "NotificationTopicArn",
+            "NotificationConfiguration/TopicStatus",
+            "active",
+        ),
+        ("AuthToken", "CacheCluster/AuthTokenEnabled", "true"),
+        (
+            "TransitEncryptionEnabled",
+            "CacheCluster/TransitEncryptionEnabled",
+            "true",
+        ),
+        ("NetworkType", "CacheCluster/NetworkType", "dual_stack"),
+        ("IpDiscovery", "CacheCluster/IpDiscovery", "ipv6"),
+        (
+            "SnapshotRetentionLimit",
+            "CacheCluster/SnapshotRetentionLimit",
+            "5",
+        ),
+        ("SnapshotWindow", "CacheCluster/SnapshotWindow", "05:00-09:00"),
+        (
+            "AutoMinorVersionUpgrade",
+            "CacheCluster/AutoMinorVersionUpgrade",
+            "false",
+        ),
+        (
+            "SecurityGroupIds",
+            // `SecurityGroupMembershipList`'s member carries no `@xmlName`, so
+            // the element is the Smithy default `member`.
+            "SecurityGroups/member/SecurityGroupId",
+            "sg-0123456789abcdef0",
+        ),
+        ("SecurityGroupIds", "SecurityGroups/member/Status", "active"),
+        (
+            "LogDeliveryConfigurations",
+            "LogDeliveryConfiguration/LogType",
+            "slow-log",
+        ),
+        (
+            "LogDeliveryConfigurations",
+            "CloudWatchLogsDetails/LogGroup",
+            "/aws/elasticache/slow",
+        ),
+        (
+            "LogDeliveryConfigurations",
+            "LogDeliveryConfiguration/Status",
+            "active",
+        ),
+    ] {
+        assert_eq!(
+            described.text(element),
+            Some(expected),
+            "case {member}: {element} must report the stored value, got {:?}",
+            described.text(element)
+        );
+    }
+    // The auth token is a secret: only the fact that one was set is reported,
+    // and the token itself appears nowhere in the answer.
+    assert!(
+        !described.body.contains("a-very-long-and-secret-token")
+            && !created.body.contains("a-very-long-and-secret-token"),
+        "the auth token must never be echoed, got {}",
+        described.body
+    );
+    assert!(
+        described
+            .text("CacheCluster/AuthTokenLastModifiedDate")
+            .is_some(),
+        "setting an auth token stamps AuthTokenLastModifiedDate, got {}",
+        described.body
+    );
+
+    // A cluster that set none of these reports the flag as false rather than
+    // claiming a token.
+    create_cluster(&emulator, "plain", &[]).await;
+    let plain = describe_cluster(&emulator, "plain").await;
+    assert_eq!(
+        plain.text("CacheCluster/AuthTokenEnabled"),
+        Some("false"),
+        "case no auth token: AuthTokenEnabled is false, got {:?}",
+        plain.text("CacheCluster/AuthTokenEnabled")
+    );
+    assert!(
+        plain.all("NotificationConfiguration/TopicArn").is_empty(),
+        "case no topic: no NotificationConfiguration is reported, got {}",
+        plain.body
+    );
+}
+
+#[tokio::test]
+async fn node_placement_follows_the_zones_the_request_asked_for() {
+    let emulator = Emulator::new();
+
+    // `single-az` (and no AZ member at all) puts every node in one zone;
+    // `cross-az` spreads the NEW nodes, and a cluster whose nodes are not all
+    // in one zone reports "Multiple".
+    let cases: [PlacementCase; 4] = [
+        ("default", &[("Engine", "memcached"), ("NumCacheNodes", "3")], 1, "us-east-1a"),
+        (
+            "single-az",
+            &[
+                ("Engine", "memcached"),
+                ("NumCacheNodes", "3"),
+                ("AZMode", "single-az"),
+            ],
+            1,
+            "us-east-1a",
+        ),
+        (
+            "cross-az",
+            &[
+                ("Engine", "memcached"),
+                ("NumCacheNodes", "3"),
+                ("AZMode", "cross-az"),
+            ],
+            3,
+            "Multiple",
+        ),
+        (
+            "explicit zones",
+            &[
+                ("Engine", "memcached"),
+                ("NumCacheNodes", "2"),
+                ("PreferredAvailabilityZones.PreferredAvailabilityZone.1", "us-east-1b"),
+                ("PreferredAvailabilityZones.PreferredAvailabilityZone.2", "us-east-1c"),
+            ],
+            2,
+            "Multiple",
+        ),
+    ];
+
+    for (case, extra, _, _) in cases {
+        let id = format!("zones-{case}").replace(' ', "-");
+        let created = create_cluster(&emulator, &id, extra).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case}: create must answer 200, got {}",
+            created.body
+        );
+    }
+    // A creating cluster reports cluster-level information only, so the
+    // per-node zones are read once every cluster has settled.
+    std::thread::sleep(PAST_TRANSITION);
+
+    for (case, _, distinct_zones, preferred) in cases {
+        let id = format!("zones-{case}").replace(' ', "-");
+        let described = describe_cluster(&emulator, &id).await;
+        let mut zones = described.all("CacheNodes/CacheNode/CustomerAvailabilityZone");
+        zones.sort_unstable();
+        zones.dedup();
+        assert_eq!(
+            zones.len(),
+            distinct_zones,
+            "case {case}: expected {distinct_zones} distinct node zone(s), got {zones:?}"
+        );
+        assert_eq!(
+            described.text("CacheCluster/PreferredAvailabilityZone"),
+            Some(preferred),
+            "case {case}: PreferredAvailabilityZone must report {preferred}, got {:?}",
+            described.text("CacheCluster/PreferredAvailabilityZone")
+        );
+    }
+
+    // The documented combinations that cannot hold.
+    let refusals: [RefusalCase; 4] = [
+        (
+            "AZMode on redis",
+            &[("CacheClusterId", "az-redis"), ("AZMode", "cross-az")],
+            400,
+            "InvalidParameterCombination",
+        ),
+        (
+            "PreferredAvailabilityZones on redis",
+            &[
+                ("CacheClusterId", "azs-redis"),
+                ("PreferredAvailabilityZones.PreferredAvailabilityZone.1", "us-east-1b"),
+            ],
+            400,
+            "InvalidParameterCombination",
+        ),
+        (
+            "both AZ members",
+            &[
+                ("CacheClusterId", "az-both"),
+                ("Engine", "memcached"),
+                ("PreferredAvailabilityZone", "us-east-1a"),
+                ("PreferredAvailabilityZones.PreferredAvailabilityZone.1", "us-east-1b"),
+            ],
+            400,
+            "InvalidParameterCombination",
+        ),
+        (
+            "zone count does not match NumCacheNodes",
+            &[
+                ("CacheClusterId", "az-count"),
+                ("Engine", "memcached"),
+                ("NumCacheNodes", "3"),
+                ("PreferredAvailabilityZones.PreferredAvailabilityZone.1", "us-east-1b"),
+            ],
+            400,
+            "InvalidParameterCombination",
+        ),
+    ];
+    for (case, pairs, status, code) in refusals {
+        let reply = emulator.call("CreateCacheCluster", &params(pairs)).await;
+        assert_eq!(
+            reply.status, status,
+            "case {case}: expected HTTP {status}, got {} {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            code,
+            "case {case}: expected {code}, got {}",
+            reply.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_member_this_emulator_cannot_honour_is_refused_not_dropped() {
+    let emulator = Emulator::new();
+    // Each row names a member whose effect nothing in the store can carry, so
+    // the request is refused instead of answered 200 with the member ignored.
+    let cases: [RefusalCase; 5] = [
+        (
+            "SnapshotName",
+            &[("CacheClusterId", "from-snapshot"), ("SnapshotName", "nightly")],
+            400,
+            "InvalidParameterValue",
+        ),
+        (
+            "SnapshotArns",
+            &[
+                ("CacheClusterId", "from-s3"),
+                ("SnapshotArns.SnapshotArn.1", "arn:aws:s3:::bucket/snap.rdb"),
+            ],
+            400,
+            "InvalidParameterValue",
+        ),
+        (
+            "OutpostMode",
+            &[("CacheClusterId", "outpost-mode"), ("OutpostMode", "single-outpost")],
+            400,
+            "InvalidParameterValue",
+        ),
+        (
+            "PreferredOutpostArn",
+            &[
+                ("CacheClusterId", "outpost-arn"),
+                (
+                    "PreferredOutpostArn",
+                    "arn:aws:outposts:us-east-1:000000000000:outpost/op-1",
+                ),
+            ],
+            400,
+            "InvalidParameterValue",
+        ),
+        (
+            "PreferredOutpostArns",
+            &[
+                ("CacheClusterId", "outpost-arns"),
+                (
+                    "PreferredOutpostArns.PreferredOutpostArn.1",
+                    "arn:aws:outposts:us-east-1:000000000000:outpost/op-1",
+                ),
+            ],
+            400,
+            "InvalidParameterValue",
+        ),
+    ];
+    for (case, pairs, status, code) in cases {
+        let reply = emulator.call("CreateCacheCluster", &params(pairs)).await;
+        assert_eq!(
+            reply.status, status,
+            "case {case}: expected HTTP {status}, got {} {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            code,
+            "case {case}: expected {code}, got {}",
+            reply.body
+        );
+        // Nothing was stored for the refused request.
+        let id = pairs
+            .iter()
+            .find(|(key, _)| *key == "CacheClusterId")
+            .map(|(_, value)| *value)
+            .expect("every row names a cluster");
+        let described = describe_cluster(&emulator, id).await;
+        assert_eq!(
+            described.status, 404,
+            "case {case}: a refused create must store nothing, got {}",
+            described.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn modify_refuses_a_member_that_names_no_change_it_can_make() {
+    let emulator = Emulator::new();
+    create_available_cluster(
+        &emulator,
+        "modify-refusals",
+        &[("Engine", "memcached"), ("NumCacheNodes", "2")],
+    )
+    .await;
+    create_available_cluster(&emulator, "modify-redis", &[("Engine", "redis")]).await;
+
+    let cases: [RefusalCase; 10] = [
+        (
+            "NumCacheNodes at the wire type's floor",
+            &[
+                ("CacheClusterId", "modify-refusals"),
+                ("NumCacheNodes", "-2147483648"),
+            ],
+            400,
+            "InvalidParameterValue",
+        ),
+        (
+            "NumCacheNodes at the wire type's ceiling",
+            &[
+                ("CacheClusterId", "modify-refusals"),
+                ("NumCacheNodes", "2147483647"),
+                ("CacheNodeIdsToRemove.CacheNodeId.1", "0001"),
+            ],
+            400,
+            "InvalidParameterValue",
+        ),
+        (
+            "ids to remove without NumCacheNodes",
+            &[
+                ("CacheClusterId", "modify-refusals"),
+                ("CacheNodeIdsToRemove.CacheNodeId.1", "0001"),
+            ],
+            400,
+            "InvalidParameterCombination",
+        ),
+        (
+            "ids to remove while growing",
+            &[
+                ("CacheClusterId", "modify-refusals"),
+                ("NumCacheNodes", "3"),
+                ("CacheNodeIdsToRemove.CacheNodeId.1", "0001"),
+            ],
+            400,
+            "InvalidParameterCombination",
+        ),
+        (
+            "new zones that do not match the nodes being added",
+            &[
+                ("CacheClusterId", "modify-refusals"),
+                ("NumCacheNodes", "3"),
+                ("NewAvailabilityZones.PreferredAvailabilityZone.1", "us-east-1b"),
+                ("NewAvailabilityZones.PreferredAvailabilityZone.2", "us-east-1c"),
+            ],
+            400,
+            "InvalidParameterCombination",
+        ),
+        (
+            "new zones on redis",
+            &[
+                ("CacheClusterId", "modify-redis"),
+                ("NewAvailabilityZones.PreferredAvailabilityZone.1", "us-east-1b"),
+            ],
+            400,
+            "InvalidParameterCombination",
+        ),
+        (
+            "new zones without ApplyImmediately",
+            &[
+                ("CacheClusterId", "modify-refusals"),
+                ("NumCacheNodes", "3"),
+                ("NewAvailabilityZones.PreferredAvailabilityZone.1", "us-east-1b"),
+            ],
+            400,
+            "InvalidParameterCombination",
+        ),
+        (
+            // The 2-node Memcached cluster cannot become a redis one: "for
+            // clusters running Valkey or Redis OSS, this value must be 1".
+            "engine change that leaves an illegal node count",
+            &[("CacheClusterId", "modify-refusals"), ("Engine", "redis")],
+            400,
+            "InvalidParameterValue",
+        ),
+        (
+            "SnapshotWindow on a memcached cluster",
+            &[
+                ("CacheClusterId", "modify-refusals"),
+                ("SnapshotWindow", "05:00-09:00"),
+            ],
+            400,
+            "InvalidParameterCombination",
+        ),
+        (
+            "SnapshotRetentionLimit on a memcached cluster",
+            &[
+                ("CacheClusterId", "modify-refusals"),
+                ("SnapshotRetentionLimit", "5"),
+            ],
+            400,
+            "InvalidParameterCombination",
+        ),
+    ];
+    for (case, pairs, status, code) in cases {
+        let reply = emulator.call("ModifyCacheCluster", &params(pairs)).await;
+        assert_eq!(
+            reply.status, status,
+            "case {case}: expected HTTP {status}, got {} {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            code,
+            "case {case}: expected {code}, got {}",
+            reply.body
+        );
+    }
+
+    // With one zone for the one node being added, the new node lands there and
+    // the existing nodes stay where they were.
+    let grown = emulator
+        .call(
+            "ModifyCacheCluster",
+            &params(&[
+                ("CacheClusterId", "modify-refusals"),
+                ("NumCacheNodes", "3"),
+                ("ApplyImmediately", "true"),
+                ("NewAvailabilityZones.PreferredAvailabilityZone.1", "us-east-1f"),
+            ]),
+        )
+        .await;
+    assert_eq!(grown.status, 200, "the grow must succeed: {}", grown.body);
+    let described = describe_cluster(&emulator, "modify-refusals").await;
+    let zones = described.all("CacheNodes/CacheNode/CustomerAvailabilityZone");
+    assert_eq!(
+        zones,
+        vec!["us-east-1a", "us-east-1a", "us-east-1f"],
+        "only the new node is placed in the named zone, got {zones:?}"
+    );
+    // The added node is not provisioned yet, so it reports no endpoint while
+    // the two it joined still do.
+    let statuses = described.all("CacheNodes/CacheNode/CacheNodeStatus");
+    assert_eq!(
+        statuses,
+        vec!["available", "available", "creating"],
+        "the added node is still being provisioned, got {statuses:?}"
+    );
+    assert_eq!(
+        described.all("CacheNodes/CacheNode/Endpoint/Address").len(),
+        2,
+        "a node being added reports no endpoint until it is provisioned, got {}",
+        described.body
+    );
+
+    // Once the clock settles the cluster, the added node is provisioned and
+    // reports its endpoint like the rest.
+    std::thread::sleep(PAST_TRANSITION);
+    let settled = describe_cluster(&emulator, "modify-refusals").await;
+    assert_eq!(
+        settled.all("CacheNodes/CacheNode/Endpoint/Address").len(),
+        3,
+        "every node reports an endpoint once the cluster settles, got {}",
+        settled.body
+    );
+}
+
+#[tokio::test]
+async fn modify_applies_the_members_pending_modified_values_cannot_hold() {
+    let emulator = Emulator::new();
+    create_available_cluster(&emulator, "applied-at-once", &[("Engine", "redis")]).await;
+
+    // `ApplyImmediately` is absent, so only a member `PendingModifiedValues`
+    // models may be deferred. `Engine`, the notification topic, `IpDiscovery`
+    // and the auth token are not among them, so they apply now.
+    let modified = emulator
+        .call(
+            "ModifyCacheCluster",
+            &params(&[
+                ("CacheClusterId", "applied-at-once"),
+                ("Engine", "valkey"),
+                ("IpDiscovery", "ipv6"),
+                ("NotificationTopicArn", "arn:aws:sns:us-east-1:000000000000:later"),
+                ("AuthToken", "another-very-long-secret-token"),
+                ("ScaleConfig.ScalePercentage", "20"),
+                ("ScaleConfig.ScaleIntervalMinutes", "15"),
+            ]),
+        )
+        .await;
+    assert_eq!(
+        modified.status, 200,
+        "the modify must answer 200, got {}",
+        modified.body
+    );
+
+    let described = describe_cluster(&emulator, "applied-at-once").await;
+    for (member, element, expected) in [
+        ("Engine", "CacheCluster/Engine", "valkey"),
+        ("IpDiscovery", "CacheCluster/IpDiscovery", "ipv6"),
+        (
+            "NotificationTopicArn",
+            "NotificationConfiguration/TopicArn",
+            "arn:aws:sns:us-east-1:000000000000:later",
+        ),
+        ("AuthToken", "CacheCluster/AuthTokenEnabled", "true"),
+        // `PendingModifiedValues` is the only place the model reports a
+        // `ScaleConfig`, so it is pending whatever `ApplyImmediately` says.
+        ("ScaleConfig", "ScaleConfig/ScalePercentage", "20"),
+    ] {
+        assert_eq!(
+            described.text(element),
+            Some(expected),
+            "case {member}: {element} must report the change, got {:?}",
+            described.text(element)
+        );
+    }
+    assert!(
+        !described.body.contains("another-very-long-secret-token"),
+        "the auth token must never be echoed, got {}",
+        described.body
+    );
+
+    // `NotificationTopicStatus: inactive` is how the topic is detached.
+    let detached = emulator
+        .call(
+            "ModifyCacheCluster",
+            &params(&[
+                ("CacheClusterId", "applied-at-once"),
+                ("NotificationTopicStatus", "inactive"),
+            ]),
+        )
+        .await;
+    assert_eq!(
+        detached.status, 200,
+        "the detach must answer 200, got {}",
+        detached.body
+    );
+    let after = describe_cluster(&emulator, "applied-at-once").await;
+    assert!(
+        after.all("NotificationConfiguration/TopicArn").is_empty(),
+        "an inactive topic status detaches the topic, got {}",
+        after.body
+    );
+
+    // `AuthTokenUpdateStrategy: DELETE` clears the flag.
+    let deleted = emulator
+        .call(
+            "ModifyCacheCluster",
+            &params(&[
+                ("CacheClusterId", "applied-at-once"),
+                ("AuthTokenUpdateStrategy", "DELETE"),
+            ]),
+        )
+        .await;
+    assert_eq!(
+        deleted.status, 200,
+        "the token delete must answer 200, got {}",
+        deleted.body
+    );
+    let cleared = describe_cluster(&emulator, "applied-at-once").await;
+    assert_eq!(
+        cleared.text("CacheCluster/AuthTokenEnabled"),
+        Some("false"),
+        "a DELETE strategy clears AuthTokenEnabled, got {:?}",
+        cleared.text("CacheCluster/AuthTokenEnabled")
+    );
+}
+
+#[tokio::test]
+async fn an_unrelated_immediate_modify_leaves_an_earlier_pending_value_pending() {
+    let emulator = Emulator::new();
+    create_available_cluster(
+        &emulator,
+        "pending-kept",
+        &[("Engine", "memcached"), ("NumCacheNodes", "1")],
+    )
+    .await;
+
+    // A deferred modify records the node count; the status does not move, so a
+    // second modify is accepted straight away.
+    let deferred = emulator
+        .call(
+            "ModifyCacheCluster",
+            &params(&[("CacheClusterId", "pending-kept"), ("NumCacheNodes", "3")]),
+        )
+        .await;
+    assert_eq!(
+        deferred.text("PendingModifiedValues/NumCacheNodes"),
+        Some("3"),
+        "the deferred count must be recorded, got {}",
+        deferred.body
+    );
+
+    // An immediate modify of an unrelated member clears only what it applied.
+    let unrelated = emulator
+        .call(
+            "ModifyCacheCluster",
+            &params(&[
+                ("CacheClusterId", "pending-kept"),
+                ("ApplyImmediately", "true"),
+                ("PreferredMaintenanceWindow", "wed:06:00-wed:07:00"),
+            ]),
+        )
+        .await;
+    assert_eq!(
+        unrelated.status, 200,
+        "the unrelated modify must answer 200, got {}",
+        unrelated.body
+    );
+    let described = describe_cluster(&emulator, "pending-kept").await;
+    assert_eq!(
+        described.text("PendingModifiedValues/NumCacheNodes"),
+        Some("3"),
+        "a pending value this request did not touch must stay pending, got {}",
+        described.body
+    );
+    assert_eq!(
+        described.text("CacheCluster/PreferredMaintenanceWindow"),
+        Some("wed:06:00-wed:07:00"),
+        "the applied member must be applied, got {:?}",
+        described.text("CacheCluster/PreferredMaintenanceWindow")
+    );
+    assert_eq!(
+        described.text("CacheCluster/NumCacheNodes"),
+        Some("1"),
+        "the still-pending count must not have been applied, got {:?}",
+        described.text("CacheCluster/NumCacheNodes")
+    );
+
+    // A later modify that DOES name the count applies it and clears it.
+    std::thread::sleep(PAST_TRANSITION);
+    let applied = emulator
+        .call(
+            "ModifyCacheCluster",
+            &params(&[
+                ("CacheClusterId", "pending-kept"),
+                ("ApplyImmediately", "true"),
+                ("NumCacheNodes", "2"),
+            ]),
+        )
+        .await;
+    assert_eq!(
+        applied.status, 200,
+        "the applied modify must answer 200, got {}",
+        applied.body
+    );
+    let after = describe_cluster(&emulator, "pending-kept").await;
+    assert_eq!(
+        after.text("CacheCluster/NumCacheNodes"),
+        Some("2"),
+        "the named count applies, got {:?}",
+        after.text("CacheCluster/NumCacheNodes")
+    );
+    assert!(
+        after.all("PendingModifiedValues/NumCacheNodes").is_empty(),
+        "applying the count clears it from PendingModifiedValues, got {}",
+        after.body
+    );
+}
+
+#[tokio::test]
+async fn a_log_delivery_request_replaces_or_removes_the_stored_one() {
+    let emulator = Emulator::new();
+    create_available_cluster(
+        &emulator,
+        "logs",
+        &[
+            ("LogDeliveryConfigurations.LogDeliveryConfigurationRequest.1.LogType", "slow-log"),
+            (
+                "LogDeliveryConfigurations.LogDeliveryConfigurationRequest.1.DestinationType",
+                "cloudwatch-logs",
+            ),
+            ("LogDeliveryConfigurations.LogDeliveryConfigurationRequest.1.Enabled", "true"),
+        ],
+    )
+    .await;
+
+    // A request for the same log type replaces the stored configuration.
+    let replaced = emulator
+        .call(
+            "ModifyCacheCluster",
+            &params(&[
+                ("CacheClusterId", "logs"),
+                ("LogDeliveryConfigurations.LogDeliveryConfigurationRequest.1.LogType", "slow-log"),
+                (
+                    "LogDeliveryConfigurations.LogDeliveryConfigurationRequest.1.DestinationType",
+                    "kinesis-firehose",
+                ),
+                ("LogDeliveryConfigurations.LogDeliveryConfigurationRequest.1.Enabled", "true"),
+            ]),
+        )
+        .await;
+    assert_eq!(replaced.status, 200, "the replace must succeed: {}", replaced.body);
+    let described = describe_cluster(&emulator, "logs").await;
+    assert_eq!(
+        described.all("LogDeliveryConfiguration/DestinationType"),
+        vec!["kinesis-firehose"],
+        "a request for the same log type replaces it, got {:?}",
+        described.all("LogDeliveryConfiguration/DestinationType")
+    );
+
+    // `Enabled: false` removes it.
+    let removed = emulator
+        .call(
+            "ModifyCacheCluster",
+            &params(&[
+                ("CacheClusterId", "logs"),
+                ("LogDeliveryConfigurations.LogDeliveryConfigurationRequest.1.LogType", "slow-log"),
+                ("LogDeliveryConfigurations.LogDeliveryConfigurationRequest.1.Enabled", "false"),
+            ]),
+        )
+        .await;
+    assert_eq!(removed.status, 200, "the removal must succeed: {}", removed.body);
+    let after = describe_cluster(&emulator, "logs").await;
+    assert!(
+        after.all("LogDeliveryConfiguration/LogType").is_empty(),
+        "a disabled request removes the configuration, got {}",
+        after.body
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_or_unsettled_cluster_is_refused() {
+    let emulator = Emulator::new();
+    // Still `creating`: the span is never zero, so this cluster is transient.
+    create_cluster(&emulator, "fresh", &[]).await;
+
+    let cases: [(&str, &str, &str, u16, &str); 6] = [
+        (
+            "modify unknown",
+            "ModifyCacheCluster",
+            "nope",
+            404,
+            "CacheClusterNotFound",
+        ),
+        (
+            "delete unknown",
+            "DeleteCacheCluster",
+            "nope",
+            404,
+            "CacheClusterNotFound",
+        ),
+        (
+            "describe unknown",
+            "DescribeCacheClusters",
+            "nope",
+            404,
+            "CacheClusterNotFound",
+        ),
+        (
+            "modify while creating",
+            "ModifyCacheCluster",
+            "fresh",
+            400,
+            "InvalidCacheClusterState",
+        ),
+        (
+            "delete while creating",
+            "DeleteCacheCluster",
+            "fresh",
+            400,
+            "InvalidCacheClusterState",
+        ),
+        // A describe is a read: it reports the transient cluster rather than
+        // refusing it.
+        (
+            "describe while creating",
+            "DescribeCacheClusters",
+            "fresh",
+            200,
+            "",
+        ),
+    ];
+
+    for (case, action, id, status, code) in cases {
+        let reply = emulator
+            .call(action, &params(&[("CacheClusterId", id)]))
+            .await;
+        assert_eq!(
+            reply.status, status,
+            "case {case}: expected HTTP {status}, got {} {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            code,
+            "case {case}: expected error code {code:?}, got {}",
+            reply.body
+        );
+    }
+}
+
+/// One row of the subnet-group table.
+#[derive(Debug, Clone)]
+struct SubnetGroupCase {
+    name: &'static str,
+    stored_name: &'static str,
+    description: &'static str,
+    subnets: &'static [&'static str],
+}
+
+#[tokio::test]
+async fn a_created_subnet_group_is_read_back_from_persisted_state() {
+    // The axis: the name's case, the description, and the number of subnets.
+    let cases = [
+        SubnetGroupCase {
+            name: "demo-subnets",
+            stored_name: "demo-subnets",
+            description: "demo",
+            subnets: &["subnet-11111111", "subnet-22222222"],
+        },
+        SubnetGroupCase {
+            name: "Single-Subnet",
+            stored_name: "single-subnet",
+            description: "one subnet, mixed-case name",
+            subnets: &["subnet-abc123"],
+        },
+        SubnetGroupCase {
+            name: "wide-group",
+            stored_name: "wide-group",
+            description: "seven subnets, so the chosen zones wrap",
+            subnets: &[
+                "subnet-a1", "subnet-a2", "subnet-a3", "subnet-a4", "subnet-a5", "subnet-a6",
+                "subnet-a7",
+            ],
+        },
+    ];
+
+    let emulator = Emulator::new();
+    for case in &cases {
+        let mut pairs = params(&[
+            ("CacheSubnetGroupName", case.name),
+            ("CacheSubnetGroupDescription", case.description),
+        ]);
+        for (index, subnet) in case.subnets.iter().enumerate() {
+            pairs.push((
+                format!("SubnetIds.SubnetIdentifier.{}", index + 1),
+                (*subnet).to_string(),
+            ));
+        }
+        let created = emulator.call("CreateCacheSubnetGroup", &pairs).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: create must answer 200, got {}",
+            created.body
+        );
+
+        let described = emulator
+            .call(
+                "DescribeCacheSubnetGroups",
+                &params(&[("CacheSubnetGroupName", case.name)]),
+            )
+            .await;
+        assert_eq!(
+            described.status, 200,
+            "case {case:?}: describe must answer 200, got {}",
+            described.body
+        );
+        assert_eq!(
+            described.text("CacheSubnetGroup/CacheSubnetGroupName"),
+            Some(case.stored_name),
+            "case {case:?}: the name is stored lowercase, got {:?}",
+            described.text("CacheSubnetGroup/CacheSubnetGroupName")
+        );
+        assert_eq!(
+            described.text("CacheSubnetGroup/CacheSubnetGroupDescription"),
+            Some(case.description),
+            "case {case:?}: the description must round-trip, got {:?}",
+            described.text("CacheSubnetGroup/CacheSubnetGroupDescription")
+        );
+        assert_eq!(
+            described.all("Subnets/Subnet/SubnetIdentifier"),
+            case.subnets.to_vec(),
+            "case {case:?}: the stored subnets must round-trip in order, got {:?}",
+            described.all("Subnets/Subnet/SubnetIdentifier")
+        );
+        let zones = described.all("SubnetAvailabilityZone/Name");
+        assert_eq!(
+            zones.len(),
+            case.subnets.len(),
+            "case {case:?}: every subnet reports a zone, got {zones:?}"
+        );
+        assert!(
+            zones.iter().all(|zone| zone.starts_with(REGION)),
+            "case {case:?}: a chosen zone is in the request's region, got {zones:?}"
+        );
+        // Minted once and stored: the create answer and the describe answer
+        // must agree.
+        for minted in ["CacheSubnetGroup/VpcId", "CacheSubnetGroup/ARN"] {
+            assert_eq!(
+                created.text(minted),
+                described.text(minted),
+                "case {case:?}: {minted} must be stored once, got {:?} then {:?}",
+                created.text(minted),
+                described.text(minted)
+            );
+        }
+        assert_eq!(
+            described.text("CacheSubnetGroup/ARN"),
+            Some(
+                format!(
+                    "arn:aws:elasticache:{REGION}:{}:subnetgroup:{}",
+                    engine::emulator_account_id(),
+                    case.stored_name
+                )
+                .as_str()
+            ),
+            "case {case:?}: the ARN must name the group, got {:?}",
+            described.text("CacheSubnetGroup/ARN")
+        );
+    }
+
+    // Every group is listed, and each VpcId is distinct: the id is minted per
+    // group rather than shared.
+    let listed = emulator.call("DescribeCacheSubnetGroups", &[]).await;
+    let names = listed.all("CacheSubnetGroups/CacheSubnetGroup/CacheSubnetGroupName");
+    assert_eq!(
+        names.len(),
+        cases.len(),
+        "the unfiltered describe lists every stored group, got {names:?}"
+    );
+    let vpc_ids: BTreeMap<&str, ()> = listed
+        .all("CacheSubnetGroup/VpcId")
+        .into_iter()
+        .map(|id| (id, ()))
+        .collect();
+    assert_eq!(
+        vpc_ids.len(),
+        cases.len(),
+        "each group carries its own VpcId, got {vpc_ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_subnet_group_request_that_cannot_hold_is_refused() {
+    let emulator = Emulator::new();
+    let base = params(&[
+        ("CacheSubnetGroupName", "taken"),
+        ("CacheSubnetGroupDescription", "first"),
+        ("SubnetIds.SubnetIdentifier.1", "subnet-11111111"),
+    ]);
+    let first = emulator.call("CreateCacheSubnetGroup", &base).await;
+    assert_eq!(first.status, 200, "the first create must succeed: {}", first.body);
+
+    let cases: [RefusalCase; 5] = [
+        (
+            "duplicate name",
+            &[
+                ("CacheSubnetGroupName", "TAKEN"),
+                ("CacheSubnetGroupDescription", "second"),
+                ("SubnetIds.SubnetIdentifier.1", "subnet-33333333"),
+            ],
+            400,
+            "CacheSubnetGroupAlreadyExists",
+        ),
+        (
+            "absent SubnetIds",
+            &[
+                ("CacheSubnetGroupName", "empty"),
+                ("CacheSubnetGroupDescription", "none"),
+            ],
+            400,
+            // `SubnetIds` is `@required`, so the boundary validator refuses an
+            // absent one before the handler runs.
+            "MalformedInput",
+        ),
+        (
+            "an empty subnet id",
+            &[
+                ("CacheSubnetGroupName", "empty-id"),
+                ("CacheSubnetGroupDescription", "none"),
+                ("SubnetIds.SubnetIdentifier.1", ""),
+            ],
+            400,
+            "InvalidSubnet",
+        ),
+        (
+            "not a subnet id",
+            &[
+                ("CacheSubnetGroupName", "bad-id"),
+                ("CacheSubnetGroupDescription", "bad"),
+                ("SubnetIds.SubnetIdentifier.1", "vpc-11111111"),
+            ],
+            400,
+            "InvalidSubnet",
+        ),
+        (
+            "one bad subnet id among good ones",
+            &[
+                ("CacheSubnetGroupName", "mixed-ids"),
+                ("CacheSubnetGroupDescription", "mixed"),
+                ("SubnetIds.SubnetIdentifier.1", "subnet-11111111"),
+                ("SubnetIds.SubnetIdentifier.2", "not-a-subnet"),
+            ],
+            400,
+            "InvalidSubnet",
+        ),
+    ];
+    for (case, pairs, status, code) in cases {
+        let reply = emulator
+            .call("CreateCacheSubnetGroup", &params(pairs))
+            .await;
+        assert_eq!(
+            reply.status, status,
+            "case {case}: expected HTTP {status}, got {} {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            code,
+            "case {case}: expected {code}, got {}",
+            reply.body
+        );
+    }
+
+    // The duplicate did not overwrite the stored group.
+    let described = emulator
+        .call(
+            "DescribeCacheSubnetGroups",
+            &params(&[("CacheSubnetGroupName", "taken")]),
+        )
+        .await;
+    assert_eq!(
+        described.text("CacheSubnetGroup/CacheSubnetGroupDescription"),
+        Some("first"),
+        "a refused duplicate must leave the stored group alone, got {}",
+        described.body
+    );
+
+    let unknown = emulator
+        .call(
+            "DescribeCacheSubnetGroups",
+            &params(&[("CacheSubnetGroupName", "nope")]),
+        )
+        .await;
+    assert_eq!(
+        unknown.status, 400,
+        "case describe unknown: expected HTTP 400, got {} {}",
+        unknown.status, unknown.body
+    );
+    assert_eq!(
+        unknown.error_code(),
+        "CacheSubnetGroupNotFoundFault",
+        "case describe unknown: expected CacheSubnetGroupNotFoundFault, got {}",
+        unknown.body
+    );
+}
+
+#[tokio::test]
+async fn subnet_group_pages_are_bounded_and_resumable() {
+    let emulator = Emulator::new();
+    // One more than the smallest page size the service serves.
+    let total = 21;
+    for index in 0..total {
+        let reply = emulator
+            .call(
+                "CreateCacheSubnetGroup",
+                &params(&[
+                    ("CacheSubnetGroupName", &format!("group-{index:03}")),
+                    ("CacheSubnetGroupDescription", "paged"),
+                    ("SubnetIds.SubnetIdentifier.1", "subnet-11111111"),
+                ]),
+            )
+            .await;
+        assert_eq!(reply.status, 200, "group {index} must be created: {}", reply.body);
+    }
+
+    let first = emulator
+        .call("DescribeCacheSubnetGroups", &params(&[("MaxRecords", "20")]))
+        .await;
+    let page_one = first.all("CacheSubnetGroups/CacheSubnetGroup/CacheSubnetGroupName");
+    assert_eq!(
+        page_one.len(),
+        20,
+        "case page 1: expected 20 groups, got {page_one:?}"
+    );
+    let marker = first
+        .marker()
+        .expect("a 21st group exists, so a marker must be issued")
+        .to_string();
+
+    let second = emulator
+        .call(
+            "DescribeCacheSubnetGroups",
+            &params(&[("MaxRecords", "20"), ("Marker", &marker)]),
+        )
+        .await;
+    let page_two = second.all("CacheSubnetGroups/CacheSubnetGroup/CacheSubnetGroupName");
+    assert_eq!(
+        page_two,
+        vec!["group-020"],
+        "case page 2: the marker resumes after page 1, got {page_two:?}"
+    );
+    assert!(
+        second.marker().is_none(),
+        "case page 2: the last page carries no marker, got {}",
+        second.body
+    );
+
+    // A refused page size is refused here too, through the operation's own
+    // channel.
+    let refused = emulator
+        .call("DescribeCacheSubnetGroups", &params(&[("MaxRecords", "5")]))
+        .await;
+    assert_eq!(
+        refused.status, 400,
+        "case MaxRecords=5: must be refused 400, got {} {}",
+        refused.status, refused.body
+    );
+}
+
+#[tokio::test]
+async fn the_documented_identifier_port_and_tag_constraints_are_enforced() {
+    let emulator = Emulator::new();
+
+    // `CacheClusterId`: "A name must contain from 1 to 50 alphanumeric
+    // characters or hyphens. The first character must be a letter. A name
+    // cannot end with a hyphen or contain two consecutive hyphens." Each clause
+    // is a row, with the length bound and one past it.
+    let fifty = "a".repeat(50);
+    let fifty_one = "a".repeat(51);
+    let id_cases: [(&str, bool); 9] = [
+        ("a", true),
+        ("demo-cluster-1", true),
+        (fifty.as_str(), true),
+        (fifty_one.as_str(), false),
+        ("", false),
+        ("1abc", false),
+        ("-abc", false),
+        ("abc-", false),
+        ("a--b", false),
+    ];
+    for (id, accepted) in id_cases {
+        let reply = create_cluster(&emulator, id, &[]).await;
+        if accepted {
+            assert_eq!(
+                reply.status, 200,
+                "case id {id:?}: must be accepted, got {} {}",
+                reply.status, reply.body
+            );
+        } else {
+            assert_eq!(
+                reply.status, 400,
+                "case id {id:?}: must be refused 400, got {} {}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error_code(),
+                "InvalidParameterValue",
+                "case id {id:?}: expected InvalidParameterValue, got {}",
+                reply.body
+            );
+        }
+    }
+
+    // `Port` is "the port number on which each of the cache nodes accepts
+    // connections" — a TCP port, so each end of the range is a row and so is
+    // one past it.
+    let port_cases: [(&str, bool); 5] = [
+        ("1", true),
+        ("65535", true),
+        ("0", false),
+        ("65536", false),
+        ("-1", false),
+    ];
+    for (index, (port, accepted)) in port_cases.iter().enumerate() {
+        let id = format!("port-{index}");
+        let reply = create_cluster(&emulator, &id, &[("Port", port)]).await;
+        if *accepted {
+            assert_eq!(
+                reply.status, 200,
+                "case port {port}: must be accepted, got {} {}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.text("ConfigurationEndpoint/Port"),
+                Some(*port),
+                "case port {port}: the stored port is what was asked for, got {:?}",
+                reply.text("ConfigurationEndpoint/Port")
+            );
+        } else {
+            assert_eq!(
+                reply.status, 400,
+                "case port {port}: must be refused 400, got {} {}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error_code(),
+                "InvalidParameterValue",
+                "case port {port}: expected InvalidParameterValue, got {}",
+                reply.body
+            );
+        }
+    }
+
+    // "The maximum number of tags permitted on a resource is 50": the bound is a
+    // row and so is one past it.
+    for (count, accepted) in [(50usize, true), (51usize, false)] {
+        let mut pairs = params(&[("CacheClusterId", &format!("tags-{count}"))]);
+        for index in 1..=count {
+            pairs.push((format!("Tags.Tag.{index}.Key"), format!("k{index}")));
+            pairs.push((format!("Tags.Tag.{index}.Value"), format!("v{index}")));
+        }
+        let reply = emulator.call("CreateCacheCluster", &pairs).await;
+        if accepted {
+            assert_eq!(
+                reply.status, 200,
+                "case {count} tags: must be accepted, got {} {}",
+                reply.status, reply.body
+            );
+        } else {
+            assert_eq!(
+                reply.status, 400,
+                "case {count} tags: must be refused 400, got {} {}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error_code(),
+                "TagQuotaPerResourceExceeded",
+                "case {count} tags: expected TagQuotaPerResourceExceeded, got {}",
+                reply.body
+            );
+        }
+    }
+
+    // `Tag$Key` "may not be null" while the value may be, so a keyless tag is
+    // refused rather than dropped.
+    let keyless = emulator
+        .call(
+            "CreateCacheCluster",
+            &params(&[
+                ("CacheClusterId", "keyless-tag"),
+                ("Tags.Tag.1.Value", "orphan"),
+            ]),
+        )
+        .await;
+    assert_eq!(
+        keyless.status, 400,
+        "case keyless tag: must be refused 400, got {} {}",
+        keyless.status, keyless.body
+    );
+    assert_eq!(
+        keyless.error_code(),
+        "InvalidParameterValue",
+        "case keyless tag: expected InvalidParameterValue, got {}",
+        keyless.body
+    );
+}
+
+#[tokio::test]
+async fn the_documented_subnet_group_constraints_are_enforced() {
+    let emulator = Emulator::new();
+
+    // `CacheSubnetGroupName` "must contain no more than 255 alphanumeric
+    // characters or hyphens": the bound is a row and so is one past it. This
+    // operation models no invalid-parameter error, so a refusal is the
+    // framework's `ValidationException`.
+    let longest = "g".repeat(255);
+    let too_long = "g".repeat(256);
+    let name_cases: [(&str, bool); 5] = [
+        ("demo-subnets", true),
+        (longest.as_str(), true),
+        (too_long.as_str(), false),
+        ("has space", false),
+        ("slash/name", false),
+    ];
+    for (name, accepted) in name_cases {
+        let reply = emulator
+            .call(
+                "CreateCacheSubnetGroup",
+                &params(&[
+                    ("CacheSubnetGroupName", name),
+                    ("CacheSubnetGroupDescription", "constraint row"),
+                    ("SubnetIds.SubnetIdentifier.1", "subnet-11111111"),
+                ]),
+            )
+            .await;
+        if accepted {
+            assert_eq!(
+                reply.status, 200,
+                "case name {name:?}: must be accepted, got {} {}",
+                reply.status, reply.body
+            );
+        } else {
+            assert_eq!(
+                reply.status, 400,
+                "case name {name:?}: must be refused 400, got {} {}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error_code(),
+                "ValidationException",
+                "case name {name:?}: expected ValidationException, got {}",
+                reply.body
+            );
+        }
+    }
+
+    // The per-group subnet bound: the limit is a row and so is one past it.
+    for (count, accepted) in [(20usize, true), (21usize, false)] {
+        let mut pairs = params(&[
+            ("CacheSubnetGroupName", &format!("subnets-{count}")),
+            ("CacheSubnetGroupDescription", "bound row"),
+        ]);
+        for index in 1..=count {
+            pairs.push((
+                format!("SubnetIds.SubnetIdentifier.{index}"),
+                format!("subnet-{index:08x}"),
+            ));
+        }
+        let reply = emulator.call("CreateCacheSubnetGroup", &pairs).await;
+        if accepted {
+            assert_eq!(
+                reply.status, 200,
+                "case {count} subnets: must be accepted, got {} {}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.all("Subnets/Subnet/SubnetIdentifier").len(),
+                count,
+                "case {count} subnets: every subnet must be stored, got {:?}",
+                reply.all("Subnets/Subnet/SubnetIdentifier")
+            );
+        } else {
+            assert_eq!(
+                reply.status, 400,
+                "case {count} subnets: must be refused 400, got {} {}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error_code(),
+                "CacheSubnetQuotaExceededFault",
+                "case {count} subnets: expected CacheSubnetQuotaExceededFault, got {}",
+                reply.body
+            );
+        }
+    }
+
+    // A subnet cannot be in one group twice.
+    let repeated = emulator
+        .call(
+            "CreateCacheSubnetGroup",
+            &params(&[
+                ("CacheSubnetGroupName", "repeated-subnet"),
+                ("CacheSubnetGroupDescription", "duplicate"),
+                ("SubnetIds.SubnetIdentifier.1", "subnet-11111111"),
+                ("SubnetIds.SubnetIdentifier.2", "subnet-11111111"),
+            ]),
+        )
+        .await;
+    assert_eq!(
+        repeated.status, 400,
+        "case repeated subnet: must be refused 400, got {} {}",
+        repeated.status, repeated.body
+    );
+    assert_eq!(
+        repeated.error_code(),
+        "InvalidSubnet",
+        "case repeated subnet: expected InvalidSubnet, got {}",
+        repeated.body
+    );
+
+    // The same 50-tag bound as a cluster.
+    let mut pairs = params(&[
+        ("CacheSubnetGroupName", "too-many-tags"),
+        ("CacheSubnetGroupDescription", "tags"),
+        ("SubnetIds.SubnetIdentifier.1", "subnet-11111111"),
+    ]);
+    for index in 1..=51 {
+        pairs.push((format!("Tags.Tag.{index}.Key"), format!("k{index}")));
+    }
+    let tagged = emulator.call("CreateCacheSubnetGroup", &pairs).await;
+    assert_eq!(
+        tagged.status, 400,
+        "case 51 tags: must be refused 400, got {} {}",
+        tagged.status, tagged.body
+    );
+    assert_eq!(
+        tagged.error_code(),
+        "TagQuotaPerResourceExceeded",
+        "case 51 tags: expected TagQuotaPerResourceExceeded, got {}",
+        tagged.body
+    );
+}
+
+#[tokio::test]
+async fn arns_and_endpoints_name_the_region_the_request_was_signed_for() {
+    // The axis: the signing region, which is where the resource lives.
+    for region in ["us-east-1", "eu-west-1", "ap-southeast-2"] {
+        let emulator = Emulator::new();
+        let created = emulator
+            .call_in(
+                region,
+                "CreateCacheCluster",
+                &params(&[("CacheClusterId", "regional")]),
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {region}: create must answer 200, got {}",
+            created.body
+        );
+        assert_eq!(
+            created.text("CacheCluster/ARN"),
+            Some(
+                format!(
+                    "arn:aws:elasticache:{region}:{}:cluster:regional",
+                    engine::emulator_account_id()
+                )
+                .as_str()
+            ),
+            "case {region}: the ARN must carry the signing region, got {:?}",
+            created.text("CacheCluster/ARN")
+        );
+        assert!(
+            created
+                .text("ConfigurationEndpoint/Address")
+                .is_some_and(|address| address.ends_with(&format!("{region}.cache.amazonaws.com"))),
+            "case {region}: the endpoint must carry the signing region, got {:?}",
+            created.text("ConfigurationEndpoint/Address")
+        );
+        assert!(
+            created
+                .text("CacheCluster/PreferredAvailabilityZone")
+                .is_some_and(|zone| zone.starts_with(region)),
+            "case {region}: the chosen zone must be in the signing region, got {:?}",
+            created.text("CacheCluster/PreferredAvailabilityZone")
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_transition_span_is_the_one_the_state_module_publishes() {
+    // The handlers store a due instant rather than sleeping, so the span is a
+    // published constant the tests wait out — and it is never zero, which is
+    // what makes the transient status observable at all.
+    assert!(
+        state::CLUSTER_TRANSITION > Duration::ZERO,
+        "the transition span must not be zero, got {:?}",
+        state::CLUSTER_TRANSITION
+    );
+    assert!(
+        PAST_TRANSITION > state::CLUSTER_TRANSITION,
+        "the tests must wait past the span: {:?} vs {:?}",
+        PAST_TRANSITION,
+        state::CLUSTER_TRANSITION
+    );
+}

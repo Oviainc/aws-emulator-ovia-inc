@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCacheCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCacheCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DeleteCacheCluster::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -166,18 +162,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCacheCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCacheClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCacheCluster"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Same identity rule as `CreateCacheCluster`: `CacheClusterId` "is
+        // stored as a lowercase string".
+        let cache_cluster_id = input.cache_cluster_id.to_ascii_lowercase();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(cluster) = store.settled_cluster_mut(&cache_cluster_id, now) else {
+            return Err(DeleteCacheClusterErrorModeled::CacheClusterNotFoundFault(
+                CacheClusterNotFoundFault {
+                    message: Some(format!(
+                        "Cache cluster {} not found.",
+                        input.cache_cluster_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "This operation is not valid for … a cluster that is not in the
+        // available state": one still `creating`, or `modifying` from an
+        // immediate change, is refused with the modelled state fault.
+        if cluster.status != crate::state::STATUS_AVAILABLE {
+            return Err(DeleteCacheClusterErrorModeled::InvalidCacheClusterStateFault(
+                InvalidCacheClusterStateFault {
+                    message: Some(format!(
+                        "Cache cluster {cache_cluster_id} is in {} state, not available.",
+                        cluster.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A final snapshot cannot be taken here: `CreateSnapshot` /
+        // `DescribeSnapshots` are scaffolded 501s and own that gap, so this
+        // slice stores no snapshots for one to appear in. Refusing with the
+        // modelled fault is the honest answer — accepting the member and
+        // deleting the cluster anyway would claim a snapshot that was never
+        // taken. (For Memcached it is also what AWS answers: snapshots are a
+        // Valkey / Redis OSS feature.)
+        if let Some(name) = input.final_snapshot_identifier.as_deref() {
+            return Err(
+                DeleteCacheClusterErrorModeled::SnapshotFeatureNotSupportedFault(
+                    SnapshotFeatureNotSupportedFault {
+                        message: Some(format!(
+                            "FinalSnapshotIdentifier {name} cannot be honoured: this emulator \
+                             takes no snapshots."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The cluster is leaving: the snapshot the caller is handed back reports
+        // it `deleting`, with its nodes in the same state, and the record is
+        // removed so a following describe answers `CacheClusterNotFoundFault`.
+        cluster.status = crate::state::STATUS_DELETING.to_string();
+        cluster.pending_status = None;
+        cluster.set_node_status(crate::state::STATUS_DELETING);
+        let deleted = store
+            .cache_clusters
+            .remove(&cache_cluster_id)
+            .map(|cluster| cluster.to_modeled(true));
+
+        Ok(DeleteCacheClusterOutput {
+            cache_cluster: deleted,
+        })
     }
 }

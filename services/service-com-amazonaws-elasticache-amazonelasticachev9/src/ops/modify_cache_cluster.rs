@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyCacheCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyCacheCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`ModifyCacheCluster::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -266,18 +262,381 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyCacheCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyCacheClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // As in `CreateCacheCluster`, every member of this request is either
+        // applied to the stored record, recorded as pending, or refused with a
+        // modelled error. Nothing is accepted and dropped.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyCacheCluster"))
+        // Same identity rule as `CreateCacheCluster`: `CacheClusterId` "is
+        // stored as a lowercase string".
+        let cache_cluster_id = input.cache_cluster_id.to_ascii_lowercase();
+
+        // Cache security groups and parameter groups other than an engine
+        // family's default cannot exist here (both creators are scaffolded
+        // 501s), so a request naming one is refused rather than recorded.
+        if let Some(name) = input
+            .cache_security_group_names
+            .as_deref()
+            .unwrap_or_default()
+            .first()
+        {
+            return Err(ModifyCacheClusterErrorModeled::CacheSecurityGroupNotFoundFault(
+                CacheSecurityGroupNotFoundFault {
+                    message: Some(format!("Cache security group {name} not found.")),
+                },
+            )
+            .into());
+        }
+        if let Some(name) = input.cache_parameter_group_name.as_deref() {
+            if !crate::state::is_known_parameter_group(name) {
+                return Err(
+                    ModifyCacheClusterErrorModeled::CacheParameterGroupNotFoundFault(
+                        CacheParameterGroupNotFoundFault {
+                            message: Some(format!("CacheParameterGroup {name} not found.")),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(cluster) = store.settled_cluster_mut(&cache_cluster_id, now) else {
+            return Err(ModifyCacheClusterErrorModeled::CacheClusterNotFoundFault(
+                CacheClusterNotFoundFault {
+                    message: Some(format!(
+                        "Cache cluster {} not found.",
+                        input.cache_cluster_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // A cluster can only be modified while it is settled: one still
+        // `creating`, or already `modifying` from an earlier immediate change,
+        // is refused with the modelled state fault.
+        if cluster.status != crate::state::STATUS_AVAILABLE {
+            return Err(ModifyCacheClusterErrorModeled::InvalidCacheClusterStateFault(
+                InvalidCacheClusterStateFault {
+                    message: Some(format!(
+                        "Cache cluster {cache_cluster_id} is in {} state, not available.",
+                        cluster.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `Engine` and `NumCacheNodes` interact: the legal node count depends on
+        // the engine the cluster will be running after this call.
+        let engine = match input.engine.as_deref() {
+            Some(engine) => match crate::state::normalize_engine(engine) {
+                Ok(engine) => engine,
+                Err(message) => {
+                    return Err(
+                        ModifyCacheClusterErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(message),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => cluster.engine.clone(),
+        };
+        let ids_to_remove = input.cache_node_ids_to_remove.unwrap_or_default();
+        let new_zones = input.new_availability_zones.unwrap_or_default();
+
+        // `AZMode` and `NewAvailabilityZones` are each "only supported" /
+        // "only supported on" Memcached clusters.
+        for (member, present) in [
+            ("AZMode", input.az_mode.is_some()),
+            ("NewAvailabilityZones", !new_zones.is_empty()),
+        ] {
+            if present && engine != "memcached" {
+                return Err(
+                    ModifyCacheClusterErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(format!(
+                                "{member} is only supported for memcached clusters, not for \
+                                 {engine}."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `NumCacheNodes` is an `IntegerOptional` with no modelled `@range`, so
+        // ANY `i32` reaches this handler. The ONE range check below runs before
+        // any arithmetic reads the count, so every difference the code takes is
+        // on a value inside the engine's documented bound; the differences are
+        // taken with saturating arithmetic as well, and every count is compared
+        // as a `usize` rather than through a cast of a request-controlled list
+        // length.
+
+        // `SnapshotRetentionLimit` / `SnapshotWindow` are "only valid if the
+        // Engine parameter is redis", the same rule `CreateCacheCluster`
+        // enforces, read against the engine the cluster will be running AFTER
+        // this call.
+        if engine == "memcached" {
+            for (member, present) in [
+                (
+                    "SnapshotRetentionLimit",
+                    input.snapshot_retention_limit.is_some(),
+                ),
+                ("SnapshotWindow", input.snapshot_window.is_some()),
+            ] {
+                if present {
+                    return Err(
+                        ModifyCacheClusterErrorModeled::InvalidParameterCombinationException(
+                            InvalidParameterCombinationException {
+                                message: Some(format!(
+                                    "{member} is only valid for a cluster running valkey or \
+                                     redis, not for memcached."
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        // `CacheNodeIdsToRemove` and `NewAvailabilityZones` only mean anything
+        // beside a `NumCacheNodes` that removes / adds nodes, so a request that
+        // names one without it is refused rather than answered 200 with the
+        // member ignored.
+        let current_nodes = usize::try_from(cluster.num_cache_nodes).unwrap_or(0);
+        let target_nodes = input.num_cache_nodes.unwrap_or(cluster.num_cache_nodes);
+        // The count the cluster ends up with must be legal for the engine it
+        // ends up running, so a request that changes only ONE of the two is
+        // checked against the other's stored value — an `Engine` change to
+        // valkey or redis on a multi-node Memcached cluster is refused here.
+        if let Err(message) = crate::state::validate_num_cache_nodes(&engine, target_nodes) {
+            return Err(
+                ModifyCacheClusterErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+        let target_count = usize::try_from(target_nodes).unwrap_or(0);
+        let removing = current_nodes.saturating_sub(target_count);
+        let adding = target_count.saturating_sub(current_nodes);
+        if !ids_to_remove.is_empty() && removing == 0 {
+            return Err(
+                ModifyCacheClusterErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(format!(
+                            "CacheNodeIdsToRemove is only valid with a NumCacheNodes below the \
+                             cluster's current {current_nodes} cache node(s)."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if !new_zones.is_empty() {
+            // "This parameter is only valid when NumCacheNodes in the request is
+            // greater than the sum of the number of active cache nodes … The
+            // number of Availability Zones supplied in this list must match the
+            // cache nodes being added in this request."
+            if adding == 0 || new_zones.len() != adding {
+                return Err(
+                    ModifyCacheClusterErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(format!(
+                                "NewAvailabilityZones lists {} zones, which must match the cache \
+                                 nodes being added by NumCacheNodes (the cluster has \
+                                 {current_nodes} today).",
+                                new_zones.len()
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // A deferred change is reported through `PendingModifiedValues`,
+            // which models no Availability Zones, so there is nowhere to record
+            // where the nodes pending creation would go — and "the Availability
+            // Zone placement of nodes pending creation cannot be modified"
+            // afterwards either. The combination is refused rather than
+            // answered 200 with the zones dropped.
+            if !input.apply_immediately.unwrap_or(false) {
+                return Err(
+                    ModifyCacheClusterErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(
+                                "NewAvailabilityZones requires ApplyImmediately: the Availability \
+                                 Zone placement of nodes pending creation cannot be recorded."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        if input.num_cache_nodes.is_some() {
+            // `NumCacheNodes`: "If you are removing cache nodes, you must use
+            // the CacheNodeIdsToRemove parameter to provide the IDs of the
+            // specific cache nodes to remove."
+            if removing > 0 && ids_to_remove.len() != removing {
+                return Err(
+                    ModifyCacheClusterErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(format!(
+                                "CacheNodeIdsToRemove must name the {removing} cache node(s) to \
+                                 remove when NumCacheNodes drops from {current_nodes} to \
+                                 {target_count}."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            for id in &ids_to_remove {
+                if !cluster.nodes.iter().any(|node| &node.cache_node_id == id) {
+                    return Err(
+                        ModifyCacheClusterErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(format!(
+                                    "Invalid value {id} for CacheNodeIdsToRemove: cache cluster \
+                                     {cache_cluster_id} has no such cache node."
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        // Every member `PendingModifiedValues` does NOT model has nowhere to be
+        // reported as pending, so it is applied at once; the ones it does model
+        // are governed by `ApplyImmediately`.
+        cluster.engine = engine;
+        if let Some(window) = input.preferred_maintenance_window {
+            cluster.preferred_maintenance_window = window;
+        }
+        if let Some(limit) = input.snapshot_retention_limit {
+            cluster.snapshot_retention_limit = Some(limit);
+        }
+        if let Some(window) = input.snapshot_window {
+            cluster.snapshot_window = Some(window);
+        }
+        if let Some(upgrade) = input.auto_minor_version_upgrade {
+            cluster.auto_minor_version_upgrade = Some(upgrade);
+        }
+        if let Some(name) = input.cache_parameter_group_name {
+            cluster.cache_parameter_group_name = name;
+        }
+        if let Some(ids) = input.security_group_ids {
+            cluster.security_group_ids = ids;
+        }
+        if let Some(discovery) = input.ip_discovery {
+            cluster.ip_discovery = Some(discovery);
+        }
+        if input.az_mode.is_some() {
+            cluster.az_mode = input.az_mode;
+        }
+        // `NotificationTopicStatus` is how a topic is detached: the member
+        // "notification topic status" is set to `inactive` to stop publishing.
+        if let Some(arn) = input.notification_topic_arn {
+            cluster.notification_topic_arn = Some(arn);
+        }
+        if input.notification_topic_status.as_deref() == Some("inactive") {
+            cluster.notification_topic_arn = None;
+        }
+        // The token itself is never stored; a `DELETE` strategy clears the flag,
+        // anything else sets it and stamps the modification.
+        if input.auth_token.is_some() || input.auth_token_update_strategy.is_some() {
+            let deleting = input.auth_token_update_strategy.as_deref() == Some("DELETE");
+            cluster.auth_token_enabled = !deleting;
+            cluster.auth_token_last_modified = Some(now);
+        }
+        if let Some(requests) = input.log_delivery_configurations {
+            crate::state::apply_log_delivery(&mut cluster.log_delivery_configurations, requests);
+        }
+
+        let deferred = !input.apply_immediately.unwrap_or(false);
+        // `PendingModifiedValues` is the only place the model reports a
+        // `ScaleConfig`, so a requested one is pending whatever
+        // `ApplyImmediately` says.
+        if input.scale_config.is_some() {
+            cluster.pending_modified_values.scale_config = input.scale_config;
+        }
+        if deferred {
+            // "If false, changes are applied during the next maintenance
+            // window" — the cluster keeps running its current values and
+            // reports the requested ones under `PendingModifiedValues`.
+            let pending = &mut cluster.pending_modified_values;
+            if let Some(target) = input.num_cache_nodes {
+                pending.num_cache_nodes = Some(target);
+                pending.cache_node_ids_to_remove = ids_to_remove;
+            }
+            if let Some(node_type) = input.cache_node_type {
+                pending.cache_node_type = Some(node_type);
+            }
+            if let Some(version) = input.engine_version {
+                pending.engine_version = Some(version);
+            }
+        } else {
+            // An applied change clears only what it applied: a value an earlier
+            // deferred modify recorded and this request did not touch stays
+            // pending rather than being dropped by an unrelated call. The
+            // `ScaleConfig` stays either way — it has no applied home.
+            let pending = &mut cluster.pending_modified_values;
+            if input.num_cache_nodes.is_some() {
+                pending.num_cache_nodes = None;
+                pending.cache_node_ids_to_remove.clear();
+            }
+            if input.cache_node_type.is_some() {
+                pending.cache_node_type = None;
+            }
+            if input.engine_version.is_some() {
+                pending.engine_version = None;
+            }
+
+            if let Some(node_type) = input.cache_node_type {
+                cluster.cache_node_type = Some(node_type);
+            }
+            if let Some(version) = input.engine_version {
+                cluster.engine_version = version;
+            }
+            if let Some(target) = input.num_cache_nodes {
+                // A node this modify adds is not provisioned yet, so it is
+                // stored `creating` and reports neither endpoint nor creation
+                // time until the clock settles the cluster below.
+                cluster.resize_nodes(
+                    target,
+                    &ids_to_remove,
+                    now,
+                    crate::state::STATUS_CREATING,
+                    &new_zones,
+                );
+            }
+            // The cluster is `modifying` until the clock owes it `available`
+            // again.
+            cluster.begin_transition(crate::state::STATUS_MODIFYING, now);
+        }
+
+        Ok(ModifyCacheClusterOutput {
+            cache_cluster: Some(cluster.to_modeled(true)),
+        })
     }
 }

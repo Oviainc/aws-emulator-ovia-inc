@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCacheClusters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCacheClusters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeCacheClusters::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -170,18 +166,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCacheClusters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCacheClustersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCacheClusters"))
+        // This is a reporting operation: it reads the stored clusters. The one
+        // write it makes is materialising the status change the clock already
+        // owed each cluster — owed at this instant whether or not anybody
+        // called — through `settle_all`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        let page_size = match crate::state::page_size(input.max_records) {
+            Ok(size) => size,
+            Err(message) => {
+                return Err(
+                    DescribeCacheClustersErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+        // A `Marker` only ever travels back unchanged, so one this service did
+        // not mint is a bad parameter value rather than an empty page.
+        let resume_from = match input.marker.as_deref() {
+            Some(marker) => match crate::state::decode_marker(marker) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(
+                        DescribeCacheClustersErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(format!("Invalid value {marker} for Marker.")),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        // `ShowCacheNodeInfo`: "an optional flag that can be included … to
+        // retrieve information about the individual cache nodes", so the node
+        // list is reported only when it was asked for.
+        let include_nodes = input.show_cache_node_info.unwrap_or(false);
+
+        // With `CacheClusterId` the answer is that one cluster, or the modelled
+        // not-found; pagination does not apply to a single-resource lookup.
+        if let Some(id) = input.cache_cluster_id.as_deref() {
+            let key = id.to_ascii_lowercase();
+            let Some(cluster) = store.cache_clusters.get(&key) else {
+                return Err(DescribeCacheClustersErrorModeled::CacheClusterNotFoundFault(
+                    CacheClusterNotFoundFault {
+                        message: Some(format!("Cache cluster {id} not found.")),
+                    },
+                )
+                .into());
+            };
+            return Ok(DescribeCacheClustersOutput {
+                marker: None,
+                cache_clusters: Some(vec![cluster.to_modeled(include_nodes)]),
+            });
+        }
+
+        // `ShowCacheClustersNotInReplicationGroups` keeps only the clusters that
+        // belong to no replication group. `CreateCacheCluster` refuses a
+        // `ReplicationGroupId` while every replication-group operation is a
+        // scaffolded 501, so no stored cluster belongs to one and the flag
+        // cannot exclude anything — it is honoured against the stored value all
+        // the same, so it keeps working when that slice lands.
+        let only_standalone = input
+            .show_cache_clusters_not_in_replication_groups
+            .unwrap_or(false);
+
+        let mut page: Vec<CacheCluster> = Vec::new();
+        let mut marker = None;
+        for (key, cluster) in store
+            .cache_clusters
+            .iter()
+            .filter(|(key, _)| resume_from.as_ref().is_none_or(|from| *key >= from))
+            .filter(|(_, cluster)| !only_standalone || cluster.replication_group_id.is_none())
+        {
+            if page.len() == page_size {
+                // More records exist than `MaxRecords`, so the response carries
+                // the marker the next call resumes from — the key of the first
+                // record this page did not return.
+                marker = Some(crate::state::encode_marker(key));
+                break;
+            }
+            page.push(cluster.to_modeled(include_nodes));
+        }
+
+        Ok(DescribeCacheClustersOutput {
+            marker,
+            cache_clusters: Some(page),
+        })
     }
 }
