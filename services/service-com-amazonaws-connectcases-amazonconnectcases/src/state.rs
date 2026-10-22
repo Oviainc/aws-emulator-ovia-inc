@@ -311,6 +311,21 @@ impl ComAmazonawsConnectcasesAmazonconnectcasesState {
         capacity(self.domains.len(), MAX_DOMAINS, "Cases domains in this store")
     }
 
+    /// Every domain this store holds, in creation order and each paired with the
+    /// key [`order_key`] builds for it: what a listing of domains reports, in the
+    /// order [`page`] needs it in. The store keeps its domains in a hash map, so
+    /// the order is imposed here, exactly as [`Domain::live_templates`] does for a
+    /// domain's templates.
+    pub fn domains_in_creation_order(&self) -> Vec<(String, &Domain)> {
+        let mut domains: Vec<(String, &Domain)> = self
+            .domains
+            .values()
+            .map(|domain| (order_key(domain.created_time, &domain.domain_id), domain))
+            .collect();
+        domains.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        domains
+    }
+
     /// The case the `client_token` already minted in `domain_id`, if the store
     /// still remembers that token AND the case it names still exists.
     pub fn idempotent_case(&self, domain_id: &str, client_token: &str) -> Option<&Case> {

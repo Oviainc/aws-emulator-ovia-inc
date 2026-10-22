@@ -15,6 +15,8 @@
 mod case_event_configuration;
 #[path = "all/case_lifecycle.rs"]
 mod case_lifecycle;
+#[path = "all/domain_listing.rs"]
+mod domain_listing;
 #[path = "all/field_listing.rs"]
 mod field_listing;
 #[path = "all/field_options.rs"]

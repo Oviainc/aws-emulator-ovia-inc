@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDomains
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDomains`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDomains::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports the domains [`crate::state`] holds, a page at a
+//! time through the crate's shared [`crate::state::page`] facility, and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -56,6 +50,12 @@
 //!
 //! * `maxResults` (MaxResults, range 1..100) — The maximum number of results to return per
 //!   page.
+//!   NOTE: `1..100` above is the `MaxResults` SHAPE's range; the
+//!   `ListDomainsRequest$maxResults` MEMBER narrows it to `@range(min: 1, max: 10)`
+//!   (`smithy_query(query="shape", shape="ListDomainsRequest")`). The member's range is
+//!   the one this operation answers by, and [`ListDomains::handle`] is what enforces it:
+//!   the boundary validator does not refuse a `maxResults` of 11 on this query member,
+//!   so the check below is load-bearing, not redundant.
 //! * `nextToken` (NextToken, len 0..9000) — The token for the next set of results. Use the
 //!   value returned in the previous response in the next request to retrieve the next set of
 //!   results.
@@ -151,18 +151,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDomains` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDomainsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDomains"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDomainsErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // `ListDomainsRequest$maxResults` is `@range(min: 1, max: 10)`, narrower than
+        // the service-wide range [`crate::state::page`] enforces, so a page size
+        // outside THIS operation's range is refused here — never quietly clamped to
+        // one the member admits, and never served.
+        if let Some(requested) = input.max_results {
+            if !(1..=PAGE_SIZE).contains(&requested) {
+                return Err(ListDomainsErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "maxResults must be between 1 and {PAGE_SIZE}, but was {requested}"
+                    ),
+                })
+                .into());
+            }
+        }
+
+        // A read: it reports the domains the store holds and writes nothing. The store
+        // keys them by `domainId` in a hash map, so the order comes from
+        // [`crate::state::order_key`] — creation order, as every listing in this
+        // service orders its answer, which is what makes a page boundary stable
+        // between the call that hands out a token and the call that resumes from it.
+        let store = state.lock();
+        let all: Vec<(String, DomainSummary)> = store
+            .domains_in_creation_order()
+            .into_iter()
+            .map(|(key, domain)| {
+                (
+                    key,
+                    DomainSummary {
+                        domain_id: domain.domain_id.clone(),
+                        domain_arn: domain.domain_arn.clone(),
+                        name: domain.name.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        // The crate's shared paging facility: it cuts the page, stamps the listing's
+        // scope into the token it hands back, and refuses a token issued for another
+        // listing or by nobody. A domain is not scoped to a container and this listing
+        // takes no filters, so the scope is the operation alone.
+        let page = crate::state::page(
+            &crate::state::page_scope("ListDomains", "", &[]),
+            all,
+            // `maxResults` is `@range(1..10)` with no `@default`, so a request that
+            // names none is answered with the largest page this operation serves.
+            Some(input.max_results.unwrap_or(PAGE_SIZE)),
+            input.next_token.as_deref(),
+        )
+        .map_err(|error| {
+            ListDomainsErrorModeled::ValidationException(crate::state::page_validation_exception(
+                &error,
+            ))
+        })?;
+
+        Ok(ListDomainsOutput {
+            domains: page.items,
+            // Absent on the last page: the `@paginated` contract is that a missing
+            // token ends the iteration ("This is null if there are no more results").
+            next_token: page.next_token,
+        })
     }
 }
+
+/// Most domains one page of this listing reports: the model's own ceiling on the
+/// caller's page size, `ListDomainsRequest$maxResults` `@range(min: 1, max: 10)`
+/// (`smithy_query(query="shape", shape="ListDomainsRequest")`) — narrower than the
+/// service-wide [`crate::state::MAX_PAGE_SIZE`], because this operation's member says
+/// so. The member declares no `@default`, so it is also the page size a request that
+/// names no `maxResults` is answered with.
+const PAGE_SIZE: i32 = 10;

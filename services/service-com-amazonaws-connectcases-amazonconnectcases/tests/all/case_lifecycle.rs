@@ -34,6 +34,7 @@ fn authorization(region: &str) -> String {
 }
 
 /// One emulator: a single shared engine behind the production router.
+///
 /// `pub(crate)` so every suite in this test target drives the service the same
 /// way, rather than each one growing its own copy of this harness.
 pub(crate) struct Emulator {
