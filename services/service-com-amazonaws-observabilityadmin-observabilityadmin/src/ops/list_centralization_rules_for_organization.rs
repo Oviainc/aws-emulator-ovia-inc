@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCentralizationRulesForOrganization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCentralizationRulesForOrganization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCentralizationRulesForOrganization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a summary of every organization centralization rule [`crate::state`]
+//! holds, one `@paginated` page at a time, narrowed to the rules whose name starts
+//! with `RuleNamePrefix` and — unless `AllRegions` asks for every region's rules —
+//! to the rules created in the region the request was signed for. A pure read: it
+//! writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +116,70 @@ impl From<ListCentralizationRulesForOrganizationErrorModeled> for ListCentraliza
     }
 }
 
+/// The largest page this operation will ever build, and the page size applied when
+/// the request omits `MaxResults`.
+///
+/// It is the maximum of the modelled `ListCentralizationRulesForOrganizationMaxResults`
+/// range (1..100), which the centralized walk already refuses values outside of — but
+/// this handler does not depend on that: the size is clamped to this constant here, so
+/// the page it allocates is decided by the server, never by the request.
+const MAX_PAGE_SIZE: usize = 100;
+
+/// The separator a page token carries between the region and the rule name it names.
+///
+/// `Region` admits only `[a-z0-9-]` in this emulator (`crate::state::request_region`)
+/// and the modelled `RuleName` pattern `^[0-9A-Za-z-_.#/]+$` admits no `|` either, so
+/// the first `|` splits the two halves unambiguously.
+const PAGE_TOKEN_SEPARATOR: char = '|';
+
+/// A page token naming the rule the NEXT page starts at: its created region and its
+/// name, because a list over every region pages across regions in key order.
+///
+/// `NextToken` is modelled opaque, so the pair is hex-encoded rather than handed back
+/// in the clear — this makes the token opaque to a caller, not secret: hex is
+/// trivially reversible and the token carries nothing beyond a region and a rule name.
+fn encode_page_token(key: &crate::state::RuleKey) -> String {
+    let (region, rule_name) = key;
+    hex::encode(format!("{region}{PAGE_TOKEN_SEPARATOR}{rule_name}"))
+}
+
+/// The store key a page token names, or a 400 refusal when the token is not one this
+/// operation issued — which it can tell because the region and name it carries have to
+/// satisfy the modelled `Region` and `RuleName` constraints.
+fn decode_page_token(
+    token: &str,
+) -> Result<crate::state::RuleKey, ListCentralizationRulesForOrganizationError> {
+    hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|decoded| {
+            let (region, rule_name) = decoded.split_once(PAGE_TOKEN_SEPARATOR)?;
+            let region_ok = !region.is_empty()
+                && region.len() <= 64
+                && region
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+            let name_ok = (1..=100).contains(&rule_name.chars().count())
+                && rule_name.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'#' | b'/')
+                });
+            (region_ok && name_ok).then(|| (region.to_string(), rule_name.to_string()))
+        })
+        .ok_or_else(|| {
+            ListCentralizationRulesForOrganizationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "NextToken is not a pagination token issued by \
+                         ListCentralizationRulesForOrganization"
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .into()
+        })
+}
+
 /// The `ListCentralizationRulesForOrganization` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +216,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCentralizationRulesForOrganization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCentralizationRulesForOrganizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCentralizationRulesForOrganization"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListCentralizationRulesForOrganizationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the centralization rule store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+
+        // The page size is the server's own decision: clamped into 1..=MAX_PAGE_SIZE
+        // whatever the request asked for, so no allocation below is sized by input.
+        let page_size = input.max_results.map_or(MAX_PAGE_SIZE, |requested| {
+            requested.clamp(1, MAX_PAGE_SIZE as i32) as usize
+        });
+        let start = input
+            .next_token
+            .as_deref()
+            .map(decode_page_token)
+            .transpose()?;
+        let prefix = input.rule_name_prefix.unwrap_or_default();
+        // `AllRegions` is "a flag determining whether to return organization
+        // centralization rules from all regions or only the current region", so it is
+        // only when it is set that a page leaves the region the request was signed for.
+        let all_regions = input.all_regions == Some(true);
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_epoch_millis();
+
+        let store = state.lock();
+        // The store is keyed by (CreatedRegion, RuleName), so one region's rules are
+        // one contiguous, name-ordered run: a region-scoped page starts at the name the
+        // token named within that region and stops at the first key of another region,
+        // and an all-region page runs on in region-then-name order.
+        let page_start = start.unwrap_or_else(|| {
+            if all_regions {
+                (String::new(), String::new())
+            } else {
+                (region.clone(), String::new())
+            }
+        });
+        let remaining = store
+            .centralization_rules
+            .range(page_start..)
+            .take_while(|((rule_region, _), _)| all_regions || *rule_region == region)
+            .filter(|(_, record)| record.rule_name.starts_with(&prefix));
+
+        // Reserve no more than the store can actually yield.
+        let mut centralization_rule_summaries =
+            Vec::with_capacity(page_size.min(store.centralization_rules.len()));
+        let mut next_token = None;
+        for (key, record) in remaining {
+            // The first rule that does not fit becomes the next page's start, and only
+            // then is a `NextToken` emitted — the last page carries none.
+            if centralization_rule_summaries.len() == page_size {
+                next_token = Some(encode_page_token(key));
+                break;
+            }
+            centralization_rule_summaries.push(record.summary(now));
+        }
+
+        Ok(ListCentralizationRulesForOrganizationOutput {
+            centralization_rule_summaries: Some(centralization_rule_summaries),
+            next_token,
+        })
     }
 }

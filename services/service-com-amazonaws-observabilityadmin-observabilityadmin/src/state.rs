@@ -15,14 +15,27 @@
 //! every read treats a record whose instant has not arrived as not yet there. That
 //! is also where the `PENDING` -> `ACTIVE` replication status a `GetTelemetryRule`
 //! reports comes from, so no operation ever has to sleep and no read has to write.
+//!
+//! The service's other rule resource is the **organization centralization rule**,
+//! held in [`ComAmazonawsObservabilityadminObservabilityadminState::centralization_rules`]
+//! and keyed by `(CreatedRegion, RuleName)` for the same reason: the rule is created
+//! in the region the request was signed for, and
+//! `ListCentralizationRulesForOrganization`'s `AllRegions` flag is what decides
+//! whether a list spans the other regions' rules or only that one. A centralization
+//! rule is not fanned out — it names its source regions and its destination in its
+//! own body — but it does carry the instant its provisioning comes due, which is
+//! where the `Provisioning` -> `Healthy` `RuleHealth` a read reports comes from.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    RegionStatus, TelemetryRule, TelemetryRuleSummary, ACTION_VALUES, DESTINATION_TYPE_VALUES,
-    FILTER_BEHAVIOR_VALUES, FILTER_REQUIREMENT_VALUES, LOG_TYPE_VALUES,
-    MSK_ENHANCED_MONITORING_LEVEL_VALUES, OUTPUT_FORMAT_VALUES, RESOURCE_TYPE_VALUES,
+    CentralizationRule, CentralizationRuleSummary, RegionStatus, TelemetryRule,
+    TelemetryRuleSummary, ACTION_VALUES, DELETION_PROTECTION_VALUES, DESTINATION_TYPE_VALUES,
+    ENCRYPTED_LOG_GROUP_STRATEGY_VALUES, ENCRYPTION_CONFLICT_RESOLUTION_STRATEGY_VALUES,
+    ENCRYPTION_SCOPE_VALUES, ENCRYPTION_STRATEGY_VALUES, FILTER_BEHAVIOR_VALUES,
+    FILTER_REQUIREMENT_VALUES, LOG_TYPE_VALUES, MSK_ENHANCED_MONITORING_LEVEL_VALUES,
+    OUTPUT_FORMAT_VALUES, RESOURCE_TYPE_VALUES, TAG_CONFLICT_RESOLUTION_STRATEGY_VALUES,
     TELEMETRY_SOURCE_TYPE_VALUES, TELEMETRY_TYPE_VALUES, W_A_F_LOG_TYPE_VALUES,
 };
 
@@ -33,6 +46,11 @@ pub const ARN_SERVICE: &str = "observabilityadmin";
 /// The resource portion a telemetry-rule ARN carries before its name, so an ARN
 /// reads `arn:aws:observabilityadmin:<region>:<account>:telemetry-rule/<RuleName>`.
 pub const RULE_ARN_RESOURCE_PREFIX: &str = "telemetry-rule/";
+
+/// The resource portion an organization centralization rule's ARN carries before its
+/// name, so an ARN reads
+/// `arn:aws:observabilityadmin:<region>:<account>:centralization-rule/<RuleName>`.
+pub const CENTRALIZATION_RULE_ARN_RESOURCE_PREFIX: &str = "centralization-rule/";
 
 /// The region used when a request carries no SigV4 credential scope to read one
 /// from; the emulator's documented default region.
@@ -86,6 +104,36 @@ pub const REGION_STATUS_ACTIVE: &str = "ACTIVE";
 
 /// Replication status of a spoke region the fan-out could not create the rule in.
 pub const REGION_STATUS_FAILED: &str = "FAILED";
+
+/// The most organization centralization rules this emulator will hold.
+///
+/// Emulator resource guard, NOT an AWS quota: this service publishes no centralization
+/// rule quota. A create past it is refused with the modelled
+/// `ServiceQuotaExceededException` before a record is allocated. A centralization rule
+/// is stored exactly once (it is never fanned out), so this one cap bounds the store.
+pub const MAX_CENTRALIZATION_RULES: usize = 500;
+
+/// How long after a create or an update an organization centralization rule's
+/// provisioning comes due.
+///
+/// A CHOSEN span, not an AWS-documented duration: `ContextGraphStatus`' own
+/// documentation says a status "Returns `Provisioning` while the context graph is
+/// being set up, `Healthy` once it is active", and this is the span this emulator
+/// takes to get there. It is deliberately non-zero, so a caller that reads straight
+/// after the create still observes `Provisioning`.
+pub const CENTRALIZATION_PROVISIONING_DELAY_MS: i64 = 400;
+
+/// The health of a centralization rule whose provisioning has not come due, from
+/// `RuleHealth`'s own value set (`Healthy`, `Unhealthy`, `Provisioning`).
+pub const RULE_HEALTH_PROVISIONING: &str = "Provisioning";
+
+/// The health of a centralization rule this emulator has finished provisioning.
+pub const RULE_HEALTH_HEALTHY: &str = "Healthy";
+
+/// The tag-propagation health of a rule whose destination configures tag propagation:
+/// `TagPropagationStatus$Healthy`, which that member documents as "the most recent
+/// tag-propagation attempt succeeded".
+pub const TAG_PROPAGATION_STATUS_HEALTHY: &str = "Healthy";
 
 /// A stored rule's key: the region it lives in, then its name. `RuleName` is unique
 /// per region, and ordering by region then name is what gives `ListTelemetryRules` a
@@ -152,6 +200,116 @@ impl StoredTelemetryRule {
     }
 }
 
+/// One stored organization centralization rule.
+///
+/// The rule body is held behind an `Arc` for the same reason the telemetry rule's is:
+/// it is caller-sized, and an update must not cost a second copy of it while a reader
+/// still holds the old one.
+#[derive(Debug, Clone, Default)]
+pub struct StoredCentralizationRule {
+    pub rule_name: String,
+    /// `CreatedRegion`: "the Amazon Web Services region where the organization
+    /// centralization rule was created", which is the region the create was signed
+    /// for and the region field of this rule's ARN.
+    pub created_region: String,
+    /// `arn:aws:observabilityadmin:<region>:<account>:centralization-rule/<RuleName>`.
+    pub rule_arn: String,
+    /// The rule body exactly as the caller supplied it.
+    pub rule: ::std::sync::Arc<CentralizationRule>,
+    /// `CreatorAccountId`: "the Amazon Web Services Account that created the
+    /// organization centralization rule".
+    pub creator_account_id: String,
+    /// `CreatedTimeStamp`, in epoch milliseconds.
+    pub created_timestamp_ms: i64,
+    /// `LastUpdateTimeStamp`, in epoch milliseconds.
+    pub last_update_timestamp_ms: i64,
+    /// The epoch-millisecond instant at which provisioning the CURRENT rule body
+    /// comes due. Until it arrives every read reports `Provisioning`; after it, the
+    /// rule is `Healthy`. A create and an update each set it, so no operation sleeps
+    /// and no read has to write.
+    pub provisioned_at_ms: i64,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl StoredCentralizationRule {
+    /// This record's store key.
+    pub fn key(&self) -> RuleKey {
+        (self.created_region.clone(), self.rule_name.clone())
+    }
+
+    /// `RuleHealth` at `now_ms`: `Provisioning` until this rule's provisioning comes
+    /// due, `Healthy` from then on.
+    pub fn rule_health(&self, now_ms: i64) -> String {
+        if now_ms < self.provisioned_at_ms {
+            RULE_HEALTH_PROVISIONING.to_string()
+        } else {
+            RULE_HEALTH_HEALTHY.to_string()
+        }
+    }
+
+    /// `ContextGraphStatus` at `now_ms`, or `None` when the member does not apply:
+    /// it is "the status of context graph centralization for this rule", so it is
+    /// reported only for a rule whose source asks for context graph centralization.
+    /// It follows the same `Provisioning` -> `Healthy` span as [`Self::rule_health`],
+    /// which is what that member documents: `Provisioning` "while the context graph
+    /// is being set up", `Healthy` "once it is active".
+    pub fn context_graph_status(&self, now_ms: i64) -> Option<String> {
+        self.rule
+            .source
+            .source_context_graph_configuration
+            .as_ref()
+            .map(|_| self.rule_health(now_ms))
+    }
+
+    /// `TagPropagationStatus`, or `None` when the member does not apply: it is "the
+    /// health status of tag propagation for this rule", so it is reported only for a
+    /// rule whose destination configures tag propagation. Nothing in this emulator
+    /// can fail such an attempt, so the status is the `Healthy` that member defines
+    /// as "the most recent tag-propagation attempt succeeded".
+    pub fn tag_propagation_status(&self) -> Option<String> {
+        self.rule
+            .destination
+            .destination_logs_configuration
+            .as_ref()
+            .and_then(|logs| logs.tag_propagation_configuration.as_ref())
+            .map(|_| TAG_PROPAGATION_STATUS_HEALTHY.to_string())
+    }
+
+    /// The destination account this rule centralizes into: the account its
+    /// destination names, or — when it names none — the account that created it,
+    /// since the data then stays in the creator's own account.
+    pub fn destination_account_id(&self) -> String {
+        self.rule
+            .destination
+            .account
+            .clone()
+            .unwrap_or_else(|| self.creator_account_id.clone())
+    }
+
+    /// This record as a `CentralizationRuleSummary`, the shape
+    /// `ListCentralizationRulesForOrganization` reports one rule as.
+    ///
+    /// `FailureReason` and `TagPropagationFailureReason` are left unset: each is the
+    /// reason an attempt failed, and nothing in this emulator fails one.
+    pub fn summary(&self, now_ms: i64) -> CentralizationRuleSummary {
+        CentralizationRuleSummary {
+            rule_name: Some(self.rule_name.clone()),
+            rule_arn: Some(self.rule_arn.clone()),
+            creator_account_id: Some(self.creator_account_id.clone()),
+            created_time_stamp: Some(self.created_timestamp_ms),
+            created_region: Some(self.created_region.clone()),
+            last_update_time_stamp: Some(self.last_update_timestamp_ms),
+            rule_health: Some(self.rule_health(now_ms)),
+            failure_reason: None,
+            tag_propagation_status: self.tag_propagation_status(),
+            tag_propagation_failure_reason: None,
+            context_graph_status: self.context_graph_status(now_ms),
+            destination_account_id: Some(self.destination_account_id()),
+            destination_region: Some(self.rule.destination.region.clone()),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-observabilityadmin-observabilityadmin. A
 /// handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -161,6 +319,14 @@ pub struct ComAmazonawsObservabilityadminObservabilityadminState {
     /// Rule ARN -> store key, so a `RuleIdentifier` resolves as an ARN as well as
     /// as a bare name.
     pub arn_index: BTreeMap<String, RuleKey>,
+    /// Every organization centralization rule, keyed by `(CreatedRegion, RuleName)`.
+    /// Ordering by region then name is what gives
+    /// `ListCentralizationRulesForOrganization` a stable, name-ordered page sequence
+    /// within one region and a stable region-then-name one across all of them.
+    pub centralization_rules: BTreeMap<RuleKey, StoredCentralizationRule>,
+    /// Centralization rule ARN -> store key, so a `RuleIdentifier` resolves as an
+    /// ARN as well as as a bare name.
+    pub centralization_arn_index: BTreeMap<String, RuleKey>,
 }
 
 impl ComAmazonawsObservabilityadminObservabilityadminState {
@@ -426,6 +592,87 @@ impl ComAmazonawsObservabilityadminObservabilityadminState {
             self.remove(replica);
         }
         self.remove(key)
+    }
+
+    /// The key of the centralization rule `identifier` names for a caller signed for
+    /// `region`, accepting both forms `RuleIdentifier` allows: the bare rule name, or
+    /// the full rule ARN.
+    ///
+    /// An ARN must match a stored ARN in EVERY field and name a rule created in the
+    /// caller's own region, so an ARN for another partition, region or account
+    /// resolves to nothing rather than to the rule that shares its name.
+    pub fn resolve_centralization_key(&self, region: &str, identifier: &str) -> Option<RuleKey> {
+        if identifier.starts_with("arn:") {
+            return self
+                .centralization_arn_index
+                .get(identifier)
+                .filter(|(rule_region, _)| rule_region == region)
+                .cloned();
+        }
+        let key = (region.to_string(), identifier.to_string());
+        self.centralization_rules.contains_key(&key).then_some(key)
+    }
+
+    /// The centralization rule `identifier` names in `region`.
+    pub fn centralization_rule(
+        &self,
+        region: &str,
+        identifier: &str,
+    ) -> Option<&StoredCentralizationRule> {
+        let key = self.resolve_centralization_key(region, identifier)?;
+        self.centralization_rules.get(&key)
+    }
+
+    /// Whether a centralization rule named `name` already exists in `region`.
+    pub fn centralization_name_taken(&self, region: &str, name: &str) -> bool {
+        self.centralization_rules
+            .contains_key(&(region.to_string(), name.to_string()))
+    }
+
+    /// How many centralization rules the store holds, which is what
+    /// [`MAX_CENTRALIZATION_RULES`] bounds.
+    pub fn centralization_rule_count(&self) -> usize {
+        self.centralization_rules.len()
+    }
+
+    /// Store a newly created centralization rule and index it by ARN.
+    ///
+    /// The key is `(CreatedRegion, RuleName)`, so a caller must have established that
+    /// the name is free in that region first ([`Self::centralization_name_taken`]) —
+    /// every write path here does — because inserting over an occupied key would
+    /// replace that record.
+    pub fn insert_centralization_rule(&mut self, record: StoredCentralizationRule) {
+        self.centralization_arn_index
+            .insert(record.rule_arn.clone(), record.key());
+        self.centralization_rules.insert(record.key(), record);
+    }
+
+    /// Replace the body of the centralization rule at `key`, bumping
+    /// `LastUpdateTimeStamp` and restarting its provisioning, and leaving
+    /// `CreatedTimeStamp`, `CreatorAccountId`, `CreatedRegion` and the tags where they
+    /// were. Answers the rule's ARN, or `None` when nothing is stored at `key`.
+    pub fn replace_centralization_rule(
+        &mut self,
+        key: &RuleKey,
+        rule: CentralizationRule,
+        now_ms: i64,
+    ) -> Option<String> {
+        let record = self.centralization_rules.get_mut(key)?;
+        record.rule = ::std::sync::Arc::new(rule);
+        record.last_update_timestamp_ms = now_ms;
+        record.provisioned_at_ms = now_ms.saturating_add(CENTRALIZATION_PROVISIONING_DELAY_MS);
+        Some(record.rule_arn.clone())
+    }
+
+    /// Remove the centralization rule at `key`, with its ARN index entry. Answers the
+    /// removed rule, or `None` when nothing was stored there.
+    pub fn remove_centralization_rule(
+        &mut self,
+        key: &RuleKey,
+    ) -> Option<StoredCentralizationRule> {
+        let record = self.centralization_rules.remove(key)?;
+        self.centralization_arn_index.remove(&record.rule_arn);
+        Some(record)
     }
 }
 
@@ -712,6 +959,172 @@ pub fn rule_arn(region: &str, name: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("{RULE_ARN_RESOURCE_PREFIX}{name}"),
+    )
+}
+
+/// The ARN of the organization centralization rule `name` created in `region`.
+pub fn centralization_rule_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{CENTRALIZATION_RULE_ARN_RESOURCE_PREFIX}{name}"),
+    )
+}
+
+/// Why `rule` is not an organization centralization rule this service will store, or
+/// `None` when it is fine.
+///
+/// The rules the model states but cannot express as a constraint, so the centralized
+/// walk lets them through and this is where they live. Every operation that stores a
+/// `CentralizationRule` applies this one function, each rendering the refusal as its
+/// own modelled `ValidationException`:
+///
+/// 1. every member targeting a modelled enum carries one of that enum's values — the
+///    generated `*_VALUES` catalogs are exactly what
+///    `smithy_query(query="shape",shape="<Enum>")` reports;
+/// 2. every member targeting `Region` names an Amazon Web Services Region of the
+///    caller's own partition — the source regions the rule centralizes FROM, the
+///    destination it centralizes INTO and each backup region — because a region is
+///    the field a later read reports as `DestinationRegion` and the field an ARN
+///    carries, and this emulator mints ARNs in the `aws` partition only.
+pub fn centralization_rule_rejection(rule: &CentralizationRule, home_region: &str) -> Option<String> {
+    let partition = partition_regions(home_region);
+    rule.source
+        .regions
+        .iter()
+        .enumerate()
+        .find_map(|(index, region)| {
+            region_rejection(
+                &format!("Rule.Source.Regions[{index}]"),
+                Some(region.as_str()),
+                &partition,
+                home_region,
+            )
+        })
+        .or_else(|| {
+            region_rejection(
+                "Rule.Destination.Region",
+                Some(rule.destination.region.as_str()),
+                &partition,
+                home_region,
+            )
+        })
+        .or_else(|| source_logs_rejection(rule))
+        .or_else(|| destination_logs_rejection(rule, &partition, home_region))
+        .or_else(|| destination_metrics_rejection(rule, &partition, home_region))
+}
+
+/// Why a member that targets `Region` is unacceptable: it has to name a region of the
+/// caller's own partition. A member the request omits is one the model admits, so it
+/// is not refused here.
+fn region_rejection(
+    member: &str,
+    value: Option<&str>,
+    partition: &BTreeSet<String>,
+    home_region: &str,
+) -> Option<String> {
+    let supplied = value?;
+    if partition.contains(supplied) {
+        return None;
+    }
+    Some(format!(
+        "{member} must be an Amazon Web Services Region of the {} partition, got '{supplied}'",
+        partition_of(home_region)
+    ))
+}
+
+/// The enum members carried under `Rule.Source`.
+fn source_logs_rejection(rule: &CentralizationRule) -> Option<String> {
+    let logs = rule.source.source_logs_configuration.as_ref()?;
+    enum_rejection(
+        "Rule.Source.SourceLogsConfiguration.EncryptedLogGroupStrategy",
+        Some(logs.encrypted_log_group_strategy.as_str()),
+        ENCRYPTED_LOG_GROUP_STRATEGY_VALUES,
+    )
+}
+
+/// The enum and `Region` members carried under
+/// `Rule.Destination.DestinationLogsConfiguration`.
+fn destination_logs_rejection(
+    rule: &CentralizationRule,
+    partition: &BTreeSet<String>,
+    home_region: &str,
+) -> Option<String> {
+    let logs = rule
+        .destination
+        .destination_logs_configuration
+        .as_ref()?;
+    enum_rejection(
+        "Rule.Destination.DestinationLogsConfiguration.LogGroupDeletionProtection",
+        logs.log_group_deletion_protection.as_deref(),
+        DELETION_PROTECTION_VALUES,
+    )
+    .or_else(|| {
+        let encryption = logs.logs_encryption_configuration.as_ref()?;
+        enum_rejection(
+            "Rule.Destination.DestinationLogsConfiguration.LogsEncryptionConfiguration.\
+             EncryptionStrategy",
+            Some(encryption.encryption_strategy.as_str()),
+            ENCRYPTION_STRATEGY_VALUES,
+        )
+        .or_else(|| {
+            enum_rejection(
+                "Rule.Destination.DestinationLogsConfiguration.LogsEncryptionConfiguration.\
+                 EncryptionConflictResolutionStrategy",
+                encryption.encryption_conflict_resolution_strategy.as_deref(),
+                ENCRYPTION_CONFLICT_RESOLUTION_STRATEGY_VALUES,
+            )
+        })
+        .or_else(|| {
+            enum_rejection(
+                "Rule.Destination.DestinationLogsConfiguration.LogsEncryptionConfiguration.\
+                 EncryptionScope",
+                encryption.encryption_scope.as_deref(),
+                ENCRYPTION_SCOPE_VALUES,
+            )
+        })
+    })
+    .or_else(|| {
+        enum_rejection(
+            "Rule.Destination.DestinationLogsConfiguration.TagPropagationConfiguration.\
+             TagConflictResolutionStrategy",
+            logs.tag_propagation_configuration
+                .as_ref()
+                .and_then(|tags| tags.tag_conflict_resolution_strategy.as_deref()),
+            TAG_CONFLICT_RESOLUTION_STRATEGY_VALUES,
+        )
+    })
+    .or_else(|| {
+        region_rejection(
+            "Rule.Destination.DestinationLogsConfiguration.BackupConfiguration.Region",
+            logs.backup_configuration
+                .as_ref()
+                .map(|backup| backup.region.as_str()),
+            partition,
+            home_region,
+        )
+    })
+}
+
+/// The `Region` member carried under
+/// `Rule.Destination.DestinationMetricsConfiguration`.
+fn destination_metrics_rejection(
+    rule: &CentralizationRule,
+    partition: &BTreeSet<String>,
+    home_region: &str,
+) -> Option<String> {
+    let metrics = rule
+        .destination
+        .destination_metrics_configuration
+        .as_ref()?;
+    region_rejection(
+        "Rule.Destination.DestinationMetricsConfiguration.BackupConfiguration.Region",
+        metrics
+            .backup_configuration
+            .as_ref()
+            .map(|backup| backup.region.as_str()),
+        partition,
+        home_region,
     )
 }
 

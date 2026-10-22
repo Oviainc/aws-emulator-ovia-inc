@@ -32,7 +32,7 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region most requests below sign for; the ARNs they mint carry exactly this one.
 const HOME_REGION: &str = "us-west-2";
 /// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`) every ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// Long enough after a create or update for the fan-out into a spoke region to have
 /// come due, whatever scheduling delay the test run adds on top.
@@ -42,12 +42,15 @@ fn past_replication_delay() -> Duration {
 
 /// One emulator with an empty store, mounted exactly as the router mounts it, plus
 /// the shared engine so a test can read the store a handler wrote.
-struct Emulator {
-    router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+///
+/// `pub(crate)` because the other suites in this test binary drive the same wire path
+/// through it (`use super::telemetry_rules::{call, emulator, error_code, Emulator}`).
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
-fn emulator() -> Emulator {
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -61,7 +64,7 @@ fn emulator() -> Emulator {
 
 /// A request signed for `observabilityadmin` in `region`, which is both the signal
 /// the router routes on and where the handlers read the rule's region from.
-fn request(region: &str, uri: &str, body: &Value) -> http::Request<bytes::Bytes> {
+pub(crate) fn request(region: &str, uri: &str, body: &Value) -> http::Request<bytes::Bytes> {
     http::Request::builder()
         .method("POST")
         .uri(uri)
@@ -81,7 +84,12 @@ fn request(region: &str, uri: &str, body: &Value) -> http::Request<bytes::Bytes>
 }
 
 /// Status and parsed body of one call. An empty body reads as `Value::Null`.
-async fn call(emulator: &Emulator, region: &str, uri: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    emulator: &Emulator,
+    region: &str,
+    uri: &str,
+    body: &Value,
+) -> (u16, Value) {
     let response = emulator.router.dispatch(request(region, uri, body)).await;
     let status = response.status().as_u16();
     let error_type = response
@@ -106,7 +114,7 @@ async fn call(emulator: &Emulator, region: &str, uri: &str, body: &Value) -> (u1
 }
 
 /// The modelled error shape a failed call reported.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
