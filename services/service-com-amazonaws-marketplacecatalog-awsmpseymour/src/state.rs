@@ -164,6 +164,31 @@ pub const PRODUCT_ENTITY_TYPES: &[&str] = &[
     "SaaSProduct",
 ];
 
+/// The entity types this catalog has at all — what an `EntityType` member is
+/// checked against, beyond the characters `EntityType`'s `@pattern` admits.
+///
+/// `EntityType` is `^[a-zA-Z]+$`, which admits any letters-only word; the
+/// catalog itself serves a FIXED set of types, and the model names it twice over
+/// — once as `EntitySummary`'s per-type summary members
+/// (`AmiProductSummary`, `ContainerProductSummary`, `DataProductSummary`,
+/// `SaaSProductSummary`, `MachineLearningProductSummary`, `OfferSummary`,
+/// `ResaleAuthorizationSummary`, `OfferSetSummary`,
+/// `ExpressPrivateOfferConfigurationSummary`) and once as the `EntityTypeFilters`
+/// / `EntityTypeSort` union members (`AmiProductFilters`, …), each the type's
+/// name with the suffix dropped. A letters-only value naming none of them names
+/// no entity type, so it is refused rather than listed as empty.
+pub const ENTITY_TYPES: &[&str] = &[
+    "AmiProduct",
+    "ContainerProduct",
+    "DataProduct",
+    "ExpressPrivateOfferConfiguration",
+    "MachineLearningProduct",
+    "Offer",
+    "OfferSet",
+    "ResaleAuthorization",
+    "SaaSProduct",
+];
+
 /// The resource type segment a CHANGE SET's ARN carries, as
 /// [`change_set_arn`] writes it. An entity's ARN carries its `EntityType`
 /// there instead, which is how one resource ARN form names both.
@@ -751,8 +776,7 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
     /// The entity `identifier` names, where an identifier is an entity id with
     /// an optional `@<revision>` suffix (`Identifier`'s `^[\w\-@]+$`).
     pub fn resolve_identifier(&self, identifier: &str) -> Option<&EntityRecord> {
-        let id = identifier.split('@').next().unwrap_or(identifier);
-        self.entities.get(id)
+        self.entities.get(entity_id_of(identifier))
     }
 
     /// Whether this store holds the resource a resource ARN named.
@@ -860,11 +884,16 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
                 continue;
             };
             let details = change.details_value();
+            // `Change$Entity$Type` is a REFERENCE to an entity type, optionally
+            // at a schema version (`DataProduct@1.0`); the entity itself is of
+            // the type that reference names, so the record and its ARN carry
+            // the type, never the version the request addressed it through.
+            let entity_type = entity_type_of(&change.entity_type).to_string();
             let entry = self.entities.entry(entity_id.clone()).or_insert_with(|| {
                 EntityRecord {
-                    arn: entity_arn(&region, &change.entity_type, &entity_id),
+                    arn: entity_arn(&region, &entity_type, &entity_id),
                     id: entity_id.clone(),
-                    entity_type: change.entity_type.clone(),
+                    entity_type,
                     revision: 0,
                     name: None,
                     visibility: DEFAULT_ENTITY_VISIBILITY.to_string(),
@@ -1057,19 +1086,29 @@ pub fn assessment_id_of<'a>(identifier: &'a str, catalog: &str) -> Option<&'a st
     is_assessment_id(id).then_some(id)
 }
 
+/// The syntax the service publishes for `AssessmentIdentifier`, which it reports
+/// in the fault for one outside it: the shape's own modelled `@pattern`
+/// (`smithy_query(query="shape", shape="AssessmentIdentifier")`), which already
+/// states both forms the member's doc documents ("You can provide either the
+/// assessment ID … or the full assessment ARN").
+///
+/// [`assessment_id_of`] is STRICTER than this string on the ARN alternative: the
+/// pattern constrains only the SHAPE of an ARN, so one naming another service's
+/// namespace or another catalog satisfies it while naming no assessment of this
+/// catalog, and such an identifier is refused too.
+pub const ASSESSMENT_IDENTIFIER_PATTERN: &str = concat!(
+    r"^(assessment-[a-zA-Z0-9]+|arn:[a-zA-Z0-9-]+:[a-zA-Z0-9-]+:[a-zA-Z0-9-]*:",
+    r"[0-9]*:[a-zA-Z0-9-]+/Assessment/assessment-[a-zA-Z0-9]+)$"
+);
+
 /// The modelled `ValidationException` payload for an `AssessmentIdentifier` that
 /// is neither of the forms [`assessment_id_of`] resolves — built from the
-/// request, naming the identifier it rejected and the forms it accepts.
+/// request, naming the identifier it rejected and the syntax it accepts.
 pub fn invalid_assessment_identifier(identifier: &str) -> ValidationException {
-    validation(
-        "AssessmentIdentifier",
-        format!(
-            "Requested assessment identifier '{identifier}' is invalid. It should match with \
-             (^{ASSESSMENT_ID_PREFIX}[a-zA-Z0-9]+$)|(^arn:[a-zA-Z0-9-]+:{ARN_NAMESPACE}:\
-             [a-zA-Z0-9-]*:[0-9]*:{AWS_MARKETPLACE_CATALOG}/{ASSESSMENT_ARN_RESOURCE_TYPE}/\
-             {ASSESSMENT_ID_PREFIX}[a-zA-Z0-9]+$)."
-        ),
-    )
+    validation_message(format!(
+        "Requested assessment identifier '{identifier}' is invalid. \
+         It should match with {ASSESSMENT_IDENTIFIER_PATTERN}."
+    ))
 }
 
 /// The modelled `ResourceNotFoundException` payload for an assessment id that
@@ -1130,6 +1169,18 @@ pub fn arn_resource(arn: &str) -> &str {
         (Some("arn"), Some(_), Some(_), Some(_), Some(_), Some(resource)) => resource,
         _ => arn,
     }
+}
+
+/// The resource ID `arn` names: the last `/`-separated segment of its resource
+/// portion, or the whole portion when it carries none.
+///
+/// A resource ARN of this catalog carries `<catalog>/<type>/<id>` there
+/// ([`entity_arn`], [`change_set_arn`]), of which the ID is what names the
+/// resource — the catalog and the type say WHERE it lives — so it is the ID that
+/// an authorization refusal reports as the resource it refused.
+pub fn arn_resource_id(arn: &str) -> &str {
+    let resource = arn_resource(arn);
+    resource.rsplit('/').next().unwrap_or(resource)
 }
 
 /// The resource of THIS service `arn` names, or `None` when `arn` names none.
@@ -1353,6 +1404,23 @@ pub fn cannot_parse(field: &str, message: impl Into<String>) -> ValidationExcept
     validation(field, message)
 }
 
+/// The modelled `ValidationException` payload for a change set that contradicts
+/// itself: two of its changes carry the same change type against the same
+/// entity.
+///
+/// `StartChangeSet` documents the rule ("Within a single `ChangeSet`, you can't
+/// start the same change type against the same entity multiple times"), and it
+/// is a rule about the REQUEST — so it is judged on the entity the request names,
+/// before that entity is resolved, and the fault is built from the request: the
+/// change type that was repeated and the entity it was repeated on.
+pub fn duplicate_change_pair(change_type: &str, entity_id: &str) -> ValidationException {
+    validation_message(format!(
+        "Requested changes contain multiple changes for the same change type \
+         '{change_type}' on entity '{entity_id}'. Entity - change type pairs \
+         should be unique."
+    ))
+}
+
 /// The modelled `ValidationException` payload for a `Catalog` other than the
 /// fixed value every operation documents.
 pub fn wrong_catalog(catalog: &str) -> ValidationException {
@@ -1360,6 +1428,260 @@ pub fn wrong_catalog(catalog: &str) -> ValidationException {
         "Catalog",
         format!("Catalog must be {AWS_MARKETPLACE_CATALOG}, not {catalog:?}"),
     )
+}
+
+/// The syntax the service documents for a catalog NAME, which it reports in the
+/// fault for a `Catalog` outside it.
+///
+/// It is WIDER than the modelled `Catalog` `@pattern` (`^[a-zA-Z]+$`) — digits,
+/// dots and hyphens are admitted — and narrower in its length (47, not 64), so
+/// the model's pattern cannot be what a caller is told to satisfy. This is the
+/// pattern the service's own recorded refusals quote, and
+/// [`is_catalog_name`] is this string spelled out as a predicate.
+pub const CATALOG_PATTERN: &str =
+    r"^(?![.-])(?!.*[.-]{2})(?![0-9]+\.[0-9.]+$)[a-zA-Z0-9.-]{1,47}(?<![.-])$";
+
+/// How long a catalog name may be: the `{1,47}` of [`CATALOG_PATTERN`].
+const CATALOG_NAME_MAX: usize = 47;
+
+/// Whether `value` is a catalog NAME — [`CATALOG_PATTERN`] as a predicate: one
+/// to [`CATALOG_NAME_MAX`] characters of `[a-zA-Z0-9.-]`, neither starting nor
+/// ending with `.` or `-`, with no two of those adjacent, and not a bare version
+/// number (`[0-9]+\.[0-9.]+`).
+pub fn is_catalog_name(value: &str) -> bool {
+    if value.is_empty() || value.chars().count() > CATALOG_NAME_MAX {
+        return false;
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+    {
+        return false;
+    }
+    let separator = |c: char| matches!(c, '.' | '-');
+    if value.starts_with(separator) || value.ends_with(separator) {
+        return false;
+    }
+    if value
+        .as_bytes()
+        .windows(2)
+        .any(|pair| pair.iter().all(|byte| separator(char::from(*byte))))
+    {
+        return false;
+    }
+    !is_version_number(value)
+}
+
+/// Whether `value` is the `[0-9]+\.[0-9.]+` form [`CATALOG_PATTERN`] excludes:
+/// digits, a dot, then digits and dots only.
+fn is_version_number(value: &str) -> bool {
+    let Some((head, tail)) = value.split_once('.') else {
+        return false;
+    };
+    !head.is_empty()
+        && head.bytes().all(|byte| byte.is_ascii_digit())
+        && !tail.is_empty()
+        && tail.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// The modelled `ValidationException` payload for a `Catalog` outside
+/// [`CATALOG_PATTERN`] — built from the request, naming the value it rejected and
+/// the syntax a catalog name has to satisfy.
+pub fn invalid_catalog(catalog: &str) -> ValidationException {
+    validation_message(format!(
+        "Requested catalog '{catalog}' is invalid. It should match with {CATALOG_PATTERN}."
+    ))
+}
+
+/// The `Catalog` check every operation of this service runs before it does
+/// anything else: a value that is not a catalog NAME at all is refused for its
+/// syntax, and a well-formed name other than the one catalog this service serves
+/// is refused as naming nothing it has.
+///
+/// The two are different faults: the first says the request is malformed, the
+/// second that the catalog it named is not this one.
+pub fn check_catalog(catalog: &str) -> Result<(), ValidationException> {
+    if !is_catalog_name(catalog) {
+        return Err(invalid_catalog(catalog));
+    }
+    if catalog != AWS_MARKETPLACE_CATALOG {
+        return Err(wrong_catalog(catalog));
+    }
+    Ok(())
+}
+
+/// Whether `value` names one of [`ENTITY_TYPES`].
+pub fn is_entity_type(value: &str) -> bool {
+    ENTITY_TYPES.contains(&value)
+}
+
+/// The modelled `ValidationException` payload for an `EntityType` this catalog
+/// has no such type for.
+///
+/// The fault names the value and NOT a pattern: the value may well satisfy
+/// `EntityType`'s `@pattern` and still name no type, so there is no syntax to
+/// tell the caller to satisfy — the set in [`ENTITY_TYPES`] is what it failed.
+pub fn invalid_entity_type(entity_type: &str) -> ValidationException {
+    validation_message(format!("Requested entity type '{entity_type}' is invalid."))
+}
+
+/// The entity type a `Change$Entity$Type` names: everything before the optional
+/// `@<version>` suffix.
+///
+/// `Entity$Type` addresses an entity type at a SCHEMA VERSION
+/// (`DataProduct@1.0`) — the form every real caller sends and the form the
+/// service accepts — while the entity itself is of the type the reference names.
+pub fn entity_type_of(reference: &str) -> &str {
+    reference.split('@').next().unwrap_or(reference)
+}
+
+/// Whether `reference` is an `Entity$Type`: one of [`ENTITY_TYPES`], on its own
+/// or at a version (`<EntityType>@<version>`).
+pub fn is_entity_type_reference(reference: &str) -> bool {
+    match reference.split_once('@') {
+        Some((entity_type, version)) => {
+            is_entity_type(entity_type) && is_entity_type_version(version)
+        }
+        None => is_entity_type(reference),
+    }
+}
+
+/// Whether `version` is the `@<version>` part of an `Entity$Type`: a non-empty
+/// run of alphanumerics separated by dots, which is the form the model's own
+/// versioned ids take (`VersionedFrameworkId`'s doc: "frameworkId@version (for
+/// example, AMISecurity@1.0)").
+fn is_entity_type_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+        && !version.starts_with('.')
+        && !version.ends_with('.')
+        && !version.contains("..")
+}
+
+/// The syntax the service documents for `Entity$Identifier`, which it reports in
+/// the fault for one outside it.
+///
+/// Two alternatives: an entity id optionally at a revision, and the
+/// `$<ChangeName>.Entity.Identifier` reference by which one change of a change
+/// set names the entity another change of the SAME change set creates. Both are
+/// wider than the modelled `Identifier` `@pattern` (`^[\w\-@]+$`) in the
+/// characters they admit (`.` and `/`) and narrower in their shape, so the
+/// model's pattern is not what a caller is told to satisfy.
+pub const ENTITY_IDENTIFIER_PATTERN: &str =
+    r"(^[a-zA-Z0-9][.a-zA-Z0-9/-]+[a-zA-Z0-9](@\d+)?$)|(^\$[a-zA-Z]{1,72}\.Entity\.Identifier$)";
+
+/// The suffix of the change-reference alternative of [`ENTITY_IDENTIFIER_PATTERN`].
+const CHANGE_REFERENCE_SUFFIX: &str = ".Entity.Identifier";
+
+/// The longest change name the change-reference alternative of
+/// [`ENTITY_IDENTIFIER_PATTERN`] admits (its `{1,72}`).
+const CHANGE_REFERENCE_NAME_MAX: usize = 72;
+
+/// Whether `value` is an `Entity$Identifier`: [`ENTITY_IDENTIFIER_PATTERN`]
+/// spelled out as a predicate.
+pub fn is_entity_identifier(value: &str) -> bool {
+    if let Some(change_name) = value
+        .strip_prefix('$')
+        .and_then(|rest| rest.strip_suffix(CHANGE_REFERENCE_SUFFIX))
+    {
+        return (1..=CHANGE_REFERENCE_NAME_MAX).contains(&change_name.chars().count())
+            && change_name.chars().all(|c| c.is_ascii_alphabetic());
+    }
+    match value.split_once('@') {
+        Some((id, revision)) => {
+            !revision.is_empty()
+                && revision.bytes().all(|byte| byte.is_ascii_digit())
+                && is_entity_id(id)
+        }
+        None => is_entity_id(value),
+    }
+}
+
+/// The entity id an `Entity$Identifier` names: the id without the `@<revision>`
+/// an identifier may address it at.
+pub fn entity_id_of(identifier: &str) -> &str {
+    identifier.split('@').next().unwrap_or(identifier)
+}
+
+/// The modelled `ValidationException` payload for an `Entity$Identifier` outside
+/// [`ENTITY_IDENTIFIER_PATTERN`] — built from the request, naming the value and
+/// the syntax it had to satisfy.
+pub fn invalid_entity_identifier(identifier: &str) -> ValidationException {
+    validation_message(format!(
+        "Requested entity identifier '{identifier}' is invalid. \
+         It should match with {ENTITY_IDENTIFIER_PATTERN}."
+    ))
+}
+
+/// The syntax the service documents for `ChangeSetName`: the modelled
+/// `@pattern` with the modelled `@length(min: 1, max: 100)` folded into it,
+/// which is how the service quotes it back to a caller.
+pub const CHANGE_SET_NAME_PATTERN: &str = r"^[\w\s+=.:@-]{1,100}$";
+
+/// The `{1,100}` of [`CHANGE_SET_NAME_PATTERN`].
+const CHANGE_SET_NAME_MAX: usize = 100;
+
+/// Whether `value` is a `ChangeSetName`: [`CHANGE_SET_NAME_PATTERN`] as a
+/// predicate — one to [`CHANGE_SET_NAME_MAX`] characters of `\w` (an ASCII word
+/// character), `\s` (whitespace) or `+=.:@-`.
+///
+/// `\w` is read as ASCII, not Unicode: the pattern is the one the service
+/// publishes and its `\w` is the ASCII class, so a name of letters outside ASCII
+/// is refused rather than quietly accepted against a wider class than the
+/// pattern the caller was told to satisfy.
+pub fn is_change_set_name(value: &str) -> bool {
+    (1..=CHANGE_SET_NAME_MAX).contains(&value.chars().count())
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || c.is_whitespace()
+                || c == '_'
+                || matches!(c, '+' | '=' | '.' | ':' | '@' | '-')
+        })
+}
+
+/// The modelled `ValidationException` payload for a `ChangeSetName` outside
+/// [`CHANGE_SET_NAME_PATTERN`].
+pub fn invalid_change_set_name(name: &str) -> ValidationException {
+    validation_message(format!(
+        "Requested change set name '{name}' is invalid. \
+         It should match with {CHANGE_SET_NAME_PATTERN}."
+    ))
+}
+
+/// The syntax the service documents for `ClientRequestToken`: the modelled
+/// `@pattern` with the modelled `@length(min: 1, max: 64)` folded into it.
+pub const CLIENT_REQUEST_TOKEN_PATTERN: &str = r"^[!-~]{1,64}$";
+
+/// The `{1,64}` of [`CLIENT_REQUEST_TOKEN_PATTERN`].
+const CLIENT_REQUEST_TOKEN_MAX: usize = 64;
+
+/// Whether `value` is a `ClientRequestToken`: [`CLIENT_REQUEST_TOKEN_PATTERN`]
+/// as a predicate — one to [`CLIENT_REQUEST_TOKEN_MAX`] printable ASCII
+/// characters, space excluded (`!` to `~`).
+pub fn is_client_request_token(value: &str) -> bool {
+    (1..=CLIENT_REQUEST_TOKEN_MAX).contains(&value.chars().count())
+        && value.bytes().all(|byte| (b'!'..=b'~').contains(&byte))
+}
+
+/// The modelled `ValidationException` payload for a `ClientRequestToken` outside
+/// [`CLIENT_REQUEST_TOKEN_PATTERN`].
+pub fn invalid_client_request_token(token: &str) -> ValidationException {
+    validation_message(format!(
+        "Requested client request token '{token}' is invalid. \
+         It should match with {CLIENT_REQUEST_TOKEN_PATTERN}."
+    ))
+}
+
+/// The modelled `ValidationException` payload for a `NextToken` that names no
+/// page of the list that was called.
+///
+/// A page token is OPAQUE: it is a value the service itself issued, so the fault
+/// quotes neither the value nor a syntax — there is nothing a caller can correct
+/// it to, only a page it has to ask for again. The same fault answers a token
+/// outside the modelled `NextToken` syntax and one that is well formed but names
+/// no page, because neither names a page.
+pub fn invalid_page_token() -> ValidationException {
+    validation_message("Requested page token is invalid.")
 }
 
 /// The form an entity id takes, as the model's own `EntityId` shape states it
@@ -1398,10 +1720,18 @@ pub fn is_entity_id(value: &str) -> bool {
 /// The message is built from the request: it names the rejected id and the
 /// pattern the service requires, which is what lets a caller correct the call.
 pub fn invalid_entity_id(entity_id: &str) -> ValidationException {
-    validation_message(format!(
+    validation_message(invalid_entity_id_message(entity_id))
+}
+
+/// The sentence that states `entity_id` is not an entity id, shared by the
+/// top-level `ValidationException` a single entity read answers and the
+/// `BatchDescribeErrorDetail$ErrorMessage` the batch read reports for the same
+/// entry — so one read and a batch of them state a malformed id identically.
+pub fn invalid_entity_id_message(entity_id: &str) -> String {
+    format!(
         "Requested entity id '{entity_id}' is invalid. \
          It should match with {ENTITY_ID_PATTERN}."
-    ))
+    )
 }
 
 /// The modelled `ValidationException` payload for a `Sort$SortBy` outside the
@@ -1465,6 +1795,15 @@ pub fn entity_missing_message(entity_id: &str) -> String {
 /// raised.
 pub const BATCH_ERROR_RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 
+/// The `BatchDescribeErrorDetail$ErrorCode` for an entry whose `EntityId` is not
+/// an entity id at all.
+///
+/// A batch read reports a malformed entry the same way it reports a missing one
+/// — per entry, under the id that was asked for, carrying the name of the error a
+/// single read of that entry would have raised — so one bad entry never costs the
+/// caller the results for the good ones in the same batch.
+pub const BATCH_ERROR_VALIDATION: &str = "ValidationException";
+
 /// The modelled `ResourceNotFoundException` payload for a resource ARN that
 /// names a resource of this catalog the store does not hold.
 pub fn resource_not_found(resource: &CatalogResource) -> ResourceNotFoundException {
@@ -1475,24 +1814,63 @@ pub fn resource_not_found(resource: &CatalogResource) -> ResourceNotFoundExcepti
 }
 
 /// The modelled `AccessDeniedException` payload for an action on a resource ARN
-/// this catalog cannot authorize: it names the IAM action (this service's
-/// `arnNamespace` is its IAM service prefix) and the resource the request named.
+/// this catalog cannot authorize.
+///
+/// The message follows the authorization-failure form AWS states every such
+/// refusal in — `User: <principal> is not authorized to perform: <action> on
+/// resource: <resource>` — assembled from the authenticated principal
+/// ([`caller_identity_arn`]), the IAM action (this service's `arnNamespace` is
+/// its IAM service prefix, and `operation` the action name) and the resource the
+/// request named ([`arn_resource_id`]). A client, a log scraper or an IAM
+/// troubleshooter reads the denied principal out of that sentence.
 pub fn access_denied(operation: &str, resource_arn: &str) -> AccessDeniedException {
-    let resource = arn_resource(resource_arn);
+    let resource = arn_resource_id(resource_arn);
     AccessDeniedException {
         message: Some(format!(
-            "Access is denied. The caller is not authorized to perform: \
-             {ARN_NAMESPACE}:{operation} on resource: {resource} because no \
-             resource-based policy allows the {ARN_NAMESPACE}:{operation} action"
+            "User: {} is not authorized to perform: {ARN_NAMESPACE}:{operation} on \
+             resource: {resource} because no resource-based policy allows the \
+             {ARN_NAMESPACE}:{operation} action",
+            caller_identity_arn()
         )),
     }
 }
 
-/// How this service states a resource ARN it will not accept: the value it
-/// rejected and the syntax it required, which is the modelled `ResourceARN`
-/// `@pattern` the request failed.
-pub fn invalid_resource_arn_message(resource_arn: &str, pattern: &str) -> String {
-    format!("[Requested resource arn '{resource_arn}' is invalid. It should match with {pattern}.]")
+/// The ARN of the identity every caller of this emulator authenticates as.
+///
+/// Every request is signed with the emulator's own credentials, so the caller is
+/// the one IAM user this emulator publishes — the very principal its
+/// `sts:GetCallerIdentity` answers, built the same way
+/// (`::engine::emulator_arn("iam", "", "user/emulator")`), so the principal an
+/// authorization refusal names is the principal the caller can look up.
+pub fn caller_identity_arn() -> String {
+    ::engine::emulator_arn("iam", "", "user/emulator")
+}
+
+/// How this service states a member it refused for its SYNTAX: one bracketed
+/// fault naming the member, the value it rejected and the syntax it required.
+///
+/// `member` is the input member's name as a violation path spells it
+/// (lowerCamel); the label is that name as words, which is how the service's own
+/// recorded refusals address a member — `catalog`, `entity type`, `change set
+/// name`, `resource arn` — rather than by the wire path.
+pub fn invalid_member_message(member: &str, value: &str, pattern: &str) -> String {
+    format!(
+        "[Requested {} '{value}' is invalid. It should match with {pattern}.]",
+        member_label(member)
+    )
+}
+
+/// An input member's name as the words a fault addresses it by: its camelCase
+/// humps split apart and lowercased (`resourceArn` -> `resource arn`).
+fn member_label(member: &str) -> String {
+    let mut label = String::with_capacity(member.len() + 2);
+    for (index, c) in member.char_indices() {
+        if c.is_uppercase() && index != 0 {
+            label.push(' ');
+        }
+        label.extend(c.to_lowercase());
+    }
+    label
 }
 
 /// The modelled `ResourceInUseException` payload for a resource another call

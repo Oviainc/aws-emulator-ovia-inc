@@ -348,12 +348,16 @@ impl ComAmazonawsRoute53recoverycontrolconfigRoute53recoverycontrolconfigState {
         found
     }
 
-    /// The control panels stored under `cluster_arn`, in creation order.
-    pub fn ordered_control_panels(&self, cluster_arn: &str) -> Vec<&ControlPanelRecord> {
+    /// The stored control panels in creation order: those of one cluster when
+    /// `cluster_arn` names one, otherwise every panel in the account.
+    ///
+    /// `ListControlPanels` scopes its page with the optional filter; the operations that
+    /// work on one cluster pass `Some(..)`.
+    pub fn ordered_control_panels(&self, cluster_arn: Option<&str>) -> Vec<&ControlPanelRecord> {
         let mut found: Vec<&ControlPanelRecord> = self
             .control_panels
             .values()
-            .filter(|cp| cp.cluster_arn == cluster_arn)
+            .filter(|cp| cluster_arn.is_none_or(|arn| cp.cluster_arn == arn))
             .collect();
         found.sort_by_key(|cp| cp.seq);
         found

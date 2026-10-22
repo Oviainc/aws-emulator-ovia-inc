@@ -164,7 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = input.name;
         let Some(record) = state.presets.get(&name) else {
             return Err(GetPresetErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Preset {name} not found.")),
+                // The refusal names the request member the lookup read, `Name` — the
+                // one template every lookup in this crate that resolves nothing uses.
+                message: Some(crate::state::not_found_message("name")),
             })
             .into());
         };

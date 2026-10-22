@@ -8,6 +8,10 @@
 //! [`certificate_summary`] — so `DescribeCertificate` and `ListCertificates` report
 //! what `RequestCertificate` stored rather than echoing their own input.
 //!
+//! Beside the certificates sits the account-level singleton
+//! [`AccountConfiguration`]: `PutAccountConfiguration` writes it and
+//! `GetAccountConfiguration` reports it, so that round trip reads one record too.
+//!
 //! A requested certificate does not stay `PENDING_VALIDATION`: ACM resolves its
 //! validation on its own, so the record carries the outcome the clock owes it and the
 //! instant it falls due ([`PendingValidation`]). Nothing sleeps for that instant —
@@ -18,8 +22,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CertificateDetail, CertificateOptions, CertificateSummary, DomainValidation, ExtendedKeyUsage,
-    HttpRedirect, KeyUsage, ResourceRecord, Tag,
+    CertificateDetail, CertificateOptions, CertificateSummary, DomainValidation,
+    ExpiryEventsConfiguration, ExtendedKeyUsage, HttpRedirect, KeyUsage, ResourceRecord, Tag,
 };
 
 /// This service's SigV4 signing name, and the `acm` segment of every ARN it mints.
@@ -183,6 +187,60 @@ pub const SORT_ORDER_DESCENDING: &str = "DESCENDING";
 /// `HasAdditionalSubjectAlternativeNames` reports whether the certificate has more
 /// (`CertificateSummary$HasAdditionalSubjectAlternativeNames` doc).
 pub const SUMMARY_SAN_LIMIT: usize = 100;
+
+/// The account-level configuration `PutAccountConfiguration` writes and
+/// `GetAccountConfiguration` reports. One per account, so the state holds a
+/// singleton rather than a map.
+///
+/// "The supported configuration option is DaysBeforeExpiry"
+/// (`PutAccountConfiguration` doc), so that option is all this record carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountConfiguration {
+    /// `ExpiryEventsConfiguration$DaysBeforeExpiry` as the last write carried it;
+    /// `None` when that write named an `ExpiryEvents` with no `DaysBeforeExpiry`.
+    pub days_before_expiry: Option<i32>,
+}
+
+/// The largest `DaysBeforeExpiry` ACM accepts. The model constrains this option
+/// only from below (`PositiveInteger`, `@range(min: 1)`), but the service refuses
+/// anything past the default notice window of 45 days with a `ValidationException`
+/// saying so, so the accepted range is 1..=45.
+pub const MAX_DAYS_BEFORE_EXPIRY: i32 = 45;
+
+/// `ExpiryEventsConfiguration$DaysBeforeExpiry` for an account that has never
+/// written one: "By default, accounts receive events starting 45 days before
+/// certificate expiration" (`ExpiryEventsConfiguration$DaysBeforeExpiry` doc), so
+/// that is the configuration such an account is running under and what
+/// `GetAccountConfiguration` reports for it.
+pub const DEFAULT_DAYS_BEFORE_EXPIRY: i32 = 45;
+
+/// How long a `PutAccountConfiguration` idempotency token stays live: "Idempotency
+/// tokens time out after one hour"
+/// (`PutAccountConfigurationRequest$IdempotencyToken` doc). Past it the token names
+/// no earlier request, so the next call carrying it is a new request.
+pub const IDEMPOTENCY_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// One `PutAccountConfiguration` request ACM has already processed, kept so a call
+/// repeating its idempotency token can be recognised as the same request — or, when
+/// it asks for something else, refused as a different one.
+#[derive(Debug, Clone)]
+pub struct AccountConfigurationRequest {
+    /// The `ExpiryEvents` that request carried, and `None` when it carried none.
+    pub expiry_events: Option<AccountConfiguration>,
+    /// When ACM processed it; the token times out [`IDEMPOTENCY_TOKEN_TTL`] later.
+    pub processed_at: SystemTime,
+}
+
+impl AccountConfigurationRequest {
+    /// Whether this request's idempotency token is still live at `now`.
+    pub fn token_is_live(&self, now: SystemTime) -> bool {
+        now.duration_since(self.processed_at)
+            .is_ok_and(|elapsed| elapsed < IDEMPOTENCY_TOKEN_TTL)
+            // A record stamped in the future (a clock that stepped back) has not
+            // timed out either.
+            || self.processed_at > now
+    }
+}
 
 /// The validation ACM is waiting on for one domain name in a certificate.
 #[derive(Debug, Clone)]
@@ -369,9 +427,26 @@ pub struct ComAmazonawsAcmCertificatemanagerState {
     /// certificate ARN, so re-sending one `RequestCertificate` returns the
     /// certificate it already created instead of making another.
     pub idempotency: HashMap<String, String>,
+    /// The account's expiry-events configuration, as the last successful
+    /// `PutAccountConfiguration` wrote it, and `None` until one has — when ACM is
+    /// running the account on the documented default,
+    /// [`DEFAULT_DAYS_BEFORE_EXPIRY`].
+    pub account_configuration: Option<AccountConfiguration>,
+    /// `PutAccountConfiguration` idempotency token -> the request it was first sent
+    /// with, for as long as that token stays live. Repeating a token with the same
+    /// request is the same request; repeating it with another is a conflict.
+    pub account_configuration_requests: HashMap<String, AccountConfigurationRequest>,
 }
 
 impl ComAmazonawsAcmCertificatemanagerState {
+    /// Drop every `PutAccountConfiguration` idempotency token that has timed out by
+    /// `now`, so the index holds only tokens ACM would still recognise and cannot
+    /// grow without bound.
+    pub fn expire_account_configuration_tokens(&mut self, now: SystemTime) {
+        self.account_configuration_requests
+            .retain(|_, request| request.token_is_live(now));
+    }
+
     /// Apply every validation outcome the clock already owes at `now`.
     ///
     /// Call it FIRST in every handler that locks the store, so each operation sees the
@@ -580,6 +655,24 @@ pub fn export_option(cert: &Certificate) -> String {
         .as_ref()
         .and_then(|options| options.export.clone())
         .unwrap_or_else(|| EXPORT_DISABLED.to_string())
+}
+
+/// The account's expiry-events configuration as the modelled
+/// `ExpiryEventsConfiguration`: what `PutAccountConfiguration` stored, or the
+/// documented default for an account that has written none.
+pub fn expiry_events_configuration(
+    stored: Option<&AccountConfiguration>,
+) -> ExpiryEventsConfiguration {
+    ExpiryEventsConfiguration {
+        days_before_expiry: match stored {
+            // A write that named an `ExpiryEvents` with no `DaysBeforeExpiry` left
+            // the option unset, so the account is back on the default.
+            Some(config) => config
+                .days_before_expiry
+                .or(Some(DEFAULT_DAYS_BEFORE_EXPIRY)),
+            None => Some(DEFAULT_DAYS_BEFORE_EXPIRY),
+        },
+    }
 }
 
 /// One stored validation as the modelled `DomainValidation`.

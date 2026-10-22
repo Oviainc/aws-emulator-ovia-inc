@@ -8,6 +8,10 @@
 //! not name carries no decision (it is allowed). The response is the policy that was
 //! stored, which `GetPolicy` then reads back.
 //!
+//! One cross-member constraint survives the boundary validator: a policy that allows no
+//! input location at all is refused with `BadRequestException` (400) and stores nothing —
+//! see [`crate::state::PolicyRecord::allows_no_input`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -169,6 +173,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already enforced, so what reaches here is a decision per named input kind.
         // The policy is replaced wholesale: whatever this request states IS the policy.
         let record = crate::state::PolicyRecord::from_requested(&input.policy);
+        // A policy that allows NO input location is one AWS refuses: "Policies require at
+        // least one input location to be set to ALLOWED." It is a cross-member condition,
+        // so no per-member constraint the boundary enforces can catch it, and it is a
+        // problem in the request rather than in the state — the modelled
+        // `BadRequestException` (400). The refusal happens BEFORE the store is written,
+        // so the policy that was already there survives it.
+        if record.allows_no_input() {
+            return Err(PutPolicyErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::policy_allows_no_input_message()),
+            })
+            .into());
+        }
         let policy = record.view();
         state.lock().policy = Some(record);
 

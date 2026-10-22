@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStackResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStackResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStackResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: answers the resources the named stack's last completed deployment
+//! materialised — the stack named by `StackName`, or the one a given `PhysicalResourceId`
+//! belongs to — optionally filtered to one `LogicalResourceId`.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +78,62 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    DeployedResource, StoredStack, DRIFT_STATUS_NOT_CHECKED, MAX_DESCRIBED_STACK_RESOURCES,
+};
+
+/// The refusal for a request that names BOTH members that select the stack.
+///
+/// "You must specify either StackName or PhysicalResourceId, but not both. … A
+/// ValidationError is returned if you specify both StackName and PhysicalResourceId in
+/// the same request."
+const BOTH_SELECTORS: &str =
+    "Cannot specify both StackName and PhysicalResourceId in the same request";
+
+/// The refusal for a request that names NEITHER: each member is "Required: Conditional"
+/// on the absence of the other, so a request with neither selects no stack at all.
+const NO_SELECTOR: &str = "Either StackName or PhysicalResourceId must be specified";
+
+/// One deployed resource as the modelled `StackResource` shape.
+///
+/// Every member is read back from what the stack operation that deployed it persisted:
+/// the logical id and type the template declared, the physical id CloudFormation's
+/// documented naming rules gave it, and the resource-level status that operation left it
+/// in with the instant it reached that status.
+///
+/// The members this emulator has nothing to report for are absent rather than invented:
+///
+/// * `ResourceStatusReason` — "Success/failure message associated with the resource":
+///   no deployment here fails part-way, so no resource carries one.
+/// * `Description` — "User defined description associated with the resource": a resource
+///   description is not one of the resource attributes CloudFormation names (the model's
+///   `ResourceAttribute` enum lists `CreationPolicy`, `DeletionPolicy`, `Metadata`,
+///   `Properties`, `Tags`, `UpdatePolicy`, `UpdateReplacePolicy`), so a template read here
+///   declares none.
+/// * `ModuleInfo` — "the module from which the resource was created, if the resource was
+///   created from a module": modules are not implemented, so no resource came from one.
+///
+/// `DriftInformation` is `NOT_CHECKED`, for the same reason `DescribeStacks` reports it at
+/// the stack level: `DetectStackResourceDrift` answers 501 here rather than reporting a
+/// check nothing ran, so no resource of this emulator has ever been checked for drift.
+fn stack_resource_view(stack: &StoredStack, deployed: &DeployedResource) -> StackResource {
+    StackResource {
+        stack_name: Some(stack.stack_name.clone()),
+        stack_id: Some(stack.stack_id.clone()),
+        logical_resource_id: deployed.resource.logical_id.clone(),
+        physical_resource_id: Some(deployed.resource.physical_resource_id.clone()),
+        resource_type: deployed.resource.resource_type.clone(),
+        timestamp: crate::state::timestamp(deployed.status_timestamp),
+        resource_status: deployed.status.clone(),
+        resource_status_reason: None,
+        description: None,
+        drift_information: Some(StackResourceDriftInformation {
+            stack_resource_drift_status: DRIFT_STATUS_NOT_CHECKED.to_string(),
+            last_check_timestamp: None,
+        }),
+        module_info: None,
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -152,18 +202,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStackResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStackResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStackResources"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no stack store to read, so this
+            // answers 501 rather than an empty, truthful-looking list.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeStackResources",
+            ));
+        };
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the
+        // clock had already made due, which was owed whether or not anyone called — and
+        // it is that transition which installs the resources a deployment produced.
+        store.settle(::std::time::SystemTime::now());
+
+        // "You must specify either StackName or PhysicalResourceId, but not both": the two
+        // members are the two ways of naming ONE stack, so neither of them names none and
+        // both of them name two.
+        let stack = match (&input.stack_name, &input.physical_resource_id) {
+            (Some(_), Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    BOTH_SELECTORS,
+                ))
+            }
+            (None, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation_error(NO_SELECTOR))
+            }
+            // "If StackName is specified, all the associated resources that are part of
+            // the stack are returned" — by name for a running stack, by stack id for a
+            // deleted one. A name that resolves to nothing is a `ValidationError`, as it
+            // is on every other read of a stack.
+            (Some(name_or_id), None) => store.resolve(name_or_id).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::stack_does_not_exist(name_or_id),
+                )
+            })?,
+            // "If PhysicalResourceId is specified, the associated resources of the stack
+            // that the resource belongs to are returned."
+            (None, Some(physical_resource_id)) => store
+                .stack_of_physical_resource(physical_resource_id)
+                .ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::stack_for_physical_resource_does_not_exist(
+                            physical_resource_id,
+                        ),
+                    )
+                })?,
+        };
+
+        // Sorted by logical id, which is what makes the answer — and therefore which
+        // resources the documented cap below keeps — the same on every build: the template
+        // reader yields a template's resources in the parsed object's iteration order,
+        // which is the declaration order only where `serde_json`'s `preserve_order`
+        // feature is enabled somewhere in the build.
+        let mut reported: Vec<&DeployedResource> = stack
+            .resources
+            .iter()
+            // "In addition, you can specify LogicalResourceId to filter the returned
+            // result": a filter over the stack's resources, so one that matches nothing
+            // leaves an empty list rather than refusing the request.
+            .filter(|deployed| {
+                input
+                    .logical_resource_id
+                    .as_deref()
+                    .is_none_or(|logical_id| deployed.resource.logical_id == logical_id)
+            })
+            .collect();
+        reported.sort_by(|left, right| left.resource.logical_id.cmp(&right.resource.logical_id));
+
+        // "Only the first 100 resources will be returned. If your stack has more resources
+        // than this, you should use ListStackResources instead": the operation is not
+        // paginated, so the cap is simply where the answer stops.
+        let stack_resources = reported
+            .into_iter()
+            .take(MAX_DESCRIBED_STACK_RESOURCES)
+            .map(|deployed| stack_resource_view(stack, deployed))
+            .collect();
+
+        Ok(DescribeStackResourcesOutput {
+            stack_resources: Some(stack_resources),
+        })
     }
 }

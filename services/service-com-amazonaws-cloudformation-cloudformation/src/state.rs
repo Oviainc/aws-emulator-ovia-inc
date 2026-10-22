@@ -4,11 +4,14 @@
 //!
 //! One store holds every stack this emulator has ever created, in creation order, so
 //! `CreateStack` / `UpdateStack` / `DeleteStack` write exactly the rows
-//! `DescribeStacks` / `ListStacks` / `GetTemplate` / `DescribeStackEvents` read back.
+//! `DescribeStacks` / `ListStacks` / `GetTemplate` / `DescribeStackEvents` /
+//! `DescribeStackResources` read back.
 //! A deleted stack is NOT dropped: CloudFormation keeps a deleted stack's summary,
-//! template and events addressable by its stack id (`ListStacks`: "Summary information
-//! for stacks that have been deleted is kept for 90 days"; `GetTemplate`: "You can get
-//! the template for running or deleted stacks"), so the single `stacks` vector carries
+//! template, events and resources addressable by its stack id (`ListStacks`: "Summary
+//! information for stacks that have been deleted is kept for 90 days"; `GetTemplate`:
+//! "You can get the template for running or deleted stacks"; `DescribeStackResources`:
+//! "For deleted stacks, DescribeStackResources returns resource information for up to 90
+//! days after the stack has been deleted"), so the single `stacks` vector carries
 //! live and deleted stacks alike and `StoredStack::is_live` is what separates them.
 //!
 //! Beside the stacks it holds every CHANGE SET, which is a persisted plan for one stack:
@@ -30,8 +33,9 @@
 //! [`TEMPLATE_BODY_MAX_BYTES`] per stored template body (the documented `TemplateBody`
 //! maximum, which the model carries no `@length` for), [`MAX_CHANGE_SETS_PER_STACK`]
 //! change sets per stack and [`MAX_CHANGE_SETS`] across the store (past either
-//! `CreateChangeSet` answers the modelled `LimitExceededException`), and [`PAGE_SIZE`]
-//! items per paginated response.
+//! `CreateChangeSet` answers the modelled `LimitExceededException`), [`PAGE_SIZE`]
+//! items per paginated response and [`MAX_DESCRIBED_STACK_RESOURCES`] resources per
+//! `DescribeStackResources` response (the documented cap on that unpaginated read).
 //!
 //! Reading a stack's template body and evaluating what it declares is bounded by the
 //! [`template`] module's own caps (nodes, depth, the documented per-template quotas and
@@ -139,6 +143,14 @@ pub const TEMPLATE_BODY_MAX_BYTES: usize = 51_200;
 /// keeps one response bounded however large the store is.
 pub const PAGE_SIZE: usize = 100;
 
+/// The most resources one `DescribeStackResources` response carries.
+///
+/// `DescribeStackResources`: "Only the first 100 resources will be returned. If your
+/// stack has more resources than this, you should use ListStackResources instead." The
+/// operation is not `@paginated`, so this documented cap is the whole of one answer —
+/// a stack may declare up to [`template::MAX_RESOURCES_PER_TEMPLATE`] of them.
+pub const MAX_DESCRIBED_STACK_RESOURCES: usize = 100;
+
 /// `Err(message)` for a `TemplateBody` past its documented maximum, naming the member and
 /// the constraint it failed.
 pub fn validate_template_body(template_body: &str) -> Result<(), String> {
@@ -167,6 +179,18 @@ pub mod status {
     /// or resources. The stack will be in the REVIEW_IN_PROGRESS state until you execute
     /// the change set").
     pub const REVIEW_IN_PROGRESS: &str = "REVIEW_IN_PROGRESS";
+}
+
+/// `ResourceStatus` values this service leaves a stack's resource in (all from the
+/// model's `ResourceStatus` enum).
+///
+/// A stack operation of this service deploys a whole template at once and never fails
+/// part-way, so the only statuses a resource reaches here are the completions of the
+/// operation that created, updated or deleted it.
+pub mod resource_status {
+    pub const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+    pub const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
+    pub const DELETE_COMPLETE: &str = "DELETE_COMPLETE";
 }
 
 /// `ChangeSetStatus` values this service puts a change set into (all from the model's
@@ -271,6 +295,24 @@ pub struct StoredResource {
     pub physical_resource_id: String,
     /// The attributes `Fn::GetAtt` reads off this resource, keyed by attribute name.
     pub attributes: BTreeMap<String, String>,
+}
+
+/// One resource a stack has DEPLOYED: what the template declared it as, plus the
+/// resource-level status the stack operation that last touched it left it in.
+///
+/// A resource only reaches a status by way of an operation COMPLETING against it, so
+/// these two members are filled in by [`StoredStack::settle`] — never by a read — and a
+/// resource a completed operation left exactly as it found it keeps the status and the
+/// instant it already carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployedResource {
+    pub resource: StoredResource,
+    /// The model's `ResourceStatus`, as `StackResource$ResourceStatus` reports it
+    /// ("Current status of the resource").
+    pub status: String,
+    /// `StackResource$Timestamp`: "Time the status was updated" — the instant the stack
+    /// operation that left this resource in `status` completed.
+    pub status_timestamp: SystemTime,
 }
 
 /// One evaluated stack output: an `Outputs` entry of the stack's template with its
@@ -410,8 +452,10 @@ pub struct StoredStack {
     pub status_reason: Option<String>,
     pub pending: Option<PendingStatus>,
     /// The resources the stack's last COMPLETED create or update materialised (see
-    /// [`StoredStack::deploy_template`]).
-    pub resources: Vec<StoredResource>,
+    /// [`StoredStack::deploy_template`]), each with the status that operation left it in.
+    /// A completed DELETE leaves them in place, in `DELETE_COMPLETE`: CloudFormation
+    /// reports a deleted stack's resources for as long as it reports the stack.
+    pub resources: Vec<DeployedResource>,
     /// The stack's evaluated outputs, in `OutputKey` order, as of that same completed
     /// operation — what `DescribeStacks` reports as `Stack$Outputs`.
     pub outputs: Vec<StoredOutput>,
@@ -613,15 +657,21 @@ impl StoredStack {
         self.status_reason = None;
         if self.status == status::DELETE_COMPLETE {
             self.deletion_time = Some(pending.due_at);
-            // The deletion completed, so the stack's resources are gone and there are no
-            // output values left to report for them.
-            self.resources.clear();
+            // The deletion completed, so every resource of the stack was deleted as of
+            // that instant — reported, not dropped: "For deleted stacks,
+            // DescribeStackResources returns resource information for up to 90 days after
+            // the stack has been deleted." The output VALUES go, since they were
+            // evaluated against resources that no longer exist.
+            for deployed in &mut self.resources {
+                deployed.status = resource_status::DELETE_COMPLETE.to_string();
+                deployed.status_timestamp = pending.due_at;
+            }
             self.outputs.clear();
             self.pending_deployment = None;
         } else if let Some(deployed) = self.pending_deployment.take() {
             // The create or update completed: the template it deployed is what the stack
             // reports resources and outputs for from here on.
-            self.resources = deployed.resources;
+            self.resources = installed_resources(&self.resources, deployed.resources, pending.due_at);
             self.outputs = deployed.outputs;
         }
         let status = self.status.clone();
@@ -672,6 +722,47 @@ impl StoredStack {
             client_request_token,
         });
     }
+}
+
+/// The resources a completed create or update leaves the stack with, each carrying the
+/// resource-level status that operation left it in.
+///
+/// `StackResource$ResourceStatus` is the resource's "Current status" and
+/// `StackResource$Timestamp` the "Time the status was updated", so a resource the
+/// operation materialised for the first time reports the create's completion, one it
+/// changed reports that completion as an update, and one it left exactly as it found it
+/// keeps the status and the instant it already carried: nothing about that resource's
+/// status was updated, so its timestamp must not move.
+fn installed_resources(
+    previous: &[DeployedResource],
+    deployed: Vec<StoredResource>,
+    at: SystemTime,
+) -> Vec<DeployedResource> {
+    deployed
+        .into_iter()
+        .map(|resource| {
+            match previous
+                .iter()
+                .find(|before| before.resource.logical_id == resource.logical_id)
+            {
+                // Deployed before and identical: this operation did not touch it.
+                Some(before) if before.resource == resource => before.clone(),
+                // Deployed before under this logical id and now different: the operation
+                // updated it.
+                Some(_) => DeployedResource {
+                    resource,
+                    status: resource_status::UPDATE_COMPLETE.to_string(),
+                    status_timestamp: at,
+                },
+                // Not deployed before: the operation created it.
+                None => DeployedResource {
+                    resource,
+                    status: resource_status::CREATE_COMPLETE.to_string(),
+                    status_timestamp: at,
+                },
+            }
+        })
+        .collect()
 }
 
 /// One resource-level change a change set would make, computed once when the change set
@@ -947,6 +1038,24 @@ impl ComAmazonawsCloudformationCloudformationState {
         self.stacks.iter().filter(|stack| stack.is_live())
     }
 
+    /// The stack a resource with this physical id belongs to, which is what
+    /// `DescribeStackResources` resolves its `PhysicalResourceId` member to ("You can pass
+    /// the EC2 InstanceId to DescribeStackResources to find which stack the instance
+    /// belongs to and what other resources are part of the stack").
+    ///
+    /// Searched over every stack, live or deleted, in creation order: a deleted stack's
+    /// resources stay addressable for as long as the stack does. The first stack carrying
+    /// the id wins, and this emulator derives a generated physical id from the stack id, so
+    /// two stacks collide only where their templates NAME the same resource.
+    pub fn stack_of_physical_resource(&self, physical_resource_id: &str) -> Option<&StoredStack> {
+        self.stacks.iter().find(|stack| {
+            stack
+                .resources
+                .iter()
+                .any(|deployed| deployed.resource.physical_resource_id == physical_resource_id)
+        })
+    }
+
     fn position_of(&self, name_or_id: &str) -> Option<usize> {
         self.stacks
             .iter()
@@ -1028,13 +1137,13 @@ pub fn template_resources(template_body: &str) -> Option<Vec<template::DeclaredR
 pub fn computed_changes(
     previous: &[template::DeclaredResource],
     next: &[template::DeclaredResource],
-    deployed: &[StoredResource],
+    deployed: &[DeployedResource],
 ) -> Vec<StoredResourceChange> {
     let physical_id = |logical_id: &str| {
         deployed
             .iter()
-            .find(|resource| resource.logical_id == logical_id)
-            .map(|resource| resource.physical_resource_id.clone())
+            .find(|deployed| deployed.resource.logical_id == logical_id)
+            .map(|deployed| deployed.resource.physical_resource_id.clone())
     };
     let change =
         |action: &str, resource: &template::DeclaredResource, scope: Vec<String>| {
@@ -1331,6 +1440,13 @@ pub fn new_request_id() -> String {
 /// addressable: no live stack has that name and no stack has that id.
 pub fn stack_does_not_exist(name_or_id: &str) -> String {
     format!("Stack with id {name_or_id} does not exist")
+}
+
+/// The message CloudFormation answers when a request names a `PhysicalResourceId` no
+/// stack has deployed: such a request names its stack only through that resource, so what
+/// is not addressable is the stack the resource would belong to.
+pub fn stack_for_physical_resource_does_not_exist(physical_resource_id: &str) -> String {
+    format!("Stack for {physical_resource_id} does not exist")
 }
 
 /// `Some(list)` unless the list is empty, which the wire shapes spell as an absent

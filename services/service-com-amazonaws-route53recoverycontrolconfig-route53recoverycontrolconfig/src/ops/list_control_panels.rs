@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListControlPanels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListControlPanels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: pages through the control panels actually stored, in creation order —
+//! every panel in the account, or only those of the cluster `ClusterArn` names —
+//! honouring `MaxResults` and round-tripping `NextToken`. A `ClusterArn` no cluster is
+//! stored under is `ResourceNotFoundException` (404) and a `NextToken` that names no
+//! item of the selected set is `ValidationException` (400).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListControlPanels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read: the cursor is the ARN of the next page's first item, so paging needs no
+//! server-side bookkeeping and this call writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +154,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListControlPanels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListControlPanelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListControlPanels"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListControlPanelsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the route53-recovery-control-config store is unavailable on this \
+                              engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let guard = state.lock();
+
+        // The filter is optional: without it the page spans the account. With it, the
+        // cluster it names must be one this service actually stored.
+        if let Some(cluster_arn) = input.cluster_arn.as_deref() {
+            if !guard.clusters.contains_key(cluster_arn) {
+                return Err(ListControlPanelsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("no cluster is stored under {cluster_arn}"),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let ordered = guard.ordered_control_panels(input.cluster_arn.as_deref());
+        let Some(page) = crate::state::paginate(
+            &ordered,
+            |cp: &crate::state::ControlPanelRecord| cp.arn.as_str(),
+            input.next_token.as_deref(),
+            input.max_results,
+        ) else {
+            return Err(ListControlPanelsErrorModeled::ValidationException(
+                ValidationException {
+                    message: "NextToken does not name a control panel of this result set"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `RoutingControlCount` is counted from the routing controls stored under each
+        // panel, so a list page can never report a stale count.
+        Ok(ListControlPanelsOutput {
+            control_panels: Some(
+                page.items
+                    .iter()
+                    .map(|cp| cp.to_control_panel(guard.routing_control_count(&cp.arn)))
+                    .collect(),
+            ),
+            next_token: page.next_token,
+        })
     }
 }

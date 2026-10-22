@@ -25,12 +25,16 @@ mod job_templates;
 mod jobs_query;
 #[path = "all/policy_lifecycle.rs"]
 mod policy_lifecycle;
+#[path = "all/preset_deletion.rs"]
+mod preset_deletion;
 #[path = "all/preset_lifecycle.rs"]
 mod preset_lifecycle;
 #[path = "all/preset_update.rs"]
 mod preset_update;
 #[path = "all/queue_deletion.rs"]
 mod queue_deletion;
+#[path = "all/queue_update.rs"]
+mod queue_update;
 #[path = "all/resource_projection_defaults.rs"]
 mod resource_projection_defaults;
 #[path = "all/resource_tagging.rs"]

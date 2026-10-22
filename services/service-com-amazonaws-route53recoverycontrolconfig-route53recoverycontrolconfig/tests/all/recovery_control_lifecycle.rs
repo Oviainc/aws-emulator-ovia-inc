@@ -1191,3 +1191,332 @@ async fn a_parent_with_children_cannot_be_deleted() {
         reused["ClusterArn"]
     );
 }
+
+/// One `ListControlPanels` page: `(status, NextToken, the page's `ControlPanel` bodies)`.
+///
+/// `ClusterArn`, `MaxResults` and `NextToken` are all `httpQuery` members
+/// (`smithy_query(query="operation", operation="ListControlPanels")`).
+async fn list_control_panels_page(
+    router: &MultiServiceRouter,
+    cluster_arn: Option<&str>,
+    max_results: Option<i32>,
+    next_token: Option<&str>,
+) -> (u16, Option<String>, Vec<Value>) {
+    let mut query: Vec<String> = Vec::new();
+    if let Some(cluster) = cluster_arn {
+        query.push(format!("ClusterArn={}", enc(cluster)));
+    }
+    if let Some(max) = max_results {
+        query.push(format!("MaxResults={max}"));
+    }
+    if let Some(token) = next_token {
+        query.push(format!("NextToken={}", enc(token)));
+    }
+    let suffix = if query.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", query.join("&"))
+    };
+    let (status, body) = call(router, "GET", &format!("/controlpanels{suffix}"), None).await;
+    let panels = body["ControlPanels"].as_array().cloned().unwrap_or_default();
+    (
+        status,
+        body["NextToken"].as_str().map(ToString::to_string),
+        panels,
+    )
+}
+
+/// Page right through `ListControlPanels` for one scope and return every
+/// `ControlPanelArn` it yielded, asserting each page honours `MaxResults`.
+async fn drain_control_panels(
+    router: &MultiServiceRouter,
+    cluster_arn: Option<&str>,
+    max_results: Option<i32>,
+    expected_total: usize,
+) -> Vec<String> {
+    let case = format!("ClusterArn={cluster_arn:?} MaxResults={max_results:?}");
+    let mut seen: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0usize;
+    loop {
+        let (status, next, panels) =
+            list_control_panels_page(router, cluster_arn, max_results, token.as_deref()).await;
+        assert_eq!(status, 200, "case {case}: expected 200, got {status}");
+        if let Some(max) = max_results {
+            assert!(
+                panels.len() <= max as usize,
+                "case {case}: a page holds at most {max} panels, got {}",
+                panels.len()
+            );
+        }
+        seen.extend(
+            panels
+                .iter()
+                .map(|p| p["ControlPanelArn"].as_str().unwrap_or_default().to_string()),
+        );
+        pages += 1;
+        assert!(
+            pages <= expected_total + 1,
+            "case {case}: paging did not terminate after {pages} pages"
+        );
+        match next {
+            None => break,
+            Some(next) => token = Some(next),
+        }
+    }
+    seen
+}
+
+/// `ListControlPanels` answers from the stored panels: every panel of the account, or
+/// only those of the cluster `ClusterArn` names, in creation order, for every page size
+/// from one to past the item count — and each listed body is the one
+/// `DescribeControlPanel` answers with.
+#[tokio::test]
+async fn listing_control_panels_pages_through_every_stored_panel_once() {
+    let router = router();
+
+    // Two clusters, each created with its own default control panel, then
+    // caller-created panels in a known order: the expected order is creation order.
+    let first = create_cluster(&router, json!({ "ClusterName": "listing-first" })).await;
+    let first_arn = first["ClusterArn"].as_str().unwrap_or_default().to_string();
+    let second = create_cluster(&router, json!({ "ClusterName": "listing-second" })).await;
+    let second_arn = second["ClusterArn"].as_str().unwrap_or_default().to_string();
+
+    // A routing control created without a panel lands in its cluster's DEFAULT panel,
+    // which is how the test learns that panel's ARN without listing.
+    let default_of = |cluster: String| {
+        let router = &router;
+        async move {
+            let control = create_routing_control(
+                router,
+                json!({ "ClusterArn": cluster, "RoutingControlName": "default-probe" }),
+            )
+            .await;
+            control["ControlPanelArn"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        }
+    };
+    let default_first = default_of(first_arn.clone()).await;
+    let default_second = default_of(second_arn.clone()).await;
+
+    let mut created_first: Vec<String> = Vec::new();
+    for name in ["first-a", "first-b"] {
+        let panel = create_control_panel(
+            &router,
+            json!({ "ClusterArn": first_arn, "ControlPanelName": name }),
+        )
+        .await;
+        created_first.push(
+            panel["ControlPanelArn"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+    let second_panel = create_control_panel(
+        &router,
+        json!({ "ClusterArn": second_arn, "ControlPanelName": "second-a" }),
+    )
+    .await;
+    let second_panel_arn = second_panel["ControlPanelArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let expected_first: Vec<String> = std::iter::once(default_first.clone())
+        .chain(created_first.iter().cloned())
+        .collect();
+    let expected_second: Vec<String> =
+        vec![default_second.clone(), second_panel_arn.clone()];
+    // Account-wide: both default panels (minted with their clusters) precede the
+    // caller-created ones, in the order the calls were made.
+    let expected_all: Vec<String> = vec![
+        default_first.clone(),
+        default_second.clone(),
+        created_first[0].clone(),
+        created_first[1].clone(),
+        second_panel_arn.clone(),
+    ];
+
+    // Rows span the scope (no filter, each cluster) and page sizes from one at a time,
+    // through a size that does not divide the total, the exact total, one past it, and
+    // the request that names no MaxResults.
+    let scopes: &[(Option<&str>, &Vec<String>)] = &[
+        (None, &expected_all),
+        (Some(first_arn.as_str()), &expected_first),
+        (Some(second_arn.as_str()), &expected_second),
+    ];
+    let page_sizes: &[Option<i32>] = &[Some(1), Some(2), Some(3), Some(5), Some(6), None];
+    for (scope, expected) in scopes {
+        for max_results in page_sizes {
+            let seen = drain_control_panels(&router, *scope, *max_results, expected.len()).await;
+            assert_eq!(
+                &seen, *expected,
+                "case ClusterArn={scope:?} MaxResults={max_results:?}: paging must yield every \
+                 stored panel once, in creation order, got {seen:?}"
+            );
+        }
+    }
+
+    // Every listed body is the stored record, so it matches the single-resource reader
+    // member for member — including the counted RoutingControlCount.
+    let (_, _, listed) = list_control_panels_page(&router, None, None, None).await;
+    for panel in &listed {
+        let arn = panel["ControlPanelArn"].as_str().unwrap_or_default();
+        let (status, body) = call(&router, "GET", &format!("/controlpanel/{}", enc(arn)), None).await;
+        assert_eq!(
+            status, 200,
+            "case listed {arn}: expected DescribeControlPanel 200, got {status} {body:?}"
+        );
+        assert_eq!(
+            &body["ControlPanel"], panel,
+            "case listed {arn}: the list body must be the stored record, got {:?} after {panel:?}",
+            body["ControlPanel"]
+        );
+    }
+    // The default panels carry the probe control created above; the caller-created ones
+    // carry none.
+    for (arn, expected_count) in [
+        (default_first.as_str(), 1),
+        (default_second.as_str(), 1),
+        (created_first[0].as_str(), 0),
+        (second_panel_arn.as_str(), 0),
+    ] {
+        let listed_count = listed
+            .iter()
+            .find(|p| p["ControlPanelArn"].as_str() == Some(arn))
+            .map(|p| p["RoutingControlCount"].clone())
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            listed_count, json!(expected_count),
+            "case listed {arn}: expected RoutingControlCount {expected_count}, got {listed_count:?}"
+        );
+    }
+
+    // A deleted panel leaves the listing, and the list stays a pure read: listing twice
+    // yields the same page.
+    let (status, body) = call(
+        &router,
+        "DELETE",
+        &format!("/controlpanel/{}", enc(&second_panel_arn)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case delete a listed panel: expected 200, got {status} {body:?}"
+    );
+    let after = drain_control_panels(&router, Some(&second_arn), None, 2).await;
+    assert_eq!(
+        after,
+        vec![default_second.clone()],
+        "case after delete: the deleted panel must be gone, got {after:?}"
+    );
+    let again = drain_control_panels(&router, Some(&second_arn), None, 2).await;
+    assert_eq!(
+        again, after,
+        "case repeated read: listing must not change what a later caller sees, got {again:?}"
+    );
+}
+
+/// `ListControlPanels` refuses what it cannot serve: a `ClusterArn` no cluster is stored
+/// under is 404, a cursor outside the selected set is 400, and `MaxResults` outside its
+/// modelled range is 400 — while both published bounds are served.
+#[tokio::test]
+async fn listing_control_panels_refuses_an_unknown_scope_or_cursor() {
+    let router = router();
+
+    let cluster = create_cluster(&router, json!({ "ClusterName": "refusing" })).await;
+    let cluster_arn = cluster["ClusterArn"].as_str().unwrap_or_default().to_string();
+    let other = create_cluster(&router, json!({ "ClusterName": "refusing-other" })).await;
+    let other_arn = other["ClusterArn"].as_str().unwrap_or_default().to_string();
+    let other_panel = create_control_panel(
+        &router,
+        json!({ "ClusterArn": other_arn, "ControlPanelName": "other-panel" }),
+    )
+    .await;
+    let other_panel_arn = other_panel["ControlPanelArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    // A cluster ARN of the right shape that no create ever minted.
+    let missing_cluster = format!("{ARN_PREFIX}cluster/00000000-0000-0000-0000-000000000000");
+    let (status, body) = call(
+        &router,
+        "GET",
+        &format!("/controlpanels?ClusterArn={}", enc(&missing_cluster)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "case ClusterArn naming no stored cluster: expected 404, got {status} {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ResourceNotFoundException",
+        "case ClusterArn naming no stored cluster: expected ResourceNotFoundException, got {body:?}"
+    );
+
+    // Cursor rows: a token naming nothing stored, in both scopes, and a token naming a
+    // panel that IS stored but lies outside the filtered set.
+    let unknown_panel = format!("{ARN_PREFIX}controlpanel/00000000-0000-0000-0000-000000000000");
+    let cursors: &[(&str, Option<&str>, &str)] = &[
+        ("unknown cursor, account-wide", None, unknown_panel.as_str()),
+        (
+            "unknown cursor, filtered",
+            Some(cluster_arn.as_str()),
+            unknown_panel.as_str(),
+        ),
+        (
+            "cursor naming a panel of another cluster",
+            Some(cluster_arn.as_str()),
+            other_panel_arn.as_str(),
+        ),
+    ];
+    for (case, scope, token) in cursors {
+        let (status, _, _) = list_control_panels_page(&router, *scope, None, Some(token)).await;
+        assert_eq!(status, 400, "case {case}: expected 400, got {status}");
+        let mut query = format!("NextToken={}", enc(token));
+        if let Some(scope) = scope {
+            query = format!("ClusterArn={}&{query}", enc(scope));
+        }
+        let (_, body) = call(&router, "GET", &format!("/controlpanels?{query}"), None).await;
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case}: expected ValidationException, got {body:?}"
+        );
+    }
+
+    // `MaxResults` is modelled `range 1..1000`: one step outside each bound is refused,
+    // and each bound itself is served.
+    for (case, max) in [
+        ("MaxResults one below the range minimum", 0),
+        ("MaxResults one above the range maximum", 1001),
+    ] {
+        let (status, body) = call(
+            &router,
+            "GET",
+            &format!("/controlpanels?MaxResults={max}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, 400, "case {case}: expected 400, got {status} {body:?}");
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case}: expected ValidationException, got {body:?}"
+        );
+    }
+    for max in [1, 1000] {
+        let (status, _, _) = list_control_panels_page(&router, None, Some(max), None).await;
+        assert_eq!(
+            status, 200,
+            "case MaxResults={max} (a published bound): expected 200, got {status}"
+        );
+    }
+}

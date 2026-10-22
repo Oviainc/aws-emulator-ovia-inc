@@ -255,6 +255,25 @@ pub fn validate_tag_set(tags: &[BucketTag]) -> Result<(), TagSetRejection> {
     Ok(())
 }
 
+/// The versioning state a bucket carries once `PutBucketVersioning` has set one.
+///
+/// A bucket that has never had the subresource set carries NO value of this at all —
+/// "If the versioning state has never been set on a bucket, it has no versioning state;
+/// a GetBucketVersioning request does not return a versioning state value"
+/// (`PutBucketVersioning`'s own documentation) — which is why [`Bucket::versioning`] is
+/// an `Option` of it rather than a status defaulting to anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketVersioning {
+    /// A `BucketVersioningStatus` value: `Enabled` or `Suspended`
+    /// (`BUCKET_VERSIONING_STATUS_VALUES`), exactly as the configuration carried it.
+    pub status: String,
+    /// An `MFADeleteStatus` value, or `None` while the bucket has never been configured
+    /// with MFA delete: "This element is only returned if the bucket has been configured
+    /// with MFA delete. If the bucket has never been so configured, this element is not
+    /// returned" (`GetBucketVersioningOutput$MFADelete`).
+    pub mfa_delete: Option<String>,
+}
+
 /// One general purpose bucket this emulator holds.
 #[derive(Debug, Clone, Default)]
 pub struct Bucket {
@@ -276,6 +295,10 @@ pub struct Bucket {
     /// bucket has none. A bucket is created WITHOUT a policy, which is what makes
     /// `GetBucketPolicy` answer `NoSuchBucketPolicy` until one is put.
     pub policy: Option<String>,
+    /// The versioning state `PutBucketVersioning` last set on the bucket, or `None`
+    /// while the bucket has no versioning state — the state a bucket is created in, and
+    /// what makes `GetBucketVersioning` report no `Status` until a put sets one.
+    pub versioning: Option<BucketVersioning>,
     /// The bucket's tag set, in the order the tagging request carried it.
     ///
     /// Private, and empty when no tag set is associated with the bucket: "no tags" and
@@ -311,6 +334,21 @@ impl Bucket {
     /// documentation).
     pub fn replace_tags(&mut self, tags: Vec<BucketTag>) {
         self.tags = tags;
+    }
+
+    /// Set the bucket's versioning state from the `VersioningConfiguration` a
+    /// `PutBucketVersioning` request carried.
+    ///
+    /// A REPLACEMENT of the whole subresource, the way [`Bucket::replace_tags`] replaces
+    /// the tag set: `VersioningConfiguration` is "Container for setting the versioning
+    /// state" (`PutBucketVersioningRequest$VersioningConfiguration`), so what the bucket
+    /// carries afterwards is exactly what this request carried and nothing of the
+    /// configuration before it.
+    pub fn set_versioning(&mut self, status: &str, mfa_delete: Option<&str>) {
+        self.versioning = Some(BucketVersioning {
+            status: status.to_string(),
+            mfa_delete: mfa_delete.map(str::to_string),
+        });
     }
 
     /// Remove the bucket's tag set, leaving no tags associated with it.
@@ -663,6 +701,11 @@ pub const PRECONDITION_FAILED_CODE: &str = "PreconditionFailed";
 pub const NO_SUCH_BUCKET_POLICY_CODE: &str = "NoSuchBucketPolicy";
 /// See [`NO_SUCH_BUCKET_POLICY_CODE`].
 pub const NO_SUCH_BUCKET_POLICY_MESSAGE: &str = "The bucket policy does not exist";
+/// The code S3 answers a `PutBucketVersioning` whose `VersioningConfiguration` is not
+/// one it can apply: "Indicates that the versioning configuration specified in the
+/// request is invalid", HTTP 400 (Amazon S3 "Error responses", list of error codes).
+pub const ILLEGAL_VERSIONING_CONFIGURATION_CODE: &str = "IllegalVersioningConfigurationException";
+
 /// "The policy must be a valid JSON policy document."
 pub const MALFORMED_POLICY_CODE: &str = "MalformedPolicy";
 /// See [`MALFORMED_POLICY_CODE`].

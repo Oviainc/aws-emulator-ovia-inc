@@ -197,19 +197,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match (reserved, input.reservation_plan_settings.as_ref()) {
             (true, None) => {
                 return Err(CreateQueueErrorModeled::BadRequestException(BadRequestException {
-                    message: Some(
-                        "ReservationPlanSettings is required when PricingPlan is RESERVED."
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::reservation_plan_required_message()),
                 })
                 .into())
             }
             (false, Some(_)) => {
                 return Err(CreateQueueErrorModeled::BadRequestException(BadRequestException {
-                    message: Some(
-                        "ReservationPlanSettings does not apply when PricingPlan is ON_DEMAND."
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::reservation_plan_not_applicable_message()),
                 })
                 .into())
             }

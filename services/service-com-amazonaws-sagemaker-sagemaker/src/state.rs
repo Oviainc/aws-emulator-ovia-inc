@@ -5,9 +5,9 @@
 //! The inference-deployment lifecycle (model -> endpoint config -> endpoint) is kept
 //! here, in `BTreeMap`s keyed by the resource name AWS keys them by, so
 //! `ListModels` has one stable order to sort and paginate over and every
-//! `Describe*` replays exactly what the matching `Create*` stored. The Git repositories
-//! `CreateCodeRepository` registers are kept the same way, keyed by
-//! `CodeRepositoryName`.
+//! `Describe*` replays exactly what the matching `Create*` stored. The Studio
+//! AppImageConfig registry and the Git repositories `CreateCodeRepository` registers
+//! are kept the same way, keyed by `AppImageConfigName` and `CodeRepositoryName`.
 //!
 //! Studio apps live here too, keyed by the [`AppKey`] their five input members name
 //! rather than by a bare name, because that tuple — domain, owning user profile or
@@ -18,12 +18,13 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AdditionalInferenceSpecificationDefinition, ArtifactSource, AsyncInferenceConfig,
-    ContainerDefinition, DataCaptureConfig, DriftCheckBaselines, ExplainerConfig, GitConfig,
-    IamIdentity, InferenceExecutionConfig, InferenceSpecification, ManagedConfiguration,
-    MetadataProperties, MetricsConfig, ModelLifeCycle, ModelMetrics, ModelPackageModelCard,
-    ModelPackageSecurityConfig, ModelPackageStatusDetails, ModelPackageStatusItem,
-    ModelPackageValidationSpecification, ProductionVariant, ProductionVariantSummary, ResourceSpec,
-    SourceAlgorithmSpecification, Tag, UserContext, VpcConfig,
+    CodeEditorAppImageConfig, ContainerDefinition, DataCaptureConfig, DriftCheckBaselines,
+    ExplainerConfig, GitConfig, IamIdentity, InferenceExecutionConfig, InferenceSpecification,
+    JupyterLabAppImageConfig, KernelGatewayImageConfig, ManagedConfiguration, MetadataProperties,
+    MetricsConfig, ModelLifeCycle, ModelMetrics, ModelPackageModelCard, ModelPackageSecurityConfig,
+    ModelPackageStatusDetails, ModelPackageStatusItem, ModelPackageValidationSpecification,
+    ProductionVariant, ProductionVariantSummary, ResourceSpec, SourceAlgorithmSpecification, Tag,
+    UserContext, VpcConfig,
 };
 
 /// The ARN service namespace (`arnNamespace` in the model's `aws.api#service` trait,
@@ -68,6 +69,8 @@ pub const ENDPOINT_QUOTA: usize = 1_000;
 /// the versions registered into model package groups), which is what `CreateModelPackage`
 /// mints and `DeleteModelPackage` releases.
 pub const MODEL_PACKAGE_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`].
+pub const APP_IMAGE_CONFIG_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const CODE_REPOSITORY_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
@@ -225,6 +228,24 @@ impl Endpoint {
         }
         false
     }
+}
+
+/// An AppImageConfig created by `CreateAppImageConfig`, as `DescribeAppImageConfig`
+/// replays it.
+///
+/// AWS returns an AppImageConfig ready the moment it is created — the resource carries
+/// no status member at all (`smithy_query` shape=AppImageConfigDetails) — so there is no
+/// clock-owed transition to settle here, only the two timestamps.
+#[derive(Debug, Clone)]
+pub struct AppImageConfig {
+    pub name: String,
+    pub arn: String,
+    pub kernel_gateway_image_config: Option<KernelGatewayImageConfig>,
+    pub jupyter_lab_app_image_config: Option<JupyterLabAppImageConfig>,
+    pub code_editor_app_image_config: Option<CodeEditorAppImageConfig>,
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
 }
 
 /// A Git repository registered by `CreateCodeRepository`, as `DescribeCodeRepository`
@@ -548,6 +569,8 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub endpoint_configs: BTreeMap<String, EndpointConfig>,
     /// Keyed by `EndpointName`.
     pub endpoints: BTreeMap<String, Endpoint>,
+    /// Keyed by `AppImageConfigName`, which AWS documents as unique to the account.
+    pub app_image_configs: BTreeMap<String, AppImageConfig>,
     /// Keyed by `CodeRepositoryName`.
     pub code_repositories: BTreeMap<String, CodeRepository>,
     /// Keyed by [`AppKey`] — an app is named by five members, not by one name.
@@ -577,6 +600,12 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// Whether another endpoint fits, i.e. the store is below [`ENDPOINT_QUOTA`].
     pub fn endpoints_below_quota(&self) -> bool {
         self.endpoints.len() < ENDPOINT_QUOTA
+    }
+
+    /// Whether another AppImageConfig fits, i.e. the store is below
+    /// [`APP_IMAGE_CONFIG_QUOTA`].
+    pub fn app_image_configs_below_quota(&self) -> bool {
+        self.app_image_configs.len() < APP_IMAGE_CONFIG_QUOTA
     }
 
     /// Whether another model package fits, i.e. the store is below
@@ -674,6 +703,18 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// drop the request's writes.
 pub const NO_STATE: &str =
     "SageMaker state is unavailable: this service is not mounted on the shared in-memory engine";
+
+/// The message SageMaker's `ResourceInUse` carries when a create names a resource whose
+/// name is already taken.
+///
+/// It is a CONSTANT of the service, not built from the request: SageMaker answers the
+/// same sentence whatever resource kind and whatever name the caller asked for, and the
+/// name is not repeated back. Stated once here so each create that MODELS
+/// `ResourceInUse` refuses with the same wording — today `CreateAppImageConfig`, the
+/// only such create implemented so far; an operation whose model does not bind
+/// `ResourceInUse` (`CreateModel`, `CreateModelPackageGroup`) refuses with its own
+/// `ValidationException` text instead and does not use this.
+pub const RESOURCE_IN_USE_MESSAGE: &str = "The ID or Name specified is already in use.";
 
 /// Whether `value` is a well-formed AWS region token: lowercase alphanumerics and
 /// hyphens, at most `emulator_telemetry::policy::REGION_MAX_LEN` (32) bytes.

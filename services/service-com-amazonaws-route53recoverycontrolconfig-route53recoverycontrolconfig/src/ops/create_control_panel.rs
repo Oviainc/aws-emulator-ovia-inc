@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A control panel name identifies the panel within its cluster.
         if guard
-            .ordered_control_panels(&input.cluster_arn)
+            .ordered_control_panels(Some(&input.cluster_arn))
             .iter()
             .any(|panel| panel.name == input.control_panel_name)
         {
