@@ -86,10 +86,12 @@ use super::types::*;
 use crate::state::{StoredGateway, SERVICE_NAMESPACE};
 
 /// Refuse the request with the service's own client-input error, `BadRequestException`
-/// (HTTP 400): "thrown if the request contains a semantic error".
-fn bad_request(message: impl Into<String>) -> CreateGatewayError {
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]).
+fn bad_request(detail: impl Into<String>) -> CreateGatewayError {
     CreateGatewayErrorModeled::BadRequestException(BadRequestException {
-        message: message.into(),
+        message: crate::state::validation_failed_message(&detail.into()),
     })
     .into()
 }

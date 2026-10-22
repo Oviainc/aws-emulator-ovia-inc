@@ -41,9 +41,71 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The modelled member name a violation path ends in: `sources.1.member.protocol` ->
+/// `Protocol`.
+///
+/// A violation path spells each member in lowerCamel — "a member names itself in
+/// lowerCamel. That casing belongs to the path, not to the model"
+/// (`aws_smithy_schema_server::constraints::path::member`) — so the modelled member name is
+/// the last segment with its initial capitalised, the exact inverse of that spelling for
+/// the names this model uses. `None` for a path that ends in no member name at all (an
+/// empty path, or one ending in the collection step), where there is nothing to name.
+///
+/// (`service-com-amazonaws-servicequotas-servicequotasv20190624`'s `service.rs` recovers
+/// the same thing for ITS service by walking that operation's schema members instead; the
+/// two stay per-service until there is a shared home for one of them, because neither
+/// crate may add a module to the other.)
+///
+/// TOTAL for every `path`: `rsplit` always yields a first item, the filter rejects the
+/// cases with nothing to name, and the re-casing walks `chars()` rather than indexing or
+/// slicing bytes — so no byte offset, `unwrap`/`expect`, parse or arithmetic is reachable,
+/// whatever the path holds (a caller-chosen map key is one of its segments).
+fn modelled_member_name(path: &str) -> Option<String> {
+    let segment = path.rsplit('.').next().filter(|segment| {
+        !segment.is_empty()
+            && segment != &"member"
+            && segment.starts_with(|c: char| c.is_ascii_alphabetic())
+    })?;
+    let mut name = String::with_capacity(segment.len());
+    for (index, c) in segment.chars().enumerate() {
+        if index == 0 {
+            name.extend(c.to_uppercase());
+        } else {
+            name.push(c);
+        }
+    }
+    Some(name)
+}
+
+/// How this service states ONE violation the framework's constraint walk found, as the
+/// detail of its `Validation failed:` envelope.
+///
+/// A value outside a modelled value set is stated the way MediaConnect states it — `Invalid
+/// <Member>`, naming the member the request carried the value in and nothing else, which is
+/// what independent recordings of this service show for an enum-typed member. The member
+/// name comes from the violation's own path, so it is derived from the request: a value
+/// outside `Protocol`'s set reads `Invalid Protocol` wherever in the request it sat.
+///
+/// Every other violation kind keeps the framework's own sentence, which names the member,
+/// the value and the rule it broke: MediaConnect's own wording for those is not known, and
+/// a sentence that states the rule is more use to a caller than a guessed one.
+///
+/// TOTAL for every violation: `modelled_member_name` is total, `Violation::message` is the
+/// framework's own rendering (which elides the echoed value), and the only other step is a
+/// `format!`.
+fn violation_detail(violation: &Violation) -> String {
+    match &violation.kind {
+        ViolationKind::EnumValue(_) => match modelled_member_name(&violation.path) {
+            Some(member) => format!("Invalid {member}"),
+            None => violation.message(),
+        },
+        _ => violation.message(),
+    }
+}
 
 /// The `com-amazonaws-mediaconnect-mediaconnect` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -105,19 +167,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // absent, a value outside a declared bound, an ARN failing its modelled
             // pattern) is worded with the code a MediaConnect client branches on, and the
             // message states each violation the framework found.
+            //
+            // The message goes through `crate::state::validation_failed_message`, the one
+            // envelope this service words a refused request in: a boundary refusal and a
+            // refusal a handler raises itself must not reach a client in two different
+            // forms, because the `Validation failed:` prefix is what a client and a
+            // log-based alert tell a validation refusal from a semantic one by. Each
+            // violation inside that envelope is stated by `violation_detail`.
             Refusal::Invalid(violations) => {
                 let detail = violations
                     .iter()
-                    .map(smithy_server_runtime::Violation::message)
+                    .map(violation_detail)
                     .collect::<Vec<String>>()
                     .join("; ");
+                let detail = if detail.is_empty() {
+                    "The request contains a semantic error.".to_string()
+                } else {
+                    detail
+                };
                 Some(Refused {
                     code: "BadRequestException".to_string(),
-                    message: if detail.is_empty() {
-                        "The request contains a semantic error.".to_string()
-                    } else {
-                        detail
-                    },
+                    message: crate::state::validation_failed_message(&detail),
                 })
             }
             // An unauthenticated caller keeps the framework's 403 wording.

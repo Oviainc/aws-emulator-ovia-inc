@@ -3,8 +3,9 @@
 //! Engine state for the com-amazonaws-codecommit-codecommit-20150413 service.
 //!
 //! The store is a map of live repositories, each carrying its own branches,
-//! commits and blobs, so every response an operation returns is a lookup in
-//! state rather than a value made up on the request path.
+//! commits, blobs and the comments posted on its commit comparisons, so every
+//! response an operation returns is a lookup in state rather than a value made up
+//! on the request path.
 //!
 //! Object ids are content-addressed over the git object encoding: `blobId`, `treeId`
 //! and `commitId` hash exactly what git hashes for that object
@@ -20,11 +21,38 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{RepositoryMetadata, UserInfo};
+use crate::ops::types::{Comment, Location, RepositoryMetadata, UserInfo};
 
 /// The region an ARN or clone URL uses when the request carries no SigV4
 /// credential scope to read one from (an unsigned request).
 pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// `relativeFileVersion` values the model's `RelativeFileVersionEnum` declares
+/// (`smithy_query(query="shape",shape="RelativeFileVersionEnum")`): whether the
+/// commented version of a file is the before or the after of the comparison.
+pub const RELATIVE_FILE_VERSION_BEFORE: &str = "BEFORE";
+pub const RELATIVE_FILE_VERSION_AFTER: &str = "AFTER";
+
+/// The largest comment CodeCommit accepts, in characters. Documented on
+/// `CommentContentSizeLimitExceededException`: "The comment is too large. Comments
+/// are limited to 10,240 characters."
+pub const MAX_COMMENT_CHARACTERS: usize = 10_240;
+
+/// How many comment threads one `GetCommentsForComparedCommit` page carries when
+/// the caller names no `maxResults`, and the largest value that member accepts.
+/// Documented on it: "A non-zero, non-negative integer used to limit the number of
+/// returned results. The default is 100 comments, but you can configure up to
+/// 500."
+pub const COMMENTS_PAGE_DEFAULT: i32 = 100;
+pub const COMMENTS_PAGE_MAX: i32 = 500;
+
+/// How many comments one repository holds before `PostCommentForComparedCommit`
+/// refuses the write.
+///
+/// The emulator's OWN bound, not an AWS limit: a comment is caller-supplied text
+/// kept for the life of the repository, so this is what keeps one repository's
+/// stored size bounded. Every record it holds is released by `DeleteRepository`.
+pub const MAX_COMMENTS_PER_REPOSITORY: usize = 1_000;
 
 /// `fileMode` values the model's `FileModeTypeEnum` declares
 /// (`smithy_query(query="shape",shape="FileModeTypeEnum")`).
@@ -75,9 +103,9 @@ pub const MAX_FOLDER_CONTENT_BYTES: i64 = 6 * 1024 * 1024;
 /// Per-service state for com-amazonaws-codecommit-codecommit-20150413. A handler reaches it through [`service_state`].
 ///
 /// Bounded on every axis a caller drives: at most [`REPOSITORY_QUOTA`]
-/// repositories, each holding at most [`MAX_FILES_PER_TREE`] files per tree and
-/// [`MAX_COMMITS_RETAINED`] commits, with blobs released as soon as no retained
-/// commit references them.
+/// repositories, each holding at most [`MAX_FILES_PER_TREE`] files per tree,
+/// [`MAX_COMMITS_RETAINED`] commits and [`MAX_COMMENTS_PER_REPOSITORY`] comments,
+/// with blobs released as soon as no retained commit references them.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCodecommitCodecommit20150413State {
     /// Live repositories, keyed by `repositoryName` (unique per account).
@@ -109,6 +137,15 @@ pub struct Repository {
     /// The sequence number the next commit takes, so the oldest commits can be
     /// told from the newest when [`Repository::prune_history`] runs.
     pub next_commit_sequence: u64,
+    /// Comments posted on this repository, keyed by `commentId`.
+    pub comments: BTreeMap<String, CommentRecord>,
+    /// Each `clientRequestToken` a comment was posted with, mapped to the
+    /// `commentId` that first request created, so a repeated request carrying the
+    /// same token returns that comment instead of posting a second one.
+    pub comment_tokens: BTreeMap<String, String>,
+    /// The sequence number the next comment takes: comments are reported in the
+    /// order they were posted.
+    pub next_comment_sequence: u64,
 }
 
 /// A branch: its name and the commit it points at (its tip).
@@ -165,6 +202,85 @@ impl Commit {
     }
 }
 
+/// The comparison a comment was posted on: the two commits that establish its
+/// directionality, and the blobs of the commented file in each of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComparedCommit {
+    pub before_commit_id: Option<String>,
+    pub after_commit_id: String,
+    pub before_blob_id: Option<String>,
+    pub after_blob_id: Option<String>,
+}
+
+/// One comment, as posted. `comparison` is what the comment is filed under, so a
+/// read of one comparison reports exactly the comments posted on it.
+#[derive(Debug, Clone)]
+pub struct CommentRecord {
+    pub comment_id: String,
+    pub content: String,
+    /// The comment this one replies to; `None` for the root of a thread.
+    pub in_reply_to: Option<String>,
+    pub creation_date: SystemTime,
+    pub last_modified_date: SystemTime,
+    pub author_arn: String,
+    pub deleted: bool,
+    pub client_request_token: Option<String>,
+    pub comparison: ComparedCommit,
+    pub location: Option<Location>,
+    /// Post order within the repository: the lowest sequence is the oldest
+    /// comment, and that is the order comments are reported in.
+    pub sequence: u64,
+}
+
+impl CommentRecord {
+    /// This comment as the modeled `Comment` shape — the one place that
+    /// projection is written, so `PostCommentForComparedCommit` and
+    /// `GetCommentsForComparedCommit` cannot disagree about a stored comment.
+    pub fn comment(&self) -> Comment {
+        Comment {
+            comment_id: Some(self.comment_id.clone()),
+            // A deleted comment keeps its record but reports no content, which is
+            // what `DeleteCommentContent` documents.
+            content: (!self.deleted).then(|| self.content.clone()),
+            in_reply_to: self.in_reply_to.clone(),
+            creation_date: Some(to_date_time(self.creation_date)),
+            last_modified_date: Some(to_date_time(self.last_modified_date)),
+            author_arn: Some(self.author_arn.clone()),
+            deleted: self.deleted,
+            client_request_token: self.client_request_token.clone(),
+            // Reactions belong to `PutCommentReaction`, which stores none yet.
+            caller_reactions: None,
+            reaction_counts: None,
+        }
+    }
+}
+
+/// A location's members as a comparable key: two comments sit in the same place in
+/// a comparison only when all three members agree. The modeled `Location` shape
+/// derives no `PartialEq`, so this is how two of them are compared.
+pub fn location_key(location: Option<&Location>) -> (Option<&str>, Option<i64>, Option<&str>) {
+    match location {
+        None => (None, None, None),
+        Some(location) => (
+            location.file_path.as_deref(),
+            location.file_position,
+            location.relative_file_version.as_deref(),
+        ),
+    }
+}
+
+/// How many lines a blob's bytes hold: the number of line separators, plus the
+/// trailing line when the content does not end in one. This is what bounds the
+/// `filePosition` a comment can name in that version of a file.
+pub fn line_count(content: &[u8]) -> i64 {
+    if content.is_empty() {
+        return 0;
+    }
+    let separators = content.iter().filter(|byte| **byte == b'\n').count();
+    let trailing = usize::from(!content.ends_with(b"\n"));
+    i64::try_from(separators + trailing).unwrap_or(i64::MAX)
+}
+
 impl Repository {
     /// Build a repository, deriving every generated field from the name, the
     /// region and the creation instant.
@@ -194,6 +310,9 @@ impl Repository {
             commits: BTreeMap::new(),
             blobs: BTreeMap::new(),
             next_commit_sequence: 0,
+            comments: BTreeMap::new(),
+            comment_tokens: BTreeMap::new(),
+            next_comment_sequence: 0,
         }
     }
 
@@ -285,14 +404,34 @@ impl Repository {
 /// the creation instant. It is therefore stable for the life of the repository and
 /// distinct for a repository of the same name created later.
 fn repository_id(name: &str, created: SystemTime) -> String {
-    let nanos = created
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let seed = format!(
+    let nanos = nanos_since_epoch(created);
+    uuid_v8(&format!(
         "codecommit/{}/{name}/{nanos}",
         ::engine::emulator_account_id()
-    );
+    ))
+}
+
+/// A comment's opaque `commentId`: the same kind of version-8 UUID, over the
+/// account, the repository, the comment's post order and the instant it was
+/// posted. It is therefore stable for the life of the comment and distinct from
+/// every other comment's.
+pub fn comment_id(repository: &str, sequence: u64, created: SystemTime) -> String {
+    let nanos = nanos_since_epoch(created);
+    uuid_v8(&format!(
+        "codecommit/{}/{repository}/comment/{sequence}/{nanos}",
+        ::engine::emulator_account_id()
+    ))
+}
+
+fn nanos_since_epoch(time: SystemTime) -> u128 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+/// An RFC 9562 version-8 (custom) UUID whose 122 implementation-defined bits are a
+/// digest of `seed`, in the canonical 8-4-4-4-12 textual form.
+fn uuid_v8(seed: &str) -> String {
     let digest = Sha256::digest(seed.as_bytes());
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
@@ -341,6 +480,29 @@ pub fn region_of(parts: &::http::request::Parts) -> String {
         .map(|scope| scope.region)
         .filter(|region| !region.is_empty())
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The identity that made this request, as an ARN: what an operation reports as
+/// the author of something the caller created.
+///
+/// Derived from the request's own SigV4 access key id, so a comment names the
+/// caller it actually had rather than a fabricated one. The access key id is
+/// caller-controlled text, so it is first reduced to the characters an access key
+/// id can hold. Every request this emulator serves is signed with a caller's own
+/// access key, so the identity is always an IAM identity of the emulator's
+/// account.
+pub fn caller_identity_arn(parts: &::http::request::Parts) -> String {
+    let filtered: String = ::engine::extract_akid(&parts.headers)
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(128)
+        .collect();
+    let akid = if filtered.is_empty() {
+        "default"
+    } else {
+        filtered.as_str()
+    };
+    ::engine::emulator_arn("iam", "", &format!("user/{akid}"))
 }
 
 /// A `SystemTime` as the modeled timestamp type.

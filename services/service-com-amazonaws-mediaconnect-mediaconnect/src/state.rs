@@ -72,6 +72,56 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// segment of every ARN the service mints.
 pub const SERVICE_NAMESPACE: &str = "mediaconnect";
 
+/// The prefix MediaConnect puts in front of the identifier a request named when it
+/// resolves no resource: the whole `NotFoundException$Message` is this prefix followed by
+/// that identifier, and nothing else.
+///
+/// `NotFoundException` models `Message` as **required** and the model states the precise
+/// meaning of the failure "is documented in the error message", so the message is part of
+/// what a client reads — a caller that parses the ARN back out of a not-found message
+/// reads it from here. Every `NotFoundException` this crate returns is built through
+/// [`not_found_message`] so no handler can word one its own way.
+pub const NOT_FOUND_PREFIX: &str = "Not found: ";
+
+/// The prefix MediaConnect puts in front of the detail of a refused request, followed by a
+/// newline: `BadRequestException$Message` is `Validation failed:` then a line stating what
+/// about the request was unacceptable.
+///
+/// Operators and clients tell a validation refusal from a semantic one by this prefix, so
+/// every `BadRequestException` this crate returns is built through
+/// [`validation_failed_message`] — including the ones the framework's own boundary walk
+/// raises, which `crate::service::EmulatedService::override_refusal` words through the
+/// same function.
+pub const VALIDATION_FAILED_PREFIX: &str = "Validation failed:";
+
+/// MediaConnect's `NotFoundException` message for a request that named `identifier` — an
+/// ARN, or whatever else the request addressed the resource by — and resolved no resource.
+///
+/// The message is derived from the REQUEST, never from the store, so it is the same
+/// whether the resource never existed, was deleted, or was never an ARN at all.
+///
+/// TOTAL for every `identifier` a request can carry: one `format!` of a borrowed `&str`,
+/// with no parsing, no indexing or slicing, no `unwrap`/`expect` and no arithmetic — so a
+/// label that satisfies no pattern (the flow labels deliberately hand their value to the
+/// handler unjudged; see the note on `DescribeFlowInput` in `crate::ops::types`) cannot
+/// panic here, whatever bytes it holds. The identifier is a URI path label, so what it
+/// adds to the response is bounded by the request line that carried it.
+pub fn not_found_message(identifier: &str) -> String {
+    format!("{NOT_FOUND_PREFIX}{identifier}")
+}
+
+/// MediaConnect's `BadRequestException` message for a request refused as unacceptable:
+/// [`VALIDATION_FAILED_PREFIX`], a newline, then `detail`.
+///
+/// `detail` states what was wrong — the member and the rule it broke. The envelope is the
+/// contract; the wording of the detail is this emulator's.
+///
+/// TOTAL for every `detail`, for the same reason as [`not_found_message`]: one `format!`
+/// of a borrowed `&str`.
+pub fn validation_failed_message(detail: &str) -> String {
+    format!("{VALIDATION_FAILED_PREFIX}\n{detail}")
+}
+
 /// The ceiling on how many flows this store holds: the cap that bounds caller-driven
 /// growth of the flow map.
 ///

@@ -24,7 +24,7 @@ use crate::ops::types::{
 #[derive(Debug)]
 pub struct ComAmazonawsSchemasSchemasState {
     /// Registries by `RegistryName`, of both scopes: the ones callers create and the
-    /// service-owned catalogue [`AWS_MANAGED_CATALOG`] seeds.
+    /// service-owned catalogue [`aws_managed_schemas`] seeds.
     pub registries: BTreeMap<String, Registry>,
     /// Source of resource-policy revision ids, so every revision this process mints
     /// is distinct. See [`ComAmazonawsSchemasSchemasState::mint_policy_revision_id`].
@@ -329,43 +329,656 @@ impl Schema {
     }
 }
 
-/// The service-owned schema catalogue every account sees: one entry per AWS-managed
-/// registry, each holding the AWS event schemas AWS publishes in it, as the
-/// `OpenApi3` documents AWS stores them as.
+/// The SERVICE-SPECIFIC event types the service-owned catalogue holds a schema for:
+/// the events an AWS service publishes beyond the API-call event every source
+/// publishes (which [`AWS_EVENT_SOURCES`] carries instead, one per source).
+///
+/// Source: the `detail` of each event as AWS documents it (the EventBridge event
+/// reference for the publishing service); the `detail_type` is the `detail-type`
+/// EventBridge delivers it under and the `event_name` is the name the catalogue
+/// publishes it as, which AWS derives from that detail-type.
 ///
 /// This is seeded content, not a response: `ListRegistries`, `ListSchemas` and
 /// `DescribeSchema` report it from the store like any other registry, and
 /// `ExportSchema` converts it. A caller cannot write to it — see
-/// [`RegistryScope::Aws`].
-///
-/// The names are AWS's own (`aws.events`, and the `<source>@<DetailType>` schema
-/// naming EventBridge uses). Each document is an AWS event envelope: an `AWSEvent`
-/// component whose `detail` references the event-specific component, which is the
-/// shape `ExportSchema`'s draft-4 conversion walks.
-pub const AWS_MANAGED_CATALOG: &[(&str, &[(&str, &str)])] = &[(
-    "aws.events",
-    &[
-        (
-            "aws.autoscaling@EC2InstanceLaunchSuccessful",
-            r##"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"EC2InstanceLaunchSuccessful"},"paths":{},"components":{"schemas":{"AWSEvent":{"type":"object","required":["detail-type","resources","detail","id","source","time","region","version","account"],"x-amazon-events-detail-type":"EC2 Instance Launch Successful","x-amazon-events-source":"aws.autoscaling","properties":{"detail":{"$ref":"#/components/schemas/EC2InstanceLaunchSuccessful"},"detail-type":{"type":"string"},"resources":{"type":"array","items":{"type":"string"}},"id":{"type":"string"},"source":{"type":"string"},"time":{"type":"string","format":"date-time"},"region":{"type":"string"},"version":{"type":"string"},"account":{"type":"string"}}},"EC2InstanceLaunchSuccessful":{"type":"object","required":["AutoScalingGroupName","EC2InstanceId","RequestId"],"properties":{"AutoScalingGroupName":{"type":"string"},"EC2InstanceId":{"type":"string"},"RequestId":{"type":"string"}}}}}}"##,
-        ),
-        (
-            "aws.ec2@EC2InstanceStateChangeNotification",
-            r##"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"EC2InstanceStateChangeNotification"},"paths":{},"components":{"schemas":{"AWSEvent":{"type":"object","required":["detail-type","resources","detail","id","source","time","region","version","account"],"x-amazon-events-detail-type":"EC2 Instance State-change Notification","x-amazon-events-source":"aws.ec2","properties":{"detail":{"$ref":"#/components/schemas/EC2InstanceStateChangeNotification"},"detail-type":{"type":"string"},"resources":{"type":"array","items":{"type":"string"}},"id":{"type":"string"},"source":{"type":"string"},"time":{"type":"string","format":"date-time"},"region":{"type":"string"},"version":{"type":"string"},"account":{"type":"string"}}},"EC2InstanceStateChangeNotification":{"type":"object","required":["instance-id","state"],"properties":{"instance-id":{"type":"string"},"state":{"type":"string"}}}}}}"##,
-        ),
-        (
-            "aws.s3@ObjectCreated",
-            r##"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"ObjectCreated"},"paths":{},"components":{"schemas":{"AWSEvent":{"type":"object","required":["detail-type","resources","detail","id","source","time","region","version","account"],"x-amazon-events-detail-type":"Object Created","x-amazon-events-source":"aws.s3","properties":{"detail":{"$ref":"#/components/schemas/ObjectCreated"},"detail-type":{"type":"string"},"resources":{"type":"array","items":{"type":"string"}},"id":{"type":"string"},"source":{"type":"string"},"time":{"type":"string","format":"date-time"},"region":{"type":"string"},"version":{"type":"string"},"account":{"type":"string"}}},"Bucket":{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}},"Object":{"type":"object","required":["key","size"],"properties":{"key":{"type":"string"},"size":{"type":"integer","format":"int64"},"etag":{"type":"string"}}},"ObjectCreated":{"type":"object","required":["bucket","object","reason","version"],"properties":{"bucket":{"$ref":"#/components/schemas/Bucket"},"object":{"$ref":"#/components/schemas/Object"},"reason":{"type":"string"},"version":{"type":"string"}}}}}}"##,
-        ),
-    ],
-)];
+/// [`RegistryScope::Aws`]. [`aws_managed_schemas`] is the whole catalogue, and is
+/// what seeds the store.
+pub const AWS_SERVICE_EVENT_TYPES: &[ManagedEventType] = &[
+    ManagedEventType {
+        source: "aws.autoscaling",
+        detail_type: "EC2 Instance Launch Successful",
+        event_name: "EC2InstanceLaunchSuccessful",
+        components: r##"{"EC2InstanceLaunchSuccessful":{"type":"object","required":["AutoScalingGroupName","EC2InstanceId","RequestId"],"properties":{"AutoScalingGroupName":{"type":"string"},"EC2InstanceId":{"type":"string"},"RequestId":{"type":"string"}}}}"##,
+    },
+    ManagedEventType {
+        source: "aws.ec2",
+        detail_type: "EC2 Instance State-change Notification",
+        event_name: "EC2InstanceStateChangeNotification",
+        components: r##"{"EC2InstanceStateChangeNotification":{"type":"object","required":["instance-id","state"],"properties":{"instance-id":{"type":"string"},"state":{"type":"string"}}}}"##,
+    },
+    ManagedEventType {
+        source: "aws.s3",
+        detail_type: "Object Created",
+        event_name: "ObjectCreated",
+        components: r##"{"Bucket":{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}},"Object":{"type":"object","required":["key","size"],"properties":{"key":{"type":"string"},"size":{"type":"integer","format":"int64"},"etag":{"type":"string"}}},"ObjectCreated":{"type":"object","required":["bucket","object","reason","version"],"properties":{"bucket":{"$ref":"#/components/schemas/Bucket"},"object":{"$ref":"#/components/schemas/Object"},"reason":{"type":"string"},"version":{"type":"string"}}}}"##,
+    },
+    ManagedEventType {
+        source: "aws.batch",
+        detail_type: "Batch Job State Change",
+        event_name: "BatchJobStateChange",
+        components: r##"{"BatchJobStateChange":{"type":"object","required":["jobArn","jobDefinition","jobId","jobName","jobQueue","status"],"properties":{"createdAt":{"type":"integer","format":"int64"},"jobArn":{"type":"string"},"jobDefinition":{"type":"string"},"jobId":{"type":"string"},"jobName":{"type":"string"},"jobQueue":{"type":"string"},"startedAt":{"type":"integer","format":"int64"},"status":{"type":"string"},"statusReason":{"type":"string"},"stoppedAt":{"type":"integer","format":"int64"}}}}"##,
+    },
+    ManagedEventType {
+        source: "aws.codebuild",
+        detail_type: "CodeBuild Build State Change",
+        event_name: "CodeBuildBuildStateChange",
+        components: r##"{"CodeBuildBuildStateChange":{"type":"object","required":["build-id","build-status","project-name","version"],"properties":{"build-id":{"type":"string"},"build-status":{"type":"string"},"current-phase":{"type":"string"},"current-phase-context":{"type":"string"},"project-name":{"type":"string"},"version":{"type":"string"}}}}"##,
+    },
+    ManagedEventType {
+        source: "aws.codepipeline",
+        detail_type: "CodePipeline Pipeline Execution State Change",
+        event_name: "CodePipelinePipelineExecutionStateChange",
+        components: r##"{"CodePipelinePipelineExecutionStateChange":{"type":"object","required":["execution-id","pipeline","state","version"],"properties":{"execution-id":{"type":"string"},"pipeline":{"type":"string"},"state":{"type":"string"},"version":{"type":"number"}}}}"##,
+    },
+    ManagedEventType {
+        source: "aws.ecs",
+        detail_type: "ECS Task State Change",
+        event_name: "ECSTaskStateChange",
+        components: r##"{"ECSContainer":{"type":"object","required":["containerArn","lastStatus","name","taskArn"],"properties":{"containerArn":{"type":"string"},"exitCode":{"type":"integer"},"lastStatus":{"type":"string"},"name":{"type":"string"},"reason":{"type":"string"},"taskArn":{"type":"string"}}},"ECSTaskStateChange":{"type":"object","required":["clusterArn","desiredStatus","lastStatus","taskArn","taskDefinitionArn"],"properties":{"clusterArn":{"type":"string"},"containers":{"type":"array","items":{"$ref":"#/components/schemas/ECSContainer"}},"createdAt":{"type":"string","format":"date-time"},"desiredStatus":{"type":"string"},"group":{"type":"string"},"lastStatus":{"type":"string"},"launchType":{"type":"string"},"startedBy":{"type":"string"},"stoppedReason":{"type":"string"},"taskArn":{"type":"string"},"taskDefinitionArn":{"type":"string"},"updatedAt":{"type":"string","format":"date-time"}}}}"##,
+    },
+    ManagedEventType {
+        source: "aws.events",
+        detail_type: "Scheduled Event",
+        event_name: "ScheduledEvent",
+        components: r##"{"ScheduledEvent":{"type":"object","properties":{}}}"##,
+    },
+    ManagedEventType {
+        source: "aws.health",
+        detail_type: "AWS Health Event",
+        event_name: "AWSHealthEvent",
+        components: r##"{"AWSHealthEvent":{"type":"object","required":["eventArn","eventTypeCategory","eventTypeCode","service","startTime"],"properties":{"affectedEntities":{"type":"array","items":{"$ref":"#/components/schemas/AWSHealthAffectedEntity"}},"endTime":{"type":"string"},"eventArn":{"type":"string"},"eventDescription":{"type":"array","items":{"$ref":"#/components/schemas/AWSHealthEventDescription"}},"eventTypeCategory":{"type":"string"},"eventTypeCode":{"type":"string"},"service":{"type":"string"},"startTime":{"type":"string"}}},"AWSHealthAffectedEntity":{"type":"object","properties":{"entityValue":{"type":"string"},"status":{"type":"string"}}},"AWSHealthEventDescription":{"type":"object","properties":{"language":{"type":"string"},"latestDescription":{"type":"string"}}}}"##,
+    },
+    ManagedEventType {
+        source: "aws.tag",
+        detail_type: "Tag Change on Resource",
+        event_name: "TagChangeonResource",
+        components: r##"{"TagChangeonResource":{"type":"object","required":["changed-tag-keys","resource-type","service","version"],"properties":{"changed-tag-keys":{"type":"array","items":{"type":"string"}},"resource-type":{"type":"string"},"service":{"type":"string"},"tags":{"type":"object"},"version":{"type":"integer"}}}}"##,
+    },
+];
 
-/// The `Type` every schema in [`AWS_MANAGED_CATALOG`] is stored as: AWS stores its
+/// The `Type` every schema of the service-owned catalogue is stored as: AWS stores its
 /// event schemas as OpenAPI 3 documents, and `ExportSchema` is what converts one to
 /// JSON Schema draft 4.
 pub const AWS_MANAGED_SCHEMA_TYPE: &str = "OpenApi3";
 
-/// Build the service-owned registries [`AWS_MANAGED_CATALOG`] describes.
+/// The registry AWS publishes its discovered event schemas in — the read-only
+/// catalogue of every AWS service event type, which every account sees without
+/// creating anything.
+pub const AWS_MANAGED_REGISTRY: &str = "aws.events";
+
+/// Where an AWS event schema's OpenAPI document keeps its reusable components, as a
+/// `$ref` names one. Shared with `ExportSchema`, which rewrites these refs when it
+/// converts a document to JSON Schema draft 4.
+pub const OPENAPI_COMPONENT_REF: &str = "#/components/schemas/";
+
+/// The component an AWS event schema's OpenAPI document roots at: the event envelope,
+/// whose `detail` references the event-specific component. Shared with
+/// `ExportSchema`, which promotes this component to the root of its draft-4 export.
+pub const EVENT_ENVELOPE_COMPONENT: &str = "AWSEvent";
+
+/// The event name the CloudTrail-delivered API-call schema carries in the catalogue,
+/// i.e. the `<EventName>` half of `<source>@<EventName>`.
+///
+/// Source: the catalogue names a schema after its event's `detail-type` with the
+/// spaces taken out, so the `AWS API Call via CloudTrail` detail-type
+/// ([`CLOUD_TRAIL_DETAIL_TYPE`]) is published as `AWSAPICallviaCloudTrail` — the
+/// lower-case `via` is AWS's own, because the detail-type spells it that way.
+pub const CLOUD_TRAIL_EVENT_NAME: &str = "AWSAPICallviaCloudTrail";
+
+/// The `detail-type` EventBridge delivers a CloudTrail-recorded API call under.
+pub const CLOUD_TRAIL_DETAIL_TYPE: &str = "AWS API Call via CloudTrail";
+
+/// The `components.schemas` of the `AWSAPICallviaCloudTrail` document, excluding the
+/// envelope [`event_schema_document`] renders around them.
+///
+/// Source: the CloudTrail record contents AWS documents (CloudTrail User Guide,
+/// "CloudTrail record contents") — the `detail` of an `AWS API Call via CloudTrail`
+/// event IS a CloudTrail record, and the record's shape is the same for every event
+/// source, which is why one template serves all of [`AWS_EVENT_SOURCES`]. The nested
+/// `userIdentity`/`sessionContext`/`resources` structures are components of their own,
+/// as the document's `$ref`s name them.
+const CLOUD_TRAIL_COMPONENTS: &str = r##"{
+  "AWSAPICallviaCloudTrail": {
+    "type": "object",
+    "required": [
+      "eventID", "eventName", "eventSource", "eventTime", "eventVersion",
+      "awsRegion", "recipientAccountId", "requestID", "userIdentity"
+    ],
+    "properties": {
+      "additionalEventData": {"type": "object"},
+      "apiVersion": {"type": "string"},
+      "awsRegion": {"type": "string"},
+      "errorCode": {"type": "string"},
+      "errorMessage": {"type": "string"},
+      "eventCategory": {"type": "string"},
+      "eventID": {"type": "string"},
+      "eventName": {"type": "string"},
+      "eventSource": {"type": "string"},
+      "eventTime": {"type": "string", "format": "date-time"},
+      "eventType": {"type": "string"},
+      "eventVersion": {"type": "string"},
+      "managementEvent": {"type": "boolean"},
+      "readOnly": {"type": "boolean"},
+      "recipientAccountId": {"type": "string"},
+      "requestID": {"type": "string"},
+      "requestParameters": {"type": "object"},
+      "resources": {
+        "type": "array",
+        "items": {"$ref": "#/components/schemas/CloudTrailResource"}
+      },
+      "responseElements": {"type": "object"},
+      "serviceEventDetails": {"type": "object"},
+      "sharedEventID": {"type": "string"},
+      "sourceIPAddress": {"type": "string"},
+      "userAgent": {"type": "string"},
+      "userIdentity": {"$ref": "#/components/schemas/CloudTrailUserIdentity"},
+      "vpcEndpointId": {"type": "string"}
+    }
+  },
+  "CloudTrailResource": {
+    "type": "object",
+    "properties": {
+      "ARN": {"type": "string"},
+      "accountId": {"type": "string"},
+      "type": {"type": "string"}
+    }
+  },
+  "CloudTrailUserIdentity": {
+    "type": "object",
+    "properties": {
+      "accessKeyId": {"type": "string"},
+      "accountId": {"type": "string"},
+      "arn": {"type": "string"},
+      "invokedBy": {"type": "string"},
+      "principalId": {"type": "string"},
+      "sessionContext": {"$ref": "#/components/schemas/CloudTrailSessionContext"},
+      "type": {"type": "string"},
+      "userName": {"type": "string"}
+    }
+  },
+  "CloudTrailSessionContext": {
+    "type": "object",
+    "properties": {
+      "attributes": {"$ref": "#/components/schemas/CloudTrailSessionAttributes"},
+      "sessionIssuer": {"$ref": "#/components/schemas/CloudTrailSessionIssuer"},
+      "webIdFederationData": {"type": "object"}
+    }
+  },
+  "CloudTrailSessionAttributes": {
+    "type": "object",
+    "properties": {
+      "creationDate": {"type": "string", "format": "date-time"},
+      "mfaAuthenticated": {"type": "string"}
+    }
+  },
+  "CloudTrailSessionIssuer": {
+    "type": "object",
+    "properties": {
+      "accountId": {"type": "string"},
+      "arn": {"type": "string"},
+      "principalId": {"type": "string"},
+      "type": {"type": "string"},
+      "userName": {"type": "string"}
+    }
+  }
+}"##;
+
+/// The AWS event sources the managed catalogue holds a schema for — the `aws.<service>`
+/// namespaces EventBridge delivers AWS service events under.
+///
+/// Source: the event-source namespaces AWS publishes events under, one per service
+/// that records API calls in CloudTrail (EventBridge delivers those as the
+/// `AWS API Call via CloudTrail` detail-type, which is why every source below carries
+/// a [`CLOUD_TRAIL_EVENT_NAME`] schema in the catalogue). Kept in alphabetical order
+/// for reading; the store sorts by name on its own, and a name repeated here seeds one
+/// schema, not two.
+pub const AWS_EVENT_SOURCES: &[&str] = &[
+    "aws.a4b",
+    "aws.abuse",
+    "aws.access-analyzer",
+    "aws.account",
+    "aws.acm",
+    "aws.acm-pca",
+    "aws.airflow",
+    "aws.amplify",
+    "aws.amplifybackend",
+    "aws.amplifyuibuilder",
+    "aws.apigateway",
+    "aws.appconfig",
+    "aws.appflow",
+    "aws.appintegrations",
+    "aws.application-autoscaling",
+    "aws.application-insights",
+    "aws.applicationcostprofiler",
+    "aws.appmesh",
+    "aws.apprunner",
+    "aws.appstream",
+    "aws.appsync",
+    "aws.aps",
+    "aws.artifact",
+    "aws.athena",
+    "aws.auditmanager",
+    "aws.autoscaling",
+    "aws.autoscaling-plans",
+    "aws.backup",
+    "aws.backup-gateway",
+    "aws.batch",
+    "aws.billingconductor",
+    "aws.braket",
+    "aws.budgets",
+    "aws.cassandra",
+    "aws.ce",
+    "aws.chatbot",
+    "aws.chime",
+    "aws.cloud9",
+    "aws.clouddirectory",
+    "aws.cloudformation",
+    "aws.cloudfront",
+    "aws.cloudhsm",
+    "aws.cloudsearch",
+    "aws.cloudshell",
+    "aws.cloudtrail",
+    "aws.cloudwatch",
+    "aws.codeartifact",
+    "aws.codebuild",
+    "aws.codecommit",
+    "aws.codedeploy",
+    "aws.codeguru-profiler",
+    "aws.codeguru-reviewer",
+    "aws.codepipeline",
+    "aws.codestar",
+    "aws.codestar-connections",
+    "aws.codestar-notifications",
+    "aws.cognito-identity",
+    "aws.cognito-idp",
+    "aws.cognito-sync",
+    "aws.comprehend",
+    "aws.comprehendmedical",
+    "aws.compute-optimizer",
+    "aws.config",
+    "aws.connect",
+    "aws.connect-contact-lens",
+    "aws.controltower",
+    "aws.databrew",
+    "aws.dataexchange",
+    "aws.datapipeline",
+    "aws.datasync",
+    "aws.dax",
+    "aws.deepracer",
+    "aws.detective",
+    "aws.devicefarm",
+    "aws.devops-guru",
+    "aws.directconnect",
+    "aws.discovery",
+    "aws.dlm",
+    "aws.dms",
+    "aws.drs",
+    "aws.ds",
+    "aws.dynamodb",
+    "aws.ebs",
+    "aws.ec2",
+    "aws.ec2-instance-connect",
+    "aws.ecr",
+    "aws.ecr-public",
+    "aws.ecs",
+    "aws.eks",
+    "aws.elasticache",
+    "aws.elasticbeanstalk",
+    "aws.elasticfilesystem",
+    "aws.elasticloadbalancing",
+    "aws.elasticmapreduce",
+    "aws.elastictranscoder",
+    "aws.email",
+    "aws.emr-containers",
+    "aws.emr-serverless",
+    "aws.es",
+    "aws.events",
+    "aws.evidently",
+    "aws.finspace",
+    "aws.firehose",
+    "aws.fis",
+    "aws.fms",
+    "aws.forecast",
+    "aws.frauddetector",
+    "aws.fsx",
+    "aws.gamelift",
+    "aws.glacier",
+    "aws.globalaccelerator",
+    "aws.glue",
+    "aws.grafana",
+    "aws.greengrass",
+    "aws.groundstation",
+    "aws.guardduty",
+    "aws.health",
+    "aws.healthlake",
+    "aws.iam",
+    "aws.identitystore",
+    "aws.imagebuilder",
+    "aws.inspector",
+    "aws.inspector2",
+    "aws.iot",
+    "aws.iot1click",
+    "aws.iotanalytics",
+    "aws.iotdeviceadvisor",
+    "aws.iotevents",
+    "aws.iotfleethub",
+    "aws.iotsitewise",
+    "aws.iottwinmaker",
+    "aws.iotwireless",
+    "aws.ivs",
+    "aws.kafka",
+    "aws.kafkaconnect",
+    "aws.kendra",
+    "aws.kinesis",
+    "aws.kinesisanalytics",
+    "aws.kinesisvideo",
+    "aws.kms",
+    "aws.lakeformation",
+    "aws.lambda",
+    "aws.lex",
+    "aws.license-manager",
+    "aws.lightsail",
+    "aws.location",
+    "aws.logs",
+    "aws.lookoutequipment",
+    "aws.lookoutmetrics",
+    "aws.lookoutvision",
+    "aws.machinelearning",
+    "aws.macie",
+    "aws.managedblockchain",
+    "aws.mediaconnect",
+    "aws.mediaconvert",
+    "aws.medialive",
+    "aws.mediapackage",
+    "aws.mediapackage-vod",
+    "aws.mediastore",
+    "aws.mediatailor",
+    "aws.memorydb",
+    "aws.mgh",
+    "aws.mgn",
+    "aws.mq",
+    "aws.mturk",
+    "aws.neptune",
+    "aws.network-firewall",
+    "aws.networkmanager",
+    "aws.nimble",
+    "aws.opensearch",
+    "aws.opsworks",
+    "aws.organizations",
+    "aws.outposts",
+    "aws.panorama",
+    "aws.personalize",
+    "aws.pi",
+    "aws.pinpoint",
+    "aws.polly",
+    "aws.pricing",
+    "aws.proton",
+    "aws.qldb",
+    "aws.quicksight",
+    "aws.ram",
+    "aws.rbin",
+    "aws.rds",
+    "aws.redshift",
+    "aws.redshift-data",
+    "aws.redshift-serverless",
+    "aws.rekognition",
+    "aws.resiliencehub",
+    "aws.resource-groups",
+    "aws.robomaker",
+    "aws.route53",
+    "aws.route53domains",
+    "aws.route53resolver",
+    "aws.rum",
+    "aws.s3",
+    "aws.s3-outposts",
+    "aws.sagemaker",
+    "aws.savingsplans",
+    "aws.scheduler",
+    "aws.schemas",
+    "aws.sdb",
+    "aws.secretsmanager",
+    "aws.securityhub",
+    "aws.serverlessrepo",
+    "aws.servicecatalog",
+    "aws.servicediscovery",
+    "aws.servicequotas",
+    "aws.ses",
+    "aws.shield",
+    "aws.signer",
+    "aws.signin",
+    "aws.sms",
+    "aws.snowball",
+    "aws.sns",
+    "aws.sqs",
+    "aws.ssm",
+    "aws.ssm-contacts",
+    "aws.ssm-incidents",
+    "aws.sso",
+    "aws.states",
+    "aws.storagegateway",
+    "aws.sts",
+    "aws.support",
+    "aws.swf",
+    "aws.synthetics",
+    "aws.tag",
+    "aws.textract",
+    "aws.timestream",
+    "aws.transcribe",
+    "aws.transfer",
+    "aws.translate",
+    "aws.trustedadvisor",
+    "aws.voiceid",
+    "aws.waf",
+    "aws.waf-regional",
+    "aws.wafv2",
+    "aws.wellarchitected",
+    "aws.wisdom",
+    "aws.workdocs",
+    "aws.worklink",
+    "aws.workmail",
+    "aws.workspaces",
+    "aws.xray",
+];
+
+/// The service-owned registries a fresh store holds. Every entry of the catalogue
+/// lives in [`AWS_MANAGED_REGISTRY`], the one registry AWS publishes event schemas in.
+pub const AWS_MANAGED_REGISTRIES: &[&str] = &[AWS_MANAGED_REGISTRY];
+
+/// One AWS event type the service-owned catalogue holds a schema for.
+///
+/// It is the event's IDENTITY plus the shape of its `detail`; the OpenAPI document
+/// itself is rendered from them by [`event_schema_document`], because the envelope
+/// around `detail` is the same for every AWS event.
+#[derive(Debug, Clone, Copy)]
+pub struct ManagedEventType {
+    /// The event source that publishes it: `aws.<service>`.
+    pub source: &'static str,
+    /// The `detail-type` EventBridge delivers the event under.
+    pub detail_type: &'static str,
+    /// The name the catalogue publishes the event type under: the `<EventName>` half
+    /// of `<source>@<EventName>`, which AWS derives from the `detail_type`.
+    pub event_name: &'static str,
+    /// The document's `components.schemas` minus the envelope: the component the
+    /// envelope's `detail` references (the one named [`Self::event_name`]) together
+    /// with everything that component references in turn.
+    pub components: &'static str,
+}
+
+impl ManagedEventType {
+    /// The CloudTrail-delivered API-call event type of `source` — the one event type
+    /// every AWS event source publishes, so it is rendered per source rather than
+    /// written out per source.
+    pub const fn cloud_trail(source: &'static str) -> Self {
+        Self {
+            source,
+            detail_type: CLOUD_TRAIL_DETAIL_TYPE,
+            event_name: CLOUD_TRAIL_EVENT_NAME,
+            components: CLOUD_TRAIL_COMPONENTS,
+        }
+    }
+
+    /// `<source>@<EventName>` — the name the catalogue publishes this event type
+    /// under, which is what `ListSchemas` reports and `DescribeSchema` takes.
+    pub fn schema_name(&self) -> String {
+        format!("{}@{}", self.source, self.event_name)
+    }
+
+    /// This event type as the catalogue holds it. `None` when its document cannot be
+    /// rendered — see [`event_schema_document`].
+    pub fn schema(&self) -> Option<ManagedSchema> {
+        let name = self.schema_name();
+        Some(ManagedSchema {
+            description: managed_schema_description(&name),
+            content: event_schema_document(
+                self.source,
+                self.detail_type,
+                self.event_name,
+                self.components,
+            )?,
+            name,
+        })
+    }
+}
+
+/// One schema of the service-owned catalogue, as [`aws_managed_schemas`] renders it
+/// and the store seeds it.
+#[derive(Debug, Clone)]
+pub struct ManagedSchema {
+    /// `<source>@<EventName>`, the naming the catalogue publishes under.
+    pub name: String,
+    /// The sentence AWS describes a catalogue entry with — see
+    /// [`managed_schema_description`].
+    pub description: Option<String>,
+    /// The `OpenApi3` document of the event type, as `DescribeSchema` serves it and
+    /// `ExportSchema` converts it.
+    pub content: String,
+}
+
+/// The description a catalogue entry carries, derived from its name.
+///
+/// AWS describes every schema in the managed catalogue with one sentence built from
+/// the schema's own name: a `<source>@<EventName>` schema is "Schema for event type
+/// `<EventName>`, published by AWS service `<source>`". `None` for a name that is not
+/// of that form, which describes no event type and so has no such sentence.
+pub fn managed_schema_description(schema_name: &str) -> Option<String> {
+    let (source, event_name) = schema_name.split_once('@')?;
+    Some(format!(
+        "Schema for event type {event_name}, published by AWS service {source}"
+    ))
+}
+
+/// Render the `OpenApi3` document of one AWS event type: the envelope every AWS event
+/// shares, wrapped around the `components` of its `detail`.
+///
+/// The envelope is the same for every AWS event — the EventBridge event fields
+/// (`detail-type`, `source`, `time`, `region`, `account`, `id`, `resources`,
+/// `version`) with `detail` referencing the event-specific component — so it is
+/// rendered here rather than repeated per entry; `detail_type` and `source` are
+/// stamped on it as the `x-amazon-events-*` extensions AWS's documents carry.
+///
+/// `None` when `components` is not a JSON object, or does not define the component the
+/// envelope's `detail` must reference (the one named after the event): that is a
+/// document with nothing to describe, and the catalogue leaves it out rather than
+/// seeding a schema whose `detail` dangles.
+fn event_schema_document(
+    source: &str,
+    detail_type: &str,
+    event_name: &str,
+    components: &str,
+) -> Option<String> {
+    let mut schemas = match ::serde_json::from_str(components).ok()? {
+        ::serde_json::Value::Object(schemas) => schemas,
+        _ => return None,
+    };
+    if !schemas.contains_key(event_name) {
+        return None;
+    }
+    schemas.insert(
+        EVENT_ENVELOPE_COMPONENT.to_string(),
+        ::serde_json::json!({
+            "type": "object",
+            "required": [
+                "detail-type", "resources", "detail", "id", "source", "time",
+                "region", "version", "account"
+            ],
+            "x-amazon-events-detail-type": detail_type,
+            "x-amazon-events-source": source,
+            "properties": {
+                "account": {"type": "string"},
+                "detail": {"$ref": format!("{OPENAPI_COMPONENT_REF}{event_name}")},
+                "detail-type": {"type": "string"},
+                "id": {"type": "string"},
+                "region": {"type": "string"},
+                "resources": {"type": "array", "items": {"type": "string"}},
+                "source": {"type": "string"},
+                "time": {"type": "string", "format": "date-time"},
+                "version": {"type": "string"}
+            }
+        }),
+    );
+    ::serde_json::to_string(&::serde_json::json!({
+        "openapi": "3.0.0",
+        "info": {"version": "1.0.0", "title": event_name},
+        "paths": {},
+        "components": {"schemas": schemas}
+    }))
+    .ok()
+}
+
+/// Every event type the service-owned catalogue holds a schema for: the
+/// CloudTrail API-call event type of every source in [`AWS_EVENT_SOURCES`], followed
+/// by the service-specific event types in [`AWS_SERVICE_EVENT_TYPES`].
+///
+/// The service-specific entries come last, so one of them wins over a generated entry
+/// of the same name: the store seeds entries in this order and keys them by name.
+pub fn aws_managed_event_types() -> Vec<ManagedEventType> {
+    AWS_EVENT_SOURCES
+        .iter()
+        .map(|source| ManagedEventType::cloud_trail(source))
+        .chain(AWS_SERVICE_EVENT_TYPES.iter().copied())
+        .collect()
+}
+
+/// The whole service-owned catalogue, one entry per schema: every event type
+/// [`aws_managed_event_types`] names, as the name, description and document the store
+/// seeds and the read operations report.
+///
+/// Rendered ONCE per process and handed out by reference afterwards: the catalogue is
+/// built from constants, so it is the same in every store, and rendering it renders
+/// every member's document.
+pub fn aws_managed_schemas() -> &'static [ManagedSchema] {
+    static CATALOGUE: ::std::sync::OnceLock<Vec<ManagedSchema>> = ::std::sync::OnceLock::new();
+    CATALOGUE.get_or_init(|| {
+        aws_managed_event_types()
+            .iter()
+            .map(|event| {
+                // A row whose `components` do not parse, or do not define the
+                // component named after the event, describes no event type. That is a
+                // typo in the seed data above rather than a runtime condition — the
+                // rows are constants — so it fails here, in every build, rather than
+                // quietly shrinking the catalogue the service serves.
+                event.schema().unwrap_or_else(|| {
+                    panic!(
+                        "the seeded event type {}@{} must render a document",
+                        event.source, event.event_name
+                    )
+                })
+            })
+            .collect()
+    })
+}
+
+/// Build the service-owned registries and seed them with [`aws_managed_schemas`].
 ///
 /// Their ARNs are left empty: a service-owned registry is minted by no request, so no
 /// request's region is stored for it, and [`Registry::arn_in`] derives the ARN from
@@ -374,51 +987,56 @@ fn aws_managed_registries() -> BTreeMap<String, Registry> {
     // One clock reading for the whole catalogue: it materialises with the store, in
     // one instant, rather than one instant per entry.
     let now = SystemTime::now();
-    AWS_MANAGED_CATALOG
+    let mut registries: BTreeMap<String, Registry> = AWS_MANAGED_REGISTRIES
         .iter()
-        .map(|(registry_name, schemas)| {
-            let registry = Registry {
-                name: (*registry_name).to_string(),
-                arn: String::new(),
-                description: None,
-                tags: BTreeMap::new(),
-                scope: RegistryScope::Aws,
-                // A service-owned registry carries no caller-written policy.
-                policy: None,
-                schemas: schemas
-                    .iter()
-                    .map(|(schema_name, content)| {
-                        (
-                            (*schema_name).to_string(),
-                            Schema {
-                                name: (*schema_name).to_string(),
-                                arn: String::new(),
-                                description: None,
-                                r#type: AWS_MANAGED_SCHEMA_TYPE.to_string(),
-                                tags: BTreeMap::new(),
-                                latest_version: 1,
-                                last_modified: now,
-                                versions: ::std::iter::once((
-                                    1,
-                                    SchemaVersion {
-                                        version: 1,
-                                        content: (*content).to_string(),
-                                        r#type: AWS_MANAGED_SCHEMA_TYPE.to_string(),
-                                        description: None,
-                                        created_date: now,
-                                    },
-                                ))
-                                .collect(),
-                                minted_by_token: BTreeMap::new(),
-                                code_bindings: BTreeMap::new(),
-                            },
-                        )
-                    })
-                    .collect(),
-            };
-            ((*registry_name).to_string(), registry)
+        .map(|name| {
+            (
+                (*name).to_string(),
+                Registry {
+                    name: (*name).to_string(),
+                    arn: String::new(),
+                    description: None,
+                    tags: BTreeMap::new(),
+                    scope: RegistryScope::Aws,
+                    // A service-owned registry carries no caller-written policy.
+                    policy: None,
+                    schemas: BTreeMap::new(),
+                },
+            )
         })
-        .collect()
+        .collect();
+
+    let Some(registry) = registries.get_mut(AWS_MANAGED_REGISTRY) else {
+        return registries;
+    };
+    for entry in aws_managed_schemas() {
+        registry.schemas.insert(
+            entry.name.clone(),
+            Schema {
+                name: entry.name.clone(),
+                arn: String::new(),
+                description: entry.description.clone(),
+                r#type: AWS_MANAGED_SCHEMA_TYPE.to_string(),
+                tags: BTreeMap::new(),
+                latest_version: 1,
+                last_modified: now,
+                versions: ::std::iter::once((
+                    1,
+                    SchemaVersion {
+                        version: 1,
+                        content: entry.content.clone(),
+                        r#type: AWS_MANAGED_SCHEMA_TYPE.to_string(),
+                        description: entry.description.clone(),
+                        created_date: now,
+                    },
+                ))
+                .collect(),
+                minted_by_token: BTreeMap::new(),
+                code_bindings: BTreeMap::new(),
+            },
+        );
+    }
+    registries
 }
 
 /// The languages this service generates code bindings for, in the identifiers the
@@ -1108,6 +1726,8 @@ pub fn invalid_next_token() -> BadRequestException {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeSet;
+
     /// The selection the helper's own tests page under; its shape does not matter
     /// here, only that it is the same one on both sides of a token.
     const SELECTION: &str = "prefix=;scope=Local";
@@ -1401,16 +2021,20 @@ mod tests {
         }
     }
 
-    /// A fresh store already holds the service-owned catalogue, with every entry
-    /// AWS-scoped and carrying one stored version of the type AWS stores it as.
+    /// A fresh store already holds the service-owned catalogue: every entry of
+    /// [`aws_managed_schemas`] is seeded into the AWS-scoped registry, with one
+    /// stored version of the type AWS stores it as, the document rendered for it and
+    /// the description derived from its name.
     #[test]
     fn a_fresh_store_holds_the_aws_managed_catalogue() {
         let state = ComAmazonawsSchemasSchemasState::default();
-        assert!(
-            !AWS_MANAGED_CATALOG.is_empty(),
-            "the catalogue must name at least one registry"
+        let catalogue = aws_managed_schemas();
+        assert_eq!(
+            catalogue.len(),
+            aws_managed_event_types().len(),
+            "every event type the catalogue names must render a document"
         );
-        for (registry_name, schemas) in AWS_MANAGED_CATALOG {
+        for registry_name in AWS_MANAGED_REGISTRIES {
             let registry = state
                 .registries
                 .get(*registry_name)
@@ -1422,36 +2046,101 @@ mod tests {
                 registry.scope
             );
             assert!(
-                !schemas.is_empty(),
+                !registry.schemas.is_empty(),
                 "case {registry_name:?}: a seeded registry must hold schemas"
             );
-            for (schema_name, content) in *schemas {
-                let schema = registry
-                    .schemas
-                    .get(*schema_name)
-                    .unwrap_or_else(|| panic!("case {schema_name:?}: must be seeded"));
-                assert_eq!(
-                    schema.r#type, AWS_MANAGED_SCHEMA_TYPE,
-                    "case {schema_name:?}: expected {AWS_MANAGED_SCHEMA_TYPE}, got {:?}",
-                    schema.r#type
-                );
-                let version = schema
-                    .version_for(None)
-                    .unwrap_or_else(|| panic!("case {schema_name:?}: has a latest version"));
-                assert_eq!(
-                    version.content, *content,
-                    "case {schema_name:?}: the seeded content is stored verbatim"
-                );
-                // The catalogue's documents are what ExportSchema converts, so each
-                // one has to BE an OpenAPI 3 document with component schemas.
-                let parsed: ::serde_json::Value = ::serde_json::from_str(content)
-                    .unwrap_or_else(|e| panic!("case {schema_name:?}: must be JSON: {e}"));
-                assert!(
-                    parsed["components"]["schemas"].is_object(),
-                    "case {schema_name:?}: must carry components.schemas, got {parsed:?}"
-                );
-            }
         }
+        let registry = &state.registries[AWS_MANAGED_REGISTRY];
+        assert_eq!(
+            registry.schemas.len(),
+            catalogue.len(),
+            "the registry holds exactly the catalogue, got {} of {}",
+            registry.schemas.len(),
+            catalogue.len()
+        );
+        for entry in catalogue {
+            let schema_name = &entry.name;
+            let schema = registry
+                .schemas
+                .get(schema_name)
+                .unwrap_or_else(|| panic!("case {schema_name:?}: must be seeded"));
+            assert_eq!(
+                schema.r#type, AWS_MANAGED_SCHEMA_TYPE,
+                "case {schema_name:?}: expected {AWS_MANAGED_SCHEMA_TYPE}, got {:?}",
+                schema.r#type
+            );
+            assert_eq!(
+                schema.description, entry.description,
+                "case {schema_name:?}: expected {:?}, got {:?}",
+                entry.description, schema.description
+            );
+            let version = schema
+                .version_for(None)
+                .unwrap_or_else(|| panic!("case {schema_name:?}: has a latest version"));
+            assert_eq!(
+                version.content, entry.content,
+                "case {schema_name:?}: the seeded content is stored verbatim"
+            );
+            // The catalogue's documents are what ExportSchema converts, so each
+            // one has to BE an OpenAPI 3 document whose envelope's `detail`
+            // references a component the document defines.
+            let parsed: ::serde_json::Value = ::serde_json::from_str(&entry.content)
+                .unwrap_or_else(|e| panic!("case {schema_name:?}: must be JSON: {e}"));
+            let components = &parsed["components"]["schemas"];
+            assert!(
+                components.is_object(),
+                "case {schema_name:?}: must carry components.schemas, got {parsed:?}"
+            );
+            let detail = components[EVENT_ENVELOPE_COMPONENT]["properties"]["detail"]["$ref"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let referenced = detail
+                .strip_prefix(OPENAPI_COMPONENT_REF)
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                !referenced.is_empty() && components[&referenced].is_object(),
+                "case {schema_name:?}: the envelope's detail must reference a defined \
+                 component, got {detail:?}"
+            );
+        }
+    }
+
+    /// Every event type the catalogue names is published under `<source>@<EventName>`
+    /// and described by the sentence that name yields, and no name is seeded twice.
+    #[test]
+    fn the_catalogue_names_and_describes_every_event_type() {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for event in aws_managed_event_types() {
+            let name = event.schema_name();
+            assert_eq!(
+                name,
+                format!("{}@{}", event.source, event.event_name),
+                "case {name:?}: a catalogue name is <source>@<EventName>"
+            );
+            assert_eq!(
+                managed_schema_description(&name),
+                Some(format!(
+                    "Schema for event type {}, published by AWS service {}",
+                    event.event_name, event.source
+                )),
+                "case {name:?}: wrong description"
+            );
+            assert!(
+                event.source.starts_with("aws."),
+                "case {name:?}: an AWS event source is `aws.<service>`"
+            );
+            assert!(
+                seen.insert(name.clone()),
+                "case {name:?}: the catalogue names it twice"
+            );
+        }
+        assert_eq!(
+            managed_schema_description("no-event-type-here"),
+            None,
+            "a name that is not <source>@<EventName> describes no event type"
+        );
     }
 
     /// A service-owned registry reports the region of the request asking, because no
@@ -1459,7 +2148,7 @@ mod tests {
     #[test]
     fn a_managed_registry_reports_the_asking_region() {
         let state = ComAmazonawsSchemasSchemasState::default();
-        let (managed_name, _) = AWS_MANAGED_CATALOG[0];
+        let managed_name = AWS_MANAGED_REGISTRY;
         let managed = &state.registries[managed_name];
         for region in ["us-east-1", "eu-west-2", "ap-southeast-1"] {
             assert_eq!(
