@@ -21,13 +21,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque `NextToken` cursors for ListRoutingControls are hex-encoded with this
+# crate (already a workspace dependency) rather than a hand-written codec.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
