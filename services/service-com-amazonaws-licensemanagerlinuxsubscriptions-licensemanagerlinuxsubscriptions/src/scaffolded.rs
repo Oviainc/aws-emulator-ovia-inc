@@ -40,6 +40,18 @@
 //! place it can return an error its own model does not declare — `validation` above,
 //! for a service whose model carries no client-input error. Delete the wrapper and the
 //! handler has no way to refuse a bad request at all.
+//!
+//! ## The tagging surface's own taxonomy
+//!
+//! The tag APIs of this service (`/tags/{resourceArn}`) answer their own error
+//! taxonomy rather than the generic `ValidationException` their models list: a
+//! `resourceArn` the service cannot parse as a resource ARN is `BadRequestException`
+//! ([`Scaffolded::invalid_resource_arn`], and the same refusal at the request boundary
+//! is worded in `crate::service::validation`), one that addresses no resource is
+//! `NotFoundException` ([`Scaffolded::not_found`]), and a tag set past the size a
+//! resource may carry is `BadRequestException`
+//! ([`Scaffolded::tag_limit_exceeded`]). None of those codes is a shape this service's
+//! model declares, so they travel as [`Scaffolded::Unmodeled`].
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -221,19 +233,25 @@ pub const NOT_FOUND_STATUS: u16 = 400;
 /// The text that refusal carries: a CONSTANT, naming nothing from the request.
 pub const NOT_FOUND_MESSAGE: &str = "Resource was not found";
 /// The wire error code the tag APIs answer when the tag set a write would leave on the
-/// resource is larger than the resource may carry.
+/// resource is larger than the resource may carry, and when the `resourceArn` they were
+/// given cannot be parsed as a resource ARN at all.
 pub const BAD_REQUEST_CODE: &str = "BadRequestException";
 /// The HTTP status of that refusal.
 pub const BAD_REQUEST_STATUS: u16 = 400;
 /// The text that refusal carries, naming the limit and nothing from the request.
 pub const TAG_LIMIT_MESSAGE: &str = "The resultant tag set must not have more than 50 user tags.";
+/// The text the tag APIs' refusal of an unparseable `resourceArn` carries: a CONSTANT,
+/// naming neither the member nor the value — which is what distinguishes it from the
+/// constraint envelope `crate::service::validation` states for every other member.
+pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn: bad syntax";
 
 /// One refusal this service states with an error code its model does not declare.
 ///
 /// It carries its own wire code, HTTP status and message precisely because the shape is
 /// not in the model, so there is no `#[operation_error]` variant that could render it.
-/// The two this service states are [`not_found`](Self::not_found) (HTTP 400
-/// `NotFoundException`) and [`tag_limit_exceeded`](Self::tag_limit_exceeded) (HTTP 400
+/// The three this service states are [`not_found`](Self::not_found) (HTTP 400
+/// `NotFoundException`), [`tag_limit_exceeded`](Self::tag_limit_exceeded) and
+/// [`invalid_resource_arn`](Self::invalid_resource_arn) (HTTP 400
 /// `BadRequestException`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnmodeledRefusal {
@@ -263,6 +281,17 @@ impl UnmodeledRefusal {
             code: BAD_REQUEST_CODE,
             status: BAD_REQUEST_STATUS,
             message: TAG_LIMIT_MESSAGE,
+        }
+    }
+
+    /// The tag APIs' refusal of a `resourceArn` they cannot parse as a resource ARN:
+    /// HTTP 400 `BadRequestException`. The FORMAT stage, ahead of the existence stage
+    /// [`not_found`](Self::not_found) answers.
+    pub const fn invalid_resource_arn() -> Self {
+        Self {
+            code: BAD_REQUEST_CODE,
+            status: BAD_REQUEST_STATUS,
+            message: INVALID_RESOURCE_ARN_MESSAGE,
         }
     }
 }
@@ -341,6 +370,19 @@ impl<E> Scaffolded<E> {
     /// SERVICE models that this OPERATION does not list.
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
+    }
+
+    /// Refuse the request the way the tag APIs refuse a `resourceArn` they cannot parse
+    /// as a resource ARN: HTTP 400 `BadRequestException`, the FORMAT stage ahead of the
+    /// existence stage [`not_found`](Self::not_found) answers.
+    ///
+    /// Every value this service's tag APIs cannot parse is outside the modelled
+    /// `@pattern` on their `resourceArn` label, so the refusal is reached at the request
+    /// boundary (`crate::service::validation`) rather than from a handler; this
+    /// constructor is what a tag operation would use if it ever had to state the same
+    /// refusal after the boundary passed a value it still cannot address.
+    pub const fn invalid_resource_arn() -> Self {
+        Self::Unmodeled(UnmodeledRefusal::invalid_resource_arn())
     }
 }
 
@@ -427,7 +469,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
-            // Same reason: the synthetic shape carries no `awsQueryError` trait.
+            // Same reason: the synthetic shape carries no `awsQueryError` trait — and
+            // this service is restJson1, which has no query envelope at all.
             Self::Unmodeled(_) => None,
             Self::ValidationException(_) => None,
         }
