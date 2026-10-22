@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints a snapshot, persists it in [`crate::state`] and answers from the
+//! stored record. `ClientToken` makes the call idempotent; `ParentSnapshotId` seeds the
+//! new snapshot with a copy of the parent's blocks.
 //!
 //! ## Shape of an operation
 //!
@@ -148,6 +143,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+use std::time::SystemTime;
+
+use crate::state::{
+    expiry_from_timeout, fingerprint_hex_sha256, BlockEntry, Snapshot, SnapshotStatus, SseType,
+    StartSnapshotIdempotencyRecord, StoredTag, DEFAULT_SNAPSHOT_TIMEOUT_MINUTES,
+    MAX_STORED_BLOCKS_PER_SNAPSHOT, MAX_STORED_BLOCKS_TOTAL, MAX_STORED_SNAPSHOTS,
+    MAX_VOLUME_SIZE_GIB, SNAPSHOT_BLOCK_SIZE_BYTES,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -223,18 +228,262 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSnapshot"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.expire_due_snapshots(now);
+
+        // `VolumeSize`: "The maximum size is 65536 GiB (64 TiB)." The model carries only
+        // the minimum, so the documented maximum is refused here.
+        if input.volume_size > MAX_VOLUME_SIZE_GIB {
+            return Err(validation(
+                "INVALID_VOLUME_SIZE",
+                format!(
+                    "VolumeSize {} exceeds the maximum snapshot volume size of {MAX_VOLUME_SIZE_GIB} GiB",
+                    input.volume_size
+                ),
+            ));
+        }
+
+        // `Encrypted`: "You can't specify Encrypted and ParentSnapshotId in the same
+        // request. If you specify both parameters, the request fails with
+        // ValidationException."
+        if input.encrypted == Some(true) && input.parent_snapshot_id.is_some() {
+            return Err(validation(
+                "INVALID_PARAMETER_VALUE",
+                "Encrypted and ParentSnapshotId cannot both be specified in the same request"
+                    .to_string(),
+            ));
+        }
+
+        // `ClientToken` idempotency: the same token replays the original answer, a
+        // different request under the same token is the modeled `ConflictException`.
+        let fingerprint = request_fingerprint(&input);
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(record) = store.client_tokens.get(token) {
+                if record.request_fingerprint != fingerprint {
+                    return Err(StartSnapshotErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(format!(
+                                "ClientToken {token} was already used for a different StartSnapshot request"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                let snapshot_id = record.snapshot_id.clone();
+                let snapshot = store.snapshots.get(&snapshot_id).ok_or_else(|| {
+                    no_state_message(format!(
+                        "ClientToken {token} names snapshot {snapshot_id}, which is no longer stored"
+                    ))
+                })?;
+                return Ok(response_for(snapshot));
+            }
+        }
+
+        // `ParentSnapshotId` must name a snapshot that exists and is sealed; the new
+        // snapshot starts from a copy of its blocks.
+        let (parent_blocks, parent_sse) = match input.parent_snapshot_id.as_deref() {
+            Some(parent_id) => {
+                let parent = store
+                    .snapshots
+                    .get(parent_id)
+                    .filter(|snapshot| snapshot.status == SnapshotStatus::Completed)
+                    .ok_or_else(|| {
+                        not_found(format!(
+                            "no completed snapshot {parent_id} exists to use as ParentSnapshotId"
+                        ))
+                    })?;
+                (Some(parent.blocks.clone()), Some(parent.sse_type))
+            }
+            None => (None, None),
+        };
+
+        // The store this call grows is bounded: one new snapshot record, plus one copied
+        // block per block of the parent. Both are emulator storage quotas, so both are
+        // the modeled `ServiceQuotaExceededException` (HTTP 402).
+        if store.snapshots.len() >= MAX_STORED_SNAPSHOTS {
+            return Err(quota_exceeded(format!(
+                "this emulator holds the maximum of {MAX_STORED_SNAPSHOTS} snapshots"
+            )));
+        }
+        let copied = parent_blocks.as_ref().map_or(0, BTreeMap::len);
+        if copied > MAX_STORED_BLOCKS_PER_SNAPSHOT
+            || store.stored_block_count().saturating_add(copied) > MAX_STORED_BLOCKS_TOTAL
+        {
+            return Err(quota_exceeded(format!(
+                "copying {copied} parent blocks would exceed this emulator's limit of \
+                 {MAX_STORED_BLOCKS_PER_SNAPSHOT} blocks per snapshot and \
+                 {MAX_STORED_BLOCKS_TOTAL} blocks in total"
+            )));
+        }
+
+        let snapshot_id = store.mint_snapshot_id();
+        let mut blocks = BTreeMap::new();
+        // The parent's map was cloned once above; its entries are MOVED into the child
+        // here rather than cloned a second time.
+        for (block_index, entry) in parent_blocks.into_iter().flatten() {
+            let block_token = store.mint_block_token(&snapshot_id, block_index);
+            blocks.insert(block_index, BlockEntry { block_token, ..entry });
+        }
+
+        let encrypted = input.encrypted == Some(true) || input.kms_key_arn.is_some();
+        let sse_type = if input.kms_key_arn.is_some() {
+            SseType::SseKms
+        } else if encrypted {
+            SseType::SseEbs
+        } else {
+            // An unencrypted request inherits whatever the parent carried.
+            parent_sse.unwrap_or(SseType::None)
+        };
+        let timeout_minutes = input.timeout.unwrap_or(DEFAULT_SNAPSHOT_TIMEOUT_MINUTES);
+
+        let snapshot = Snapshot {
+            snapshot_id: snapshot_id.clone(),
+            owner_id: ::engine::emulator_account_id().to_string(),
+            // "The new snapshot enters the pending state after the request completes."
+            status: SnapshotStatus::Pending,
+            volume_size: input.volume_size,
+            block_size: SNAPSHOT_BLOCK_SIZE_BYTES,
+            start_time: now,
+            expiry_time: expiry_from_timeout(now, timeout_minutes),
+            description: input.description.clone(),
+            tags: input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| StoredTag {
+                    key: tag.key,
+                    value: tag.value,
+                })
+                .collect(),
+            parent_snapshot_id: input.parent_snapshot_id.clone(),
+            kms_key_arn: input.kms_key_arn.clone(),
+            encrypted,
+            sse_type,
+            timeout_minutes,
+            blocks,
+        };
+        store.snapshots.insert(snapshot_id.clone(), snapshot);
+        store.refresh_expiry_schedule();
+        if let Some(token) = input.client_token.as_deref() {
+            store.client_tokens.insert(
+                token.to_string(),
+                StartSnapshotIdempotencyRecord {
+                    snapshot_id: snapshot_id.clone(),
+                    request_fingerprint: fingerprint,
+                },
+            );
+        }
+
+        // Answer from the record that was just persisted, never from the request.
+        let stored = store.snapshots.get(&snapshot_id).ok_or_else(|| {
+            no_state_message(format!("snapshot {snapshot_id} was not persisted"))
+        })?;
+        Ok(response_for(stored))
+    }
+}
+
+/// The modelled server error for an engine that holds no state for this service.
+fn no_state() -> StartSnapshotError {
+    no_state_message(
+        "the com-amazonaws-ebs-ebs service is mounted on an engine that holds no state"
+            .to_string(),
+    )
+}
+
+/// The modelled server error carrying `message`.
+fn no_state_message(message: String) -> StartSnapshotError {
+    StartSnapshotErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400) with one of `ValidationExceptionReason`'s
+/// values.
+fn validation(reason: &str, message: String) -> StartSnapshotError {
+    StartSnapshotErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+        reason: Some(reason.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) for an absent snapshot.
+fn not_found(message: String) -> StartSnapshotError {
+    StartSnapshotErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        reason: Some("SNAPSHOT_NOT_FOUND".to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ServiceQuotaExceededException` (HTTP 402) for an emulator storage limit.
+fn quota_exceeded(message: String) -> StartSnapshotError {
+    StartSnapshotErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message: Some(message),
+        reason: None,
+    })
+    .into()
+}
+
+/// A stable digest of the request members a `ClientToken` is scoped to, so a retry of
+/// the identical request is recognised and a different one is a `ConflictException`.
+fn request_fingerprint(input: &StartSnapshotInput) -> String {
+    let mut canonical = String::new();
+    canonical.push_str(&format!("VolumeSize={}\n", input.volume_size));
+    canonical.push_str(&format!(
+        "ParentSnapshotId={}\n",
+        input.parent_snapshot_id.as_deref().unwrap_or_default()
+    ));
+    canonical.push_str(&format!(
+        "Description={}\n",
+        input.description.as_deref().unwrap_or_default()
+    ));
+    canonical.push_str(&format!(
+        "Encrypted={}\n",
+        input.encrypted.unwrap_or(false)
+    ));
+    canonical.push_str(&format!(
+        "KmsKeyArn={}\n",
+        input.kms_key_arn.as_deref().unwrap_or_default()
+    ));
+    canonical.push_str(&format!("Timeout={}\n", input.timeout.unwrap_or_default()));
+    for tag in input.tags.iter().flatten() {
+        canonical.push_str(&format!(
+            "Tag={}={}\n",
+            tag.key.as_deref().unwrap_or_default(),
+            tag.value.as_deref().unwrap_or_default()
+        ));
+    }
+    fingerprint_hex_sha256(canonical.as_bytes())
+}
+
+/// Render the stored snapshot as this operation's output.
+fn response_for(snapshot: &Snapshot) -> StartSnapshotOutput {
+    StartSnapshotOutput {
+        description: snapshot.description.clone(),
+        snapshot_id: Some(snapshot.snapshot_id.clone()),
+        owner_id: Some(snapshot.owner_id.clone()),
+        status: Some(snapshot.status.as_wire().to_string()),
+        start_time: Some(::aws_smithy_types::DateTime::from(snapshot.start_time)),
+        volume_size: Some(snapshot.volume_size),
+        block_size: Some(snapshot.block_size),
+        tags: Some(
+            snapshot
+                .tags
+                .iter()
+                .map(|tag| Tag {
+                    key: tag.key.clone(),
+                    value: tag.value.clone(),
+                })
+                .collect(),
+        ),
+        parent_snapshot_id: snapshot.parent_snapshot_id.clone(),
+        kms_key_arn: snapshot.kms_key_arn.clone(),
+        sse_type: Some(snapshot.sse_type.as_wire().to_string()),
     }
 }
