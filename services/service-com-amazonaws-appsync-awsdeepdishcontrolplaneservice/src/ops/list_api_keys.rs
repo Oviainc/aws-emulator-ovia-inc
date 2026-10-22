@@ -158,10 +158,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource: it is refused BEFORE the lookup, with the modelled
+        // `BadRequestException` (400). `NotFoundException` (404) is reserved for an id
+        // that could name an API but names none.
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(ListApiKeysErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+
         let guard = state.lock();
         let Some(api) = guard.graphql_apis.get(&input.api_id) else {
             return Err(ListApiKeysErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("No GraphQL API found with ID {}", input.api_id)),
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         };
@@ -176,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.max_results,
         ) else {
             return Err(ListApiKeysErrorModeled::BadRequestException(BadRequestException {
-                message: Some("nextToken does not name a page of this list".to_string()),
+                message: Some(crate::state::INVALID_PAGINATION_TOKEN_MESSAGE.to_string()),
                 ..Default::default()
             })
             .into());

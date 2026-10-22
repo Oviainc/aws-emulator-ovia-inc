@@ -13,6 +13,10 @@
 //! table of page sizes, `minimumCompressionSize` over its published bounds and one past
 //! each, and the HTTP verbs a method accepts over the whole catalog plus verbs outside
 //! it.
+//!
+//! [`Gateway`], [`Answer`], [`create_api`] and [`string_member`] are this crate's one
+//! wire-test harness, so a sibling suite (`api_key_lifecycle`) reuses them rather than
+//! standing a second emulator up its own way.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -23,20 +27,20 @@ use service_com_amazonaws_apigateway_backplanecontrolservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// One emulator with this service mounted on a fresh shared engine.
-struct Gateway {
+pub(crate) struct Gateway {
     router: MultiServiceRouter,
 }
 
 /// One answered request: the HTTP status, the `x-amzn-errortype` error code when the
 /// answer is a failure, and the parsed JSON body (`Value::Null` for an empty body).
-struct Answer {
-    status: u16,
-    error: Option<String>,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) error: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Gateway {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The tests exercise the service, not SigV4: requests carry a credential scope
@@ -46,7 +50,7 @@ impl Gateway {
         Self { router }
     }
 
-    async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
+    pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
         let payload = body.map(|value| value.to_string()).unwrap_or_default();
         let request = http::Request::builder()
             .method(method)
@@ -83,7 +87,7 @@ impl Gateway {
 }
 
 /// `CreateRestApi` for `name`, returning the API id and its root resource id.
-async fn create_api(gateway: &Gateway, name: &str) -> (String, String) {
+pub(crate) async fn create_api(gateway: &Gateway, name: &str) -> (String, String) {
     let answer = gateway
         .call("POST", "/restapis", Some(json!({ "name": name })))
         .await;
@@ -119,7 +123,7 @@ async fn create_resource(gateway: &Gateway, api: &str, parent: &str, path_part: 
 }
 
 /// A required string member of a response body, with the case named on failure.
-fn string_member(body: &Value, member: &str, case: &str) -> String {
+pub(crate) fn string_member(body: &Value, member: &str, case: &str) -> String {
     body[member]
         .as_str()
         .unwrap_or_else(|| panic!("case {case}: expected a string {member}, got {body:?}"))

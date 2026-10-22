@@ -68,6 +68,23 @@ fn endpoint_host(parts: &http::request::Parts) -> Option<String> {
     (!without_port.is_empty()).then_some(without_port)
 }
 
+/// Whether `host` is this service's own endpoint: the modelled prefix itself, or that
+/// prefix followed by a dot (`portal.sso.<region>.amazonaws.com`). A dot is required so
+/// a host that merely STARTS with the prefix (`portal.ssoother.example`) is not this
+/// endpoint.
+///
+/// What follows that dot is DELIBERATELY unconstrained: the model publishes the endpoint
+/// prefix, not the region labels or the partition's DNS suffix, so pinning a suffix here
+/// would be invented data, and an emulator is reached through whatever endpoint its
+/// operator configured. A host naming another partition is served; only the fidelity of
+/// endpoint resolution — which this emulator does not model — would refuse it.
+fn is_portal_endpoint(host: &str) -> bool {
+    host == PORTAL_ENDPOINT_PREFIX
+        || host
+            .strip_prefix(PORTAL_ENDPOINT_PREFIX)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
 /// Where an http-bound member rides on the wire.
 enum BoundIn {
     Header,
@@ -104,7 +121,8 @@ const ROLE_NAME: RequiredMember = RequiredMember {
 /// `restJson1` selects a route only when every one of those members is on the request,
 /// so a request that omits one matches no operation at all. This table is what lets
 /// [`Service::override_routing_error`] tell that case — a readable request missing a
-/// required parameter — from a path this service does not serve.
+/// required parameter — from a path this service does not serve, and it is also the
+/// request SIGNATURE [`serves_route`] claims an anonymous portal request by.
 ///
 /// DRIFT: this is model-derived data held by hand, because the generated
 /// `ServiceDefinition`'s routing table exposes no required-member set to read it from.
@@ -112,7 +130,8 @@ const ROLE_NAME: RequiredMember = RequiredMember {
 /// WRONGLY, just unreworded — the request falls back to the framework's routing
 /// answer. The invalid-request test in `tests/all/portal_session.rs` carries one row
 /// per (route, required member) pair here, so a row that disagrees with the model
-/// fails there.
+/// fails there, and `tests/all/endpoint_agnostic_routing.rs` carries one row per
+/// route.
 const ROUTES: &[(&str, &str, &[RequiredMember])] = &[
     ("GET", "/assignment/accounts", &[ACCESS_TOKEN]),
     ("GET", "/assignment/roles", &[ACCESS_TOKEN, ACCOUNT_ID]),
@@ -155,6 +174,26 @@ fn query_has(uri: &str, name: &str) -> bool {
         .split('&')
         .filter(|pair| !pair.is_empty())
         .any(|pair| pair.split_once('=').map_or(pair, |(key, _)| key) == name)
+}
+
+/// Whether `parts` addresses one of this service's own modelled routes: its method and
+/// its path are an `@http` binding in [`ROUTES`].
+///
+/// This is the request's own SIGNATURE — the same (method, path) pair `restJson1` routes
+/// on — and for a portal request it is the only service-identifying signal there is.
+/// Every portal operation is `@optionalAuth` with an empty `@auth`, so an SDK sends it
+/// unsigned: there is no SigV4 credential scope, `restJson1` carries no `X-Amz-Target`,
+/// and a client pointed at an endpoint that does not name a service (the emulator's own
+/// `localhost:9297`, an IP literal, a proxy) leaves nothing for the host-style tier
+/// either. Claiming by this table is what makes the service reachable there.
+///
+/// Matching is EXACT on both halves, never a prefix: a path this model does not bind
+/// stays unclaimed (the router's own `UnknownService`) rather than being swallowed here.
+fn serves_route(parts: &http::request::Parts) -> bool {
+    let path = parts.uri.path();
+    ROUTES
+        .iter()
+        .any(|(method, route, _)| parts.method == *method && *route == path)
 }
 
 /// The `@required` members of `req`'s route that are absent from it, or `None` when
@@ -212,25 +251,33 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if resolved.as_deref() == Some(self.entry.identity().signing_name()) {
             return true;
         }
-        // ... and also one addressed to this service's ENDPOINT, which the model does
-        // express but the routing key cannot carry: every portal operation is
-        // `@optionalAuth` with an empty `@auth`, so an SDK sends it unsigned and there
-        // is no SigV4 credential scope to resolve. The host-style fallback then yields
-        // only the endpoint's first label (`portal`), which is not the signing name, and
-        // the request would reach no service at all.
-        let Some(host) = endpoint_host(parts) else {
-            return false;
-        };
-        // Only when nothing stronger than the host named a service: a SigV4 credential
-        // scope or an `X-Amz-Target` naming another service wins, so a request meant for
-        // someone else is never claimed here (two claimants are an error to the router).
-        if resolved.is_some_and(|key| Some(key.as_str()) != host.split('.').next()) {
-            return false;
+        match resolved {
+            // SOMETHING named a service, and it was not this one's signing name. The
+            // only such signal that still belongs here is the host naming this
+            // service's own ENDPOINT, which the model does express but the routing key
+            // cannot carry: every portal operation is `@optionalAuth` with an empty
+            // `@auth`, so an SDK sends it unsigned and the host-style fallback yields
+            // only the endpoint's first label (`portal`), which is not the signing
+            // name. Anything else — a SigV4 credential scope or an `X-Amz-Target`
+            // naming another service, or another service's endpoint host — is somebody
+            // else's request, and two claimants are an error to the router.
+            // The first conjunct is the "the resolved key came from this HOST, not from
+            // something stronger" guard: `is_portal_endpoint` already forces the host's
+            // first label to be `portal`, so the comparison only ever rejects the case
+            // where a credential scope or an `X-Amz-Target` named a DIFFERENT service
+            // while the host was this endpoint.
+            Some(key) => endpoint_host(parts).is_some_and(|host| {
+                Some(key.as_str()) == host.split('.').next() && is_portal_endpoint(&host)
+            }),
+            // NOTHING in the request named a service at all: no credential scope, no
+            // `X-Amz-Target` (`restJson1` has none), and a host that names no service
+            // (the emulator's own endpoint, a bare IP, a proxy). That is the normal
+            // shape of a portal request from a client pointed at this emulator, so the
+            // request is attributed by its own modelled signature instead — the method
+            // and path of one of this service's four `@http` bindings. Nothing weaker
+            // is claimed: an unmodelled path reaches no service, exactly as before.
+            None => serves_route(parts),
         }
-        host == PORTAL_ENDPOINT_PREFIX
-            || host
-                .strip_prefix(PORTAL_ENDPOINT_PREFIX)
-                .is_some_and(|rest| rest.starts_with('.'))
     }
 
     fn override_operation(

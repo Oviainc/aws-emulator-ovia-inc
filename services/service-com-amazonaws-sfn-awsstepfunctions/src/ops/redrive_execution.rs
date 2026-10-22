@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RedriveExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RedriveExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: a MUTATING operation. It re-runs an unsuccessful execution of a
+//! Standard workflow from the Execution record `StartExecution` stored, using that
+//! record's own input and its state machine's definition, and records the redrive on
+//! the execution: `redriveCount` moves, `redriveDate` becomes this call's instant,
+//! the `ExecutionRedriven` event is appended to the existing history, and the
+//! execution reports `RUNNING` until the clock makes the re-run's outcome due.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RedriveExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request this operation cannot serve is refused with one of the operation's own
+//! modelled errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +178,185 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RedriveExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RedriveExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RedriveExecution"))
+        let _ = ctx;
+        // `executionArn` (1..256) and `clientToken` (1..64, `^[!-~]+$`) are modelled,
+        // so the centralized walk has already refused anything outside them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        if crate::state::parse_execution_arn(&input.execution_arn).is_none() {
+            return Err(RedriveExecutionErrorModeled::InvalidArn(InvalidArn {
+                message: Some(format!(
+                    "'{}' is not an execution ARN of this service",
+                    input.execution_arn
+                )),
+            })
+            .into());
+        }
+
+        let now = crate::state::now();
+
+        // Phase 1, under the lock: resolve the execution, refuse what cannot be
+        // redriven, and read what the re-run needs. The lock is released before the
+        // walk, so no other request waits on an interpretation.
+        let (definition, execution_input, previous_event_id) = {
+            let mut store = state.lock();
+            // Settle first: an execution whose terminal status the clock already owed
+            // is terminal when this call decides whether it can be redriven.
+            store.settle(now);
+
+            let Some(execution) = store.executions.get(&input.execution_arn) else {
+                return Err(RedriveExecutionErrorModeled::ExecutionDoesNotExist(
+                    ExecutionDoesNotExist {
+                        message: Some(format!("execution {} does not exist", input.execution_arn)),
+                    },
+                )
+                .into());
+            };
+
+            // "The API will return idempotent responses for the last 10 client tokens
+            // used to successfully redrive the execution": a repeat of a remembered,
+            // unexpired token answers the `redriveDate` it answered the first time and
+            // redrives nothing a second time.
+            if let Some(redrive_date) = input
+                .client_token
+                .as_deref()
+                .and_then(|token| execution.redrive_for_token(token, now))
+            {
+                return Ok(RedriveExecutionOutput {
+                    redrive_date: crate::state::to_date_time(redrive_date),
+                });
+            }
+
+            let machine = store.state_machines.get(&execution.state_machine_arn);
+            // "This API action is not supported by EXPRESS state machines."
+            if machine
+                .is_some_and(|machine| machine.sm_type == crate::state::STATE_MACHINE_TYPE_EXPRESS)
+            {
+                return Err(RedriveExecutionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "RedriveExecution does not support execution {}, which belongs to \
+                             an EXPRESS state machine",
+                            input.execution_arn
+                        )),
+                        reason: None,
+                    },
+                )
+                .into());
+            }
+
+            // The ONE predicate `DescribeExecution`'s `redriveStatus` is projected
+            // from, so an execution this refuses is exactly one that reports
+            // `NOT_REDRIVABLE`, with this reason.
+            if let Some(reason) = store.not_redrivable_reason(execution, now) {
+                return Err(RedriveExecutionErrorModeled::ExecutionNotRedrivable(
+                    ExecutionNotRedrivable {
+                        message: Some(reason.to_string()),
+                    },
+                )
+                .into());
+            }
+
+            // A state machine the store no longer holds is already refused above (it
+            // is past the end of its own deletion), so the definition is here.
+            let Some(machine) = machine else {
+                return Err(RedriveExecutionErrorModeled::ExecutionNotRedrivable(
+                    ExecutionNotRedrivable {
+                        message: Some(crate::state::NOT_REDRIVABLE_DELETING.to_string()),
+                    },
+                )
+                .into());
+            };
+            (
+                machine.definition.clone(),
+                execution.input.clone(),
+                execution.last_event_id(),
+            )
+        };
+
+        // Phase 2, OUTSIDE the lock: the re-run is INTERPRETED here, from the
+        // execution's own stored input — "when you redrive an execution, it continues
+        // the failed execution from the unsuccessful step and uses the same input".
+        // The walk has no side effects and the states this emulator executes are
+        // deterministic, so re-walking the definition reaches the same values the
+        // successful steps produced the first time and then runs on; nothing about the
+        // outcome is assumed. That outcome is owed to the clock, so the execution
+        // reports `RUNNING` until then.
+        let (opening, pending) = crate::state::plan_run(
+            &definition,
+            &execution_input,
+            now,
+            crate::state::EVENT_EXECUTION_REDRIVEN,
+            previous_event_id,
+        );
+
+        // Phase 3, under the lock again: record it. Every check is re-made, because
+        // the execution could have been redriven or its state machine deleted while
+        // the walk ran.
+        let mut store = state.lock();
+        store.settle(now);
+        let Some(execution) = store.executions.get(&input.execution_arn) else {
+            return Err(RedriveExecutionErrorModeled::ExecutionDoesNotExist(
+                ExecutionDoesNotExist {
+                    message: Some(format!("execution {} does not exist", input.execution_arn)),
+                },
+            )
+            .into());
+        };
+        if let Some(redrive_date) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| execution.redrive_for_token(token, now))
+        {
+            return Ok(RedriveExecutionOutput {
+                redrive_date: crate::state::to_date_time(redrive_date),
+            });
+        }
+        if let Some(reason) = store.not_redrivable_reason(execution, now) {
+            return Err(RedriveExecutionErrorModeled::ExecutionNotRedrivable(
+                ExecutionNotRedrivable {
+                    message: Some(reason.to_string()),
+                },
+            )
+            .into());
+        }
+
+        match store.redrive_execution(
+            &input.execution_arn,
+            now,
+            input.client_token.as_deref(),
+            opening,
+            pending,
+        ) {
+            Ok(redrive_date) => Ok(RedriveExecutionOutput {
+                redrive_date: crate::state::to_date_time(redrive_date),
+            }),
+            Err(crate::state::RedriveRejection::NotFound) => {
+                Err(RedriveExecutionErrorModeled::ExecutionDoesNotExist(
+                    ExecutionDoesNotExist {
+                        message: Some(format!("execution {} does not exist", input.execution_arn)),
+                    },
+                )
+                .into())
+            }
+            // The re-run's own history and outcome are what this record would grow
+            // by, so a redrive the store has no room for is refused rather than
+            // retained past its ceiling.
+            Err(crate::state::RedriveRejection::NoRoom) => Err(
+                RedriveExecutionErrorModeled::ExecutionLimitExceeded(ExecutionLimitExceeded {
+                    message: Some(format!(
+                        "redriving execution {} would take the store past the {} bytes this \
+                         emulator retains",
+                        input.execution_arn,
+                        crate::state::MAX_STORE_BYTES
+                    )),
+                })
+                .into(),
+            ),
+        }
     }
 }
