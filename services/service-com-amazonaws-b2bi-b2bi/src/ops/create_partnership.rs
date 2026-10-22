@@ -3,7 +3,8 @@
 //! @op CreatePartnership
 //! Mints a partnership under an existing profile, persists it, and answers with the
 //! STORED record so a later `GetPartnership` returns exactly what was created. An
-//! unknown `profileId` is refused with `ResourceNotFoundException`.
+//! unknown `profileId`, or a `capabilities` element naming a capability that does not
+//! exist, is refused with `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -259,12 +260,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // A partnership is created UNDER a profile, so the profile it names has to
-        // exist: an unknown id is the modelled 404, never a success.
+        // A partnership is created UNDER a profile and BOUND to a set of capabilities,
+        // so every id it names has to resolve in this service's store: an unknown id is
+        // the modelled 404, never a success with a dangling reference.
         if !state.profiles.contains_key(&input.profile_id) {
             return Err(CreatePartnershipErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Could not find profile with ID {}", input.profile_id),
+                    message: crate::state::profile_not_found(&input.profile_id),
+                },
+            )
+            .into());
+        }
+        // `capabilities` is required, so the list is walked in order and the FIRST
+        // unknown element is what the refusal names. The modelled list carries no
+        // `@length`, so the walk is kept cheap: one hash lookup per element, and it
+        // stops at the first element that does not resolve.
+        if let Some(unknown) = input
+            .capabilities
+            .iter()
+            .find(|capability_id| !state.capabilities.contains_key(*capability_id))
+        {
+            return Err(CreatePartnershipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::capability_not_found(unknown),
                 },
             )
             .into());

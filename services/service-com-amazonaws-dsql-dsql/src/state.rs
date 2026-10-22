@@ -49,6 +49,14 @@ pub const ENCRYPTION_STATUS_ENABLED: &str = "ENABLED";
 /// SigV4 credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The service segment of every ARN this service mints and resolves
+/// (`ClusterArn`'s pattern fixes it: `^arn:aws(-[^:]+)?:dsql:...$`).
+pub const ARN_SERVICE: &str = "dsql";
+
+/// The resource-type segment of a cluster ARN (`...:cluster/{identifier}`), and
+/// the `resourceType` a cluster's `ResourceNotFoundException` carries.
+pub const RESOURCE_TYPE_CLUSTER: &str = "cluster";
+
 /// How long a cluster stays in a transient status (`CREATING`, `UPDATING`,
 /// `DELETING`) before the clock settles it into its terminal one.
 ///
@@ -327,7 +335,55 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 /// The ARN of a cluster: `arn:aws:dsql:{region}:{account}:cluster/{identifier}`,
 /// built through the one ARN helper so the account segment is the emulator's.
 pub fn cluster_arn(region: &str, identifier: &str) -> String {
-    ::engine::emulator_arn("dsql", region, &format!("cluster/{identifier}"))
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{RESOURCE_TYPE_CLUSTER}/{identifier}"),
+    )
+}
+
+/// The resource an Aurora DSQL ARN names: its type segment and the id after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArnResource {
+    /// The resource type, e.g. [`RESOURCE_TYPE_CLUSTER`].
+    pub resource_type: String,
+    /// The resource's own identifier.
+    pub resource_id: String,
+}
+
+/// The resource a tagging ARN names, or `None` when the ARN names no Aurora DSQL
+/// resource at all.
+///
+/// An ARN is the six colon-separated fields
+/// `arn:{partition}:{service}:{region}:{account}:{resource}`, and its resource
+/// field is `{type}/{id}` or `{type}:{id}`; anything else — too few fields, a
+/// service field that is not this service's, a resource field with no type —
+/// names nothing here.
+///
+/// The partition, region and account fields take no part in the lookup: this
+/// emulator serves a single account, and a resource id already names at most one
+/// stored resource, so the type and the id are what resolve it.
+pub fn parse_resource_arn(arn: &str) -> Option<ArnResource> {
+    // `splitn(6, ..)` keeps the resource field whole: it is the only field that
+    // may itself contain a colon.
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    let _partition = fields.next()?;
+    if fields.next()? != ARN_SERVICE {
+        return None;
+    }
+    let _region = fields.next()?;
+    let _account = fields.next()?;
+    let (resource_type, resource_id) = fields.next()?.split_once(['/', ':'])?;
+    if resource_type.is_empty() || resource_id.is_empty() {
+        return None;
+    }
+    Some(ArnResource {
+        resource_type: resource_type.to_string(),
+        resource_id: resource_id.to_string(),
+    })
 }
 
 /// The connection endpoint of a cluster, in Aurora DSQL's own form
@@ -422,11 +478,18 @@ fn crockford_base32(value: u128) -> String {
 }
 
 /// The modelled `ResourceNotFoundException` for a cluster this service does not
-/// hold. Every member of the shape is `@required`, so all three are filled.
+/// hold.
 pub fn cluster_not_found(identifier: &str) -> ResourceNotFoundException {
+    resource_not_found(RESOURCE_TYPE_CLUSTER, identifier)
+}
+
+/// The modelled `ResourceNotFoundException` for any resource of this service that
+/// the store does not hold. Every member of the shape is `@required`, so all three
+/// are filled.
+pub fn resource_not_found(resource_type: &str, resource_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("cluster {identifier} not found"),
-        resource_id: identifier.to_string(),
-        resource_type: "cluster".to_string(),
+        message: format!("{resource_type} {resource_id} not found"),
+        resource_id: resource_id.to_string(),
+        resource_type: resource_type.to_string(),
     }
 }

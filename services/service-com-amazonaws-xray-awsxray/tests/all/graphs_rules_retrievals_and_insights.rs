@@ -918,8 +918,9 @@ async fn a_sampling_rule_is_created_once_and_listed_from_its_stored_record() {
         );
     }
 
-    // Every created rule is in the listing, in rule-name order, with the ARN and
-    // the timestamps it was stored with.
+    // Every created rule is in the listing, in rule-name order, followed by the
+    // account's service-managed `Default` rule, with the ARN and the timestamps
+    // each was stored with.
     let listed = xray.call("/GetSamplingRules", &json!({})).await;
     assert_eq!(
         listed.status, 200,
@@ -945,9 +946,10 @@ async fn a_sampling_rule_is_created_once_and_listed_from_its_stored_record() {
         })
         .collect();
     expected.sort();
+    expected.push("Default".to_string());
     assert_eq!(
         names, expected,
-        "every created rule must be listed in rule-name order, got {names:?}"
+        "every created rule must be listed in rule-name order, then the Default rule, got {names:?}"
     );
 }
 
@@ -996,7 +998,10 @@ async fn the_sampling_rule_listing_pages_and_resumes_exactly_once() {
                 break;
             }
         }
-        let expected: Vec<String> = (0..count).map(|index| format!("rule-{index:02}")).collect();
+        // The created rules, then the account's service-managed `Default` rule,
+        // which the listing always carries.
+        let mut expected: Vec<String> = (0..count).map(|index| format!("rule-{index:02}")).collect();
+        expected.push("Default".to_string());
         assert_eq!(
             seen, expected,
             "count {count}: paging must yield every rule exactly once, got {seen:?}"
@@ -1073,11 +1078,12 @@ async fn a_sampling_rule_the_service_cannot_describe_is_refused() {
         );
     }
 
-    // Nothing above was stored.
+    // Nothing above was stored: the listing holds only the account's
+    // service-managed `Default` rule, which nobody created.
     let listed = xray.call("/GetSamplingRules", &json!({})).await;
     assert_eq!(
         (listed.status, array(&listed.body, "SamplingRuleRecords").len()),
-        (200, 0),
+        (200, 1),
         "a refused rule must not be stored, got {listed:?}"
     );
 }
@@ -1112,11 +1118,12 @@ async fn concurrent_creates_of_one_rule_name_have_exactly_one_winner() {
         );
     }
 
-    // And the winner's rule is the only one stored.
+    // And the winner's rule is the only one stored, beside the account's
+    // service-managed `Default` rule.
     let listed = xray.call("/GetSamplingRules", &json!({})).await;
     assert_eq!(
         (listed.status, array(&listed.body, "SamplingRuleRecords").len()),
-        (200, 1),
+        (200, 2),
         "one winner must leave exactly one stored rule, got {listed:?}"
     );
 }

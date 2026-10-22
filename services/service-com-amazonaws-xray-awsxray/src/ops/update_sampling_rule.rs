@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSamplingRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSamplingRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSamplingRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Modifies a sampling rule's configuration": every member the submitted
+//! `SamplingRuleUpdate` carries is WRITTEN THROUGH to the stored rule and every
+//! member it omits is left alone, so each later read of that rule
+//! (`GetSamplingRules`, `DeleteSamplingRule`, another update) reports the
+//! updated values and a `ModifiedAt` moved to the time of the write, while
+//! `CreatedAt` stays as it was.
+//!
+//! The rule is selected by `RuleName` or `RuleARN`, "but not both", exactly as
+//! `DeleteSamplingRule` selects one; the account's service-managed `Default`
+//! rule is derived rather than stored, so the first update of it materialises
+//! its record, carrying the ARN it is already read with.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +141,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSamplingRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSamplingRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSamplingRule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateSamplingRuleErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray sampling-rule store is unavailable on this emulator engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_epoch_seconds();
+        let submitted = input.sampling_rule_update;
+
+        let update = crate::state::SamplingRuleUpdateDraft {
+            resource_arn: submitted.resource_arn,
+            priority: submitted.priority,
+            fixed_rate: submitted.fixed_rate,
+            reservoir_size: submitted.reservoir_size,
+            service_name: submitted.service_name,
+            service_type: submitted.service_type,
+            host: submitted.host,
+            http_method: submitted.http_method,
+            url_path: submitted.url_path,
+            attributes: submitted.attributes,
+            sampling_rate_boost: submitted.sampling_rate_boost,
+        };
+
+        // `SamplingRuleUpdate`'s own members target the UNCONSTRAINED
+        // `NullableInteger` / `NullableDouble`, so the boundary refuses none of
+        // the bounds the modelled `SamplingRule` carries. They are checked here
+        // instead, BEFORE anything is written, so a refused update leaves the
+        // stored rule exactly as it was and no update can take a rule to a value
+        // `CreateSamplingRule` would have refused.
+        if let Err(rejection) = crate::state::validate_sampling_rule_update(&update) {
+            return Err(invalid(rejection.message().to_string()));
+        }
+
+        // One lock, so the lookup and the write cannot interleave with another
+        // call for the same rule.
+        let mut store = state.lock();
+        let rule_name = store
+            .resolve_sampling_rule_name(
+                submitted.rule_name.as_deref(),
+                submitted.rule_arn.as_deref(),
+                &region,
+            )
+            .map_err(|error| invalid(error.message()))?;
+
+        // The lookup above resolved either a stored rule or the service-managed
+        // one, and the store has stayed locked since, so there is always a
+        // record to write to; a name that somehow holds none is answered as the
+        // same "no such rule" refusal rather than as a write that happened.
+        let Some(stored) = store.apply_sampling_rule_update(&region, &rule_name, update, now)
+        else {
+            return Err(invalid(
+                crate::state::SAMPLING_RULE_NOT_FOUND_MESSAGE.to_string(),
+            ));
+        };
+
+        Ok(UpdateSamplingRuleOutput {
+            sampling_rule_record: Some(stored.to_record()),
+        })
     }
+}
+
+/// Refuse the request with the error this operation models for an invalid one
+/// (HTTP 400): "The request is missing required parameters or has invalid
+/// parameters."
+fn invalid(message: impl Into<String>) -> UpdateSamplingRuleError {
+    UpdateSamplingRuleErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

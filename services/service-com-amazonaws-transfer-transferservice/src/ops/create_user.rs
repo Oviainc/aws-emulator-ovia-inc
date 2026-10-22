@@ -250,15 +250,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let key = (input.server_id.clone(), input.user_name.clone());
         if guard.users.contains_key(&key) {
+            // The service's fixed text for this condition: the name that collided
+            // travels in `Resource`, not in the message.
             return Err(CreateUserErrorModeled::ResourceExistsException(
-                ResourceExistsException {
-                    message: format!(
-                        "User {} already exists on server {}",
-                        input.user_name, input.server_id
-                    ),
-                    resource: input.user_name.clone(),
-                    resource_type: "user".to_string(),
-                },
+                st::user_already_exists(&input.user_name),
             )
             .into());
         }
@@ -271,9 +266,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateUserErrorModeled::ServiceUnavailableException(
                 ServiceUnavailableException {
                     message: Some(format!(
-                        "server {} already holds the maximum of {} users; \
+                        "a server already holds the maximum of {} users; \
                          delete one before creating another",
-                        input.server_id,
                         st::MAX_USERS_PER_SERVER
                     )),
                 },

@@ -170,29 +170,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The ARN is parsed BEFORE the store is read: "that is not a MediaPackage
         // resource ARN" is a different failure from "no such resource", and only the
-        // first can be decided without a lookup.
+        // first can be decided without a lookup. The first is a value in the request, so
+        // it is keyed by the member; the second is a resource, so it is keyed by the
+        // resource type.
         let Some(target) = crate::state::parse_tag_arn(&input.resource_arn) else {
-            return Err(TagResourceErrorModeled::UnprocessableEntityException(
-                UnprocessableEntityException {
-                    message: Some(format!(
-                        "ResourceArn \"{}\" is not a MediaPackage channel or origin endpoint ARN.",
-                        input.resource_arn
-                    )),
-                },
+            return Err(crate::state::member_invalid(
+                "resourceArn",
+                "must be a MediaPackage channel or origin endpoint ARN",
             )
             .into());
         };
 
         let mut state = state.lock();
         let Some(tags) = state.tags_mut(&target) else {
-            return Err(TagResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "{} with ID \"{}\" not found.",
-                    target.label(),
-                    target.id()
-                )),
-            })
-            .into());
+            return Err(
+                crate::state::resource_not_found(target.kind(), target.id()).into(),
+            );
         };
 
         // What the resource would be LEFT holding is what the tag limits judge, and they
@@ -206,16 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone())),
         );
-        if let Err(message) =
-            crate::state::bound_tag_entries(merged.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        {
-            return Err(TagResourceErrorModeled::UnprocessableEntityException(
-                UnprocessableEntityException {
-                    message: Some(message),
-                },
-            )
-            .into());
-        }
+        crate::state::bound_tag_entries(merged.iter().map(|(k, v)| (k.as_str(), v.as_str())))?;
 
         // Assigning a tag whose key the resource already carries replaces that tag's
         // value and leaves every other tag alone.

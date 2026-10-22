@@ -54,9 +54,9 @@ use crate::ops::types::{
     MediaResource, MediaResourceNeighbor, MonitorDeployment, MulticastSettings,
     MulticastSettingsCreateRequest, MulticastSource, OutputDestination, PipelineDetail,
     RouterDestination, RouterInputSettings, RouterSettings, SdiSource, SdiSourceSummary,
-    Smpte2110ReceiverGroupSettings, SrtCallerDecryption, SrtCallerSource,
-    SignalMapSummary, SrtListenerDecryption, SrtListenerSettings, SrtSettings,
-    SrtSettingsRequest, SuccessfulMonitorDeployment,
+    Smpte2110ReceiverGroupSettings, SignalMapSummary, SpecialRouterSettings,
+    SrtCallerDecryption, SrtCallerSource, SrtListenerDecryption, SrtListenerSettings,
+    SrtSettings, SrtSettingsRequest, SuccessfulMonitorDeployment,
     VpcOutputSettings, VpcOutputSettingsDescription,
 };
 
@@ -454,13 +454,21 @@ impl ChannelRecord {
         self.state == channel_state::IDLE
     }
 
+    /// Whether this channel has stopped: it is `IDLE`, or it failed and never
+    /// started, so it is ingesting through no input. The notion `DeleteChannel`
+    /// and `UpdateInput`'s conflict check share, so the two cannot disagree
+    /// about which states count as settled.
+    pub fn has_stopped(&self) -> bool {
+        self.is_idle()
+            || self.state == channel_state::CREATE_FAILED
+            || self.state == channel_state::UPDATE_FAILED
+    }
+
     /// Whether this channel is in a state `DeleteChannel` accepts: a channel is
     /// deletable once it has stopped (`IDLE`) or has failed, never while it is
     /// creating, starting, running, stopping or already deleting.
     pub fn is_deletable(&self) -> bool {
-        self.is_idle()
-            || self.state == channel_state::CREATE_FAILED
-            || self.state == channel_state::UPDATE_FAILED
+        self.has_stopped()
     }
 
     /// Put the channel into `state` as of `now` and owe `to` once
@@ -1194,19 +1202,44 @@ impl ComAmazonawsMedialiveMedialiveState {
         self.inputs.get(id).map(|input| input.id.as_str())
     }
 
+    /// The channels whose `InputAttachments` name this input. One predicate, so
+    /// what counts as attached cannot differ between the input's reported
+    /// `AttachedChannels` and the conflict its edit answers.
+    fn channels_attaching<'a>(
+        &'a self,
+        input_id: &'a str,
+    ) -> impl Iterator<Item = &'a ChannelRecord> {
+        self.channels.values().filter(move |channel| {
+            channel
+                .input_attachments
+                .iter()
+                .any(|attachment| attachment.input_id.as_deref() == Some(input_id))
+        })
+    }
+
     /// An input's `AttachedChannels`: "A list of channel IDs that that input is
     /// attached to". Derived from the channels' own `InputAttachments`, so it
     /// tracks every channel created or deleted after this input.
     pub fn attached_channels(&self, input_id: &str) -> Vec<String> {
-        self.channels
-            .values()
-            .filter(|channel| {
-                channel.input_attachments.iter().any(|attachment| {
-                    attachment.input_id.as_deref() == Some(input_id)
-                })
-            })
+        self.channels_attaching(input_id)
             .map(|channel| channel.id.clone())
             .collect()
+    }
+
+    /// The channel that stands in the way of editing this input: one whose
+    /// `InputAttachments` names it and which has not stopped, reported as its id
+    /// and its state.
+    ///
+    /// An attached channel that is still running ingests through exactly the
+    /// settings an edit would replace, so the settings can only be changed once
+    /// that channel has stopped ([`ChannelRecord::has_stopped`], the same notion
+    /// `DeleteChannel` accepts) — the "in use" refusal `DeleteSdiSource` also
+    /// makes for a source an input is using, and the condition `UpdateInput`'s
+    /// modelled `ConflictException` answers.
+    pub fn channel_blocking_input_edit(&self, input_id: &str) -> Option<(String, String)> {
+        self.channels_attaching(input_id)
+            .find(|channel| !channel.has_stopped())
+            .map(|channel| (channel.id.clone(), channel.state.clone()))
     }
 
     /// An input's `InputPartnerIds`: "A list of IDs for all Inputs which are
@@ -1867,6 +1900,12 @@ pub struct InputRecord {
     /// member that reports them back, but they are what makes this a VPC input,
     /// so they are kept with the record rather than discarded.
     pub vpc: Option<InputVpcRequest>,
+    /// The MediaConnect Router handoff settings `UpdateInput` accepts
+    /// (`SpecialRouterSettings`, whose only member is the router's ARN). Kept
+    /// for the same reason as `vpc`: the `Input` response shape has no member
+    /// that reports a router ARN, so storing it is how the request is not
+    /// silently dropped.
+    pub special_router_settings: Option<SpecialRouterSettings>,
     pub tags: HashMap<String, String>,
     /// The input this one was created as a partner of (`CreatePartnerInput`),
     /// which is what makes the pair name each other in `InputPartnerIds`.
@@ -2014,6 +2053,7 @@ pub fn new_input(id: String, arn: String) -> InputRecord {
         smpte2110_receiver_group_settings: None,
         router_settings: None,
         vpc: None,
+        special_router_settings: None,
         tags: HashMap::new(),
         partner_of: None,
         deletion_due: None,

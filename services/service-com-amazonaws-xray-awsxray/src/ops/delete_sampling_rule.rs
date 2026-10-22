@@ -162,16 +162,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.rule_arn.as_deref(),
                 &region,
             )
-            .map_err(|error| {
-                invalid(error.message(input.rule_name.as_deref(), input.rule_arn.as_deref()))
-            })?;
+            .map_err(|error| invalid(error.message()))?;
+
+        // The account's service-managed rule is not the caller's to remove: it
+        // exists in every account without being created
+        // (`crate::state::default_sampling_rule`), so a delete naming it is
+        // refused and the listing keeps reporting it.
+        if rule_name == crate::state::DEFAULT_SAMPLING_RULE_NAME {
+            return Err(invalid(format!(
+                "the service-managed `{}` sampling rule cannot be deleted",
+                crate::state::DEFAULT_SAMPLING_RULE_NAME
+            )));
+        }
 
         let Some(removed) = store.remove_sampling_rule(&rule_name) else {
-            return Err(invalid(format!(
-                "no sampling rule named `{rule_name}` is stored"
-            )));
+            return Err(invalid(
+                crate::state::SAMPLING_RULE_NOT_FOUND_MESSAGE.to_string(),
+            ));
         };
-
         Ok(DeleteSamplingRuleOutput {
             sampling_rule_record: Some(removed.to_record()),
         })

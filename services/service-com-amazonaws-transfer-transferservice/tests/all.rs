@@ -17,6 +17,8 @@ mod as2_profile_listing;
 mod connector_configuration;
 #[path = "all/connector_listing.rs"]
 mod connector_listing;
+#[path = "all/error_message_rules.rs"]
+mod error_message_rules;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/host_key_lifecycle.rs"]

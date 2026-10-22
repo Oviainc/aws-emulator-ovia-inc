@@ -206,21 +206,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Bound what the caller may make this record cost, before anything is stored:
         // the store copies these collections and strings verbatim, so one request must
-        // not decide how much memory its record occupies.
-        let refuse = |message: String| {
-            CreateOriginEndpointError::from(
-                CreateOriginEndpointErrorModeled::UnprocessableEntityException(
-                    UnprocessableEntityException {
-                        message: Some(message),
-                    },
-                ),
-            )
-        };
-        for (member, value) in [("Id", &input.id), ("ChannelId", &input.channel_id)] {
-            crate::state::bound_chars(member, value, crate::state::MAX_STRING_CHARS)
-                .map_err(refuse)?;
+        // not decide how much memory its record occupies. Each refusal is this service's
+        // own envelope, keyed by the member it is about.
+        for (member, value) in [("id", &input.id), ("channelId", &input.channel_id)] {
+            crate::state::bound_chars(member, value, crate::state::MAX_STRING_CHARS)?;
         }
-        crate::state::bound_tags(&input.tags).map_err(refuse)?;
+        crate::state::bound_tags(&input.tags)?;
         // The members a create shares with an update are bounded by the one function both
         // handlers call, so neither can store more than the other would have refused.
         crate::state::bound_origin_endpoint_members(
@@ -228,31 +219,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.manifest_name.as_deref(),
             input.whitelist.as_deref(),
             input.cmaf_package.as_ref(),
-        )
-        .map_err(refuse)?;
+        )?;
 
         // An OriginEndpoint packages ONE Channel: a ChannelId naming no stored channel
-        // has nothing to package, so the endpoint is not created.
+        // has nothing to package, so the endpoint is not created. This is a value in the
+        // REQUEST the caller has to fix — not a resource the request addressed — so it is
+        // `UnprocessableEntityException` (422) keyed by the member, which is a different
+        // answer from "the endpoint you asked about is gone" (404).
         if !state.channels.contains_key(&input.channel_id) {
-            return Err(CreateOriginEndpointErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "Channel with ID \"{}\" not found.",
-                    input.channel_id
-                )),
-            })
-            .into());
+            return Err(crate::state::member_not_found("channelId").into());
         }
 
         // The ID must be unique: a second create on an id already in use is refused,
         // never an overwrite.
         if state.origin_endpoints.contains_key(&input.id) {
-            return Err(CreateOriginEndpointErrorModeled::UnprocessableEntityException(
-                UnprocessableEntityException {
-                    message: Some(format!(
-                        "An origin endpoint with ID \"{}\" already exists.",
-                        input.id
-                    )),
-                },
+            return Err(crate::state::resource_already_exists(
+                crate::state::ORIGIN_ENDPOINT_KIND,
+                &input.id,
             )
             .into());
         }
@@ -260,13 +243,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store lives for the life of the process and only a create adds to it, so
         // it is capped by entry count; past the cap the resource limit is reported.
         if state.origin_endpoints.len() >= crate::state::MAX_ORIGIN_ENDPOINTS {
-            return Err(CreateOriginEndpointErrorModeled::TooManyRequestsException(
-                TooManyRequestsException {
-                    message: Some(format!(
-                        "The origin endpoint limit of {} for this account has been reached.",
-                        crate::state::MAX_ORIGIN_ENDPOINTS
-                    )),
-                },
+            return Err(crate::state::resource_limit_reached(
+                crate::state::ORIGIN_ENDPOINT_KIND,
+                crate::state::MAX_ORIGIN_ENDPOINTS,
             )
             .into());
         }
@@ -274,7 +253,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An endpoint packages its channel in exactly one format, and its playback URL
         // ends in that format's manifest, so exactly one packaging configuration must be
         // supplied. Neither none nor several can be packaged. `UpdateOriginEndpoint`
-        // decides which packaging a request names with the same function.
+        // decides which packaging a request names with the same function, and the refusal
+        // is this service's own envelope — keyed by the resource being created, because a
+        // rule about a COMBINATION of members has no single member at fault.
         let kind = match crate::state::sole_packaging_kind(
             input.hls_package.is_some(),
             input.dash_package.is_some(),
@@ -282,8 +263,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.mss_package.is_some(),
         ) {
             Ok(Some(kind)) => kind,
-            Ok(None) => return Err(refuse(crate::state::packaging_refusal(&[]))),
-            Err(supplied) => return Err(refuse(crate::state::packaging_refusal(&supplied))),
+            Ok(None) => return Err(crate::state::packaging_refusal(&[]).into()),
+            Err(supplied) => return Err(crate::state::packaging_refusal(&supplied).into()),
         };
 
         let region = crate::state::request_region(ctx.parts());

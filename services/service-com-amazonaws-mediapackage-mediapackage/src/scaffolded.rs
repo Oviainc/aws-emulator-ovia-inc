@@ -177,6 +177,269 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+// =============================================================================
+// MediaPackage's own error envelope: `message` AND `errors`
+// =============================================================================
+//
+// Every MediaPackage error body carries TWO members: the `message` sentence the
+// model declares, and an `errors` object keyed by the thing that was wrong — a
+// resource type for a resource that is missing or in the way, a request member for a
+// value the service will not accept — whose value reports the reasons for that key (see
+// [`Reasons`] for the two shapes a recorded body uses). The model declares only
+// `Message` on each error shape, so the generated
+// error structs (`NotFoundException`, `UnprocessableEntityException`, …) cannot carry
+// the second member: they are generated from the model and a field that is not a
+// modelled member does not exist on them.
+//
+// [`ServiceError`] is that envelope, and it travels on the error channel as
+// [`Scaffolded::Service`]. It carries the MODELLED error's wire code and HTTP status
+// (so a client branches exactly as the model says) and renders the two body members
+// from the per-key reasons it was built with — including the `message`, which is
+// built FROM those reasons rather than written twice, so the sentence and the
+// structured map can never disagree.
+//
+// The wording of each reason — what a missing resource, a duplicate id or a refused
+// member says — lives in `crate::state`, beside the rest of this service's
+// request-derived text.
+
+/// The `message` member of this service's error envelope: the sentence, built from
+/// the envelope's per-key reasons.
+static SERVICE_ERROR_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#MediaPackageError$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_json_name("message")
+.with_xml_name("Message");
+
+/// The `errors` member of this service's error envelope: an object keyed by the resource
+/// type or request member the failure is about, whose value reports that key's reasons —
+/// a bare requirement string or a list, as [`Reasons`] describes.
+///
+/// One member schema serves the map, its keys and its list values: the JSON codec reads
+/// a member schema for the BODY KEY it emits and for nothing else (list elements and map
+/// entries carry no key of their own), which is also how the generated serializers write
+/// a modelled map member.
+static SERVICE_ERROR_ERRORS: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#MediaPackageError$errors",
+        "smithy.framework",
+        "errors",
+    ),
+    ShapeType::Map,
+    "errors",
+    1,
+)
+.with_json_name("errors")
+.with_xml_name("Errors");
+
+/// Schema for this service's error envelope.
+///
+/// In the `smithy.framework` namespace for the same reason as [`NOT_IMPLEMENTED_SCHEMA`]:
+/// the shape is not in the model (the model declares the error shapes, each with
+/// `Message` alone), so it must not collide with a modelled one. ONE schema serves every
+/// MediaPackage error because a schema shapes only the BODY; the wire error code and the
+/// HTTP status travel beside it, on the [`ServiceError`] itself.
+pub static SERVICE_ERROR_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#MediaPackageError",
+        "smithy.framework",
+        "MediaPackageError",
+    ),
+    ShapeType::Structure,
+    &[&SERVICE_ERROR_MESSAGE, &SERVICE_ERROR_ERRORS],
+);
+
+/// `NotFoundException`'s wire error code — the shape name, which restJson1 puts in
+/// `x-amzn-errortype` and in the body's `__type`.
+pub const NOT_FOUND_CODE: &str = "NotFoundException";
+/// `NotFoundException`'s modelled status (`httpError` 404 on
+/// `com.amazonaws.mediapackage#NotFoundException`).
+pub const NOT_FOUND_STATUS: u16 = 404;
+/// `UnprocessableEntityException`'s wire error code.
+pub const UNPROCESSABLE_ENTITY_CODE: &str = "UnprocessableEntityException";
+/// `UnprocessableEntityException`'s modelled status (`httpError` 422 on
+/// `com.amazonaws.mediapackage#UnprocessableEntityException`).
+pub const UNPROCESSABLE_ENTITY_STATUS: u16 = 422;
+/// `TooManyRequestsException`'s wire error code.
+pub const TOO_MANY_REQUESTS_CODE: &str = "TooManyRequestsException";
+/// `TooManyRequestsException`'s modelled status (`httpError` 429 on
+/// `com.amazonaws.mediapackage#TooManyRequestsException`).
+pub const TOO_MANY_REQUESTS_STATUS: u16 = 429;
+
+/// What an `errors` entry reports for its key.
+///
+/// MediaPackage reports a failure one of two ways, and the recorded bodies show both:
+///
+/// * the REQUEST VALIDATOR — the step that reads the request before anything is looked up
+///   — reports the ONE requirement a member failed, as a bare string
+///   (`"errors": {"maxResults": "must be an integer between 1 and 50"}`);
+/// * everything decided against STATE — a resource that is missing, an id in use,
+///   children blocking a delete, a reference the service cannot resolve — reports a LIST
+///   of reasons for its key (`"errors": {"channel": ["with id=… not found"]}`).
+///
+/// So the shape of the value says which kind of failure it is, and a client reading one
+/// key gets the same structure for every failure of that kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reasons {
+    /// The single requirement a request member failed, as the request validator reports
+    /// it.
+    Requirement(String),
+    /// The reasons a key carries, as everything decided against state reports them.
+    List(Vec<String>),
+}
+
+impl Reasons {
+    /// The reasons, whichever way they are reported — what the sentence states.
+    fn each(&self) -> &[String] {
+        match self {
+            Self::Requirement(requirement) => std::slice::from_ref(requirement),
+            Self::List(reasons) => reasons.as_slice(),
+        }
+    }
+}
+
+/// One MediaPackage error: a modelled error's code and status, plus the per-key reasons
+/// its body reports in `errors` and states in `message`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceError {
+    /// The modelled error shape's name — the wire error code.
+    code: &'static str,
+    /// That shape's modelled `httpError` status.
+    status: u16,
+    /// The reasons, by the resource type or request member each is about. A `BTreeMap`,
+    /// so the body's key order is the keys' own order rather than an insertion or hash
+    /// order: one failure renders the same bytes every time.
+    errors: std::collections::BTreeMap<String, Reasons>,
+}
+
+impl ServiceError {
+    /// An error of the modelled shape `code`/`status`, reporting `reasons` for `key`.
+    fn new(code: &'static str, status: u16, key: &str, reasons: Reasons) -> Self {
+        let mut errors = std::collections::BTreeMap::new();
+        errors.insert(key.to_string(), reasons);
+        Self {
+            code,
+            status,
+            errors,
+        }
+    }
+
+    /// `NotFoundException` (404): the resource the request addressed does not exist.
+    pub fn not_found(key: &str, reason: impl Into<String>) -> Self {
+        Self::new(
+            NOT_FOUND_CODE,
+            NOT_FOUND_STATUS,
+            key,
+            Reasons::List(vec![reason.into()]),
+        )
+    }
+
+    /// `UnprocessableEntityException` (422) for something decided against STATE: an id
+    /// already in use, children blocking a delete, a reference that cannot be resolved.
+    /// Reports a LIST of reasons for `key` — see [`Reasons`].
+    pub fn unprocessable_state(key: &str, reason: impl Into<String>) -> Self {
+        Self::new(
+            UNPROCESSABLE_ENTITY_CODE,
+            UNPROCESSABLE_ENTITY_STATUS,
+            key,
+            Reasons::List(vec![reason.into()]),
+        )
+    }
+
+    /// `UnprocessableEntityException` (422) from the REQUEST VALIDATOR: the one
+    /// requirement `member` failed, reported as a bare string — see [`Reasons`].
+    pub fn unprocessable_member(member: &str, requirement: impl Into<String>) -> Self {
+        Self::new(
+            UNPROCESSABLE_ENTITY_CODE,
+            UNPROCESSABLE_ENTITY_STATUS,
+            member,
+            Reasons::Requirement(requirement.into()),
+        )
+    }
+
+    /// `TooManyRequestsException` (429): "The client has exceeded their resource or
+    /// throttling limits".
+    pub fn too_many_requests(key: &str, reason: impl Into<String>) -> Self {
+        Self::new(
+            TOO_MANY_REQUESTS_CODE,
+            TOO_MANY_REQUESTS_STATUS,
+            key,
+            Reasons::List(vec![reason.into()]),
+        )
+    }
+
+    /// The sentence this error states: each reason after the key it is about, so the
+    /// `message` and the `errors` map say the same thing in the same words.
+    pub fn message(&self) -> String {
+        self.errors
+            .iter()
+            .flat_map(|(key, reasons)| {
+                reasons
+                    .each()
+                    .iter()
+                    .map(move |reason| format!("{key} {reason}"))
+            })
+            .collect::<Vec<String>>()
+            .join("; ")
+    }
+
+    /// The wire error code (the modelled shape's name).
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    /// The modelled HTTP status.
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// The reasons this error reports, by key — what the body's `errors` member carries.
+    pub fn errors(&self) -> &std::collections::BTreeMap<String, Reasons> {
+        &self.errors
+    }
+}
+
+impl std::fmt::Display for ServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message())
+    }
+}
+
+impl std::error::Error for ServiceError {}
+
+impl SerializableStruct for ServiceError {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&SERVICE_ERROR_MESSAGE, self.message().as_str())?;
+        s.write_map(&SERVICE_ERROR_ERRORS, &|entries| {
+            for (key, reasons) in &self.errors {
+                entries.write_string(&SERVICE_ERROR_ERRORS, key.as_str())?;
+                match reasons {
+                    // A requirement is the value itself, not a one-element list.
+                    Reasons::Requirement(requirement) => {
+                        entries.write_string(&SERVICE_ERROR_ERRORS, requirement.as_str())?;
+                    }
+                    Reasons::List(reasons) => {
+                        entries.write_list(&SERVICE_ERROR_ERRORS, &|list| {
+                            for reason in reasons {
+                                list.write_string(&SERVICE_ERROR_ERRORS, reason.as_str())?;
+                            }
+                            Ok(())
+                        })?;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +448,14 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// A modelled error carrying this service's full body — `message` AND the per-key
+    /// `errors` map every MediaPackage error reports. Renders with the code and status
+    /// the envelope carries, which are the modelled shape's own.
+    ///
+    /// Reach for this for every client-visible refusal: the generated error structs
+    /// carry `Message` alone, because that is all the model declares, so a refusal
+    /// returned as [`Modeled`](Self::Modeled) answers with half the envelope.
+    Service(ServiceError),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -223,11 +494,21 @@ impl<E> Scaffolded<E> {
     }
 }
 
+/// Lets a handler write `Err(crate::state::channel_not_found(id).into())`: the envelope
+/// is the same whichever operation raises it, so every operation's error channel takes
+/// it without naming the wrapper variant.
+impl<E> From<ServiceError> for Scaffolded<E> {
+    fn from(error: ServiceError) -> Self {
+        Self::Service(error)
+    }
+}
+
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::Service(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +521,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::Service(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +536,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::Service(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +545,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::Service(_) => &SERVICE_ERROR_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +558,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            // The modelled shape the envelope was built for, which is where its status
+            // comes from too — so code and status cannot disagree.
+            Self::Service(e) => e.code(),
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +573,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            Self::Service(e) => e.status(),
             Self::ValidationException(_) => 400,
         }
     }
@@ -297,6 +585,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
+            // MediaPackage is restJson1 and its model carries no `awsQueryError`
+            // trait on any error shape, so there is no legacy query code to name.
+            Self::Service(_) => None,
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
         }

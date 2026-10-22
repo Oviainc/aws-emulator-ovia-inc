@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_configuration.rs"]
 mod account_configuration;
+#[path = "all/certificate_domain_validations.rs"]
+mod certificate_domain_validations;
 #[path = "all/certificate_lifecycle.rs"]
 mod certificate_lifecycle;
 #[path = "all/certificate_list_filters.rs"]

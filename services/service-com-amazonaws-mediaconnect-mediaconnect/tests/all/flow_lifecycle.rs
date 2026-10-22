@@ -66,8 +66,8 @@ pub(crate) const REGION: &str = "us-east-1";
 /// One emulator: a router with only this service mounted on one shared engine.
 ///
 /// Other suites in this test crate drive the same front door through it (see
-/// `tests/all/flow_outputs.rs` and `tests/all/update_flow.rs`), so there is one harness
-/// rather than one per file.
+/// `tests/all/flow_outputs.rs`, `tests/all/update_flow.rs` and
+/// `tests/all/flow_entitlements.rs`), so there is one harness rather than one per file.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
     /// The same engine the mounted service holds, so a suite that needs a particular

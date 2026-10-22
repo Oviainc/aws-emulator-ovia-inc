@@ -197,10 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(transformer) = state.transformers.get(&input.transformer_id) else {
             return Err(GetTransformerErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Could not find transformer with ID {}",
-                        input.transformer_id
-                    ),
+                    message: crate::state::transformer_not_found(&input.transformer_id),
                 },
             )
             .into());

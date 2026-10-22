@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
+#[path = "all/error_resource_identity.rs"]
+mod error_resource_identity;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

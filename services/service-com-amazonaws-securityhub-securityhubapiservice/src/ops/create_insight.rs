@@ -153,7 +153,9 @@ const MAX_CUSTOM_INSIGHTS_PER_HUB: usize = 100;
 /// The 128 bits come from SHA-256 over the hub, the submitted name, the store's
 /// monotonic write sequence and the clock, so two creates cannot mint the same
 /// identifier — not even when a deleted insight's name is created again in the same
-/// instant, because the write sequence has moved on.
+/// instant, because the write sequence has moved on. The construction itself lives in
+/// [`crate::state::mint_resource_id`], shared with the other operations that mint such
+/// an id.
 fn mint_insight_id(
     account_id: &str,
     region: &str,
@@ -161,25 +163,10 @@ fn mint_insight_id(
     write_seq: u64,
     now_nanos: i128,
 ) -> String {
-    use ::sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    for field in [account_id.as_bytes(), region.as_bytes(), name.as_bytes()] {
-        hasher.update(field);
-        // A separator, so two different field splits cannot hash alike.
-        hasher.update([0u8]);
-    }
-    hasher.update(write_seq.to_be_bytes());
-    hasher.update(now_nanos.to_be_bytes());
-    let digest = hasher.finalize();
-    let hex = ::hex::encode(&digest[..16]);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
+    crate::state::mint_resource_id(
+        &[account_id.as_bytes(), region.as_bytes(), name.as_bytes()],
+        write_seq,
+        now_nanos,
     )
 }
 

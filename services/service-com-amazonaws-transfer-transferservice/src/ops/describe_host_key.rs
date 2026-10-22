@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = (input.server_id.clone(), input.host_key_id.clone());
         let stored = guard.host_keys.get(&key).ok_or_else(|| {
             st::not_found(DescribeHostKeyErrorModeled::ResourceNotFoundException(
-                st::resource_not_found(st::RESOURCE_TYPE_HOST_KEY, &input.host_key_id),
+                st::resource_not_found(&st::NOT_FOUND_HOST_KEY, &input.host_key_id),
             ))
         })?;
 

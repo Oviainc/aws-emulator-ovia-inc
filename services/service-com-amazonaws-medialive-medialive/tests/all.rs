@@ -32,6 +32,9 @@ mod input_lifecycle;
 #[path = "all/input_security_group.rs"]
 mod input_security_group;
 
+#[path = "all/input_update.rs"]
+mod input_update;
+
 #[path = "all/multiplex_lifecycle.rs"]
 mod multiplex_lifecycle;
 

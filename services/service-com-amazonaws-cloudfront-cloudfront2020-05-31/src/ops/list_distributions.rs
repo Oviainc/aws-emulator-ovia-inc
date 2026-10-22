@@ -146,12 +146,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "MaxItems: the maximum number of distributions you want in the response" — a
         // page holds at least one item, so a non-positive size names no page at all.
         // The size served is bounded above by this emulator's own page ceiling, so one
-        // request cannot serve the whole store in a single response.
+        // request cannot serve the whole store in a single response. A value the
+        // parameter cannot take is refused with the one sentence CloudFront states the
+        // constraint in, whether it is out of range here or unreadable as an integer at
+        // the request boundary (see `crate::service::envelope`).
         let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
         let Some(page_size) = crate::state::page_size(input.max_items) else {
-            return Err(ListDistributionsErrorModeled::InvalidArgument(InvalidArgument {
-                message: Some(format!("MaxItems must be at least 1, was {max_items}")),
-            })
+            return Err(ListDistributionsErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
             .into());
         };
         // The marker is the distribution id the previous page ended at, so a value that

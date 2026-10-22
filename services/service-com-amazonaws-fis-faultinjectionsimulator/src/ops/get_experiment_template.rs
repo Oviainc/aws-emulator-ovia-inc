@@ -146,7 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(record) = store.experiment_templates.get(&input.id) else {
             return Err(GetExperimentTemplateErrorModeled::ResourceNotFoundException(
-                crate::state::template_not_found(&input.id),
+                crate::state::template_not_found(),
             )
             .into());
         };

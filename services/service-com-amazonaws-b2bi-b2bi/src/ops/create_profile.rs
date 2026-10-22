@@ -4,6 +4,28 @@
 //! Mints a profile, persists it in [`crate::state`], and answers with the STORED record
 //! so a later `GetProfile` / `ListProfiles` returns exactly what was created.
 //!
+//! Two things happen besides the insert: the account's documented five-profile limit is
+//! charged (past it the modelled `ServiceQuotaExceededException`), and a profile created
+//! with `logging` ENABLED gets a real CloudWatch Logs log group, provisioned by calling
+//! the emulator's own logs service, so the `logGroupName` the response carries resolves
+//! for a client that follows it.
+//!
+//! Two consequences of provisioning that group, both deliberate:
+//!
+//! * a router that mounts b2bi WITHOUT the CloudWatch Logs service cannot provision it,
+//!   so `CreateProfile(logging=ENABLED)` answers `InternalServerException` there rather
+//!   than minting a profile whose reported `logGroupName` resolves nowhere. Creating a
+//!   profile with logging DISABLED needs no peer service and still succeeds. The
+//!   assembled emulator is not such a router: `core/router`'s `build_router` registers
+//!   EVERY service crate in the workspace, so CloudWatch Logs is always mounted beside
+//!   b2bi there and in anything driven through it (this crate's own tests mount the pair
+//!   explicitly, which is what a single-service harness has to do);
+//! * the group is created before the record is stored, so a call whose future is dropped
+//!   at that `.await` (a client that disconnects mid-request) can leave the group behind.
+//!   It is named after the `profileId` that call minted and nothing else can mint that id
+//!   again, so a later create never collides with it, and the account's profile slot is
+//!   released either way by the reservation guard's `Drop`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -148,26 +170,161 @@ impl From<CreateProfileErrorModeled> for CreateProfileError {
     }
 }
 
-/// The modelled refusal for a store already holding
-/// [`crate::state::MAX_RECORDS_PER_STORE`] profiles: this emulator will not grow its
-/// profile store further, so the request is refused rather than served by allocating
-/// more.
+/// The modelled refusal for an account already holding its documented maximum of
+/// profiles ([`crate::state::MAX_PROFILES_PER_ACCOUNT`], from this operation's own
+/// documentation: "You can have up to five customer profiles").
 ///
-/// `quotaCode` and `serviceCode` name the limit that was actually reached — this
-/// emulator's own storage bound and this service's own code — rather than an AWS quota
-/// code, which only AWS can assign.
-fn store_full() -> CreateProfileError {
+/// `quotaCode` / `serviceCode` name the quota that was reached, as the Service Quotas
+/// emulator publishes it for this service, so a client that reads the exception can
+/// look the limit up. Deleting a profile releases a slot, so this is a refusal of ONE
+/// request, not a permanent one.
+fn quota_exceeded() -> CreateProfileError {
     CreateProfileErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
         message: format!(
-            "this emulator stores at most {} profiles",
-            crate::state::MAX_RECORDS_PER_STORE
+            "Account has reached the limit of {} profiles",
+            crate::state::MAX_PROFILES_PER_ACCOUNT
         ),
         resource_id: ::engine::emulator_account_id().to_string(),
         resource_type: "profile".to_string(),
-        service_code: "b2bi".to_string(),
-        quota_code: "ProfilesPerAccount".to_string(),
+        service_code: crate::state::SERVICE_CODE.to_string(),
+        quota_code: crate::state::PROFILE_QUOTA_CODE.to_string(),
     })
     .into()
+}
+
+/// The modelled refusal for a log group this service could not provision: with
+/// `logging` ENABLED the profile's `logGroupName` must resolve in CloudWatch Logs, so a
+/// profile is not minted at all when the group cannot be created.
+fn log_group_unavailable(detail: &str) -> CreateProfileError {
+    CreateProfileErrorModeled::InternalServerException(InternalServerException {
+        message: format!("could not provision the profile's log group: {detail}"),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
+/// A CloudWatch Logs client over the in-process callback into this same emulator.
+///
+/// The callback is the framework's documented seam for calling another emulated service:
+/// it routes in process, so no network client is configured here and this service names
+/// no other service's crate. `region` is the request's own signing region, so the group
+/// lands where the profile's ARN says it does.
+fn logs_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_cloudwatchlogs::Client {
+    let config = ::aws_sdk_cloudwatchlogs::Config::builder()
+        .behavior_version(::aws_sdk_cloudwatchlogs::config::BehaviorVersion::latest())
+        .region(::aws_sdk_cloudwatchlogs::config::Region::new(
+            region.to_string(),
+        ))
+        .endpoint_url(format!("https://logs.{region}.amazonaws.com"))
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: there is nothing to retry, time out or watch for
+        // a stalled stream, and each of those would need a sleep implementation this
+        // client is not given. The same goes for caching the identity: the credentials
+        // are handed over directly. (Same configuration as the EventBridge Scheduler
+        // emulator's own callback client.)
+        .retry_config(::aws_sdk_cloudwatchlogs::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_cloudwatchlogs::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_cloudwatchlogs::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_cloudwatchlogs::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_cloudwatchlogs::Client::from_conf(config)
+}
+
+/// Provision the profile's CloudWatch Logs log group, so the `logGroupName` the
+/// response carries names a group `logs:DescribeLogGroups` reports.
+///
+/// Answers whether this call CREATED the group: a group that was already there belongs
+/// to whoever made it, so it is accepted (the destination resolves) but never released
+/// by [`release_log_group`].
+async fn provision_log_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    log_group_name: &str,
+) -> Result<bool, String> {
+    match logs_client(ctx, region)
+        .create_log_group()
+        .log_group_name(log_group_name)
+        .send()
+        .await
+    {
+        Ok(_) => Ok(true),
+        // A group under this name already exists, so the destination resolves — which
+        // is the whole of what this step owes the caller.
+        Err(err)
+            if err
+                .as_service_error()
+                .is_some_and(|service| service.is_resource_already_exists_exception()) =>
+        {
+            Ok(false)
+        }
+        Err(err) => Err(::aws_smithy_types::error::display::DisplayErrorContext(&err).to_string()),
+    }
+}
+
+/// Delete a log group this call created for a profile it then did NOT store, so a bail-out
+/// leaves no group behind owning nothing.
+///
+/// Best effort: the request it belongs to is already being answered, and a group that
+/// outlives its profile is the only thing this prevents.
+async fn release_log_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    log_group_name: &str,
+) {
+    let _ = logs_client(ctx, region)
+        .delete_log_group()
+        .log_group_name(log_group_name)
+        .send()
+        .await;
+}
+
+/// A minted `profileId` held reserved for ONE in-flight create, released on drop.
+///
+/// The reservation keeps a concurrent create from minting the same id or taking the
+/// account's last slot while the log group is provisioned with no state lock held. It is
+/// released by the guard's `Drop`, so it goes away on EVERY exit from the handler — the
+/// stored profile, the refusal, a panic the server contains, and the handler's future
+/// being dropped at its `.await` (a disconnected client) — and an interrupted create can
+/// never leak one of the account's five profile slots for the life of the process.
+///
+/// `Drop` takes the state lock, so a guard must not be dropped while a
+/// [`::engine::ServiceState::lock`] guard is alive in the same scope.
+struct ReservedProfileId {
+    store: ::engine::ServiceState<crate::state::ComAmazonawsB2biB2biState>,
+    profile_id: String,
+}
+
+impl ReservedProfileId {
+    /// The id this reservation holds.
+    fn id(&self) -> &str {
+        &self.profile_id
+    }
+}
+
+impl Drop for ReservedProfileId {
+    fn drop(&mut self) {
+        self.store
+            .lock()
+            .reserved_profile_ids
+            .remove(&self.profile_id);
+    }
+}
+
+/// What the insert settled on, decided under the state lock and acted on after it is
+/// released — so the one bail-out can still release the log group, which takes an
+/// in-process call and therefore no lock.
+enum Settled {
+    /// The profile was stored; this is its response.
+    Stored(CreateProfileOutput),
+    /// A concurrent call carrying the same `clientToken` stored one first, so this
+    /// request answers with THAT profile and stores nothing.
+    Replayed(CreateProfileOutput),
 }
 
 /// The response for a stored profile — every member read back off the record, so a
@@ -231,7 +388,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let mut state = store.lock();
 
         // `clientToken` is this operation's `@idempotencyToken`: a repeat carrying the
         // same token answers with the resource the first call created, not a second one.
@@ -239,52 +395,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .client_token
             .as_deref()
             .map(|token| crate::state::idempotency_key("profile", token));
-        if let Some(key) = idempotency_key.as_deref() {
-            if let Some(existing) = state
-                .idempotency
-                .get(key)
-                .and_then(|id| state.profiles.get(id))
-            {
-                return Ok(stored_profile_response(existing));
+
+        // PHASE 1, under the lock: answer a replay, charge the quota, and mint the id —
+        // RESERVING it, because the lock is released before the log group is provisioned
+        // (that is a call into another service, and no state lock may span it). While the
+        // reservation stands no concurrent create can mint the same id or take the
+        // account's last slot; the guard releases it on every exit from this handler.
+        let reserved = {
+            let profile_id = {
+                let mut state = store.lock();
+                if let Some(key) = idempotency_key.as_deref() {
+                    if let Some(existing) = state
+                        .idempotency
+                        .get(key)
+                        .and_then(|id| state.profiles.get(id))
+                    {
+                        return Ok(stored_profile_response(existing));
+                    }
+                }
+
+                // AWS's documented limit on customer profiles. Checked AFTER the
+                // idempotency replay, so a replay still answers from a full account.
+                if !state.accepts_another_profile() {
+                    return Err(quota_exceeded());
+                }
+
+                let mut profile_id = crate::state::new_resource_id("p");
+                while state.profiles.contains_key(&profile_id)
+                    || state.reserved_profile_ids.contains(&profile_id)
+                {
+                    profile_id = crate::state::new_resource_id("p");
+                }
+                state.reserved_profile_ids.insert(profile_id.clone());
+                profile_id
+            };
+            // Built with the state lock already released: the guard's `Drop` takes it.
+            ReservedProfileId {
+                store: store.clone(),
+                profile_id,
             }
-        }
+        };
+        let profile_id = reserved.id().to_string();
 
-        // Residency bound: this store holds at most `MAX_RECORDS_PER_STORE` profiles,
-        // so repeated creates cannot grow the emulator's memory without limit. Checked
-        // AFTER the idempotency replay, so a replay still answers from a full store.
-        if !state.accepts_another_profile() {
-            return Err(store_full());
-        }
-
-        let mut profile_id = crate::state::new_resource_id("p");
-        while state.profiles.contains_key(&profile_id) {
-            profile_id = crate::state::new_resource_id("p");
-        }
+        // PHASE 2, with no lock held: with logging ENABLED the service provisions a real
+        // log group, so the `logGroupName` this profile reports resolves in CloudWatch
+        // Logs; with logging DISABLED it provisions none and reports none. The profile
+        // is minted only once its logging destination exists.
         let region = crate::state::request_region(ctx.parts());
-        let profile = crate::state::Profile {
-            profile_arn: ::engine::emulator_arn("b2bi", &region, &format!("profile/{profile_id}")),
-            // A logging group exists only where logging is turned on; its name is the
-            // `b2bi/<profileId>-Logs` form this service's own model example carries.
-            log_group_name: (input.logging == crate::state::LOGGING_ENABLED)
-                .then(|| format!("b2bi/{profile_id}-Logs")),
-            profile_id,
-            name: input.name,
-            email: input.email,
-            phone: input.phone,
-            business_name: input.business_name,
-            logging: input.logging,
-            created_at: crate::state::now(),
-            modified_at: None,
-            tags: input.tags.unwrap_or_default(),
+        let log_group_name = (input.logging == crate::state::LOGGING_ENABLED)
+            .then(|| crate::state::log_group_name(&profile_id));
+        let provisioned = match log_group_name.as_deref() {
+            None => Ok(false),
+            Some(name) => provision_log_group(ctx, &region, name).await,
+        };
+        let provisioned_here = match provisioned {
+            Ok(created) => created,
+            // The reservation goes with the call, released by `reserved`'s `Drop`.
+            Err(detail) => return Err(log_group_unavailable(&detail)),
         };
 
-        let response = stored_profile_response(&profile);
-        let profile_id = profile.profile_id.clone();
-        state.profiles.insert(profile_id.clone(), profile);
-        state.profile_order.push(profile_id.clone());
-        if let Some(key) = idempotency_key {
-            state.record_idempotency(key, &profile_id);
+        // PHASE 3, under the lock again: persist the record. The reservation held both
+        // the id and the quota slot, so neither can have been taken; only the idempotency
+        // token can have been answered meanwhile, by a concurrent create carrying the
+        // same one. What was decided is acted on BELOW the lock — so that one bail-out
+        // can still release the group it provisioned, and so the reservation guard (whose
+        // `Drop` takes the state lock) is not dropped while this one is held.
+        let settled = {
+            let mut state = store.lock();
+            // Release the reservation here, so the account's live count is exact the
+            // moment the profile is stored; the guard's `Drop` then finds nothing to do.
+            state.reserved_profile_ids.remove(&profile_id);
+            let replayed = idempotency_key
+                .as_deref()
+                .and_then(|key| state.idempotency.get(key).cloned())
+                .and_then(|id| state.profiles.get(&id).map(stored_profile_response));
+            if let Some(response) = replayed {
+                Settled::Replayed(response)
+            } else {
+                let profile = crate::state::Profile {
+                    profile_arn: ::engine::emulator_arn(
+                        "b2bi",
+                        &region,
+                        &format!("profile/{profile_id}"),
+                    ),
+                    log_group_name: log_group_name.clone(),
+                    profile_id: profile_id.clone(),
+                    name: input.name,
+                    email: input.email,
+                    phone: input.phone,
+                    business_name: input.business_name,
+                    logging: input.logging,
+                    created_at: crate::state::now(),
+                    modified_at: None,
+                    tags: input.tags.unwrap_or_default(),
+                };
+                let response = stored_profile_response(&profile);
+                state.profiles.insert(profile_id.clone(), profile);
+                state.profile_order.push(profile_id.clone());
+                if let Some(key) = idempotency_key {
+                    state.record_idempotency(key, &profile_id);
+                }
+                Settled::Stored(response)
+            }
+        };
+
+        match settled {
+            Settled::Stored(response) => Ok(response),
+            Settled::Replayed(response) => {
+                // No profile was stored under the minted id, so a log group THIS call
+                // created for it owns nothing: release it rather than leave it behind. A
+                // group that was already there belongs to whoever created it, and stays.
+                if provisioned_here {
+                    if let Some(name) = log_group_name.as_deref() {
+                        release_log_group(ctx, &region, name).await;
+                    }
+                }
+                Ok(response)
+            }
         }
-        Ok(response)
     }
 }

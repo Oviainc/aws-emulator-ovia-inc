@@ -304,15 +304,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `IpAddressType`: "It cannot be changed while the server is online. You must
         // stop the server before modifying this parameter." A request that names the
         // value the server already has changes nothing and is not refused.
+        //
+        // The refusal states the requirement, not the state the server happens to be
+        // in: `OFFLINE` is the one state the change is allowed from, so the text is
+        // fixed for the condition and carries nothing of the request.
         if let Some(requested) = input.ip_address_type.as_deref() {
             if requested != stored.ip_address_type && stored.state != st::SERVER_STATE_OFFLINE {
                 return Err(UpdateServerErrorModeled::InvalidRequestException(
                     InvalidRequestException {
-                        message: format!(
-                            "IpAddressType cannot be changed while the server is in the {} \
-                             state; stop the server first",
-                            stored.state
-                        ),
+                        message: st::IP_ADDRESS_TYPE_NEEDS_OFFLINE_SERVER.to_string(),
                     },
                 )
                 .into());

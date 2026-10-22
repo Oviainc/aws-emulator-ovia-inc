@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagDeliveryStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagDeliveryStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagDeliveryStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes EXACTLY the tag keys the request names from the stream's tag register in
+//! [`crate::state`], leaving every other tag of that stream in place and ignoring a named
+//! key the stream does not carry (so a repeated removal is a no-op).
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +140,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagDeliveryStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagDeliveryStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagDeliveryStream"))
+        // Mounted on an engine that holds no state this service can reach. Unreachable
+        // through the router, which mounts every service on one shared `InMemoryEngine`,
+        // and this operation models no server-side error to report it with.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UntagDeliveryStream",
+            ));
+        };
+        let _ = ctx;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Applies only the transitions the clock had ALREADY made due (`CREATING` ->
+        // `ACTIVE`, the removal of a deleted stream), so this call sees the register the
+        // same way every other operation does.
+        store.materialise_due(now);
+
+        let Some(stream) = store.streams.get_mut(&input.delivery_stream_name) else {
+            return Err(UntagDeliveryStreamErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // Scoped to the account, and NOT to the name that was probed — see
+                    // `crate::service::not_found_message`.
+                    message: Some(crate::service::not_found_message()),
+                },
+            )
+            .into());
+        };
+
+        // "Removes tags from the specified Firehose stream" — the tags it names, which is
+        // `TagKeys` and nothing else, so every key the request does not name survives.
+        // "If you specify a tag that doesn't exist, the operation ignores it": a key the
+        // stream does not carry removes nothing and fails nothing, which is what makes a
+        // repeated removal a no-op. A key repeated inside one request removes it once for
+        // the same reason.
+        for key in &input.tag_keys {
+            stream.tags.remove(key);
+        }
+        // A tag change is not part of the stream's described configuration
+        // (`DescribeDeliveryStream` reports no tags and the model gives tagging no
+        // version), so neither `VersionId` nor `LastUpdateTimestamp` moves here.
+
+        Ok(UntagDeliveryStreamOutput {})
     }
 }

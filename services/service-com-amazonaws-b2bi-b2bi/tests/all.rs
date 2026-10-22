@@ -15,6 +15,8 @@
 mod generate_mapping;
 #[path = "all/onboarding_loop.rs"]
 mod onboarding_loop;
+#[path = "all/references_logging_and_quota.rs"]
+mod references_logging_and_quota;
 #[path = "all/starter_mapping_template.rs"]
 mod starter_mapping_template;
 #[path = "all/state_roundtrip.rs"]

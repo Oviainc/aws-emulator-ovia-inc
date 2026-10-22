@@ -146,15 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         if state.origin_endpoints.remove(&input.id).is_none() {
-            return Err(DeleteOriginEndpointErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(format!(
-                        "Origin endpoint with ID \"{}\" not found.",
-                        input.id
-                    )),
-                },
-            )
-            .into());
+            return Err(crate::state::origin_endpoint_not_found(&input.id).into());
         }
         Ok(DeleteOriginEndpointOutput {})
     }

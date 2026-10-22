@@ -691,8 +691,11 @@ async fn an_origin_endpoint_the_service_cannot_package_is_refused() {
     .await;
     assert_eq!(status, 200, "the fixture endpoint expected 200");
 
-    // A ChannelId naming no stored channel: nothing to package, so 404. The rows differ
-    // along the shape of the absent channel id.
+    // A ChannelId naming no stored channel: nothing to package. It is a value in the
+    // REQUEST that cannot be resolved, so it is refused as 422 keyed by the member (see
+    // `tests/all/error_envelope.rs`, which pins that rule against the 404 a request
+    // ADDRESSING a missing resource gets). The rows differ along the shape of the absent
+    // channel id.
     for channel_id in ["no-such-channel", "demo-channe", "DEMO-CHANNEL"] {
         let case = format!("absent channel {channel_id}");
         let (status, error) = call(
@@ -703,13 +706,13 @@ async fn an_origin_endpoint_the_service_cannot_package_is_refused() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404, got {status} {error:?}"
+            status, 422,
+            "case {case:?}: expected 422, got {status} {error:?}"
         );
         assert_eq!(
             error_code(&error),
-            "NotFoundException",
-            "case {case:?}: expected NotFoundException, got {error:?}"
+            "UnprocessableEntityException",
+            "case {case:?}: expected UnprocessableEntityException, got {error:?}"
         );
         let (status, _) = call(&router, "GET", "/origin_endpoints/x", None).await;
         assert_eq!(
@@ -1002,12 +1005,14 @@ async fn deleting_an_origin_endpoint_removes_it_from_state() {
 // Paging
 // ---------------------------------------------------------------------------
 
-/// `MaxResults`' published range: `range 1..1000` on `ListChannels`/`ListOriginEndpoints`
-/// — `smithy_query(query="operation",operation="ListOriginEndpoints",model_path="services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json")`.
-const MAX_RESULTS_RANGE: (i64, i64) = (1, 1000);
+/// The page-size bound MediaPackage ENFORCES: `maxResults` must be an integer between 1
+/// and 50. Narrower than the modelled `MaxResults` `@range` (1..1000 —
+/// `smithy_query(query="shape",shape="MaxResults",model_path="services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json")`),
+/// which is what a client-side validator checks; this is what the service applies.
+const MAX_RESULTS_RANGE: (i64, i64) = (1, 50);
 
 #[tokio::test]
-async fn max_results_is_honoured_inside_its_published_range_and_refused_outside_it() {
+async fn max_results_is_honoured_inside_the_enforced_bound_and_refused_outside_it() {
     let router = emulator();
     for index in 0..5 {
         create_channel(&router, &format!("channel-{index}")).await;
@@ -1025,7 +1030,8 @@ async fn max_results_is_honoured_inside_its_published_range_and_refused_outside_
         .await;
         assert_eq!(
             status, 200,
-            "case {case:?}: a maxResults inside 1..1000 must be accepted, got {status} {listed:?}"
+            "case {case:?}: a maxResults inside {low}..{high} must be accepted, got \
+             {status} {listed:?}"
         );
         let returned = listed
             .get("channels")
@@ -1045,8 +1051,9 @@ async fn max_results_is_honoured_inside_its_published_range_and_refused_outside_
         );
     }
 
-    // One past each published bound is refused, not clamped.
-    for max_results in [low - 1, high + 1] {
+    // One past each enforced bound is refused, not clamped — and so is a value the
+    // MODELLED range would admit but the service does not, and one it would not.
+    for max_results in [low - 1, high + 1, 1_000, 10_000] {
         let case = format!("maxResults={max_results}");
         let (status, body) = call(
             &router,
@@ -1055,9 +1062,15 @@ async fn max_results_is_honoured_inside_its_published_range_and_refused_outside_
             None,
         )
         .await;
-        assert!(
-            (400..500).contains(&status),
-            "case {case:?}: a maxResults outside 1..1000 must be refused, got {status} {body:?}"
+        assert_eq!(
+            status, 422,
+            "case {case:?}: a maxResults outside {low}..{high} must be refused as 422, \
+             got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "UnprocessableEntityException",
+            "case {case:?}: expected UnprocessableEntityException, got {body:?}"
         );
         assert_eq!(
             body.get("channels"),

@@ -35,6 +35,9 @@ mod request_deserialization;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 
+#[path = "all/sampling_rule_default_and_update.rs"]
+mod sampling_rule_default_and_update;
+
 #[path = "all/sampling_rule_deletion.rs"]
 mod sampling_rule_deletion;
 

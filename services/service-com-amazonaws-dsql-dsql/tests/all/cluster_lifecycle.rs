@@ -12,6 +12,10 @@
 //! optional member a cluster can carry, pagination for several page sizes over
 //! several cluster counts, and the refusals for the whole class of malformed
 //! identifiers.
+//!
+//! The `Dsql` harness below is this crate's ONE test client: a sibling suite
+//! (`tests/all/resource_tags.rs`) drives the same `dispatch` path through it rather
+//! than building a second one.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -45,21 +49,21 @@ const MAX_RESULTS_MIN: i64 = 1;
 const MAX_RESULTS_MAX: i64 = 100;
 
 /// One emulator plus the region its requests are signed for.
-struct Dsql {
+pub(crate) struct Dsql {
     router: MultiServiceRouter,
     region: String,
 }
 
 /// One answer from the emulator: the status, the restJson1 error code, and the body.
-struct Answer {
-    status: u16,
-    error: Option<String>,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) error: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// A string member of the response body, or the empty string when absent.
-    fn str(&self, member: &str) -> String {
+    pub(crate) fn str(&self, member: &str) -> String {
         self.body
             .get(member)
             .and_then(Value::as_str)
@@ -68,13 +72,13 @@ impl Answer {
     }
 
     /// A member of the response body, or `Value::Null` when absent.
-    fn get(&self, member: &str) -> Value {
+    pub(crate) fn get(&self, member: &str) -> Value {
         self.body.get(member).cloned().unwrap_or(Value::Null)
     }
 }
 
 impl Dsql {
-    fn in_region(region: &str) -> Self {
+    pub(crate) fn in_region(region: &str) -> Self {
         // The one shared engine the router builds in production, handed to the
         // service through its constructor.
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -87,11 +91,11 @@ impl Dsql {
         }
     }
 
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::in_region("us-east-1")
     }
 
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Answer {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Answer {
         let payload = body
             .map(|v| serde_json::to_vec(&v).expect("a JSON body serializes"))
             .unwrap_or_default();
@@ -137,11 +141,11 @@ impl Dsql {
         }
     }
 
-    async fn create(&self, body: Value) -> Answer {
+    pub(crate) async fn create(&self, body: Value) -> Answer {
         self.call("POST", "/cluster", Some(body)).await
     }
 
-    async fn get(&self, identifier: &str) -> Answer {
+    pub(crate) async fn get(&self, identifier: &str) -> Answer {
         self.call("GET", &format!("/cluster/{identifier}"), None).await
     }
 
@@ -161,7 +165,7 @@ impl Dsql {
 
     /// Create a cluster that accepts a mutation straight away: deletion protection
     /// off, and the clock's `CREATING -> ACTIVE` transition already settled.
-    async fn create_settled(&self) -> String {
+    pub(crate) async fn create_settled(&self) -> String {
         let created = self.create(json!({"deletionProtectionEnabled": false})).await;
         assert_eq!(
             created.status, 200,
@@ -175,7 +179,7 @@ impl Dsql {
 
 /// Let the clock's pending transition come due. The emulator never sleeps for it —
 /// it stores the due instant — so a test that wants the settled state waits past it.
-async fn wait_for_the_clock() {
+pub(crate) async fn wait_for_the_clock() {
     ::tokio::time::sleep(SETTLE_AFTER + Duration::from_millis(150)).await;
 }
 
@@ -188,7 +192,7 @@ fn is_cluster_id(value: &str) -> bool {
 }
 
 /// The ARN `ClusterArn`'s pattern requires for `identifier` in `region`.
-fn expected_arn(region: &str, identifier: &str) -> String {
+pub(crate) fn expected_arn(region: &str, identifier: &str) -> String {
     format!(
         "arn:aws:dsql:{region}:{}:cluster/{identifier}",
         engine::EMULATOR_ACCOUNT_ID
@@ -196,7 +200,7 @@ fn expected_arn(region: &str, identifier: &str) -> String {
 }
 
 /// A syntactically valid cluster id for a cluster that was never created.
-fn absent_identifier() -> String {
+pub(crate) fn absent_identifier() -> String {
     "zzzzzzzzzzzzzzzzzzzzzzzzzz".to_string()
 }
 

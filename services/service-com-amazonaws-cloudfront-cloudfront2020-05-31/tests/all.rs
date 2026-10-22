@@ -19,6 +19,8 @@ mod distribution_delete_gate;
 mod distribution_lifecycle;
 #[path = "all/distribution_tags.rs"]
 mod distribution_tags;
+#[path = "all/error_envelope.rs"]
+mod error_envelope;
 #[path = "all/key_value_store_lifecycle.rs"]
 mod key_value_store_lifecycle;
 #[path = "all/state_roundtrip.rs"]

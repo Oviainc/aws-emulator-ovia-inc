@@ -51,6 +51,13 @@ pub const RECORD_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 /// streams per Amazon Web Services Region" (`CreateDeliveryStream`).
 pub const MAX_STREAMS_PER_REGION: usize = 5_000;
 
+/// The most tags ONE stream carries.
+///
+/// Documented, not chosen: "Each Firehose stream can have up to 50 tags"
+/// (`TagDeliveryStream`) — the same ceiling as the modelled `TagDeliveryStreamInputTagList`
+/// and `ListTagsForDeliveryStreamOutputTagList` length and as `Limit`'s range.
+pub const MAX_TAGS_PER_STREAM: usize = 50;
+
 /// The most record data ONE stream keeps buffered.
 ///
 /// An emulator resource budget, NOT an AWS limit: this process holds every buffered

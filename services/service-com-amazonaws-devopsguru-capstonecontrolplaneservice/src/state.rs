@@ -5,10 +5,21 @@
 //! Everything a DevOps Guru client can itself create lives here: the analysis
 //! coverage it declares (`UpdateResourceCollection`), the notification channels it
 //! adds (`AddNotificationChannel`), and the service-integration configuration it
-//! sets (`UpdateServiceIntegration`). Insights and anomalies are produced by AWS
-//! analysis rather than by the client, so they are not part of this store.
+//! sets (`UpdateServiceIntegration`).
+//!
+//! Insights are produced by DevOps Guru's own analysis, never by a client call, so
+//! [`ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::insights`] is the map
+//! that analysis would write and the insight READS (`ListInsights` today) report:
+//! this emulator runs no analysis, so the map stays empty for an account whose
+//! insights nothing produced, and a read over it reports nothing rather than
+//! inventing an insight.
 
 use std::collections::{BTreeMap, BTreeSet};
+
+use crate::ops::types::{
+    CloudFormationCollection, InsightTimeRange, PredictionTimeRange, ProactiveInsightSummary,
+    ReactiveInsightSummary, ResourceCollection, ServiceCollection, TagCollection,
+};
 
 /// Per-service state for com-amazonaws-devopsguru-capstonecontrolplaneservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -21,6 +32,146 @@ pub struct ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
     /// The last `UpdateServiceIntegration` configuration, which
     /// `DescribeServiceIntegration` reports.
     pub service_integration: ServiceIntegrationRecord,
+    /// The insights DevOps Guru's analysis produced for this account, keyed by
+    /// `InsightId`.
+    ///
+    /// No modelled operation MINTS an insight — DevOps Guru derives one itself from
+    /// anomalies in the covered resources — so this map is what an insight generator
+    /// writes and what the insight reads walk. A `BTreeMap` because the reads page over
+    /// it: the key order is stable, which is what a page cursor needs.
+    pub insights: BTreeMap<String, InsightRecord>,
+}
+
+/// One insight, as the insight reads report it.
+///
+/// Holds every member `ProactiveInsightSummary` and `ReactiveInsightSummary` carry;
+/// [`InsightRecord::insight_type`] is what decides which of the two a read renders.
+#[derive(Debug, Clone, Default)]
+pub struct InsightRecord {
+    /// `InsightId` — the map key, repeated here so a page of records is self-contained.
+    pub id: String,
+    /// `InsightName`.
+    pub name: String,
+    /// `InsightType`: `PROACTIVE` or `REACTIVE` — see `INSIGHT_TYPE_VALUES`.
+    pub insight_type: String,
+    /// `InsightSeverity` — see `INSIGHT_SEVERITY_VALUES`.
+    pub severity: String,
+    /// `InsightStatus`: `ONGOING` while the behaviour continues, `CLOSED` once it
+    /// ended — see `INSIGHT_STATUS_VALUES`.
+    pub status: String,
+    /// `InsightTimeRange.StartTime`, in milliseconds since the epoch. Required by the
+    /// modelled shape, so every record carries one.
+    pub start_time_millis: i64,
+    /// `InsightTimeRange.EndTime`, in milliseconds since the epoch: the instant the
+    /// behaviour ended, which only a `CLOSED` insight has.
+    pub end_time_millis: Option<i64>,
+    /// `PredictionTimeRange.StartTime`, in milliseconds since the epoch. Only a
+    /// proactive insight predicts a window, so this is absent on a reactive one.
+    pub prediction_start_time_millis: Option<i64>,
+    /// `PredictionTimeRange.EndTime`, in milliseconds since the epoch.
+    pub prediction_end_time_millis: Option<i64>,
+    /// `ResourceCollection` — the resources this insight is about. The same
+    /// stack-name / tag-collection shape as the account's coverage, so it reuses
+    /// [`ResourceCoverage`]; absent when the insight names no resources.
+    pub resource_collection: Option<ResourceCoverage>,
+    /// `ServiceCollection.ServiceNames` (`SERVICE_NAME_VALUES`), empty when the
+    /// insight names no service.
+    pub service_names: Vec<String>,
+    /// `AssociatedResourceArns`, empty when the insight names no resource ARN.
+    pub associated_resource_arns: Vec<String>,
+}
+
+impl InsightRecord {
+    /// This record as the modelled `ProactiveInsightSummary`.
+    pub fn to_proactive_summary(&self) -> ProactiveInsightSummary {
+        ProactiveInsightSummary {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            severity: Some(self.severity.clone()),
+            status: Some(self.status.clone()),
+            insight_time_range: Some(self.insight_time_range()),
+            prediction_time_range: self.prediction_time_range(),
+            resource_collection: self.wire_resource_collection(),
+            service_collection: self.wire_service_collection(),
+            associated_resource_arns: self.wire_associated_resource_arns(),
+        }
+    }
+
+    /// This record as the modelled `ReactiveInsightSummary`, which carries no
+    /// `PredictionTimeRange`: only a proactive insight predicts a window.
+    pub fn to_reactive_summary(&self) -> ReactiveInsightSummary {
+        ReactiveInsightSummary {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            severity: Some(self.severity.clone()),
+            status: Some(self.status.clone()),
+            insight_time_range: Some(self.insight_time_range()),
+            resource_collection: self.wire_resource_collection(),
+            service_collection: self.wire_service_collection(),
+            associated_resource_arns: self.wire_associated_resource_arns(),
+        }
+    }
+
+    fn insight_time_range(&self) -> InsightTimeRange {
+        InsightTimeRange {
+            start_time: timestamp(self.start_time_millis),
+            end_time: self.end_time_millis.map(timestamp),
+        }
+    }
+
+    fn prediction_time_range(&self) -> Option<PredictionTimeRange> {
+        self.prediction_start_time_millis
+            .map(|start| PredictionTimeRange {
+                start_time: timestamp(start),
+                end_time: self.prediction_end_time_millis.map(timestamp),
+            })
+    }
+
+    fn wire_resource_collection(&self) -> Option<ResourceCollection> {
+        self.resource_collection
+            .as_ref()
+            .map(|coverage| ResourceCollection {
+                cloud_formation: (!coverage.cloudformation_stack_names.is_empty()).then(|| {
+                    CloudFormationCollection {
+                        stack_names: Some(
+                            coverage.cloudformation_stack_names.iter().cloned().collect(),
+                        ),
+                    }
+                }),
+                tags: (!coverage.tag_collections.is_empty()).then(|| {
+                    coverage
+                        .tag_collections
+                        .iter()
+                        .map(|(app_boundary_key, tag_values)| TagCollection {
+                            app_boundary_key: app_boundary_key.clone(),
+                            tag_values: tag_values.iter().cloned().collect(),
+                        })
+                        .collect()
+                }),
+            })
+    }
+
+    fn wire_service_collection(&self) -> Option<ServiceCollection> {
+        (!self.service_names.is_empty()).then(|| ServiceCollection {
+            service_names: Some(self.service_names.clone()),
+        })
+    }
+
+    fn wire_associated_resource_arns(&self) -> Option<Vec<String>> {
+        (!self.associated_resource_arns.is_empty())
+            .then(|| self.associated_resource_arns.clone())
+    }
+}
+
+/// A stored instant as the modelled `Timestamp`.
+pub fn timestamp(millis_since_epoch: i64) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from_millis(millis_since_epoch)
+}
+
+/// A submitted `Timestamp` as the milliseconds this store keeps, or `None` when the
+/// instant is too far from the epoch to be one.
+pub fn millis_of(at: &::aws_smithy_types::DateTime) -> Option<i64> {
+    at.to_millis().ok()
 }
 
 /// The set of resources DevOps Guru analyses for this account and region.
@@ -29,7 +180,7 @@ pub struct ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
 /// add/remove of coverage, so adding the same stack name or tag value twice
 /// leaves the coverage unchanged and `GetResourceCollection` reports each one
 /// once, in a stable order.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ResourceCoverage {
     /// `UpdateCloudFormationCollectionFilter.StackNames`, reported as
     /// `ResourceCollectionFilter.CloudFormation.StackNames`.
@@ -122,6 +273,9 @@ impl Default for KmsServerSideEncryptionRecord {
 /// so the page size is the service's own; this is the emulator's choice, not a
 /// number AWS publishes. It bounds response amplification; the write-side caps
 /// below are what bound the store itself.
+///
+/// It is also the default page size of a read that DOES model `MaxResults`
+/// (`ListInsights`), where it coincides with that member's modelled maximum of 100.
 pub const PAGE_SIZE: usize = 100;
 
 // ---------------------------------------------------------------------------
@@ -144,6 +298,10 @@ pub const PAGE_SIZE: usize = 100;
 // most MAX_COVERED_TAG_KEYS app-boundary keys each holding at most
 // MAX_TAG_VALUES_PER_KEY values, at most MAX_NOTIFICATION_CHANNELS channels, and one
 // service-integration record of fixed shape.
+//
+// `insights` carries no cap because no request can grow it: insights come from DevOps
+// Guru's analysis, which this emulator does not run, so nothing a caller sends adds an
+// entry. An operation that ever mints one brings its own bound.
 // ---------------------------------------------------------------------------
 
 /// DevOps Guru's own documented ceiling, from `UpdateResourceCollection`'s and
@@ -211,6 +369,19 @@ pub fn encode_page_token(scope: &str, offset: usize) -> Option<String> {
 /// an arbitrary seek (the digest is not a secret, so the offset group is the part a
 /// caller can plausibly change).
 pub fn decode_page_token(scope: &str, token: &str) -> Option<usize> {
+    let offset = decode_token_offset(scope, token)?;
+    offset.is_multiple_of(PAGE_SIZE).then_some(offset)
+}
+
+/// The offset `token` names for `scope`, checking only what the token itself must
+/// satisfy: the modelled `8-4-4-4-12` lowercase-hex shape and `scope`'s digest.
+///
+/// [`decode_page_token`] adds the page-boundary check, which it can only do because its
+/// page size is this service's own [`PAGE_SIZE`]. An operation that models `MaxResults`
+/// pages at the size the CALLER asked for, and AWS honours a `MaxResults` that changes
+/// between pages of one walk, so there the offset need not be a multiple of the current
+/// page size — see [`page_sized`].
+fn decode_token_offset(scope: &str, token: &str) -> Option<usize> {
     let groups: Vec<&str> = token.split('-').collect();
     let [offset, a, b, c, d] = groups[..] else {
         return None;
@@ -223,8 +394,7 @@ pub fn decode_page_token(scope: &str, token: &str) -> Option<usize> {
     if format!("{a}{b}{c}{d}") != scope_digest(scope) {
         return None;
     }
-    let offset = u32::from_str_radix(offset, 16).ok()? as usize;
-    offset.is_multiple_of(PAGE_SIZE).then_some(offset)
+    Some(u32::from_str_radix(offset, 16).ok()? as usize)
 }
 
 /// One page of `items`, plus the token for the next page when more remain.
@@ -248,10 +418,41 @@ pub fn page<T: Clone>(
         Some(token) => decode_page_token(scope, token)?,
         None => 0,
     };
+    page_at(items, scope, offset, PAGE_SIZE)
+}
+
+/// [`page`], at a page size the CALLER chose through a modelled `MaxResults`.
+///
+/// Resolves the token on its shape and its digest alone: the caller may ask for a
+/// different `MaxResults` on each call of one walk, so an offset this service issued at
+/// an earlier page size is not a multiple of the current one and must still resolve.
+/// `None` has the same two meanings as in [`page`] — a token not issued for `scope`, or
+/// an offset past the end of a collection that has since shrunk — which the caller
+/// answers with its `ValidationException`.
+pub fn page_sized<T: Clone>(
+    items: &[T],
+    scope: &str,
+    token: Option<&str>,
+    page_size: usize,
+) -> Option<(Vec<T>, Option<String>)> {
+    let offset = match token {
+        Some(token) => decode_token_offset(scope, token)?,
+        None => 0,
+    };
+    page_at(items, scope, offset, page_size.max(1))
+}
+
+/// The `page_size` items at `offset`, plus the token for the page after them.
+fn page_at<T: Clone>(
+    items: &[T],
+    scope: &str,
+    offset: usize,
+    page_size: usize,
+) -> Option<(Vec<T>, Option<String>)> {
     if offset > items.len() {
         return None;
     }
-    let end = (offset + PAGE_SIZE).min(items.len());
+    let end = (offset + page_size).min(items.len());
     let next = if end < items.len() {
         encode_page_token(scope, end)
     } else {

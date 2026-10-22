@@ -16,7 +16,8 @@ use std::collections::HashSet;
 use serde_json::{json, Value};
 
 use crate::onboarding_loop::{
-    b2bi_router, call, call_signed_for, error_code, is_generated_id, text, ACCOUNT, SIGNING_REGION,
+    b2bi_router, call, call_signed_for, error_code, given_transformer, is_generated_id, text,
+    ACCOUNT, SIGNING_REGION,
 };
 
 /// Every configuration member `CreateTransformerResponse` can echo, so a row can assert
@@ -456,6 +457,9 @@ async fn repeating_a_create_with_the_same_client_token_returns_the_same_transfor
 async fn getting_an_unknown_transformer_is_a_404() {
     let router = b2bi_router();
 
+    // The capability this test borrows an id from needs a transformer to name, so one is
+    // created first; its own id is NOT among the rows below.
+    let host_transformer = given_transformer(&router, "host-transformer").await;
     let (status, created) = call(
         &router,
         "CreateCapability",
@@ -469,7 +473,7 @@ async fn getting_an_unknown_transformer_is_a_404() {
                     },
                     "inputLocation": { "bucketName": "inbound-bucket", "key": "in/" },
                     "outputLocation": { "bucketName": "outbound-bucket", "key": "out/" },
-                    "transformerId": "t-0123456789abcdef0"
+                    "transformerId": host_transformer
                 }
             }
         }),

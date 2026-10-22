@@ -24,7 +24,8 @@ tracing = { workspace = true }
 # SHA-256, for the stable domain-validation labels and request fingerprints this
 # service derives from a certificate's own id.
 sha2 = { workspace = true }
-# Hex encoding for those labels and for the opaque `ListCertificates` NextToken.
+# Hex encoding for those labels and for the opaque `NextToken`s this service's list
+# operations issue.
 hex = { workspace = true }
 # Certificate ids: ACM certificate ARNs end in a v4 UUID.
 uuid = { version = "1", features = ["v4"] }
