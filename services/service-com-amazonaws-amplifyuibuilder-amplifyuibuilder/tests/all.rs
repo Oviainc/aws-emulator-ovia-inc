@@ -17,6 +17,9 @@ mod codegen_job_lifecycle;
 #[path = "all/component_lifecycle.rs"]
 mod component_lifecycle;
 
+#[path = "all/component_refusals.rs"]
+mod component_refusals;
+
 #[path = "all/component_wire_fidelity.rs"]
 mod component_wire_fidelity;
 
@@ -25,6 +28,9 @@ mod export_components;
 
 #[path = "all/form_lifecycle.rs"]
 mod form_lifecycle;
+
+#[path = "all/metadata_flags.rs"]
+mod metadata_flags;
 
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
