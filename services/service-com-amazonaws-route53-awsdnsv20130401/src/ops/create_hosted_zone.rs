@@ -155,7 +155,8 @@
 use super::types::*;
 
 use crate::state::{
-    normalize_dns_name, RecordKey, StoredZone, HOSTED_ZONE_PREFIX, MAX_HOSTED_ZONES,
+    normalize_dns_name, RecordKey, StoredZone, HOSTED_ZONE_ALREADY_EXISTS_MESSAGE,
+    MAX_HOSTED_ZONES,
 };
 use std::collections::BTreeMap;
 
@@ -402,15 +403,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // CallerReference is the idempotency token: "You must use a unique
         // CallerReference string every time you submit a CreateHostedZone
-        // request." A repeat is refused rather than served.
-        if let Some(existing) = store.zone_by_caller_reference.get(&input.caller_reference) {
+        // request." A repeat is refused rather than served, in the service's own
+        // constant wording: the zone the reference already names is in state,
+        // not in the refusal text (see [`HOSTED_ZONE_ALREADY_EXISTS_MESSAGE`]).
+        if store
+            .zone_by_caller_reference
+            .contains_key(&input.caller_reference)
+        {
             return Err(CreateHostedZoneErrorModeled::HostedZoneAlreadyExists(
                 HostedZoneAlreadyExists {
-                    message: Some(format!(
-                        "a hosted zone has already been created with CallerReference \
-                         {}: {HOSTED_ZONE_PREFIX}{existing}",
-                        input.caller_reference
-                    )),
+                    message: Some(HOSTED_ZONE_ALREADY_EXISTS_MESSAGE.to_string()),
                 },
             )
             .into());

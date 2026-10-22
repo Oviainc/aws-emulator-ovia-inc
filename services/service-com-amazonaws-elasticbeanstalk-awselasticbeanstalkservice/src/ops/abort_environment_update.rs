@@ -160,24 +160,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // neither there is nothing to cancel, which is the
         // `MissingRequiredParameter` refusal this service answers for an absent
         // member of an either-or pair.
-        if input.environment_id.is_none() && input.environment_name.is_none() {
-            return Err(AbortEnvironmentUpdateError::missing_required_parameter(
-                "Must specify either EnvironmentId or EnvironmentName.",
-            ));
-        }
-
         let environment_id = store
-            .resolve_environment_id(
+            .environment_id_for(
                 input.environment_id.as_deref(),
                 input.environment_name.as_deref(),
             )
-            .ok_or_else(|| {
-                AbortEnvironmentUpdateError::invalid_parameter_value(
-                    crate::state::missing_environment_message(
-                        input.environment_id.as_deref(),
-                        input.environment_name.as_deref(),
-                    ),
-                )
+            .map_err(|refusal| match refusal {
+                crate::state::EnvironmentRefusal::NoIdentifier => {
+                    AbortEnvironmentUpdateError::missing_required_parameter(
+                        "Must specify either EnvironmentId or EnvironmentName.",
+                    )
+                }
+                crate::state::EnvironmentRefusal::NotFound(message) => {
+                    AbortEnvironmentUpdateError::invalid_parameter_value(message)
+                }
             })?;
 
         let environment = store.environments.get_mut(&environment_id).ok_or_else(|| {

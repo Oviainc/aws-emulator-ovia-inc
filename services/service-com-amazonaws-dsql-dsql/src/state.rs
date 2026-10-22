@@ -9,6 +9,13 @@
 //! `clientToken` ledgers that make every `@idempotencyToken`-carrying operation
 //! idempotent.
 //!
+//! A change data capture (CDC) stream belongs to exactly one cluster — every
+//! stream operation is reached at `/stream/{clusterIdentifier}/...` and a
+//! `StreamArn` nests the stream under its cluster's ARN — so a cluster's streams
+//! are stored ON the cluster record rather than in a second map beside it: the
+//! cluster's deletion takes its streams with it, and no handler can read one of
+//! two copies.
+//!
 //! Besides the data, this module owns the few derivations every cluster handler
 //! shares — the request's region, the cluster ARN, the connection endpoint, the
 //! encryption details and the modelled "no such resource" errors — so the
@@ -48,7 +55,8 @@ pub const STREAM_STATUS_CREATING: &str = "CREATING";
 pub const STREAM_STATUS_ACTIVE: &str = "ACTIVE";
 
 /// `EncryptionType` values (`smithy_query(query="shape", shape="EncryptionType")`).
-pub const ENCRYPTION_AWS_OWNED: &str = "AWS_OWNED_KMS_KEY";/// See [`ENCRYPTION_AWS_OWNED`].
+pub const ENCRYPTION_AWS_OWNED: &str = "AWS_OWNED_KMS_KEY";
+/// See [`ENCRYPTION_AWS_OWNED`].
 pub const ENCRYPTION_CUSTOMER_MANAGED: &str = "CUSTOMER_MANAGED_KMS_KEY";
 /// `EncryptionStatus` value for a cluster whose encryption is in place
 /// (`smithy_query(query="shape", shape="EncryptionStatus")`).
@@ -76,22 +84,22 @@ pub const RESOURCE_TYPE_STREAM: &str = "stream";
 /// by the cluster's identifier.
 pub const RESOURCE_TYPE_POLICY: &str = "policy";
 
-/// How long a cluster stays in a transient status (`CREATING`, `UPDATING`,
-/// `DELETING`) before the clock settles it into its terminal one.
+/// How long a cluster or a stream stays in a transient status (`CREATING`,
+/// `UPDATING`, `DELETING`) before the clock settles it into its terminal one.
 ///
 /// A span this emulator CHOOSES, not a duration the service documents: AWS gives
-/// no timing contract for cluster creation. It is deliberately non-zero so a
-/// caller that acts immediately after `CreateCluster` still observes `CREATING`
-/// and the state errors that go with it.
+/// no timing contract for cluster or stream creation. It is deliberately
+/// non-zero so a caller that acts immediately after `CreateCluster` or
+/// `CreateStream` still observes `CREATING` and the state errors that go with it.
 pub const SETTLE_AFTER: Duration = Duration::from_millis(750);
 
-/// A status change the clock owes a cluster: at `due_at` it becomes
+/// A status change the clock owes a cluster or a stream: at `due_at` it becomes
 /// `next_status`, whether or not anybody calls.
 #[derive(Debug, Clone)]
 pub struct PendingTransition {
     /// The instant the change became (or becomes) due.
     pub due_at: SystemTime,
-    /// The `ClusterStatus` the cluster holds from `due_at` on.
+    /// The `ClusterStatus` (or `StreamStatus`) the resource holds from `due_at` on.
     pub next_status: &'static str,
 }
 
@@ -481,6 +489,7 @@ impl ComAmazonawsDsqlDsqlState {
         // Every cluster is visited, because a settled stream transition can be
         // owed to a cluster that owes none itself.
         let identifiers: Vec<String> = self.clusters.keys().cloned().collect();
+
 
         for identifier in identifiers {
             let Some(cluster) = self.clusters.get_mut(&identifier) else {

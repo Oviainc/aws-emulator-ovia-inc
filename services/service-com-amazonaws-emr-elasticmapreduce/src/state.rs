@@ -1016,6 +1016,109 @@ impl StepRecord {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `ListReleaseLabels`: filtering and paging the release catalog
+//
+// The catalog itself is the one above ([`RELEASE_LINES`] / [`APPLICATION_CATALOG`],
+// read through [`catalog_release_labels`] and [`release_line_applications`]); what
+// follows is only what the LISTING needs on top of it — the `Application` filter's
+// predicate and the page-token codec. `ListReleaseLabels` "retrieves release labels
+// of Amazon EMR services in the Region where the API is called", the same answer for
+// every caller, so the listing reads the catalog and writes nothing.
+
+/// "Defines the maximum number of release labels to return in a single
+/// response. The default is 100." (`ListReleaseLabelsInput$MaxResults` doc.)
+/// The modelled `MaxResultsNumber` range is `1..100`, so 100 is both the
+/// default and the largest page a caller can ask for.
+pub const LIST_RELEASE_LABELS_MAX_RESULTS: i32 = 100;
+
+/// Whether the release `label` bundles the application a `ReleaseLabelFilter`'s
+/// `Application` half names.
+///
+/// "Optional release label application filter. For example, `spark@2.1.0`."
+/// (`ReleaseLabelFilter$Application` doc): the bare name matches whatever version of
+/// that application the release bundles, `name@version` only that one version. Both
+/// halves are compared case-insensitively, so the documented lowercase form matches
+/// however the catalog spells a name. A label the catalog does not offer bundles
+/// nothing.
+pub fn release_bundles_application(label: &str, filter: &str) -> bool {
+    let Some((major, minor, _)) = catalog_release(label) else {
+        return false;
+    };
+    let (name, version) = match filter.split_once('@') {
+        Some((name, version)) => (name, Some(version)),
+        None => (filter, None),
+    };
+    release_line_applications(major, minor)
+        .iter()
+        .any(|application| {
+            application
+                .name
+                .as_deref()
+                .is_some_and(|bundled| bundled.eq_ignore_ascii_case(name))
+                && version.is_none_or(|wanted| {
+                    application
+                        .version
+                        .as_deref()
+                        .is_some_and(|bundled| bundled.eq_ignore_ascii_case(wanted))
+                })
+        })
+}
+
+/// A `NextToken` this listing did not mint for the filters it came back with.
+#[derive(Debug, Clone, Copy)]
+pub struct InvalidNextToken;
+
+/// The marker every `ListReleaseLabels` page token carries, before the filters
+/// it is bound to and the label it resumes after. It is what makes a token
+/// verifiable: a string that merely happens to be base64 is not a resume point.
+const RELEASE_LABEL_TOKEN_PREFIX: &str = "emr/v1/releaseLabels/";
+
+/// The filters a page token is bound to, rendered with each half's length ahead
+/// of it so no two different filter pairs render the same string.
+pub fn release_label_filter_fingerprint(
+    prefix: Option<&str>,
+    application: Option<&str>,
+) -> String {
+    let prefix = prefix.unwrap_or_default();
+    let application = application.unwrap_or_default();
+    format!(
+        "{}:{prefix}|{}:{application}",
+        prefix.len(),
+        application.len()
+    )
+}
+
+/// The opaque token that resumes a `fingerprint`-filtered listing after the
+/// release label `cursor`.
+pub fn encode_release_label_token(fingerprint: &str, cursor: &str) -> String {
+    ::aws_smithy_types::base64::encode(format!(
+        "{RELEASE_LABEL_TOKEN_PREFIX}{fingerprint}/{cursor}"
+    ))
+}
+
+/// The release label a token resumes after, or [`InvalidNextToken`] when the
+/// token was not minted by this listing for these filters.
+///
+/// "The ListReleaseLabels request fails if the identity (Amazon Web Services
+/// account ID) and all filtering parameters are different from the original
+/// request, or if the NextToken is expired or tampered with."
+/// (`ListReleaseLabelsInput$NextToken` doc) — binding the filters into the token
+/// and checking them back out is what detects both.
+pub fn decode_release_label_token(
+    token: &str,
+    fingerprint: &str,
+) -> Result<String, InvalidNextToken> {
+    let bytes = ::aws_smithy_types::base64::decode(token).map_err(|_| InvalidNextToken)?;
+    let decoded = String::from_utf8(bytes).map_err(|_| InvalidNextToken)?;
+    decoded
+        .strip_prefix(RELEASE_LABEL_TOKEN_PREFIX)
+        .and_then(|rest| rest.strip_prefix(fingerprint))
+        .and_then(|rest| rest.strip_prefix('/'))
+        .map(str::to_string)
+        .ok_or(InvalidNextToken)
+}
+
 /// A stored instant as the wire timestamp the model declares.
 pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)

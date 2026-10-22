@@ -9,8 +9,11 @@
 //!   SHARED with other services uses for its `Service::can_handle`;
 //! * [`arn`], the one parse of a caller-supplied resource ARN, so no two services
 //!   disagree about which vendor an ARN names;
-//! * [`nth_path_segment`], for the rarer case of two such services publishing the SAME
-//!   path space;
+//! * [`nth_path_segment`] and [`addresses_modeled_route`], for the rarer case of two such
+//!   services publishing the SAME path space — the segment their modelled URIs differ at,
+//!   or (where only the whole route tells them apart) whether a service's own model binds
+//!   a route for the request at all. [`bedrock`] states that split once for the six
+//!   services that share the signing name `bedrock`;
 //! * [`shared_path`], the reader for the one case the path half of the claim rule
 //!   cannot settle on its own: two colliding models binding the same URI path space,
 //!   where the ARN in the path names the resource and so the service that owns it;
@@ -87,13 +90,17 @@
 //! should inline the rule again — call this crate.
 
 pub mod arn;
+pub mod bedrock;
 pub mod front_door;
 pub mod iot_job_executions;
 pub mod network;
 pub mod shared_path;
 pub mod validation;
 
+use aws_smithy_runtime_api::http::Request as RuntimeApiRequest;
+use aws_smithy_types::body::SdkBody;
 use emulator_server::{resolve_route_key, service_from_target, ROOT_PATH_SEGMENT};
+use smithy_server_runtime::ErasedServiceDefinition;
 
 /// A stable 64-bit mixing of `parts`, rendered as 16 hexadecimal digits.
 ///
@@ -244,6 +251,64 @@ pub fn claims_modeled_path(parts: &http::request::Parts, path_segments: &[&str])
     match first_path_segment(parts.uri.path()) {
         Some(segment) => path_segments.contains(&segment),
         None => path_segments.contains(&ROOT_PATH_SEGMENT),
+    }
+}
+
+/// Whether the service whose generated `ServiceDefinition` is `definition` binds a
+/// modelled route for the request `parts` came from.
+///
+/// The LAST discriminator available to two peers under one signing name whose modelled
+/// path spaces overlap and whose URIs do not differ at any single segment
+/// ([`nth_path_segment`] is the cheaper reader for that case). It names nothing about
+/// either service: the question it asks is exactly the one the router asks AFTER a
+/// service claims a request — the service's own wire protocol resolves the request's
+/// routing key (for a REST protocol, from the method and the URI patterns its model
+/// binds; for `awsJson`, from `X-Amz-Target`; for `rpcv2Cbor`, from the URI), and the
+/// model-derived routing table answers whether that key names one of this service's
+/// operations. So a peer claims a path inside the space it shares only for the routes its
+/// OWN model binds, and the framework's route matcher stays the single owner of route
+/// matching.
+///
+/// `Service::can_handle` is handed the request's parts, while a protocol reads a whole
+/// runtime-API request, so the three things a routing key is read from — the method, the
+/// URI and the headers — are re-presented to it on an EMPTY body. No protocol that keys
+/// on the body is affected: `awsQuery` and `ec2Query` route on the `Action` form field,
+/// publish no `smithy.api#http` bindings at all, and are therefore separated by the
+/// service their request NAMES rather than by a route (see [`claims_request`]).
+///
+/// `false` when the request cannot be rebuilt (a URI or method the runtime API rejects),
+/// when the protocol resolves no routing key, and when the key it resolves names no
+/// operation this service wires.
+///
+/// The rebuild mirrors the router's own `runtime_api_request_from_parts`
+/// (`vendor/smithy-server-runtime/src/multi_service_router.rs`), which is private to that
+/// agent-immutable crate: the URI, the method and every header value, `append`ed so a
+/// repeated header keeps all of its values. The two must stay in step — the ONE
+/// difference is deliberate, the empty body, since no routing key this is used for reads
+/// one.
+pub fn addresses_modeled_route(
+    parts: &http::request::Parts,
+    definition: &dyn ErasedServiceDefinition,
+) -> bool {
+    let mut request = RuntimeApiRequest::new(SdkBody::empty());
+    if request.set_uri(parts.uri.to_string().as_str()).is_err() {
+        return false;
+    }
+    if request.set_method(parts.method.as_str()).is_err() {
+        return false;
+    }
+    for (name, value) in parts.headers.iter() {
+        if let Ok(value) = value.to_str() {
+            // `append`, not `insert`: `HeaderMap::iter` yields one entry per value, so a
+            // repeated header keeps every one of them, as the router's own rebuild does.
+            request
+                .headers_mut()
+                .append(name.as_str().to_string(), value.to_string());
+        }
+    }
+    match definition.protocol().routing_key(&request) {
+        Ok(key) => definition.routing_table().get(key).is_some(),
+        Err(_) => false,
     }
 }
 

@@ -19,3 +19,5 @@ mod file_system_lifecycle;
 mod lifecycle_configuration;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tags.rs"]
+mod tags;

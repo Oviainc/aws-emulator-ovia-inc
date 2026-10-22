@@ -203,9 +203,15 @@ impl Emulator {
     }
 }
 
-/// Percent-encode the `:` and `/` of an ARN so it fits one non-greedy `@httpLabel`,
-/// exactly as an AWS SDK encodes a label value.
-fn encoded(arn: &str) -> String {
+/// Percent-encode an ARN so it fits one non-greedy `@httpLabel`, exactly as an AWS SDK
+/// encodes a label value: its `:` and `/` are the reserved characters that would
+/// otherwise split the path.
+///
+/// `pub(crate)` because it is the ONE label escaper this crate's test suites share —
+/// `resource_tagging::tags_path` and `resource_tags` both address the tagging URIs
+/// through it, so no suite needs a second copy and the same ARN always becomes the same
+/// URI.
+pub(crate) fn encoded(arn: &str) -> String {
     arn.chars()
         .map(|c| match c {
             ':' => "%3A".to_string(),

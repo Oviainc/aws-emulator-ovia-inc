@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: adds, updates and removes tags on the Elastic Beanstalk resource the ARN
+//! names, within the per-resource tag quota — which also bounds the request: a tag list
+//! longer than the quota is refused before anything is merged or the store is locked.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +84,98 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::collections::{HashMap, HashSet};
+
+/// How this operation words each way a `ResourceArn` names no taggable resource.
+///
+/// * not an ARN of this service — `ResourceArn` is documented as "the ARN of the
+///   resouce to be updated. Must be the ARN of an Elastic Beanstalk resource",
+///   so a value that is any other service's ARN, or no ARN at all, is a
+///   parameter value that cannot be used: `InvalidParameterValue`, which is what
+///   the service answers a foreign ARN with.
+/// * a type this service does not tag — `ResourceTypeNotSupportedException`:
+///   "The type of the specified Amazon Resource Name (ARN) isn't supported for
+///   this operation."
+/// * a taggable type whose resource does not exist — `ResourceNotFoundException`:
+///   "A resource doesn't exist for the specified Amazon Resource Name (ARN)."
+fn refused(
+    resource_arn: &str,
+    refusal: crate::state::ResourceArnRefusal,
+) -> UpdateTagsForResourceError {
+    match refusal {
+        crate::state::ResourceArnRefusal::NotThisService => {
+            UpdateTagsForResourceError::invalid_parameter_value(format!(
+                "Resource ARN {resource_arn} is not an Elastic Beanstalk resource ARN."
+            ))
+        }
+        crate::state::ResourceArnRefusal::UnsupportedType => {
+            UpdateTagsForResourceErrorModeled::ResourceTypeNotSupportedException(
+                ResourceTypeNotSupportedException {
+                    message: Some(format!(
+                        "The type of the resource ARN {resource_arn} is not supported for tagging."
+                    )),
+                },
+            )
+            .into()
+        }
+        crate::state::ResourceArnRefusal::NotFound => {
+            UpdateTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Resource not found for ARN {resource_arn}.")),
+                },
+            )
+            .into()
+        }
+    }
+}
+
+/// The tag set this request leaves on the resource.
+///
+/// "`TagsToAdd`: A list of tags to add or update. If a key of an existing tag is
+/// added, the tag's value is updated." / "`TagsToRemove`: A list of tag keys to
+/// remove. If a tag key doesn't exist, it is silently ignored." Removals are
+/// applied to what the resource already carries, then the additions are
+/// upserted, so a key in both lists ends up with the value that was added.
+///
+/// Both passes are keyed through a set and a key index, so the work is LINEAR in
+/// the lists involved rather than quadratic: the caller chooses how long they
+/// are, and this runs while the store is locked. The handler has already bounded
+/// each list by [`crate::state::MAX_TAGS_PER_RESOURCE`] before calling in.
+fn merge_tags(current: &[Tag], tags_to_add: &[Tag], tags_to_remove: &[String]) -> Vec<Tag> {
+    let removals: HashSet<&str> = tags_to_remove.iter().map(String::as_str).collect();
+    let mut merged: Vec<Tag> = current
+        .iter()
+        .filter(|tag| {
+            tag.key
+                .as_deref()
+                .is_none_or(|key| !removals.contains(key))
+        })
+        .cloned()
+        .collect();
+    // The index owns its keys, so an upsert can write straight through to
+    // `merged` without a second scan of it.
+    let mut at_key: HashMap<String, usize> = HashMap::with_capacity(merged.len());
+    for (at, tag) in merged.iter().enumerate() {
+        if let Some(key) = tag.key.clone() {
+            at_key.insert(key, at);
+        }
+    }
+    for tag in tags_to_add {
+        // A tag with no key is refused by the handler before the merge runs.
+        let Some(key) = tag.key.clone() else {
+            continue;
+        };
+        match at_key.get(&key) {
+            Some(&at) => merged[at].value = tag.value.clone(),
+            None => {
+                at_key.insert(key, merged.len());
+                merged.push(tag.clone());
+            }
+        }
+    }
+    merged
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -181,18 +268,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTagsForResource"))
+        let _ = ctx;
+
+        // Every refusal that reads only the request is answered BEFORE the store
+        // is locked, so a request that cannot succeed holds the lock for nothing
+        // and the work done under it is bounded by the quota below.
+
+        // "Specify at least one of these parameters: TagsToAdd, TagsToRemove."
+        // A list that is present but empty specifies nothing, so it is the same
+        // request as one that omitted both.
+        let tags_to_add = input.tags_to_add.clone().unwrap_or_default();
+        let tags_to_remove = input.tags_to_remove.clone().unwrap_or_default();
+        if tags_to_add.is_empty() && tags_to_remove.is_empty() {
+            return Err(UpdateTagsForResourceError::missing_parameter(
+                "Specify at least one of TagsToAdd or TagsToRemove.",
+            ));
+        }
+        // A tag is stored under its key, so one without a key cannot be applied.
+        if let Some(keyless) = tags_to_add.iter().position(|tag| {
+            tag.key.as_ref().is_none_or(|key| key.is_empty())
+        }) {
+            return Err(UpdateTagsForResourceError::invalid_parameter_value(format!(
+                "Value null at 'tagsToAdd.{}.member.key' failed to satisfy constraint: Member must not be null.",
+                keyless + 1
+            )));
+        }
+        // Neither list can be longer than the number of tags a resource can
+        // hold: `TagsToAdd` longer than that could not leave a legal tag set
+        // whatever the resource already carries, and `TagsToRemove` longer than
+        // that names more keys than any resource has. Refusing the oversized
+        // list up front is also what bounds the merge below, which the caller
+        // would otherwise size, to that quota.
+        let longest = tags_to_add.len().max(tags_to_remove.len());
+        if longest > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(UpdateTagsForResourceErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "The request carries {longest} tags, which exceeds the limit of {} that each resource can have.",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateTagsForResourceError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        // A tagged environment whose termination the clock has already completed
+        // is no longer a resource to tag, so settle those first.
+        store.materialize_due_transitions();
+
+        let resource = store
+            .resolve_tagged_resource(&input.resource_arn)
+            .map_err(|refusal| refused(&input.resource_arn, refusal))?;
+
+        let current = store.tags_of(&resource).cloned().unwrap_or_default();
+        let updated = merge_tags(&current, &tags_to_add, &tags_to_remove);
+        // "The number of tags in the resource would exceed the number of tags
+        // that each resource can have. To calculate this, the operation
+        // considers both the number of tags the resource already has and the
+        // tags this operation would add if it succeeded." The bound above sizes
+        // the request; this one is the documented semantics, so a removal in the
+        // same call makes room and updating an existing key is not a new tag.
+        if updated.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(UpdateTagsForResourceErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "The number of tags for the resource would exceed the limit of {}.",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let stored = store.tags_of_mut(&resource).ok_or_else(|| {
+            UpdateTagsForResourceError::internal_failure(
+                "the resource resolved from the ARN is no longer in the store",
+            )
+        })?;
+        *stored = updated;
+        Ok(UpdateTagsForResourceOutput)
     }
 }

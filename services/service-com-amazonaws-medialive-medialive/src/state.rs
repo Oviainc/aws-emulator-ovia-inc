@@ -44,6 +44,17 @@
 //! [`alarm_template_group_output`],
 //! [`event_bridge_rule_template_group_output`]) - no operation builds a response
 //! out of its own request.
+//!
+//! Tags are NOT a store of their own: every resource record above carries its
+//! own tag map, and the tag operations reach the map of the resource their
+//! `ResourceArn` names through
+//! [`ComAmazonawsMedialiveMedialiveState::resource_tags`] (reading),
+//! [`ComAmazonawsMedialiveMedialiveState::insert_resource_tags`] and
+//! [`ComAmazonawsMedialiveMedialiveState::remove_resource_tags`] (writing), so a
+//! tag written by `CreateTags` is the tag that resource's own describe reports.
+//! The two writers own the per-resource tag bounds ([`MAX_RESOURCE_TAGS`],
+//! [`MAX_TAG_KEY_LEN`], [`MAX_TAG_VALUE_LEN`]), which is why the map itself is
+//! only ever handed out mutably inside this module.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -373,6 +384,29 @@ pub const MAX_RESOURCE_DESCRIPTION_LEN: usize = 1024;
 /// target shape `__stringMin1Max256PatternS`.
 pub const MAX_REQUEST_ID_LEN: usize = 256;
 
+/// The most tags one resource carries.
+///
+/// AWS's documented tag restriction for a MediaLive resource ("Tagging AWS
+/// Elemental MediaLive Resources": "Maximum number of tags per resource — 50"),
+/// and at the same time the ceiling that keeps `CreateTags` from growing the
+/// emulator's heap without bound: the keys it writes are caller-chosen, so
+/// without a cap a create loop against one resource would accumulate forever.
+/// `CreateTags` models `BadRequestException`, which is the refusal once a
+/// resource is full.
+pub const MAX_RESOURCE_TAGS: usize = 50;
+
+/// The longest tag key a resource stores, from the same AWS tag restrictions
+/// ("Maximum key length — 128 Unicode characters"). The model declares no
+/// constraint on `Tags` (`smithy_query(query="shape", shape="Tags")`: a plain
+/// `__string` to `__string` map), so the boundary validator cannot bound it and
+/// this is the service-side rule.
+pub const MAX_TAG_KEY_LEN: usize = 128;
+
+/// The longest tag value a resource stores, from the same AWS tag restrictions
+/// ("Maximum value length — 256 Unicode characters"), unbounded by the model for
+/// the same reason as [`MAX_TAG_KEY_LEN`].
+pub const MAX_TAG_VALUE_LEN: usize = 256;
+
 /// The page size a list operation (`ListChannels`, `ListSdiSources`) uses when
 /// the request names no `MaxResults`, and the ceiling it clamps a larger
 /// `MaxResults` to. Finite, so one request cannot ask the service to project an
@@ -695,9 +729,9 @@ pub struct SdiSourceRecord {
     pub r#type: Option<String>,
     /// The request's `Tags`. `CreateSdiSource` accepts them but neither
     /// `SdiSource` nor `SdiSourceSummary` carries a `Tags` member
-    /// (`smithy_query(query="shape", shape="SdiSource")`), so nothing reports
-    /// them until `ListTagsForResource` stops being a scaffold stub; they are
-    /// kept rather than dropped so that operation reads them from the store.
+    /// (`smithy_query(query="shape", shape="SdiSource")`), so the tag
+    /// operations are what report them: `ListTagsForResource` reads this map
+    /// through [`ComAmazonawsMedialiveMedialiveState::resource_tags`].
     pub tags: HashMap<String, String>,
     /// Whether `DeleteSdiSource` has deleted this source.
     ///
@@ -1689,6 +1723,227 @@ impl ComAmazonawsMedialiveMedialiveState {
             tags: Some(map.tags.clone()),
         }
     }
+
+    /// Which of this store's taggable resources `arn` names, if it holds one.
+    ///
+    /// The tag operations address a resource ONLY by its ARN, and every resource
+    /// this store holds carries its own tag map, so the ARN is resolved once
+    /// here and both the read ([`Self::resource_tags`]) and the write
+    /// ([`Self::resource_tags_mut`]) go through the same resolution: a tag
+    /// written through one of them is the tag the resource's own describe
+    /// reports, because there is no second copy to write.
+    fn tagged_resource(&self, arn: &str) -> Option<TaggedResource> {
+        if let Some(record) = self.channel_by_arn(arn) {
+            return Some(TaggedResource::Channel(record.id.clone()));
+        }
+        if let Some(record) = self.input_by_arn(arn) {
+            return Some(TaggedResource::Input(record.id.clone()));
+        }
+        if let Some(record) = self
+            .input_security_groups
+            .values()
+            .find(|record| record.arn == arn)
+        {
+            return Some(TaggedResource::InputSecurityGroup(record.id.clone()));
+        }
+        if let Some(record) = self.sdi_sources.values().find(|record| record.arn == arn) {
+            return Some(TaggedResource::SdiSource(record.id.clone()));
+        }
+        if let Some(record) = self.signal_maps.values().find(|record| record.arn == arn) {
+            return Some(TaggedResource::SignalMap(record.id.clone()));
+        }
+        if let Some(record) = self.multiplexes.values().find(|record| record.arn == arn) {
+            return Some(TaggedResource::Multiplex(record.id.clone()));
+        }
+        if let Some(record) = self
+            .alarm_template_groups
+            .values()
+            .find(|record| record.arn == arn)
+        {
+            return Some(TaggedResource::AlarmTemplateGroup(record.id.clone()));
+        }
+        if let Some(record) = self
+            .event_bridge_rule_template_groups
+            .values()
+            .find(|record| record.arn == arn)
+        {
+            return Some(TaggedResource::EventBridgeRuleTemplateGroup(
+                record.id.clone(),
+            ));
+        }
+        None
+    }
+
+    /// The tags stored on the resource `arn` names, or `None` when this store
+    /// holds no resource with that ARN.
+    pub fn resource_tags(&self, arn: &str) -> Option<&HashMap<String, String>> {
+        match self.tagged_resource(arn)? {
+            TaggedResource::Channel(id) => self.channels.get(&id).map(|record| &record.tags),
+            TaggedResource::Input(id) => self.inputs.get(&id).map(|record| &record.tags),
+            TaggedResource::InputSecurityGroup(id) => self
+                .input_security_groups
+                .get(&id)
+                .map(|record| &record.tags),
+            TaggedResource::SdiSource(id) => self.sdi_sources.get(&id).map(|record| &record.tags),
+            TaggedResource::SignalMap(id) => self.signal_maps.get(&id).map(|record| &record.tags),
+            TaggedResource::Multiplex(id) => self.multiplexes.get(&id).map(|record| &record.tags),
+            TaggedResource::AlarmTemplateGroup(id) => self
+                .alarm_template_groups
+                .get(&id)
+                .map(|record| &record.tags),
+            TaggedResource::EventBridgeRuleTemplateGroup(id) => self
+                .event_bridge_rule_template_groups
+                .get(&id)
+                .map(|record| &record.tags),
+        }
+    }
+
+    /// The tag map of the resource `arn` names, to write through, or `None`
+    /// when this store holds no resource with that ARN.
+    ///
+    /// The map handed back is the resource's OWN, so a tag written here is on
+    /// the resource itself: the resource's describe and
+    /// [`Self::resource_tags`] read the one map rather than two copies that
+    /// could drift.
+    ///
+    /// PRIVATE: the per-resource tag bounds are invariants of
+    /// [`Self::insert_resource_tags`], which is the only way a tag is written,
+    /// so no handler can grow a resource's tag map past them.
+    fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut HashMap<String, String>> {
+        match self.tagged_resource(arn)? {
+            TaggedResource::Channel(id) => {
+                self.channels.get_mut(&id).map(|record| &mut record.tags)
+            }
+            TaggedResource::Input(id) => self.inputs.get_mut(&id).map(|record| &mut record.tags),
+            TaggedResource::InputSecurityGroup(id) => self
+                .input_security_groups
+                .get_mut(&id)
+                .map(|record| &mut record.tags),
+            TaggedResource::SdiSource(id) => self
+                .sdi_sources
+                .get_mut(&id)
+                .map(|record| &mut record.tags),
+            TaggedResource::SignalMap(id) => self
+                .signal_maps
+                .get_mut(&id)
+                .map(|record| &mut record.tags),
+            TaggedResource::Multiplex(id) => self
+                .multiplexes
+                .get_mut(&id)
+                .map(|record| &mut record.tags),
+            TaggedResource::AlarmTemplateGroup(id) => self
+                .alarm_template_groups
+                .get_mut(&id)
+                .map(|record| &mut record.tags),
+            TaggedResource::EventBridgeRuleTemplateGroup(id) => self
+                .event_bridge_rule_template_groups
+                .get_mut(&id)
+                .map(|record| &mut record.tags),
+        }
+    }
+
+    /// Add `tags` to the resource `arn` names, bounded.
+    ///
+    /// The bounds live here rather than in the handler, so no caller-driven
+    /// write can grow a resource's tag map past them: every refusal is checked
+    /// BEFORE the first insert, and a refused request leaves the stored tags
+    /// exactly as they were.
+    pub fn insert_resource_tags(
+        &mut self,
+        arn: &str,
+        tags: HashMap<String, String>,
+    ) -> Result<(), TagRefusal> {
+        // Request shape first — a key or value past its length is refused
+        // whatever resource it was aimed at.
+        for (key, value) in &tags {
+            if key.chars().count() > MAX_TAG_KEY_LEN {
+                return Err(TagRefusal::KeyTooLong {
+                    length: key.chars().count(),
+                });
+            }
+            if value.chars().count() > MAX_TAG_VALUE_LEN {
+                return Err(TagRefusal::ValueTooLong {
+                    key: key.clone(),
+                    length: value.chars().count(),
+                });
+            }
+        }
+
+        let stored = self
+            .resource_tags_mut(arn)
+            .ok_or(TagRefusal::NoSuchResource)?;
+
+        // What the resource would carry afterwards: the keys it already has,
+        // plus the ones this request introduces. A key being overwritten adds
+        // nothing, so re-tagging a full resource is not refused.
+        let added = tags
+            .keys()
+            .filter(|key| !stored.contains_key(*key))
+            .count();
+        let merged = stored.len() + added;
+        if merged > MAX_RESOURCE_TAGS {
+            return Err(TagRefusal::TooManyTags { merged });
+        }
+
+        for (key, value) in tags {
+            stored.insert(key, value);
+        }
+        Ok(())
+    }
+
+    /// Remove the tags `keys` names from the resource `arn` names.
+    ///
+    /// Only ever shrinks a tag map, so it needs no bound of its own; a key the
+    /// resource does not carry leaves it in the state the caller asked for, so
+    /// naming one is not a refusal. The only refusal is an ARN this store holds
+    /// no resource for.
+    pub fn remove_resource_tags(
+        &mut self,
+        arn: &str,
+        keys: &[String],
+    ) -> Result<(), TagRefusal> {
+        let stored = self
+            .resource_tags_mut(arn)
+            .ok_or(TagRefusal::NoSuchResource)?;
+        for key in keys {
+            stored.remove(key);
+        }
+        Ok(())
+    }
+}
+
+/// Why [`ComAmazonawsMedialiveMedialiveState::insert_resource_tags`] stored
+/// nothing. Each variant is one refusal a tag write can answer with.
+#[derive(Debug)]
+pub enum TagRefusal {
+    /// No resource in this store carries that ARN.
+    NoSuchResource,
+    /// The merged tag set would push the resource past
+    /// [`MAX_RESOURCE_TAGS`]. Carries the count it would have reached.
+    TooManyTags { merged: usize },
+    /// A tag key is longer than [`MAX_TAG_KEY_LEN`].
+    KeyTooLong { length: usize },
+    /// A tag value is longer than [`MAX_TAG_VALUE_LEN`]. Carries the key it
+    /// belongs to, so the refusal names the offending member.
+    ValueTooLong { key: String, length: usize },
+}
+
+/// One of this store's taggable resources: which store holds it and the key it
+/// is stored under.
+///
+/// Returned by [`ComAmazonawsMedialiveMedialiveState::tagged_resource`] as an
+/// OWNED key rather than a borrow of the record, so the same resolution serves
+/// the shared and the mutable accessor.
+#[derive(Debug, Clone)]
+enum TaggedResource {
+    Channel(String),
+    Input(String),
+    InputSecurityGroup(String),
+    SdiSource(String),
+    SignalMap(String),
+    Multiplex(String),
+    AlarmTemplateGroup(String),
+    EventBridgeRuleTemplateGroup(String),
 }
 
 /// One created signal map, as `CreateSignalMap` stored it plus the graph its

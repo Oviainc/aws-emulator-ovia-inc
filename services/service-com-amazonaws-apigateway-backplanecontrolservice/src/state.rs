@@ -4,8 +4,8 @@
 //!
 //! This holds the REST API resource tree the control plane persists — a `RestApi`, the
 //! `Resource`s under it (including the implicit root resource every API is created
-//! with) and the `Method`s put on those resources — beside the account's `ApiKey`
-//! records. Every handler in `src/ops/` computes
+//! with), the `Method`s put on those resources and the API's `Stage`s — beside the
+//! account's `ApiKey` records. Every handler in `src/ops/` computes
 //! its response from these records; nothing is synthesised per request.
 //!
 //! A few leaf values are stored as the modelled shapes from [`crate::ops::types`]
@@ -13,9 +13,12 @@
 //! second hand-written mirror of the same members: the model already declares them, and
 //! two copies of one shape is how two operations end up reading two different records.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ops::types::{EndpointConfiguration, GetIntegrationOutput, GetMethodResponseOutput};
+use crate::ops::types::{
+    CanarySettings, EndpointConfiguration, GetIntegrationOutput, GetMethodResponseOutput,
+    MethodSetting, MethodSnapshot,
+};
 
 /// Per-service state for com-amazonaws-apigateway-backplanecontrolservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -62,6 +65,12 @@ pub struct RestApiEntry {
     pub root_resource_id: String,
     /// Every resource of this API, keyed by resource id; the root resource included.
     pub resources: BTreeMap<String, ResourceEntry>,
+    /// Every `Stage` of this API, keyed by stage name. A stage is what an API key is
+    /// associated with and what a caller invokes, so it is the record a `stageKeys`
+    /// entry must name.
+    pub stages: BTreeMap<String, StageEntry>,
+    /// Every `Deployment` of this API, keyed by deployment id: what a stage points at.
+    pub deployments: BTreeMap<String, DeploymentEntry>,
     /// This API's creation rank, from [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`].
     pub sequence: u64,
 }
@@ -83,6 +92,29 @@ impl RestApiEntry {
             .map(|resource| resource.id.clone())
             .collect()
     }
+
+    /// Every resource of this API that `resource_id` owns — itself and everything whose
+    /// stored `parentId` chain reaches it.
+    ///
+    /// This is the subtree a resource carries with it: the set `DeleteResource` removes,
+    /// the set whose derived `path` a rename or a move recomputes, and the set a resource
+    /// may not be moved into. One walk, so the ownership rule cannot differ between the
+    /// operations that apply it. A record whose parent link is missing ends its branch.
+    pub fn descendant_ids(&self, resource_id: &str) -> Vec<String> {
+        let mut found: BTreeSet<String> = BTreeSet::new();
+        found.insert(resource_id.to_string());
+        let mut frontier = vec![resource_id.to_string()];
+        while let Some(parent) = frontier.pop() {
+            for child in self.resources.values() {
+                if child.parent_id.as_deref() == Some(parent.as_str())
+                    && found.insert(child.id.clone())
+                {
+                    frontier.push(child.id.clone());
+                }
+            }
+        }
+        found.into_iter().collect()
+    }
 }
 
 /// One stored `Resource`: a node of an API's path tree.
@@ -100,6 +132,68 @@ pub struct ResourceEntry {
     pub methods: BTreeMap<String, MethodEntry>,
     /// This resource's creation rank, from [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`]; `0` on
     /// the root resource.
+    pub sequence: u64,
+}
+
+/// One stored `Stage` of an API: a named pointer at one deployment, which is what a
+/// caller invokes and what an `ApiKey`'s `stageKeys` entry associates a key with.
+#[derive(Debug, Clone, Default)]
+pub struct StageEntry {
+    pub stage_name: String,
+    /// The deployment this stage serves; always the id of a stored
+    /// [`DeploymentEntry`] of the same API.
+    pub deployment_id: String,
+    pub description: Option<String>,
+    pub cache_cluster_enabled: bool,
+    pub cache_cluster_size: Option<String>,
+    /// When the stage's cache cluster finishes being created. A cluster is reported
+    /// `CREATE_IN_PROGRESS` until this instant and `AVAILABLE` after it; absent when the
+    /// stage has no cache cluster, which is reported `NOT_AVAILABLE`. See
+    /// [`CACHE_CLUSTER_CREATE_SPAN`].
+    pub cache_cluster_ready_at: Option<::std::time::Instant>,
+    pub variables: BTreeMap<String, String>,
+    pub documentation_version: Option<String>,
+    pub canary_settings: Option<CanarySettings>,
+    pub tracing_enabled: bool,
+    /// Written by `UpdateStage`, which is still a stub, so this stays empty for now and
+    /// a `Stage` body reports an empty `methodSettings` map.
+    pub method_settings: BTreeMap<String, MethodSetting>,
+    pub tags: BTreeMap<String, String>,
+    pub created_date: Option<::aws_smithy_types::DateTime>,
+    pub last_updated_date: Option<::aws_smithy_types::DateTime>,
+}
+
+impl StageEntry {
+    /// The `cacheClusterStatus` this stage reports now.
+    ///
+    /// A stage without a cache cluster has none to report, which is `NOT_AVAILABLE`. A
+    /// cluster the caller asked for is created over [`CACHE_CLUSTER_CREATE_SPAN`], so a
+    /// caller reading straight after the call still sees `CREATE_IN_PROGRESS`; the
+    /// transition is one the CLOCK owes, materialised from the stored due instant rather
+    /// than by sleeping or by being read.
+    pub fn cache_cluster_status(&self) -> &'static str {
+        match self.cache_cluster_ready_at {
+            None => CACHE_CLUSTER_NOT_AVAILABLE,
+            Some(ready_at) if ::std::time::Instant::now() < ready_at => {
+                CACHE_CLUSTER_CREATE_IN_PROGRESS
+            }
+            Some(_) => CACHE_CLUSTER_AVAILABLE,
+        }
+    }
+}
+
+/// One stored `Deployment` of an API: the snapshot of the API's methods at the instant
+/// it was created, which a `Stage` points at.
+#[derive(Debug, Clone, Default)]
+pub struct DeploymentEntry {
+    pub id: String,
+    pub description: Option<String>,
+    pub created_date: Option<::aws_smithy_types::DateTime>,
+    /// The `apiSummary` this deployment reports: resource path -> HTTP verb -> the
+    /// method as it stood when the deployment was created.
+    pub api_summary: BTreeMap<String, BTreeMap<String, MethodSnapshot>>,
+    /// This deployment's creation rank, from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`].
     pub sequence: u64,
 }
 
@@ -270,6 +364,34 @@ pub const MAX_API_KEYS: usize = 10_000;
 
 /// API Gateway's default quota "Resources per API: 300".
 pub const MAX_RESOURCES_PER_API: usize = 300;
+
+/// API Gateway's default quota "Stages per API: 10".
+pub const MAX_STAGES_PER_API: usize = 10;
+
+/// Emulator resource guard, NOT an AWS quota: the most deployments this emulator keeps
+/// for one API. API Gateway publishes no deployment quota.
+pub const MAX_DEPLOYMENTS_PER_API: usize = 300;
+
+/// From `CreateStage$stageName`'s own documentation: "Maximum length is 128
+/// characters."
+pub const MAX_STAGE_NAME_CHARS: usize = 128;
+
+/// How long a stage's cache cluster takes to come up, after which it reports
+/// `AVAILABLE`. API Gateway documents no duration for it ("it can take up to 4 minutes
+/// to create" is guidance, not a contract), so this span is the emulator's own, chosen
+/// so a caller reading straight after `CreateStage` still observes
+/// `CREATE_IN_PROGRESS`.
+pub const CACHE_CLUSTER_CREATE_SPAN: ::std::time::Duration =
+    ::std::time::Duration::from_millis(500);
+
+/// The `cacheClusterStatus` of a stage with no cache cluster.
+pub const CACHE_CLUSTER_NOT_AVAILABLE: &str = "NOT_AVAILABLE";
+
+/// The `cacheClusterStatus` of a cache cluster that is still coming up.
+pub const CACHE_CLUSTER_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
+
+/// The `cacheClusterStatus` of a cache cluster that is up.
+pub const CACHE_CLUSTER_AVAILABLE: &str = "AVAILABLE";
 
 /// API Gateway's documented resource-policy document size: 8192 characters.
 pub const MAX_POLICY_CHARS: usize = 8192;
@@ -874,6 +996,12 @@ pub const NO_SUCH_RESOURCE: &str = "Invalid Resource identifier specified";
 
 /// The `NotFoundException` message for an `httpMethod` with no method on the resource.
 pub const NO_SUCH_METHOD: &str = "Invalid Method identifier specified";
+
+/// The `NotFoundException` message for a `stageName` that names no stage of the API.
+pub const NO_SUCH_STAGE: &str = "Invalid stage identifier specified";
+
+/// The `NotFoundException` message for a `deploymentId` that names no stored deployment.
+pub const NO_SUCH_DEPLOYMENT: &str = "Invalid deployment identifier specified";
 
 /// The `NotFoundException` message for an `apiKey` that names no stored API key.
 pub const NO_SUCH_API_KEY: &str = "Invalid API Key identifier specified";

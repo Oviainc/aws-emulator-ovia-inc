@@ -189,6 +189,10 @@ use super::types::*;
 /// `bridge`."
 const DEFAULT_NETWORK_MODE: &str = "bridge";
 
+/// The network mode a Fargate task definition must declare. The same doc: "For Amazon
+/// ECS tasks on Fargate, the `awsvpc` network mode is required."
+const FARGATE_NETWORK_MODE: &str = "awsvpc";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -290,29 +294,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .any(|compatibility| compatibility == "FARGATE");
 
-        // "For Amazon ECS tasks on Fargate, the awsvpc network mode is required", and
-        // task-level `cpu`/`memory` are "required for Fargate".
-        if wants_fargate && network_mode != "awsvpc" {
+        // "For Amazon ECS tasks on Fargate, the `awsvpc` network mode is required", and
+        // task-level `cpu` and `memory` are each "required for Fargate" (the members'
+        // own docs). A Fargate refusal states the requirement the registration has to
+        // meet and names the ONE member it is about — it carries none of the request's
+        // values — so a client is pointed at the single member to supply. The members
+        // are checked in the order they are declared, `cpu` before `memory`.
+        if wants_fargate && network_mode != FARGATE_NETWORK_MODE {
             return Err(RegisterTaskDefinitionErrorModeled::ClientException(
                 ClientException {
                     message: Some(format!(
-                        "Fargate requires that 'networkMode' be set to 'awsvpc'; got \
-                         {network_mode:?}"
+                        "Fargate requires that 'networkMode' be set to \
+                         '{FARGATE_NETWORK_MODE}'."
                     )),
                 },
             )
             .into());
         }
-        if wants_fargate && (input.cpu.is_none() || input.memory.is_none()) {
-            return Err(RegisterTaskDefinitionErrorModeled::ClientException(
-                ClientException {
-                    message: Some(
-                        "Fargate requires task-level 'cpu' and 'memory' to be specified"
-                            .to_string(),
-                    ),
-                },
-            )
-            .into());
+        if wants_fargate {
+            for (member, value) in [("cpu", &input.cpu), ("memory", &input.memory)] {
+                if value
+                    .as_deref()
+                    .is_none_or(|supplied| supplied.trim().is_empty())
+                {
+                    return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                        ClientException {
+                            message: Some(format!(
+                                "Fargate requires that '{member}' be defined at the task \
+                                 level."
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
         }
 
         // Every container needs a name and an image to be runnable, and — unless the

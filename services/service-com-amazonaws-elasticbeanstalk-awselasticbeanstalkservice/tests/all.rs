@@ -15,6 +15,8 @@
 mod abort_environment_update;
 #[path = "all/application_versions.rs"]
 mod application_versions;
+#[path = "all/environment_operations.rs"]
+mod environment_operations;
 #[path = "all/lifecycle.rs"]
 mod lifecycle;
 #[path = "all/platform_branches.rs"]

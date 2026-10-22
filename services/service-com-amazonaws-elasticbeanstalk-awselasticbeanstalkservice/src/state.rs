@@ -105,6 +105,15 @@ pub const MAX_APPLICATION_VERSIONS: usize = 1_000;
 /// `Terminated`, which is what the real quota counts.
 pub const MAX_ENVIRONMENTS: usize = 200;
 
+/// How many tags one Elastic Beanstalk resource can carry, from the service's
+/// published quota ("Tags per resource: 50" in the Elastic Beanstalk service
+/// quotas / "Tagging Application Resources" guide). This is the bound
+/// `TooManyTagsException` names: "The number of tags in the resource would exceed
+/// the number of tags that each resource can have. To calculate this, the
+/// operation considers both the number of tags the resource already has and the
+/// tags this operation would add if it succeeded."
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
 /// How many terminated environments the store keeps, so DescribeEnvironments can
 /// still report them for `IncludeDeleted`.
 ///
@@ -162,6 +171,104 @@ pub fn environment_arn(region: &str, application_name: &str, environment_name: &
 /// `<cname prefix>.<region>.elasticbeanstalk.com`.
 pub fn environment_cname(cname_prefix: &str, region: &str) -> String {
     format!("{cname_prefix}.{region}.elasticbeanstalk.com")
+}
+
+/// The resource portion of `arn` when it is an ARN of THIS service, i.e.
+/// `arn:<partition>:elasticbeanstalk:<region>:<account>:<resource>` — the only
+/// ARNs `ResourceArn` accepts ("Must be the ARN of an Elastic Beanstalk
+/// resource"). The region and account are not matched: this store is not
+/// partitioned by either, and the ARN forms above are the only ones it mints.
+fn elasticbeanstalk_arn_resource(arn: &str) -> Option<&str> {
+    let mut fields = arn.splitn(6, ':');
+    let (Some("arn"), Some(_partition), Some(ARN_NAMESPACE), Some(_region), Some(_account)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return None;
+    };
+    fields.next().filter(|resource| !resource.is_empty())
+}
+
+/// The resource types an Elastic Beanstalk ARN can name. Elastic Beanstalk
+/// "supports tagging of all of its resources" (`UpdateTagsForResource`), so a
+/// type in this set is a resource that CAN carry tags even where this store holds
+/// no record of one; a type outside it is what
+/// `ResourceTypeNotSupportedException` ("The type of the specified Amazon
+/// Resource Name (ARN) isn't supported for this operation") covers.
+pub const TAGGABLE_RESOURCE_TYPES: &[&str] = &[
+    "application",
+    "applicationversion",
+    "configurationtemplate",
+    "environment",
+    "platform",
+];
+
+/// Why an operation that takes the `EnvironmentId` / `EnvironmentName` pair
+/// resolved no environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvironmentRefusal {
+    /// The request named neither identifier. Which code that answers is the
+    /// OPERATION's: the model documents `MissingRequiredParameter` for some of
+    /// them ("If you do not specify either, Elastic Beanstalk returns
+    /// MissingRequiredParameter error") and nothing for the rest, whose recorded
+    /// refusal is the generic query `MissingParameter`.
+    NoIdentifier,
+    /// No environment matched; carries the message naming what was asked for.
+    NotFound(String),
+}
+
+/// A taggable Elastic Beanstalk resource this store holds: which record a
+/// `ResourceArn` resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// An application, by `ApplicationName`.
+    Application(String),
+    /// An application version, by `(ApplicationName, VersionLabel)`.
+    ApplicationVersion(String, String),
+    /// An environment, by `EnvironmentId`.
+    Environment(String),
+}
+
+/// Why a `ResourceArn` resolves to no taggable resource in this store. Each
+/// variant is a DIFFERENT refusal, so the two tag operations answer the same
+/// three codes for the same three cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceArnRefusal {
+    /// The value is not an ARN of this service at all — another service's
+    /// namespace, or not an ARN.
+    NotThisService,
+    /// An Elastic Beanstalk ARN naming a resource type that is not one of
+    /// [`TAGGABLE_RESOURCE_TYPES`].
+    UnsupportedType,
+    /// A well-formed Elastic Beanstalk ARN of a taggable type whose resource
+    /// this store does not hold.
+    NotFound,
+}
+
+/// Whether `requested` asks for a version lifecycle configuration this
+/// application has no service role to apply it with.
+///
+/// From `ApplicationResourceLifecycleConfig$ServiceRole`: "The `ServiceRole`
+/// property is required the first time that you provide a
+/// `VersionLifecycleConfig` for the application in one of the supporting calls
+/// (`CreateApplication` or `UpdateApplicationResourceLifecycle`). After you
+/// provide it once, in either one of the calls, Elastic Beanstalk persists the
+/// Service Role with the application, and you don't need to specify it again in
+/// subsequent `UpdateApplicationResourceLifecycle` calls."
+pub fn version_lifecycle_service_role_missing(
+    stored: Option<&ApplicationResourceLifecycleConfig>,
+    requested: &ApplicationResourceLifecycleConfig,
+) -> bool {
+    let requests_version_lifecycle = requested.version_lifecycle_config.is_some();
+    let has_service_role = requested
+        .service_role
+        .as_ref()
+        .or_else(|| stored.and_then(|config| config.service_role.as_ref()))
+        .is_some_and(|role| !role.is_empty());
+    requests_version_lifecycle && !has_service_role
 }
 
 /// A stored application.
@@ -600,6 +707,13 @@ impl Environment {
         self.status == STATUS_TERMINATED
     }
 
+    /// Whether this environment is in the one status the model documents as
+    /// accepting an action: "Ready: Environment is available to have an action
+    /// performed on it, such as update or terminate."
+    pub fn is_ready(&self) -> bool {
+        self.status == STATUS_READY
+    }
+
     /// Start the move to `Terminating`, with the move to `Terminated` due one
     /// [`STATUS_TRANSITION_SPAN`] from now.
     pub fn begin_termination(&mut self) {
@@ -616,6 +730,39 @@ impl Environment {
             // status at all rather than one of the running values.
             health_status: None,
         });
+    }
+
+    /// Start a rebuild: RebuildEnvironment "deletes and recreates all of the
+    /// Amazon Web Services resources … for a specified environment and forces a
+    /// restart", so the environment goes back through the same deployment the
+    /// model describes for a new one — "Launching: Environment is in the process
+    /// of initial deployment" — and the move back to `Ready` is what the clock
+    /// then owes, exactly as after CreateEnvironment.
+    pub fn begin_rebuild(&mut self) {
+        self.status = STATUS_LAUNCHING.to_string();
+        self.health = HEALTH_GREY.to_string();
+        self.health_status = Some(HEALTH_STATUS_PENDING.to_string());
+        self.date_updated = now();
+        self.pending_status = Some(PendingStatus::completion_to_ready());
+    }
+
+    /// Start an application-server restart: the environment keeps its status —
+    /// RestartAppServer restarts the container server, it does not redeploy —
+    /// while its health checks are suspended, which the model's `Health` doc
+    /// gives as the `Grey` case ("health checks are suspended during an
+    /// UpdateEnvironment or RestartEnvironment request"). The health the
+    /// environment reported before the restart is what the clock owes back.
+    pub fn begin_app_server_restart(&mut self) {
+        let restored = PendingStatus {
+            due_at: Instant::now() + STATUS_TRANSITION_SPAN,
+            status: self.status.clone(),
+            health: self.health.clone(),
+            health_status: self.health_status.clone(),
+        };
+        self.health = HEALTH_GREY.to_string();
+        self.health_status = Some(HEALTH_STATUS_PENDING.to_string());
+        self.date_updated = now();
+        self.pending_status = Some(restored);
     }
 
     /// Start the cancellation of the in-progress update this environment
@@ -780,6 +927,118 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
         }
         let name = environment_name?;
         self.environment_name_index.get(name).cloned()
+    }
+
+    /// The id of the environment named by `EnvironmentId` or `EnvironmentName`,
+    /// or why no environment answers to the pair.
+    ///
+    /// Every operation that takes that pair resolves it through here, so they
+    /// agree on what "no such environment" means and word it identically; each
+    /// one maps [`EnvironmentRefusal::NoIdentifier`] to the code its own model
+    /// documents.
+    pub fn environment_id_for(
+        &self,
+        environment_id: Option<&str>,
+        environment_name: Option<&str>,
+    ) -> Result<String, EnvironmentRefusal> {
+        match (environment_id, environment_name) {
+            (None, None) => Err(EnvironmentRefusal::NoIdentifier),
+            (id, name) => self.resolve_environment_id(id, name).ok_or_else(|| {
+                EnvironmentRefusal::NotFound(missing_environment_message(id, name))
+            }),
+        }
+    }
+
+    /// The record `arn` names, for the two tag operations.
+    ///
+    /// The ARN forms are this service's own ([`application_arn`],
+    /// [`application_version_arn`], [`environment_arn`]), so the same ARN a
+    /// create answered with resolves back to the record it minted. The resource
+    /// path after the type is matched against the names the store HOLDS rather
+    /// than split on `/`, because an application name, a version label and an
+    /// environment name may each contain that character, which would otherwise
+    /// make the ARN of a stored resource unresolvable. A terminated environment
+    /// is not resolved: its resources are gone, so there is nothing left to tag.
+    pub fn resolve_tagged_resource(
+        &self,
+        arn: &str,
+    ) -> Result<TaggedResource, ResourceArnRefusal> {
+        let Some(resource) = elasticbeanstalk_arn_resource(arn) else {
+            return Err(ResourceArnRefusal::NotThisService);
+        };
+        let (kind, path) = resource.split_once('/').unwrap_or((resource, ""));
+        match kind {
+            "application" if self.applications.contains_key(path) => {
+                Ok(TaggedResource::Application(path.to_string()))
+            }
+            "applicationversion" => self
+                .application_versions
+                .keys()
+                .find(|(application_name, version_label)| {
+                    format!("{application_name}/{version_label}") == path
+                })
+                .map(|(application_name, version_label)| {
+                    TaggedResource::ApplicationVersion(
+                        application_name.clone(),
+                        version_label.clone(),
+                    )
+                })
+                .ok_or(ResourceArnRefusal::NotFound),
+            "environment" => self
+                .environments
+                .values()
+                .find(|environment| {
+                    !environment.is_terminated()
+                        && format!(
+                            "{}/{}",
+                            environment.application_name, environment.environment_name
+                        ) == path
+                })
+                .map(|environment| {
+                    TaggedResource::Environment(environment.environment_id.clone())
+                })
+                .ok_or(ResourceArnRefusal::NotFound),
+            // A taggable type whose record this store does not hold: the ARN is
+            // this service's and its type is one Elastic Beanstalk tags, so what
+            // is missing is the resource.
+            kind if TAGGABLE_RESOURCE_TYPES.contains(&kind) => {
+                Err(ResourceArnRefusal::NotFound)
+            }
+            _ => Err(ResourceArnRefusal::UnsupportedType),
+        }
+    }
+
+    /// The tags stored on `resource`.
+    pub fn tags_of(&self, resource: &TaggedResource) -> Option<&Vec<Tag>> {
+        match resource {
+            TaggedResource::Application(name) => {
+                self.applications.get(name).map(|record| &record.tags)
+            }
+            TaggedResource::ApplicationVersion(application_name, version_label) => self
+                .application_versions
+                .get(&(application_name.clone(), version_label.clone()))
+                .map(|record| &record.tags),
+            TaggedResource::Environment(environment_id) => {
+                self.environments.get(environment_id).map(|record| &record.tags)
+            }
+        }
+    }
+
+    /// The tags stored on `resource`, for a tag mutation to write through.
+    pub fn tags_of_mut(&mut self, resource: &TaggedResource) -> Option<&mut Vec<Tag>> {
+        match resource {
+            TaggedResource::Application(name) => {
+                self.applications.get_mut(name).map(|record| &mut record.tags)
+            }
+            TaggedResource::ApplicationVersion(application_name, version_label) => self
+                .application_versions
+                .get_mut(&(application_name.clone(), version_label.clone()))
+                .map(|record| &mut record.tags),
+            TaggedResource::Environment(environment_id) => self
+                .environments
+                .get_mut(environment_id)
+                .map(|record| &mut record.tags),
+        }
     }
 
     /// Every platform branch in the catalog, in the one order

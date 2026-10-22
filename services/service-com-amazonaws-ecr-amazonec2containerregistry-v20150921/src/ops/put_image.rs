@@ -200,15 +200,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
 
         // A manifest is addressed by its own content: the digest is computed over the
-        // manifest bytes, and a digest the push asserts must be that one.
+        // manifest bytes, and a digest the push asserts must be that one. The refusal
+        // names the digest, repository and registry the request carried; the digest the
+        // manifest actually hashes to is this registry's own computation.
         let digest = crate::state::manifest_digest(&input.image_manifest);
         if let Some(supplied) = input.image_digest.as_deref() {
             if supplied != digest {
                 return Err(PutImageErrorModeled::ImageDigestDoesNotMatchException(
                     ImageDigestDoesNotMatchException {
                         message: Some(format!(
-                            "The image digest '{supplied}' does not match the digest of \
-                             the supplied manifest, '{digest}'"
+                            "The image with digest '{supplied}' in repository '{}' and registry \
+                             ID '{}' does not match the image digest that Amazon ECR has \
+                             calculated.",
+                            input.repository_name,
+                            crate::state::registry_id()
                         )),
                     },
                 )

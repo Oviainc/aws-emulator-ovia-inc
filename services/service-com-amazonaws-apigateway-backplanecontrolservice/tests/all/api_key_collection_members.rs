@@ -24,6 +24,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::rest_api_lifecycle::{create_api, string_member, Answer, Gateway};
+use crate::stage_lifecycle::create_deployed_stage;
 
 /// The members of an `ApiKey` body this rule governs, with the JSON shape each one is
 /// reported as.
@@ -74,6 +75,14 @@ async fn an_api_key_body_reports_its_stage_keys_and_tags_however_many_it_holds()
     let gateway = Gateway::new();
     let (first, _) = create_api(&gateway, "collection-members-one").await;
     let (second, _) = create_api(&gateway, "collection-members-two").await;
+
+    // A `stageKeys` entry must name a stage that exists, so every stage this table
+    // associates a key with is deployed first — over the wire, through
+    // `CreateDeployment`.
+    for stage in ["prod", "beta", "canary", "gamma"] {
+        create_deployed_stage(&gateway, &first, stage).await;
+    }
+    create_deployed_stage(&gateway, &second, "prod").await;
 
     // Each row: the case name, the tag count, and the (restApiId, stageName) pairs the
     // key is created with. Row 1 is the recorded case — no tags, no stage associations.

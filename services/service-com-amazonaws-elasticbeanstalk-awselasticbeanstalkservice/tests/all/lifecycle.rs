@@ -15,6 +15,10 @@
 //! [`Emulator::store`] is there for a suite that has to seed a precondition no
 //! implemented operation can produce yet.
 //!
+//! [`Emulator`] and [`Answer`] are `pub(crate)`: every other suite in this one
+//! test target (see `tests/all.rs`) drives the service through them rather than
+//! standing up a second harness of its own.
+//!
 //! The two helpers at the bottom — the form-value encoder and the element reader
 //! — are written here rather than taken from a crate ON PURPOSE: a dependency
 //! would have to be recorded in `Cargo.lock`, the one file this branch shares
@@ -37,7 +41,7 @@ const API_VERSION: &str = "2010-12-01";
 
 /// The region the tests sign with, so every region-derived value (ARNs, CNAMEs)
 /// is asserted against something that is not the default.
-const TEST_REGION: &str = "us-west-2";
+pub(crate) const TEST_REGION: &str = "us-west-2";
 
 /// Long enough that a status change the clock owed is due. Derived from the
 /// service's own span so the two cannot drift apart.
@@ -81,7 +85,7 @@ impl Emulator {
         self.call_in_region(TEST_REGION, action, params).await
     }
 
-    async fn call_in_region(&self, region: &str, action: &str, params: &[(&str, &str)]) -> Answer {
+    pub(crate) async fn call_in_region(&self, region: &str, action: &str, params: &[(&str, &str)]) -> Answer {
         let mut form = vec![
             format!("Action={}", form_encoded(action)),
             format!("Version={}", form_encoded(API_VERSION)),
@@ -255,7 +259,7 @@ fn is_environment_id(id: &str) -> bool {
     })
 }
 
-fn account() -> &'static str {
+pub(crate) fn account() -> &'static str {
     engine::emulator_account_id()
 }
 

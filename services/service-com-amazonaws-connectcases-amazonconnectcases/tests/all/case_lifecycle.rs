@@ -172,7 +172,7 @@ fn field_value_variants() -> Vec<(&'static str, &'static str, Value)> {
 
 /// The id of the field of `field_type` among `fields`, as
 /// `fields_of_every_type` created them.
-fn field_of_type(fields: &[(&'static str, String)], field_type: &str) -> String {
+pub(crate) fn field_of_type(fields: &[(&'static str, String)], field_type: &str) -> String {
     fields
         .iter()
         .find(|(created, _)| *created == field_type)
@@ -190,7 +190,10 @@ pub(crate) async fn domain(emulator: &Emulator, name: &str) -> String {
 
 /// Create one field per `FieldType` the model declares, returning
 /// `(type, fieldId)` in that order.
-async fn fields_of_every_type(emulator: &Emulator, domain_id: &str) -> Vec<(&'static str, String)> {
+pub(crate) async fn fields_of_every_type(
+    emulator: &Emulator,
+    domain_id: &str,
+) -> Vec<(&'static str, String)> {
     let mut created = Vec::new();
     for field_type in FIELD_TYPE_VALUES {
         let case = format!("CreateField type={field_type}");

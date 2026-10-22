@@ -67,7 +67,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::normalize_zone_id;
+use crate::state::{no_such_hosted_zone, normalize_zone_id};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -151,9 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = normalize_zone_id(&input.id);
         let store = state.lock();
         let zone = store.zones.get(id).ok_or_else(|| {
-            GetHostedZoneErrorModeled::NoSuchHostedZone(NoSuchHostedZone {
-                message: Some(format!("no hosted zone exists with the ID {}", input.id)),
-            })
+            GetHostedZoneErrorModeled::NoSuchHostedZone(no_such_hosted_zone(&input.id))
         })?;
 
         Ok(GetHostedZoneOutput {

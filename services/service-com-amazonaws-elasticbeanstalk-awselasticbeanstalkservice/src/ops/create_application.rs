@@ -167,6 +167,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "The ServiceRole property is required the first time that you provide
+        // a VersionLifecycleConfig for the application in one of the supporting
+        // calls (CreateApplication or UpdateApplicationResourceLifecycle)." A
+        // new application has no stored role, so the request must carry one.
+        if let Some(requested) = input.resource_lifecycle_config.as_ref() {
+            if crate::state::version_lifecycle_service_role_missing(None, requested) {
+                return Err(CreateApplicationError::invalid_parameter_value(
+                    "The ServiceRole property is required the first time that you provide a VersionLifecycleConfig for an application.",
+                ));
+            }
+        }
+
         let created = crate::state::now();
         let application = crate::state::Application {
             name: input.application_name.clone(),

@@ -234,11 +234,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             return Err(DescribeImagesErrorModeled::ImageNotFoundException(
                                 ImageNotFoundException {
                                     message: Some(format!(
-                                        "The image with digest '{}' and tag '{}' does not exist \
-                                         within the repository with name '{}'",
-                                        id.image_digest.as_deref().unwrap_or("null"),
-                                        id.image_tag.as_deref().unwrap_or("null"),
-                                        repository.name
+                                        "The image with {} does not exist within the repository \
+                                         with name '{}' in the registry with id '{}'",
+                                        crate::state::identifier_description(id),
+                                        repository.name,
+                                        repository.registry_id
                                     )),
                                 },
                             )

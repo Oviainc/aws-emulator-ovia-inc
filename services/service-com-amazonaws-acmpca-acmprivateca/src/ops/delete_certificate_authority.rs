@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCertificateAuthority
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCertificateAuthority`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCertificateAuthority::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -129,13 +120,20 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteCertificateAuthori
 // here — hence the `DeleteCertificateAuthorityError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.acmpca#DeleteCertificateAuthority")]
+// `RequestFailedException` is widened in: the service models it, this operation does
+// not list it, and it is the only modelled answer for "this emulator could not reach
+// its own state store".
+#[smithy_macros::operation_error(
+    "com.amazonaws.acmpca#DeleteCertificateAuthority",
+    extra_errors = ["RequestFailedException"]
+)]
 #[derive(Debug)]
 pub enum DeleteCertificateAuthorityErrorModeled {
     ConcurrentModificationException(ConcurrentModificationException),
     InvalidArnException(InvalidArnException),
     InvalidStateException(InvalidStateException),
     ResourceNotFoundException(ResourceNotFoundException),
+    RequestFailedException(RequestFailedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -189,18 +187,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCertificateAuthority` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCertificateAuthorityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCertificateAuthority"))
+        let _ = ctx;
+        let arn = input.certificate_authority_arn;
+        if crate::state::parse_certificate_authority_arn(&arn).is_none() {
+            return Err(DeleteCertificateAuthorityErrorModeled::InvalidArnException(
+                InvalidArnException {
+                    message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteCertificateAuthorityErrorModeled::RequestFailedException(
+                RequestFailedException {
+                    message: Some("the private CA store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // `certificate_authority_mut` materialises what the clock already owed: the
+        // CREATING -> PENDING_CERTIFICATE settle, and the permanent deletion of a CA whose
+        // restoration window has closed — which is why a CA deleted long enough ago is
+        // not found rather than deleted a second time.
+        let Some(record) = state.certificate_authority_mut(&arn, now) else {
+            return Err(
+                DeleteCertificateAuthorityErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("the certificate authority {arn} was not found")),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A CA is deletable only from the statuses the operation documents; an ACTIVE CA
+        // has to be disabled first, and one already DELETED is not deleted again.
+        if !record.is_deletable() {
+            return Err(DeleteCertificateAuthorityErrorModeled::InvalidStateException(
+                InvalidStateException {
+                    message: Some(crate::state::DELETE_INVALID_STATE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The restoration window is read off the status BEFORE the deletion moves it, so
+        // a deletion from CREATING or FAILED assigns none.
+        let window = record.restoration_window(input.permanent_deletion_time_in_days);
+        record.delete(now, window);
+
+        Ok(DeleteCertificateAuthorityOutput)
     }
 }

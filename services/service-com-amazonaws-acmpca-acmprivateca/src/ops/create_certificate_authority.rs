@@ -234,7 +234,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Every CA lives in memory for the life of the process, so the store is capped
-        // and a create past the cap answers the quota error the operation models.
+        // and a create past the cap answers the quota error the operation models. The
+        // clock-owed changes are materialised first, so a CA whose restoration window has
+        // already closed was permanently deleted and no longer counts against the quota.
+        state.settle(now);
         if state.certificate_authorities.len() >= crate::state::MAX_CERTIFICATE_AUTHORITIES {
             return Err(CreateCertificateAuthorityErrorModeled::LimitExceededException(
                 LimitExceededException {
@@ -289,6 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ca_certificate_pem: None,
             ca_certificate_chain_pem: None,
             restorable_until: None,
+            status_before_deletion: None,
             tags: input.tags.unwrap_or_default(),
             // A new CA carries no resource-based policy until one is attached to it.
             resource_policy: None,

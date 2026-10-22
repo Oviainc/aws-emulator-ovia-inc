@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the `Resource` named by `resourceId` and the subtree hanging off
+//! it, so a later `GetResource` for any of them no longer finds one.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +161,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+
+        // Both identifiers are resolved against stored state before anything is
+        // removed, each naming its own record so the refusal says which one was not
+        // found.
+        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+            DeleteResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+            })
+        })?;
+        if !api.resources.contains_key(&input.resource_id) {
+            return Err(DeleteResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_RESOURCE.to_string()),
+            })
+            .into());
+        }
+        // The root resource is created with its API and is the tree's anchor — every
+        // other resource's path hangs off it — so it goes only when the API goes.
+        if input.resource_id == api.root_resource_id {
+            return Err(DeleteResourceErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(
+                        "The root resource cannot be deleted; delete the RestApi instead"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A resource owns the resources below it, so removing it removes that subtree:
+        // a child left behind would report a path no parent of this API holds. The walk
+        // is `RestApiEntry::descendant_ids`, the one place this crate decides what a
+        // resource owns.
+        for id in api.descendant_ids(&input.resource_id) {
+            api.resources.remove(&id);
+        }
+        Ok(DeleteResourceOutput)
     }
 }

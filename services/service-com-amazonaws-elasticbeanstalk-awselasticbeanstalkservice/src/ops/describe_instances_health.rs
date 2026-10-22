@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstancesHealth
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstancesHealth`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstancesHealth::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the per-instance health of the stored environment's instances.
+//! This emulator provisions no EC2 instance, so a found environment reports an empty
+//! instance list rather than an instance nothing launched. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +157,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstancesHealth` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstancesHealthErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstancesHealth"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeInstancesHealthError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        // The only write a report performs: a status change the clock already
+        // made due is owed whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "Specify the Elastic Beanstalk environment by ID" / "by name". This
+        // operation's model documents no code for naming neither; the recorded
+        // refusal is the generic query `MissingParameter`.
+        let environment_id = store
+            .environment_id_for(
+                input.environment_id.as_deref(),
+                input.environment_name.as_deref(),
+            )
+            .map_err(|refusal| match refusal {
+                crate::state::EnvironmentRefusal::NoIdentifier => {
+                    DescribeInstancesHealthError::missing_parameter(
+                        "Either EnvironmentName or EnvironmentId must be specified.",
+                    )
+                }
+                crate::state::EnvironmentRefusal::NotFound(message) => {
+                    DescribeInstancesHealthError::invalid_parameter_value(message)
+                }
+            })?;
+        if !store.environments.contains_key(&environment_id) {
+            return Err(DescribeInstancesHealthError::invalid_parameter_value(
+                crate::state::missing_environment_message(Some(environment_id.as_str()), None),
+            ));
+        }
+
+        // "Specify the pagination token returned by a previous call." There is
+        // never a page after the first one here (see below), so no token this
+        // operation issued can come back — one that did not come from it is
+        // refused rather than silently ignored.
+        if let Some(next_token) = input.next_token.as_deref() {
+            return Err(DescribeInstancesHealthError::invalid_parameter_value(
+                format!("Invalid NextToken: {next_token}"),
+            ));
+        }
+        // `AttributeNames` selects which members of each instance's health are
+        // reported. This emulator provisions no EC2 instance for an environment,
+        // so there is no instance health to select from: the list is empty
+        // whatever was asked for, and there is no further page.
+        let _ = &input.attribute_names;
+
+        Ok(DescribeInstancesHealthOutput {
+            instance_health_list: Some(Vec::new()),
+            // "The date and time that the health information was retrieved."
+            refreshed_at: Some(crate::state::now()),
+            next_token: None,
+        })
     }
 }
