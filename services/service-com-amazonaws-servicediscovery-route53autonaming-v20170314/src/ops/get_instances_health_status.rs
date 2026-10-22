@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInstancesHealthStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInstancesHealthStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInstancesHealthStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +119,20 @@ impl From<GetInstancesHealthStatusErrorModeled> for GetInstancesHealthStatusErro
     }
 }
 
+/// The `MaxResults` bounds the model declares for this operation (`MaxResults`,
+/// `range 1..100`).
+const MIN_MAX_RESULTS: usize = 1;
+const MAX_MAX_RESULTS: usize = 100;
+
+/// The number of instances reported when the request names no `MaxResults`, as
+/// `GetInstancesHealthStatusRequest$MaxResults` documents: "If you don't specify a value
+/// for MaxResults, Cloud Map returns up to 100 instances."
+const DEFAULT_MAX_RESULTS: usize = MAX_MAX_RESULTS;
+
+/// The scope the `NextToken` this operation issues carries, so a cursor minted here is
+/// not honoured as a page boundary by another paginated read.
+const NEXT_TOKEN_SCOPE: &str = "GetInstancesHealthStatus";
+
 /// The `GetInstancesHealthStatus` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -164,18 +169,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInstancesHealthStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInstancesHealthStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInstancesHealthStatus"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetInstancesHealthStatusErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // A pure report: an instance's health status is whatever was last stored for it
+        // (`RegisterInstance`'s initial status, or an `UpdateInstanceCustomHealthStatus`
+        // since), so this handler only reads.
+        let state = state.lock();
+        let Some(service) = state
+            .resolve_service_id(&input.service_id)
+            .and_then(|id| state.services.get(&id))
+        else {
+            return Err(GetInstancesHealthStatusErrorModeled::ServiceNotFound(
+                ServiceNotFound {
+                    message: Some(format!(
+                        "No service exists with the specified ID {}.",
+                        input.service_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "If you omit Instances, Cloud Map returns the health status for all the
+        // instances that are associated with the specified service." A named instance
+        // that is not registered with this service has no status to report, which is
+        // what `InstanceNotFound` says. Every named id is checked BEFORE the page is
+        // cut, so an unknown id is refused on the first page rather than on whichever
+        // page it would have landed on.
+        let selected: Vec<(String, String)> = match input.instances.as_ref() {
+            // `InstanceIdList` is modelled `length min 1`, and the framework refuses a
+            // shorter list before this handler runs. The case is re-stated here so a
+            // list that ever did reach the handler is refused rather than answered with
+            // an empty report, which a caller cannot tell from "the service is empty".
+            Some(requested) if requested.is_empty() => {
+                return Err(GetInstancesHealthStatusErrorModeled::InvalidInput(InvalidInput {
+                    message: Some(
+                        "Value at 'instances' failed to satisfy constraint: Member must have \
+                         at least 1 element."
+                            .to_string(),
+                    ),
+                })
+                .into());
+            }
+            Some(requested) => {
+                for instance_id in requested {
+                    if !service.instances.contains_key(instance_id) {
+                        return Err(GetInstancesHealthStatusErrorModeled::InstanceNotFound(
+                            InstanceNotFound {
+                                message: Some(format!(
+                                    "No instance exists with the specified ID {instance_id} in \
+                                     service {}.",
+                                    service.id
+                                )),
+                            },
+                        )
+                        .into());
+                    }
+                }
+                // A repeated id names one instance, and the response is a map keyed by
+                // id, so the request's list is reduced to its distinct ids in id order.
+                requested
+                    .iter()
+                    .collect::<std::collections::BTreeSet<&String>>()
+                    .into_iter()
+                    .filter_map(|instance_id| service.instances.get(instance_id))
+                    .map(|instance| (instance.instance_id.clone(), instance.health_status.clone()))
+                    .collect()
+            }
+            // `instances` is a `BTreeMap`, so every page is cut from the same order.
+            None => service
+                .instances
+                .values()
+                .map(|instance| (instance.instance_id.clone(), instance.health_status.clone()))
+                .collect(),
+        };
+
+        // "Specify the value of NextToken from the previous response in the next
+        // request": the cursor is the last instance id the previous page reported, and a
+        // token this operation did not issue is a bad request, not an empty page.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_next_token(NEXT_TOKEN_SCOPE, token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(GetInstancesHealthStatusErrorModeled::InvalidInput(
+                        InvalidInput {
+                            message: Some(
+                                "The NextToken isn't a token GetInstancesHealthStatus issued."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+        let remaining: Vec<(String, String)> = match resume_after {
+            Some(cursor) => selected
+                .into_iter()
+                .filter(|(instance_id, _)| *instance_id > cursor)
+                .collect(),
+            None => selected,
+        };
+
+        // The modelled range is enforced before this handler runs; re-stating it here
+        // keeps an out-of-range value a refusal rather than a silent default page.
+        let page_size = match input.max_results {
+            None => DEFAULT_MAX_RESULTS,
+            Some(requested) => match usize::try_from(requested)
+                .ok()
+                .filter(|size| (MIN_MAX_RESULTS..=MAX_MAX_RESULTS).contains(size))
+            {
+                Some(size) => size,
+                None => {
+                    return Err(GetInstancesHealthStatusErrorModeled::InvalidInput(
+                        InvalidInput {
+                            message: Some(format!(
+                                "Value '{requested}' at 'maxResults' failed to satisfy \
+                                 constraint: Member must be between {MIN_MAX_RESULTS} and \
+                                 {MAX_MAX_RESULTS}."
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+        let truncated = remaining.len() > page_size;
+        let page: Vec<(String, String)> = remaining.into_iter().take(page_size).collect();
+        // Only a truncated page carries a token, so a client's paging loop terminates.
+        let next_token = page
+            .last()
+            .filter(|_| truncated)
+            .map(|(instance_id, _)| crate::state::encode_next_token(NEXT_TOKEN_SCOPE, instance_id));
+
+        Ok(GetInstancesHealthStatusOutput {
+            status: Some(page.into_iter().collect()),
+            next_token,
+        })
     }
 }

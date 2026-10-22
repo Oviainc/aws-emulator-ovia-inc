@@ -539,6 +539,31 @@ pub fn shuffle_key(nonce: u128, instance_id: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// The separator between a `NextToken`'s scope and its cursor.
+///
+/// A unit separator cannot appear in a resource id or in an operation name, so splitting
+/// a decoded token on it recovers exactly the two fields that were encoded.
+const NEXT_TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// An opaque `NextToken` that resumes a paginated read after `cursor`.
+///
+/// `scope` is the operation that issued it, so a token minted by one paginated read is
+/// not honoured as a page boundary by another. The payload is hex-encoded because the
+/// member is modelled as an opaque string the caller only ever echoes back.
+pub fn encode_next_token(scope: &str, cursor: &str) -> String {
+    ::hex::encode(format!("{scope}{NEXT_TOKEN_SEPARATOR}{cursor}"))
+}
+
+/// The cursor a `NextToken` carries for `scope`, or `None` when the token is not one
+/// this operation issued — which covers a token that is not hex, is not UTF-8, carries
+/// no separator, or names another operation's scope. A forged token is therefore
+/// refused rather than silently honoured as "start from the beginning".
+pub fn decode_next_token(scope: &str, token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let (encoded_scope, cursor) = decoded.split_once(NEXT_TOKEN_SEPARATOR)?;
+    (encoded_scope == scope).then(|| cursor.to_string())
+}
+
 /// A stored instant as the wire `timestamp` the modelled shapes carry.
 pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     match at.duration_since(SystemTime::UNIX_EPOCH) {
