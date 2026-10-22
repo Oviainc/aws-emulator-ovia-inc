@@ -324,6 +324,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 current_deployment: None,
                 next_deployment: deployment.clone(),
                 next_deployment_version: if deployment.is_some() { 2 } else { 1 },
+                // Nothing is registered to a service this call just created: an
+                // image is registered only after a push puts it in the service's
+                // private registry (see `RegisterContainerImage`).
+                images: Vec::new(),
                 owed,
             };
             let view = service.view(endpoint.as_deref());

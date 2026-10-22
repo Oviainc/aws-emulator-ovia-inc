@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/bucket_bundles.rs"]
 mod bucket_bundles;
+#[path = "all/container_image_registry.rs"]
+mod container_image_registry;
 #[path = "all/container_service_lifecycle.rs"]
 mod container_service_lifecycle;
 #[path = "all/container_service_public_endpoint.rs"]

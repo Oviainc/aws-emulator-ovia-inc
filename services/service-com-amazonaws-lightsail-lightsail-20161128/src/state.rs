@@ -28,8 +28,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AddOn, AddOnRequest, AvailabilityZone, BucketBundle, Container, ContainerService,
-    ContainerServiceDeployment, ContainerServiceDeploymentRequest,
+    AddOn, AddOnRequest, AvailabilityZone, BucketBundle, Container, ContainerImage,
+    ContainerService, ContainerServiceDeployment, ContainerServiceDeploymentRequest,
     ContainerServiceECRImagePullerRole, ContainerServiceEndpoint,
     ContainerServiceHealthCheckConfig, ContainerServiceStateDetail, Domain, DomainEntry, Instance,
     InstanceHardware, InstanceMetadataOptions, InstanceNetworking, InstancePortInfo, InstanceState,
@@ -2356,6 +2356,35 @@ pub fn ecr_image_puller_principal_arn(region: &str, name: &str, token: &str) -> 
     )
 }
 
+/// One container image registered to a container service: the digest that was
+/// pushed, the name this service assigned it, and when it was registered.
+///
+/// The assigned name has the form the modelled
+/// `RegisterContainerImageRequest$label` documentation gives — "if the name of
+/// your container service is `mycontainerservice`, and the label that you specify
+/// is `mystaticwebsite`, then the name of the registered container image will be
+/// `:mycontainerservice.mystaticwebsite.1`", the trailing number being the
+/// version of the images sharing that label.
+#[derive(Debug, Clone)]
+pub struct StoredContainerImage {
+    /// The name the service assigned the image.
+    pub image: String,
+    /// The digest of the pushed image, kept verbatim.
+    pub digest: String,
+    pub created_at_ms: i64,
+}
+
+impl StoredContainerImage {
+    /// This record as the modelled `ContainerImage`.
+    pub fn view(&self) -> ContainerImage {
+        ContainerImage {
+            image: Some(self.image.clone()),
+            digest: Some(self.digest.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+        }
+    }
+}
+
 /// One stored deployment of a container service: the containers it launches, the
 /// public endpoint that fronts them, and where it is in its own lifecycle.
 #[derive(Debug, Clone)]
@@ -2426,6 +2455,19 @@ pub struct StoredContainerService {
     pub next_deployment: Option<StoredDeployment>,
     /// The version the NEXT deployment of this service will carry.
     pub next_deployment_version: i32,
+    /// The container images registered to this service, in registration order —
+    /// the service's own registry, which `GetContainerImages` reports.
+    ///
+    /// A `Vec` and not a map: the modelled `ContainerImageList` documents no
+    /// order, so registration order is the one stable total order the store has,
+    /// and the assigned name already keys each entry uniquely.
+    ///
+    /// It stays EMPTY for as long as this emulator serves no container image
+    /// registry to push to: an image is registered only after a `docker push`
+    /// puts it in the service's private registry, which is why
+    /// `RegisterContainerImage` refuses every digest (see that handler). Whoever
+    /// serves that registry fills this field.
+    pub images: Vec<StoredContainerImage>,
     /// The phases the clock still owes this service, soonest first.
     pub owed: VecDeque<OwedPhase>,
 }
@@ -2794,6 +2836,17 @@ impl ComAmazonawsLightsailLightsail20161128State {
     pub fn container_service(&self, region: &str, name: &str) -> Option<&StoredContainerService> {
         self.container_services
             .get(&(region.to_string(), name.to_string()))
+    }
+
+    /// The container service `name` names in `region`, for an operation that
+    /// mutates it.
+    pub fn container_service_mut(
+        &mut self,
+        region: &str,
+        name: &str,
+    ) -> Option<&mut StoredContainerService> {
+        self.container_services
+            .get_mut(&(region.to_string(), name.to_string()))
     }
 
     /// Every container service in `region`, in the store's stable order.

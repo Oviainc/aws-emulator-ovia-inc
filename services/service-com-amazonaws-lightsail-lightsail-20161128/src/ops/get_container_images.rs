@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetContainerImages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetContainerImages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the container images registered to one of this store's container services.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetContainerImages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +153,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetContainerImages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetContainerImagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Reporting only: the answer is read from the stored container service's
+        // registry, and the one write behind this call is the clock
+        // materialising the lifecycle phases it already owed (see
+        // `crate::state::with_state`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetContainerImages"))
+        // A container service is a regional resource whose name is unique within
+        // one region of the account, so the region the request is signed for is
+        // what scopes the lookup — exactly as it does for `GetContainerServices`.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `serviceName` is modelled `@required` and carries the modelled length
+        // and pattern, so the centralized walk refused anything outside them
+        // before this body ran.
+        crate::state::with_state(&*self.engine, |store| {
+            store
+                .container_service(&region, &input.service_name)
+                // Only the images REGISTERED to the service are reported: this
+                // operation's own documentation says an image a deployment pulls
+                // "from a public registry like Docker Hub" is "not registered to
+                // your Lightsail container service" and so is not returned.
+                .map(|service| {
+                    service
+                        .images
+                        .iter()
+                        .map(crate::state::StoredContainerImage::view)
+                        .collect::<Vec<_>>()
+                })
+                .ok_or_else(|| not_found(&input.service_name))
+        })
+        .ok_or_else(unavailable)?
+        // A service with nothing registered reports an EMPTY list, which is a
+        // different answer from a service that does not exist at all.
+        .map(|container_images| GetContainerImagesOutput {
+            container_images: Some(container_images),
+        })
     }
+}
+
+/// No container service of that name is stored in that region: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the requested
+/// name. The region scopes the LOOKUP, but it is not part of the message: the
+/// identifier the message names is the one the request carried.
+fn not_found(name: &str) -> GetContainerImagesError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_CONTAINER_SERVICE,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetContainerImagesError {
+    GetContainerImagesErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail container service store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
