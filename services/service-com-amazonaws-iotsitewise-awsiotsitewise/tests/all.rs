@@ -29,6 +29,8 @@ mod asset_model_composite_model;
 mod asset_model_properties;
 #[path = "all/asset_property_update.rs"]
 mod asset_property_update;
+#[path = "all/associated_assets.rs"]
+mod associated_assets;
 #[path = "all/batch_get_latest_values.rs"]
 mod batch_get_latest_values;
 #[path = "all/batch_put_timestamp_and_quality.rs"]
