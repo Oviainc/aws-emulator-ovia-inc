@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateModelPackage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateModelPackage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateModelPackage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: registers a model package in `crate::state` — either an UNVERSIONED
+//! package under its `ModelPackageName`, or the next VERSION inside the model package
+//! group `ModelPackageGroupName` names — minting the `ModelPackageArn` from the
+//! request's region, replaying a repeated `ClientToken` instead of registering twice,
+//! and refusing a name already in use. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -197,6 +194,20 @@ impl From<CreateModelPackageErrorModeled> for CreateModelPackageError {
     }
 }
 
+/// Which of the two documented kinds of model package a request asks for, and the
+/// identifier it named it by.
+///
+/// `ModelPackageName` and `ModelPackageGroupName` are mutually exclusive: the first names
+/// an unversioned package and "is not applicable to versioned models", the second names
+/// the group a version joins and "does not apply to unversioned models".
+enum Requested<'a> {
+    /// An unversioned package, by `ModelPackageName`.
+    Unversioned(&'a str),
+    /// A version inside the model package group this `ModelPackageGroupName` (a name or
+    /// a group ARN) resolves to.
+    Versioned(&'a str),
+}
+
 /// The `CreateModelPackage` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -233,18 +244,185 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateModelPackage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateModelPackageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateModelPackage"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // Exactly one of the two kind-selecting members names the package to create.
+        let requested = match (
+            input.model_package_name.as_deref(),
+            input.model_package_group_name.as_deref(),
+        ) {
+            (Some(name), None) => Requested::Unversioned(name),
+            (None, Some(group)) => Requested::Versioned(group),
+            (None, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "Either ModelPackageName, for an unversioned model package, or \
+                     ModelPackageGroupName, for a versioned one, must be provided.",
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "ModelPackageName and ModelPackageGroupName cannot both be provided: \
+                     ModelPackageName names an unversioned model package and \
+                     ModelPackageGroupName names the group a versioned one belongs to.",
+                ));
+            }
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // The identity the request asks for, before any of it is registered: an
+        // unversioned package is identified by its own name and no group, a version by
+        // the group it joins (named here, per `ArnOrName`, by name or by group ARN).
+        let (target_name, target_group) = match requested {
+            Requested::Unversioned(name) => (name.to_string(), None),
+            Requested::Versioned(group) => {
+                let group_name = crate::state::name_from_arn_or_name(group).to_string();
+                (group_name.clone(), Some(group_name))
+            }
+        };
+
+        let mut store = state.lock();
+
+        // A retry that presents the same idempotency token answers the first call's ARN:
+        // `ClientToken` "guarantees that the call to this API is idempotent", so a replay
+        // registers neither a second package nor a second version. The replay is scoped
+        // to the identity this request asks for, so a token reused for a different
+        // package is a fresh call rather than an unrelated package's ARN.
+        if let Some(package) = input.client_token.as_deref().and_then(|token| {
+            store.model_package_for_client_token(token, &target_name, target_group.as_deref())
+        }) {
+            return Ok(CreateModelPackageOutput {
+                model_package_arn: package.arn.clone(),
+            });
+        }
+
+        // The store is bounded, so a caller varying names or registering versions cannot
+        // grow it without end. `ResourceLimitExceeded` is the limit failure this
+        // operation models.
+        if !store.model_packages_below_quota() {
+            return Err(CreateModelPackageErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for model packages is {}, with \
+                         current utilization of {} and a request delta of 1.",
+                        crate::state::MODEL_PACKAGE_QUOTA,
+                        store.model_packages.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let (version, tags) = match requested {
+            // An unversioned package carries the tags the request named.
+            Requested::Unversioned(_) => (None, input.tags.unwrap_or_default()),
+            Requested::Versioned(group) => {
+                // `ModelPackageGroupName` is a reference to a group the account holds, by
+                // name or by ARN; a reference to one that does not exist is refused
+                // rather than silently creating the group.
+                let Some(group_record) = store.model_package_groups.get(&target_name) else {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "Could not find model package group \"{group}\"."
+                    )));
+                };
+                // `Tags`: "If you supply ModelPackageGroupName, your model package belongs
+                // to the model group you specify and uses the tags associated with the
+                // model group. In this case, you cannot supply a tag argument." So a
+                // version takes the group's tags, and a request that names tags of its own
+                // is refused rather than silently tagged with something else.
+                let group_tags = group_record.tags.clone();
+                if input.tags.is_some_and(|tags| !tags.is_empty()) {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Tags cannot be supplied with ModelPackageGroupName: a versioned \
+                         model package uses the tags associated with its model package \
+                         group.",
+                    ));
+                }
+                // A version is assigned by the service, never by the request: the next
+                // one past the highest the group already holds.
+                (Some(store.next_model_package_version(&target_name)), group_tags)
+            }
+        };
+        let name = target_name;
+        let group_name = target_group;
+
+        let key = crate::state::model_package_key(&name, version);
+        // A name already in use is refused, never overwritten: otherwise the caller reads
+        // a 200 for a package it did not create, and the one it did create is gone.
+        // `ConflictException` is the conflict this operation models.
+        if store.model_packages.contains_key(&key) {
+            return Err(CreateModelPackageErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Cannot create already existing model package \"{key}\"."
+                )),
+            })
+            .into());
+        }
+        let arn = crate::state::resource_arn(&region, "model-package", &key);
+
+        // Registration is asynchronous: the package is `Pending` until the instant the
+        // clock owes it `Completed`, which a reporting call materialises.
+        let model_approval_status = match version {
+            // "This parameter is optional for versioned models": a version the request
+            // left unset starts out awaiting manual approval.
+            Some(_) => Some(
+                input
+                    .model_approval_status
+                    .clone()
+                    .unwrap_or_else(|| crate::state::MODEL_APPROVAL_PENDING_MANUAL.to_string()),
+            ),
+            // "does not apply to unversioned models": no approval status is recorded for
+            // one, so none is reported back either.
+            None => None,
+        };
+
+        store.model_packages.insert(
+            key,
+            crate::state::ModelPackage {
+                name,
+                group_name,
+                version,
+                arn: arn.clone(),
+                description: input.model_package_description,
+                registration_type: input.model_package_registration_type,
+                inference_specification: input.inference_specification,
+                validation_specification: input.validation_specification,
+                source_algorithm_specification: input.source_algorithm_specification,
+                certify_for_marketplace: input.certify_for_marketplace,
+                model_approval_status,
+                // Set by `UpdateModelPackage` when an approval decision is recorded, so a
+                // freshly registered package carries none.
+                approval_description: None,
+                metadata_properties: input.metadata_properties,
+                model_metrics: input.model_metrics,
+                domain: input.domain,
+                task: input.task,
+                sample_payload_url: input.sample_payload_url,
+                customer_metadata_properties: input.customer_metadata_properties,
+                drift_check_baselines: input.drift_check_baselines,
+                additional_inference_specifications: input.additional_inference_specifications,
+                skip_model_validation: input.skip_model_validation,
+                source_uri: input.source_uri,
+                security_config: input.security_config,
+                model_card: input.model_card,
+                model_life_cycle: input.model_life_cycle,
+                managed_storage_type: input.managed_storage_type,
+                tags,
+                created_by: crate::state::caller_user_context(ctx),
+                client_token: input.client_token,
+                status: crate::state::MODEL_PACKAGE_STATUS_PENDING.to_string(),
+                creation_time: now,
+                last_modified_time: now,
+                completed_at: now + crate::state::MODEL_PACKAGE_COMPLETED_AFTER,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateModelPackageOutput {
+            model_package_arn: arn,
+        })
     }
 }

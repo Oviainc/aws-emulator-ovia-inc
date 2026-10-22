@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeModelPackage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeModelPackage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: replays the model package `CreateModelPackage` stored in `crate::state`,
+//! resolved from a bare name, a `name/version` pair or the package ARN, materialising the
+//! `Pending` -> `Completed` transition the clock already owes and sanitizing the embedded
+//! model card when the request asks for `MetadataOnly`. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeModelPackage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The `kms:Decrypt` precondition AWS documents for `IncludedData=AllData` is deliberately
+//! NOT implemented: this emulator models no IAM policy and no KMS key, so there is no
+//! decision to make and nothing here refuses a caller for lacking a permission. The
+//! `MetadataOnly` projection is still honoured, because the request asks for it.
 //!
 //! ## Shape of an operation
 //!
@@ -190,6 +191,56 @@ impl From<DescribeModelPackageErrorModeled> for DescribeModelPackageError {
     }
 }
 
+/// The `IncludedData` member's value that sanitizes the embedded model card. The other
+/// value, `AllData`, returns it unchanged and is what an absent member means: "If you
+/// don't specify a value, SageMaker returns AllData."
+const INCLUDED_DATA_METADATA_ONLY: &str = "MetadataOnly";
+
+/// The JSON paths `IncludedData=MetadataOnly` preserves inside `ModelCardContent`, from
+/// the model's own documentation of `DescribeModelPackageOutput$ModelCard`
+/// (`smithy_query(query="doc",shape="DescribeModelPackageOutput",member="ModelCard")`):
+/// everything else is dropped, so the answer needs no `kms:Decrypt`.
+///
+/// The two `model_package_details` paths are in that documented list even though the same
+/// doc notes the `ModelPackageModelCard` schema does not include `model_package_details`
+/// — so against the real service they simply never match. They are kept because the list
+/// is the service's, not this emulator's, and a card that does carry the section is then
+/// projected exactly as documented.
+const METADATA_ONLY_PATHS: &[(&str, &str)] = &[
+    ("model_overview", "model_id"),
+    ("model_overview", "model_name"),
+    ("intended_uses", "risk_rating"),
+    ("model_package_details", "model_package_group_name"),
+    ("model_package_details", "model_package_arn"),
+];
+
+/// `content` reduced to the [`METADATA_ONLY_PATHS`] it actually carries, as the
+/// `MetadataOnly` answer renders it.
+///
+/// Content that is not a JSON object carries none of those paths, so nothing of it is
+/// preserved and the sanitized card is the empty object — the model card is stored
+/// verbatim, and only this redaction ever rewrites it.
+fn sanitize_model_card_content(content: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(content).ok();
+    let card = parsed.as_ref().and_then(serde_json::Value::as_object);
+    let mut kept = serde_json::Map::new();
+    for (section, field) in METADATA_ONLY_PATHS {
+        let Some(value) = card
+            .and_then(|card| card.get(*section))
+            .and_then(|section| section.get(*field))
+        else {
+            continue;
+        };
+        let entry = kept
+            .entry((*section).to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(section) = entry.as_object_mut() {
+            section.insert((*field).to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(kept).to_string()
+}
+
 /// The `DescribeModelPackage` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -226,18 +277,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeModelPackage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeModelPackageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeModelPackage"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `ModelPackageName` here is a `VersionedArnOrName`: a bare name, a
+        // `<group>/<version>` pair, or the package's ARN. All three name one stored
+        // package, so they resolve to one key.
+        let key = crate::state::model_package_lookup_key(&input.model_package_name);
+
+        let mut store = state.lock();
+        let Some(package) = store.model_packages.get_mut(key) else {
+            // The message quotes the identifier the caller passed, not an ARN this
+            // emulator synthesized.
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Could not find model package \"{}\".",
+                input.model_package_name
+            )));
+        };
+
+        // The only write a reporting call makes: the registration the clock already
+        // owed. It was due at the stored instant whether or not anybody described the
+        // package, so a waiter terminates and no caller's read changes the outcome.
+        let settled = package.settle_status(::std::time::SystemTime::now());
+
+        // `AllData` (the default) replays the stored card; `MetadataOnly` keeps
+        // `ModelCardStatus` and reduces `ModelCardContent` to the documented paths.
+        let model_card = package.model_card.clone().map(|card| {
+            if input.included_data.as_deref() == Some(INCLUDED_DATA_METADATA_ONLY) {
+                ModelPackageModelCard {
+                    model_card_content: card
+                        .model_card_content
+                        .as_deref()
+                        .map(sanitize_model_card_content),
+                    model_card_status: card.model_card_status,
+                }
+            } else {
+                card
+            }
+        });
+
+        let output = DescribeModelPackageOutput {
+            // A versioned package is described by its group's name plus its version; an
+            // unversioned one carries neither a group nor a version.
+            model_package_name: package.name.clone(),
+            model_package_group_name: package.group_name.clone(),
+            model_package_version: package.version,
+            model_package_registration_type: package.registration_type.clone(),
+            model_package_arn: package.arn.clone(),
+            model_package_description: package.description.clone(),
+            creation_time: crate::state::timestamp(package.creation_time),
+            inference_specification: package.inference_specification.clone(),
+            source_algorithm_specification: package.source_algorithm_specification.clone(),
+            validation_specification: package.validation_specification.clone(),
+            model_package_status: package.status.clone(),
+            model_package_status_details: package.status_details(),
+            certify_for_marketplace: package.certify_for_marketplace,
+            model_approval_status: package.model_approval_status.clone(),
+            // The identity that registered the package, recorded then and replayed
+            // unchanged. Nothing but that registration has written to it, so there is no
+            // modifying identity to report.
+            created_by: Some(package.created_by.clone()),
+            last_modified_by: None,
+            metadata_properties: package.metadata_properties.clone(),
+            model_metrics: package.model_metrics.clone(),
+            // Reported only once something has modified the package (the status reaching
+            // `Completed` is the first such change), which is why it is an optional
+            // member while `CreationTime` is required.
+            last_modified_time: (package.last_modified_time != package.creation_time)
+                .then(|| crate::state::timestamp(package.last_modified_time)),
+            approval_description: package.approval_description.clone(),
+            domain: package.domain.clone(),
+            task: package.task.clone(),
+            sample_payload_url: package.sample_payload_url.clone(),
+            customer_metadata_properties: package.customer_metadata_properties.clone(),
+            drift_check_baselines: package.drift_check_baselines.clone(),
+            additional_inference_specifications: package
+                .additional_inference_specifications
+                .clone(),
+            skip_model_validation: package.skip_model_validation.clone(),
+            source_uri: package.source_uri.clone(),
+            security_config: package.security_config.clone(),
+            model_card,
+            model_life_cycle: package.model_life_cycle.clone(),
+            managed_storage_type: package.managed_storage_type.clone(),
+        };
+        let arn = package.arn.clone();
+        drop(store);
+
+        if settled {
+            crate::state::record_state_change(Self::NAME, &arn, ctx);
+        }
+        Ok(output)
     }
 }

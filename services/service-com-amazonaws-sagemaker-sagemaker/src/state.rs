@@ -13,14 +13,17 @@
 //! rather than by a bare name, because that tuple — domain, owning user profile or
 //! space, app type, app name — is what identifies one app.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ArtifactSource, AsyncInferenceConfig, ContainerDefinition, DataCaptureConfig, ExplainerConfig,
-    GitConfig, IamIdentity, InferenceExecutionConfig, ManagedConfiguration, MetadataProperties,
-    MetricsConfig, ProductionVariant, ProductionVariantSummary, ResourceSpec, Tag, UserContext,
-    VpcConfig,
+    AdditionalInferenceSpecificationDefinition, ArtifactSource, AsyncInferenceConfig,
+    ContainerDefinition, DataCaptureConfig, DriftCheckBaselines, ExplainerConfig, GitConfig,
+    IamIdentity, InferenceExecutionConfig, InferenceSpecification, ManagedConfiguration,
+    MetadataProperties, MetricsConfig, ModelLifeCycle, ModelMetrics, ModelPackageModelCard,
+    ModelPackageSecurityConfig, ModelPackageStatusDetails, ModelPackageStatusItem,
+    ModelPackageValidationSpecification, ProductionVariant, ProductionVariantSummary, ResourceSpec,
+    SourceAlgorithmSpecification, Tag, UserContext, VpcConfig,
 };
 
 /// The ARN service namespace (`arnNamespace` in the model's `aws.api#service` trait,
@@ -61,6 +64,10 @@ pub const MODEL_QUOTA: usize = 1_000;
 pub const ENDPOINT_CONFIG_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const ENDPOINT_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`]. Counts model packages of both kinds (unversioned packages and
+/// the versions registered into model package groups), which is what `CreateModelPackage`
+/// mints and `DeleteModelPackage` releases.
+pub const MODEL_PACKAGE_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const CODE_REPOSITORY_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
@@ -94,6 +101,35 @@ pub const MAX_PAGE_SIZE: i32 = 50;
 pub const STATUS_CREATING: &str = "Creating";
 /// See [`STATUS_CREATING`].
 pub const STATUS_IN_SERVICE: &str = "InService";
+
+/// How long after `CreateModelPackage` the clock owes the `Pending` -> `Completed`
+/// transition of `ModelPackageStatus`.
+///
+/// `CreateModelPackage` answers with an ARN while registration (and any validation the
+/// request asked for) is still outstanding, so a caller that describes the package
+/// straight away still observes `Pending`, and one that waits observes `Completed` —
+/// which is what lets a waiter terminate. Real SageMaker takes anywhere from seconds to
+/// minutes depending on the validation profiles; the span is compressed, never zero.
+pub const MODEL_PACKAGE_COMPLETED_AFTER: Duration = Duration::from_millis(300);
+
+/// The `ModelPackageStatus` members this emulator moves a model package through (the
+/// modelled enum also carries `InProgress`, `Failed` and `Deleting`, which this slice
+/// does not reach). Named once here so no handler compares a bare string literal, and
+/// separately from [`STATUS_COMPLETED`], which is a `ModelPackageGroupStatus` member.
+pub const MODEL_PACKAGE_STATUS_PENDING: &str = "Pending";
+/// See [`MODEL_PACKAGE_STATUS_PENDING`].
+pub const MODEL_PACKAGE_STATUS_COMPLETED: &str = "Completed";
+
+/// The `DetailedModelPackageStatus` members a per-profile validation item reports while
+/// the package is `Pending` and once it is `Completed`.
+pub const DETAILED_MODEL_PACKAGE_STATUS_NOT_STARTED: &str = "NotStarted";
+/// See [`DETAILED_MODEL_PACKAGE_STATUS_NOT_STARTED`].
+pub const DETAILED_MODEL_PACKAGE_STATUS_COMPLETED: &str = "Completed";
+
+/// The `ModelApprovalStatus` a registered model version carries when the request named
+/// none: SageMaker's model registry documents a new version as awaiting manual approval,
+/// and `CreateModelPackage` documents the member as optional for versioned models.
+pub const MODEL_APPROVAL_PENDING_MANUAL: &str = "PendingManualApproval";
 
 /// `AppStatus`'s members this emulator moves an app through. The modelled enum
 /// (`smithy_query(query="shape", shape="AppStatus")`) also carries `Deleting`,
@@ -347,7 +383,8 @@ pub struct Artifact {
 }
 
 /// A model package group created by `CreateModelPackageGroup`, as
-/// `DescribeModelPackageGroup` replays it.
+/// `DescribeModelPackageGroup` replays it, and the container a VERSIONED model package
+/// is registered into.
 ///
 /// `created_by` is stored at creation rather than rebuilt per read, so every later read
 /// reports the identity that actually created the group.
@@ -361,6 +398,145 @@ pub struct ModelPackageGroup {
     pub created_by: UserContext,
     pub tags: Vec<Tag>,
     pub creation_time: SystemTime,
+}
+
+/// A model package created by `CreateModelPackage`, as `DescribeModelPackage` replays it.
+///
+/// One record covers both documented kinds: an UNVERSIONED package (the request named
+/// `ModelPackageName`, so `group_name` and `version` are absent) and a VERSIONED one (the
+/// request named `ModelPackageGroupName`, so `name` is the group's name and `version` is
+/// the number this registration was given inside that group).
+///
+/// `created_by` is stored at creation, as [`ModelPackageGroup`]'s is, so every later read
+/// reports the identity that actually registered the package.
+///
+/// `client_token` is the idempotency token the registering call presented, if any. It is
+/// held here rather than in a map of its own so it is bounded by the same
+/// [`MODEL_PACKAGE_QUOTA`] as the record and is released with it.
+///
+/// `completed_at` is the instant the clock owes the `Pending` -> `Completed` transition;
+/// it is stored, never slept on, and materialised by whichever reporting call first runs
+/// at or after it.
+#[derive(Debug, Clone)]
+pub struct ModelPackage {
+    pub name: String,
+    pub group_name: Option<String>,
+    pub version: Option<i32>,
+    pub arn: String,
+    pub description: Option<String>,
+    pub registration_type: Option<String>,
+    pub inference_specification: Option<InferenceSpecification>,
+    pub validation_specification: Option<ModelPackageValidationSpecification>,
+    pub source_algorithm_specification: Option<SourceAlgorithmSpecification>,
+    pub certify_for_marketplace: Option<bool>,
+    pub model_approval_status: Option<String>,
+    pub approval_description: Option<String>,
+    pub metadata_properties: Option<MetadataProperties>,
+    pub model_metrics: Option<ModelMetrics>,
+    pub domain: Option<String>,
+    pub task: Option<String>,
+    pub sample_payload_url: Option<String>,
+    pub customer_metadata_properties: Option<HashMap<String, String>>,
+    pub drift_check_baselines: Option<DriftCheckBaselines>,
+    pub additional_inference_specifications: Option<Vec<AdditionalInferenceSpecificationDefinition>>,
+    pub skip_model_validation: Option<String>,
+    pub source_uri: Option<String>,
+    pub security_config: Option<ModelPackageSecurityConfig>,
+    pub model_card: Option<ModelPackageModelCard>,
+    pub model_life_cycle: Option<ModelLifeCycle>,
+    pub managed_storage_type: Option<String>,
+    pub tags: Vec<Tag>,
+    pub created_by: UserContext,
+    pub client_token: Option<String>,
+    pub status: String,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    pub completed_at: SystemTime,
+}
+
+impl ModelPackage {
+    /// The key this package is stored under: its name for an unversioned package,
+    /// `<group>/<version>` for a version registered into a group. It is also the
+    /// resource part of the package's ARN, so one identifier serves both.
+    pub fn key(&self) -> String {
+        model_package_key(&self.name, self.version)
+    }
+
+    /// Materialise the `Pending` -> `Completed` transition the clock already owes.
+    ///
+    /// The same single write a reporting operation may make as [`Endpoint::settle_status`]:
+    /// the transition was due at `completed_at` whether or not anybody described the
+    /// package, so the observer makes no difference to the result, and
+    /// `LastModifiedTime` moves to the instant it was due rather than to "now" so the
+    /// value is stable across later reads.
+    ///
+    /// Answers whether the transition happened on this call, so the caller can record it.
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        if self.status == MODEL_PACKAGE_STATUS_PENDING && now >= self.completed_at {
+            self.status = MODEL_PACKAGE_STATUS_COMPLETED.to_string();
+            self.last_modified_time = self.completed_at;
+            return true;
+        }
+        false
+    }
+
+    /// `ModelPackageStatusDetails` for this package: one validation item per profile the
+    /// request's `ValidationSpecification` named (no profiles, no items), each reporting
+    /// `NotStarted` while the package is `Pending` and `Completed` once it has settled.
+    ///
+    /// `ImageScanStatuses` stays absent: this emulator scans no container image, so it
+    /// reports no scan it did not run.
+    pub fn status_details(&self) -> ModelPackageStatusDetails {
+        let item_status = if self.status == MODEL_PACKAGE_STATUS_COMPLETED {
+            DETAILED_MODEL_PACKAGE_STATUS_COMPLETED
+        } else {
+            DETAILED_MODEL_PACKAGE_STATUS_NOT_STARTED
+        };
+        let validation_statuses = self
+            .validation_specification
+            .as_ref()
+            .map(|spec| {
+                spec.validation_profiles
+                    .iter()
+                    .map(|profile| ModelPackageStatusItem {
+                        name: profile.profile_name.clone(),
+                        status: item_status.to_string(),
+                        failure_reason: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ModelPackageStatusDetails {
+            validation_statuses,
+            image_scan_statuses: None,
+        }
+    }
+}
+
+/// The store key (and ARN resource part) of a model package: `name` on its own for an
+/// unversioned package, `name/version` for a version inside a model package group.
+///
+/// The two forms cannot collide: `name` is an `EntityName` / `ModelPackageGroupName`,
+/// whose modelled pattern (`^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,62}$`) admits no `/`, and the
+/// boundary validator refuses a name outside it before any handler runs.
+pub fn model_package_key(name: &str, version: Option<i32>) -> String {
+    match version {
+        Some(version) => format!("{name}/{version}"),
+        None => name.to_string(),
+    }
+}
+
+/// The store key a caller-supplied model package identifier names.
+///
+/// `DescribeModelPackage` takes a `VersionedArnOrName`, whose modelled pattern admits
+/// exactly three forms: a bare name, a `name/version` pair, or this service's
+/// `...:model-package/<key>` ARN — so an identifier reaching here is one of them. An ARN
+/// resolves to everything after its `:model-package/` segment, which is exactly the key
+/// form above; anything else is already a key.
+pub fn model_package_lookup_key(identifier: &str) -> &str {
+    identifier
+        .split_once(":model-package/")
+        .map_or(identifier, |(_, resource)| resource)
 }
 
 /// Per-service state for com-amazonaws-sagemaker-sagemaker. A handler reaches it through [`service_state`].
@@ -378,6 +554,9 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub apps: BTreeMap<AppKey, App>,
     /// Keyed by `ModelPackageGroupName`.
     pub model_package_groups: BTreeMap<String, ModelPackageGroup>,
+    /// Keyed by [`model_package_key`], so an unversioned package and the versions of a
+    /// group share one store and one stable order.
+    pub model_packages: BTreeMap<String, ModelPackage>,
     /// Lineage artifacts, keyed by `ArtifactArn` — the only identifier `DescribeArtifact`
     /// resolves one by, and the one `CreateArtifact` mints.
     pub artifacts: BTreeMap<String, Artifact>,
@@ -398,6 +577,25 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// Whether another endpoint fits, i.e. the store is below [`ENDPOINT_QUOTA`].
     pub fn endpoints_below_quota(&self) -> bool {
         self.endpoints.len() < ENDPOINT_QUOTA
+    }
+
+    /// Whether another model package fits, i.e. the store is below
+    /// [`MODEL_PACKAGE_QUOTA`].
+    pub fn model_packages_below_quota(&self) -> bool {
+        self.model_packages.len() < MODEL_PACKAGE_QUOTA
+    }
+
+    /// The version number the next registration into `group` gets: one past the highest
+    /// version the group currently holds, so a group's versions count up from 1 and each
+    /// registration into it gets its own.
+    pub fn next_model_package_version(&self, group: &str) -> i32 {
+        self.model_packages
+            .values()
+            .filter(|package| package.group_name.as_deref() == Some(group))
+            .filter_map(|package| package.version)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
     }
 
     /// Whether another code repository fits, i.e. the store is below
@@ -431,6 +629,30 @@ impl ComAmazonawsSagemakerSagemakerState {
         self.artifacts
             .values()
             .find(|artifact| artifact.region == region && artifact.name.as_deref() == Some(name))
+    }
+
+    /// The model package the call that presented `token` registered under the same
+    /// identity (`name` plus `group`), if one is stored.
+    ///
+    /// This is what makes `CreateModelPackage` idempotent: a retry carrying the same
+    /// `ClientToken` answers the ARN of the package found here instead of registering
+    /// another. The match is scoped to the identity the retry asks for, so a token reused
+    /// for a DIFFERENT package is not answered with an unrelated package's ARN.
+    ///
+    /// The token lives ON the package record rather than in a map of its own, so it is
+    /// bounded by [`MODEL_PACKAGE_QUOTA`] and released with the record it belongs to —
+    /// hence the scan, as [`Self::artifact_named`] does for the same reason.
+    pub fn model_package_for_client_token(
+        &self,
+        token: &str,
+        name: &str,
+        group: Option<&str>,
+    ) -> Option<&ModelPackage> {
+        self.model_packages.values().find(|package| {
+            package.client_token.as_deref() == Some(token)
+                && package.name == name
+                && package.group_name.as_deref() == group
+        })
     }
 }
 
