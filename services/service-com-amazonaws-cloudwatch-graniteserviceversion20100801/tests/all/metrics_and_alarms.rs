@@ -1,89 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end cover for the CloudWatch metric ingest/read loop and the metric-alarm
-//! lifecycle, driven over the wire the service actually speaks: `awsJson1_0`, `POST /`
-//! with `X-Amz-Target: GraniteServiceVersion20100801.<OperationName>` (README.md /
-//! OPERATIONS.md "Wire protocol").
+//! lifecycle, driven over the wire the service actually speaks through the shared
+//! `harness` (`awsJson1_0`, `POST /` with `X-Amz-Target`).
 //!
 //! Every table row is a distinct input along what the rule under test generalises over
 //! (publish form, dimension ordering, period length, requested statistic set, page size),
 //! so the recorded happy path is one row among many rather than the specification.
 
+use crate::harness::{build_router, call, error_code, ok};
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
-use std::sync::Arc;
-
-/// The `X-Amz-Target` prefix this service's model declares.
-const TARGET_PREFIX: &str = "GraniteServiceVersion20100801";
 
 /// A fixed epoch second used as the base of every published time stamp, so the aggregation
 /// windows a test asserts on never depend on the wall clock.
 const T0: f64 = 1_700_000_000.0;
-
-/// One emulator with this service mounted, reached exactly the way the production router
-/// reaches it.
-fn build_router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Signature verification is the emulator's concern, not this service's; turning it off
-    // keeps the suite independent of how the process was launched.
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
-            engine,
-        ),
-    );
-    router
-}
-
-/// Call one operation and return its HTTP status and parsed body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("content-type", "application/x-amz-json-1.0")
-        .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
-        // The SigV4 credential scope is what routes the request to the `monitoring`
-        // signing name.
-        .header(
-            "authorization",
-            "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/us-east-1/monitoring/aws4_request, \
-             SignedHeaders=host;x-amz-date, Signature=deadbeef",
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let payload = response.into_body();
-    let parsed = if payload.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&payload).unwrap_or(Value::Null)
-    };
-    (status, parsed)
-}
-
-/// Call one operation, requiring a 200, and return its body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
-    let (status, parsed) = call(router, operation, body).await;
-    assert_eq!(
-        status, 200,
-        "{operation}: expected HTTP 200, got {status} with body {parsed}"
-    );
-    parsed
-}
-
-/// The wire error code of a failure body (`__type` on the awsJson protocols), without any
-/// namespace prefix.
-fn error_code(body: &Value) -> String {
-    body.get("__type")
-        .and_then(Value::as_str)
-        .map(|name| name.rsplit('#').next().unwrap_or(name).to_string())
-        .unwrap_or_default()
-}
 
 /// A numeric member, treating an absent member and an explicit null alike.
 fn number(value: &Value, member: &str) -> Option<f64> {
