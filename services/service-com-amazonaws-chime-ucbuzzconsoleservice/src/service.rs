@@ -96,17 +96,32 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Amazon Chime states a request that breaks a rule its model declares as
+        // `BadRequestException` — "The input parameters don't match the service's
+        // restrictions" — the HTTP 400 every operation in this service declares. The
+        // framework's generic `ValidationException` is not a code a Chime client can
+        // branch on, so both the code and the message are replaced here; the status
+        // (400 for a refused value, 403 for an unauthenticated caller) stays with the
+        // protocol, which owns it.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "BadRequestException".to_string(),
+                message: aws_smithy_schema_server::constraints::envelope(violations)
+                    .unwrap_or_else(|| {
+                        "The input parameters don't match the service's restrictions."
+                            .to_string()
+                    }),
+            }),
+            // 403 in this service's model is `ForbiddenException`.
+            Refusal::Unauthenticated => Some(Refused {
+                code: "ForbiddenException".to_string(),
+                message: "The client is permanently forbidden from making the request."
+                    .to_string(),
+            }),
+            // `Refusal` is `#[non_exhaustive]`: a refusal this service has no modelled
+            // answer for keeps the framework's own wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

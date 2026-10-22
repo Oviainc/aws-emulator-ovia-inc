@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints an Amazon Chime account and stores it in this service's state under the
+//! `AccountId` it generates, so every later call — `GetAccount`, `ListAccounts`,
+//! `CreateUser`, `DeleteAccount` — resolves the same record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation computes its answer from this service's state.
 //!
 //! ## Shape of an operation
 //!
@@ -91,12 +87,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chime-ucbuzzconsoleserv
 // here — hence the `CreateAccountError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.chime#CreateAccount")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.chime#CreateAccount",
+    // Widened in: the store this emulator keeps is in memory, so it refuses a create
+    // past its capacity guard (`crate::state::MAX_ACCOUNTS`) with the shape THIS SERVICE
+    // models for exceeding a resource limit, rather than growing without a ceiling.
+    extra_errors = ["ResourceLimitExceededException"]
+)]
 #[derive(Debug)]
 pub enum CreateAccountErrorModeled {
     BadRequestException(BadRequestException),
     ForbiddenException(ForbiddenException),
     NotFoundException(NotFoundException),
+    ResourceLimitExceededException(ResourceLimitExceededException),
     ServiceFailureException(ServiceFailureException),
     ServiceUnavailableException(ServiceUnavailableException),
     ThrottledClientException(ThrottledClientException),
@@ -154,18 +157,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAccount"))
+        let _ = ctx;
+        // `Name`'s @length(1..100) and @pattern(\S) are modelled, so a blank or
+        // oversized name is refused before this handler runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAccountErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the Amazon Chime account store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        if store.accounts.len() >= crate::state::MAX_ACCOUNTS {
+            return Err(CreateAccountErrorModeled::ResourceLimitExceededException(
+                ResourceLimitExceededException {
+                    code: Some("ResourceLimitExceeded".to_string()),
+                    message: Some(format!(
+                        "this emulator holds at most {} Amazon Chime accounts",
+                        crate::state::MAX_ACCOUNTS
+                    )),
+                },
+            )
+            .into());
+        }
+        let account_id = store.next_account_id();
+        let account = Account {
+            aws_account_id: ::engine::emulator_account_id().to_string(),
+            account_id: account_id.clone(),
+            name: input.name,
+            account_type: Some(crate::state::ACCOUNT_TYPE_TEAM.to_string()),
+            created_timestamp: Some(::aws_smithy_types::DateTime::from(
+                ::std::time::SystemTime::now(),
+            )),
+            default_license: Some(crate::state::DEFAULT_LICENSE.to_string()),
+            supported_licenses: Some(
+                crate::state::SUPPORTED_LICENSES
+                    .iter()
+                    .map(|license| (*license).to_string())
+                    .collect(),
+            ),
+            account_status: Some(crate::state::ACCOUNT_STATUS_ACTIVE.to_string()),
+            // Absent, not empty: no sign-in delegate group is associated with a new
+            // account until `AssociateSigninDelegateGroupsWithAccount` associates one.
+            signin_delegate_groups: None,
+        };
+        // Written under the id it is reported with, inside the same lock scope: the
+        // `AccountId` this response carries is one a later reader resolves.
+        store.accounts.insert(account_id, account.clone());
+
+        Ok(CreateAccountOutput {
+            account: Some(account),
+        })
     }
 }

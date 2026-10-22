@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a user under an existing Amazon Chime account and stores it under
+//! `(AccountId, UserId)`, so `GetUser` and `ListUsers` report the record this call
+//! wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation computes its answer from this service's state.
 //!
 //! ## Shape of an operation
 //!
@@ -92,13 +88,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chime-ucbuzzconsoleserv
 // here — hence the `CreateUserError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.chime#CreateUser")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.chime#CreateUser",
+    // Widened in for the same reason as `CreateAccount`: a create past this emulator's
+    // capacity guard (`crate::state::MAX_USERS_PER_ACCOUNT`) is refused with the shape
+    // THIS SERVICE models for exceeding a resource limit.
+    extra_errors = ["ResourceLimitExceededException"]
+)]
 #[derive(Debug)]
 pub enum CreateUserErrorModeled {
     BadRequestException(BadRequestException),
     ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     NotFoundException(NotFoundException),
+    ResourceLimitExceededException(ResourceLimitExceededException),
     ServiceFailureException(ServiceFailureException),
     ServiceUnavailableException(ServiceUnavailableException),
     ThrottledClientException(ThrottledClientException),
@@ -156,18 +159,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUser"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateUserErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the Amazon Chime account store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // A user hangs off an account, so the account has to exist first.
+        let account = store.accounts.get(&input.account_id).cloned().ok_or_else(|| {
+            CreateUserErrorModeled::NotFoundException(NotFoundException {
+                code: Some("NotFound".to_string()),
+                message: Some(format!(
+                    "no Amazon Chime account with AccountId {}",
+                    input.account_id
+                )),
+            })
+        })?;
+
+        // One email address identifies one user within an account (`ListUsers` documents
+        // `UserEmail` as returning at most one user), so a second user claiming an
+        // address already in the account conflicts with the account's current state.
+        // The scan is bounded by the capacity guard checked just below.
+        let users_in_account = store.users_of(&input.account_id).count();
+        if users_in_account >= crate::state::MAX_USERS_PER_ACCOUNT {
+            return Err(CreateUserErrorModeled::ResourceLimitExceededException(
+                ResourceLimitExceededException {
+                    code: Some("ResourceLimitExceeded".to_string()),
+                    message: Some(format!(
+                        "this emulator holds at most {} users per Amazon Chime account",
+                        crate::state::MAX_USERS_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(email) = input.email.as_deref() {
+            if store
+                .users_of(&input.account_id)
+                .any(|user| user.primary_email.as_deref() == Some(email))
+            {
+                return Err(CreateUserErrorModeled::ConflictException(ConflictException {
+                    code: Some("Conflict".to_string()),
+                    message: Some(
+                        "a user with this email address already exists in the account"
+                            .to_string(),
+                    ),
+                })
+                .into());
+            }
+        }
+
+        let (user_id, personal_pin) = store.next_user_identity();
+        let user = User {
+            user_id: user_id.clone(),
+            account_id: Some(account.account_id.clone()),
+            primary_email: input.email,
+            primary_provisioned_number: None,
+            display_name: input.username,
+            // The account's own default license is what a new user is licensed under.
+            license_type: account.default_license.clone(),
+            user_type: Some(
+                input
+                    .user_type
+                    .unwrap_or_else(|| crate::state::USER_TYPE_PRIVATE_USER.to_string()),
+            ),
+            user_registration_status: Some(
+                crate::state::REGISTRATION_STATUS_REGISTERED.to_string(),
+            ),
+            // Nothing invited this user — `InviteUsers` is what sets an invitation
+            // status and `InvitedOn` — so both stay absent.
+            user_invitation_status: None,
+            registered_on: Some(::aws_smithy_types::DateTime::from(
+                ::std::time::SystemTime::now(),
+            )),
+            invited_on: None,
+            alexa_for_business_metadata: None,
+            personal_pin: Some(personal_pin),
+        };
+        // Written under the account it was created on and the id it is reported with,
+        // inside the same lock scope.
+        store
+            .users
+            .insert((account.account_id.clone(), user_id), user.clone());
+
+        Ok(CreateUserOutput { user: Some(user) })
     }
 }

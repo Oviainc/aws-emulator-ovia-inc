@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes an Amazon Chime account from this service's state, together with the users
+//! stored under it, so a later `GetAccount` answers 404 and `ListAccounts` no longer
+//! reports it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! NOT emulated here, because the operations they depend on are still scaffolded: AWS
+//! additionally requires a Team account's users to be suspended first (through
+//! `BatchSuspendUser`, still a 501) and keeps a deleted account visible for a time in the
+//! `Disabled` accounts list. This handler deletes the account outright and cascades its
+//! users, and it never answers the `UnprocessableEntityException` (HTTP 422) those
+//! preconditions would produce.
+//!
+//! IMPLEMENTED: this operation computes its answer from this service's state.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +159,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAccount"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAccountErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the Amazon Chime account store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        if store.accounts.remove(&input.account_id).is_none() {
+            return Err(DeleteAccountErrorModeled::NotFoundException(NotFoundException {
+                code: Some("NotFound".to_string()),
+                message: Some(format!(
+                    "no Amazon Chime account with AccountId {}",
+                    input.account_id
+                )),
+            })
+            .into());
+        }
+        // The account's users live only under the account, so deleting it takes them
+        // with it: nothing can reach them once their account is gone.
+        store
+            .users
+            .retain(|(account_id, _), _| account_id != &input.account_id);
+
+        Ok(DeleteAccountOutput {})
     }
 }
