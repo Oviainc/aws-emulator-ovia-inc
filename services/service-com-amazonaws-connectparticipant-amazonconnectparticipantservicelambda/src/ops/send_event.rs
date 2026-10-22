@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendEvent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendEvent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Appends an `EVENT` item to the transcript of the session the
+//! `ConnectionToken` header authenticates, and returns the `Id` and `AbsoluteTime` it
+//! was stored with. Repeating a `ClientToken` returns that same stored item.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendEvent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An unknown, expired or disconnected connection token is refused with
+//! `AccessDeniedException` (HTTP 403).
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +167,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendEvent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendEventErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendEvent"))
+        let _ = ctx;
+        let now = std::time::SystemTime::now();
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(SendEventErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the connectparticipant store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+        // Reclaim what the clock has already retired before anything new is appended.
+        state.prune_expired(now);
+
+        let Some(session) =
+            state.session_for_connection_token_mut(&input.connection_token, now)
+        else {
+            return Err(SendEventErrorModeled::AccessDeniedException(AccessDeniedException {
+                message: "the connection token does not name a connected chat participant"
+                    .to_string(),
+            })
+            .into());
+        };
+
+        // A repeated `ClientToken` must answer with the item the first call stored, and
+        // must not append a second one.
+        let key = crate::state::idempotency_key(
+            crate::state::CHAT_ITEM_TYPE_EVENT,
+            input.client_token.as_deref(),
+        );
+        if let Some(stored) = session.replayed(key.as_deref()) {
+            return Ok(SendEventOutput {
+                id: Some(stored.id.clone()),
+                absolute_time: Some(stored.absolute_time.clone()),
+            });
+        }
+
+        if !session.has_room() {
+            return Err(SendEventErrorModeled::ThrottlingException(ThrottlingException {
+                message: format!(
+                    "this chat's transcript holds its {} item limit",
+                    crate::state::MAX_TRANSCRIPT_ITEMS
+                ),
+            })
+            .into());
+        }
+
+        let (id, absolute_time) = session.append(
+            crate::state::CHAT_ITEM_TYPE_EVENT,
+            input.content.clone(),
+            input.content_type.clone(),
+            key,
+            now,
+        );
+        Ok(SendEventOutput {
+            id: Some(id),
+            absolute_time: Some(absolute_time),
+        })
     }
 }
