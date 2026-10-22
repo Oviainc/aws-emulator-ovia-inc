@@ -17,12 +17,111 @@ pub struct GetConnectionInput {
     pub connection_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.apigatewaymanagementapi#GetConnectionResponse")]
+/// `GetConnectionResponse`, with its schema written out instead of derived.
+///
+/// WHY it is not `#[smithy_macros::smithy(shape = ...)]` like the shapes beside it:
+/// both timestamp members target `__timestampIso8601`, which the model marks
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="__timestampIso8601")`), and the derive does
+/// not carry that trait onto the member schemas it emits. The JSON codec reads the
+/// format off the member schema and otherwise falls back to the restJson1 default,
+/// epoch seconds — so `connectedAt` would go out as `1700000000` where the real
+/// service sends `"2023-11-14T22:13:20Z"`, which is not even the modelled type. The
+/// three member schemas below are the model's, member for member: same shape ids,
+/// same `@jsonName`s, same order, plus the `date-time` format the model declares.
+///
+/// This is a PER-SHAPE workaround, and it has to be kept in step with the model by
+/// hand. The generator gap it works around is filed as
+/// `issues/things-that-do-not-work/20261022T000000Z-smithy-macros-drops-timestampformat-from-member-schemas.md`
+/// — the fix belongs in `vendor/smithy-macros` (chain `.with_timestamp_format(..)` when
+/// building a member schema), which is read-only from a service crate. Do not copy this
+/// pattern into another service: fix the macro instead.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this shape
+/// is an operation OUTPUT, which the server only ever serializes
+/// (`Operation::Output` requires `SerializableStruct`; only `Input` is deserialized),
+/// so a hand-written read path would be untested code with no caller.
 #[derive(Debug, Clone, Default)]
 pub struct GetConnectionOutput {
     pub connected_at: Option<::aws_smithy_types::DateTime>,
     pub identity: Option<Identity>,
     pub last_active_at: Option<::aws_smithy_types::DateTime>,
+}
+
+#[allow(non_upper_case_globals)]
+impl GetConnectionOutput {
+    const M_CONNECTED_AT: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.apigatewaymanagementapi#GetConnectionResponse$ConnectedAt",
+            "com.amazonaws.apigatewaymanagementapi",
+            "ConnectedAt",
+        ),
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        "ConnectedAt",
+        0,
+    )
+    .with_json_name("connectedAt")
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    const M_IDENTITY: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.apigatewaymanagementapi#GetConnectionResponse$Identity",
+            "com.amazonaws.apigatewaymanagementapi",
+            "Identity",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        "Identity",
+        1,
+    )
+    .with_json_name("identity");
+
+    const M_LAST_ACTIVE_AT: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.apigatewaymanagementapi#GetConnectionResponse$LastActiveAt",
+            "com.amazonaws.apigatewaymanagementapi",
+            "LastActiveAt",
+        ),
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        "LastActiveAt",
+        2,
+    )
+    .with_json_name("lastActiveAt")
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.apigatewaymanagementapi#GetConnectionResponse",
+            "com.amazonaws.apigatewaymanagementapi",
+            "GetConnectionResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_CONNECTED_AT,
+            &Self::M_IDENTITY,
+            &Self::M_LAST_ACTIVE_AT,
+        ],
+    );
+}
+
+pub static GET_CONNECTION_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetConnectionOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetConnectionOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.connected_at.as_ref() {
+            serializer.write_timestamp(&Self::M_CONNECTED_AT, value)?;
+        }
+        if let Some(value) = self.identity.as_ref() {
+            serializer.write_struct(&Self::M_IDENTITY, value)?;
+        }
+        if let Some(value) = self.last_active_at.as_ref() {
+            serializer.write_timestamp(&Self::M_LAST_ACTIVE_AT, value)?;
+        }
+        Ok(())
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.apigatewaymanagementapi#Identity")]

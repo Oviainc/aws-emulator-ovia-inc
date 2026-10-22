@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PostToConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PostToConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: delivers one `Data` payload to a registered connection. A MUTATION:
+//! the spec says it "Sends the provided data to the specified connection", so a
+//! successful call appends the payload to that connection's delivered-message queue
+//! (in send order) and advances its `LastActiveAt` — data flowed, so the connection was
+//! active.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PostToConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An unregistered or already-deleted connection id answers the modeled `GoneException`
+//! (HTTP 410) and delivers nothing; see [`crate::state`] for the registration rule. A
+//! payload past the modeled `@length` maximum answers `PayloadTooLargeException`
+//! (HTTP 413) — see [`MAX_DATA_BYTES`] and `crate::service::OversizedPayload` for where
+//! that bound is enforced.
 //!
 //! ## Shape of an operation
 //!
@@ -68,6 +70,28 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest `Data` payload `PostToConnection` accepts, in bytes.
+///
+/// Source: the model's `@length(min: 0, max: 131072)` on the `Data` blob shape
+/// (`smithy_query(query="shape", shape="Data")`), which is the same 128 KiB frame limit
+/// the modeled `PayloadTooLargeException` (HTTP 413) describes. Anything past it is
+/// refused; nothing is delivered.
+pub const MAX_DATA_BYTES: usize = 131_072;
+
+/// The modeled `PayloadTooLargeException` for a `Data` payload of `actual` bytes.
+///
+/// The message is built from the request — the size that was sent and the bound it
+/// broke — so a caller can fix the request from the text alone. Shared with
+/// `crate::service`, which refuses an over-limit payload the framework's own
+/// constraint boundary would otherwise answer for.
+pub fn payload_too_large(actual: usize) -> PayloadTooLargeException {
+    PayloadTooLargeException {
+        message: Some(format!(
+            "Data payload of {actual} bytes exceeds the maximum of {MAX_DATA_BYTES} bytes"
+        )),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -164,18 +188,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PostToConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PostToConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PostToConnection"))
+        let _ = ctx;
+        // Backstop for the modelled `@length` bound. In the served path an over-limit
+        // payload never reaches here — `crate::service::EmulatedService::override_operation`
+        // answers it with the same modelled error before any handler runs, because the
+        // framework's constraint boundary would otherwise refuse it as a generic 400.
+        // Keeping the check here means the bound holds for any caller of `handle`, and
+        // it states the order: the payload is judged before the connection is resolved,
+        // so an over-limit payload is `PayloadTooLargeException` whether or not the id
+        // is registered. Nothing is delivered either way.
+        if input.data.len() > MAX_DATA_BYTES {
+            return Err(PostToConnectionErrorModeled::PayloadTooLargeException(
+                payload_too_large(input.data.len()),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::registry_unavailable(Self::NAME));
+        };
+
+        let mut guard = state.lock();
+        let Some(connection) = guard.connections.get_mut(&input.connection_id) else {
+            // Nothing is recorded for a connection that was never registered or has
+            // already been deleted.
+            return Err(PostToConnectionErrorModeled::GoneException(GoneException {}).into());
+        };
+        // Counts the delivery and keeps it in the connection's BOUNDED observation
+        // window; see `crate::state::Connection::push_delivered` for why the retained
+        // payloads are capped rather than accumulated.
+        connection.push_delivered(input.data);
+        // Data flowed to the connection, so this is the moment it was last active.
+        connection.last_active_at = ::std::time::SystemTime::now();
+
+        Ok(PostToConnectionOutput)
     }
 }

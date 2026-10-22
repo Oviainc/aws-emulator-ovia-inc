@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes one connection from the registry. A MUTATION: the spec says it
+//! "Delete[s] the connection with the provided id", so a successful call drops the
+//! registry entry outright and answers HTTP 204 with no body.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removal is what makes the connection gone: every later `GetConnection`,
+//! `PostToConnection` and `DeleteConnection` on the same id answers the modeled
+//! `GoneException` (HTTP 410), since a missing entry is this service's single source of
+//! truth for that error. See [`crate::state`] for the registration rule.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +158,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConnection"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::registry_unavailable(Self::NAME));
+        };
+
+        // Removing the entry IS the delete: the registry is the only record of the
+        // connection, so a second delete of the same id finds nothing.
+        let removed = state.lock().connections.remove(&input.connection_id);
+        if removed.is_none() {
+            return Err(DeleteConnectionErrorModeled::GoneException(GoneException {}).into());
+        }
+
+        Ok(DeleteConnectionOutput)
     }
 }
