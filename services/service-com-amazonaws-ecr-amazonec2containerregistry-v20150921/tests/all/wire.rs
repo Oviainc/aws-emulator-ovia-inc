@@ -91,3 +91,61 @@ pub async fn ok(router: &MultiServiceRouter, case: &str, operation: &str, body: 
     );
     answer.body
 }
+
+/// The same call as [`call`], made against `region`: the credential scope's region is
+/// the Region a request is made against, so a suite exercising regional behaviour picks
+/// it per call instead of taking [`REGION`].
+pub async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> Answer {
+    let request = ::http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", format!("api.ecr.{region}.amazonaws.com"))
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/ecr/aws4_request, \
+                 SignedHeaders=host, Signature=abc"
+            ),
+        )
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
+        .body(Bytes::from(body.to_string()))
+        .expect("the test request is well formed");
+
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let bytes = response.into_body();
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "{operation} answered a body that is not JSON ({error}): {:?}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
+    };
+    Answer { status, body }
+}
+
+/// A successful [`call_in_region`], or a panic naming the case and what came back.
+pub async fn ok_in_region(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
+    let answer = call_in_region(router, region, operation, body).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected HTTP 200 from {operation}, got {} with {:?}",
+        answer.status, answer.body
+    );
+    answer.body
+}

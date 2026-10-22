@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RequestCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RequestCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RequestCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a certificate ARN, persists the certificate record (status
+//! `PENDING_VALIDATION`, type `AMAZON_ISSUED`) with one validation entry per domain
+//! name, and returns the ARN. An `IdempotencyToken` re-sent with the same request
+//! parameters resolves to the certificate already created for it.
 //!
 //! ## Shape of an operation
 //!
@@ -224,18 +219,368 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RequestCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RequestCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RequestCertificate"))
+        // Unreachable in the assembled emulator (the engine is the shared store), and
+        // this operation models no server fault, so the wrapper's refusal is the one
+        // honest answer left.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the acm certificate store is unavailable",
+            ));
+        };
+
+        // The certificate's name set: DomainName first, then the requested SANs, with
+        // duplicates dropped — a name appears once in a certificate however often the
+        // request lists it.
+        let mut names: Vec<String> = Vec::new();
+        for name in
+            std::iter::once(&input.domain_name).chain(input.subject_alternative_names.iter().flatten())
+        {
+            if !names.iter().any(|existing| existing == name) {
+                names.push(name.clone());
+            }
+        }
+
+        // "The maximum number of domain names that you can add to an ACM certificate
+        // is 100" (`RequestCertificateRequest$SubjectAlternativeNames` doc), counting
+        // the DomainName itself — an ACM quota, which `LimitExceededException` reports.
+        if names.len() > DOMAIN_NAME_LIMIT {
+            let requested = names.len();
+            return Err(RequestCertificateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "a certificate may cover at most {DOMAIN_NAME_LIMIT} domain names; this request names {requested}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `DomainValidationOptions` may only name domains the certificate covers.
+        let validation_domains = validation_domains(&input, &names)?;
+
+        let tags = crate::state::tag_map(input.tags.as_deref().unwrap_or_default()).map_err(
+            |message| {
+                RequestCertificateErrorModeled::InvalidTagException(InvalidTagException {
+                    message: Some(message),
+                })
+            },
+        )?;
+
+        // `Options.ValidationMethod` is the newer home of the choice the top-level
+        // `ValidationMethod` member carries; either names it, and absent both ACM
+        // validates the domains by email.
+        let validation_method = input
+            .validation_method
+            .clone()
+            .or_else(|| {
+                input
+                    .options
+                    .as_ref()
+                    .and_then(|options| options.validation_method.clone())
+            })
+            .unwrap_or_else(|| crate::state::DEFAULT_VALIDATION_METHOD.to_string());
+
+        let key_algorithm = input
+            .key_algorithm
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_KEY_ALGORITHM.to_string());
+
+        let region = crate::state::request_region(ctx.parts());
+        let idempotency = input.idempotency_token.as_ref().map(|token| {
+            idempotency_key(
+                token,
+                &input,
+                &DerivedRequest {
+                    region: &region,
+                    names: &names,
+                    validation_method: &validation_method,
+                    key_algorithm: &key_algorithm,
+                    tags: &tags,
+                    validation_domains: &validation_domains,
+                },
+            )
+        });
+
+        let mut store = state.lock();
+
+        // A re-sent request resolves to the certificate it already created. An entry
+        // whose certificate has since been deleted is stale, so it is not reused: a
+        // minted ARN must always have a record behind it.
+        if let Some(existing) = idempotency
+            .as_ref()
+            .and_then(|key| store.idempotency.get(key))
+            .filter(|arn| store.certificates.contains_key(*arn))
+            .cloned()
+        {
+            return Ok(RequestCertificateOutput {
+                certificate_arn: Some(existing),
+            });
+        }
+
+        // The per-account certificate quota: refused BEFORE the record is inserted, so
+        // the store cannot grow past it however many times the call is repeated. (The
+        // idempotency index is bounded with it: an entry is only ever written beside a
+        // new certificate and `remove_certificate` drops every entry pointing at a
+        // deleted one, so it never holds more entries than there are certificates.)
+        if store.certificates.len() >= CERTIFICATE_LIMIT {
+            let held = store.certificates.len();
+            return Err(RequestCertificateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this account already holds {held} ACM certificates, the quota of {CERTIFICATE_LIMIT} for this Region"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let certificate_id = uuid::Uuid::new_v4().to_string();
+        let arn = crate::state::certificate_arn(&region, &certificate_id);
+
+        let domain_validations = names
+            .iter()
+            .map(|name| {
+                domain_validation_record(
+                    &certificate_id,
+                    name,
+                    &validation_method,
+                    validation_domains.get(name.as_str()).copied(),
+                )
+            })
+            .collect();
+
+        let certificate = crate::state::Certificate {
+            arn: arn.clone(),
+            domain_name: input.domain_name.clone(),
+            subject_alternative_names: names,
+            status: crate::state::STATUS_PENDING_VALIDATION.to_string(),
+            cert_type: crate::state::TYPE_AMAZON_ISSUED.to_string(),
+            key_algorithm,
+            key_pair_origin: crate::state::KEY_PAIR_ORIGIN_AWS_MANAGED.to_string(),
+            validation_method: Some(validation_method),
+            domain_validations,
+            options: input.options.clone(),
+            certificate_authority_arn: input.certificate_authority_arn.clone(),
+            managed_by: input.managed_by.clone(),
+            renewal_eligibility: crate::state::RENEWAL_INELIGIBLE.to_string(),
+            in_use_by: Vec::new(),
+            // A certificate carries X.509 key-usage extensions only once it has been
+            // issued, and this one is pending validation.
+            key_usages: Vec::new(),
+            extended_key_usages: Vec::new(),
+            exported: false,
+            created_at: std::time::SystemTime::now(),
+            issued_at: None,
+            not_before: None,
+            not_after: None,
+            tags,
+        };
+
+        store.certificates.insert(arn.clone(), certificate);
+        if let Some(key) = idempotency {
+            store.idempotency.insert(key, arn.clone());
+        }
+
+        Ok(RequestCertificateOutput {
+            certificate_arn: Some(arn),
+        })
+    }
+}
+
+/// The number of domain names one certificate may cover, counting `DomainName`
+/// itself: "The maximum number of domain names that you can add to an ACM
+/// certificate is 100" (`RequestCertificateRequest$SubjectAlternativeNames` doc).
+const DOMAIN_NAME_LIMIT: usize = 100;
+
+/// The number of ACM certificates one account may hold in a Region, from the ACM
+/// service quota "ACM certificates" (default 2,500 per Region). It bounds the store
+/// against a caller that repeats `RequestCertificate`, and past it ACM answers the
+/// quota error this operation already models.
+const CERTIFICATE_LIMIT: usize = 2_500;
+
+/// `DomainValidationOptions` as a `domain name -> validation domain` lookup.
+///
+/// Every entry must name a domain the certificate covers; one that does not is
+/// `InvalidDomainValidationOptionsException`, the error this operation models for "one
+/// or more values in the DomainValidationOption structure is incorrect".
+fn validation_domains<'a>(
+    input: &'a RequestCertificateInput,
+    names: &[String],
+) -> Result<std::collections::HashMap<&'a str, &'a str>, RequestCertificateError> {
+    let mut mapped = std::collections::HashMap::new();
+    for option in input.domain_validation_options.iter().flatten() {
+        if !names.iter().any(|name| name == &option.domain_name) {
+            return Err(
+                RequestCertificateErrorModeled::InvalidDomainValidationOptionsException(
+                    InvalidDomainValidationOptionsException {
+                        message: Some(format!(
+                            "DomainValidationOptions names {}, which is not a domain name in this certificate request",
+                            option.domain_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        mapped.insert(
+            option.domain_name.as_str(),
+            option.validation_domain.as_str(),
+        );
+    }
+    Ok(mapped)
+}
+
+/// The validation ACM is waiting on for one domain name.
+///
+/// DNS validation publishes a CNAME, email validation names the mailboxes ACM wrote
+/// to, and HTTP validation names the URL the CA fetches; the method the request chose
+/// decides which. Each value is derived from the certificate's own id, so a later
+/// `DescribeCertificate` reports exactly the same record.
+fn domain_validation_record(
+    certificate_id: &str,
+    domain_name: &str,
+    validation_method: &str,
+    validation_domain: Option<&str>,
+) -> crate::state::DomainValidationRecord {
+    let target = crate::state::validation_target(domain_name);
+    let mut record = crate::state::DomainValidationRecord {
+        domain_name: domain_name.to_string(),
+        validation_status: crate::state::DOMAIN_STATUS_PENDING_VALIDATION.to_string(),
+        validation_method: validation_method.to_string(),
+        validation_domain: None,
+        validation_emails: Vec::new(),
+        resource_record: None,
+        http_redirect: None,
+    };
+    match validation_method {
+        "DNS" => {
+            let name = crate::state::validation_label(certificate_id, domain_name, "dns-name");
+            let value = crate::state::validation_label(certificate_id, domain_name, "dns-value");
+            record.resource_record = Some(ResourceRecord {
+                name: format!("_{name}.{target}."),
+                r#type: crate::state::RECORD_TYPE_CNAME.to_string(),
+                value: format!("_{value}.{}.", crate::state::ACM_VALIDATIONS_ZONE),
+            });
+        }
+        "HTTP" => {
+            let token = crate::state::validation_label(certificate_id, domain_name, "http-token");
+            let path = crate::state::HTTP_VALIDATION_PATH;
+            record.http_redirect = Some(HttpRedirect {
+                redirect_from: Some(format!("http://{target}{path}{token}.txt")),
+                redirect_to: Some(format!(
+                    "http://{token}.{}{path}{token}.txt",
+                    crate::state::ACM_VALIDATIONS_ZONE
+                )),
+            });
+        }
+        // EMAIL, and the default when the request named no method.
+        _ => {
+            let mailed = validation_domain.unwrap_or(target);
+            record.validation_domain = Some(mailed.to_string());
+            record.validation_emails = crate::state::VALIDATION_EMAIL_LOCAL_PARTS
+                .iter()
+                .map(|local_part| format!("{local_part}@{mailed}"))
+                .collect();
+        }
+    }
+    record
+}
+
+/// What a request's certificate is built from beyond the request members themselves:
+/// the Region the ARN is minted in and the values the handler derived (the name set,
+/// the resolved validation method and key algorithm, the tag map and the per-domain
+/// validation domains). [`idempotency_key`] fingerprints all of it.
+struct DerivedRequest<'a> {
+    region: &'a str,
+    names: &'a [String],
+    validation_method: &'a str,
+    key_algorithm: &'a str,
+    tags: &'a std::collections::BTreeMap<String, String>,
+    validation_domains: &'a std::collections::HashMap<&'a str, &'a str>,
+}
+
+/// The idempotency index key for a request: the caller's token plus a fingerprint of
+/// EVERY parameter the certificate is built from.
+///
+/// Keyed on both, because the token identifies one certificate REQUEST — re-sending
+/// it unchanged must not create a second certificate, while the same token on a
+/// different request is a different request and gets its own certificate. The
+/// fingerprint therefore has to cover every member that ends up on the record
+/// (names, validation method, key algorithm, CA ARN, `ManagedBy`, `Options`, the tags
+/// and the per-domain validation domains) plus the Region the ARN is minted in, or a
+/// re-send that changed one of them would answer 200 while silently discarding the
+/// change — or hand back another Region's ARN.
+///
+/// Each group of parts is hashed behind its own length, and every part inside it
+/// length-prefixed, so no value can move between groups or run into its neighbour
+/// and leave the fingerprint unchanged: three domain names with no tags and one
+/// domain name with a tag whose key and value are the other two are different
+/// requests and hash differently. The tags and validation domains are hashed in key
+/// order, so the same request with its tags listed in another order is recognised as
+/// the same request.
+fn idempotency_key(
+    token: &str,
+    input: &RequestCertificateInput,
+    derived: &DerivedRequest<'_>,
+) -> String {
+    use sha2::Digest;
+
+    let options = input.options.as_ref();
+    let certificate_authority_arn = input.certificate_authority_arn.clone().unwrap_or_default();
+    let managed_by = input.managed_by.clone().unwrap_or_default();
+    let transparency_logging = options
+        .and_then(|o| o.certificate_transparency_logging_preference.clone())
+        .unwrap_or_default();
+    let export = options.and_then(|o| o.export.clone()).unwrap_or_default();
+    let options_validation_method = options
+        .and_then(|o| o.validation_method.clone())
+        .unwrap_or_default();
+    let scalars = [
+        derived.region,
+        derived.validation_method,
+        derived.key_algorithm,
+        &certificate_authority_arn,
+        &managed_by,
+        &transparency_logging,
+        &export,
+        &options_validation_method,
+    ];
+
+    let mut domains: Vec<(&str, &str)> = derived
+        .validation_domains
+        .iter()
+        .map(|(domain, validation_domain)| (*domain, *validation_domain))
+        .collect();
+    domains.sort_unstable();
+
+    let mut hasher = sha2::Sha256::new();
+    hash_group(&mut hasher, scalars);
+    hash_group(&mut hasher, derived.names.iter().map(String::as_str));
+    hash_group(
+        &mut hasher,
+        derived
+            .tags
+            .iter()
+            .flat_map(|(key, value)| [key.as_str(), value.as_str()]),
+    );
+    hash_group(
+        &mut hasher,
+        domains
+            .iter()
+            .flat_map(|(domain, validation_domain)| [*domain, *validation_domain]),
+    );
+    format!("{token}:{}", hex::encode(hasher.finalize()))
+}
+
+/// Hash one group of fingerprint parts: how many parts it holds, then each part
+/// behind its own length.
+fn hash_group<'a>(hasher: &mut sha2::Sha256, parts: impl IntoIterator<Item = &'a str>) {
+    use sha2::Digest;
+
+    let parts: Vec<&str> = parts.into_iter().collect();
+    hasher.update(parts.len().to_le_bytes());
+    for part in parts {
+        hasher.update(part.len().to_le_bytes());
+        hasher.update(part.as_bytes());
     }
 }
