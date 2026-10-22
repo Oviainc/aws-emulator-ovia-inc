@@ -11,6 +11,12 @@
 //! Resource metrics are NOT stored: `GetResourceMetrics` derives its aligned
 //! window, its effective period and its metric keys from the request, and
 //! reports no data points at all, so reading metrics never writes.
+//!
+//! The data sources themselves are not stored either — no Performance Insights
+//! operation registers one, they are the DB resources other services own — so
+//! whether a request addresses a data source this account may see is decided by
+//! [`is_data_source_identifier`], the authorization gate every operation in this
+//! crate applies before it answers.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -261,6 +267,62 @@ impl ComAmazonawsPiPerformanceinsightsv20180227State {
         self.tags_by_arn.remove(&removed.resource_arn);
         true
     }
+}
+
+/// The message every authorization refusal in this service carries.
+///
+/// ONE service-wide constant, with nothing from the request in it: the real
+/// service answers the same sentence whether the data source is absent, belongs
+/// to another account, or holds no report with the requested id, precisely so
+/// the answer discloses which. A message rebuilt from a lookup miss ("… was not
+/// found for the resource …") would leak exactly the existence information this
+/// uniform refusal exists to withhold. The modelled requirement is the status
+/// (400) and the error code (`NotAuthorizedException`); this text is the one the
+/// corpus records for it, identically on five different operations, which is
+/// what makes it a constant rather than one request's value.
+pub const NOT_AUTHORIZED_MESSAGE: &str = "The specified resource is not authorized for this account";
+
+/// The kind prefixes an immutable DB resource id is minted with: `db-` for a DB
+/// instance (reported as `DbiResourceId`) and `cluster-` for a DB cluster
+/// (reported as `DbClusterResourceId`).
+const DATA_SOURCE_ID_PREFIXES: [&str; 2] = ["db-", "cluster-"];
+
+/// Whether `identifier` addresses a data source Performance Insights serves for
+/// this account — the check every operation that names a `(ServiceType,
+/// Identifier)` pair makes before it answers anything.
+///
+/// Performance Insights gathers metrics from a data source addressed by the
+/// IMMUTABLE resource id its owning service minted, which is what every
+/// `Identifier` member of this model documents: "When you call
+/// DescribeDBInstances, the identifier is returned as DbiResourceId. To use a DB
+/// instance as a data source, specify its DbiResourceId value. For example,
+/// specify db-ABCDEFGHIJKLMNOPQRSTU1VW2X." Those ids are a kind prefix plus a
+/// token drawn from an uppercase-alphanumeric alphabet — the same ids the
+/// emulator's own database services mint (RDS `mint_dbi_resource_id`: `db-`
+/// plus 26 uppercase base-36 symbols; DocumentDB and Neptune
+/// `CreateDBCluster`: `cluster-` plus a token of that alphabet). The modelled
+/// `IdentifierString` pattern `^[a-zA-Z0-9-]+$` is far wider, so the boundary
+/// validator passes anything that merely looks like a NAME — a
+/// `DBInstanceIdentifier`, say — and this is the check that refuses it, with the
+/// modelled `NotAuthorizedException` rather than an argument error: the value
+/// is a well-formed `IdentifierString`, it just addresses no data source this
+/// account may see.
+///
+/// It is a NECESSARY condition, not a sufficient one: this emulator monitors no
+/// running DB engine and holds no cross-account inventory, so it cannot know
+/// whether a well-formed resource id was ever minted for this account. What it
+/// can decide — and does, uniformly for every operation — is that an identifier
+/// of a form this service could never have handed out addresses nothing, and is
+/// never served as if the account owned it.
+pub fn is_data_source_identifier(identifier: &str) -> bool {
+    DATA_SOURCE_ID_PREFIXES.iter().any(|prefix| {
+        identifier.strip_prefix(prefix).is_some_and(|token| {
+            !token.is_empty()
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+        })
+    })
 }
 
 /// The current wall-clock instant as the modelled `ISOTimestamp` type.

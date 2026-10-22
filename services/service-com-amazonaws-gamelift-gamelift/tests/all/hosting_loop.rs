@@ -23,6 +23,15 @@ use smithy_server_runtime::MultiServiceRouter;
 /// region of its SigV4 credential scope, and the ARNs it mints name that region.
 pub(crate) const REGION: &str = "us-west-2";
 
+/// An ARN this service mints for `resource`, in [`REGION`] and carrying the one account
+/// every emulated response presents (`engine::emulator_account_id`).
+pub(crate) fn gamelift_arn(resource: &str) -> String {
+    format!(
+        "arn:aws:gamelift:{REGION}:{}:{resource}",
+        engine::emulator_account_id()
+    )
+}
+
 /// One emulator holding only the GameLift service, driven through the production
 /// dispatch path.
 pub(crate) struct GameLift {
@@ -112,6 +121,19 @@ pub(crate) fn ec2_fleet(name: &str) -> Value {
     })
 }
 
+/// An Anywhere fleet request deployed to `locations`, which `CreateFleet` requires for
+/// this compute type.
+pub(crate) fn anywhere_fleet(name: &str, locations: &[&str]) -> Value {
+    json!({
+        "Name": name,
+        "ComputeType": "ANYWHERE",
+        "Locations": locations
+            .iter()
+            .map(|location| json!({"Location": location}))
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// Create a fleet and return its `FleetId`.
 pub(crate) async fn create_fleet(gamelift: &GameLift, request: Value) -> String {
     let created = gamelift.ok("CreateFleet", request).await;
@@ -156,10 +178,11 @@ async fn the_hosting_loop_runs_end_to_end_against_stored_state() {
         fleet_id.starts_with("fleet-") && fleet_id.len() > "fleet-".len(),
         "CreateFleet: FleetId must match the modelled ^[a-z]*fleet-[a-zA-Z0-9\\-]+$, got {fleet_id}"
     );
-    // `FleetAttributes$FleetArn` doc: "Format is arn:aws:gamelift:<region>::fleet/fleet-…".
+    // `FleetAttributes$FleetArn` doc: "Format is arn:aws:gamelift:<region>::fleet/fleet-…",
+    // with the account segment populated (see `state::gamelift_arn`).
     assert_eq!(
         attributes["FleetArn"],
-        json!(format!("arn:aws:gamelift:{REGION}::fleet/{fleet_id}")),
+        json!(gamelift_arn(&format!("fleet/{fleet_id}"))),
         "CreateFleet: FleetArn must be the documented format, got {}",
         attributes["FleetArn"]
     );
@@ -179,7 +202,7 @@ async fn the_hosting_loop_runs_end_to_end_against_stored_state() {
     assert_eq!(attributes["BuildId"], json!("build-demo"));
     assert_eq!(
         attributes["BuildArn"],
-        json!(format!("arn:aws:gamelift:{REGION}::build/build-demo"))
+        json!(gamelift_arn("build/build-demo"))
     );
     assert_eq!(
         attributes["NewGameSessionProtectionPolicy"],
@@ -263,7 +286,7 @@ async fn the_hosting_loop_runs_end_to_end_against_stored_state() {
         .to_string();
     // `GameSession$GameSessionId` doc: "arn:aws:gamelift:<home_region>::gamesession/<fleet
     // ID>/<ID string>".
-    let home_prefix = format!("arn:aws:gamelift:{REGION}::gamesession/{fleet_id}/");
+    let home_prefix = gamelift_arn(&format!("gamesession/{fleet_id}/"));
     assert!(
         game_session_id.starts_with(&home_prefix)
             && game_session_id.len() > home_prefix.len(),
@@ -1276,9 +1299,9 @@ async fn a_remote_location_game_session_carries_the_location_in_its_id() {
             .expect("a created session has an id")
             .to_string();
         assert!(
-            id.starts_with(&format!(
-                "arn:aws:gamelift:{REGION}::gamesession/{fleet_id}/{location}/"
-            )),
+            id.starts_with(&gamelift_arn(&format!(
+                "gamesession/{fleet_id}/{location}/"
+            ))),
             "case {location}: a remote-location session id must carry its location, got {id}"
         );
         assert_eq!(
@@ -1394,7 +1417,7 @@ async fn absent_resources_and_missing_selectors_are_refused() {
             label: "reserve a slot in an unknown session",
             operation: "CreatePlayerSession",
             request: json!({
-                "GameSessionId": format!("arn:aws:gamelift:{REGION}::gamesession/{fleet_id}/nope"),
+                "GameSessionId": gamelift_arn(&format!("gamesession/{fleet_id}/nope")),
                 "PlayerId": "player-1",
             }),
             expected: "NotFoundException",

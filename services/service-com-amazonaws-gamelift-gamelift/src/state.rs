@@ -58,6 +58,25 @@ pub const FLEET_TYPE_ON_DEMAND: &str = "ON_DEMAND";
 /// decides which of the two documented `DnsName` forms a game session reports.
 pub const CERTIFICATE_TYPE_GENERATED: &str = "GENERATED";
 
+/// `CertificateConfiguration.CertificateType` default: that member's own doc —
+/// "DISABLED - (default) Do not generate a TLS/SSL certificate for this fleet." A fleet
+/// created without a `CertificateConfiguration` carries this one, so every fleet reports
+/// the member the service decided for it.
+pub const CERTIFICATE_TYPE_DISABLED: &str = "DISABLED";
+
+/// `PlayerGatewayMode` default: CreateFleet's `PlayerGatewayMode` doc — "`DISABLED`
+/// (default) -- Game clients connect to the game server endpoint."
+pub const PLAYER_GATEWAY_MODE_DISABLED: &str = "DISABLED";
+
+/// The CloudWatch metric group a fleet created without one is added to.
+///
+/// `FleetAttributes$MetricGroups`' doc: "Name of a metric group that metrics for this
+/// fleet are added to. [...] A fleet can be included in only one metric group at a
+/// time" — so a fleet is always in exactly one group, and a `CreateFleet` that names
+/// none leaves the fleet in the service's own group. The model does not name that group;
+/// the recorded wire responses of this service report it as `default`.
+pub const DEFAULT_METRIC_GROUP: &str = "default";
+
 /// The upper bound on `MaximumPlayerSessionCount`. CreatePlayerSession's doc: "The
 /// maximum number of players per game session is 200. It is not adjustable." The model
 /// leaves the member unbounded above, so the service rule is enforced here.
@@ -176,15 +195,19 @@ fn process_seed() -> u128 {
     })
 }
 
-/// An ARN in the format the GameLift model documents for its resources:
-/// `FleetAttributes$FleetArn` — "Format is
-/// `arn:aws:gamelift:<region>::fleet/fleet-a1234567-...`" — and
-/// `GameSession$GameSessionId` — "`arn:aws:gamelift:<home_region>::gamesession/<fleet
-/// ID>/<ID string>`". Both carry an EMPTY account segment, which is why this is not
-/// `engine::emulator_arn`: that helper always writes the emulator account id into the
-/// account segment.
+/// An ARN for a GameLift resource: `arn:aws:gamelift:<region>:<account>:<resource>`.
+///
+/// Every segment the model documents for `FleetAttributes$FleetArn` ("Format is
+/// `arn:aws:gamelift:<region>::fleet/fleet-a1234567-...`") and for
+/// `GameSession$GameSessionId` ("`arn:aws:gamelift:<home_region>::gamesession/<fleet
+/// ID>/<ID string>`"), with the account segment POPULATED: those prose examples render
+/// the account empty, but the service's own responses carry the account id of the
+/// calling account, and an ARN is only usable as an IAM resource — or splittable back
+/// into its owning account — when that segment is there. So this delegates to
+/// [`::engine::emulator_arn`], the single source of the one account every emulated
+/// response presents.
 pub fn gamelift_arn(region: &str, resource: &str) -> String {
-    format!("arn:aws:gamelift:{region}::{resource}")
+    ::engine::emulator_arn("gamelift", region, resource)
 }
 
 /// The region the caller addressed, read from the request's SigV4 credential scope.
@@ -438,6 +461,17 @@ impl Fleet {
                 player_gateway_status: None,
             })
             .collect()
+    }
+
+    /// Whether Amazon GameLift Servers owns and runs this fleet's compute.
+    ///
+    /// `ComputeType`'s doc distinguishes the two: an `EC2` fleet's instances are managed
+    /// by the service, while an `ANYWHERE` fleet "represents compute resources that are
+    /// not owned or managed by Amazon GameLift Servers". Deleting a fleet "shuts down
+    /// any currently running fleet instances", so only a fleet WITH managed instances
+    /// has anything to shut down — which is what makes its deletion take time.
+    pub fn hosts_managed_instances(&self) -> bool {
+        self.compute_type != COMPUTE_TYPE_ANYWHERE
     }
 
     /// Whether this fleet deploys to `location`.

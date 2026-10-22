@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds tags to the stored resource the ARN names (see [`TagResource::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +150,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The ARN's shape is already enforced by `TranscribeArn`'s `@pattern`, so
+        // reaching here means it is well formed; what it names is what decides.
+        let Some(resource) = crate::state::parse_resource_arn(&input.resource_arn) else {
+            return Err(bad_request(&format!(
+                "The ResourceArn {} is not an Amazon Transcribe resource ARN. Specify an \
+                 ARN of the form arn:aws:transcribe:<region>:<account>:<type>/<name> and \
+                 try your request again.",
+                input.resource_arn
+            )));
+        };
+
+        let mut store = state.lock();
+        let Some(tags) = store.tags_mut(&resource) else {
+            return Err(not_found(&input.resource_arn));
+        };
+
+        // "a key:value pair": one value per key, so a tag whose key is already on the
+        // resource replaces that key's value rather than being added beside it. The
+        // merge is computed first and committed below.
+        let mut merged = tags.clone();
+        for tag in input.tags {
+            match merged.iter_mut().find(|stored| stored.key == tag.key) {
+                Some(stored) => stored.value = tag.value,
+                None => merged.push(tag),
+            }
+        }
+        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            let count = merged.len();
+            return Err(bad_request(&format!(
+                "Tagging {arn} would give it {count} tags, more than the {max} tags a \
+                 resource may hold. Remove tags you no longer need and try your request \
+                 again.",
+                arn = input.resource_arn,
+                max = crate::state::MAX_TAGS_PER_RESOURCE,
+            )));
+        }
+        // Committed only now, so a request past the ceiling above leaves the stored
+        // tag set exactly as it was.
+        let stored_count = merged.len();
+        *tags = merged;
+
+        ::tracing::info!(
+            operation = "TagResource",
+            resource = %input.resource_arn,
+            tags = stored_count,
+            "resource tagged"
+        );
+        Ok(TagResourceOutput {})
     }
+}
+
+/// A `BadRequestException` (HTTP 400) refusing a request the model's own constraint
+/// traits cannot express.
+fn bad_request(message: &str) -> TagResourceError {
+    TagResourceErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The modelled not-found refusal for an ARN that names no resource this account
+/// holds.
+fn not_found(arn: &str) -> TagResourceError {
+    TagResourceErrorModeled::NotFoundException(NotFoundException {
+        message: Some(format!(
+            "The requested resource {arn} couldn't be found. Check the ARN and try your \
+             request again."
+        )),
+    })
+    .into()
 }

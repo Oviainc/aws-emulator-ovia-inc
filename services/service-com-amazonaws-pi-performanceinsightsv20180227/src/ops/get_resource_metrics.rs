@@ -12,11 +12,13 @@
 //! (`MetricQuery.GroupBy` / `MetricQuery.Filter`) is answered with the scaffold's
 //! 501, because there are no DB sessions to group or filter.
 //!
-//! Two further divergences are deliberate and documented rather than invented:
-//! authorization is not emulated (no IAM principals or policies exist here, so
-//! the modelled `NotAuthorizedException` is never the answer), and the
-//! documented 7-day-to-2-year `StartTime` retention bound is not enforced,
-//! because this emulator monitors no resource that has been retaining anything.
+//! A request that addresses no data source this account may see is refused with
+//! the modelled `NotAuthorizedException`, the uniform answer the real service
+//! gives for an absent, another account's or a wrong-`ServiceType` data source
+//! (see [`crate::state::is_data_source_identifier`]). One divergence is
+//! deliberate and documented rather than invented: the documented
+//! 7-day-to-2-year `StartTime` retention bound is not enforced, because this
+//! emulator monitors no resource that has been retaining anything.
 //!
 //! ## Shape of an operation
 //!
@@ -215,6 +217,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // Nothing about the data source is answered until the request is
+        // authorized for it: a caller reading metrics for a data source this
+        // account does not monitor gets the modelled refusal, not an
+        // authoritative-looking success with an empty series. The cross-member
+        // window check above runs FIRST, so a request whose values do not hold
+        // together is still answered as the argument error it is rather than
+        // disappearing behind this gate.
+        if !crate::state::is_data_source_identifier(&input.identifier) {
+            return Err(not_authorized());
+        }
+
         // Dimension-grouped or filtered metrics are computed from individual DB
         // sessions, which this emulator does not have. Answer them honestly
         // rather than returning the ungrouped series under a grouped key.
@@ -364,6 +377,15 @@ const PERIOD_CHOICE_MAX_POINTS: i64 = 200;
 fn invalid_argument(message: impl Into<String>) -> GetResourceMetricsError {
     GetResourceMetricsErrorModeled::InvalidArgumentException(InvalidArgumentException {
         message: Some(message.into()),
+    })
+    .into()
+}
+
+/// `NotAuthorizedException` (HTTP 400), the uniform refusal for a request that
+/// addresses a data source this account may not read.
+fn not_authorized() -> GetResourceMetricsError {
+    GetResourceMetricsErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(crate::state::NOT_AUTHORIZED_MESSAGE.to_string()),
     })
     .into()
 }

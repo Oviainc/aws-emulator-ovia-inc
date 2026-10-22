@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConnectors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConnectors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConnectors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +156,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConnectors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConnectorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConnectors"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListConnectorsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the pca-connector-ad state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `MaxResults` is modelled `range 1..1000` and the boundary validator has
+        // already refused anything outside it, so a value arriving here is in
+        // range; an absent one means "everything", which is that same modelled
+        // maximum. A value the validator cannot let through (zero or negative)
+        // falls back to the maximum rather than silently serving one-item pages.
+        let modelled_max = usize::try_from(crate::state::MAX_LIST_RESULTS).unwrap_or(usize::MAX);
+        let page_size =
+            usize::try_from(input.max_results.unwrap_or(crate::state::MAX_LIST_RESULTS))
+                .ok()
+                .filter(|&requested| requested > 0)
+                .unwrap_or(modelled_max);
+
+        let after = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_page_token(token).ok_or_else(|| {
+                ListConnectorsError::from(ListConnectorsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "NextToken is not a pagination token this service issued"
+                            .to_string(),
+                        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                    },
+                ))
+            })?,
+        };
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising the CREATING ->
+        // ACTIVE moves the clock already owed.
+        store.settle(::std::time::SystemTime::now());
+
+        let remaining = store.connectors_after(after);
+        let connectors: Vec<ConnectorSummary> = remaining
+            .iter()
+            .take(page_size)
+            .map(|record| ConnectorSummary {
+                arn: Some(record.arn.clone()),
+                certificate_authority_arn: Some(record.certificate_authority_arn.clone()),
+                certificate_enrollment_policy_server_endpoint: Some(
+                    record.certificate_enrollment_policy_server_endpoint.clone(),
+                ),
+                directory_id: Some(record.directory_id.clone()),
+                vpc_information: Some(record.vpc_information.clone()),
+                status: Some(record.status.clone()),
+                status_reason: record.status_reason.clone(),
+                created_at: Some(::aws_smithy_types::DateTime::from(record.created_at)),
+                updated_at: Some(::aws_smithy_types::DateTime::from(record.updated_at)),
+            })
+            .collect();
+
+        // A token only on a page that does not exhaust the store, so the last page
+        // carries none. The cursor is the `seq` of the last record served.
+        let next_token = if remaining.len() > page_size {
+            Some(crate::state::encode_page_token(remaining[page_size - 1].seq))
+        } else {
+            None
+        };
+
+        Ok(ListConnectorsOutput {
+            connectors: Some(connectors),
+            next_token,
+        })
     }
 }

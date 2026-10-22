@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSubnets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSubnets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSubnets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's subnets out of [`crate::state`]: the whole store by default, or
+//! the subset the request's `SubnetIds` and `Filters` select, one `MaxResults`-sized page
+//! at a time. A reporting operation only — it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +80,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::borrow::Cow;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -152,18 +149,313 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSubnets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSubnetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSubnets"))
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`DescribeSubnetsRequest$DryRun`). Every caller of this emulator is permitted,
+        // so a dry run reports that outcome and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+
+        // "The token returned from a previous paginated request"
+        // (`DescribeSubnetsRequest$NextToken`) — anything else is refused rather than read
+        // as an id, and it is refused before any other member is looked at, so whether a
+        // bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(crate::state::invalid_pagination_token)?,
+            ),
+        };
+
+        // A filter name this operation does not document is refused whether or not any
+        // subnet would have matched it, so an unsupported filter can never read as "no
+        // results". The documented alternative spellings are resolved to one name here, so
+        // the comparison below has a single case per attribute.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<(&str, &[String])> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                crate::state::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            selectors.push((canonical, filter.values.as_deref().unwrap_or_default()));
+        }
+
+        let store = state.lock();
+
+        // "The IDs of the subnets" (`DescribeSubnetsRequest$SubnetIds`): an id that names
+        // no subnet of the account is an error, not an absent row.
+        let requested: &[String] = input.subnet_ids.as_deref().unwrap_or_default();
+        if let Some(unknown) = requested
+            .iter()
+            .find(|id| !store.subnets.contains_key(id.as_str()))
+        {
+            return Err(crate::state::invalid_subnet_id_not_found(unknown));
+        }
+
+        // "Default: Describes all your subnets": `SubnetIds` narrows the store to the ids
+        // named, and every filter must then hold ("If you specify multiple filters, the
+        // filters are joined with an AND" — `Filter`).
+        let mut selected: Vec<&Subnet> = store
+            .subnets
+            .values()
+            .filter(|subnet| {
+                requested.is_empty()
+                    || requested
+                        .iter()
+                        .any(|id| subnet.subnet_id.as_deref() == Some(id.as_str()))
+            })
+            .filter(|subnet| matches_every_filter(subnet, &selectors))
+            .collect();
+
+        // Page in `SubnetId` order, which the cursor below names a position in. The store
+        // is an ordered map, so its iteration order already satisfies this sort; doing it
+        // here establishes the invariant the cursor depends on at the point of use rather
+        // than inheriting it from the container `crate::state` happens to hold.
+        selected.sort_by(|left, right| left.subnet_id.cmp(&right.subnet_id));
+
+        // That order is both the stable paging order and the cursor, so a token naming the
+        // id the next page starts at always advances.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected
+                .partition_point(|subnet| subnet.subnet_id.as_deref().unwrap_or_default() < cursor),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of items to return for this request"
+        // (`DescribeSubnetsRequest$MaxResults`). A request that names none gets the largest
+        // page the model publishes, so the `NextToken` path below behaves the same whether
+        // or not a page size was asked for. The model's `range 5..1000` has already refused
+        // anything outside it, so the only value that cannot convert is one the boundary
+        // validator would have rejected.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        // "This value is null when there are no more items to return"
+        // (`DescribeSubnetsResult$NextToken`): a token only when a subnet follows this
+        // page.
+        let next_token = page
+            .get(limit)
+            .and_then(|subnet| subnet.subnet_id.as_deref())
+            .map(crate::state::encode_page_token);
+
+        Ok(DescribeSubnetsOutput {
+            subnets: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|subnet| (*subnet).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The page size a request that names no `MaxResults` gets: the largest the model
+/// publishes (`DescribeSubnetsMaxResults`, `range 5..1000`), which is also the most EC2
+/// returns in one page.
+const DEFAULT_MAX_RESULTS: usize = 1000;
+
+/// The filter names this operation documents, from `DescribeSubnetsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeSubnetsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather
+/// than listed here. Every entry must be answered by [`filter_values`].
+const SUBNET_FILTERS: [&str; 24] = [
+    "availability-zone",
+    "availability-zone-id",
+    "available-ip-address-count",
+    "cidr-block",
+    "customer-owned-ipv4-pool",
+    "default-for-az",
+    "enable-dns64",
+    "enable-lni-at-device-index",
+    "ipv6-cidr-block-association.association-id",
+    "ipv6-cidr-block-association.ipv6-cidr-block",
+    "ipv6-cidr-block-association.state",
+    "ipv6-native",
+    "map-customer-owned-ip-on-launch",
+    "map-public-ip-on-launch",
+    "outpost-arn",
+    "owner-id",
+    "private-dns-name-options-on-launch.enable-resource-name-dns-a-record",
+    "private-dns-name-options-on-launch.enable-resource-name-dns-aaaa-record",
+    "private-dns-name-options-on-launch.hostname-type",
+    "state",
+    "subnet-arn",
+    "subnet-id",
+    "tag-key",
+    "vpc-id",
+];
+
+/// The alternative spellings this operation's `Filters` doc publishes beside the names in
+/// [`SUBNET_FILTERS`], as `(alternative, the name it means)`: "You can also use
+/// `availabilityZone` as the filter name", "You can also use `availabilityZoneId` as the
+/// filter name", "You can also use `cidr` or `cidrBlock` as the filter names" and "You can
+/// also use `defaultForAz` as the filter name".
+const SUBNET_FILTER_ALIASES: [(&str, &str); 5] = [
+    ("availabilityZone", "availability-zone"),
+    ("availabilityZoneId", "availability-zone-id"),
+    ("cidr", "cidr-block"),
+    ("cidrBlock", "cidr-block"),
+    ("defaultForAz", "default-for-az"),
+];
+
+/// The prefix of the tag filter: "Use the tag key in the filter name and the tag value as
+/// the filter value" (`DescribeSubnetsRequest$Filters`).
+const TAG_FILTER_PREFIX: &str = "tag:";
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None`
+/// when this operation documents no such filter.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact — and a
+/// `tag:` prefix with no key names no tag, so it is as undocumented as any other
+/// misspelling. The `tag:<key>` family keeps its whole name, the key being part of what it
+/// selects on.
+fn canonical_filter_name(name: &str) -> Option<&str> {
+    if name
+        .strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return Some(name);
+    }
+    if SUBNET_FILTERS.contains(&name) {
+        return Some(name);
+    }
+    SUBNET_FILTER_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == name)
+        .map(|(_, documented)| *documented)
+}
+
+/// A boolean attribute as a filter value compares against it: the wire rendering of the
+/// member, `true` or `false`. A member that is not set carries no value for the filter to
+/// match, like any other absent attribute.
+fn boolean_values(value: Option<bool>) -> Vec<Cow<'static, str>> {
+    value
+        .map(|set| Cow::Borrowed(if set { "true" } else { "false" }))
+        .into_iter()
+        .collect()
+}
+
+/// A numeric attribute as a filter value compares against it: its decimal rendering, which
+/// is how the wire carries it.
+fn integer_values(value: Option<i32>) -> Vec<Cow<'static, str>> {
+    value
+        .map(|number| Cow::Owned(number.to_string()))
+        .into_iter()
+        .collect()
+}
+
+/// The values the EC2 filter `name` compares against this subnet.
+///
+/// A filter naming an attribute this subnet does not carry compares against NO values, so
+/// it selects nothing — the same answer AWS gives for, say, `outpost-arn` on a subnet that
+/// is not on an Outpost. `name` is a name [`canonical_filter_name`] resolved.
+fn filter_values<'a>(subnet: &'a Subnet, name: &str) -> Vec<Cow<'a, str>> {
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return subnet
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let ipv6_associations = || subnet.ipv6_cidr_block_association_set.iter().flatten();
+    let private_dns_options = || subnet.private_dns_name_options_on_launch.as_ref();
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "availability-zone" => text(subnet.availability_zone.as_deref()),
+        "availability-zone-id" => text(subnet.availability_zone_id.as_deref()),
+        "available-ip-address-count" => integer_values(subnet.available_ip_address_count),
+        "cidr-block" => text(subnet.cidr_block.as_deref()),
+        "customer-owned-ipv4-pool" => text(subnet.customer_owned_ipv4_pool.as_deref()),
+        "default-for-az" => boolean_values(subnet.default_for_az),
+        "enable-dns64" => boolean_values(subnet.enable_dns64),
+        "enable-lni-at-device-index" => integer_values(subnet.enable_lni_at_device_index),
+        "ipv6-cidr-block-association.association-id" => ipv6_associations()
+            .filter_map(|association| association.association_id.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "ipv6-cidr-block-association.ipv6-cidr-block" => ipv6_associations()
+            .filter_map(|association| association.ipv6_cidr_block.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "ipv6-cidr-block-association.state" => ipv6_associations()
+            .filter_map(|association| {
+                association
+                    .ipv6_cidr_block_state
+                    .as_ref()
+                    .and_then(|block| block.state.as_deref())
+                    .map(Cow::Borrowed)
+            })
+            .collect(),
+        "ipv6-native" => boolean_values(subnet.ipv6_native),
+        "map-customer-owned-ip-on-launch" => {
+            boolean_values(subnet.map_customer_owned_ip_on_launch)
+        }
+        "map-public-ip-on-launch" => boolean_values(subnet.map_public_ip_on_launch),
+        "outpost-arn" => text(subnet.outpost_arn.as_deref()),
+        "owner-id" => text(subnet.owner_id.as_deref()),
+        "private-dns-name-options-on-launch.enable-resource-name-dns-a-record" => boolean_values(
+            private_dns_options().and_then(|options| options.enable_resource_name_dns_a_record),
+        ),
+        "private-dns-name-options-on-launch.enable-resource-name-dns-aaaa-record" => {
+            boolean_values(
+                private_dns_options()
+                    .and_then(|options| options.enable_resource_name_dns_aaaa_record),
+            )
+        }
+        "private-dns-name-options-on-launch.hostname-type" => {
+            text(private_dns_options().and_then(|options| options.hostname_type.as_deref()))
+        }
+        "state" => text(subnet.state.as_deref()),
+        "subnet-arn" => text(subnet.subnet_arn.as_deref()),
+        "subnet-id" => text(subnet.subnet_id.as_deref()),
+        "tag-key" => subnet
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "vpc-id" => text(subnet.vpc_id.as_deref()),
+        // Unreachable: `canonical_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even
+        // if that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// Does `subnet` satisfy every filter?
+///
+/// "If you specify multiple filters, the filters are joined with an AND" (`Filter`), and
+/// within one filter "if you specify multiple values for a filter, the values are joined
+/// with an OR" (`Filter$Values`) — each value matched case-sensitively, with EC2's own
+/// `*`/`?` wildcards, by [`crate::state::filter_value_matches`]. So a filter carrying no
+/// value at all matches nothing, there being no value for the attribute to match.
+fn matches_every_filter(subnet: &Subnet, selectors: &[(&str, &[String])]) -> bool {
+    selectors.iter().all(|(name, wanted_values)| {
+        let held = filter_values(subnet, name);
+        wanted_values.iter().any(|wanted| {
+            held.iter()
+                .any(|value| crate::state::filter_value_matches(wanted, value))
+        })
+    })
 }

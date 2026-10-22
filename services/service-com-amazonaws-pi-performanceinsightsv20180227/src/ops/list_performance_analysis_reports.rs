@@ -5,10 +5,10 @@
 //! start time of each report as this operation documents, computing every summary
 //! from the store.
 //!
-//! Authorization is NOT emulated here: the emulator holds no IAM principals or
-//! policies, so the modelled `NotAuthorizedException` is never the answer and a
-//! well-formed request for a resource is served. That is a deliberate,
-//! documented divergence, not a permission decision.
+//! A request that addresses no data source this account may see is refused with
+//! the modelled `NotAuthorizedException` (HTTP 400) rather than answered with a
+//! valid, empty listing — "no access" and "no reports" are different answers
+//! (see [`crate::state::is_data_source_identifier`]).
 //!
 //! ## Shape of an operation
 //!
@@ -173,6 +173,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
+        // The listing is scoped to one data source, so authorization for it is
+        // decided first: a cursor could never have been handed out for a data
+        // source this account may not see.
+        if !crate::state::is_data_source_identifier(&input.identifier) {
+            return Err(not_authorized());
+        }
+
         // A cursor is only valid for the result set it was handed out for, which
         // for this operation is one monitored resource.
         let scope = format!("{}|{}", input.service_type, input.identifier);
@@ -240,4 +247,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
         })
     }
+}
+
+/// `NotAuthorizedException` (HTTP 400), the uniform refusal for a listing of a
+/// data source this account may not see.
+fn not_authorized() -> ListPerformanceAnalysisReportsError {
+    ListPerformanceAnalysisReportsErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(crate::state::NOT_AUTHORIZED_MESSAGE.to_string()),
+    })
+    .into()
 }

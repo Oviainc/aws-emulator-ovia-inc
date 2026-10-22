@@ -16,6 +16,11 @@
 //! is named by the (template, account) pair, so it is held on the template record and its
 //! count is derived from that map.
 //!
+//! An experiment carries one more derived record: the RESOLVED TARGETS its targets
+//! resolved to when it was started ([`resolve_targets`]), enumerated by
+//! `ListExperimentResolvedTargets`. It is computed once, at start, and held on the
+//! experiment record, so every read of it reports the resolution that start computed.
+//!
 //! Besides those caller-owned records it holds the service's own data: the built-in FIS
 //! ACTION catalog ([`ACTION_CATALOG`]), which `GetAction` reports from. No API creates,
 //! updates or deletes an action, so that catalog is a constant table rather than a map a
@@ -27,7 +32,7 @@
 //! due is stored on the record and materialised by [`ExperimentRecord::settle`], so no
 //! handler ever sleeps and a read never invents a status the clock did not already owe.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -55,7 +60,8 @@ use crate::ops::types::{
     ExperimentTemplateS3LogConfigurationInput, ExperimentTemplateStopCondition,
     ExperimentTemplateSummary, ExperimentTemplateTarget, ExperimentTemplateTargetFilter,
     ExperimentTemplateTargetInputFilter, ReportConfigurationCloudWatchDashboardInput,
-    ReportConfigurationS3Output, ReportConfigurationS3OutputInput, ResourceNotFoundException,
+    ReportConfigurationS3Output, ReportConfigurationS3OutputInput, ResolvedTarget,
+    ResourceNotFoundException,
     ServiceQuotaExceededException, TargetAccountConfiguration, TargetAccountConfigurationSummary,
     ValidationException,
     ACCOUNT_TARGETING_VALUES, ACTIONS_MODE_VALUES, EMPTY_TARGET_RESOLUTION_MODE_VALUES,
@@ -128,6 +134,25 @@ pub const MAX_EXPERIMENTS: usize = 1_000;
 /// request would ADD a configuration.
 pub const MAX_TARGET_ACCOUNT_CONFIGURATIONS: usize = 1_000;
 
+/// `ResourceArnList`'s published ceiling (`@length(min: 0, max: 5)`) — the most resources
+/// ONE target of an experiment template may name.
+///
+/// The boundary validator refuses a longer `resourceArns` before any handler runs, so
+/// this is the bound on the per-target work [`resolve_targets`] does. It is named here
+/// because that bound is what makes the resolution of one target constant-sized.
+pub const MAX_TARGET_RESOURCE_ARNS: usize = 5;
+
+/// How many resolved targets ONE experiment's resolution holds.
+///
+/// The ceiling [`resolve_targets`] resolves up to: an experiment resolves the first
+/// [`MAX_RESOLVED_TARGETS`] resources its targets identify, so neither the work that
+/// resolution costs nor the records it leaves in the store grows with how many targets a
+/// request put on a template (the model bounds the resources ONE target names, see
+/// [`MAX_TARGET_RESOURCE_ARNS`], but not how many targets a template carries). The
+/// emulator's OWN bound, like [`MAX_EXPERIMENT_TEMPLATES`], and far above any workflow an
+/// emulator serves.
+pub const MAX_RESOLVED_TARGETS: usize = 1_000;
+
 /// `TargetAccountId`'s modelled bounds (`@length(min: 12, max: 48)`) — the floor.
 ///
 /// The boundary validator applies them to a modelled `accountId` member; they are named
@@ -165,6 +190,44 @@ pub const DEFAULT_EMPTY_TARGET_RESOLUTION_MODE: &str = "fail";
 /// The value FIS applies to `actionsMode` when `StartExperiment` names none: the
 /// experiment runs all of its actions (`ActionsMode` is modelled `run-all | skip-all`).
 pub const DEFAULT_ACTIONS_MODE: &str = "run-all";
+
+/// The `selectionMode` that keeps every identified resource, which FIS documents as the
+/// default: "ALL - Run the action on all identified targets. This is the default."
+///
+/// `SelectionMode` is modelled as a plain string, so the three forms FIS documents
+/// (`ALL`, `COUNT(n)`, `PERCENT(n)`) are spelled out here and read by
+/// [`selection_count`].
+pub const SELECTION_MODE_ALL: &str = "ALL";
+
+/// The `selectionMode` form that keeps a fixed NUMBER of the identified resources:
+/// "COUNT(n) - Run the action on the specified number of targets … For example, COUNT(1)
+/// selects one of the targets."
+pub const SELECTION_MODE_COUNT_PREFIX: &str = "COUNT(";
+
+/// The `selectionMode` form that keeps a PERCENTAGE of the identified resources:
+/// "PERCENT(n) - Run the action on the specified percentage of targets … For example,
+/// PERCENT(25) selects 25% of the targets."
+pub const SELECTION_MODE_PERCENT_PREFIX: &str = "PERCENT(";
+
+/// The `ResolvedTarget$targetInformation` key the resolved resource's ARN is reported
+/// under.
+///
+/// `TargetInformationMap` is modelled as a free `string -> string` map ("Information about
+/// the target") with no documented catalog of keys, and the only thing this emulator KNOWS
+/// about a resolved resource is the ARN its target named — so that ARN is what it reports,
+/// under this key. Within `TargetInformationKey`'s modelled `@length(0..64)` and
+/// `^[\S]+$`.
+pub const TARGET_INFORMATION_ARN_KEY: &str = "arn";
+
+/// The marker every `nextToken` `ListExperimentResolvedTargets` issues starts with.
+///
+/// A resolved target is not named by an id this service mints — it is one entry of an
+/// experiment's resolution, so what a page resumes at is its POSITION in that
+/// resolution. The token carries that position behind this marker, which makes it
+/// self-describing: a value this operation never issued carries no marker and is refused
+/// as a `ValidationException` instead of being read as a resume point (the same shape as
+/// [`TARGET_ACCOUNT_PAGE_TOKEN_PREFIX`]).
+pub const RESOLVED_TARGET_PAGE_TOKEN_PREFIX: &str = "resolvedTarget.";
 
 /// The two sources a stop condition may name.
 ///
@@ -494,6 +557,14 @@ pub struct ExperimentRecord {
     pub reason: Option<String>,
     /// Copied from the template, as `ExperimentTarget`s.
     pub targets: HashMap<String, ExperimentTarget>,
+    /// What those targets RESOLVED to when this experiment was started, in the order
+    /// `ListExperimentResolvedTargets` reports them.
+    ///
+    /// A SNAPSHOT, computed once by [`resolve_targets`] at start time: FIS resolves an
+    /// experiment's targets when the experiment starts, so the resolution a read reports
+    /// is the one the start computed, however often it is read and whatever happens to
+    /// the template afterwards.
+    pub resolved_targets: Vec<ResolvedTarget>,
     /// Copied from the template, as `ExperimentAction`s.
     pub actions: HashMap<String, ExperimentAction>,
     /// Copied from the template, as `ExperimentStopCondition`s.
@@ -530,6 +601,13 @@ impl ExperimentRecord {
         tags: Option<HashMap<String, String>>,
         now: SystemTime,
     ) -> Self {
+        let targets: HashMap<String, ExperimentTarget> = template
+            .targets
+            .iter()
+            .map(|(name, target)| (name.clone(), experiment_target(target)))
+            .collect();
+        // Resolution happens ONCE, here, where the experiment is started.
+        let resolved_targets = resolve_targets(&targets);
         Self {
             id,
             arn,
@@ -539,11 +617,8 @@ impl ExperimentRecord {
             // `running`.
             status: ExperimentStatus::Initiating,
             reason: None,
-            targets: template
-                .targets
-                .iter()
-                .map(|(name, target)| (name.clone(), experiment_target(target)))
-                .collect(),
+            targets,
+            resolved_targets,
             actions: template
                 .actions
                 .iter()
@@ -826,6 +901,119 @@ pub fn target_account_page_token_account(token: &str) -> Option<&str> {
     ((TARGET_ACCOUNT_ID_FLOOR..=TARGET_ACCOUNT_ID_CEILING).contains(&length)
         && !account_id.chars().any(char::is_whitespace))
     .then_some(account_id)
+}
+
+/// The `nextToken` a page of `ListExperimentResolvedTargets` hands back when resolved
+/// targets remain: the marker of [`RESOLVED_TARGET_PAGE_TOKEN_PREFIX`] followed by the
+/// POSITION in the experiment's resolution the next page resumes at.
+///
+/// `NextToken` is modelled `@length(min: 1, max: 1024)`, `pattern ^[\S]+$`: the marker
+/// carries no whitespace, a decimal position carries none either, and the two together
+/// are far under the ceiling.
+pub fn resolved_target_page_token(index: usize) -> String {
+    format!("{RESOLVED_TARGET_PAGE_TOKEN_PREFIX}{index}")
+}
+
+/// The position the page token `token` resumes at, or `None` when `token` is not one
+/// [`resolved_target_page_token`] could have issued — the marker followed by a decimal
+/// position.
+pub fn resolved_target_page_token_index(token: &str) -> Option<usize> {
+    let index = token.strip_prefix(RESOLVED_TARGET_PAGE_TOKEN_PREFIX)?;
+    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    index.parse().ok()
+}
+
+/// What `targets` RESOLVE to: one `ResolvedTarget` per resource a target identifies,
+/// scoped by that target's `selectionMode`.
+///
+/// The resources a target identifies are the ones it NAMES (`resourceArns`), each named
+/// resource resolving once however often the target lists it. A target that identifies
+/// its resources by `resourceTags` instead describes resources of OTHER services, which
+/// this emulator does not hold and therefore cannot resolve — it identifies nothing here,
+/// and nothing is reported for it rather than a resource being invented for it.
+///
+/// The order is a stable total order — targets by name, and within one target the order
+/// it named its resources — which is what [`resolved_target_page_token`] indexes into.
+///
+/// The work is linear and bounded: de-duplication goes through a set, one target names at
+/// most [`MAX_TARGET_RESOURCE_ARNS`] resources (the model's own ceiling, refused at the
+/// boundary), and the resolution stops at [`MAX_RESOLVED_TARGETS`].
+pub fn resolve_targets(targets: &HashMap<String, ExperimentTarget>) -> Vec<ResolvedTarget> {
+    let mut by_name: Vec<(&String, &ExperimentTarget)> = targets.iter().collect();
+    by_name.sort_by_key(|(name, _)| *name);
+    let mut resolved = Vec::new();
+    for (name, target) in by_name {
+        // [`MAX_RESOLVED_TARGETS`] is the emulator's own ceiling on one experiment's
+        // resolution: the work this function does, and the records it hands to the store,
+        // are bounded by it rather than by how long a list a request carried.
+        if resolved.len() >= MAX_RESOLVED_TARGETS {
+            break;
+        }
+        // One resource per ARN: an ARN a target repeats names the resource it already
+        // identified. Membership goes through a SET, so de-duplicating a target's list
+        // costs time linear in its length rather than quadratic.
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut identified: Vec<&String> = Vec::new();
+        for arn in target.resource_arns.iter().flatten() {
+            if seen.insert(arn.as_str()) {
+                identified.push(arn);
+            }
+        }
+        let keep = selection_count(target.selection_mode.as_deref(), identified.len())
+            .min(MAX_RESOLVED_TARGETS - resolved.len());
+        for arn in identified.into_iter().take(keep) {
+            resolved.push(ResolvedTarget {
+                resource_type: target.resource_type.clone(),
+                target_name: Some(name.clone()),
+                target_information: Some(HashMap::from([(
+                    TARGET_INFORMATION_ARN_KEY.to_string(),
+                    arn.clone(),
+                )])),
+            });
+        }
+    }
+    resolved
+}
+
+/// How many of the `identified` resources a target's `selectionMode` keeps.
+///
+/// FIS documents three forms: `ALL` ("Run the action on all identified targets. This is
+/// the default"), `COUNT(n)` ("the specified number of targets") and `PERCENT(n)` ("the
+/// specified percentage of targets"). A count or a percentage asking for more than the
+/// target identified keeps what it identified.
+///
+/// Two choices this emulator makes, where FIS documents no rule: a percentage that does
+/// not reach a whole resource is taken DOWN (`PERCENT(25)` of two resources keeps none,
+/// of four keeps one), and a value in none of the three documented forms is read as the
+/// documented default, `ALL`, rather than scoping anything away. FIS picks the kept
+/// resources "at random"; this emulator keeps the first ones in the order the target
+/// named them, which satisfies the documented count and makes a resolution reproducible.
+pub fn selection_count(selection_mode: Option<&str>, identified: usize) -> usize {
+    let Some(mode) = selection_mode.map(str::trim) else {
+        return identified;
+    };
+    if mode == SELECTION_MODE_ALL {
+        return identified;
+    }
+    if let Some(count) = selection_argument(mode, SELECTION_MODE_COUNT_PREFIX) {
+        return identified.min(count);
+    }
+    if let Some(percent) = selection_argument(mode, SELECTION_MODE_PERCENT_PREFIX) {
+        return identified.saturating_mul(percent.min(100)) / 100;
+    }
+    // `ALL`, and anything the create accepted that is in none of the documented forms:
+    // the default scopes nothing away. No panic and no refusal here — `selectionMode` is
+    // modelled as a plain string, so a value outside the documented forms reaches the
+    // store, and reporting every identified resource for it is the documented default.
+    identified
+}
+
+/// The `n` of a `selectionMode` of the form `<prefix>n)`, or `None` when `mode` is not of
+/// that form. The documented forms are upper-case, so the match is case-sensitive.
+fn selection_argument(mode: &str, prefix: &str) -> Option<usize> {
+    mode.strip_prefix(prefix)?.strip_suffix(')')?.trim().parse().ok()
 }
 
 /// The ARN of the experiment template `id` names, in `region`.

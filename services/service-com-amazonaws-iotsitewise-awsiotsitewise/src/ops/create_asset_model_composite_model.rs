@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAssetModelCompositeModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAssetModelCompositeModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAssetModelCompositeModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one custom composite model on an asset model and persists it on that
+//! model's stored record, so every reader of the model reports it.
 //!
 //! ## Shape of an operation
 //!
@@ -154,6 +148,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How many ids the handler draws before giving up on minting a free
+/// `assetModelCompositeModelId`.
+///
+/// `state::new_id()` seeds every id with a mint counter, the clock and the
+/// process id, so a collision with a stored composite model is a practical
+/// impossibility; the bound is here so a caller cannot make this draw spin
+/// however much state it has created. Exhausting it is an internal failure, not
+/// a bad request.
+const MINT_ATTEMPTS: usize = 8;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -229,18 +233,314 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAssetModelCompositeModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAssetModelCompositeModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAssetModelCompositeModel"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_failure)?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // The target asset model is resolved FIRST: a request that names no stored
+        // asset model is a 404, whatever else is wrong with it. Every id member
+        // here is a `CustomID` label: a raw UUID or `externalId:<id>`.
+        let asset_model_id = store
+            .resolve_asset_model_id(&input.asset_model_id)
+            .ok_or_else(|| model_not_found(&input.asset_model_id))?;
+
+        // `assetModelCompositeModelType` is modelled as a free `Name` string, so the
+        // catalog its documentation states is enforced here.
+        let composite_type = input.asset_model_composite_model_type.clone();
+        if !crate::state::COMPOSITE_MODEL_TYPES.contains(&composite_type.as_str()) {
+            return Err(invalid_request(format!(
+                "The composite model type {composite_type} is not one of {}.",
+                crate::state::COMPOSITE_MODEL_TYPES.join(", ")
+            )));
+        }
+
+        let definitions = input
+            .asset_model_composite_model_properties
+            .as_deref()
+            .unwrap_or(&[]);
+        // The two kinds of custom composite model this operation documents:
+        // component-model-based (it names `composedAssetModelId` and has no
+        // properties of its own) or inline (it carries its own property
+        // definitions and names no composed model). Never both.
+        if input.composed_asset_model_id.is_some() && !definitions.is_empty() {
+            return Err(invalid_request(
+                "A component-model-based composite model names composedAssetModelId and has no \
+                 properties of its own; an inline one carries \
+                 assetModelCompositeModelProperties and no composedAssetModelId."
+                    .to_string(),
+            ));
+        }
+        if definitions.len() > crate::state::MAX_PROPERTIES_PER_COMPOSITE_MODEL {
+            return Err(limit_exceeded(format!(
+                "A composite model carries at most {} properties, but {} were specified.",
+                crate::state::MAX_PROPERTIES_PER_COMPOSITE_MODEL,
+                definitions.len()
+            )));
+        }
+
+        // A component-model-based composite model reuses an existing asset model,
+        // and only one of type COMPONENT_MODEL can be reused.
+        let composed_asset_model_id = match input.composed_asset_model_id.as_deref() {
+            Some(label) => {
+                let composed = store
+                    .resolve_asset_model_id(label)
+                    .ok_or_else(|| model_not_found(label))?;
+                let composed_type = store
+                    .asset_models
+                    .get(&composed)
+                    .map(|model| model.model_type.clone())
+                    .ok_or_else(|| model_not_found(label))?;
+                if composed_type != crate::state::MODEL_TYPE_COMPONENT {
+                    return Err(invalid_request(format!(
+                        "The asset model {label} has type {composed_type}; a \
+                         component-model-based composite model can only reuse an asset model of \
+                         type {}.",
+                        crate::state::MODEL_TYPE_COMPONENT
+                    )));
+                }
+                Some(composed)
+            }
+            None => None,
+        };
+
+        // A caller-supplied composite model id has to be globally unique, so the
+        // check spans every stored asset model, not just this one.
+        if let Some(requested) = input.asset_model_composite_model_id.as_deref() {
+            if store.composite_model_id_taken(requested) {
+                return Err(already_exists(
+                    &region,
+                    &asset_model_id,
+                    format!("The composite model {requested} already exists."),
+                ));
+            }
+        }
+
+        let record = store
+            .asset_models
+            .get(&asset_model_id)
+            .ok_or_else(|| model_not_found(&input.asset_model_id))?;
+
+        // The target version the `If-Match` / `If-None-Match` preconditions are
+        // evaluated against. `matchForVersionType` targets the modelled
+        // `AssetModelVersionType` enum (`LATEST | ACTIVE`), so only those two
+        // values reach here and LATEST is the documented default. This emulator
+        // keeps ONE version of an asset model, so its latest version is always
+        // there and its ACTIVE version exists only once the transition the clock
+        // owes has fallen due.
+        let version_type = input.match_for_version_type.as_deref().unwrap_or("LATEST");
+        let target_exists =
+            version_type != "ACTIVE" || record.state(now) == crate::state::STATE_ACTIVE;
+        let target_etag = crate::state::asset_model_etag(record);
+        if let Some(expected) = input.if_match.as_deref() {
+            if !target_exists || expected != target_etag {
+                return Err(precondition_failed(
+                    &region,
+                    &asset_model_id,
+                    format!(
+                        "The If-Match precondition failed: the {version_type} version of asset \
+                         model {asset_model_id} does not have entity tag {expected}."
+                    ),
+                ));
+            }
+        }
+        // `ifNoneMatch` is modelled as `SelectAll` with the pattern `^\*$`, so `*`
+        // is the only value that reaches here; it asks that the target version NOT
+        // exist.
+        if input.if_none_match.as_deref() == Some("*") && target_exists {
+            return Err(precondition_failed(
+                &region,
+                &asset_model_id,
+                format!(
+                    "The If-None-Match precondition failed: asset model {asset_model_id} already \
+                     has a {version_type} version."
+                ),
+            ));
+        }
+
+        // A nested composite model's parent has to be a composite model of THIS
+        // asset model.
+        let parent_id = match input.parent_asset_model_composite_model_id.as_deref() {
+            Some(label) => Some(
+                record
+                    .resolve_composite_model_id(label)
+                    .ok_or_else(|| composite_not_found(label))?,
+            ),
+            None => None,
+        };
+
+        // `assetModelCompositeModelExternalId` names the composite model within its
+        // asset model, so it has to be free there.
+        if let Some(external) = input.asset_model_composite_model_external_id.as_deref() {
+            if record
+                .resolve_composite_model_id(&format!(
+                    "{}{external}",
+                    crate::state::EXTERNAL_ID_PREFIX
+                ))
+                .is_some()
+            {
+                return Err(already_exists(
+                    &region,
+                    &asset_model_id,
+                    format!(
+                        "The asset model {asset_model_id} already has a composite model with \
+                         external id {external}."
+                    ),
+                ));
+            }
+        }
+
+        // The per-model list is bounded: a create is the only thing that adds a
+        // composite model and nothing evicts one.
+        if record.composite_models.len() >= crate::state::MAX_COMPOSITE_MODELS_PER_ASSET_MODEL {
+            return Err(limit_exceeded(format!(
+                "This emulator holds at most {} composite models per asset model.",
+                crate::state::MAX_COMPOSITE_MODELS_PER_ASSET_MODEL
+            )));
+        }
+
+        // A supplied id was checked for collisions above; a minted one is drawn
+        // until it collides with nothing stored, with a bounded number of draws so
+        // no request can spin here.
+        let composite_model_id = match input.asset_model_composite_model_id.clone() {
+            Some(requested) => requested,
+            None => {
+                let mut minted = None;
+                for _ in 0..MINT_ATTEMPTS {
+                    let candidate = crate::state::new_id();
+                    if !store.composite_model_id_taken(&candidate) {
+                        minted = Some(candidate);
+                        break;
+                    }
+                }
+                minted.ok_or_else(internal_failure)?
+            }
+        };
+
+        // A component-model-based composite model has no properties of its own: the
+        // component model it reuses provides them, and
+        // `DescribeAssetModelCompositeModel` reads them from there.
+        let properties = if composed_asset_model_id.is_some() {
+            None
+        } else {
+            Some(
+                crate::state::property_definitions_to_properties(definitions)
+                    .map_err(invalid_request)?,
+            )
+        };
+
+        let record = store
+            .asset_models
+            .get_mut(&asset_model_id)
+            .ok_or_else(internal_failure)?;
+        record.composite_models.push(AssetModelCompositeModel {
+            id: Some(composite_model_id.clone()),
+            external_id: input.asset_model_composite_model_external_id.clone(),
+            name: input.asset_model_composite_model_name.clone(),
+            description: input.asset_model_composite_model_description.clone(),
+            r#type: composite_type,
+            properties,
+        });
+        if parent_id.is_some() || composed_asset_model_id.is_some() {
+            record.composite_model_links.insert(
+                composite_model_id.clone(),
+                crate::state::CompositeModelLink {
+                    parent_id,
+                    composed_asset_model_id,
+                },
+            );
+        }
+        // The asset model's definition changed, so it carries a new version and
+        // owes a transition back to ACTIVE — the rule every mutating call on a
+        // record follows, kept on the record itself.
+        record.begin_update(now);
+
+        Ok(CreateAssetModelCompositeModelOutput {
+            asset_model_composite_model_id: composite_model_id.clone(),
+            asset_model_composite_model_path: record.composite_model_path(&composite_model_id),
+            asset_model_status: record.status(now),
+            asset_model_id: Some(asset_model_id),
+        })
     }
+}
+
+/// HTTP 500 `InternalFailureException`: this service's store is not reachable.
+fn internal_failure() -> CreateAssetModelCompositeModelError {
+    CreateAssetModelCompositeModelErrorModeled::InternalFailureException(InternalFailureException {
+        message: "the IoT SiteWise store is unavailable".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> CreateAssetModelCompositeModelError {
+    CreateAssetModelCompositeModelErrorModeled::InvalidRequestException(InvalidRequestException {
+        message,
+    })
+    .into()
+}
+
+/// HTTP 410 `LimitExceededException` carrying `message`.
+fn limit_exceeded(message: String) -> CreateAssetModelCompositeModelError {
+    CreateAssetModelCompositeModelErrorModeled::LimitExceededException(LimitExceededException {
+        message,
+    })
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the asset model label that
+/// resolved to nothing.
+fn model_not_found(label: &str) -> CreateAssetModelCompositeModelError {
+    CreateAssetModelCompositeModelErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: format!("The asset model {label} could not be found."),
+        },
+    )
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the composite model label that
+/// resolved to nothing on this asset model.
+fn composite_not_found(label: &str) -> CreateAssetModelCompositeModelError {
+    CreateAssetModelCompositeModelErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: format!("The composite model {label} could not be found."),
+        },
+    )
+    .into()
+}
+
+/// HTTP 409 `ResourceAlreadyExistsException` naming the asset model the create
+/// targeted.
+fn already_exists(
+    region: &str,
+    asset_model_id: &str,
+    message: String,
+) -> CreateAssetModelCompositeModelError {
+    CreateAssetModelCompositeModelErrorModeled::ResourceAlreadyExistsException(
+        ResourceAlreadyExistsException {
+            message,
+            resource_id: asset_model_id.to_string(),
+            resource_arn: crate::state::asset_model_arn(region, asset_model_id),
+        },
+    )
+    .into()
+}
+
+/// HTTP 412 `PreconditionFailedException`: an `If-Match` / `If-None-Match`
+/// precondition on the asset model evaluated to FALSE.
+fn precondition_failed(
+    region: &str,
+    asset_model_id: &str,
+    message: String,
+) -> CreateAssetModelCompositeModelError {
+    CreateAssetModelCompositeModelErrorModeled::PreconditionFailedException(
+        PreconditionFailedException {
+            message,
+            resource_id: asset_model_id.to_string(),
+            resource_arn: crate::state::asset_model_arn(region, asset_model_id),
+        },
+    )
+    .into()
 }
