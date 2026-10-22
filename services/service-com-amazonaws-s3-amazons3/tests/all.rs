@@ -23,6 +23,8 @@ mod bucket_ownership_controls;
 mod bucket_policy_and_tagging;
 #[path = "all/bucket_policy_put_status.rs"]
 mod bucket_policy_put_status;
+#[path = "all/bucket_public_access_block.rs"]
+mod bucket_public_access_block;
 #[path = "all/bucket_tagging.rs"]
 mod bucket_tagging;
 #[path = "all/bucket_versioning.rs"]

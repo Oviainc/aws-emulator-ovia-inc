@@ -431,6 +431,29 @@ pub struct BucketVersioning {
     pub mfa_delete: Option<String>,
 }
 
+/// The Block Public Access settings a bucket carries once `PutPublicAccessBlock` has set
+/// a `PublicAccessBlockConfiguration` on it.
+///
+/// Four INDEPENDENT switches, not an `Option` each: every member of
+/// `PublicAccessBlockConfiguration` is a `Setting` (a boolean) documented as "Specifies
+/// whether Amazon S3 should block …  Setting this element to TRUE causes …"
+/// (`smithy_query(query="shape",shape="PublicAccessBlockConfiguration")`), so a switch the
+/// configuration does not turn on is off — there is no third state for a member to be in.
+/// A bucket that has never had the subresource set carries NO value of this at all, which
+/// is why [`Bucket::public_access_block`] is an `Option` of it: the same distinction
+/// [`BucketVersioning`] keeps between "never configured" and "configured off".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BucketPublicAccessBlock {
+    /// Whether S3 blocks public ACLs for the bucket and its objects.
+    pub block_public_acls: bool,
+    /// Whether S3 ignores public ACLs on the bucket and its objects.
+    pub ignore_public_acls: bool,
+    /// Whether S3 blocks public bucket policies for the bucket.
+    pub block_public_policy: bool,
+    /// Whether S3 restricts access to the bucket when it has a public policy.
+    pub restrict_public_buckets: bool,
+}
+
 /// Every value the `Event` enum publishes: the bucket events a notification configuration
 /// may ask to be notified about, and so the only values one may name.
 ///
@@ -845,6 +868,13 @@ pub struct Bucket {
     /// while the bucket has no versioning state — the state a bucket is created in, and
     /// what makes `GetBucketVersioning` report no `Status` until a put sets one.
     pub versioning: Option<BucketVersioning>,
+    /// The Block Public Access settings `PutPublicAccessBlock` last set on the bucket, or
+    /// `None` while no `PublicAccessBlockConfiguration` is associated with it — the state a
+    /// bucket is created in, and what makes `GetPublicAccessBlock` answer
+    /// [`NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION_CODE`] until a put sets one.
+    ///
+    /// Private, like `tags`, so the accessor trio below is the only way in or out.
+    public_access_block: Option<BucketPublicAccessBlock>,
     /// The bucket's tag set, in the order the tagging request carried it.
     ///
     /// Private, and empty when no tag set is associated with the bucket: "no tags" and
@@ -956,6 +986,34 @@ impl Bucket {
         self.versioning
             .as_ref()
             .is_some_and(|versioning| versioning.status == VERSIONING_ENABLED_STATUS)
+    }
+
+    /// The bucket's Block Public Access settings, or `None` when no
+    /// `PublicAccessBlockConfiguration` is associated with the bucket.
+    pub fn public_access_block(&self) -> Option<BucketPublicAccessBlock> {
+        self.public_access_block
+    }
+
+    /// Associate `configuration` with the bucket as its whole Block Public Access
+    /// configuration.
+    ///
+    /// A replacement, not a merge: `PutPublicAccessBlock` "creates or modifies the
+    /// PublicAccessBlock configuration for an Amazon S3 bucket" (that operation's own
+    /// documentation) from the complete `PublicAccessBlockConfiguration` it carries as its
+    /// payload, so what the request names becomes the bucket's configuration in full — the
+    /// way [`Bucket::set_ownership_controls`] replaces the ownership controls.
+    pub fn set_public_access_block(&mut self, configuration: BucketPublicAccessBlock) {
+        self.public_access_block = Some(configuration);
+    }
+
+    /// Remove the bucket's Block Public Access configuration, leaving none associated with
+    /// it, and report whether the bucket carried one.
+    ///
+    /// What `DeletePublicAccessBlock` does — "Removes the PublicAccessBlock configuration
+    /// for an Amazon S3 bucket" — which puts the bucket back in the state it was created
+    /// in, so a later `GetPublicAccessBlock` reports no configuration again.
+    pub fn clear_public_access_block(&mut self) -> bool {
+        self.public_access_block.take().is_some()
     }
 
     /// Remove the bucket's tag set, leaving no tags associated with it.
@@ -1690,10 +1748,11 @@ impl ComAmazonawsS3Amazons3State {
                 // The creation instant is read here, where the bucket comes into being,
                 // so `CreationDate` is the moment the store accepted it.
                 created_at: Some(SystemTime::now()),
-                // A fresh bucket carries no policy, no tags and no ownership controls, and
-                // holds no objects; `PutBucketPolicy`, `PutBucketTagging` and
-                // `PutBucketOwnershipControls` are what associate those subresources with
-                // it and `PutObject` what puts an object in it.
+                // A fresh bucket carries no policy, no tags, no ownership controls and no
+                // Block Public Access configuration, and holds no objects;
+                // `PutBucketPolicy`, `PutBucketTagging`, `PutBucketOwnershipControls` and
+                // `PutPublicAccessBlock` are what associate those subresources with it and
+                // `PutObject` what puts an object in it.
                 ..Bucket::default()
             },
         );
@@ -1784,6 +1843,16 @@ pub const OWNERSHIP_CONTROLS_NOT_FOUND_CODE: &str = "OwnershipControlsNotFoundEr
 /// See [`OWNERSHIP_CONTROLS_NOT_FOUND_CODE`].
 pub const OWNERSHIP_CONTROLS_NOT_FOUND_MESSAGE: &str =
     "The bucket ownership controls were not found";
+/// The code S3 answers a read of a bucket that has no `PublicAccessBlockConfiguration`
+/// associated with it, with HTTP 404 — the subresource-not-there case, answered the way
+/// [`OWNERSHIP_CONTROLS_NOT_FOUND_CODE`] answers it for ownership controls, because
+/// `GetPublicAccessBlock` reports the configuration as its WHOLE @httpPayload and so has
+/// no way to report "there is none" in a 200.
+pub const NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION_CODE: &str =
+    "NoSuchPublicAccessBlockConfiguration";
+/// See [`NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION_CODE`].
+pub const NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION_MESSAGE: &str =
+    "The public access block configuration was not found";
 /// The code S3 answers a request whose XML payload does not validate against the schema
 /// the API publishes for it: "MalformedXML - The XML provided does not match the schema"
 /// (`PutBucketTagging`'s own list of special errors), with HTTP 400.

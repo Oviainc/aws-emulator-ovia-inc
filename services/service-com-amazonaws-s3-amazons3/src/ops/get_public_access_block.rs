@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPublicAccessBlock
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPublicAccessBlock`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPublicAccessBlock::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the `PublicAccessBlockConfiguration` `PutPublicAccessBlock` stored on the
+//! bucket, and the documented not-found when the bucket carries none.
 //!
 //! ## Shape of an operation
 //!
@@ -90,14 +83,20 @@ use super::types::*;
 // `GetPublicAccessBlockError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `GetPublicAccessBlockError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#GetPublicAccessBlock")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="GetPublicAccessBlock")` reports
+// `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that does
+// not exist and AWS answers the service-wide `NoSuchBucket` (`httpError 404`), the shape
+// every other bucket-scoped operation in this crate widens in.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#GetPublicAccessBlock",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum GetPublicAccessBlockErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -151,18 +150,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPublicAccessBlock` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPublicAccessBlockErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPublicAccessBlock"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `GetPublicAccessBlockRequest$ExpectedBucketOwner`. This emulator
+        // serves one account, so that account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Nothing can be reported about a bucket the emulator cannot look up, and the
+            // widened-in `NoSuchBucket` would not be a true statement about it. The
+            // scaffold's 501 says what is true: this emulator cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetPublicAccessBlock",
+            ));
+        };
+
+        // Read-only: the guard is taken, the configuration is copied out, and nothing is
+        // written — a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(GetPublicAccessBlockErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let Some(stored) = bucket.public_access_block() else {
+            // `PublicAccessBlockConfiguration` is this output's WHOLE @httpPayload, so a
+            // 200 with an empty body would report a configuration that does not exist.
+            // AWS answers a bucket with no Block Public Access configuration with the code
+            // below and HTTP 404 — the same subresource-not-there shape
+            // `GetBucketOwnershipControls` answers — which the model declares no shape
+            // for, so it goes out through the unmodelled channel.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION_CODE,
+                NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION_STATUS,
+                crate::state::NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION_MESSAGE,
+            ));
+        };
+
+        // All four switches, because all four are what the bucket carries: each member is
+        // a boolean that is either on or off, with no third state a reader could omit it
+        // for.
+        Ok(GetPublicAccessBlockOutput {
+            public_access_block_configuration: Some(PublicAccessBlockConfiguration {
+                block_public_acls: Some(stored.block_public_acls),
+                ignore_public_acls: Some(stored.ignore_public_acls),
+                block_public_policy: Some(stored.block_public_policy),
+                restrict_public_buckets: Some(stored.restrict_public_buckets),
+            }),
+        })
     }
 }
+
+/// The HTTP status AWS answers `NoSuchPublicAccessBlockConfiguration` with: 404, the
+/// status S3's error-responses list carries for a subresource that is not there.
+const NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION_STATUS: u16 = 404;
+
+/// The HTTP status AWS answers a bucket-owner mismatch with: 403, as
+/// `GetPublicAccessBlockRequest$ExpectedBucketOwner` documents.
+const ACCESS_DENIED_STATUS: u16 = 403;
