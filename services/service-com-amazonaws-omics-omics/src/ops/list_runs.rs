@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRuns
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRuns`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Enumerates the persisted runs as `items`, honouring the `name` and `status` query
+//! filters and the `maxResults`/`startingToken` page bounds. Reporting-only: it
+//! materialises the status steps the clock already owed each run (so a filter on `status`
+//! sees the same value `GetRun` reports) and writes nothing else. A run `DeleteRun`
+//! removed is gone from the store, so it cannot appear here.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRuns::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `batchId` or `runGroupId` filter is REFUSED rather than answered with an empty page:
+//! run batches and run groups are their own resources and their creates are still 501
+//! here, so neither exists and an empty 200 would read as "it exists and has no runs".
 //!
 //! ## Shape of an operation
 //!
@@ -135,6 +135,21 @@ impl From<ListRunsErrorModeled> for ListRunsError {
     }
 }
 
+/// A page token naming the run the NEXT page starts at. The codec and the page bound
+/// are [`crate::state::encode_page_token`] / [`crate::state::decode_page_token`] and
+/// [`crate::state::MAX_LIST_PAGE_SIZE`], shared with this crate's other listing; this
+/// wrapper only renders an unreadable token as THIS operation's 400 refusal.
+fn decode_page_token(token: &str) -> Result<u64, ListRunsError> {
+    crate::state::decode_page_token(crate::state::RUN_PAGE_TOKEN_TAG, token).ok_or_else(|| {
+        // This operation declares its own `ValidationException`, so the refusal carries
+        // the SERVICE's shape rather than the scaffold channel's synthetic one.
+        ListRunsErrorModeled::ValidationException(ValidationException {
+            message: "startingToken is not a pagination token issued by ListRuns".to_string(),
+        })
+        .into()
+    })
+}
+
 /// The `ListRuns` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -171,18 +186,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRuns` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRunsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRuns"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListRunsErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics run store is unavailable".to_string(),
+            })
+        })?;
+
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_LIST_PAGE_SIZE, |requested| {
+                requested.clamp(1, crate::state::MAX_LIST_PAGE_SIZE as i32) as usize
+            });
+        let start = input
+            .starting_token
+            .as_deref()
+            .map(decode_page_token)
+            .transpose()?
+            .unwrap_or(0);
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut store = state.lock();
+        store.settle(now_ms);
+
+        // A `batchId` names a run batch and a `runGroupId` names a run group. Both are
+        // their own resources, and their creates (`StartRunBatch`, `CreateRunGroup`) are
+        // still 501 in this crate, so neither exists and no stored run can belong to one
+        // — `StartRun` refuses both members for the same reason. The filter is refused
+        // the same way: an empty 200 page would read as "the batch/group exists and has
+        // no runs".
+        for (member, resource, value) in [
+            ("batchId", "run batch", input.batch_id.as_deref()),
+            ("runGroupId", "run group", input.run_group_id.as_deref()),
+        ] {
+            if let Some(value) = value {
+                return Err(ListRunsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "{member} names {resource} {value}, which does not exist in this \
+                             region; {resource}s are not emulated yet"
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Reserve no more than the store can actually yield.
+        let mut items = Vec::with_capacity(page_size.min(store.runs.len()));
+        let mut next_token = None;
+        for (key, run) in store.runs.range(start..) {
+            let kept = input
+                .name
+                .as_deref()
+                .is_none_or(|name| run.name.as_deref() == Some(name))
+                && input
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| run.status == status);
+            if !kept {
+                continue;
+            }
+            // The first run that does not fit becomes the next page's start, and only
+            // then is a `nextToken` emitted — the last page carries none.
+            if items.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(
+                    crate::state::RUN_PAGE_TOKEN_TAG,
+                    *key,
+                ));
+                break;
+            }
+            items.push(RunListItem {
+                arn: Some(run.arn.clone()),
+                id: Some(run.id.clone()),
+                status: Some(run.status.clone()),
+                workflow_id: Some(run.workflow_id.clone()),
+                batch_id: None,
+                name: run.name.clone(),
+                priority: run.priority,
+                storage_capacity: run.storage_capacity,
+                creation_time: Some(crate::state::timestamp(run.creation_time_ms)),
+                start_time: run.start_time_ms.map(crate::state::timestamp),
+                stop_time: run.stop_time_ms.map(crate::state::timestamp),
+                storage_type: Some(run.storage_type.clone()),
+                workflow_version_name: run.workflow_version_name.clone(),
+                workflow_name: run.workflow_name.clone(),
+            });
+        }
+
+        Ok(ListRunsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }

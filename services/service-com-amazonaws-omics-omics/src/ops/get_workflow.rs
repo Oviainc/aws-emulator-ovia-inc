@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the stored workflow record. Reporting-only: it materialises the
+//! `CREATING` -> `ACTIVE` move the clock already owed the record (a change that was due at
+//! the same instant whether or not anybody called) and writes nothing else. An id no
+//! stored workflow carries answers the modelled `ResourceNotFoundException` (HTTP 404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The `export` query is NOT served, and a request that asks for one is REFUSED rather
+//! than answered: each value it names (`DEFINITION`, `README`) asks for an S3 presigned
+//! URL to an exported object, and this emulator serves no object store for workflow
+//! definitions, so there is no URL to mint. Answering 200 with the member simply unset
+//! would report success for an export nobody performed, so an `export` request gets the
+//! scaffold's HTTP 501 instead, naming what is not implemented. A request that asks for
+//! no export is served in full from state.
 //!
 //! ## Shape of an operation
 //!
@@ -207,18 +210,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWorkflow"))
+        let _ = ctx;
+        // An export asks this emulator to produce a presigned URL to an exported
+        // definition or README. It serves no object store for them, so there is nothing
+        // to export and nothing to sign: the request is refused with the scaffold's 501
+        // rather than answered 200 with the member unset, which would read as an export
+        // that succeeded and produced nothing.
+        if input.export.as_deref().is_some_and(|export| !export.is_empty()) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetWorkflow with an export requested",
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetWorkflowErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics workflow store is unavailable".to_string(),
+            })
+        })?;
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut store = state.lock();
+        store.settle(now_ms);
+
+        // `type` narrows the lookup to workflows of that type, so a request that asks
+        // for a `READY2RUN` workflow by a private workflow's id finds nothing rather
+        // than the private one. Every workflow this emulator holds is `PRIVATE`.
+        // `workflowOwnerId` narrows it the same way: this emulator holds only its own
+        // account's workflows, so a request naming another owner finds nothing.
+        let foreign_owner = input
+            .workflow_owner_id
+            .as_deref()
+            .is_some_and(|owner| !crate::state::is_emulator_account(owner));
+        let wanted_type = input.r#type.as_deref();
+        let workflow = store
+            .workflow(&input.id)
+            .filter(|_| !foreign_owner)
+            .filter(|workflow| wanted_type.is_none_or(|wanted| wanted == workflow.r#type))
+            .ok_or_else(|| {
+                GetWorkflowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!("no workflow with id {} exists in this region", input.id),
+                })
+            })?;
+
+        Ok(GetWorkflowOutput {
+            arn: Some(workflow.arn.clone()),
+            id: Some(workflow.id.clone()),
+            status: Some(workflow.status.clone()),
+            r#type: Some(workflow.r#type.clone()),
+            name: workflow.name.clone(),
+            description: workflow.description.clone(),
+            engine: workflow.engine.clone(),
+            definition: workflow.definition.clone(),
+            main: workflow.main.clone(),
+            digest: workflow.digest.clone(),
+            parameter_template: workflow.parameter_template_output(),
+            storage_capacity: workflow.storage_capacity,
+            creation_time: Some(crate::state::timestamp(workflow.creation_time_ms)),
+            status_message: workflow.status_message.clone(),
+            tags: workflow.tags_output(),
+            // `metadata` is documented as "Any metadata available for workflow. The
+            // information listed may vary depending on the workflow, and there may
+            // also be no metadata to return." This slice derives none, so it returns
+            // none rather than inventing entries.
+            metadata: None,
+            accelerators: workflow.accelerators.clone(),
+            storage_type: workflow.storage_type.clone(),
+            uuid: Some(workflow.uuid.clone()),
+            container_registry_map: workflow.container_registry_map.clone(),
+            // `readme`, and the presigned form of `definition`, are the S3 URLs the real
+            // service mints for an export. No export reaches here (one is refused above),
+            // so nothing is reported for them; `definition` and `readmePath`, which the
+            // create supplied, are reported from state.
+            readme: None,
+            definition_repository_details: workflow.definition_repository_details(),
+            readme_path: workflow.readme_path.clone(),
+            // Workflow profiles are declared inside the definition file, which this
+            // slice does not parse; `CreateWorkflow` accepts no profile member either.
+            profiles: None,
+            profile_parameter_templates: None,
+        })
     }
 }

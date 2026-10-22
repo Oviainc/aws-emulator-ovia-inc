@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkflows
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkflows`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkflows::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the persisted workflows as `items`, honouring the `type` and `name` query
+//! filters and the `maxResults`/`startingToken` page bounds. Reporting-only: it
+//! materialises the `CREATING` -> `ACTIVE` move the clock already owed each record and
+//! writes nothing else. A workflow `DeleteWorkflow` removed is gone from the store, so it
+//! cannot appear here.
 //!
 //! ## Shape of an operation
 //!
@@ -131,6 +127,25 @@ impl From<ListWorkflowsErrorModeled> for ListWorkflowsError {
     }
 }
 
+/// A page token naming the workflow the NEXT page starts at. The codec and the page
+/// bound are [`crate::state::encode_page_token`] / [`crate::state::decode_page_token`]
+/// and [`crate::state::MAX_LIST_PAGE_SIZE`], shared with this crate's other listing;
+/// this wrapper only renders an unreadable token as THIS operation's 400 refusal.
+fn decode_page_token(token: &str) -> Result<u64, ListWorkflowsError> {
+    crate::state::decode_page_token(crate::state::WORKFLOW_PAGE_TOKEN_TAG, token).ok_or_else(
+        || {
+            // This operation declares its own `ValidationException`, so the refusal
+            // carries the SERVICE's shape rather than the scaffold channel's synthetic
+            // one.
+            ListWorkflowsErrorModeled::ValidationException(ValidationException {
+                message: "startingToken is not a pagination token issued by ListWorkflows"
+                    .to_string(),
+            })
+            .into()
+        },
+    )
+}
+
 /// The `ListWorkflows` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -167,18 +182,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkflows` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkflowsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkflows"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListWorkflowsErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics workflow store is unavailable".to_string(),
+            })
+        })?;
+
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_LIST_PAGE_SIZE, |requested| {
+                requested.clamp(1, crate::state::MAX_LIST_PAGE_SIZE as i32) as usize
+            });
+        let start = input
+            .starting_token
+            .as_deref()
+            .map(decode_page_token)
+            .transpose()?
+            .unwrap_or(0);
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut store = state.lock();
+        store.settle(now_ms);
+
+        let mut items = Vec::with_capacity(page_size.min(store.workflows.len()));
+        let mut next_token = None;
+        for (key, workflow) in store.workflows.range(start..) {
+            let kept = input
+                .r#type
+                .as_deref()
+                .is_none_or(|wanted| workflow.r#type == wanted)
+                && input
+                    .name
+                    .as_deref()
+                    .is_none_or(|name| workflow.name.as_deref() == Some(name));
+            if !kept {
+                continue;
+            }
+            // The first workflow that does not fit becomes the next page's start, and
+            // only then is a `nextToken` emitted — the last page carries none.
+            if items.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(
+                    crate::state::WORKFLOW_PAGE_TOKEN_TAG,
+                    *key,
+                ));
+                break;
+            }
+            items.push(WorkflowListItem {
+                arn: Some(workflow.arn.clone()),
+                id: Some(workflow.id.clone()),
+                name: workflow.name.clone(),
+                status: Some(workflow.status.clone()),
+                r#type: Some(workflow.r#type.clone()),
+                digest: workflow.digest.clone(),
+                creation_time: Some(crate::state::timestamp(workflow.creation_time_ms)),
+                // `metadata` is documented as possibly absent; this slice derives none.
+                metadata: None,
+            });
+        }
+
+        Ok(ListWorkflowsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts a run from a stored workflow and PERSISTS it. The `workflowId` is resolved
+//! against the workflow store (an unknown one answers `ResourceNotFoundException`, HTTP
+//! 404), the run gets a fresh numeric id, ARN and UUID, and every member the request
+//! carried is copied into the stored record for `GetRun`/`ListRuns` to report.
+//! `requestId` is this operation's `@idempotencyToken`, so a replay answers with the run
+//! the first call started.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The run's control plane is real; its EXECUTION is not. This emulator runs no WDL,
+//! Nextflow or CWL engine, so the status progression the clock owes the run ends in the
+//! modelled failure status with a reason that says exactly that, never in `COMPLETED`.
 //!
 //! ## Shape of an operation
 //!
@@ -282,18 +283,335 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartRun"))
+        // `roleArn`, `outputUri` and `requestId` are `@required`, and every string
+        // length/pattern plus `priority`'s and `storageCapacity`'s 0..100000 ranges are
+        // modelled, so the centralized walk refused anything outside them before this
+        // body ran. The `tags` map carries NO modelled length, so its bound is here.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartRunErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics run store is unavailable".to_string(),
+            })
+        })?;
+
+        if let Some(why) = crate::state::tag_bounds_rejection(input.tags.as_ref()) {
+            return Err(
+                StartRunErrorModeled::ValidationException(ValidationException { message: why })
+                    .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now_ms = crate::state::now_epoch_millis();
+        let uuid = crate::state::fresh_uuid();
+
+        let mut store = state.lock();
+        store.settle(now_ms);
+
+        // A replayed idempotency token answers with the run the first call started.
+        if let Some(key) =
+            store.replayed(crate::state::IdempotencyScope::StartRun, &input.request_id)
+        {
+            let run = store.runs.get(&key).ok_or_else(|| {
+                StartRunErrorModeled::InternalServerException(InternalServerException {
+                    message: "the run this requestId started is no longer held".to_string(),
+                })
+            })?;
+            return Ok(StartRunOutput {
+                arn: Some(run.arn.clone()),
+                id: Some(run.id.clone()),
+                status: Some(run.status.clone()),
+                tags: run.tags_output(),
+                uuid: Some(run.uuid.clone()),
+                run_output_uri: Some(run.run_output_uri.clone()),
+                configuration: None,
+                networking_mode: run.networking_mode.clone(),
+            });
+        }
+
+        // `runId` names a run to duplicate: "using the run's default values", which the
+        // caller may then override member by member. A `runId` naming nothing is as
+        // much a missing target as an unknown `workflowId`.
+        let source = match input.run_id.as_deref() {
+            Some(run_id) => Some(store.run(run_id).cloned().ok_or_else(|| {
+                StartRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!("no run with id {run_id} exists in this region"),
+                })
+            })?),
+            None => None,
+        };
+        let source = source.as_ref();
+
+        let workflow_id = input
+            .workflow_id
+            .clone()
+            .or_else(|| source.map(|run| run.workflow_id.clone()))
+            .ok_or_else(|| {
+                StartRunErrorModeled::ValidationException(ValidationException {
+                    message: "StartRun needs a workflowId, or a runId naming the run to \
+                              duplicate"
+                        .to_string(),
+                })
+            })?;
+        // `workflowType`'s own documentation: "If you are running a PRIVATE workflow
+        // (default), you do not need to include the workflow type."
+        let workflow_type = input
+            .workflow_type
+            .clone()
+            .or_else(|| source.map(|run| run.workflow_type.clone()))
+            .unwrap_or_else(|| crate::state::DEFAULT_RUN_WORKFLOW_TYPE.to_string());
+
+        // Every member below REFERENCES a resource whose own create operation is still a
+        // 501 in this crate, so no value can name one that exists: run configurations
+        // (`CreateConfiguration`), run groups (`CreateRunGroup`), run caches
+        // (`CreateRunCache`) and workflow versions (`CreateWorkflowVersion`). The real
+        // service answers "not found" for an id none of its stores holds, and so does
+        // this one — accepting the reference and storing it would report a run bound to
+        // a group, cache, configuration or version nothing ever resolved.
+        for (member, resource, value) in [
+            (
+                "configurationName",
+                "run configuration",
+                input.configuration_name.as_deref(),
+            ),
+            ("runGroupId", "run group", input.run_group_id.as_deref()),
+            ("cacheId", "run cache", input.cache_id.as_deref()),
+            (
+                "workflowVersionName",
+                "workflow version",
+                input.workflow_version_name.as_deref(),
+            ),
+        ] {
+            if let Some(value) = value {
+                return Err(StartRunErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "{member} names {resource} {value}, which does not exist in this \
+                             region; {resource}s are not emulated yet"
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+        // `workflowOwnerId` asks for a workflow shared from another account; this
+        // emulator holds only its own account's workflows (see `is_emulator_account`).
+        if let Some(owner) = input
+            .workflow_owner_id
+            .as_deref()
+            .filter(|owner| !crate::state::is_emulator_account(owner))
+        {
+            return Err(StartRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no workflow shared from account {owner} exists here"),
+                },
+            )
+            .into());
+        }
+
+        // The run is bound to the stored workflow, so an id no workflow of that type
+        // carries is "not found" rather than a run that references nothing. Only the
+        // workflow's EXISTENCE is required here: HealthOmics documents no status the
+        // workflow must be in for StartRun, so this emulator asserts none.
+        let workflow = store
+            .workflow(&workflow_id)
+            .filter(|workflow| workflow.r#type == workflow_type)
+            .ok_or_else(|| {
+                StartRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!(
+                        "no {workflow_type} workflow with id {workflow_id} exists in this region"
+                    ),
+                })
+            })?;
+        let workflow_uuid = Some(workflow.uuid.clone());
+        let workflow_name = workflow.name.clone();
+        // The run records the workflow's CANONICAL id, not the text the request spelled
+        // it with. `WorkflowId` is `^[0-9]+$`, so `01000000` and `1000000` name the same
+        // workflow; storing the resolved record's own id is what keeps `GetRun`'s
+        // `workflowId` and `DeleteWorkflow`'s blocking-run check in agreement with every
+        // other lookup.
+        let workflow_id = workflow.id.clone();
+        let definition = workflow.definition.clone();
+        let digest = workflow.digest.clone();
+        let accelerators = workflow.accelerators.clone();
+        // "The run cannot include any parameters that are not defined in the parameter
+        // template": the template is the workflow's declared input surface, so a run
+        // naming anything outside it is refused rather than stored. A workflow that
+        // declared no template constrains nothing, so there is nothing to check against.
+        // The check is on the RESOLVED document — this request's, or the one inherited
+        // from the run it duplicates — so a duplicate pointed at another workflow cannot
+        // carry parameters that workflow does not define either.
+        let parameters = input
+            .parameters
+            .clone()
+            .or_else(|| source.and_then(|run| run.parameters.clone()));
+        let undefined_parameters =
+            crate::state::undefined_parameters(&workflow.parameter_template, parameters.as_ref());
+        if let Some(undefined) = undefined_parameters {
+            return Err(
+                StartRunErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "parameters names [{undefined}], which the workflow's parameterTemplate \
+                         does not define"
+                    ),
+                })
+                .into(),
+            );
+        }
+        // `storageCapacity` and `storageType` are the workflow's defaults for runs that
+        // use it, overridable at run time. One precedence order for every inherited
+        // member: this request, then the run it duplicates, then the workflow's default,
+        // then the value the member's own documentation names.
+        let storage_capacity = input
+            .storage_capacity
+            .or_else(|| source.and_then(|run| run.storage_capacity))
+            .or(workflow.storage_capacity);
+        // `storageType`'s own documentation: "By default, the run uses STATIC storage
+        // type" — applied only when nothing above names one.
+        let storage_type = input
+            .storage_type
+            .clone()
+            .or_else(|| source.map(|run| run.storage_type.clone()))
+            .or_else(|| workflow.storage_type.clone())
+            .unwrap_or_else(|| crate::state::DEFAULT_RUN_STORAGE_TYPE.to_string());
+        // From the same documentation: "The storage capacity is not required for runs
+        // with a DYNAMIC storage type" — so a run that resolves to STATIC must have one,
+        // from the request, the run it duplicates or the workflow's default.
+        if storage_type == crate::state::STORAGE_TYPE_STATIC && storage_capacity.is_none() {
+            return Err(
+                StartRunErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "storageCapacity is required for a run with the {} storage type",
+                        crate::state::STORAGE_TYPE_STATIC
+                    ),
+                })
+                .into(),
+            );
+        }
+
+        if store.runs.len() >= crate::state::MAX_RUNS {
+            return Err(StartRunErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} runs",
+                        crate::state::MAX_RUNS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let (key, id) = store.next_run_id();
+        let arn = crate::state::run_arn(&region, &id);
+        let run_output_uri = crate::state::run_output_uri(&input.output_uri, &id);
+        let run = crate::state::Run {
+            id: id.clone(),
+            arn: arn.clone(),
+            uuid: uuid.clone(),
+            workflow_id,
+            workflow_type,
+            workflow_uuid,
+            workflow_name,
+            // `workflowVersionName`, `runGroupId` and `cacheId` are refused above, so no
+            // stored run can carry one and there is nothing to inherit: the fields stay
+            // unset rather than carrying inheritance that can never run. The slice that
+            // implements workflow versions, run groups and run caches fills them.
+            workflow_version_name: None,
+            networking_mode: input
+                .networking_mode
+                .clone()
+                .or_else(|| source.and_then(|run| run.networking_mode.clone())),
+            scratch_storage_mode: input
+                .scratch_storage_mode
+                .clone()
+                .or_else(|| source.and_then(|run| run.scratch_storage_mode.clone())),
+            // Like `workflow_id`, the duplicated run's id is stored CANONICALLY — the
+            // resolved record's own decimal — so `GetRun`'s `runId` agrees with every
+            // other lookup rather than echoing the caller's spelling.
+            source_run_id: source.map(|run| run.id.clone()),
+            // `roleArn` and `outputUri` are `@required`, so they always come from this
+            // request and nothing is inherited for them.
+            role_arn: input.role_arn.clone(),
+            name: input
+                .name
+                .clone()
+                .or_else(|| source.and_then(|run| run.name.clone())),
+            run_group_id: None,
+            cache_id: None,
+            cache_behavior: input
+                .cache_behavior
+                .clone()
+                .or_else(|| source.and_then(|run| run.cache_behavior.clone())),
+            priority: input.priority.or_else(|| source.and_then(|run| run.priority)),
+            parameters,
+            engine_settings: input
+                .engine_settings
+                .clone()
+                .or_else(|| source.and_then(|run| run.engine_settings.clone())),
+            storage_capacity,
+            storage_type,
+            output_uri: input.output_uri.clone(),
+            run_output_uri: run_output_uri.clone(),
+            log_level: input
+                .log_level
+                .clone()
+                .or_else(|| source.and_then(|run| run.log_level.clone())),
+            // `retentionMode`'s own documentation: "The default value is RETAIN."
+            retention_mode: input
+                .retention_mode
+                .clone()
+                .or_else(|| source.map(|run| run.retention_mode.clone()))
+                .unwrap_or_else(|| crate::state::DEFAULT_RUN_RETENTION_MODE.to_string()),
+            accelerators,
+            session_policy: input
+                .session_policy
+                .clone()
+                .or_else(|| source.and_then(|run| run.session_policy.clone())),
+            definition,
+            digest,
+            // A run starts in the modelled non-terminal `PENDING` and owes the clock
+            // the rest of its progression; a caller that reads it straight away still
+            // observes `PENDING`. That progression ends in the modelled FAILURE status
+            // (see `crate::state::RUN_STATUS_SEQUENCE`): this emulator records a run
+            // faithfully but executes no workflow engine, so no run here can have
+            // succeeded. Nothing has failed yet at this point, so the reason and the
+            // message are set by the transition that lands on it, not here.
+            status: crate::state::RUN_STATUS_SEQUENCE[0].to_string(),
+            status_message: None,
+            failure_reason: None,
+            creation_time_ms: now_ms,
+            start_time_ms: None,
+            stop_time_ms: None,
+            status_due_at_ms: Some(now_ms + crate::state::TRANSITION_DELAY.as_millis() as i64),
+            // A duplicate inherits the source run's tags only when this request sets
+            // none of its own; tags are replaced as a whole, never merged.
+            tags: match input.tags.clone() {
+                Some(tags) => tags.into_iter().collect(),
+                None => source.map(|run| run.tags.clone()).unwrap_or_default(),
+            },
+        };
+        let status = run.status.clone();
+        let tags = run.tags_output();
+        let networking_mode = run.networking_mode.clone();
+        store.runs.insert(key, run);
+        store.remember(
+            crate::state::IdempotencyScope::StartRun,
+            input.request_id,
+            key,
+        );
+
+        Ok(StartRunOutput {
+            arn: Some(arn),
+            id: Some(id),
+            status: Some(status),
+            tags,
+            uuid: Some(uuid),
+            run_output_uri: Some(run_output_uri),
+            // `configuration` reports the run configuration resource
+            // `configurationName` names. Configurations are their own resource
+            // (`CreateConfiguration` is still a 501 in this crate), so none can be
+            // resolved and none is reported.
+            configuration: None,
+            networking_mode,
+        })
     }
 }

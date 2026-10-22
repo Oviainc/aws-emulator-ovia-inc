@@ -21,13 +21,13 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# SHA-256 over a workflow definition, and the entropy behind each resource's UUID.
+sha2 = { workspace = true }
+# Hex for the `WorkflowDigest`, the UUID groups and the opaque page tokens.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

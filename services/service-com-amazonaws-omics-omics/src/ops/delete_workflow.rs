@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a private workflow: the record is REMOVED from [`crate::state`], so a
+//! following `GetWorkflow` answers the modelled `ResourceNotFoundException` (HTTP 404)
+//! and `ListWorkflows` no longer enumerates it. A workflow that still has runs in a
+//! non-terminal status cannot be deleted — those runs reference it — so that answers the
+//! modelled `ConflictException` (HTTP 409).
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +172,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWorkflow"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteWorkflowErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics workflow store is unavailable".to_string(),
+            })
+        })?;
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut store = state.lock();
+        // Settle first, so a run the clock has already finished does not block the
+        // delete just because nobody read it since.
+        store.settle(now_ms);
+
+        let Some(key) = crate::state::numeric_id(&input.id).filter(|key| {
+            store.workflows.contains_key(key)
+        }) else {
+            return Err(DeleteWorkflowErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no workflow with id {} exists in this region", input.id),
+                },
+            )
+            .into());
+        };
+
+        // A run in a non-terminal status is still using this workflow, so the request
+        // cannot be applied to the workflow in its current state. The reference is
+        // matched on the workflow's NUMERIC key, the same normalisation every lookup in
+        // this crate uses, so a run and a delete that spell the id differently (the
+        // modelled `^[0-9]+$` admits leading zeros) still agree on which workflow is
+        // meant.
+        let blocking = store
+            .runs
+            .values()
+            .filter(|run| {
+                crate::state::numeric_id(&run.workflow_id) == Some(key)
+                    && !crate::state::is_terminal_run_status(&run.status)
+            })
+            .count();
+        if blocking > 0 {
+            return Err(DeleteWorkflowErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "workflow {} still has {blocking} run(s) that have not reached a terminal status",
+                    input.id
+                ),
+            })
+            .into());
+        }
+
+        store.workflows.remove(&key);
+
+        Ok(DeleteWorkflowOutput)
     }
 }
