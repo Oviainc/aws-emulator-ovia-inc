@@ -26,6 +26,9 @@ mod group_identifier_exclusivity;
 #[path = "all/indexing_rules.rs"]
 mod indexing_rules;
 
+#[path = "all/insight_summaries.rs"]
+mod insight_summaries;
+
 #[path = "all/request_deserialization.rs"]
 mod request_deserialization;
 
