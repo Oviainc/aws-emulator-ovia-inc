@@ -18,6 +18,8 @@ mod describe_vpcs;
 // The shared ec2Query plumbing every describe drives the service through.
 #[path = "all/ec2_query.rs"]
 mod ec2_query;
+#[path = "all/instance_lifecycle.rs"]
+mod instance_lifecycle;
 #[path = "all/instance_type_offerings.rs"]
 mod instance_type_offerings;
 #[path = "all/state_roundtrip.rs"]
