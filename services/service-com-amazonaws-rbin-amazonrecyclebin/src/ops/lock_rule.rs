@@ -185,13 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(rule) = store.rules.get_mut(&input.identifier) else {
             return Err(LockRuleErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Retention rule with ID {} not found",
-                        input.identifier
-                    )),
-                    reason: Some("RULE_NOT_FOUND".to_string()),
-                },
+                crate::state::rule_not_found(&input.identifier),
             )
             .into());
         };
@@ -206,35 +200,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carrying exclusion tags is a Region-level rule with exclusions. For neither
         // can a lock request be completed.
         if !rule.resource_tags.is_empty() {
-            return Err(LockRuleErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Retention rule with ID {} is a tag-level retention rule and can't be locked",
-                    rule.identifier
-                )),
-                reason: Some("INVALID_RULE_STATE".to_string()),
-            })
+            return Err(LockRuleErrorModeled::ConflictException(
+                crate::state::rule_state_conflict(
+                    crate::state::BlockedAction::Lock,
+                    &rule.identifier,
+                    crate::state::BlockingCondition::TagLevelRule,
+                ),
+            )
             .into());
         }
         if !rule.exclude_resource_tags.is_empty() {
-            return Err(LockRuleErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Retention rule with ID {} has exclusion tags and can't be locked",
-                    rule.identifier
-                )),
-                reason: Some("INVALID_RULE_STATE".to_string()),
-            })
+            return Err(LockRuleErrorModeled::ConflictException(
+                crate::state::rule_state_conflict(
+                    crate::state::BlockedAction::Lock,
+                    &rule.identifier,
+                    crate::state::BlockingCondition::RuleWithExclusionTags,
+                ),
+            )
             .into());
         }
         // A rule that is already `locked` "can't be modified", and a lock request
         // carries a lock configuration, so locking it again would modify it.
         if rule.lock_state.as_deref() == Some(crate::state::LOCK_STATE_LOCKED) {
-            return Err(LockRuleErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Retention rule with ID {} is already locked",
-                    rule.identifier
-                )),
-                reason: Some("INVALID_RULE_STATE".to_string()),
-            })
+            return Err(LockRuleErrorModeled::ConflictException(
+                crate::state::rule_state_conflict(
+                    crate::state::BlockedAction::Lock,
+                    &rule.identifier,
+                    crate::state::BlockingCondition::AlreadyLocked,
+                ),
+            )
             .into());
         }
 
