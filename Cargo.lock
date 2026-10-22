@@ -3714,6 +3714,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-s3-amazons3",
  "sha2 0.10.9",
  "tokio",
  "tracing",

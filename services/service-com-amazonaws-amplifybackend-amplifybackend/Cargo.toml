@@ -24,6 +24,10 @@ tracing = { workspace = true }
 # `hex` renders the opaque `ListBackendJobs` pagination token, so a position in this
 # service's own job order travels as bytes the caller cannot read as a job id.
 hex = { workspace = true }
+# The S3 service's bucket store: `ListS3Buckets` reports the S3 buckets the account
+# holds, which S3 owns, so it is read from S3's own state in the shared engine rather
+# than kept a second time here.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

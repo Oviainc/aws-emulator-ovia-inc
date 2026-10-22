@@ -261,6 +261,17 @@ pub struct Bucket {
     /// The Region the bucket lives in — what `HeadBucket` reports as
     /// `x-amz-bucket-region` and what decides the form of `CreateBucket`'s `Location`.
     pub region: String,
+    /// When the bucket was created: the instant
+    /// [`ComAmazonawsS3Amazons3State::create_bucket`] recorded it, which is what
+    /// `Bucket$CreationDate` reports for a bucket of this account — whether the reader is
+    /// S3's own `ListBuckets` or another service that reports the account's buckets.
+    ///
+    /// Private and never reassigned, so the value a reader sees does not move while the
+    /// bucket exists. `None` only in a `Default`-built value, which is never a bucket this
+    /// store holds: `create_bucket` is the one place a bucket comes into being and it
+    /// always records the instant. A reader reports no creation date rather than inventing
+    /// one.
+    created_at: Option<SystemTime>,
     /// The bucket policy `PutBucketPolicy` attached, verbatim, or `None` while the
     /// bucket has none. A bucket is created WITHOUT a policy, which is what makes
     /// `GetBucketPolicy` answer `NoSuchBucketPolicy` until one is put.
@@ -280,6 +291,13 @@ pub struct Bucket {
 }
 
 impl Bucket {
+    /// When the bucket was created, as `create_bucket` recorded it. Stable across reads:
+    /// nothing updates it. `None` only for a `Default`-built value, which this store
+    /// never holds — a reader reports no creation date rather than inventing one.
+    pub fn created_at(&self) -> Option<SystemTime> {
+        self.created_at
+    }
+
     /// The bucket's tag set, empty when none is associated with it.
     pub fn tags(&self) -> &[BucketTag] {
         &self.tags
@@ -489,6 +507,17 @@ pub struct ComAmazonawsS3Amazons3State {
 }
 
 impl ComAmazonawsS3Amazons3State {
+    /// Every bucket this account holds, as `(name, bucket)` in bucket-name order — the
+    /// order S3 lists buckets in.
+    ///
+    /// The read seam for any operation that reports the whole account's buckets, S3's own
+    /// `ListBuckets` included, so none of them keeps a second copy of this map.
+    pub fn buckets(&self) -> impl Iterator<Item = (&str, &Bucket)> + '_ {
+        self.buckets
+            .iter()
+            .map(|(name, bucket)| (name.as_str(), bucket))
+    }
+
     /// The bucket named `name`, or `None` when this emulator holds no such bucket.
     pub fn bucket(&self, name: &str) -> Option<&Bucket> {
         self.buckets.get(name)
@@ -571,6 +600,9 @@ impl ComAmazonawsS3Amazons3State {
             name.to_string(),
             Bucket {
                 region: region.to_string(),
+                // The creation instant is read here, where the bucket comes into being,
+                // so `CreationDate` is the moment the store accepted it.
+                created_at: Some(SystemTime::now()),
                 // A fresh bucket carries no policy and no tags and holds no objects;
                 // `PutBucketPolicy` and `PutBucketTagging` are what associate those
                 // subresources with it and `PutObject` what puts an object in it.
