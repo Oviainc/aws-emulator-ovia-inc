@@ -307,11 +307,18 @@ async fn put_schema_refuses_a_definition_that_is_not_a_cedar_schema() {
         );
     }
 
-    // A refused put stores nothing, so the store still has no schema at all.
-    let (status, body) = call(&router, "GetSchema", &json!({ "policyStoreId": store_id })).await;
+    // A refused put stores nothing, so the store still reports the EMPTY schema
+    // document it has held since it was created.
+    let fetched = ok(&router, "GetSchema", &json!({ "policyStoreId": store_id })).await;
     assert_eq!(
-        status, 404,
-        "case \"nothing persisted\": expected HTTP 404, got {status} {body}"
+        fetched["schema"].as_str(),
+        Some("{}"),
+        "case \"nothing persisted\": a refused put must leave the empty document, got {fetched}"
+    );
+    assert_eq!(
+        namespaces(&fetched["namespaces"]),
+        Vec::<String>::new(),
+        "case \"nothing persisted\": the empty document declares no namespace, got {fetched}"
     );
 }
 
@@ -361,15 +368,14 @@ async fn put_schema_bounds_the_schema_text_it_stores() {
 }
 
 /// A schema belongs to a policy store, so both operations refuse a reference that
-/// resolves to no store, and `GetSchema` refuses a store that holds no schema.
+/// resolves to no store.
 #[tokio::test]
 async fn schema_operations_report_what_is_missing() {
     let router = router();
-    let store_id = store_with_mode(&router, "OFF").await;
     let schema = photo_app_schema();
 
-    // Rows differ along WHICH resource is missing, and therefore along the
-    // `resourceType` the refusal names.
+    // Rows differ along WHICH operation is called and HOW the reference fails to
+    // resolve — an unknown id, and an alias that names no store.
     let cases: &[(&str, &str, Value, &str)] = &[
         (
             "PutSchema on an unknown store id",
@@ -393,10 +399,10 @@ async fn schema_operations_report_what_is_missing() {
             "POLICY_STORE",
         ),
         (
-            "GetSchema on a store that holds no schema",
+            "GetSchema through an unknown alias",
             "GetSchema",
-            json!({ "policyStoreId": store_id }),
-            "SCHEMA",
+            json!({ "policyStoreId": "policy-store-alias/nope" }),
+            "POLICY_STORE",
         ),
     ];
 
@@ -415,6 +421,76 @@ async fn schema_operations_report_what_is_missing() {
             body["resourceType"].as_str(),
             Some(*resource_type),
             "case {case:?}: expected resourceType {resource_type}, got {body}"
+        );
+    }
+}
+
+/// A policy store that has never been given a schema still HAS a schema document
+/// to report: the empty one, `{}`, dated at the store's own creation. "No schema"
+/// is a state of that one document — the state `PutSchema` returns a store to
+/// with `{}` — not a missing resource, so `GetSchema` answers 200 and not a
+/// `ResourceNotFoundException` naming `SCHEMA`.
+#[tokio::test]
+async fn get_schema_reports_the_empty_document_until_a_schema_is_stored() {
+    let router = router();
+
+    // Rows differ along the validation mode the store was created with: the
+    // document a store starts with does not depend on it.
+    for mode in ["OFF", "STRICT"] {
+        let store_id = store_with_mode(&router, mode).await;
+        let store = ok(&router, "GetPolicyStore", &json!({ "policyStoreId": store_id })).await;
+
+        let empty = ok(&router, "GetSchema", &json!({ "policyStoreId": store_id })).await;
+        assert_eq!(
+            empty["schema"].as_str(),
+            Some("{}"),
+            "case {mode:?}: a store without a schema reports the empty document, got {empty}"
+        );
+        assert_eq!(
+            namespaces(&empty["namespaces"]),
+            Vec::<String>::new(),
+            "case {mode:?}: the empty document declares no namespace, got {empty}"
+        );
+        assert_eq!(
+            empty["policyStoreId"].as_str(),
+            Some(store_id.as_str()),
+            "case {mode:?}: GetSchema reported the wrong policyStoreId, got {empty}"
+        );
+        assert_eq!(
+            empty["createdDate"], store["createdDate"],
+            "case {mode:?}: the document dates from the store's creation, got {empty}"
+        );
+        assert_eq!(
+            empty["lastUpdatedDate"], store["createdDate"],
+            "case {mode:?}: nothing has updated the document yet, got {empty}"
+        );
+
+        // Reading it changed nothing: the second read is the first.
+        let again = ok(&router, "GetSchema", &json!({ "policyStoreId": store_id })).await;
+        assert_eq!(
+            again, empty,
+            "case {mode:?}: GetSchema must not change what a later read sees, got {again}"
+        );
+
+        // And a put replaces that document, which is what makes the empty one
+        // the document's INITIAL state rather than a fixed answer.
+        let text = photo_app_schema();
+        ok(
+            &router,
+            "PutSchema",
+            &json!({ "policyStoreId": store_id, "definition": { "cedarJson": text } }),
+        )
+        .await;
+        let stored = ok(&router, "GetSchema", &json!({ "policyStoreId": store_id })).await;
+        assert_eq!(
+            stored["schema"].as_str(),
+            Some(text.as_str()),
+            "case {mode:?}: GetSchema must report the schema that was put, got {stored}"
+        );
+        assert_eq!(
+            namespaces(&stored["namespaces"]),
+            vec!["PhotoApp".to_string()],
+            "case {mode:?}: GetSchema must report the stored namespaces, got {stored}"
         );
     }
 }

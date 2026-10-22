@@ -264,7 +264,8 @@ pub struct PolicyStore {
     pub next_id_seq: u64,
     /// The Cedar schema `PutSchema` stored, when one has been stored. A store
     /// holds at most ONE schema — `PutSchema` "creates or updates" it — so this
-    /// is an `Option`, not a map.
+    /// is an `Option`, not a map. `None` is the EMPTY schema document: see
+    /// [`PolicyStore::schema_document`], which is what `GetSchema` reports.
     pub schema: Option<StoredSchema>,
 }
 
@@ -284,6 +285,13 @@ pub struct StoredSchema {
     /// When the schema was last put.
     pub last_updated_date: DateTime,
 }
+
+/// The EMPTY Cedar schema document: a schema that declares no namespace, and the
+/// document a policy store holds until `PutSchema` writes one. It is also the
+/// document `PutSchema` returns a store to — `SchemaDefinition$cedarJson`
+/// documents "To delete the schema, run PutSchema with `{}` for this parameter" —
+/// so "no schema" and "the empty schema" are one state of one document.
+pub const EMPTY_SCHEMA_JSON: &str = "{}";
 
 /// One identity source in a store: the provider it points at, the Cedar entity
 /// type its principals carry, and when it was created and last changed.
@@ -677,6 +685,24 @@ impl ComAmazonawsVerifiedpermissionsVerifiedpermissionsState {
 }
 
 impl PolicyStore {
+    /// The schema document this store holds, as a reader reports it.
+    ///
+    /// A store that has never been given a schema holds the EMPTY document
+    /// ([`EMPTY_SCHEMA_JSON`]), dated at the store's own creation: the schema is
+    /// one document of the store, in the state a caller also returns it to by
+    /// putting `{}`. It is not a MISSING resource, which is why `GetSchema`
+    /// answers 200 for a store that exists and has never been given a schema —
+    /// the behaviour the recorded `get-schema-lifecycle` unit pins. Nothing is
+    /// written to reach this answer; the dates come from the persisted store.
+    pub fn schema_document(&self) -> StoredSchema {
+        self.schema.clone().unwrap_or_else(|| StoredSchema {
+            cedar_json: EMPTY_SCHEMA_JSON.to_string(),
+            namespaces: Vec::new(),
+            created_date: self.created_date,
+            last_updated_date: self.created_date,
+        })
+    }
+
     /// Mint the next `policyId` for this store. `SP` + 22 base62 characters, the
     /// shape AWS publishes (`SPEXAMPLEabcdefg111111`).
     pub fn mint_policy_id(&mut self) -> String {

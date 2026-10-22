@@ -172,12 +172,12 @@ pub struct StaticScope {
     pub actions: Vec<ScopeEntity>,
 }
 
-/// Parse one Cedar static policy and read its effect and scope off the parsed
-/// form. `Err` carries the parser's diagnostics, for a `ValidationException`.
-///
-/// Refuses a statement past [`MAX_STATEMENT_BYTES`] BEFORE handing it to the
-/// parser, so an over-long payload costs a length check rather than a parse.
-pub fn parse_static_policy(statement: &str) -> Result<StaticScope, String> {
+/// Refuse a statement past [`MAX_STATEMENT_BYTES`] — the CHEAP check, so an
+/// over-long payload costs a length comparison rather than a Cedar parse or a
+/// schema validation. Called by every path that hands a caller's statement to
+/// Cedar ([`parse_static_policy`], [`validate_static_policy`]) and, before any
+/// of them, by the handler, so the bound dominates whichever runs first.
+pub fn check_statement_size(statement: &str) -> Result<(), String> {
     if statement.len() > MAX_STATEMENT_BYTES {
         return Err(format!(
             "definition.static.statement is {} bytes, more than the {MAX_STATEMENT_BYTES} \
@@ -185,6 +185,16 @@ pub fn parse_static_policy(statement: &str) -> Result<StaticScope, String> {
             statement.len()
         ));
     }
+    Ok(())
+}
+
+/// Parse one Cedar static policy and read its effect and scope off the parsed
+/// form. `Err` carries the parser's diagnostics, for a `ValidationException`.
+///
+/// Refuses a statement past [`MAX_STATEMENT_BYTES`] BEFORE handing it to the
+/// parser, so an over-long payload costs a length check rather than a parse.
+pub fn parse_static_policy(statement: &str) -> Result<StaticScope, String> {
+    check_statement_size(statement)?;
     let policy = cedar_policy::Policy::parse(None, statement)
         .map_err(|e| format!("the policy statement is not valid Cedar: {e}"))?;
 
@@ -269,14 +279,10 @@ pub fn parse_schema(text: &str) -> Result<ParsedSchema, String> {
 /// [`parse_schema`]); `Err` carries the validator's diagnostics, for a
 /// `ValidationException`.
 pub fn validate_static_policy(schema_json: &str, statement: &str) -> Result<(), String> {
+    // The statement is bounded BEFORE the schema is parsed and before Cedar sees
+    // the statement, so the cheap check dominates both parses.
+    check_statement_size(statement)?;
     let parsed = parse_schema(schema_json)?;
-    if statement.len() > MAX_STATEMENT_BYTES {
-        return Err(format!(
-            "definition.static.statement is {} bytes, more than the {MAX_STATEMENT_BYTES} \
-             bytes a policy may carry",
-            statement.len()
-        ));
-    }
     let policy = cedar_policy::Policy::parse(None, statement)
         .map_err(|e| format!("the policy statement is not valid Cedar: {e}"))?;
     let mut set = cedar_policy::PolicySet::new();

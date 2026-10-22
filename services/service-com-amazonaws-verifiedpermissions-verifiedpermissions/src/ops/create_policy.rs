@@ -202,6 +202,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // The SIZE BOUND on everything below: the cheap length check, before the
+        // state lock and before any Cedar parse or schema validation, so no
+        // caller-sized statement reaches the parser or the validator. Only the
+        // length is checked here — the full parse stays where it was, after the
+        // store is resolved, so an unknown store is still a 404 and a client
+        // token still replays before the statement is parsed.
+        crate::state::cedar::check_statement_size(&definition.statement)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
         let mut state = state.lock();
         let store_id = state

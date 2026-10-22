@@ -31,6 +31,8 @@ mod policy_store_settings;
 mod policy_templates;
 #[path = "all/schema.rs"]
 mod schema;
+#[path = "all/schema_lifecycle.rs"]
+mod schema_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tagging.rs"]

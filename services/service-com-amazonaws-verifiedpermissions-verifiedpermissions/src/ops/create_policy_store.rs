@@ -202,7 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy_templates: ::std::collections::BTreeMap::new(),
             identity_sources: ::std::collections::BTreeMap::new(),
             next_id_seq: 0,
-            // A new store holds no schema: `PutSchema` is what puts one there.
+            // A new store holds no schema: `PutSchema` is what puts one there,
+            // and until it does the store reports the EMPTY schema document
+            // (`crate::state::PolicyStore::schema_document`).
             schema: None,
         };
         state.policy_stores.insert(policy_store_id.clone(), store);
