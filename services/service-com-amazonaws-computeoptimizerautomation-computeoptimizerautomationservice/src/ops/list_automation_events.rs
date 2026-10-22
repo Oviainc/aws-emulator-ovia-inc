@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAutomationEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAutomationEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAutomationEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Reports the automation events the store holds, in creation order,
+//! narrowed by the half-open `[startTimeInclusive, endTimeExclusive)` window and by
+//! `filters`, and paged by `maxResults` with an opaque `nextToken` that resumes where
+//! the previous page stopped. `@paginated(inputToken: nextToken, outputToken:
+//! nextToken, items: automationEvents)`. A REPORTING operation: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +157,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAutomationEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAutomationEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAutomationEvents"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAutomationEventsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service is not mounted on a state-bearing engine".into()),
+                },
+            )
+            .into());
+        };
+
+        let filters = input.filters.unwrap_or_default();
+        // `AutomationEventFilter$name` is typed as the `AutomationEventFilterName`
+        // value set, but a name outside it is refused here too so a filter is
+        // never silently ignored.
+        if let Some(unknown) = crate::state::unknown_event_filter_name(&filters) {
+            return Err(invalid_parameter(format!(
+                "Value '{unknown}' at 'filters.member.name' failed to satisfy constraint: Member \
+                 must satisfy enum value set: [{}]",
+                AUTOMATION_EVENT_FILTER_NAME_VALUES.join(", ")
+            )));
+        }
+
+        // `endTimeExclusive` is exclusive, so a range whose end does not come
+        // after its start can hold no event at all: refuse it rather than report
+        // an empty page for a window the caller cannot have meant. The wording
+        // is the service's own constant message for this rule (it names neither
+        // bound's value, so it is the same for every refused range).
+        if !crate::state::time_range_is_valid(input.start_time_inclusive, input.end_time_exclusive)
+        {
+            return Err(invalid_parameter(
+                crate::state::INVALID_TIME_RANGE_MESSAGE.to_string(),
+            ));
+        }
+
+        // The page token carries a fingerprint of the whole query — the filters
+        // AND the time window — because both define the sequence a page is a
+        // window onto, so resuming with a different query is refused instead of
+        // answered with a page of a different result set.
+        let query_fingerprint = crate::state::fingerprint(&(
+            &filters,
+            input.start_time_inclusive.map(crate::state::instant_key),
+            input.end_time_exclusive.map(crate::state::instant_key),
+        ));
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(cursor) = crate::state::decode_page_token(token) else {
+                    return Err(invalid_parameter(format!(
+                        "Value '{token}' at 'nextToken' failed to satisfy constraint: Member must \
+                         be a token returned by a previous ListAutomationEvents call"
+                    )));
+                };
+                if cursor.filter_fingerprint != query_fingerprint {
+                    return Err(invalid_parameter(
+                        "Value at 'nextToken' failed to satisfy constraint: Member must be a \
+                         token returned for the same filters and time range"
+                            .to_string(),
+                    ));
+                }
+                cursor.offset
+            }
+        };
+
+        // The model bounds `maxResults` at 1..=100, so a caller that sends none
+        // gets the largest page it could have asked for. Clamped to at least one
+        // here as well: a zero page would return nothing while still carrying a
+        // token whose offset never advances, so a walk would never terminate.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::DEFAULT_MAX_RESULTS),
+        )
+        .unwrap_or(1)
+        .max(1);
+
+        // Only events created inside the retrieval window are reachable, so the
+        // window this call reports over starts at the later of the caller's
+        // `startTimeInclusive` and that floor.
+        let window_start = crate::state::effective_window_start(
+            input.start_time_inclusive,
+            ::std::time::SystemTime::now(),
+        );
+
+        let guard = state.lock();
+        let matching: Vec<AutomationEvent> = guard
+            .events
+            .iter_in_order()
+            .filter(|event| {
+                crate::state::within_window(
+                    event.created_timestamp,
+                    Some(window_start),
+                    input.end_time_exclusive,
+                )
+            })
+            .filter(|event| crate::state::event_matches_filters(event, &filters))
+            .skip(offset)
+            .take(page_size.saturating_add(1))
+            .map(crate::state::StoredEvent::to_automation_event)
+            .collect();
+
+        // One extra event was taken: its presence is what says another page
+        // exists, and the token resumes exactly where this page stopped.
+        let has_more = matching.len() > page_size;
+        let page: Vec<AutomationEvent> = matching.into_iter().take(page_size).collect();
+        let next_token = has_more.then(|| {
+            crate::state::encode_page_token(&crate::state::PageCursor {
+                offset: offset + page.len(),
+                filter_fingerprint: query_fingerprint,
+            })
+        });
+
+        Ok(ListAutomationEventsOutput {
+            automation_events: Some(page),
+            next_token,
+        })
     }
+}
+
+fn invalid_parameter(message: String) -> ListAutomationEventsError {
+    ListAutomationEventsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }
