@@ -792,7 +792,11 @@ pub struct Repo {
     pub created_at: SystemTime,
     pub image_tag_mutability: String,
     pub image_tag_mutability_exclusion_filters: Vec<ImageTagMutabilityExclusionFilter>,
-    pub image_scanning_config: Option<ImageScanningConfiguration>,
+    /// Always present: `ImageScanningConfiguration$scanOnPush` is modelled
+    /// `@default(false)` ("If this parameter is not specified, it will default to false"),
+    /// so a repository created without one scans nothing on push rather than carrying no
+    /// scanning configuration at all. Every repository therefore reports the member.
+    pub image_scanning_config: ImageScanningConfiguration,
     pub encryption_config: EncryptionConfiguration,
     pub tags: Vec<Tag>,
     /// The repository policy, as the last `SetRepositoryPolicy` stored it: `None`
@@ -829,7 +833,7 @@ impl Repo {
             } else {
                 Some(self.image_tag_mutability_exclusion_filters.clone())
             },
-            image_scanning_configuration: self.image_scanning_config.clone(),
+            image_scanning_configuration: Some(self.image_scanning_config.clone()),
             encryption_configuration: Some(self.encryption_config.clone()),
         }
     }
@@ -837,18 +841,16 @@ impl Repo {
     /// The scanning configuration reported for this repository.
     ///
     /// Derived from what is stored, never from the request: `scanOnPush` is the flag the
-    /// repository's own `imageScanningConfiguration` carries (absent means not
-    /// configured, so `false`, the member's modelled default), and the frequency follows
-    /// from it — a repository scanned on push has the `SCAN_ON_PUSH` frequency, and one
-    /// that is not has the `MANUAL` one. `appliedScanFilters` lists the registry
-    /// scanning rules' filters that match this repository; deriving that match from the
-    /// registry configuration `PutRegistryScanningConfiguration` now stores belongs to
-    /// this projection's own operation, so the list stays empty here.
+    /// repository's own `imageScanningConfiguration` carries (modelled
+    /// `@default(false)`, so a repository created without one is not scanned on push),
+    /// and the frequency follows from it — a repository scanned on push has the
+    /// `SCAN_ON_PUSH` frequency, and one that is not has the `MANUAL` one.
+    /// `appliedScanFilters` lists the registry scanning rules' filters that match this
+    /// repository; deriving that match from the registry configuration
+    /// `PutRegistryScanningConfiguration` now stores belongs to this projection's own
+    /// operation, so the list stays empty here.
     pub fn to_scanning_configuration(&self) -> RepositoryScanningConfiguration {
-        let scan_on_push = self
-            .image_scanning_config
-            .as_ref()
-            .is_some_and(|config| config.scan_on_push);
+        let scan_on_push = self.image_scanning_config.scan_on_push;
         RepositoryScanningConfiguration {
             repository_arn: Some(self.arn.clone()),
             repository_name: Some(self.name.clone()),

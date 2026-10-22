@@ -299,7 +299,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             image_tag_mutability: mutability,
             image_tag_mutability_exclusion_filters: exclusion_filters,
-            image_scanning_config: input.image_scanning_configuration,
+            // "If this parameter is not specified, it will default to false and images
+            // will not be scanned unless a scan is manually started" — the modelled
+            // `@default(false)` on `ImageScanningConfiguration$scanOnPush`. A request
+            // that names no scanning configuration still creates a repository that
+            // reports one, with scanning off.
+            image_scanning_config: input.image_scanning_configuration.unwrap_or_default(),
             encryption_config: encryption,
             tags: Vec::new(),
             // A new repository carries no repository policy until

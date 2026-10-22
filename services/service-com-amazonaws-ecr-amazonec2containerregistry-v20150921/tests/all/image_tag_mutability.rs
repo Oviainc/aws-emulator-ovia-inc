@@ -411,11 +411,13 @@ async fn a_put_the_registry_cannot_honour_is_refused() {
             "InvalidParameterException",
         ),
         (
-            // The boundary validator refuses a value outside `ImageTagMutability`'s
-            // enum before the handler runs, with the framework's ValidationException.
+            // The boundary validator refuses a value outside `ImageTagMutability`'s enum
+            // before the handler runs, and this service states such a refusal with the
+            // client-input error its model declares (`override_refusal` in
+            // `src/service.rs`).
             "a setting outside the modelled enum",
             json!({"repositoryName": "present", "imageTagMutability": "immutable"}),
-            "ValidationException",
+            "InvalidParameterException",
         ),
         (
             "more exclusion filters than the modelled maximum of five",
@@ -431,7 +433,7 @@ async fn a_put_the_registry_cannot_honour_is_refused() {
                     {"filterType": "WILDCARD", "filter": "f"},
                 ],
             }),
-            "ValidationException",
+            "InvalidParameterException",
         ),
         (
             "exclusion filters beside a setting that excludes nothing",

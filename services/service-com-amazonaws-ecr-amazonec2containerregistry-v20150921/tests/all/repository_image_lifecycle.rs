@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 // The wire harness lives in `tests/all/wire.rs`, shared with every other suite.
-use crate::wire::{call, emulator, ok, REGION, REGISTRY_ID};
+use crate::wire::{at, call, emulator, ok, REGION, REGISTRY_ID};
 
 /// The values `ImageTagMutability` accepts, from the model's enum. Spelled out here so a
 /// setting the implementation silently ignores is visible as an unexercised value.
@@ -68,10 +68,6 @@ fn listed_pairs(body: &Value) -> BTreeSet<ImagePair> {
             )
         })
         .collect()
-}
-
-fn at(value: &Value, pointer: &str) -> Value {
-    value.pointer(pointer).cloned().unwrap_or(Value::Null)
 }
 
 /// Create a repository that the case under test only needs to exist.
@@ -202,8 +198,11 @@ async fn a_created_repository_is_described_from_what_was_stored() {
             request
                 .get("imageScanningConfiguration")
                 .cloned()
-                .unwrap_or(Value::Null),
-            "case {case:?}: imageScanningConfiguration is reported as it was stored, got {:?}",
+                // `scanOnPush` is modelled `@default(false)`, so a create that names no
+                // scanning configuration still reports one, with scanning off.
+                .unwrap_or(json!({"scanOnPush": false})),
+            "case {case:?}: imageScanningConfiguration is reported as it was stored, and \
+             defaults to scanOnPush false, got {:?}",
             at(&repository, "/imageScanningConfiguration")
         );
         assert_eq!(
@@ -1436,12 +1435,13 @@ async fn create_repository_refuses_a_configuration_it_cannot_honour() {
     let cases: Vec<(&str, Value, &str)> = vec![
         (
             // The boundary validator refuses a value outside `EncryptionType`'s enum
-            // before the handler runs, with the framework's own ValidationException.
+            // before the handler runs, and this service states such a refusal with the
+            // client-input error its model declares (see `src/service.rs`).
             "an encryption type outside the modelled set",
             json!({"repositoryName": "bad-encryption", "encryptionConfiguration": {
                 "encryptionType": "aes256",
             }}),
-            "ValidationException",
+            "InvalidParameterException",
         ),
         (
             "a KMS key beside the AES256 encryption type",

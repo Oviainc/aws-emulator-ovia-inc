@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/create_repository_contract.rs"]
+mod create_repository_contract;
 #[path = "all/image_tag_mutability.rs"]
 mod image_tag_mutability;
 #[path = "all/layer_availability.rs"]

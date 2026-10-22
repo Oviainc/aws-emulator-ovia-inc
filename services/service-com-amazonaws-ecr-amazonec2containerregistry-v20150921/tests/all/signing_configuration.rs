@@ -352,7 +352,8 @@ async fn a_refused_put_leaves_the_stored_configuration_untouched() {
 
     let long_profile_name = "A".repeat(200);
     // Each row is outside a constraint the model states for this input, so the boundary
-    // validator refuses it with `ValidationException` before the handler runs.
+    // validator refuses it before the handler runs, with the client-input error this
+    // service models (`override_refusal` in `src/service.rs`).
     let cases: Vec<(&str, Value)> = vec![
         (
             "no signingConfiguration at all, which the input requires",
@@ -426,10 +427,14 @@ async fn a_refused_put_leaves_the_stored_configuration_untouched() {
             "case {case:?}: expected HTTP 400, got {} with {:?}",
             answer.status, answer.body
         );
+        // A refusal against a constraint the model declares is stated with the
+        // client-input error this service models — `InvalidParameterException`, which
+        // this operation declares — naming the member and the constraint it failed. See
+        // `override_refusal` in `src/service.rs`.
         assert_eq!(
             answer.error_code(),
-            "ValidationException",
-            "case {case:?}: expected ValidationException, got {:?}",
+            "InvalidParameterException",
+            "case {case:?}: expected InvalidParameterException, got {:?}",
             answer.body
         );
 

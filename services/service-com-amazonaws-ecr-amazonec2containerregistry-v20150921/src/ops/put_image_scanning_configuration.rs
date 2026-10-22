@@ -207,12 +207,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The whole setting is replaced, not merged: `imageScanningConfiguration` is a
         // required member, so every call states the repository's new setting in full.
-        repo.image_scanning_config = Some(input.image_scanning_configuration);
+        repo.image_scanning_config = input.image_scanning_configuration;
 
         Ok(PutImageScanningConfigurationOutput {
             registry_id: Some(repo.registry_id.clone()),
             repository_name: Some(repo.name.clone()),
-            image_scanning_configuration: repo.image_scanning_config.clone(),
+            image_scanning_configuration: Some(repo.image_scanning_config.clone()),
         })
     }
 }

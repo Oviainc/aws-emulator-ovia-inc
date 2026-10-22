@@ -341,10 +341,14 @@ async fn the_listing_pages_the_exclusion_list_in_a_stable_order() {
             "case {case:?}: expected HTTP 400, got {} with {:?}",
             answer.status, answer.body
         );
+        // A refusal against a constraint the model declares is stated with the
+        // client-input error this service models — `InvalidParameterException`, which
+        // this operation declares — naming the member and the bound it failed. See
+        // `override_refusal` in `src/service.rs`.
         assert_eq!(
             answer.error_code(),
-            "ValidationException",
-            "case {case:?}: expected ValidationException, got {:?}",
+            "InvalidParameterException",
+            "case {case:?}: expected InvalidParameterException, got {:?}",
             answer.body
         );
     }
@@ -411,10 +415,20 @@ async fn a_principal_arn_outside_the_modelled_constraints_is_refused() {
             "case {case:?}: expected HTTP 400, got {} with {:?}",
             answer.status, answer.body
         );
+        // Same rule as above: the modelled client-input error, naming the member and
+        // the constraint it failed (`override_refusal` in `src/service.rs`).
         assert_eq!(
             answer.error_code(),
-            "ValidationException",
-            "case {case:?}: expected ValidationException, got {:?}",
+            "InvalidParameterException",
+            "case {case:?}: expected InvalidParameterException, got {:?}",
+            answer.body
+        );
+        assert!(
+            answer.body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("at 'principalArn' failed to satisfy constraint:"),
+            "case {case:?}: the message must name the member and the constraint, got {:?}",
             answer.body
         );
     }

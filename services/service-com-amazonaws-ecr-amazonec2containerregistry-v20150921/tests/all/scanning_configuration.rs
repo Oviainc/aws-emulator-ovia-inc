@@ -18,6 +18,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::wire::at;
+
 /// A SigV4 credential scope naming this service. It is what routes a request to ECR,
 /// and its region is what a repository ARN is built for.
 const SIGNED_FOR_AP_SOUTH_1: &str = "AWS4-HMAC-SHA256 \
@@ -102,10 +104,6 @@ async fn ok(router: &MultiServiceRouter, case: &str, operation: &str, body: &Val
         answer.status, answer.body
     );
     answer.body
-}
-
-fn at(value: &Value, pointer: &str) -> Value {
-    value.pointer(pointer).cloned().unwrap_or(Value::Null)
 }
 
 /// The batch read of `names`, as a successful body.
@@ -417,10 +415,22 @@ async fn the_batch_size_bounds_are_enforced() {
             "case {case:?}: expected HTTP 400, got {} with {:?}",
             answer.status, answer.body
         );
+        // A refusal against a constraint the model declares is stated with the
+        // client-input error this service models — `InvalidParameterException`, which
+        // this operation declares — naming the member and the bound it failed. See
+        // `override_refusal` in `src/service.rs`.
         assert_eq!(
             answer.error_code(),
-            "ValidationException",
-            "case {case:?}: expected ValidationException, got {:?}",
+            "InvalidParameterException",
+            "case {case:?}: expected InvalidParameterException, got {:?}",
+            answer.body
+        );
+        assert!(
+            answer.body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("at 'repositoryNames' failed to satisfy constraint:"),
+            "case {case:?}: the message must name the member and the bound, got {:?}",
             answer.body
         );
     }

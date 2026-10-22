@@ -302,10 +302,14 @@ async fn a_rule_list_past_the_modelled_maximum_is_refused() {
                 "case {case:?}: expected HTTP 400 for {count} rules, got {} with {:?}",
                 answer.status, answer.body
             );
+            // A refusal against a constraint the model declares is stated with the
+            // client-input error this service models — `InvalidParameterException`,
+            // which this operation declares — naming the member and the bound it
+            // failed. See `override_refusal` in `src/service.rs`.
             assert_eq!(
                 answer.error_code(),
-                "ValidationException",
-                "case {case:?}: expected ValidationException for {count} rules, got {:?}",
+                "InvalidParameterException",
+                "case {case:?}: expected InvalidParameterException for {count} rules, got {:?}",
                 answer.body
             );
             // The refused put left the last accepted configuration in place.

@@ -306,10 +306,14 @@ async fn a_filter_outside_the_modelled_constraint_is_refused_and_stores_nothing(
                  400, got {} with {:?}",
                 answer.status, answer.body
             );
+            // A refusal against a constraint the model declares is stated with the
+            // client-input error this service models — `InvalidParameterException`,
+            // which this operation declares — naming the member and the constraint it
+            // failed. See `override_refusal` in `src/service.rs`.
             assert_eq!(
                 answer.error_code(),
-                "ValidationException",
-                "case {case:?}: expected ValidationException, got {:?}",
+                "InvalidParameterException",
+                "case {case:?}: expected InvalidParameterException, got {:?}",
                 answer.error_code()
             );
         }

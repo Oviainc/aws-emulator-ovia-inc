@@ -300,14 +300,15 @@ async fn a_document_that_is_not_a_registry_policy_is_refused_and_stores_nothing(
     }
 
     // One character past the modelled ceiling is refused at the boundary, before the
-    // handler runs — and stores nothing either.
+    // handler runs — with the client-input error this service models, naming the member
+    // and the bound (`override_refusal` in `src/service.rs`) — and stores nothing either.
     let too_long = policy_of_size(MAX_POLICY_TEXT + 1);
     refused(
         &router,
         "a document one character past the modelled ceiling",
         "PutRegistryPolicy",
         &json!({"policyText": too_long}),
-        "ValidationException",
+        "InvalidParameterException",
     )
     .await;
     let got = ok(&router, "past the ceiling", "GetRegistryPolicy", &json!({})).await;

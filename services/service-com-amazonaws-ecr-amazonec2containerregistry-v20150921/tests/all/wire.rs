@@ -60,6 +60,11 @@ impl Answer {
     pub fn error_code(&self) -> &str {
         self.body["__type"].as_str().unwrap_or_default()
     }
+
+    /// The error message, or the empty string when the answer carries none.
+    pub fn message(&self) -> &str {
+        self.body["message"].as_str().unwrap_or_default()
+    }
 }
 
 /// Call one operation of this service on the awsJson1_1 wire: `POST /` with
@@ -100,6 +105,12 @@ pub async fn ok(router: &MultiServiceRouter, case: &str, operation: &str, body: 
         answer.status, answer.body
     );
     answer.body
+}
+
+/// The value at a JSON pointer, or `null` when the answer carries nothing there — so an
+/// assertion reports the member that is missing rather than panicking on the lookup.
+pub fn at(value: &Value, pointer: &str) -> Value {
+    value.pointer(pointer).cloned().unwrap_or(Value::Null)
 }
 
 /// A refused call: HTTP 400 with the wire error code `code`, or a panic naming the case

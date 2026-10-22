@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -62,6 +62,70 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
         }
+    }
+}
+
+/// The clause ECR states for one refused input member: the member at fault and the
+/// constraint it failed.
+///
+/// ECR words a parameter it will not accept as `Invalid parameter at '<member>' failed
+/// to satisfy constraint: '<requirement>'`, and for a `@pattern` failure the requirement
+/// names the regular expression the member declares. Both halves are built from the
+/// request and the model — the member's dotted path and the constraint the walk found it
+/// outside of — so they are reproduced from the violation here rather than written out
+/// per member. A violation kind this list does not know (the enum is `#[non_exhaustive]`)
+/// keeps the framework's own clause, which states the same two facts in its own words.
+fn clause(violation: &Violation) -> String {
+    let requirement = match &violation.kind {
+        ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
+        ViolationKind::MinLength(min) => {
+            format!("Member must have length greater than or equal to {min}")
+        }
+        ViolationKind::MaxLength(max) => {
+            format!("Member must have length less than or equal to {max}")
+        }
+        ViolationKind::MinValue(min) => {
+            format!("Member must have value greater than or equal to {min}")
+        }
+        ViolationKind::MaxValue(max) => {
+            format!("Member must have value less than or equal to {max}")
+        }
+        // The one requirement NOT worded "Member must …": ECR states a pattern failure
+        // by naming the expression, which is the form the recorded refusal carries.
+        // Deliberate — do not "align" it with the arms around it.
+        ViolationKind::Pattern(pattern) => {
+            format!("must satisfy regular expression '{}'", unanchored(pattern))
+        }
+        ViolationKind::EnumValue(allowed) => {
+            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
+        }
+        ViolationKind::UniqueItems => "Member must have unique values".to_string(),
+        _ => return violation.message(),
+    };
+    format!(
+        "Invalid parameter at '{}' failed to satisfy constraint: '{requirement}'",
+        violation.path
+    )
+}
+
+/// A `@pattern` expression without the anchors a model may spell it with: AWS states
+/// the expression a value must satisfy, not the anchoring the model uses to make the
+/// match total. A `$` escaped by a backslash is a literal dollar sign inside the
+/// expression, not the end anchor, so it stays. (Same rule, and the same reasoning, as
+/// `services/service-com-amazonaws-controlcatalog-controlcatalog/src/service.rs`'s own
+/// `unanchored`; neither service's private helper is reachable from the other.)
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
     }
 }
 
@@ -96,17 +160,51 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // The centralized walk calls this on a framework-level refusal — an absent
+        // required member, or a value outside a `@length`, `@range`, `@pattern`,
+        // `@enum` or `@uniqueItems` the model declares — before any handler runs.
+        //
+        // ECR states such an input as `InvalidParameterException` ("The specified
+        // parameter is invalid. Review the available parameters for the API request."):
+        // 57 of this model's 58 operations declare it, and it is the only client-input
+        // error `CreateRepository`, `DescribeRepositories`, `ListImages`, `DescribeImages`
+        // and `PutImage` declare at all. The framework's default code,
+        // `ValidationException`, is not in those operations' error sets — the model binds
+        // its own `ValidationException` ("There was an exception validating this request")
+        // only to other operations — so a client branching on ECR's documented code sees
+        // an error its SDK cannot even name. This seam is per SERVICE, not per operation,
+        // so the code chosen here is the one nearly every operation models.
+        //
+        // The status stays with the protocol: awsJson1_1 renders a refusal as HTTP 400,
+        // which is `InvalidParameterException`'s modelled status.
+        match refusal {
+            // Every operation but `DeleteSigningConfiguration` declares this error; that
+            // one declares ECR's own `ValidationException` instead, and this seam cannot
+            // name the operation, so it answers the code the other 57 model rather than
+            // the framework's synthetic one, which none of them models.
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "InvalidParameterException".to_string(),
+                // Every member at fault, so a caller fixes the request from the message
+                // alone; one refused member is the single-clause case of the same rule.
+                // A refusal that named no violation still answers the modelled code,
+                // with the error shape's own documented sentence: the alternative is
+                // falling through to a code no operation here models.
+                message: if violations.is_empty() {
+                    "The specified parameter is invalid. Review the available parameters \
+                     for the API request."
+                        .to_string()
+                } else {
+                    violations
+                        .iter()
+                        .map(clause)
+                        .collect::<Vec<String>>()
+                        .join("; ")
+                },
+            }),
+            // Authentication is not this service's concern, and a refusal kind added
+            // later keeps the framework's wording until it is worded here.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
