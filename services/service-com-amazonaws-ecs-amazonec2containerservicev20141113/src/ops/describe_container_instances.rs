@@ -211,11 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !seen.insert(arn.clone()) {
                 continue;
             }
-            match guard
-                .container_instances
-                .get(&arn)
-                .filter(|instance| instance.cluster_name == cluster_name)
-            {
+            match guard.resolve_container_instance(&region, &cluster_name, reference) {
                 Some(instance) => container_instances.push(instance.view(fields)),
                 None => failures.push(crate::state::missing_failure(&arn)),
             }

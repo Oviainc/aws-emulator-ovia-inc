@@ -21,8 +21,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    count, create_cluster, identity_document, list, ok, refused, service, string, ACCOUNT,
-    SIGNED_REGION,
+    count, create_cluster, identity_document, list, ok, refused, register_instance, service,
+    string, ACCOUNT, SIGNED_REGION,
 };
 
 /// Every value `ContainerInstanceStatus` takes, from the model's enum (smithy_query
@@ -46,26 +46,6 @@ type RegistrationRow = (&'static str, Option<&'static str>, Value, Value, Value)
 /// One row of the describe table: the case name, the ids the request names, the ARNs
 /// expected back and the ARNs expected as `MISSING` failures.
 type DescribeRow = (&'static str, Vec<String>, Vec<String>, Vec<String>);
-
-/// Register one container instance into `cluster` and return its ARN.
-async fn register_instance(
-    router: &MultiServiceRouter,
-    cluster: &str,
-    instance_id: &str,
-    case: &str,
-) -> String {
-    let body = ok(
-        router,
-        "RegisterContainerInstance",
-        json!({
-            "cluster": cluster,
-            "instanceIdentityDocument": identity_document(instance_id),
-        }),
-        case,
-    )
-    .await;
-    string(&body["containerInstance"], "containerInstanceArn", case)
-}
 
 /// The ARNs `ListContainerInstances` answers with for one request.
 async fn list_instances(router: &MultiServiceRouter, request: Value, case: &str) -> Vec<String> {
