@@ -170,7 +170,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = store.resolve_asset_id(&input.asset_id).ok_or_else(|| {
             DeleteAssetError::Modeled(DeleteAssetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("The asset {} could not be found.", input.asset_id),
+                    message: crate::state::not_found_message(
+                        crate::state::RESOURCE_ASSET,
+                        &input.asset_id,
+                    ),
                 },
             ))
         })?;

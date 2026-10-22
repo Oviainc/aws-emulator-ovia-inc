@@ -26,6 +26,13 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex codec for those ids and for the opaque `PaginationToken` this service issues.
 hex = { workspace = true }
+# PEM decoding of the `publicKeyMaterial` an `ImportPlaybackKeyPair` call carries.
+pem = "3"
+# SubjectPublicKeyInfo parsing, so an import is refused unless the material really
+# is a DER-encoded public key.
+spki = "0.7"
+# MD5 digest: a playback key pair's fingerprint is the MD5 of its public key's DER.
+md-5 = "0.10"
 # The modelled `@pattern` this service enforces itself (the tagging `ResourceArn`, whose
 # modelled pattern no IVS ARN can satisfy) is run through the same regex engine the
 # framework's own constraint walk uses, at the minor version that walk pins.
@@ -37,6 +44,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Real key pairs for the playback-key-pair tests, so what they import is a genuine
+# public key rather than a hand-built byte string.
+rcgen = "0.13"
 
 [lints]
 workspace = true
