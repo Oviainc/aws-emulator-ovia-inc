@@ -144,22 +144,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         // The whitelist rules are validated BEFORE anything is written, so a
-        // refused request mints no group and leaves no partial one behind.
-        let requested = input.whitelist_rules.unwrap_or_default();
-        let mut whitelist_rules: Vec<String> = Vec::with_capacity(requested.len());
-        for (index, rule) in requested.into_iter().enumerate() {
-            let cidr = rule.cidr.ok_or_else(|| {
-                bad_request(format!(
-                    "WhitelistRules[{index}].Cidr is required: a whitelist rule must name an IPv4 CIDR to whitelist"
-                ))
-            })?;
-            if !crate::state::is_ipv4_cidr(&cidr) {
-                return Err(bad_request(format!(
-                    "WhitelistRules[{index}].Cidr must be an IPv4 CIDR with a prefix length of 0 to 32 (for example 10.0.0.0/16); got {cidr:?}"
-                )));
-            }
-            whitelist_rules.push(cidr);
-        }
+        // refused request mints no group and leaves no partial one behind. The
+        // rule itself lives in `state`, shared with `UpdateInputSecurityGroup`.
+        let whitelist_rules =
+            crate::state::whitelist_rules_from_request(input.whitelist_rules.unwrap_or_default())
+                .map_err(bad_request)?;
 
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();

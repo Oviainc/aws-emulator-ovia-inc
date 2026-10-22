@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateInputSecurityGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateInputSecurityGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateInputSecurityGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! "Update an Input Security Group's Whilelists": the group named by the path label is
+//! looked up in this service's store, the members the request carries replace the stored
+//! ones, and the response is read back out of the updated record — never built from the
+//! request. A member the request omits leaves that setting as it was, so an update that
+//! names only `WhitelistRules` keeps the group's tags and the other way round.
+//!
+//! `State`, `Inputs` and `Channels` stay DERIVED from the rest of the state
+//! (`ComAmazonawsMedialiveMedialiveState::input_security_group_description`): they report
+//! what currently uses the group, which a change to its whitelist does not touch. Nothing
+//! in the model documents a hold in `UPDATING`, and `CreateInputSecurityGroup` answers
+//! with a group that is already `IDLE`, so a whitelist change takes effect on the call
+//! that makes it and the group owes the clock no transition.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +158,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateInputSecurityGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateInputSecurityGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateInputSecurityGroup"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // The requested rules are validated BEFORE the store is touched, so a
+        // refused update leaves the group's whitelist exactly as it was rather
+        // than applying a prefix of the new one. The IPv4 CIDR rule is the one
+        // `CreateInputSecurityGroup` enforces, shared from `crate::state`.
+        let requested_rules = match input.whitelist_rules {
+            Some(rules) => {
+                Some(crate::state::whitelist_rules_from_request(rules).map_err(bad_request)?)
+            }
+            None => None,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // The response reports which inputs and channels use the group, so this
+        // handler reads those stores: `settle` materialises the channel
+        // transitions the clock had already made due, which were owed whether or
+        // not this update ran.
+        state.settle(now);
+
+        let Some(group) = state
+            .input_security_groups
+            .get_mut(&input.input_security_group_id)
+        else {
+            return Err(UpdateInputSecurityGroupErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Input security group not found: {}",
+                        input.input_security_group_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // A member the request carries replaces the stored one; a member it omits
+        // leaves that setting as it was. An empty `WhitelistRules` list is a
+        // value like any other: it clears the group's whitelist, which is not the
+        // same as omitting the member.
+        if let Some(rules) = requested_rules {
+            group.whitelist_rules = rules;
+        }
+        if let Some(tags) = input.tags {
+            group.tags = tags;
+        }
+
+        // Read back out of the store, so the response reports what was written
+        // rather than what the request asked for.
+        let security_group = state
+            .input_security_group_description(&input.input_security_group_id)
+            .ok_or_else(unavailable)?;
+        Ok(UpdateInputSecurityGroupOutput {
+            security_group: Some(security_group),
+        })
     }
 }
+
+/// Refuse a request whose whitelist rules are not IPv4 CIDRs, with the
+/// operation's own modelled client error (HTTP 400).
+fn bad_request(message: String) -> UpdateInputSecurityGroupError {
+    UpdateInputSecurityGroupErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to update the group in. A modelled server error, never a
+/// fresh engine (which would drop the write when this request returns).
+fn unavailable() -> UpdateInputSecurityGroupError {
+    UpdateInputSecurityGroupErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
+}
+
