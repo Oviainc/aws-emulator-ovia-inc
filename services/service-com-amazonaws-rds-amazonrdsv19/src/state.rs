@@ -33,9 +33,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
     Certificate, CertificateDetails, DBInstance, DBParameterGroupStatus, DBSecurityGroupMembership,
-    DBSnapshot, DBSubnetGroup, DomainMembership, Endpoint, EventCategoriesMap, Option2,
-    OptionGroup, OptionGroupMembership, OptionSetting, PendingModifiedValues, Tag,
-    VpcSecurityGroupMembership,
+    DBSnapshot, DBSubnetGroup, DomainMembership, Endpoint, EventCategoriesMap, EventSubscription,
+    GlobalCluster, GlobalClusterMember, Option2, OptionGroup, OptionGroupMembership, OptionSetting,
+    PendingModifiedValues, Tag, VpcSecurityGroupMembership,
 };
 
 pub mod option_catalog;
@@ -153,6 +153,24 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     pub db_instances: BTreeMap<RegionalKey, DbInstanceRecord>,
     /// DB snapshots by `(region, DBSnapshotIdentifier)`. Ordered, for the same reason.
     pub db_snapshots: BTreeMap<RegionalKey, DbSnapshotRecord>,
+    /// Event notification subscriptions by `(region, SubscriptionName)`. Ordered, so
+    /// `DescribeEventSubscriptions` pages deterministically within a region.
+    ///
+    /// Nothing in this crate INSERTS here yet: the only operations that mint or remove a
+    /// subscription (`CreateEventSubscription`, `DeleteEventSubscription`) are still
+    /// scaffolded, so they also own the quota that bounds this map when they are written.
+    /// `DescribeEventSubscriptions` reports what is here, which is how a subscription
+    /// becomes visible the moment its writer lands.
+    pub event_subscriptions: BTreeMap<RegionalKey, EventSubscriptionRecord>,
+    /// Aurora global database clusters by `GlobalClusterIdentifier`.
+    ///
+    /// Keyed by the identifier ALONE, not by `(region, identifier)` like the maps above: a
+    /// global cluster is an ACCOUNT-scoped resource whose ARN carries no region
+    /// (`arn:aws:rds::<account>:global-cluster:<id>`) and spans the regions of its member
+    /// clusters, so `DescribeGlobalClusters` reports it whatever region the request is
+    /// signed for. As with the subscriptions above, its writers (`CreateGlobalCluster`,
+    /// `DeleteGlobalCluster`) are still scaffolded and own the bound on this map.
+    pub global_clusters: BTreeMap<String, GlobalClusterRecord>,
     /// Option groups by `(region, OptionGroupName)`. Ordered, so
     /// `DescribeOptionGroups` pages deterministically within a region.
     pub option_groups: BTreeMap<RegionalKey, OptionGroupRecord>,
@@ -221,6 +239,12 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     /// The DB snapshots stored in `region`, in identifier order.
     pub fn snapshots_in(&self, region: &str) -> Vec<&DbSnapshotRecord> {
         range_in(&self.db_snapshots, region)
+    }
+
+    /// The event notification subscriptions stored in `region`, in subscription-name
+    /// order.
+    pub fn event_subscriptions_in(&self, region: &str) -> Vec<&EventSubscriptionRecord> {
+        range_in(&self.event_subscriptions, region)
     }
 
     /// The option groups stored in `region`, in name order.
@@ -685,6 +709,63 @@ impl DbSnapshotRecord {
     }
 }
 
+/// A stored RDS event notification subscription: the record `DescribeEventSubscriptions`
+/// reports.
+///
+/// Regional, like the DB instances and snapshots above: a subscription is created in one
+/// region and `DescribeEventSubscriptions` lists that region's subscriptions.
+#[derive(Debug, Clone)]
+pub struct EventSubscriptionRecord {
+    /// The caller's `SubscriptionName`, and the second half of this record's key.
+    pub subscription_name: String,
+    /// The region the subscription was created in; the scope of its ARN.
+    pub region: String,
+    /// `SnsTopicArn`: the topic RDS publishes the events to.
+    pub sns_topic_arn: String,
+    /// `Status`: "Can be one of the following: creating | modifying | deleting | active |
+    /// no-permission | topic-not-exist" (`EventSubscription$Status`).
+    pub status: String,
+    /// `SubscriptionCreationTime`, which the model types as a STRING rather than a
+    /// timestamp, so the record carries the rendered form its writer chose.
+    pub subscription_creation_time: String,
+    /// `SourceType`, absent when the subscription covers every source type.
+    pub source_type: Option<String>,
+    /// `SourceIdsList`.
+    pub source_ids: Vec<String>,
+    /// `EventCategoriesList`.
+    pub event_categories: Vec<String>,
+    /// `Enabled`.
+    pub enabled: bool,
+}
+
+impl EventSubscriptionRecord {
+    /// `arn:aws:rds:<region>:<account>:es:<subscription name>` — the `es` resource type
+    /// RDS gives an event subscription.
+    pub fn arn(&self) -> String {
+        emulator_server::emulator_arn(
+            ARN_NAMESPACE,
+            &self.region,
+            &format!("es:{}", self.subscription_name),
+        )
+    }
+
+    /// Project the stored record onto the modelled `EventSubscription` output shape.
+    pub fn to_wire(&self) -> EventSubscription {
+        EventSubscription {
+            customer_aws_id: Some(emulator_server::emulator_account_id().to_string()),
+            cust_subscription_id: Some(self.subscription_name.clone()),
+            sns_topic_arn: Some(self.sns_topic_arn.clone()),
+            status: Some(self.status.clone()),
+            subscription_creation_time: Some(self.subscription_creation_time.clone()),
+            source_type: self.source_type.clone(),
+            source_ids_list: Some(self.source_ids.clone()),
+            event_categories_list: Some(self.event_categories.clone()),
+            enabled: Some(self.enabled),
+            event_subscription_arn: Some(self.arn()),
+        }
+    }
+}
+
 /// A stored option group: everything `CreateOptionGroup` persists about one, plus the
 /// options `ModifyOptionGroup` has added to it.
 ///
@@ -746,6 +827,89 @@ impl OptionGroupRecord {
             // to a group `CopyOptionGroup` produced. None describes a group created
             // here, so none is reported rather than carrying a made-up value.
             ..OptionGroup::default()
+        }
+    }
+}
+
+/// A stored Aurora global database cluster: the record `DescribeGlobalClusters` reports.
+///
+/// Account-scoped rather than regional — see
+/// [`ComAmazonawsRdsAmazonrdsv19State::global_clusters`].
+#[derive(Debug, Clone)]
+pub struct GlobalClusterRecord {
+    /// The caller's `GlobalClusterIdentifier`, and this record's key.
+    pub identifier: String,
+    /// `GlobalClusterResourceId`: the immutable, server-minted id.
+    pub resource_id: String,
+    /// `Status`.
+    pub status: String,
+    /// `Engine`.
+    pub engine: Option<String>,
+    /// `EngineVersion`.
+    pub engine_version: Option<String>,
+    /// `DatabaseName`.
+    pub database_name: Option<String>,
+    /// `StorageEncrypted`.
+    pub storage_encrypted: bool,
+    /// `DeletionProtection`.
+    pub deletion_protection: bool,
+    /// The ARNs of the member DB clusters, the PRIMARY (writer) first: that order is what
+    /// [`Self::to_wire`] reports as `GlobalClusterMember$IsWriter`, and the regions in
+    /// these ARNs are what the documented `region` filter of `DescribeGlobalClusters`
+    /// matches on.
+    pub member_cluster_arns: Vec<String>,
+}
+
+impl GlobalClusterRecord {
+    /// `arn:aws:rds::<account>:global-cluster:<identifier>`. A global cluster spans
+    /// regions, so — as AWS does — the ARN's region segment is EMPTY.
+    pub fn arn(&self) -> String {
+        emulator_server::emulator_arn(
+            ARN_NAMESPACE,
+            "",
+            &format!("global-cluster:{}", self.identifier),
+        )
+    }
+
+    /// Whether any member cluster of this global cluster lives in `region`, which is what
+    /// the one documented filter of `DescribeGlobalClusters` selects on: "the only
+    /// supported filter is `region` … any global cluster with at least one member (primary
+    /// or secondary) in the specified Amazon Web Services Regions".
+    pub fn has_member_in(&self, region: &str) -> bool {
+        self.member_cluster_arns
+            .iter()
+            .any(|arn| arn_region(arn) == Some(region))
+    }
+
+    /// Project the stored record onto the modelled `GlobalCluster` output shape.
+    pub fn to_wire(&self) -> GlobalCluster {
+        GlobalCluster {
+            global_cluster_identifier: Some(self.identifier.clone()),
+            global_cluster_resource_id: Some(self.resource_id.clone()),
+            global_cluster_arn: Some(self.arn()),
+            status: Some(self.status.clone()),
+            engine: self.engine.clone(),
+            engine_version: self.engine_version.clone(),
+            database_name: self.database_name.clone(),
+            storage_encrypted: Some(self.storage_encrypted),
+            deletion_protection: Some(self.deletion_protection),
+            global_cluster_members: Some(
+                self.member_cluster_arns
+                    .iter()
+                    .enumerate()
+                    .map(|(position, arn)| GlobalClusterMember {
+                        db_cluster_arn: Some(arn.clone()),
+                        // The primary is stored first; every other member is a secondary.
+                        is_writer: Some(position == 0),
+                        readers: Some(Vec::new()),
+                        ..GlobalClusterMember::default()
+                    })
+                    .collect(),
+            ),
+            // `FailoverState` "is empty unless the SwitchoverGlobalCluster or
+            // FailoverGlobalCluster operation was called on this global cluster", and
+            // neither is implemented in this crate, so nothing can have set one.
+            ..GlobalCluster::default()
         }
     }
 }
@@ -851,6 +1015,19 @@ impl OptionRecord {
             ),
         }
     }
+}
+
+/// The region segment of an ARN (`arn:aws:<service>:<region>:<account>:<resource>`), or
+/// `None` when `value` does not have that shape. Empty for a region-less ARN, which is
+/// how a global resource's ARN reads.
+fn arn_region(value: &str) -> Option<&str> {
+    let mut fields = value.split(':');
+    let (Some("arn"), Some(_partition), Some(_service), Some(region)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return None;
+    };
+    Some(region)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

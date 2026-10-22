@@ -204,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         DescribeDBSnapshotsError::from(
                             DescribeDBSnapshotsErrorModeled::DBSnapshotNotFoundFault(
                                 DBSnapshotNotFoundFault {
-                                    message: Some(format!("DBSnapshot {requested} not found")),
+                                    message: Some(format!("DBSnapshot {requested} not found.")),
                                 },
                             ),
                         )

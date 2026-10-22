@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ApplyPendingMaintenanceAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ApplyPendingMaintenanceAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation resolves the request's resource ARN in this service's
+//! store and reports that resource's pending maintenance actions. It is the ONLY file to
+//! touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ApplyPendingMaintenanceAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +112,45 @@ impl From<ApplyPendingMaintenanceActionErrorModeled> for ApplyPendingMaintenance
     }
 }
 
+/// The values `ApplyPendingMaintenanceActionMessage$ApplyAction` documents: "Valid Values:
+/// ca-certificate-rotation db-upgrade hardware-maintenance os-upgrade system-update".
+/// A request naming anything else is refused rather than answered, because the member is a
+/// plain `String` in the model, so the boundary validator cannot refuse it.
+const APPLY_ACTION_VALUES: [&str; 5] = [
+    "ca-certificate-rotation",
+    "db-upgrade",
+    "hardware-maintenance",
+    "os-upgrade",
+    "system-update",
+];
+
+/// The values `ApplyPendingMaintenanceActionMessage$OptInType` documents: "Valid Values:
+/// immediate … next-maintenance … undo-opt-in". Refused for the same reason as
+/// [`APPLY_ACTION_VALUES`].
+const OPT_IN_TYPE_VALUES: [&str; 3] = ["immediate", "next-maintenance", "undo-opt-in"];
+
+/// Refuse a member whose value is outside the list its own documentation publishes,
+/// naming the member, the value and the values it admits.
+fn check_value(member: &str, value: &str, allowed: &[&str]) -> Result<(), String> {
+    if allowed.contains(&value) {
+        return Ok(());
+    }
+    Err(format!(
+        "invalid value '{value}' for {member}: valid values are {}",
+        allowed.join(", ")
+    ))
+}
+
+/// The resource NAME a `ResourceIdentifier` ends with: the last `:`-separated field of an
+/// RDS ARN (`arn:aws:rds:<region>:<account>:<type>:<name>` -> `<name>`), and the whole
+/// value when it carries none.
+///
+/// RDS names the RESOURCE in this fault's message, not the ARN the caller passed, so the
+/// name is taken from the request rather than echoed whole.
+fn resource_name(resource: &str) -> &str {
+    resource.rsplit(':').next().unwrap_or(resource)
+}
+
 /// The `ApplyPendingMaintenanceAction` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -151,18 +187,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ApplyPendingMaintenanceAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ApplyPendingMaintenanceActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ApplyPendingMaintenanceAction"))
+        let region = crate::state::request_region(ctx)
+            .map_err(ApplyPendingMaintenanceActionError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot resolve the resource at all; 501 is the honest answer.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due, so a resource that has just become
+        // available is reported in the state it is really in.
+        store.settle_due_transitions(&region);
+
+        // `ResourceIdentifier` is "the RDS Amazon Resource Name (ARN) of the resource that
+        // the pending maintenance action applies to", so the request is resolved by ARN
+        // against what this service stores. RDS is regional: only the region the request
+        // was signed for is in scope, which is also the region a resource's own ARN names.
+        let resource = input.resource_identifier.trim().to_string();
+        let resolved = store
+            .instances_in(&region)
+            .into_iter()
+            .find(|record| record.arn() == resource)
+            .map(|record| record.arn());
+        let Some(resource_arn) = resolved else {
+            return Err(
+                ApplyPendingMaintenanceActionErrorModeled::ResourceNotFoundFault(
+                    ResourceNotFoundFault {
+                        message: Some(format!("Resource not found: {}", resource_name(&resource))),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Only once the resource is resolved: `ApplyAction` and `OptInType` say what to do
+        // WITH it, so a request that names a resource this service does not hold is
+        // answered with the 404 above rather than with a complaint about those members.
+        check_value("ApplyAction", &input.apply_action, &APPLY_ACTION_VALUES)
+            .map_err(ApplyPendingMaintenanceActionError::validation)?;
+        check_value("OptInType", &input.opt_in_type, &OPT_IN_TYPE_VALUES)
+            .map_err(ApplyPendingMaintenanceActionError::validation)?;
+
+        // What the resource has pending. This service schedules no maintenance action —
+        // nothing in it ever writes one — so a resolved resource has none, and the honest
+        // answer is its EMPTY action list rather than a detail for work nothing scheduled
+        // and nothing applied. `ResourcePendingMaintenanceActions` is exactly that report:
+        // "Describes the pending maintenance actions for a resource."
+        Ok(ApplyPendingMaintenanceActionOutput {
+            resource_pending_maintenance_actions: Some(ResourcePendingMaintenanceActions {
+                resource_identifier: Some(resource_arn),
+                pending_maintenance_action_details: Some(Vec::new()),
+            }),
+        })
     }
 }
