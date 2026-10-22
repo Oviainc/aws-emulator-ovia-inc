@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/function_configuration.rs"]
+mod function_configuration;
 #[path = "all/function_lifecycle.rs"]
 mod function_lifecycle;
 #[path = "all/resource_policy.rs"]

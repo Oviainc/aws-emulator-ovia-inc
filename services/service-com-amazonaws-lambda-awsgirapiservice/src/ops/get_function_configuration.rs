@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFunctionConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFunctionConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFunctionConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the version-specific configuration of the function record [`crate::state`]
+//! holds — the same `FunctionConfiguration` `GetFunction` reports under its
+//! `Configuration` member, without the code location, the tags or the concurrency that
+//! are not version-specific settings.
+//!
+//! The operation is `@readonly`: it resolves the `FunctionName`/`Qualifier` pair to one
+//! stored record and one version label through [`crate::state::resolve_function`] and
+//! answers out of what is stored. The only thing that resolution writes is the
+//! `Pending` -> `Active` move the CLOCK already made due, which would have been owed at
+//! the same instant even if nobody had called.
 //!
 //! ## Shape of an operation
 //!
@@ -259,18 +261,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFunctionConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFunctionConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFunctionConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetFunctionConfigurationErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+        let (record, version) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &region,
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                GetFunctionConfigurationErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                GetFunctionConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+        })?;
+
+        // `resolve_function` already refused a version this function does not hold, so
+        // the configuration is there to report.
+        let Some(config) = record.config_of(&version).cloned() else {
+            return Err(GetFunctionConfigurationErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("The resolved function version could not be read".to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(function_configuration(
+            record.configuration(&version, &config),
+        ))
     }
 }
+
+/// Re-key the `FunctionConfiguration` [`crate::state`] builds onto this operation's own
+/// output struct.
+///
+/// The model gives `GetFunctionConfiguration` the very same `FunctionConfiguration`
+/// output shape as `CreateFunction`, but the generated types name one struct per
+/// operation, so the two are distinct Rust types over identical members. The values are
+/// therefore computed in ONE place
+/// ([`crate::state::FunctionRecord::configuration`]) and only moved across here.
+/// Destructuring without `..` is deliberate: a member added to the shape fails to
+/// compile here rather than silently dropping out of this operation's answer.
+fn function_configuration(configuration: CreateFunctionOutput) -> GetFunctionConfigurationOutput {
+    let CreateFunctionOutput {
+        function_name,
+        function_arn,
+        runtime,
+        role,
+        handler,
+        code_size,
+        description,
+        timeout,
+        memory_size,
+        last_modified,
+        code_sha256,
+        version,
+        vpc_config,
+        dead_letter_config,
+        environment,
+        kms_key_arn,
+        tracing_config,
+        master_arn,
+        revision_id,
+        layers,
+        state,
+        state_reason,
+        state_reason_code,
+        last_update_status,
+        last_update_status_reason,
+        last_update_status_reason_code,
+        file_system_configs,
+        signing_profile_version_arn,
+        signing_job_arn,
+        package_type,
+        image_config_response,
+        architectures,
+        ephemeral_storage,
+        snap_start,
+        runtime_version_config,
+        logging_config,
+        tenancy_config,
+        capacity_provider_config,
+        config_sha256,
+        durable_config,
+    } = configuration;
+    GetFunctionConfigurationOutput {
+        function_name,
+        function_arn,
+        runtime,
+        role,
+        handler,
+        code_size,
+        description,
+        timeout,
+        memory_size,
+        last_modified,
+        code_sha256,
+        version,
+        vpc_config,
+        dead_letter_config,
+        environment,
+        kms_key_arn,
+        tracing_config,
+        master_arn,
+        revision_id,
+        layers,
+        state,
+        state_reason,
+        state_reason_code,
+        last_update_status,
+        last_update_status_reason,
+        last_update_status_reason_code,
+        file_system_configs,
+        signing_profile_version_arn,
+        signing_job_arn,
+        package_type,
+        image_config_response,
+        architectures,
+        ephemeral_storage,
+        snap_start,
+        runtime_version_config,
+        logging_config,
+        tenancy_config,
+        capacity_provider_config,
+        config_sha256,
+        durable_config,
+    }
+}
+
