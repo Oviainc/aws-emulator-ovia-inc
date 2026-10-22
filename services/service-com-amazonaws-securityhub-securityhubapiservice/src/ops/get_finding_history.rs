@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFindingHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFindingHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFindingHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the change events recorded for one finding, addressed by the modelled
+//! `AwsSecurityFindingIdentifier` (`ProductArn` + `Id`): the events
+//! `BatchImportFindings` and `BatchUpdateFindings` appended to the stored finding,
+//! most recent first, narrowed to the requested time window and paged with
+//! `MaxResults` / `NextToken`. A reporting operation: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -164,6 +160,29 @@ impl<Eng> GetFindingHistory<Eng> {
     }
 }
 
+/// The largest page `MaxResults` can ask for, and the page size when the caller asks
+/// for none: "If you don’t provide it, Security Hub CSPM returns up to 100 results of
+/// finding history" (`GetFindingHistoryRequest$MaxResults`), which is also that
+/// member's modelled `@range` maximum.
+pub const MAX_RESULTS_LIMIT: usize = 100;
+
+/// Marker the opaque `NextToken` carries, so a token minted for another list — or a
+/// value a caller invented — is rejected rather than read as an offset.
+const NEXT_TOKEN_PREFIX: &str = "securityhub:findinghistory:";
+
+/// A `NextToken` resuming at `offset` in the selected history. Opaque to the caller:
+/// the cursor is hex-encoded, so nothing in the response invites arithmetic on it.
+fn encode_next_token(offset: usize) -> String {
+    ::hex::encode(format!("{NEXT_TOKEN_PREFIX}{offset}"))
+}
+
+/// The offset a `NextToken` resumes at, or `None` when it is not one this operation
+/// minted.
+fn decode_next_token(token: &str) -> Option<usize> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    decoded.strip_prefix(NEXT_TOKEN_PREFIX)?.parse().ok()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for GetFindingHistory<Eng>
 {
@@ -181,18 +200,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFindingHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFindingHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFindingHistory"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetFindingHistoryError::Modeled(GetFindingHistoryErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the Security Hub CSPM state store is unavailable".to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+        let invalid_input = |message: String| {
+            GetFindingHistoryError::Modeled(GetFindingHistoryErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                    code: Some("InvalidInputException".to_string()),
+                },
+            ))
+        };
+
+        let (account_id, region) = crate::state::hub_key(ctx);
+        let store = state.lock();
+        if !store.hubs.contains_key(&(account_id.clone(), region.clone())) {
+            return Err(GetFindingHistoryErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(format!(
+                        "Account {account_id} is not subscribed to Security Hub CSPM in Region {region}"
+                    )),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Whether the window is a window at all is decided before any event is read,
+        // so an inverted one is refused identically on a finding with history and on
+        // one with none.
+        let start_nanos = input.start_time.as_ref().map(crate::state::datetime_nanos);
+        let end_nanos = input.end_time.as_ref().map(crate::state::datetime_nanos);
+        if let (Some(start), Some(end)) = (start_nanos, end_nanos) {
+            if start > end {
+                return Err(invalid_input(
+                    "StartTime must not be later than EndTime".to_string(),
+                ));
+            }
+        }
+
+        let identifier = input.finding_identifier;
+        let key = crate::state::FindingKey {
+            account_id,
+            region,
+            product_arn: identifier.product_arn.clone(),
+            finding_id: identifier.id.clone(),
+        };
+        // An identifier no stored finding carries has no history, which is an empty
+        // list rather than an error: this operation reports history, so a window that
+        // selects nothing is still a successful report of nothing.
+        let mut selected: Vec<&crate::state::FindingHistoryEvent> = store
+            .findings
+            .get(&key)
+            .map(|stored| stored.history.as_slice())
+            .unwrap_or_default()
+            .iter()
+            // An omitted bound is the widest the member documents — the finding's own
+            // `CreatedAt` for `StartTime`, "the time at which the API is called" for
+            // `EndTime` — and every recorded event lies inside that, so an omitted
+            // bound selects everything.
+            .filter(|event| {
+                let Some(at) = crate::state::parse_iso8601_nanos(&event.update_time) else {
+                    return false;
+                };
+                start_nanos.is_none_or(|start| at >= start)
+                    && end_nanos.is_none_or(|end| at <= end)
+            })
+            .collect();
+        // Most recent change first, then the write sequence, so two events recorded at
+        // the same instant never swap places between two calls and `NextToken` paging
+        // is repeatable. The stored history is bounded
+        // (`state::MAX_HISTORY_EVENTS_PER_FINDING`), so this ordering is over a
+        // bounded number of events.
+        selected.sort_by(|left, right| {
+            let left_at = crate::state::parse_iso8601_nanos(&left.update_time).unwrap_or_default();
+            let right_at = crate::state::parse_iso8601_nanos(&right.update_time).unwrap_or_default();
+            right_at.cmp(&left_at).then_with(|| right.seq.cmp(&left.seq))
+        });
+
+        // `MaxResults` is modelled `@range(min: 1, max: 100)`, so the boundary
+        // validator already refuses a value outside it; clamping here keeps the page
+        // bounded even if this handler is reached another way.
+        let page_size = input.max_results.map_or(MAX_RESULTS_LIMIT, |requested| {
+            usize::try_from(requested)
+                .unwrap_or(MAX_RESULTS_LIMIT)
+                .clamp(1, MAX_RESULTS_LIMIT)
+        });
+        let offset = match input.next_token.as_deref() {
+            Some(token) => decode_next_token(token).ok_or_else(|| {
+                invalid_input("NextToken is not a token this operation issued".to_string())
+            })?,
+            None => 0,
+        };
+        if offset > selected.len() {
+            return Err(invalid_input(
+                "NextToken refers to a position past the end of the result set".to_string(),
+            ));
+        }
+
+        let records: Vec<FindingHistoryRecord> = selected
+            .iter()
+            .skip(offset)
+            .take(page_size)
+            .map(|event| FindingHistoryRecord {
+                finding_identifier: Some(AwsSecurityFindingIdentifier {
+                    id: identifier.id.clone(),
+                    product_arn: identifier.product_arn.clone(),
+                }),
+                update_time: crate::state::parse_iso8601(&event.update_time),
+                finding_created: Some(event.finding_created),
+                update_source: Some(FindingHistoryUpdateSource {
+                    r#type: Some(event.source_type.clone()),
+                    identity: Some(event.source_identity.clone()),
+                }),
+                updates: Some(event.updates.clone()),
+                // The pagination token belongs to the response, which carries it once
+                // in its own `NextToken`.
+                next_token: None,
+            })
+            .collect();
+        let next_offset = offset + records.len();
+        let next_token = (next_offset < selected.len()).then(|| encode_next_token(next_offset));
+
+        Ok(GetFindingHistoryOutput {
+            records: Some(records),
+            next_token,
+        })
     }
 }
