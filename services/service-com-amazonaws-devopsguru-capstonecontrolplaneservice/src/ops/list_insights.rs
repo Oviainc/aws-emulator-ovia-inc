@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInsights
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInsights`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInsights::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the insights DevOps Guru's analysis produced for this account, selected by
+//! the ONE status filter the request names. A pure read: it never writes to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +152,290 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInsights` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInsightsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInsights"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListInsightsError::Modeled(ListInsightsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the DevOps Guru insight store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            ))
+        })?;
+
+        let selector = Selector::of(&input.status_filter)?;
+        let page_size = input
+            .max_results
+            .map_or(crate::state::PAGE_SIZE, |requested| {
+                (requested as usize).clamp(1, crate::state::PAGE_SIZE)
+            });
+
+        let guard = state.lock();
+        // Select, then page: a token names an offset into the insights THIS selector
+        // matches, so it is scoped to the selector and does not resolve against another.
+        let matching: Vec<&crate::state::InsightRecord> = guard
+            .insights
+            .values()
+            .filter(|insight| selector.matches(insight))
+            .collect();
+
+        let (page, next_token) = crate::state::page_sized(
+            &matching,
+            &selector.page_scope(),
+            input.next_token.as_deref(),
+            page_size,
+        )
+        .ok_or_else(|| -> ListInsightsError {
+            ListInsightsErrorModeled::ValidationException(ValidationException {
+                message:
+                    "NextToken does not name a page of the insights this status filter selects"
+                        .to_string(),
+                reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                fields: Some(vec![ValidationExceptionField {
+                    name: "NextToken".to_string(),
+                    message:
+                        "must be a token returned by an earlier ListInsights for the same StatusFilter"
+                            .to_string(),
+                }]),
+            })
+            .into()
+        })?;
+
+        // An insight is reported in the list for ITS OWN type, so the page is
+        // partitioned rather than placed wholesale in one list.
+        let proactive_insights: Vec<ProactiveInsightSummary> = page
+            .iter()
+            .filter(|insight| insight.insight_type == PROACTIVE)
+            .map(|insight| insight.to_proactive_summary())
+            .collect();
+        let reactive_insights: Vec<ReactiveInsightSummary> = page
+            .iter()
+            .filter(|insight| insight.insight_type == REACTIVE)
+            .map(|insight| insight.to_reactive_summary())
+            .collect();
+
+        // An account whose analysis produced no matching insight is not an error: both
+        // lists are simply empty.
+        Ok(ListInsightsOutput {
+            proactive_insights: Some(proactive_insights),
+            reactive_insights: Some(reactive_insights),
+            next_token,
+        })
     }
+}
+
+/// `InsightType`'s two values, from `INSIGHT_TYPE_VALUES`.
+const PROACTIVE: &str = "PROACTIVE";
+const REACTIVE: &str = "REACTIVE";
+
+/// `InsightStatus`'s two values, from `INSIGHT_STATUS_VALUES`.
+const ONGOING: &str = "ONGOING";
+const CLOSED: &str = "CLOSED";
+
+/// A closed interval of instants, in milliseconds since the epoch. An absent bound is
+/// unbounded on that side, which is what `StartTimeRange` and `EndTimeRange` model:
+/// both of their members are optional.
+#[derive(Debug, Clone, Copy)]
+struct MillisRange {
+    from: Option<i64>,
+    to: Option<i64>,
+}
+
+impl MillisRange {
+    fn holds(&self, at: i64) -> bool {
+        self.from.is_none_or(|from| at >= from) && self.to.is_none_or(|to| at <= to)
+    }
+}
+
+/// The ONE status filter a request names, resolved to what it selects.
+///
+/// `ListInsightsStatusFilter` carries three optional members and `StatusFilter`'s
+/// documentation says "You can specify one status filter", so exactly one of them is a
+/// well-formed request. The model cannot express that, so [`Selector::of`] enforces it.
+#[derive(Debug, Clone, Copy)]
+enum Selector {
+    /// `Ongoing`: the insights of this type whose behaviour has not ended.
+    Ongoing { insight_type: &'static str },
+    /// `Closed`: the insights of this type whose behaviour ended inside the range.
+    Closed {
+        insight_type: &'static str,
+        ended: MillisRange,
+    },
+    /// `Any`: the insights of this type, whatever their status, whose behaviour started
+    /// inside the range.
+    Any {
+        insight_type: &'static str,
+        started: MillisRange,
+    },
+}
+
+impl Selector {
+    /// The selector `filter` names, or the `ValidationException` that refuses it.
+    fn of(filter: &ListInsightsStatusFilter) -> Result<Self, ListInsightsError> {
+        let named: Vec<&str> = [
+            filter.ongoing.is_some().then_some("Ongoing"),
+            filter.closed.is_some().then_some("Closed"),
+            filter.any.is_some().then_some("Any"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if named.len() != 1 {
+            let named = if named.is_empty() {
+                "none".to_string()
+            } else {
+                named.join(" + ")
+            };
+            return Err(ListInsightsErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "StatusFilter must specify exactly one of Ongoing, Closed or Any, got {named}"
+                    ),
+                    reason: Some("INVALID_PARAMETER_COMBINATION".to_string()),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "StatusFilter".to_string(),
+                        message: "exactly one of Ongoing, Closed or Any must be specified"
+                            .to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        if let Some(ongoing) = filter.ongoing.as_ref() {
+            return Ok(Self::Ongoing {
+                insight_type: insight_type_of(&ongoing.r#type, "StatusFilter.Ongoing.Type")?,
+            });
+        }
+        if let Some(closed) = filter.closed.as_ref() {
+            return Ok(Self::Closed {
+                insight_type: insight_type_of(&closed.r#type, "StatusFilter.Closed.Type")?,
+                ended: millis_range(
+                    closed.end_time_range.from_time.as_ref(),
+                    closed.end_time_range.to_time.as_ref(),
+                    "StatusFilter.Closed.EndTimeRange",
+                )?,
+            });
+        }
+        let any = filter
+            .any
+            .as_ref()
+            .expect("exactly one selector is named, and it is neither Ongoing nor Closed");
+        Ok(Self::Any {
+            insight_type: insight_type_of(&any.r#type, "StatusFilter.Any.Type")?,
+            started: millis_range(
+                any.start_time_range.from_time.as_ref(),
+                any.start_time_range.to_time.as_ref(),
+                "StatusFilter.Any.StartTimeRange",
+            )?,
+        })
+    }
+
+    /// Whether this selector selects `insight`.
+    fn matches(&self, insight: &crate::state::InsightRecord) -> bool {
+        match self {
+            Self::Ongoing { insight_type } => {
+                insight.insight_type == *insight_type && insight.status == ONGOING
+            }
+            Self::Closed {
+                insight_type,
+                ended,
+            } => {
+                insight.insight_type == *insight_type
+                    && insight.status == CLOSED
+                    // A closed insight's behaviour ended at `EndTime`; one that records
+                    // no end instant lies in no end-time range.
+                    && insight.end_time_millis.is_some_and(|at| ended.holds(at))
+            }
+            Self::Any {
+                insight_type,
+                started,
+            } => insight.insight_type == *insight_type && started.holds(insight.start_time_millis),
+        }
+    }
+
+    /// The scope a page token of this selector is bound to: a cursor into one selection
+    /// must not seek into another's.
+    fn page_scope(&self) -> String {
+        let bound = |at: Option<i64>| at.map_or_else(|| "-".to_string(), |at| at.to_string());
+        match self {
+            Self::Ongoing { insight_type } => format!("ListInsights/{ONGOING}/{insight_type}"),
+            Self::Closed {
+                insight_type,
+                ended,
+            } => format!(
+                "ListInsights/{CLOSED}/{insight_type}/ended/{}/{}",
+                bound(ended.from),
+                bound(ended.to)
+            ),
+            Self::Any {
+                insight_type,
+                started,
+            } => format!(
+                "ListInsights/ANY/{insight_type}/started/{}/{}",
+                bound(started.from),
+                bound(started.to)
+            ),
+        }
+    }
+}
+
+/// `value` as one of `InsightType`'s values, or the `ValidationException` naming
+/// `member`.
+///
+/// The model declares the member as an enum, so the boundary validator refuses anything
+/// else before this handler runs; this keeps such a value a 400 rather than a silently
+/// empty answer if it ever reaches here.
+fn insight_type_of(value: &str, member: &str) -> Result<&'static str, ListInsightsError> {
+    match value {
+        PROACTIVE => Ok(PROACTIVE),
+        REACTIVE => Ok(REACTIVE),
+        other => {
+            let allowed = INSIGHT_TYPE_VALUES.join(" | ");
+            Err(
+                ListInsightsErrorModeled::ValidationException(ValidationException {
+                    message: format!("{member} must be one of {allowed}, got '{other}'"),
+                    reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: member.to_string(),
+                        message: format!("must be one of {allowed}"),
+                    }]),
+                })
+                .into(),
+            )
+        }
+    }
+}
+
+/// A submitted time range in the milliseconds the store keeps, or the
+/// `ValidationException` naming `member` when a bound is not a representable instant.
+///
+/// A range whose `FromTime` is after its `ToTime` is NOT refused: it holds no instant,
+/// so it selects nothing, which is what an empty interval means. The model states no
+/// ordering rule for either range, so refusing it would be this emulator's invention.
+fn millis_range(
+    from: Option<&::aws_smithy_types::DateTime>,
+    to: Option<&::aws_smithy_types::DateTime>,
+    member: &str,
+) -> Result<MillisRange, ListInsightsError> {
+    let bound = |at: Option<&::aws_smithy_types::DateTime>, side: &str| match at {
+        None => Ok(None),
+        Some(at) => crate::state::millis_of(at)
+            .map(Some)
+            .ok_or_else(|| -> ListInsightsError {
+                ListInsightsErrorModeled::ValidationException(ValidationException {
+                    message: format!("{member}.{side} is not an instant this service can represent"),
+                    reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: format!("{member}.{side}"),
+                        message: "must be an instant representable in milliseconds since the epoch"
+                            .to_string(),
+                    }]),
+                })
+                .into()
+            }),
+    };
+    Ok(MillisRange {
+        from: bound(from, "FromTime")?,
+        to: bound(to, "ToTime")?,
+    })
 }

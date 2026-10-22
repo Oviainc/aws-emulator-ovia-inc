@@ -15,6 +15,10 @@
 //! persisted here so `GetReport` can check it against the report and version it was
 //! issued for.
 //!
+//! The other caller-owned record is the account's SETTINGS: `PutAccountSettings` writes
+//! the one `AccountSettings` record this store holds and `GetAccountSettings` reports it
+//! back, so a setting a caller writes is what every later read of it answers with.
+//!
 //! COMPLIANCE INQUIRIES are the one thing a caller CREATES through this API:
 //! `CreateComplianceInquiry` mints one, so the records live in the state struct rather
 //! than in its [`Default`]. An inquiry carries its own clock-owed transition — AWS
@@ -47,9 +51,9 @@ use std::time::{Duration, SystemTime};
 use smithy_server_runtime::Violation;
 
 use crate::ops::types::{
-    ConflictException, CustomerAgreementSummary, InquiryDetail, InquirySummary, QuerySummary,
-    ReportDetail, ReportSummary, ResourceNotFoundException, ValidationException,
-    ValidationExceptionField,
+    AccountSettings, ConflictException, CustomerAgreementSummary, InquiryDetail, InquirySummary,
+    QuerySummary, ReportDetail, ReportSummary, ResourceNotFoundException, ValidationException,
+    ValidationExceptionField, NOTIFICATION_SUBSCRIPTION_STATUS_VALUES,
 };
 
 /// The region a report ARN names when the request carries no SigV4 credential scope to
@@ -100,6 +104,14 @@ pub const TERM_GRANT_CAPACITY: usize = 1_000;
 /// `ValidationExceptionReason`'s value for a pagination or term token the service did
 /// not issue.
 pub const REASON_INVALID_TOKEN: &str = "invalidToken";
+
+/// The `NotificationSubscriptionStatus` an account carries before any
+/// `PutAccountSettings` call.
+///
+/// AWS Artifact notifications are OPT-IN — `PutAccountSettings` is how a customer
+/// subscribes — so an account nobody has subscribed reports the enum's
+/// `NOT_SUBSCRIBED`, never an absent status.
+pub const DEFAULT_NOTIFICATION_SUBSCRIPTION_STATUS: &str = "NOT_SUBSCRIBED";
 
 /// The `resourceType` the modelled `ConflictException` reports for a compliance inquiry
 /// id.
@@ -419,6 +431,61 @@ pub struct TermGrant {
     pub report_id: String,
     pub report_version: i64,
     pub issued_at: SystemTime,
+}
+
+/// The account-wide Artifact settings, as this emulator persists them.
+///
+/// AWS Artifact's settings are a SINGLE per-account record: neither
+/// `GetAccountSettings` nor `PutAccountSettings` carries a member naming which settings
+/// to read or write, so the store holds exactly one and every caller of this emulator
+/// observes the same one.
+#[derive(Debug, Clone)]
+pub struct AccountSettingsRecord {
+    /// "Notification subscription status of the customer" — one of the values
+    /// [`NOTIFICATION_SUBSCRIPTION_STATUS_VALUES`](crate::ops::types::NOTIFICATION_SUBSCRIPTION_STATUS_VALUES)
+    /// lists for the model's `NotificationSubscriptionStatus` enum. Written only through
+    /// [`AccountSettingsRecord::set_notification_subscription_status`], which ties the
+    /// stored string to that set.
+    notification_subscription_status: String,
+}
+
+impl Default for AccountSettingsRecord {
+    fn default() -> Self {
+        Self {
+            notification_subscription_status: DEFAULT_NOTIFICATION_SUBSCRIPTION_STATUS.to_string(),
+        }
+    }
+}
+
+impl AccountSettingsRecord {
+    /// The stored status — always a value of the modelled enum.
+    pub fn notification_subscription_status(&self) -> &str {
+        &self.notification_subscription_status
+    }
+
+    /// Record `status` as the account's notification subscription status.
+    ///
+    /// The debug assertion states the invariant the store holds rather than correcting a
+    /// caller: a value outside the modelled enum reaching here would be a boundary-binding
+    /// bug (the gateway and the framework's validator both refuse one), and a release
+    /// build still stores what the caller asked for rather than silently repairing it.
+    pub fn set_notification_subscription_status(&mut self, status: &str) {
+        debug_assert!(
+            NOTIFICATION_SUBSCRIPTION_STATUS_VALUES.contains(&status),
+            "a notification subscription status must be one of \
+             {NOTIFICATION_SUBSCRIPTION_STATUS_VALUES:?}, got {status:?}"
+        );
+        self.notification_subscription_status = status.to_string();
+    }
+
+    /// The `AccountSettings` projection both account-settings operations return, so the
+    /// answer to a `Get` and the answer to a `Put` are the same projection of the one
+    /// stored record.
+    pub fn to_settings(&self) -> AccountSettings {
+        AccountSettings {
+            notification_subscription_status: Some(self.notification_subscription_status.clone()),
+        }
+    }
 }
 
 /// What a caller submitted as an inquiry's content, as `InquiryContent`'s two union
@@ -791,6 +858,9 @@ pub struct ComAmazonawsArtifactArtifactState {
     pub term_tokens: BTreeMap<String, TermGrant>,
     /// The counter term tokens are minted from, so two calls never share a token.
     pub term_token_seq: u64,
+    /// The account's settings: what `PutAccountSettings` writes and
+    /// `GetAccountSettings` reports.
+    pub account_settings: AccountSettingsRecord,
     /// Every compliance inquiry `CreateComplianceInquiry` has created, keyed by its id.
     ///
     /// A `BTreeMap` because the ids are minted from a monotonic counter in fixed-width
@@ -828,6 +898,7 @@ impl Default for ComAmazonawsArtifactArtifactState {
             reports: seed_catalog(),
             term_tokens: BTreeMap::new(),
             term_token_seq: 0,
+            account_settings: AccountSettingsRecord::default(),
             inquiries: BTreeMap::new(),
             inquiry_seq: 0,
             inquiry_create_tokens: BTreeMap::new(),

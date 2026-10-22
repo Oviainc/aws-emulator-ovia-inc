@@ -21,10 +21,10 @@ use crate::delivery_stream_lifecycle::{
 /// The modelled ceiling shared by `Limit`'s range, the tag list a create may carry and
 /// the `ListTagsForDeliveryStreamOutputTagList` a response may hold
 /// (`smithy_query(query="shape",shape="TagKey,ListTagsForDeliveryStreamOutputTagList")`).
-const MAX_TAGS: usize = 50;
+pub(crate) const MAX_TAGS: usize = 50;
 
 /// Create a stream carrying `tags`, in the order the request lists them.
-async fn create_tagged(emulator: &Emulator, name: &str, tags: &[(String, String)]) {
+pub(crate) async fn create_tagged(emulator: &Emulator, name: &str, tags: &[(String, String)]) {
     let mut body = json!({
         "DeliveryStreamName": name,
         "S3DestinationConfiguration": s3_configuration(),
@@ -42,7 +42,7 @@ async fn create_tagged(emulator: &Emulator, name: &str, tags: &[(String, String)
 }
 
 /// Ask for a page of `name`'s tags.
-async fn list_tags(
+pub(crate) async fn list_tags(
     emulator: &Emulator,
     name: &str,
     start_after: Option<&str>,
@@ -59,7 +59,7 @@ async fn list_tags(
 }
 
 /// The `(Key, Value)` pairs a response listed, in the order it listed them.
-fn listed(response: &Value) -> Vec<(String, String)> {
+pub(crate) fn listed(response: &Value) -> Vec<(String, String)> {
     response["Tags"]
         .as_array()
         .map(|tags| {
@@ -87,14 +87,14 @@ fn expected_tags(given: &[(String, String)]) -> Vec<(String, String)> {
 
 /// `count` distinct tags, handed over in DESCENDING key order so a response in key order
 /// cannot be insertion order by accident.
-fn generated_tags(count: usize) -> Vec<(String, String)> {
+pub(crate) fn generated_tags(count: usize) -> Vec<(String, String)> {
     (0..count)
         .rev()
         .map(|ordinal| (format!("key-{ordinal:02}"), format!("value-{ordinal:02}")))
         .collect()
 }
 
-fn owned(tags: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn owned(tags: &[(&str, &str)]) -> Vec<(String, String)> {
     tags.iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
         .collect()

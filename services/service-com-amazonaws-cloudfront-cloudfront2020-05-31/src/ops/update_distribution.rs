@@ -365,7 +365,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|stored| (stored.etag.clone(), stored.config.caller_reference.clone()))
         else {
             return Err(UpdateDistributionErrorModeled::NoSuchDistribution(
-                crate::state::no_such_distribution(&input.id),
+                crate::state::no_such_distribution(),
             )
             .into());
         };
@@ -389,12 +389,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             IfMatch::Stale => {
                 return Err(UpdateDistributionErrorModeled::PreconditionFailed(
-                    PreconditionFailed {
-                        message: Some(format!(
-                            "The If-Match version is not the distribution's current version \
-                             ({current_etag})"
-                        )),
-                    },
+                    crate::state::precondition_failed(),
                 )
                 .into());
             }
@@ -457,7 +452,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(stored) = store.apply_config(&input.id, input.distribution_config, now) else {
             return Err(UpdateDistributionErrorModeled::NoSuchDistribution(
-                crate::state::no_such_distribution(&input.id),
+                crate::state::no_such_distribution(),
             )
             .into());
         };

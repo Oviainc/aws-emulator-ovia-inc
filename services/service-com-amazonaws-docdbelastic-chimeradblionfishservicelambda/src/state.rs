@@ -9,7 +9,7 @@
 //! the only place a response body is built from.
 
 use crate::ops::types::{
-    Cluster, ClusterInList, ClusterSnapshot, ResourceNotFoundException,
+    Cluster, ClusterInList, ClusterSnapshot, ConflictException, ResourceNotFoundException,
     ServiceQuotaExceededException, Shard, ValidationException, ValidationExceptionField,
 };
 use std::collections::BTreeMap;
@@ -548,12 +548,78 @@ pub fn validate_admin_user_name(member: &str, value: &str) -> Result<(), Validat
     }
 }
 
+/// A kind of resource this service owns, named the way AWS names it.
+///
+/// Each kind has TWO spellings, and they are not interchangeable:
+///
+/// * the RESOURCE TYPE NAME, which is the modelled resource shape's own name —
+///   `Cluster` / `ClusterSnapshot` (`smithy_query(query="shape",
+///   shape="Cluster,ClusterSnapshot")`). It is what the error shapes' `resourceType`
+///   member carries: "The type of the resource that could not be found"
+///   (`ResourceNotFoundException$resourceType`) and "The type of the resource where
+///   there was an access conflict" (`ConflictException$resourceType`), both
+///   `@required`;
+/// * the ARN RESOURCE SEGMENT, which is lowercase and hyphenated — `cluster/<id>`,
+///   `cluster-snapshot/<id>`.
+///
+/// Holding both on one value is what keeps an error body from reporting the ARN
+/// segment (or this store's own key) where a client reads a resource type, and keeps
+/// the ARN segment spelled in exactly one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    /// An elastic cluster: the modelled `Cluster` shape.
+    Cluster,
+    /// An elastic cluster snapshot: the modelled `ClusterSnapshot` shape.
+    ClusterSnapshot,
+}
+
+impl ResourceKind {
+    /// The AWS resource type NAME, as every `resourceType` member reports it.
+    pub const fn type_name(self) -> &'static str {
+        match self {
+            Self::Cluster => "Cluster",
+            Self::ClusterSnapshot => "ClusterSnapshot",
+        }
+    }
+
+    /// The resource segment an ARN of this kind carries, ahead of the resource id.
+    pub const fn arn_segment(self) -> &'static str {
+        match self {
+            Self::Cluster => "cluster",
+            Self::ClusterSnapshot => "cluster-snapshot",
+        }
+    }
+
+    /// The ARN of the resource of this kind with id `resource_id`, in `region`.
+    pub fn arn(self, region: &str, resource_id: &str) -> String {
+        docdb_elastic_arn(region, &format!("{}/{resource_id}", self.arn_segment()))
+    }
+}
+
 /// The `ResourceNotFoundException` (HTTP 404) for an ARN this store does not hold.
-pub fn not_found(resource_type: &str, arn: &str) -> ResourceNotFoundException {
+///
+/// The two structured members are what a client branches on: `resourceType` is the
+/// AWS resource type name of the kind that was looked up (see [`ResourceKind`]) and
+/// `resourceId` is the ARN the request named. The message restates them in prose and
+/// is not where either is read from.
+pub fn not_found(kind: ResourceKind, arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("{resource_type} {arn} not found"),
+        message: format!("{} {arn} not found", kind.type_name()),
         resource_id: arn.to_string(),
-        resource_type: resource_type.to_string(),
+        resource_type: kind.type_name().to_string(),
+    }
+}
+
+/// The `ConflictException` (HTTP 409) for a request that collides with the already
+/// existing resource `arn` of kind `kind`.
+///
+/// Same contract as [`not_found`] for the two structured members: the type name of the
+/// resource kind and the ARN of the resource the request collided with.
+pub fn conflict(kind: ResourceKind, arn: &str, message: String) -> ConflictException {
+    ConflictException {
+        message,
+        resource_id: arn.to_string(),
+        resource_type: kind.type_name().to_string(),
     }
 }
 

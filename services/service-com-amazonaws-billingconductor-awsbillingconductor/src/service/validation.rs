@@ -66,6 +66,10 @@ const SENSITIVE_MEMBERS: &[&str] = &["name", "names", "description"];
 /// 400 body.
 const MAX_ECHOED_VALUE: usize = 256;
 
+/// The `[` and `]` a list rendering always carries, which both the kept-bytes budget and
+/// the reported total count from.
+const LIST_BRACKETS: usize = 2;
+
 /// The `Message` for a set of constraint violations, as AWS builds it from the request:
 /// the count, then one clause per failing member.
 ///
@@ -88,15 +92,17 @@ const MAX_ECHOED_VALUE: usize = 256;
 /// keyed on a member's name or type. It is still a total, deterministic order: the walk
 /// visits a given input shape in one order.
 ///
-/// `lists` carries the rendering of every list member of the request (see
-/// [`list_values`]); it may be empty, in which case the value the framework stored on
-/// the violation is used.
+/// `lists` carries the already-rendered value of every list member of the request (see
+/// [`list_values`]); it may be empty, in which case the value the framework stored on the
+/// violation is used. It is rendered ONCE per list member, before this loop, because the
+/// walk reports one violation per failing ELEMENT: rendering it here would rebuild the
+/// whole list for each of them, which is quadratic in a length the caller chooses.
 ///
 /// `None` declines the whole refusal — a violation class this service has no wording for
 /// ([`ViolationKind`] is `#[non_exhaustive]`) keeps the framework's own.
 pub(super) fn refusal_message(
     violations: &[Violation],
-    lists: &HashMap<String, Vec<String>>,
+    lists: &HashMap<String, String>,
 ) -> Option<String> {
     // One clause per (member path, requirement): the several element violations a list
     // member can carry fold into the one clause stated at that member, while a member that
@@ -174,17 +180,18 @@ fn requirement_of(kind: &ViolationKind) -> Option<String> {
 /// * an ABSENT member has no value at all and is reported as the null it was;
 /// * a `@sensitive` member names no value — the constraint it broke is the whole of what
 ///   a caller needs, and the value belongs in nobody's logs;
-/// * a LIST member is reported as the list the caller sent, bracketed;
+/// * a LIST member is reported as the list the caller sent, bracketed and already bounded
+///   by [`rendered_list`];
 /// * everything else echoes the value the framework stored, already elided.
-fn subject(path: &str, violation: &Violation, lists: &HashMap<String, Vec<String>>) -> String {
+fn subject(path: &str, violation: &Violation, lists: &HashMap<String, String>) -> String {
     if violation.value.is_none() {
         return "Value null".to_string();
     }
     if is_sensitive(path) {
         return "Value".to_string();
     }
-    if let Some(elements) = lists.get(path) {
-        return format!("Value '{}'", elided(&format!("[{}]", elements.join(", "))));
+    if let Some(rendered) = lists.get(path) {
+        return format!("Value '{rendered}'");
     }
     match &violation.value {
         Some(shown) => format!("Value '{shown}'"),
@@ -232,21 +239,43 @@ fn is_sensitive(path: &str) -> bool {
         .is_some_and(|segment| SENSITIVE_MEMBERS.contains(&segment))
 }
 
-/// `value` as it should appear in a message: itself when short, a character-boundary-safe
-/// prefix with an elision when not. See [`MAX_ECHOED_VALUE`].
-fn elided(value: &str) -> String {
-    if value.len() <= MAX_ECHOED_VALUE {
-        return value.to_string();
+/// One list member as a clause states it: the elements the caller sent, joined and
+/// bracketed, with the length of the WHOLE list reported when it does not fit.
+///
+/// Bounded as it is BUILT, not after: `elements` already stops at the echo budget (see
+/// [`ListValues::record`]) and the join stops once [`MAX_ECHOED_VALUE`] bytes are in hand,
+/// so a request carrying a list of multi-kilobyte strings cannot make the server
+/// materialise the whole concatenation to then throw it away. `total` is the length the
+/// untruncated rendering would have had — counted as the elements were collected — so the
+/// message still says how long what the caller sent really was. The cut is taken at a
+/// character boundary, so the prefix is always valid UTF-8.
+fn rendered_list(elements: &[String], total: usize) -> String {
+    let mut rendered = String::with_capacity(MAX_ECHOED_VALUE.min(total).saturating_add(1));
+    rendered.push('[');
+    for (index, element) in elements.iter().enumerate() {
+        // Position decides the separator, not the length of what is already written: an
+        // element that renders empty still takes its place in the list.
+        if index > 0 {
+            rendered.push_str(", ");
+        }
+        rendered.push_str(element);
+        if rendered.len() > MAX_ECHOED_VALUE {
+            break;
+        }
     }
-    let mut end = MAX_ECHOED_VALUE;
-    while end > 0 && !value.is_char_boundary(end) {
+    if total <= MAX_ECHOED_VALUE {
+        rendered.push(']');
+        return rendered;
+    }
+    let mut end = MAX_ECHOED_VALUE.min(rendered.len());
+    while end > 0 && !rendered.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}... [{} bytes]", &value[..end], value.len())
+    format!("{}... [{total} bytes]", &rendered[..end])
 }
 
 /// Every LIST member of a request, keyed by the lowerCamel member path the validating
-/// walk reports it under, and rendered element by element.
+/// walk reports it under, and rendered ONCE (see [`rendered_list`]).
 ///
 /// A constraint on a list's element shape is violated by ONE element, and the framework
 /// reports it at that element (`accountIds.1.member`); AWS reports it at the list member
@@ -256,7 +285,7 @@ fn elided(value: &str) -> String {
 pub(super) fn list_values(
     input: &dyn SerializableStruct,
     schema: &Schema,
-) -> HashMap<String, Vec<String>> {
+) -> HashMap<String, String> {
     let mut capture = ListValues::default();
     // Rendering only: a walk that cannot be completed yields the paths it reached, and a
     // path it did not reach simply falls back to the violation's own value.
@@ -269,7 +298,19 @@ pub(super) fn list_values(
 /// encloses it.
 #[derive(Debug)]
 enum Frame {
-    List(Vec<String>),
+    /// A list, as its elements are collected.
+    List {
+        /// The element renderings kept for the message. Collection stops once
+        /// [`MAX_ECHOED_VALUE`] bytes are in hand, so one request cannot make the server
+        /// hold a copy of an arbitrarily long list.
+        elements: Vec<String>,
+        /// The bytes `elements` would render as, the measure the budget above is spent
+        /// against.
+        kept: usize,
+        /// The bytes the WHOLE rendering would have, every element counted — what
+        /// [`rendered_list`] reports when it cannot fit.
+        total: usize,
+    },
     Opaque,
 }
 
@@ -285,8 +326,8 @@ struct ListValues {
     path: Vec<String>,
     /// Open frames, innermost last.
     frames: Vec<Frame>,
-    /// The rendered elements of every list member reached so far.
-    values: HashMap<String, Vec<String>>,
+    /// The rendered value of every list member reached so far.
+    values: HashMap<String, String>,
 }
 
 impl ListValues {
@@ -309,9 +350,27 @@ impl ListValues {
     }
 
     /// Record one rendered leaf, when it is an element of the innermost list.
+    ///
+    /// EVERY element counts towards `total` — that is the length the message reports — but
+    /// only the ones a bounded rendering can use are kept. The first element is always
+    /// kept, so `elements` being empty is exactly "this is the first element", which is
+    /// what decides the `, ` separator.
     fn record(&mut self, rendered: &str) {
-        if let Some(Frame::List(elements)) = self.frames.last_mut() {
-            elements.push(rendered.to_string());
+        if let Some(Frame::List {
+            elements,
+            kept,
+            total,
+        }) = self.frames.last_mut()
+        {
+            // `, ` before every element but the first: the same shape `rendered_list`
+            // builds.
+            let separator: usize = if elements.is_empty() { 0 } else { 2 };
+            let width = separator.saturating_add(rendered.len());
+            *total = total.saturating_add(width);
+            if *kept <= MAX_ECHOED_VALUE {
+                *kept = kept.saturating_add(width);
+                elements.push(rendered.to_string());
+            }
         }
     }
 }
@@ -336,10 +395,18 @@ impl ShapeSerializer for ListValues {
         write_elements: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
         let pushed = self.push_segment(schema);
-        self.frames.push(Frame::List(Vec::new()));
+        self.frames.push(Frame::List {
+            elements: Vec::new(),
+            kept: LIST_BRACKETS,
+            total: LIST_BRACKETS,
+        });
         let out = write_elements(self);
-        if let Some(Frame::List(elements)) = self.frames.pop() {
-            self.values.insert(self.path.join("."), elements);
+        if let Some(Frame::List {
+            elements, total, ..
+        }) = self.frames.pop()
+        {
+            self.values
+                .insert(self.path.join("."), rendered_list(&elements, total));
         }
         self.pop_segment(pushed);
         out

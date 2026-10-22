@@ -148,13 +148,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(stored) = store.distribution(&input.distribution_id) else {
             return Err(GetInvalidationErrorModeled::NoSuchDistribution(
-                crate::state::no_such_distribution(&input.distribution_id),
+                crate::state::no_such_distribution(),
             )
             .into());
         };
         let Some(invalidation) = stored.invalidations.get(&input.id) else {
             return Err(GetInvalidationErrorModeled::NoSuchInvalidation(
-                crate::state::no_such_invalidation(&input.id),
+                crate::state::no_such_invalidation(),
             )
             .into());
         };

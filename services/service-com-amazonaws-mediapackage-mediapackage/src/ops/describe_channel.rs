@@ -156,11 +156,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
 
+        // The request addressed a Channel by id: a miss is `NotFoundException` (404)
+        // keyed, in the body's `errors` map, by the RESOURCE TYPE that is missing.
         let Some(record) = state.channels.get(&input.id) else {
-            return Err(DescribeChannelErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Channel with ID \"{}\" not found.", input.id)),
-            })
-            .into());
+            return Err(crate::state::channel_not_found(&input.id).into());
         };
 
         let channel = record.to_channel();

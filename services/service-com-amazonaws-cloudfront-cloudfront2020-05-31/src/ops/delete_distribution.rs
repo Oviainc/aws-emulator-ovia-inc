@@ -182,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|stored| (stored.etag.clone(), stored.deletable()))
         else {
             return Err(DeleteDistributionErrorModeled::NoSuchDistribution(
-                crate::state::no_such_distribution(&input.id),
+                crate::state::no_such_distribution(),
             )
             .into());
         };
@@ -207,12 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             IfMatch::Stale => {
                 return Err(DeleteDistributionErrorModeled::PreconditionFailed(
-                    PreconditionFailed {
-                        message: Some(format!(
-                            "The If-Match version is not the distribution's current version \
-                             ({current_etag})"
-                        )),
-                    },
+                    crate::state::precondition_failed(),
                 )
                 .into());
             }

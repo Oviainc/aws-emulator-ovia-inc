@@ -3,7 +3,11 @@
 //! @op DeleteAsset
 //! IMPLEMENTED: removes the stored Asset, so a following `DescribeAsset` answers 404
 //! and `ListAssets` no longer lists it. `NotFoundException` (404) for an `Id` no asset
-//! is stored under. Answers 202, the status the model declares.
+//! is stored under.
+//!
+//! Answers `204 No Content` — the RECORDED success status of a MediaPackage VOD
+//! delete, which the model's `@http` code 202 disagrees with; see `SUCCESS_STATUS`
+//! below.
 //!
 //! ## Shape of an operation
 //!
@@ -130,7 +134,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "DeleteAsset";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_ASSET_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_ASSET_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 202u16;
+    // The RECORDED success status of a MediaPackage VOD delete, which CONFLICTS with
+    // this model's `@http` code for the operation (202): the recorded AWS response to a
+    // successful delete on this service is `204 No Content`, and the status a client
+    // branches on is wire behaviour, so the recording wins over the modelled code.
+    //
+    // Recording: behavioral unit `mediapackage-vod.delete-asset-state-transition`,
+    // whose assertion on the delete reads `assert status_code == 204, f"expected 204 No
+    // Content, got {status_code}"` (filed as cause 3 of the open issue
+    // `20261022T132356Z-mediapackage-vod-egress-manifest-url-serves-nothing-
+    // createpackaginggroup.md`). `DeletePackagingConfiguration` carries the same
+    // reconciliation, from its own unit.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,
