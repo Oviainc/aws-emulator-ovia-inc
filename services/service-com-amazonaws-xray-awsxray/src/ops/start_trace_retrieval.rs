@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartTraceRetrieval
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartTraceRetrieval`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartTraceRetrieval::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a retrieval of the named traces over a `[StartTime, EndTime]` window
+//! and answers with the `RetrievalToken` it MINTED and STORED for it, so a
+//! later reader has a retrieval to resume from and a token this service never
+//! issued resolves to nothing.
+//!
+//! Two refusals come before that token exists:
+//!
+//! * a `[StartTime, EndTime]` window that names no interval of recorded traffic
+//!   — one running backwards, or one whose bounds are not times the data could
+//!   have — is refused with `InvalidRequestException` (400), through the one
+//!   window check in [`crate::state::validate_window`]; and
+//! * a call that arrives with the account's request budget empty is refused with
+//!   `ThrottledException` (429).
+//!
+//! The window is checked BEFORE the budget is spent, so a malformed request is
+//! always answered by the refusal that names what is wrong with it, rather than
+//! by whichever refusal the call rate happened to earn.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +165,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartTraceRetrieval` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartTraceRetrievalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartTraceRetrieval"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartTraceRetrievalErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray trace store is unavailable on this emulator engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `TraceIds` (@length 0..100) and both timestamps are modelled, so the
+        // boundary has already refused a missing or over-long list; what the
+        // model cannot express is whether the window names an interval at all.
+        let start = crate::state::epoch_seconds(&input.start_time);
+        let end = crate::state::epoch_seconds(&input.end_time);
+        let now = crate::state::now_epoch_seconds();
+        if let Err(window) = crate::state::validate_window(start, end, now) {
+            return Err(StartTraceRetrievalErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(window.message(start, end)),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        if !store.retrieval_rate.try_acquire() {
+            return Err(StartTraceRetrievalErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(format!(
+                        "StartTraceRetrieval accepts {} requests back-to-back and {} per second; retry this request",
+                        crate::state::TRACE_RETRIEVAL_BURST,
+                        crate::state::TRACE_RETRIEVAL_RATE_PER_SECOND,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The token is the stored retrieval's own, so the only tokens in
+        // circulation are ones this service can resolve again.
+        let retrieval_token = store
+            .start_trace_retrieval(input.trace_ids, start, end, now)
+            .retrieval_token
+            .clone();
+        Ok(StartTraceRetrievalOutput {
+            retrieval_token: Some(retrieval_token),
+        })
     }
 }
+

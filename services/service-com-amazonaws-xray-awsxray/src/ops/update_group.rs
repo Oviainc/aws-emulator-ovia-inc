@@ -12,6 +12,15 @@
 //! at once) is refused with the modelled `InvalidRequestException` (HTTP 400)
 //! before anything is written.
 //!
+//! Supplying both selectors is refused whatever they name, which is also what
+//! settles a CONFLICTING pair: two selectors that name different stored groups
+//! can never be acted on, so no update mutates a group the caller did not name
+//! on its own.
+//!
+//! The one other refusal this handler owns is the configuration the
+//! documentation forbids: `NotificationsEnabled` true where `InsightsEnabled` is
+//! not explicitly true.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -161,12 +170,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // "Notifications can only be enabled on a group with InsightsEnabled set
+        // to true" (`InsightsConfiguration` on this operation's input). Decided
+        // against the RESULTING record: a submitted `InsightsConfiguration`
+        // REPLACES the stored one whole, so the configuration in the request is
+        // the one the group ends up with — notifications on without insights
+        // explicitly on is the state the documentation forbids, whether
+        // `InsightsEnabled` is false or absent.
+        if let Some(configuration) = input.insights_configuration.as_ref() {
+            if configuration.notifications_enabled == Some(true)
+                && configuration.insights_enabled != Some(true)
+            {
+                return Err(refuse(
+                    "InsightsConfiguration.NotificationsEnabled can only be true on a group whose InsightsEnabled is true".to_string(),
+                ));
+            }
+        }
+
         // Both selectors are optional in the model, so what is left to refuse
         // here is a request that names no group at all, one that supplies both
         // selectors, and one that names a group this emulator does not hold;
         // `GroupName`'s and `GroupARN`'s length bounds are modelled and already
         // refused before this handler. The refusal happens before any write, so
         // a refused update leaves every stored group as it was.
+        //
+        // Supplying BOTH selectors is refused in `resolve_group_name` itself,
+        // which is also what settles a CONFLICTING pair: two selectors that name
+        // different stored groups can never be acted on, so no update can mutate
+        // a group the caller did not name on its own.
         let mut store = state.lock();
         let group_name = store
             .resolve_group_name(input.group_name.as_deref(), input.group_arn.as_deref())
@@ -204,4 +235,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(UpdateGroupOutput { group: Some(group) })
     }
+}
+
+/// Refuse the request with the error this operation models for an invalid one.
+fn refuse(message: String) -> UpdateGroupError {
+    UpdateGroupErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message),
+    })
+    .into()
 }
