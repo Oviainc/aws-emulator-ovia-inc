@@ -290,6 +290,13 @@ const PARTITION: &str = "aws";
 /// What `{"Ref": "AWS::URLSuffix"}` resolves to in the `aws` partition.
 const URL_SUFFIX: &str = "amazonaws.com";
 
+/// How many hexadecimal characters an AWS Transfer Family resource identifier carries
+/// after its one-letter prefix.
+///
+/// Transfer's own Smithy model fixes it: `ServerId` is `^s-([0-9a-f]{17})$` and
+/// `WorkflowId` is `^w-([a-z0-9]{17})$`, both `length 19..19`.
+const TRANSFER_ID_HEX_DIGITS: usize = 17;
+
 /// One resource a template declares, as the template spells it.
 #[derive(Debug, Clone)]
 pub struct DeclaredResource {
@@ -802,6 +809,28 @@ fn generated_name(logical_id: &str, scope: StackScope<'_>) -> String {
     format!("{}-{logical_id}-{}", scope.stack_name, &digest[0..12])
 }
 
+/// A service-generated identifier of the form `<prefix>-<digits hexadecimal characters>`.
+///
+/// Some resource types do not take a name from the template at all: the owning service
+/// ASSIGNS the identifier, in a documented form (an AWS Transfer Family server is
+/// `s-` + 17 hexadecimal characters, which is the `ServerId` pattern
+/// `^s-([0-9a-f]{17})$` in Transfer's own Smithy model). CloudFormation's
+/// `<stack name>-<logical id>-<unique id>` name is not such an identifier, so a resource
+/// of one of those types reports an identifier of ITS form instead — derived from the
+/// name, which is itself derived from the stack id and the logical id, so the identifier
+/// is stable across reads and across a later update of the same stack, and two resources
+/// of one stack never collide.
+fn generated_service_id(prefix: &str, name: &str, digits: usize) -> String {
+    use ::sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(prefix.as_bytes());
+    hasher.update(b"/");
+    hasher.update(name.as_bytes());
+    let digest = ::hex::encode(hasher.finalize());
+    format!("{prefix}-{}", &digest[..digits])
+}
+
 /// What `Ref` returns for a resource of this type, and what `Fn::GetAtt` reads off it.
 ///
 /// Source: the "Return values" section the AWS CloudFormation resource and property type
@@ -811,6 +840,11 @@ fn generated_name(logical_id: &str, scope: StackScope<'_>) -> String {
 /// this catalogue does not carry gets its physical NAME as its physical resource id,
 /// which is what the majority of types return, and no attributes: `Fn::GetAtt` against it
 /// yields no value rather than a guessed one.
+///
+/// An attribute whose documented return value is a LIST (an
+/// `As2ServiceManagedEgressIpAddresses`, say) is not carried either: the attribute map is
+/// string-valued, and reporting one element of a list as the whole of it would be worse
+/// than reporting no value.
 fn return_values(
     resource_type: &str,
     name: &str,
@@ -862,6 +896,47 @@ fn return_values(
                 ::emulator_server::emulator_arn("lambda", region, &format!("function:{name}")),
             );
             (name.to_string(), attributes)
+        }
+        // "Ref returns the log group name"; Fn::GetAtt: Arn. A CloudWatch Logs log-group
+        // ARN ends in `:*` ("such as
+        // arn:aws:logs:us-east-1:123456789012:log-group:/mystack-testgroup-12ABC1AB12A1:*").
+        "AWS::Logs::LogGroup" => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    "logs",
+                    region,
+                    &format!("log-group:{name}:*"),
+                ),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the Amazon Resource Name (ARN) of the server"; Fn::GetAtt: Arn,
+        // ServerId ("the service-assigned ID of the server that is created") and the
+        // list-valued As2ServiceManagedEgressIpAddresses, which is not carried. The
+        // template names no server — AWS::Transfer::Server has no name property — so the
+        // id is the service-assigned `s-` + 17 hexadecimal form.
+        "AWS::Transfer::Server" => {
+            let server_id = generated_service_id("s", name, TRANSFER_ID_HEX_DIGITS);
+            let arn =
+                ::emulator_server::emulator_arn("transfer", region, &format!("server/{server_id}"));
+            attributes.insert("Arn".to_string(), arn.clone());
+            attributes.insert("ServerId".to_string(), server_id);
+            (arn, attributes)
+        }
+        // The same shape one type along: "Ref returns the Amazon Resource Name (ARN)";
+        // Fn::GetAtt: Arn, WorkflowId. Transfer's `WorkflowId` is `w-` + 17 characters of
+        // `[a-z0-9]` (model pattern `^w-([a-z0-9]{17})$`), which hexadecimal satisfies.
+        "AWS::Transfer::Workflow" => {
+            let workflow_id = generated_service_id("w", name, TRANSFER_ID_HEX_DIGITS);
+            let arn = ::emulator_server::emulator_arn(
+                "transfer",
+                region,
+                &format!("workflow/{workflow_id}"),
+            );
+            attributes.insert("Arn".to_string(), arn.clone());
+            attributes.insert("WorkflowId".to_string(), workflow_id);
+            (arn, attributes)
         }
         // "Ref returns the role name"; Fn::GetAtt: Arn. IAM is a global service, so its
         // ARNs carry no region.

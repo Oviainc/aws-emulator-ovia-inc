@@ -45,6 +45,36 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Whether this service serves the request these `parts` came from.
+///
+/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable owner
+/// of this rule, and it is CALLED here rather than re-implemented: the request's route key
+/// must match this service's signing name AND its first URI path segment must be one the
+/// generated, model-derived `ROUTE_PATH_SEGMENTS` declares, by exact segment equality. It
+/// is the same rule `service_common::claims_request` applies for a REST service; this
+/// crate reaches the framework helper directly, as
+/// `service-com-amazonaws-transcribe-transcribe`, `-appconfig-amazonappconfig` and
+/// `-ivs-*` do.
+///
+/// The helper takes a whole `http::Request` while [`Service::can_handle`] is handed only
+/// the request's parts, so the two things it reads — the URI and the headers — are
+/// re-presented to it as a bodiless request. It reads neither the body nor the method, so
+/// nothing it decides on is missing.
+fn can_handle_parts(parts: &http::request::Parts) -> bool {
+    let Ok(mut request) = http::Request::builder()
+        .uri(parts.uri.clone())
+        .body(bytes::Bytes::new())
+    else {
+        return false;
+    };
+    *request.headers_mut() = parts.headers.clone();
+    emulator_server::can_handle_based_on_route_key_and_path(
+        &request,
+        crate::ROUTE_KEY,
+        crate::ROUTE_PATH_SEGMENTS,
+    )
+}
+
 /// The `com-amazonaws-apigateway-backplanecontrolservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +104,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `apigateway` — a signing name it SHARES with Amazon API
+        // Gateway V2 (`services/service-com-amazonaws-apigatewayv2-apigatewayv2`, `sdkId`
+        // `ApiGatewayV2`, the same `apigateway` endpoint prefix and signing name), a
+        // DIFFERENT service that AWS separates by URI path space: every V2 operation is
+        // bound under `/v2/…`, while this control plane's are bound under `/restapis`,
+        // `/apikeys`, `/account`, `/domainnames`, `/usageplans`, `/vpclinks`,
+        // `/clientcertificates`, `/sdktypes`, `/tags`, … The router resolves a request's
+        // routing key from the SigV4 credential scope, so both services resolve to
+        // `apigateway`; claiming on the signing name ALONE makes both claim every such
+        // request, which the router answers `500 AmbiguousService` — a code no AWS model
+        // carries — leaving BOTH services unreachable.
+        //
+        // So the claim adds the framework's path conjunct over this service's own
+        // model-derived path space — see [`can_handle_parts`]. `/v2` is in neither of
+        // this model's segments, so the V2 endpoint alone claims its traffic and each
+        // service answers only its own.
+        can_handle_parts(parts)
     }
 
     fn override_operation(

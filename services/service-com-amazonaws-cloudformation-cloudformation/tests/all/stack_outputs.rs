@@ -92,6 +92,44 @@ enum Expected {
     /// The output is reported (its key is there) but carries no `OutputValue`, because
     /// this service cannot evaluate the declared expression.
     NoValue,
+    /// The output carries a value of this FORM. For an identifier the OWNING SERVICE
+    /// assigns — which no request fixes, so no row can spell it — the rule is the
+    /// documented form, not a literal.
+    Form {
+        described: &'static str,
+        check: fn(&str) -> bool,
+    },
+}
+
+/// Whether `value` is an AWS Transfer Family `ServerId`: `s-` and 17 LOWERCASE
+/// hexadecimal characters (Transfer's model: `^s-([0-9a-f]{17})$`, `length 19..19`).
+fn is_transfer_server_id(value: &str) -> bool {
+    value
+        .strip_prefix("s-")
+        .is_some_and(|id| id.len() == 17 && id.chars().all(is_lower_hex))
+}
+
+/// Whether `value` is an AWS Transfer Family `WorkflowId`: `w-` and 17 characters of
+/// `[a-z0-9]` (Transfer's model: `^w-([a-z0-9]{17})$`, `length 19..19`).
+fn is_transfer_workflow_id(value: &str) -> bool {
+    value.strip_prefix("w-").is_some_and(|id| {
+        id.len() == 17
+            && id
+                .chars()
+                .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
+    })
+}
+
+fn is_lower_hex(c: char) -> bool {
+    c.is_ascii_digit() || ('a'..='f').contains(&c)
+}
+
+/// Whether `value` is the ARN of a Transfer resource of type `kind` whose id satisfies
+/// `id_form` — `arn:aws:transfer:<region>:<account>:<kind>/<id>`.
+fn is_transfer_arn(value: &str, kind: &str, id_form: fn(&str) -> bool) -> bool {
+    value
+        .strip_prefix(&format!("arn:aws:transfer:{REGION}:{ACCOUNT_ID}:{kind}/"))
+        .is_some_and(id_form)
 }
 
 /// One row of the outputs table: a template, the parameters the create supplies, and
@@ -259,6 +297,104 @@ fn output_cases() -> Vec<OutputCase> {
                 (
                     "TableArn",
                     format!("arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/probe-table"),
+                ),
+            ]),
+        },
+        OutputCase {
+            // The issue's own CloudFormation case, in the YAML spelling it was recorded
+            // in: the template hands the caller the server id the owning SERVICE assigns,
+            // which is the only way a CFN-driven integration can learn it.
+            case: "a transfer server: !GetAtt of the id its service assigns, and its arn",
+            stack_name: "transfer-server",
+            template: concat!(
+                "Resources:\n",
+                "  Server:\n",
+                "    Type: AWS::Transfer::Server\n",
+                "    Properties:\n",
+                "      Protocols:\n",
+                "        - SFTP\n",
+                "Outputs:\n",
+                "  ServerId:\n",
+                "    Value: !GetAtt Server.ServerId\n",
+                "  ServerArn:\n",
+                "    Value:\n",
+                "      Fn::GetAtt: [Server, Arn]\n",
+                "  ServerRef:\n",
+                "    Value: !Ref Server\n",
+            )
+            .to_string(),
+            parameters: vec![],
+            expected: vec![
+                (
+                    "ServerId",
+                    Expected::Form {
+                        described: "a ServerId of the form s- + 17 hexadecimal characters",
+                        check: is_transfer_server_id,
+                    },
+                ),
+                (
+                    "ServerArn",
+                    Expected::Form {
+                        described: "a transfer server ARN",
+                        check: |value| is_transfer_arn(value, "server", is_transfer_server_id),
+                    },
+                ),
+                (
+                    // "Ref returns the Amazon Resource Name (ARN) of the server".
+                    "ServerRef",
+                    Expected::Form {
+                        described: "a transfer server ARN",
+                        check: |value| is_transfer_arn(value, "server", is_transfer_server_id),
+                    },
+                ),
+            ],
+        },
+        OutputCase {
+            // The same rule one type along, on a type the issue never cited: a workflow id
+            // is `w-` + 17 of `[a-z0-9]`, so the FORM differs while the rule does not.
+            case: "a transfer workflow: its own service-assigned id form",
+            stack_name: "transfer-workflow",
+            template: r#"{"Resources":{"Flow":{"Type":"AWS::Transfer::Workflow",
+                   "Properties":{"Steps":[]}}},
+                 "Outputs":{"WorkflowId":{"Value":{"Fn::GetAtt":["Flow","WorkflowId"]}},
+                   "WorkflowArn":{"Value":{"Fn::GetAtt":["Flow","Arn"]}}}}"#
+                .to_string(),
+            parameters: vec![],
+            expected: vec![
+                (
+                    "WorkflowId",
+                    Expected::Form {
+                        described: "a WorkflowId of the form w- + 17 of [a-z0-9]",
+                        check: is_transfer_workflow_id,
+                    },
+                ),
+                (
+                    "WorkflowArn",
+                    Expected::Form {
+                        described: "a transfer workflow ARN",
+                        check: |value| {
+                            is_transfer_arn(value, "workflow", is_transfer_workflow_id)
+                        },
+                    },
+                ),
+            ],
+        },
+        OutputCase {
+            // A catalogued type whose name the TEMPLATE fixes, for contrast: `Ref` is that
+            // name and the ARN is built from it, and a log-group ARN ends in `:*`.
+            case: "a log group: Ref is the declared name, Arn ends in :*",
+            stack_name: "logs",
+            template: r#"{"Resources":{"G":{"Type":"AWS::Logs::LogGroup",
+                   "Properties":{"LogGroupName":"/probe/group"}}},
+                 "Outputs":{"GroupName":{"Value":{"Ref":"G"}},
+                   "GroupArn":{"Value":{"Fn::GetAtt":["G","Arn"]}}}}"#
+                .to_string(),
+            parameters: vec![],
+            expected: expect(&[
+                ("GroupName", "/probe/group".to_string()),
+                (
+                    "GroupArn",
+                    format!("arn:aws:logs:{REGION}:{ACCOUNT_ID}:log-group:/probe/group:*"),
                 ),
             ]),
         },
@@ -478,6 +614,15 @@ async fn declared_outputs_are_evaluated_and_reported_by_describe_stacks() {
                     case.case,
                     output.value
                 ),
+                Expected::Form { described, check } => {
+                    let actual = output.value.as_deref().unwrap_or_default();
+                    assert!(
+                        output.value.is_some() && check(actual),
+                        "case {:?}: output {key:?} must carry {described}, got {:?}",
+                        case.case,
+                        output.value
+                    );
+                }
             }
         }
     }
@@ -1076,6 +1221,99 @@ async fn a_substitution_chain_cannot_multiply_the_work_of_its_parts() {
             expected,
             "case {case:?}: expected {expected:?}, got {:?}",
             output.value
+        );
+    }
+}
+
+/// A resource whose identifier the OWNING SERVICE assigns gets one identifier per
+/// resource, of that service's documented form, and it is STABLE: two reads report the
+/// same one, and two resources of the same type in one stack never share it.
+///
+/// The rows differ along what the rule generalises over: the resource type, its
+/// documented prefix, and the character class its id is drawn from.
+#[tokio::test]
+async fn a_service_assigned_resource_id_is_unique_per_resource_and_stable() {
+    let router = router();
+    let template = concat!(
+        "Resources:\n",
+        "  First:\n",
+        "    Type: AWS::Transfer::Server\n",
+        "  Second:\n",
+        "    Type: AWS::Transfer::Server\n",
+        "  Flow:\n",
+        "    Type: AWS::Transfer::Workflow\n",
+        "Outputs:\n",
+        "  FirstId:\n",
+        "    Value: !GetAtt First.ServerId\n",
+        "  SecondId:\n",
+        "    Value: !GetAtt Second.ServerId\n",
+        "  FlowId:\n",
+        "    Value: !GetAtt Flow.WorkflowId\n",
+    );
+    create_stack(&router, "assigned-ids", template, &[]).await;
+    wait_for_the_transition().await;
+
+    let (_, body) = describe_stack(&router, "assigned-ids").await;
+    let first = wire_outputs(&body);
+    let read = |key: &str, outputs: &[WireOutput]| -> String {
+        output_for(outputs, key)
+            .and_then(|output| output.value.clone())
+            .unwrap_or_else(|| panic!("expected an evaluated {key}, got {body}"))
+    };
+
+    // (case, output key, the form the owning service documents, the predicate)
+    struct IdRow {
+        case: &'static str,
+        key: &'static str,
+        described: &'static str,
+        check: fn(&str) -> bool,
+    }
+    let rows: [IdRow; 3] = [
+        IdRow {
+            case: "a transfer server",
+            key: "FirstId",
+            described: "s- + 17 hexadecimal characters",
+            check: is_transfer_server_id,
+        },
+        IdRow {
+            case: "a second transfer server in the same stack",
+            key: "SecondId",
+            described: "s- + 17 hexadecimal characters",
+            check: is_transfer_server_id,
+        },
+        IdRow {
+            case: "a transfer workflow",
+            key: "FlowId",
+            described: "w- + 17 of [a-z0-9]",
+            check: is_transfer_workflow_id,
+        },
+    ];
+    for IdRow {
+        case,
+        key,
+        described,
+        check,
+    } in rows
+    {
+        let value = read(key, &first);
+        assert!(
+            check(&value),
+            "case {case:?}: {key} must be of the form {described}, got {value:?}"
+        );
+    }
+    assert_ne!(
+        read("FirstId", &first),
+        read("SecondId", &first),
+        "two resources of one type in one stack must not share an assigned id, got {body}"
+    );
+
+    let (_, body) = describe_stack(&router, "assigned-ids").await;
+    let second = wire_outputs(&body);
+    for key in ["FirstId", "SecondId", "FlowId"] {
+        assert_eq!(
+            read(key, &second),
+            read(key, &first),
+            "reading the stack again must report the same assigned id for {key}, got {body}"
         );
     }
 }

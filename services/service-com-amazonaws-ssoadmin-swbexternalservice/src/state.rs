@@ -45,6 +45,14 @@ pub const SEED_INSTANCE_NAME: &str = "IdentityCenter";
 /// ACTIVE`, and a seeded instance is ready, so it is `ACTIVE` and stays `ACTIVE`.
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 
+/// Whether permission sets are enabled on the seeded instance.
+///
+/// They are: this service implements `CreatePermissionSet`, `DescribePermissionSet`,
+/// `ListPermissionSets` and the account-assignment operations against that instance, so
+/// reporting anything else from `DescribeInstance` would contradict what the instance
+/// actually serves.
+pub const SEED_PERMISSION_SETS_ENABLED: bool = true;
+
 /// `StatusValues::SUCCEEDED` — the terminal status of an assignment operation this
 /// emulator has already applied in full.
 pub const STATUS_SUCCEEDED: &str = "SUCCEEDED";
@@ -111,6 +119,12 @@ pub struct Instance {
     pub status: String,
     pub primary_region: String,
     pub regions: Vec<Region>,
+    /// `DescribeInstance$PermissionSetsEnabled` — "Indicates whether permission sets
+    /// are enabled for this Identity Center instance". It is a property of the
+    /// instance, not of the request, so it is held here rather than decided per read;
+    /// `InstanceMetadata` (what `ListInstances` projects) carries no such member, so
+    /// only `DescribeInstance` reports it.
+    pub permission_sets_enabled: bool,
 }
 
 impl Instance {
@@ -285,6 +299,10 @@ impl Default for ComAmazonawsSsoadminSwbexternalserviceState {
                 added_date: created_date,
                 is_primary_region: true,
             }],
+            // The seeded instance is the one `CreatePermissionSet` /
+            // `ListPermissionSets` / `CreateAccountAssignment` operate against, so
+            // permission sets ARE enabled on it.
+            permission_sets_enabled: SEED_PERMISSION_SETS_ENABLED,
         };
         let mut instances = BTreeMap::new();
         instances.insert(instance.instance_arn.clone(), instance);

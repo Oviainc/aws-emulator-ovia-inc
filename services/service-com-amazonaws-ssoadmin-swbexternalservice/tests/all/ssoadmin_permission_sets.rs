@@ -27,7 +27,7 @@ use smithy_server_runtime::MultiServiceRouter;
 /// A pattern-valid `InstanceArn` for an instance that was never created, used to pin
 /// the 404 rule. Shaped by the model's `InstanceArn` pattern
 /// `^arn:aws(-[a-z]{1,5}){0,3}:sso:::instance/(sso)?ins-[a-zA-Z0-9-.]{16}$`.
-const UNKNOWN_INSTANCE_ARN: &str = "arn:aws:sso:::instance/ssoins-0000000000000000";
+pub(crate) const UNKNOWN_INSTANCE_ARN: &str = "arn:aws:sso:::instance/ssoins-0000000000000000";
 
 /// A pattern-valid `PermissionSetArn` that was never minted. Shaped by the model's
 /// `PermissionSetArn` pattern
@@ -40,7 +40,7 @@ const ACCOUNT_A: &str = "123456789012";
 
 /// A one-service router over a fresh engine: the same assembly the production router
 /// performs, minus the other services.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are the emulator's business, not this service's; this test drives the
@@ -54,7 +54,11 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Call one operation and return `(http status, parsed body)`.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -83,7 +87,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 
 /// The wire error code of an error response: `__type` on the awsJson protocols, with
 /// any `namespace#` prefix stripped.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -94,7 +98,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// The ARN of the one seeded instance, read the way a client reads it.
-async fn seeded_instance_arn(router: &MultiServiceRouter) -> String {
+pub(crate) async fn seeded_instance_arn(router: &MultiServiceRouter) -> String {
     let (status, body) = call(router, "ListInstances", &json!({})).await;
     assert_eq!(status, 200, "ListInstances: expected 200, got {status} {body}");
     body["Instances"][0]["InstanceArn"]
@@ -105,7 +109,7 @@ async fn seeded_instance_arn(router: &MultiServiceRouter) -> String {
 
 /// Whether `arn` has the shape the model's `InstanceArn` pattern requires:
 /// `arn:aws:sso:::instance/` then `ins-` or `ssoins-` then 16 of `[a-zA-Z0-9-.]`.
-fn is_instance_arn(arn: &str) -> bool {
+pub(crate) fn is_instance_arn(arn: &str) -> bool {
     let Some(id) = arn.strip_prefix("arn:aws:sso:::instance/") else {
         return false;
     };

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE IAM Identity Center instance, read from
+//! [`crate::state::ComAmazonawsSsoadminSwbexternalserviceState::instances`] — the same
+//! records `ListInstances` enumerates, so a client that picks an instance out of the list
+//! and describes it by ARN sees the same instance.
+//!
+//! This is a REPORTING operation: it writes nothing. An `InstanceArn` the store does not
+//! hold is refused with the modelled `AccessDeniedException` (403), the only not-found
+//! channel this operation's model declares (it declares no `ResourceNotFoundException`,
+//! and the operation's own documentation gives `AccessDeniedException` as the answer for
+//! an instance that is no longer there: "DELETE_IN_PROGRESS — … Returns
+//! AccessDeniedException after the delete operation completes").
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +187,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstance"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeInstanceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+
+        // A read, so the store is only READ: the instance is reported exactly as it is
+        // held, and an ARN the store does not hold is refused rather than created.
+        let guard = state.lock();
+        let Some(instance) = guard.instance(&input.instance_arn) else {
+            return Err(DescribeInstanceErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(format!(
+                        "No IAM Identity Center instance {} exists in this account",
+                        input.instance_arn
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeInstanceOutput {
+            instance_arn: Some(instance.instance_arn.clone()),
+            identity_store_id: Some(instance.identity_store_id.clone()),
+            identity_store_arn: Some(instance.identity_store_arn.clone()),
+            owner_account_id: Some(instance.owner_account_id.clone()),
+            name: Some(instance.name.clone()),
+            created_date: Some(instance.created_date),
+            status: Some(instance.status.clone()),
+            // "Provides additional context about the current status … particularly useful
+            // when an instance is in a non-ACTIVE state": an ACTIVE instance has none.
+            status_reason: None,
+            primary_region: Some(instance.primary_region.clone()),
+            regions: Some(
+                instance
+                    .regions
+                    .iter()
+                    .map(crate::state::Region::to_shape)
+                    .collect(),
+            ),
+            // Nothing in this emulator configures a customer-managed KMS key for the
+            // instance (`CreateInstance`/`UpdateInstance` are still scaffolded), so there
+            // is no encryption configuration to report and the optional member is absent
+            // rather than carrying an invented key type or ARN.
+            encryption_configuration_details: None,
+            permission_sets_enabled: Some(instance.permission_sets_enabled),
+        })
     }
 }

@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/rest_api_lifecycle.rs"]
 mod rest_api_lifecycle;
+#[path = "all/service_claim.rs"]
+mod service_claim;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
