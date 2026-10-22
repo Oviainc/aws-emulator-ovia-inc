@@ -19,8 +19,9 @@
 //! without end.
 //!
 //! The per-request work is bounded the same way, and does not rest on the
-//! boundary validator alone: [`MAX_CASE_FIELD_IDS`] and
-//! [`MAX_BATCH_FIELD_IDS`] are re-checked in the handler ([`list_too_long`]),
+//! boundary validator alone: [`MAX_CASE_FIELD_IDS`],
+//! [`MAX_BATCH_FIELD_IDS`] and [`MAX_EVENT_INCLUDED_FIELD_IDS`] are re-checked
+//! in the handler ([`list_too_long`]),
 //! the scans below are linear in the list length, and a refusal names at most
 //! [`MAX_IDS_NAMED_IN_A_REFUSAL`] ids. A list that carries the same id twice is
 //! refused on the WRITE paths only ([`duplicate_ids`]), where two values for one
@@ -105,6 +106,12 @@ pub const MAX_BATCH_FIELD_IDS: usize = 50;
 /// `CreateTemplateRequest$requiredFields` cap of `..100`, re-checked in the
 /// handler for the same reason as [`MAX_CASE_FIELD_IDS`].
 pub const MAX_REQUIRED_FIELDS: usize = 100;
+
+/// Most field identifiers one domain's case-event publishing configuration may
+/// include: the model's `CaseEventIncludedData$fields` cap of `..400`
+/// (`smithy_query(query="shape", shape="CaseEventIncludedData")`), re-checked in
+/// the handler for the same reason as [`MAX_CASE_FIELD_IDS`].
+pub const MAX_EVENT_INCLUDED_FIELD_IDS: usize = 400;
 
 /// Most ids a refusal message names, so a refusal over a long list cannot be
 /// amplified into a long response.
@@ -603,6 +610,36 @@ pub fn state_unavailable() -> InternalServerException {
 /// Render a stored instant the way the model's `date-time` timestamps expect.
 pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
+}
+
+/// The case-event publishing configuration a domain reports when no
+/// `PutCaseEventConfiguration` has been made against it: delivery disabled, with
+/// no included data.
+///
+/// The configuration is a PROPERTY of the domain, not a resource of its own:
+/// `PutCaseEventConfiguration` "Adds case event publishing configuration" to a
+/// domain and `GetCaseEventConfiguration` "Returns the case event publishing
+/// configuration" with `eventBridge` as a REQUIRED output member
+/// (`smithy_query(query="operation", operation="GetCaseEventConfiguration")`), so
+/// an unconfigured domain reports event delivery off rather than a missing
+/// resource — the 404 of either operation is for a domain this store does not
+/// hold.
+pub fn event_bridge_disabled() -> EventBridgeConfiguration {
+    EventBridgeConfiguration {
+        enabled: false,
+        included_data: None,
+    }
+}
+
+/// How many field identifiers `configuration` asks the case event stream to
+/// include: the length of its `includedData.caseData.fields` list, or zero when
+/// it names no case data at all. Linear in nothing — it reads one length.
+pub fn included_field_count(configuration: &EventBridgeConfiguration) -> usize {
+    configuration
+        .included_data
+        .as_ref()
+        .and_then(|included| included.case_data.as_ref())
+        .map_or(0, |case_data| case_data.fields.len())
 }
 
 /// A tag map for a response member: absent when the resource carries no tags,

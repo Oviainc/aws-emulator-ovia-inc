@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteInput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteInput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes an input: refused while a channel attaches it, otherwise the input enters
+//! `DELETING` and the clock settles it into the terminal `DELETED`.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +140,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteInput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteInputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.settle(now);
+
+        if !state.inputs.contains_key(&input.input_id) {
+            return Err(DeleteInputErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("Input", &input.input_id)),
+            })
+            .into());
+        }
+
+        // An input a channel still attaches is busy: "Deletes the input end
+        // point" cannot happen while some channel's `InputAttachments` names it,
+        // so the answer is this operation's modelled `ConflictException` and the
+        // input is left exactly as it was.
+        let attached_to = state.attached_channels(&input.input_id);
+        if !attached_to.is_empty() {
+            return Err(DeleteInputErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Input {} is attached to channel(s) {} and cannot be deleted",
+                    input.input_id,
+                    attached_to.join(", ")
+                )),
+            })
+            .into());
+        }
+
+        // A detached input is deleted: it enters `DELETING` and the clock owes
+        // the terminal `DELETED`, which `DescribeInput` then reports. The record
+        // stays in the account in that state rather than vanishing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteInput"))
+        // A delete already accepted (the input is `DELETING` or `DELETED`) is
+        // answered 200 rather than with `ConflictException`: the state the
+        // caller is asking for is the state the input is already heading for or
+        // in, so nothing about the request conflicts with the stored resource —
+        // and `begin_delete_input` keeps the instant the first call set, so a
+        // repeat can neither restart the clock nor revive a deleted input. The
+        // conflict is reserved for the case the doc gives it: an input some
+        // channel still attaches.
+        let record = state
+            .inputs
+            .get_mut(&input.input_id)
+            .ok_or_else(unavailable)?;
+        crate::state::begin_delete_input(record, now);
+
+        // `DeleteInputResponse` carries no members at all
+        // (`smithy_query(query="operation", operation="DeleteInput")`), so the
+        // success is an empty body at HTTP 200; the effect is readable through
+        // `DescribeInput`.
+        Ok(DeleteInputOutput {})
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no input store to delete from. A modelled server error, never a
+/// fresh engine (which would drop the deletion on return).
+fn unavailable() -> DeleteInputError {
+    DeleteInputErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

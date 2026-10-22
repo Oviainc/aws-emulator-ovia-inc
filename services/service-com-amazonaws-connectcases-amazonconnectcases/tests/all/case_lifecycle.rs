@@ -34,13 +34,13 @@ fn authorization(region: &str) -> String {
 }
 
 /// One emulator: a single shared engine behind the production router.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     region: String,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::in_region("us-east-1")
     }
 
@@ -54,7 +54,7 @@ impl Emulator {
         }
     }
 
-    async fn send(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+    pub(crate) async fn send(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
         let payload = body
             .map(|body| serde_json::to_vec(&body).expect("serialize the request body"))
             .unwrap_or_default();
@@ -77,7 +77,7 @@ impl Emulator {
     }
 
     /// Send a call that must succeed, and hand back its parsed body.
-    async fn ok(&self, case: &str, method: &str, path: &str, body: Value) -> Value {
+    pub(crate) async fn ok(&self, case: &str, method: &str, path: &str, body: Value) -> Value {
         let (status, json) = self.send(method, path, Some(body)).await;
         assert_eq!(
             status, 200,
@@ -87,7 +87,13 @@ impl Emulator {
     }
 
     /// Send a call that must fail, and hand back its status and wire error code.
-    async fn failure(&self, case: &str, method: &str, path: &str, body: Option<Value>) -> (u16, String) {
+    pub(crate) async fn failure(
+        &self,
+        case: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, String) {
         let (status, json) = self.send(method, path, body).await;
         let code = json
             .get("__type")
@@ -173,7 +179,7 @@ fn field_of_type(fields: &[(&'static str, String)], field_type: &str) -> String 
 }
 
 /// Create a domain and return its id.
-async fn domain(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn domain(emulator: &Emulator, name: &str) -> String {
     let created = emulator
         .ok(name, "POST", "/domains", json!({ "name": name }))
         .await;

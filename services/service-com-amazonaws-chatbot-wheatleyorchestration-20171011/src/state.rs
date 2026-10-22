@@ -3,7 +3,7 @@
 //! Engine state for the com-amazonaws-chatbot-wheatleyorchestration-20171011 service.
 //!
 //! This module owns the persisted shape of every chat configuration the service
-//! stores, plus the few helpers the Slack-channel handlers share (the ARN form, the
+//! stores, plus the few helpers the configuration handlers share (the ARN form, the
 //! request's region, and the record -> modelled-shape projection). Handlers reach it
 //! through [`service_state`]; nothing here is per-request.
 //!
@@ -19,7 +19,8 @@
 use std::collections::BTreeMap;
 
 use crate::ops::types::{
-    AccountPreferences, ConfiguredTeam, SlackChannelConfiguration, SlackWorkspace, Tag,
+    AccountPreferences, ChimeWebhookConfiguration, ConfiguredTeam, SlackChannelConfiguration,
+    SlackWorkspace, Tag,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -29,9 +30,16 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// The `chatbot` ARN service namespace (`OPERATIONS.md`: "ARN namespace: chatbot").
 const ARN_SERVICE: &str = "chatbot";
 
-/// `State` of a chat configuration AWS Chatbot reports as usable. A Slack channel
+/// The ARN resource-path segment naming the chat client a configuration configures: a
+/// Slack channel, or an Amazon Chime webhook. A chat configuration ARN is
+/// `chat-configuration/{kind}/{name}`, so the kind is what keeps one client's
+/// configuration name from colliding with another's.
+const CHAT_CONFIGURATION_KIND_SLACK: &str = "slack-channel";
+const CHAT_CONFIGURATION_KIND_CHIME: &str = "chime-webhook";
+
+/// `State` of a chat configuration AWS Chatbot reports as usable. A chat
 /// configuration is usable the moment it is created — AWS returns no transient
-/// status for it — so this is the only state a created record is ever in.
+/// status for one — so this is the only state a created record is ever in.
 pub const STATE_ENABLED: &str = "ENABLED";
 
 /// The most tags a chat configuration can carry: the model's `TagList` is
@@ -53,10 +61,19 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// refused with the modelled `LimitExceededException`.
 pub const MAX_SLACK_CHANNEL_CONFIGURATIONS: usize = MAX_PAGE_SIZE;
 
+/// The most Amazon Chime webhook configurations this store holds AT ALL, for the same
+/// reason — and on the same (emulator-owned) grounds — as
+/// [`MAX_SLACK_CHANNEL_CONFIGURATIONS`]: AWS enforces a service quota on chat
+/// configurations per account, the model does not carry the number, and past this bound
+/// a create is refused with the modelled `LimitExceededException` rather than growing
+/// the emulator's memory without limit.
+pub const MAX_CHIME_WEBHOOK_CONFIGURATIONS: usize = MAX_PAGE_SIZE;
+
 // A `Describe` that names no `MaxResults` answers a region's configurations in ONE page
 // with no `NextToken`. That holds only while the store cannot hold more than one page,
 // so the two bounds are tied here rather than left to drift apart.
 const _: () = assert!(MAX_SLACK_CHANNEL_CONFIGURATIONS <= MAX_PAGE_SIZE);
+const _: () = assert!(MAX_CHIME_WEBHOOK_CONFIGURATIONS <= MAX_PAGE_SIZE);
 
 /// Per-service state for com-amazonaws-chatbot-wheatleyorchestration-20171011. A handler reaches it through [`service_state`].
 ///
@@ -67,6 +84,10 @@ const _: () = assert!(MAX_SLACK_CHANNEL_CONFIGURATIONS <= MAX_PAGE_SIZE);
 pub struct ComAmazonawsChatbotWheatleyorchestration20171011State {
     /// Every Slack channel configuration, keyed by its `ChatConfigurationArn`.
     pub slack_channel_configurations: BTreeMap<String, SlackChannelConfigRecord>,
+    /// Every Amazon Chime webhook configuration, keyed by its `ChatConfigurationArn`,
+    /// for the same reason as the Slack ones: `DescribeChimeWebhookConfigurations`
+    /// walks them in one stable total order and resumes that walk from an opaque token.
+    pub chime_webhook_configurations: BTreeMap<String, ChimeWebhookConfigRecord>,
     /// The Slack workspaces AUTHORIZED with this account, keyed by `SlackTeamId`.
     ///
     /// A Slack channel configuration can only be created for a workspace this map
@@ -101,6 +122,7 @@ impl Default for ComAmazonawsChatbotWheatleyorchestration20171011State {
     fn default() -> Self {
         Self {
             slack_channel_configurations: BTreeMap::new(),
+            chime_webhook_configurations: BTreeMap::new(),
             slack_workspace_authorizations: seed_slack_workspaces()
                 .into_iter()
                 .map(|workspace| (workspace.slack_team_id.clone(), workspace))
@@ -430,16 +452,23 @@ pub struct SlackChannelConfigRecord {
     pub tags: BTreeMap<String, String>,
 }
 
+/// A record's stored tags as the modelled `Tag` list, in `TagKey` order.
+///
+/// Shared by every kind of chat configuration, so one read cannot answer a different
+/// tag shape than another.
+pub fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
+    tags.iter()
+        .map(|(tag_key, tag_value)| Tag {
+            tag_key: tag_key.clone(),
+            tag_value: tag_value.clone(),
+        })
+        .collect()
+}
+
 impl SlackChannelConfigRecord {
     /// The stored tags as the modelled `Tag` list, in key order.
     pub fn tag_list(&self) -> Vec<Tag> {
-        self.tags
-            .iter()
-            .map(|(tag_key, tag_value)| Tag {
-                tag_key: tag_key.clone(),
-                tag_value: tag_value.clone(),
-            })
-            .collect()
+        tag_list(&self.tags)
     }
 
     /// Project the stored record onto the modelled `SlackChannelConfiguration` every
@@ -466,8 +495,60 @@ impl SlackChannelConfigRecord {
     }
 }
 
-/// The `ChatConfigurationArn` of a Slack channel configuration:
-/// `arn:aws:chatbot:{region}:{account}:chat-configuration/slack-channel/{name}`.
+/// One stored Amazon Chime webhook configuration: everything a later `Describe`,
+/// `Update`, `Delete` or tag call has to be able to answer from.
+///
+/// `WebhookUrl` is stored even though no response carries it (the modelled
+/// `ChimeWebhookConfiguration` has no `WebhookUrl` member, and the input's is
+/// `@sensitive`): it is the webhook's destination, so an update has to be able to
+/// replace it and a create has to keep it.
+#[derive(Debug, Clone, Default)]
+pub struct ChimeWebhookConfigRecord {
+    pub chat_configuration_arn: String,
+    pub configuration_name: String,
+    /// The region the configuration lives in, the one its ARN names. Chat
+    /// configurations are regional, so a listing answers only its own region's.
+    pub region: String,
+    pub webhook_description: String,
+    pub webhook_url: String,
+    pub iam_role_arn: String,
+    pub sns_topic_arns: Vec<String>,
+    pub logging_level: Option<String>,
+    /// `ENABLED` or `DISABLED`; see [`STATE_ENABLED`].
+    pub state: String,
+    pub state_reason: Option<String>,
+    /// Tags keyed by `TagKey`, so `TagResource` merges by key and the list a read
+    /// returns has one entry per key in a stable order.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl ChimeWebhookConfigRecord {
+    /// The stored tags as the modelled `Tag` list, in key order.
+    pub fn tag_list(&self) -> Vec<Tag> {
+        tag_list(&self.tags)
+    }
+
+    /// Project the stored record onto the modelled `ChimeWebhookConfiguration` every
+    /// Chime-webhook operation returns. The single place that mapping lives, so
+    /// create, update and describe cannot answer three different shapes for one record.
+    pub fn view(&self) -> ChimeWebhookConfiguration {
+        ChimeWebhookConfiguration {
+            webhook_description: self.webhook_description.clone(),
+            chat_configuration_arn: self.chat_configuration_arn.clone(),
+            iam_role_arn: self.iam_role_arn.clone(),
+            sns_topic_arns: self.sns_topic_arns.clone(),
+            configuration_name: Some(self.configuration_name.clone()),
+            logging_level: self.logging_level.clone(),
+            tags: Some(self.tag_list()),
+            state: Some(self.state.clone()),
+            state_reason: self.state_reason.clone(),
+        }
+    }
+}
+
+/// The `ChatConfigurationArn` of a chat configuration of kind `kind` (the ARN
+/// resource-path segment that names the chat client: `slack-channel`,
+/// `chime-webhook`): `arn:aws:chatbot:{region}:{account}:chat-configuration/{kind}/{name}`.
 ///
 /// Built through `emulator_server::emulator_arn`, so the account segment is the one
 /// canonical emulator account id and no ARN is assembled by hand.
@@ -476,12 +557,24 @@ impl SlackChannelConfigRecord {
 /// ARN-addressed operations (`Update`, `Delete`, `TagResource`, `ListTagsForResource`)
 /// look a record up by ARN alone and ignore the signing region, while a listing — which
 /// has no ARN to go on — filters on the region the request is addressed to.
-pub fn slack_channel_configuration_arn(region: &str, configuration_name: &str) -> String {
+pub fn chat_configuration_arn(region: &str, kind: &str, configuration_name: &str) -> String {
     ::emulator_server::emulator_arn(
         ARN_SERVICE,
         region,
-        &format!("chat-configuration/slack-channel/{configuration_name}"),
+        &format!("chat-configuration/{kind}/{configuration_name}"),
     )
+}
+
+/// The `ChatConfigurationArn` of a Slack channel configuration:
+/// `arn:aws:chatbot:{region}:{account}:chat-configuration/slack-channel/{name}`.
+pub fn slack_channel_configuration_arn(region: &str, configuration_name: &str) -> String {
+    chat_configuration_arn(region, CHAT_CONFIGURATION_KIND_SLACK, configuration_name)
+}
+
+/// The `ChatConfigurationArn` of an Amazon Chime webhook configuration:
+/// `arn:aws:chatbot:{region}:{account}:chat-configuration/chime-webhook/{name}`.
+pub fn chime_webhook_configuration_arn(region: &str, configuration_name: &str) -> String {
+    chat_configuration_arn(region, CHAT_CONFIGURATION_KIND_CHIME, configuration_name)
 }
 
 /// The prefix every Slack channel configuration ARN in `region` starts with: the same
@@ -491,6 +584,13 @@ pub fn slack_channel_configuration_arn(region: &str, configuration_name: &str) -
 /// issued from a string a caller made up.
 pub fn slack_channel_configuration_arn_prefix(region: &str) -> String {
     slack_channel_configuration_arn(region, "")
+}
+
+/// The prefix every Amazon Chime webhook configuration ARN in `region` starts with: the
+/// same ARN with an empty configuration name. As for the Slack prefix, this is what
+/// tells a pagination token this service issued from a string a caller made up.
+pub fn chime_webhook_configuration_arn_prefix(region: &str) -> String {
+    chime_webhook_configuration_arn(region, "")
 }
 
 /// The region this request is addressed to: the SigV4 credential scope's region, or
