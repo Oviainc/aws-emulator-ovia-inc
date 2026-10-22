@@ -407,15 +407,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A channel only exists inside a channel group, so the parent has to be there.
+        // An absent parent is reported exactly as `GetChannelGroup` reports it: the
+        // fixed channel-group not-found, with no name in it.
         let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
             return Err(CreateChannelErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Channel group {} not found",
-                        input.channel_group_name
-                    )),
-                    resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
-                },
+                crate::state::ResourceKind::ChannelGroup.not_found(),
             )
             .into());
         };
@@ -469,13 +465,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if group.channels.contains_key(&input.channel_name) {
-            return Err(CreateChannelErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Channel {} already exists in channel group {}",
-                    input.channel_name, group.name
-                )),
-                conflict_exception_type: Some("RESOURCE_ALREADY_EXISTS".to_string()),
-            })
+            return Err(CreateChannelErrorModeled::ConflictException(
+                crate::state::resource_already_exists(),
+            )
             .into());
         }
 

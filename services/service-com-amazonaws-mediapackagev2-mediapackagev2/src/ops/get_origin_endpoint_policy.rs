@@ -134,27 +134,8 @@ impl From<GetOriginEndpointPolicyErrorModeled> for GetOriginEndpointPolicyError 
     }
 }
 
-/// The sentence MediaPackage answers with when a channel group cannot be resolved —
-/// fixed per resource type, echoing none of the caller's identifiers. Worded exactly as
-/// the channel-scope policy handlers word it (`get_channel_policy`).
-const CHANNEL_GROUP_NOT_FOUND: &str = "MediaPackage can't process your request because \
-    we can't find your channel group. Verify your channel group name or add a channel \
-    group and then try again";
-
-/// The same fixed sentence at channel scope.
-const CHANNEL_NOT_FOUND: &str = "MediaPackage can't process your request because we \
-    can't find your channel. Verify your channel name or add a channel and then try \
-    again";
-
-/// The same fixed sentence at origin-endpoint scope.
-const ORIGIN_ENDPOINT_NOT_FOUND: &str = "MediaPackage can't process your request because \
-    we can't find your origin endpoint. Verify your origin endpoint name or add an origin \
-    endpoint and then try again";
-
-/// The not-found text for an endpoint that exists with no policy attached: the endpoint
-/// resolves, so what is missing is the policy sub-resource.
-const POLICY_NOT_FOUND: &str = "MediaPackage can't process your request because we can't \
-    find your policy. Attach a policy to your resource and then try again";
+// The not-found text for an endpoint that exists with no policy attached lives with the
+// rest of this service's refusal bodies, as `crate::state::policy_not_found`.
 
 /// The `GetOriginEndpointPolicy` operation.
 ///
@@ -209,10 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(group) = store.channel_groups.get(&input.channel_group_name) else {
             return Err(
                 GetOriginEndpointPolicyErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(CHANNEL_GROUP_NOT_FOUND.to_string()),
-                        resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
-                    },
+                    crate::state::ResourceKind::ChannelGroup.not_found(),
                 )
                 .into(),
             );
@@ -220,10 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(channel) = group.channels.get(&input.channel_name) else {
             return Err(
                 GetOriginEndpointPolicyErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(CHANNEL_NOT_FOUND.to_string()),
-                        resource_type_not_found: Some("CHANNEL".to_string()),
-                    },
+                    crate::state::ResourceKind::Channel.not_found(),
                 )
                 .into(),
             );
@@ -231,10 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(endpoint) = channel.origin_endpoints.get(&input.origin_endpoint_name) else {
             return Err(
                 GetOriginEndpointPolicyErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(ORIGIN_ENDPOINT_NOT_FOUND.to_string()),
-                        resource_type_not_found: Some("ORIGIN_ENDPOINT".to_string()),
-                    },
+                    crate::state::ResourceKind::OriginEndpoint.not_found(),
                 )
                 .into(),
             );
@@ -246,10 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(attached) = endpoint.policy.as_ref() else {
             return Err(
                 GetOriginEndpointPolicyErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(POLICY_NOT_FOUND.to_string()),
-                        resource_type_not_found: None,
-                    },
+                    crate::state::policy_not_found(),
                 )
                 .into(),
             );

@@ -25,11 +25,13 @@ use aws_smithy_schema_server::{Violation, ViolationKind};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    CdnAuthConfiguration, CreateDashManifestConfiguration, CreateHlsManifestConfiguration,
-    CreateLowLatencyHlsManifestConfiguration, CreateMssManifestConfiguration,
-    ForceEndpointErrorConfiguration, GetDashManifestConfiguration, GetHlsManifestConfiguration,
+    CdnAuthConfiguration, ConflictException, CreateDashManifestConfiguration,
+    CreateHlsManifestConfiguration, CreateLowLatencyHlsManifestConfiguration,
+    CreateMssManifestConfiguration, ForceEndpointErrorConfiguration,
+    GetDashManifestConfiguration, GetHlsManifestConfiguration,
     GetLowLatencyHlsManifestConfiguration, GetMssManifestConfiguration, IngestEndpoint,
-    InputSwitchConfiguration, MultiviewConfiguration, OutputHeaderConfiguration, Segment,
+    InputSwitchConfiguration, MultiviewConfiguration, OutputHeaderConfiguration,
+    ResourceNotFoundException, Segment, ValidationException,
 };
 
 /// The signing name (and ARN service namespace) of this service, from the model's
@@ -729,6 +731,199 @@ pub fn idempotent_parameter_mismatch_message(client_token: &str) -> String {
 }
 
 // =============================================================================
+// Refusals: the MODELED error bodies this service answers with
+//
+// Every constructor here builds one of the model's own client errors
+// (`ResourceNotFoundException`, `ConflictException`, `ValidationException`), so a
+// refusal carries the members the model declares rather than a bare sentence.
+//
+// The rule they all follow: mediapackagev2 states a refusal in words that depend only
+// on WHAT was refused — the kind of resource, the constraint that was violated — and
+// never on the identifiers the caller sent. The discriminator member
+// (`ResourceTypeNotFound`, `ConflictExceptionType`, `ValidationExceptionType`) and the
+// sentence are two readings of that same fact, so they are chosen together, here, and
+// no handler words a refusal of its own.
+// =============================================================================
+
+/// One kind of resource in mediapackagev2's containment hierarchy: channel group ->
+/// channel -> origin endpoint.
+///
+/// The variants are the `ResourceTypeNotFound` enum values the model declares for the
+/// three resources this emulator persists (the model also declares `HARVEST_JOB`, whose
+/// operations are still scaffolded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    /// The top-level resource, which owns channels.
+    ChannelGroup,
+    /// A channel inside a channel group, which owns origin endpoints.
+    Channel,
+    /// An origin endpoint on a channel.
+    OriginEndpoint,
+}
+
+impl ResourceKind {
+    /// This kind's `ResourceTypeNotFound` value (model shape `ResourceTypeNotFound`,
+    /// whose values are `CHANNEL_GROUP`, `CHANNEL`, `ORIGIN_ENDPOINT`, `HARVEST_JOB`).
+    pub fn resource_type_not_found(self) -> &'static str {
+        match self {
+            Self::ChannelGroup => "CHANNEL_GROUP",
+            Self::Channel => "CHANNEL",
+            Self::OriginEndpoint => "ORIGIN_ENDPOINT",
+        }
+    }
+
+    /// How a mediapackagev2 message names this kind in prose.
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::ChannelGroup => "channel group",
+            Self::Channel => "channel",
+            Self::OriginEndpoint => "origin endpoint",
+        }
+    }
+
+    /// The plural of [`noun`](Self::noun), for a sentence about this kind's children.
+    pub fn plural(self) -> String {
+        format!("{}s", self.noun())
+    }
+
+    /// The indefinite article [`noun`](Self::noun) takes — `an` before a vowel.
+    fn article(self) -> &'static str {
+        match self.noun().starts_with(['a', 'e', 'i', 'o', 'u']) {
+            true => "an",
+            false => "a",
+        }
+    }
+
+    /// The 404 for a resource of this kind the service cannot find.
+    ///
+    /// The sentence names the KIND and nothing else: a caller's resource names are not
+    /// echoed back, so two callers asking for two different absent channels read the
+    /// same message.
+    pub fn not_found(self) -> ResourceNotFoundException {
+        let noun = self.noun();
+        let article = self.article();
+        ResourceNotFoundException {
+            message: Some(format!(
+                "MediaPackage can't process your request because we can't find your {noun}. \
+                 Verify your {noun} name or add {article} {noun} and then try again"
+            )),
+            resource_type_not_found: Some(self.resource_type_not_found().to_string()),
+        }
+    }
+}
+
+/// The 409 a delete answers while the resource it names still holds children.
+///
+/// `RESOURCE_IN_USE`: the deletion would orphan the children, so the service names the
+/// child kind that has to go first — not how many of them there are, which is a fact
+/// about the caller's state rather than about the refusal.
+pub fn children_attached(parent: ResourceKind, child: ResourceKind) -> ConflictException {
+    let parent_noun = parent.noun();
+    let children = child.plural();
+    ConflictException {
+        message: Some(format!(
+            "The {parent_noun} you tried to delete has {children} attached to it. \
+             If you want to delete this {parent_noun}, you must first delete the \
+             {children} attached to it"
+        )),
+        conflict_exception_type: Some("RESOURCE_IN_USE".to_string()),
+    }
+}
+
+/// The 409 a create answers when the name it was given is already taken.
+///
+/// `RESOURCE_ALREADY_EXISTS`, and resource-agnostic: mediapackagev2 states the collision
+/// without naming either the resource kind or the name that collided, so a client's
+/// idempotency logic matches one sentence for every create path.
+pub fn resource_already_exists() -> ConflictException {
+    ConflictException {
+        message: Some(
+            "MediaPackage can't create the resource you requested because a resource with \
+             that name already exists. Verify the name of the resource and then try again"
+                .to_string(),
+        ),
+        conflict_exception_type: Some("RESOURCE_ALREADY_EXISTS".to_string()),
+    }
+}
+
+/// The 404 for a policy the service cannot find because none is attached to the resource
+/// it would belong to — a channel or origin endpoint that exists with no policy on it.
+///
+/// The resource itself is present, and `ResourceTypeNotFound` enumerates only resource
+/// types (`CHANNEL_GROUP`, `CHANNEL`, `ORIGIN_ENDPOINT`, `HARVEST_JOB`), so the
+/// discriminator is left unset rather than naming a resource that is NOT missing. AWS
+/// publishes no wording for this case: what the service requires is the 404 and the
+/// error code, and the sentence follows the same rule as every other refusal here — one
+/// fixed sentence, naming neither the resource the caller addressed nor its kind, since
+/// what is missing is the policy either way.
+pub fn policy_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(
+            "MediaPackage can't process your request because we can't find your policy. \
+             Attach a policy to your resource and then try again"
+                .to_string(),
+        ),
+        resource_type_not_found: None,
+    }
+}
+
+/// The modeled 400 for one constraint the request violated.
+///
+/// Both members are set, and both are derived from the violation rather than from the
+/// request's values: `ValidationExceptionType` is the discriminator for the violated
+/// constraint CLASS, and `Message` names the member path that failed and restates the
+/// constraint it failed ([`constraint_detail`], which also words the framework's own
+/// refusal fallback, so one violation cannot be worded two ways). A caller can therefore
+/// branch on the type and repair the named member from the sentence alone.
+pub fn member_validation_failed(violation: &Violation) -> ValidationException {
+    validation_failed(
+        &violation.path,
+        &constraint_detail(&violation.kind),
+        validation_exception_type(&violation.kind),
+    )
+}
+
+/// The modeled 400 for a member this service refuses, in the envelope every
+/// mediapackagev2 validation message uses ([`validation_message`]): the member path the
+/// request named it at, then the requirement it failed.
+///
+/// A rule the service enforces itself (a policy document it cannot parse, a pagination
+/// token it did not issue) is therefore stated exactly like a constraint the model
+/// declares, so a caller reads one form for both.
+pub fn validation_failed(
+    member_path: &str,
+    requirement: &str,
+    exception_type: &str,
+) -> ValidationException {
+    ValidationException {
+        message: Some(validation_message(Some(member_path), requirement)),
+        validation_exception_type: Some(exception_type.to_string()),
+    }
+}
+
+/// The `ValidationExceptionType` value for a violated constraint class.
+///
+/// The model's `ValidationExceptionType` enum carries one `MEMBER_*` value per Smithy
+/// constraint class — `MEMBER_MISSING`, `MEMBER_MIN_LENGTH`, `MEMBER_MAX_LENGTH`,
+/// `MEMBER_MIN_VALUE`, `MEMBER_MAX_VALUE`, `MEMBER_DOES_NOT_MATCH_PATTERN`,
+/// `MEMBER_INVALID_ENUM_VALUE` — plus `MEMBER_INVALID` for a member that is wrong in a
+/// way none of the others names. This is that mapping and nothing more.
+fn validation_exception_type(kind: &ViolationKind) -> &'static str {
+    match kind {
+        ViolationKind::MissingRequiredMember => "MEMBER_MISSING",
+        ViolationKind::MinLength(_) => "MEMBER_MIN_LENGTH",
+        ViolationKind::MaxLength(_) => "MEMBER_MAX_LENGTH",
+        ViolationKind::MinValue(_) => "MEMBER_MIN_VALUE",
+        ViolationKind::MaxValue(_) => "MEMBER_MAX_VALUE",
+        ViolationKind::Pattern(_) => "MEMBER_DOES_NOT_MATCH_PATTERN",
+        ViolationKind::EnumValue(_) => "MEMBER_INVALID_ENUM_VALUE",
+        // `@uniqueItems`, and any constraint class added to the framework later: the
+        // member is invalid, which is all the enum can say about it.
+        _ => "MEMBER_INVALID",
+    }
+}
+
+// =============================================================================
 // Validation: how this service words a refused request
 // =============================================================================
 
@@ -753,7 +948,12 @@ pub fn validation_message(member_path: Option<&str>, detail: &str) -> String {
 
 /// The requirement a declared-constraint violation states, worded as this service words
 /// it: the violated bound, then the sentence telling the caller to check what it sent.
-fn constraint_detail(kind: &ViolationKind) -> String {
+///
+/// Reached from both refusal paths — the modelled `ValidationException` this service
+/// serializes for a constraint violation ([`member_validation_failed`])
+/// and the framework's own refusal wording ([`refusal_message`]) — so one violation
+/// cannot be worded two ways.
+pub fn constraint_detail(kind: &ViolationKind) -> String {
     let requirement = match kind {
         ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
         ViolationKind::MinLength(min) => {
@@ -768,9 +968,16 @@ fn constraint_detail(kind: &ViolationKind) -> String {
         ViolationKind::MaxValue(max) => {
             format!("Member must have value less than or equal to {max}")
         }
-        ViolationKind::Pattern(pattern) => {
-            format!("Member must satisfy regular expression pattern: {pattern}")
-        }
+        // A `@pattern` that is one character class is stated as the characters it
+        // ADMITS, which is what the caller has to act on; a pattern with no listable
+        // character set is stated as the pattern itself.
+        ViolationKind::Pattern(pattern) => match pattern_character_set(pattern) {
+            Some(supported) => format!(
+                "Member must contain only supported characters. Supported characters are \
+                 {supported}"
+            ),
+            None => format!("Member must satisfy regular expression pattern: {pattern}"),
+        },
         ViolationKind::EnumValue(allowed) => {
             format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
         }
@@ -780,6 +987,99 @@ fn constraint_detail(kind: &ViolationKind) -> String {
         _ => "Member must satisfy the constraints specified by the AWS service".to_string(),
     };
     format!("{requirement}. {CHECK_THE_VALUE}")
+}
+
+/// The characters a `@pattern` of the form `^[<class>]+$` admits, listed the way a
+/// MediaPackage validation message lists them — `^[a-zA-Z0-9_-]+$` becomes
+/// `A-Z, a-z, 0-9, _ (underscore), and - (hyphen)`.
+///
+/// `None` when the pattern is not a single, non-negated character class (the model's
+/// `^[\S]+$`, say): there is no set of characters to list, so the caller states the
+/// pattern itself instead.
+///
+/// Deliberately a RENDERER for message wording and nothing else: it reads the model's
+/// own `@pattern` string, never caller data, and must never be used to decide whether a
+/// value is acceptable — that is the framework's constraint walk, which compiles the
+/// pattern with the `regex` crate. Anything it cannot describe it declines.
+fn pattern_character_set(pattern: &str) -> Option<String> {
+    let body = pattern.strip_prefix('^')?.strip_suffix('$')?;
+    let class = body
+        .strip_suffix('+')
+        .or_else(|| body.strip_suffix('*'))
+        .unwrap_or(body);
+    let class = class.strip_prefix('[')?.strip_suffix(']')?;
+    // A negated class names what is FORBIDDEN, and an escape (`\S`, `\w`) names a set
+    // with no listable members, so neither can be rendered as "supported characters".
+    if class.starts_with('^') || class.contains('\\') || class.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = class.chars().collect();
+    let mut ranges: Vec<String> = Vec::new();
+    let mut literals: Vec<char> = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        // `X-Y` is a range; a `-` with nothing after it is the literal hyphen.
+        if index + 2 < chars.len() && chars[index + 1] == '-' {
+            // A range whose ends are not one run of letters or digits (`[_-x]`, which
+            // regex reads as the code points between them) has no listing a message
+            // could state, so the whole pattern is left to its own rendering rather
+            // than described as something narrower than it is.
+            if !is_listable_range(chars[index], chars[index + 2]) {
+                return None;
+            }
+            ranges.push(format!("{}-{}", chars[index], chars[index + 2]));
+            index += 3;
+        } else {
+            literals.push(chars[index]);
+            index += 1;
+        }
+    }
+    // The message lists the ranges in a canonical order — upper case, then lower case,
+    // then digits — rather than in the order the pattern happens to write them.
+    ranges.sort_by_key(|range| match range.chars().next() {
+        Some(first) if first.is_ascii_uppercase() => 0,
+        Some(first) if first.is_ascii_lowercase() => 1,
+        Some(first) if first.is_ascii_digit() => 2,
+        _ => 3,
+    });
+    let items: Vec<String> = ranges
+        .into_iter()
+        .chain(literals.into_iter().map(named_character))
+        .collect();
+    Some(join_with_and(&items))
+}
+
+/// Whether `start`-`end` is a range a message can state as itself: one run of upper-case
+/// letters, lower-case letters or digits, in ascending order. Anything else is a range
+/// over code points that happens to be writable in a class, and listing it would claim
+/// more or less than the pattern admits.
+fn is_listable_range(start: char, end: char) -> bool {
+    let same_run = (start.is_ascii_uppercase() && end.is_ascii_uppercase())
+        || (start.is_ascii_lowercase() && end.is_ascii_lowercase())
+        || (start.is_ascii_digit() && end.is_ascii_digit());
+    same_run && start <= end
+}
+
+/// One literal character as a message names it: the character, plus the word for it
+/// where it has one, because `_` and `-` are not legible on their own.
+fn named_character(character: char) -> String {
+    match character {
+        '_' => "_ (underscore)".to_string(),
+        '-' => "- (hyphen)".to_string(),
+        '.' => ". (period)".to_string(),
+        ' ' => "a space".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Join `items` as prose: `a`, `a and b`, `a, b, and c`.
+fn join_with_and(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [leading @ .., last] => format!("{}, and {last}", leading.join(", ")),
+    }
 }
 
 /// This service's wording for a refusal the request boundary made from the model's own
@@ -804,15 +1104,11 @@ pub fn refusal_message(violations: &[Violation]) -> String {
     }
 }
 
-/// The message a list operation answers a pagination token it did not issue with.
-/// Request-derived, and the same sentence whichever list is being paged.
-pub fn invalid_pagination_token_message() -> String {
-    validation_message(
-        Some("nextToken"),
-        "You've provided an invalid pagination token in your request. Check your token \
-         and then try again",
-    )
-}
+/// Why a pagination token this service did not issue is refused — the detail
+/// [`validation_message`] states after the member path. The same sentence whichever list
+/// is being paged, and about the token rather than about the caller's data.
+pub const INVALID_PAGINATION_TOKEN_DETAIL: &str = "You've provided an invalid pagination \
+     token in your request. Check your token and then try again";
 
 // =============================================================================
 // Validation: which manifests an origin endpoint's container type can serve
@@ -1104,6 +1400,169 @@ fn short_digest(parts: &[&str], len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every not-found sentence names the KIND of resource and never a resource name,
+    /// and carries the discriminator for that kind.
+    #[test]
+    fn a_not_found_names_the_resource_kind_and_no_identifier() {
+        for (kind, expected_type, noun) in [
+            (ResourceKind::ChannelGroup, "CHANNEL_GROUP", "channel group"),
+            (ResourceKind::Channel, "CHANNEL", "channel"),
+            (
+                ResourceKind::OriginEndpoint,
+                "ORIGIN_ENDPOINT",
+                "origin endpoint",
+            ),
+        ] {
+            let error = kind.not_found();
+            let message = error.message.clone().unwrap_or_default();
+            assert!(
+                message.contains(noun),
+                "case {kind:?}: expected a message naming {noun:?}, got {message:?}"
+            );
+            assert_eq!(
+                error.resource_type_not_found.as_deref(),
+                Some(expected_type),
+                "case {kind:?}: wrong ResourceTypeNotFound, got {:?}",
+                error.resource_type_not_found
+            );
+        }
+        // "an origin endpoint", not "a origin endpoint".
+        let endpoint = ResourceKind::OriginEndpoint
+            .not_found()
+            .message
+            .unwrap_or_default();
+        assert!(
+            endpoint.contains("add an origin endpoint"),
+            "case OriginEndpoint: expected the `an` article, got {endpoint:?}"
+        );
+    }
+
+    /// Each constraint class maps to its own `ValidationExceptionType`, and the message
+    /// names the member path that failed without echoing the value that failed it.
+    #[test]
+    fn a_violation_sets_both_modeled_members() {
+        let cases = [
+            (
+                ViolationKind::Pattern("^[a-zA-Z0-9_-]+$".to_string()),
+                "MEMBER_DOES_NOT_MATCH_PATTERN",
+            ),
+            (ViolationKind::MissingRequiredMember, "MEMBER_MISSING"),
+            (ViolationKind::MinLength(1), "MEMBER_MIN_LENGTH"),
+            (ViolationKind::MaxLength(256), "MEMBER_MAX_LENGTH"),
+            (
+                ViolationKind::MinValue("1".to_string()),
+                "MEMBER_MIN_VALUE",
+            ),
+            (
+                ViolationKind::MaxValue("100".to_string()),
+                "MEMBER_MAX_VALUE",
+            ),
+            (
+                ViolationKind::EnumValue(vec!["CMAF".to_string()]),
+                "MEMBER_INVALID_ENUM_VALUE",
+            ),
+            (ViolationKind::UniqueItems, "MEMBER_INVALID"),
+        ];
+        for (kind, expected_type) in cases {
+            let violation = Violation {
+                path: "channelGroupName".to_string(),
+                kind: kind.clone(),
+                value: Some("bad name!".to_string()),
+            };
+            let error = member_validation_failed(&violation);
+            assert_eq!(
+                error.validation_exception_type.as_deref(),
+                Some(expected_type),
+                "case {kind:?}: wrong ValidationExceptionType, got {:?}",
+                error.validation_exception_type
+            );
+            let message = error.message.clone().unwrap_or_default();
+            assert!(
+                message.starts_with("Validation error encountered at request.channelGroupName: "),
+                "case {kind:?}: expected the member path in the message, got {message:?}"
+            );
+            assert!(
+                !message.contains("bad name!"),
+                "case {kind:?}: the rejected value must not be echoed, got {message:?}"
+            );
+        }
+    }
+
+    /// The character-set rendering a `@pattern` refusal states, over the pattern forms
+    /// this service's model uses plus the ones it must decline to describe.
+    #[test]
+    fn a_character_class_pattern_is_stated_as_its_supported_characters() {
+        let cases = [
+            // `ResourceName`, the shape every resource-name member targets.
+            (
+                "^[a-zA-Z0-9_-]+$",
+                Some("A-Z, a-z, 0-9, _ (underscore), and - (hyphen)"),
+            ),
+            // A two-item class, which joins with `and` and no comma.
+            ("^[a-z0-9]+$", Some("a-z and 0-9")),
+            // A one-item class.
+            ("^[A-Z]+$", Some("A-Z")),
+            // A leading `-` is the literal hyphen, and the ranges are listed first.
+            ("^[-a-z]+$", Some("a-z and - (hyphen)")),
+            // A range that is not one run of letters or digits (regex reads `_-x` as the
+            // code points between them) has no listing, so the whole pattern declines.
+            ("^[a-z_-x]+$", None),
+            // A descending range is not a range a message can state either.
+            ("^[z-a]+$", None),
+            // `EntityTag` / `IdempotencyToken`: an escape names no listable set.
+            (r"^[\S]+$", None),
+            // A negated class states what is forbidden, not what is supported.
+            ("^[^a-z]+$", None),
+            // Not a single character class at all.
+            ("^arn:aws:mediapackagev2:", None),
+        ];
+        for (pattern, expected) in cases {
+            let rendered = pattern_character_set(pattern);
+            assert_eq!(
+                rendered.as_deref(),
+                expected,
+                "case {pattern:?}: expected {expected:?}, got {rendered:?}"
+            );
+        }
+    }
+
+    /// A `@pattern` violation is stated as the characters the member may hold, and every
+    /// other constraint class as the bound it broke — each followed by the sentence
+    /// telling the caller to check the value it sent.
+    #[test]
+    fn a_constraint_detail_states_the_bound_that_was_broken() {
+        let cases = [
+            (
+                ViolationKind::Pattern("^[a-zA-Z0-9_-]+$".to_string()),
+                "Member must contain only supported characters. Supported characters are \
+                 A-Z, a-z, 0-9, _ (underscore), and - (hyphen). Check the value you \
+                 specified in your request and then try again",
+            ),
+            (
+                ViolationKind::Pattern(r"^[\S]+$".to_string()),
+                "Member must satisfy regular expression pattern: ^[\\S]+$. Check the \
+                 value you specified in your request and then try again",
+            ),
+            (
+                ViolationKind::MaxLength(256),
+                "Member must have length less than or equal to 256. Check the value you \
+                 specified in your request and then try again",
+            ),
+            (
+                ViolationKind::MissingRequiredMember,
+                "Member must not be null. Check the value you specified in your request \
+                 and then try again",
+            ),
+        ];
+        for (kind, expected) in cases {
+            let detail = constraint_detail(&kind);
+            assert_eq!(
+                detail, expected,
+                "case {kind:?}: expected {expected:?}, got {detail:?}"
+            );
+        }
+    }
 
     #[test]
     fn a_page_token_round_trips_the_name_it_stopped_after() {

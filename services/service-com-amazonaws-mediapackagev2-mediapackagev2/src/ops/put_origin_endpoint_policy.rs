@@ -126,28 +126,11 @@ impl From<PutOriginEndpointPolicyErrorModeled> for PutOriginEndpointPolicyError 
     }
 }
 
-/// The sentence MediaPackage answers with when a channel group cannot be resolved —
-/// fixed per resource type, echoing none of the caller's identifiers. Worded exactly as
-/// the channel-scope policy handlers word it (`put_channel_policy`).
-const CHANNEL_GROUP_NOT_FOUND: &str = "MediaPackage can't process your request because \
-    we can't find your channel group. Verify your channel group name or add a channel \
-    group and then try again";
-
-/// The same fixed sentence at channel scope.
-const CHANNEL_NOT_FOUND: &str = "MediaPackage can't process your request because we \
-    can't find your channel. Verify your channel name or add a channel and then try \
-    again";
-
-/// The same fixed sentence at origin-endpoint scope.
-const ORIGIN_ENDPOINT_NOT_FOUND: &str = "MediaPackage can't process your request because \
-    we can't find your origin endpoint. Verify your origin endpoint name or add an origin \
-    endpoint and then try again";
-
-/// Why a policy document was refused — the same text `PutChannelPolicy` answers with, so
-/// one rule produces one message at both policy scopes.
-const INVALID_POLICY_MESSAGE: &str = "Validation error encountered at request.policy: \
-    The policy you provided isn't a valid policy document. Provide a JSON policy \
-    document with a Statement and then try again";
+/// Why a policy document was refused — the requirement the rejected member failed. The
+/// same text `PutChannelPolicy` answers with, so one rule produces one message at both
+/// policy scopes; `crate::state::validation_failed` states it in the service's envelope.
+const INVALID_POLICY_REQUIREMENT: &str = "The policy you provided isn't a valid policy \
+    document. Provide a JSON policy document with a Statement and then try again";
 
 /// The `PutOriginEndpointPolicy` operation.
 ///
@@ -202,10 +185,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // crate's one definition of a valid policy, shared with `PutChannelPolicy`.
         if !crate::state::is_policy_document(&input.policy) {
             return Err(PutOriginEndpointPolicyErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(INVALID_POLICY_MESSAGE.to_string()),
-                    validation_exception_type: Some("INVALID_POLICY".to_string()),
-                },
+                crate::state::validation_failed(
+                    "policy",
+                    INVALID_POLICY_REQUIREMENT,
+                    "INVALID_POLICY",
+                ),
             )
             .into());
         }
@@ -215,10 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
             return Err(
                 PutOriginEndpointPolicyErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(CHANNEL_GROUP_NOT_FOUND.to_string()),
-                        resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
-                    },
+                    crate::state::ResourceKind::ChannelGroup.not_found(),
                 )
                 .into(),
             );
@@ -226,10 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(channel) = group.channels.get_mut(&input.channel_name) else {
             return Err(
                 PutOriginEndpointPolicyErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(CHANNEL_NOT_FOUND.to_string()),
-                        resource_type_not_found: Some("CHANNEL".to_string()),
-                    },
+                    crate::state::ResourceKind::Channel.not_found(),
                 )
                 .into(),
             );
@@ -240,10 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(
                 PutOriginEndpointPolicyErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(ORIGIN_ENDPOINT_NOT_FOUND.to_string()),
-                        resource_type_not_found: Some("ORIGIN_ENDPOINT".to_string()),
-                    },
+                    crate::state::ResourceKind::OriginEndpoint.not_found(),
                 )
                 .into(),
             );
